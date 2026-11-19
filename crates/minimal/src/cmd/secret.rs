@@ -164,13 +164,122 @@ fn set_proxy(
 }
 
 /// Prompt on the terminal, with no echo.
+///
+/// The cursor waits after the prompt and nothing is drawn while the value is
+/// typed. After Return the line shows a random number of `*`, so the screen
+/// does not tell the value's length. Ctrl-C, Ctrl-D on an empty line and Esc
+/// cancel.
 fn read_terminal(id: &str) -> anyhow::Result<Zeroizing<String>> {
-    let value = inquire::Password::new(&format!("Value for {id}:"))
-        .without_confirmation()
-        .prompt()
-        .context("min secret set did not read the value from the terminal")?;
-    Ok(Zeroizing::new(value))
+    let mut stderr = std::io::stderr();
+    write!(stderr, "▸ Value for {id}: ").context(TERMINAL_READ_FAILED)?;
+    stderr.flush().context(TERMINAL_READ_FAILED)?;
+    let value = {
+        crossterm::terminal::enable_raw_mode().context(TERMINAL_READ_FAILED)?;
+        let _restore = RawModeGuard;
+        let mut value = Zeroizing::new(String::with_capacity(VALUE_CAPACITY));
+        loop {
+            let event = crossterm::event::read().context(TERMINAL_READ_FAILED)?;
+            let crossterm::event::Event::Key(key) = event else {
+                continue;
+            };
+            match hidden_key(&mut value, key) {
+                HiddenStep::More => {}
+                HiddenStep::Done => break Ok(value),
+                HiddenStep::Cancel => break Err(()),
+            }
+        }
+    };
+    match value {
+        Ok(value) => {
+            writeln!(stderr, "{}", "*".repeat(mask_len())).context(TERMINAL_READ_FAILED)?;
+            Ok(value)
+        }
+        Err(()) => {
+            writeln!(stderr).context(TERMINAL_READ_FAILED)?;
+            bail!("min secret set stopped: the value was not entered, and nothing was stored.")
+        }
+    }
 }
+
+/// The context of a terminal read that failed.
+const TERMINAL_READ_FAILED: &str = "min secret set did not read the value from the terminal";
+
+/// Leaves raw mode when the read ends, however it ends.
+struct RawModeGuard;
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+/// What a key does to a hidden read.
+#[derive(Debug, PartialEq, Eq)]
+enum HiddenStep {
+    /// Keep reading.
+    More,
+    /// Return the value.
+    Done,
+    /// Stop without a value.
+    Cancel,
+}
+
+/// Apply one key to the value being typed.
+fn hidden_key(value: &mut Zeroizing<String>, key: crossterm::event::KeyEvent) -> HiddenStep {
+    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+    if key.kind == KeyEventKind::Release {
+        return HiddenStep::More;
+    }
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Enter => HiddenStep::Done,
+        KeyCode::Esc => HiddenStep::Cancel,
+        KeyCode::Char('c') if control => HiddenStep::Cancel,
+        KeyCode::Char('d') if control && value.is_empty() => HiddenStep::Cancel,
+        KeyCode::Char('u') if control => {
+            value.clear();
+            HiddenStep::More
+        }
+        KeyCode::Char(_) if control => HiddenStep::More,
+        KeyCode::Char(c) => {
+            // `String` frees its old buffer unzeroed when it grows, so grow
+            // it here: the old `Zeroizing` buffer is wiped when replaced.
+            if value.len() + c.len_utf8() > value.capacity() {
+                let mut grown = Zeroizing::new(String::with_capacity(
+                    (value.capacity() * 2).max(VALUE_CAPACITY),
+                ));
+                grown.push_str(value);
+                *value = grown;
+            }
+            value.push(c);
+            HiddenStep::More
+        }
+        KeyCode::Backspace => {
+            value.pop();
+            HiddenStep::More
+        }
+        _ => HiddenStep::More,
+    }
+}
+
+/// The number of `*` shown for an entered value: 8 to 16, drawn at random
+/// and unrelated to its length.
+fn mask_len() -> usize {
+    let mut byte = [0u8; 1];
+    // A failed draw shows the shortest mask, which still says nothing of the
+    // value.
+    let _ = getrandom::fill(&mut byte);
+    MASK_MIN + usize::from(byte[0]) % (MASK_MAX - MASK_MIN + 1)
+}
+
+/// The bytes a typed value starts with room for. Most values fit, so the
+/// buffer holding them is never copied.
+const VALUE_CAPACITY: usize = 512;
+
+/// The shortest mask.
+const MASK_MIN: usize = 8;
+/// The longest mask.
+const MASK_MAX: usize = 16;
 
 /// The refusals of `set` that come from its arguments alone.
 fn refuse_set_args(args: &SecretSetArgs) -> anyhow::Result<()> {
@@ -697,7 +806,7 @@ fn recertify(
             );
             return Ok(());
         }
-        Err(MintError::NotRunning { path, error }) => {
+        Err(MintError::NotRunning { path, error, .. }) => {
             tracing::debug!(path = %path.display(), %error, "no proxy to re-certify its root; bep serve reads the rule when it starts");
             return Ok(());
         }
@@ -840,6 +949,93 @@ mod tests {
     use super::*;
     use bep::store::MemorySecretStore;
     use clap::Parser as _;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+    fn type_keys(keys: &[KeyEvent]) -> (Zeroizing<String>, HiddenStep) {
+        let mut value = Zeroizing::new(String::new());
+        let mut last = HiddenStep::More;
+        for key in keys {
+            last = hidden_key(&mut value, *key);
+            if last != HiddenStep::More {
+                break;
+            }
+        }
+        (value, last)
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn hidden_read_takes_typed_keys_and_backspace_until_return() {
+        let (value, step) = type_keys(&[
+            key(KeyCode::Char('a')),
+            key(KeyCode::Char('b')),
+            key(KeyCode::Backspace),
+            key(KeyCode::Char('C')),
+            key(KeyCode::Enter),
+            key(KeyCode::Char('z')),
+        ]);
+        assert_eq!(step, HiddenStep::Done);
+        assert_eq!(value.as_str(), "aC");
+    }
+
+    #[test]
+    fn hidden_read_keeps_a_value_longer_than_its_first_buffer() {
+        let long: Vec<_> = std::iter::repeat_n(key(KeyCode::Char('é')), VALUE_CAPACITY)
+            .chain([key(KeyCode::Enter)])
+            .collect();
+        let (value, step) = type_keys(&long);
+        assert_eq!(step, HiddenStep::Done);
+        assert_eq!(value.as_str(), "é".repeat(VALUE_CAPACITY));
+    }
+
+    #[test]
+    fn hidden_read_ignores_key_releases_and_other_control_keys() {
+        let mut release = key(KeyCode::Char('x'));
+        release.kind = KeyEventKind::Release;
+        let (value, step) =
+            type_keys(&[release, ctrl('a'), key(KeyCode::Left), key(KeyCode::Enter)]);
+        assert_eq!(step, HiddenStep::Done);
+        assert_eq!(value.as_str(), "");
+    }
+
+    #[test]
+    fn hidden_read_clears_the_line_on_ctrl_u() {
+        let (value, _) = type_keys(&[
+            key(KeyCode::Char('a')),
+            ctrl('u'),
+            key(KeyCode::Char('b')),
+            key(KeyCode::Enter),
+        ]);
+        assert_eq!(value.as_str(), "b");
+    }
+
+    #[test]
+    fn hidden_read_cancels_on_ctrl_c_esc_and_ctrl_d_on_an_empty_line() {
+        assert_eq!(
+            type_keys(&[key(KeyCode::Char('a')), ctrl('c')]).1,
+            HiddenStep::Cancel
+        );
+        assert_eq!(type_keys(&[key(KeyCode::Esc)]).1, HiddenStep::Cancel);
+        assert_eq!(type_keys(&[ctrl('d')]).1, HiddenStep::Cancel);
+        assert_eq!(
+            type_keys(&[key(KeyCode::Char('a')), ctrl('d')]).1,
+            HiddenStep::More
+        );
+    }
+
+    #[test]
+    fn the_mask_length_is_bounded_and_unrelated_to_the_value() {
+        let lens: std::collections::BTreeSet<usize> = (0..400).map(|_| mask_len()).collect();
+        assert!(lens.iter().all(|n| (MASK_MIN..=MASK_MAX).contains(n)));
+        assert!(lens.len() > 1, "the mask length never varied: {lens:?}");
+    }
 
     fn set_args(argv: &[&str]) -> SecretSetArgs {
         let mut full = vec!["min", "secret", "set"];

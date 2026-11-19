@@ -272,7 +272,22 @@ let EnvVars = std.contract.custom (fun label record_value =>
                 std.contract.check needs_schema."%{field}".validate label value
                 |> match {
                 'Ok wrapped_value => 'Ok (acc @ [{ include field, value = wrapped_value }]),
-                'Error e => 'Error { message = "failed to validate %{field}", blame_location = e.blame_location }
+                'Error e =>
+                    let why = if std.record.has_field "message" e then ": %{e.message}" else "" in
+                    # The hint is for a value that is not a record. A record
+                    # that fails has the shape right, so it gets no hint. No
+                    # record fails today: each class in need_classes.ncl takes
+                    # `{}`, and that check passes any record here.
+                    let hint =
+                        if std.is_record value then
+                            ""
+                        else
+                            "; a need is written as a record, as in `needs.%{field} = {}`"
+                    in
+                    'Error {
+                        message = "failed to validate %{field}%{why}%{hint}",
+                        blame_location = e.blame_location,
+                    }
                 }
             else
                 'Error { message = "`%{field}` is not a valid need" }

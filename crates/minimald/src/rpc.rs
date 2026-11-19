@@ -1741,6 +1741,57 @@ async fn serve_get_box_spec(
         .await
 }
 
+/// The liveness of connection `c`, which holds the exports it claims
+/// (BOX-202). `None` once the connection's teardown has finished.
+async fn export_holder(c: &ConnectionHandle) -> Option<std::sync::Weak<()>> {
+    c.liveness().await
+}
+
+/// `ClaimExports`: grants the calling connection each export of a box's
+/// last end that no other command holds or reported (BOX-198).
+async fn serve_claim_exports(
+    s: ServerStateHandle,
+    c: ConnectionHandle,
+    channel: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    minimald_rpc::ClaimExports
+        .handle_channel(channel, async |req: minimald_rpc::ClaimExportsRequest| {
+            let Some(holder) = export_holder(&c).await else {
+                return Ok(Errorable::Err {
+                    error: "the connection to minimald is closing".to_string(),
+                });
+            };
+            let mngr = s.sessions_manager().await;
+            Ok(mngr.claim_exports(req.id, &req.paths, &holder).await.into())
+        })
+        .await
+}
+
+/// `ReportExport`: appends the `file_exported` event of one export the
+/// calling connection claimed (BOX-195).
+async fn serve_report_export(
+    s: ServerStateHandle,
+    c: ConnectionHandle,
+    channel: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    minimald_rpc::ReportExport
+        .handle_channel(channel, async |req: minimald_rpc::ReportExportRequest| {
+            let Some(holder) = export_holder(&c).await else {
+                return Ok(Errorable::Err {
+                    error: "the connection to minimald is closing".to_string(),
+                });
+            };
+            let mngr = s.sessions_manager().await;
+            Ok(match mngr.report_export(&req, &holder).await {
+                Ok(event) => Errorable::Ok(minimald_rpc::ReportExportResponse { ts: event.ts }),
+                Err(e) => Errorable::Err {
+                    error: e.to_string(),
+                },
+            })
+        })
+        .await
+}
+
 /// `ShowBox`: one box record with its state, identity and live execs
 /// (BOX-159).
 async fn serve_show_box(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), ConnectionError> {
@@ -3605,6 +3656,8 @@ pub async fn handle_ssh_rpc(
         | minimald_rpc::ListBoxes::NAME
         | minimald_rpc::ShowBox::NAME
         | minimald_rpc::GetBoxSpec::NAME
+        | minimald_rpc::ClaimExports::NAME
+        | minimald_rpc::ReportExport::NAME
         | Shutdown::NAME
         | AbortSession::NAME
         | GetSessionPolicy::NAME
@@ -3694,6 +3747,12 @@ pub async fn handle_ssh_rpc(
         minimald_rpc::ListBoxes::NAME => serve!(serve_list_boxes(s, channel)),
         minimald_rpc::ShowBox::NAME => serve!(serve_show_box(s, channel)),
         minimald_rpc::GetBoxSpec::NAME => serve!(serve_get_box_spec(s, channel)),
+        minimald_rpc::ClaimExports::NAME => {
+            serve!(serve_claim_exports(s, c.clone(), channel))
+        }
+        minimald_rpc::ReportExport::NAME => {
+            serve!(serve_report_export(s, c.clone(), channel))
+        }
         Shutdown::NAME => serve!(serve_shutdown(s, channel)),
         AbortSession::NAME => serve!(serve_abort_session(s, channel)),
         GetSessionPolicy::NAME => serve!(serve_get_session_policy(s, channel)),

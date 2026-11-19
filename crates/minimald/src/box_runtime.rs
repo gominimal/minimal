@@ -113,6 +113,11 @@ pub(crate) struct Host<P: BoxProcess, G: BoxGuard> {
     /// of [`Host::mainloop`] reads it to tell a requested end from a pty
     /// failure. A pty error stashed before the kill does not hide the kill.
     kill_requested: bool,
+    /// Set when a stop or a removal of the box tells this host it is under
+    /// way ([`Message::BoxEnding`]), before it signals the box's processes.
+    /// The teardown to the attached binding then carries this cause, not a
+    /// process exit, so the binding raises no shell-exit prompt (BCLI-068).
+    box_end: Option<BoxEnd>,
     /// The master-side fd of the Pty. On a host whose entrypoint runs on
     /// pipes, the read end of its stdout pipe (see [`Self::pipes`]).
     master: AsyncFd<std::fs::File>,
@@ -675,6 +680,8 @@ pub(crate) fn launch_span(
         session = %session_name,
         entrypoint = entrypoint.log_name(),
         args = entrypoint.arg_count(),
+        otel.status_code = tracing::field::Empty,
+        otel.status_description = tracing::field::Empty,
     );
     tracing::info!(
         parent: &span,
@@ -683,6 +690,25 @@ pub(crate) fn launch_span(
         "launching the box's entrypoint from its spec"
     );
     span
+}
+
+/// Runs a launch inside its `box.launch` span (from [`launch_span`]) and
+/// closes the span when the launch completes. A launch that failed marks the
+/// span and says why in its status (gominimal/minimal#3223) before the error
+/// goes up. The span is taken by value, so no handle outlives the launch: the
+/// span's duration is the launch's, not the binding setup and attach hooks
+/// that follow it.
+pub(crate) async fn launch_in_span<T, E: std::fmt::Display>(
+    span: tracing::Span,
+    launch: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    let launched = tracing::Instrument::instrument(launch, span.clone()).await;
+    if let Err(e) = &launched {
+        span.record("otel.status_code", "ERROR");
+        span.record("otel.status_description", format!("{e:#}").as_str());
+    }
+    drop(span);
+    launched
 }
 
 /// Places the grants' sealed values in a launch's connection layer
@@ -1287,7 +1313,20 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         // One span per launch, naming the entrypoint the launcher read from
         // the box's spec, so the daemon log says what each launch started.
         let entrypoint = launcher.entrypoint()?;
-        let launch_span = launch_span(session_id, &session_name, &entrypoint);
+        // The span closes when the launch completes, marked and explained
+        // if it failed.
+        let launched = launch_in_span(
+            launch_span(session_id, &session_name, &entrypoint),
+            launcher.launch(
+                crate::guest::is_microvm_daemon(),
+                session_id,
+                name,
+                username,
+                paths,
+                sz,
+            ),
+        )
+        .await;
         let Launched {
             master,
             process,
@@ -1300,18 +1339,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             listen_plan,
             start_gate,
             pipes,
-        } = tracing::Instrument::instrument(
-            launcher.launch(
-                crate::guest::is_microvm_daemon(),
-                session_id,
-                name,
-                username,
-                paths,
-                sz,
-            ),
-            launch_span,
-        )
-        .await?;
+        } = launched?;
 
         // The listen-publication watcher (NET-016, NET-017): the plan this
         // launch gathered is the box's whole publication surface — its
@@ -1377,6 +1405,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             process,
             pending_pty_err: None,
             kill_requested: false,
+            box_end: None,
             master,
             pipes,
             output_log,
@@ -1661,6 +1690,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                     killed = true;
                 }
                 Message::TakeEntrypointIo(reply) => self.answer_take_entrypoint_io(reply),
+                Message::BoxEnding(end, reply) => self.record_box_end(end, reply),
                 _ => {}
             }
         }
@@ -1760,16 +1790,24 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
     /// drops, and an mpsc receiver drains its buffer before observing the closed
     /// sender, so the binding sees the teardown before falling through to
     /// `HostGone`.
+    ///
+    /// A stop or a removal recorded in [`Self::box_end`] replaces the
+    /// process exit as the cause: the process ended because the daemon
+    /// signalled it, and the binding raises no shell-exit prompt (BCLI-068).
     fn notify_remote_teardown(&mut self, cause: TeardownCause) {
         // Read off the screen before the binding slot is borrowed: the binding
         // has no view of this host's parser, so the codes that undo whatever
         // input modes the process left behind have to travel with the message.
         let unwind_codes = self.unwind_codes();
-        match self.remote.as_mut() {
-            Some((tx, ..)) => match tx.try_send(BindingMsg::TeardownDueToProcessExit {
+        let msg = match self.box_end {
+            Some(end) => BindingMsg::TeardownDueToBoxEnd(end, unwind_codes),
+            None => BindingMsg::TeardownDueToProcessExit {
                 cause,
                 unwind_codes,
-            }) {
+            },
+        };
+        match self.remote.as_mut() {
+            Some((tx, ..)) => match tx.try_send(msg) {
                 Ok(()) => tracing::debug!(
                     session_id = %self.session_id,
                     "handed the teardown cause to the attached binding",
@@ -1789,6 +1827,24 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                 "session process exited with no binding attached",
             ),
         }
+    }
+
+    /// Records that a stop or a removal of the box is under way, and answers
+    /// the caller once it is recorded (BCLI-068). See [`Self::box_end`].
+    fn record_box_end(&mut self, end: BoxEnd, reply: oneshot::Sender<()>) {
+        tracing::info!(
+            session_id = %self.session_id,
+            session = %self.session_name,
+            ?end,
+            attached = self.remote.is_some(),
+            "the box is being stopped or removed; an attached client is told so at teardown",
+        );
+        self.box_end = Some(end);
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "a caller that went away needs no answer"
+        )]
+        let _ = reply.send(());
     }
 
     /// Snapshots the visible terminal screen into the structured
@@ -1848,16 +1904,21 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                             "session host killed on request",
                         );
                         self.kill_requested = true;
-                        if for_shutdown
+                        // A daemon shutdown says so. A stop or a removal that
+                        // ends in this kill says that instead (BCLI-068), so
+                        // the binding does not report a vanished session.
+                        if (for_shutdown || self.box_end.is_some())
                             && let Some(binding) = self.remote.take() {
                                 // If there was a binding we just swapped out, tell it to
                                 // shut down and wait for it to finish.
                                 let unwind_codes = self.unwind_codes();
-                                retire_binding(
-                                    binding,
-                                    BindingMsg::TeardownDueToDaemonShutdown(unwind_codes),
-                                )
-                                .await;
+                                let msg = match self.box_end {
+                                    Some(end) if !for_shutdown => {
+                                        BindingMsg::TeardownDueToBoxEnd(end, unwind_codes)
+                                    }
+                                    _ => BindingMsg::TeardownDueToDaemonShutdown(unwind_codes),
+                                };
+                                retire_binding(binding, msg).await;
                             }
 
                         if let Err(e) = self.process.kill() {
@@ -1871,6 +1932,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                         // `mainloop` reap via `wait()` and return.
                         return Err(());
                     }
+                    Message::BoxEnding(end, reply) => self.record_box_end(end, reply),
                     Message::Attach(channel, sz, connection, keys) => {
                         self.attach(channel, sz, false, connection, keys).await;
                     }

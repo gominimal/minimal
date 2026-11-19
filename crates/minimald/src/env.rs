@@ -484,7 +484,7 @@ fn state_dirs_from_env_vars(env_vars: &BTreeMap<String, String>) -> BTreeSet<Str
     env_vars
         .values()
         .filter_map(|v| v.strip_prefix("/state/"))
-        .filter(|p| !p.is_empty() && !p.contains('/'))
+        .filter(|p| mfile::File::validate_state_component(p).is_ok())
         .map(str::to_owned)
         .collect()
 }
@@ -1913,7 +1913,29 @@ impl BoxChannel {
     }
 
     /// Record and transmit a newly-acquired variable to the session shell.
+    ///
+    /// The name is passed through to the shell helper verbatim, where bash
+    /// evaluates a `declare`d name for array subscripts — a crafted one runs
+    /// commands in the user's live shell. Invalid names are refused here
+    /// rather than recorded or sent. A value opening with `(` is refused
+    /// too: the helpers refuse it, so recording it would leave the daemon
+    /// holding a variable the shell never exported.
     fn announce_env(&self, stream: &mut UnixStream, key: &str, value: &str) {
+        if !graph::is_valid_env_var_name(key) {
+            let _ = writeln!(
+                stream,
+                "msg:min: refusing to export environment variable with an invalid name: {}",
+                one_line(key)
+            );
+            return;
+        }
+        if value.starts_with('(') {
+            let _ = writeln!(
+                stream,
+                "msg:min: refusing to export {key}: a value starting with ( would be read as an array"
+            );
+            return;
+        }
         self.runtime_env.record(key, value);
         let _ = writeln!(stream, "set_env:{key}:{value}");
     }
@@ -2429,7 +2451,7 @@ impl BoxChannel {
         };
 
         // T123: a helper whose stdin is a pipe or a file forwards it. The
-        // task gets it on its stdin pipe, through `run_invocations_in`.
+        // task's first invocation gets it on its stdin pipe.
         let forward_stdin = relays && request.stdin;
         tracing::info!(
             task = %task_name,
@@ -2487,27 +2509,17 @@ impl BoxChannel {
                 return Ok(false);
             }
 
-            match &start_dir {
-                dir if dir.is_some() || forward_stdin => {
-                    run_invocations_in(
-                        &mut env,
-                        invocations,
-                        dir.as_deref(),
-                        stream,
-                        note_tag,
-                        forward_stdin.then_some(&mut forwarded),
-                    )
-                    .await?
-                }
-                _ => {
-                    let (stdout_writer, stderr_writer) =
-                        StreamWriter::pair_tagged(stream, note_tag)
-                            .map_err(|e| Error::IO("creating writers", Default::default(), e))?;
-                    env.run(invocations, Some(stdout_writer), Some(stderr_writer))
-                        .await?
-                }
-            }
-            Ok(true)
+            run_invocations_relayed(
+                &mut env,
+                stream,
+                note_tag,
+                task_name,
+                invocations,
+                start_dir.clone(),
+                forward_stdin,
+                &mut forwarded,
+            )
+            .await
         }
         .await;
 
@@ -3598,117 +3610,130 @@ fn relayed_exit_code(result: &Result<(), Error>) -> Option<u8> {
     }
 }
 
-/// Runs each invocation in `dir`, streams its stdout to `stream` as `msg:`
-/// lines and its stderr as `err_tag` lines, and stops at the first one that fails, as `Env::run` does.
-/// `Env::run` has no working directory of its own, so an `inherit_cwd` task
-/// runs here.
-///
-/// `Env::run` gives a task no stdin either, so a run whose helper forwards
-/// its stdin runs here too (T123). With `stdin`, the first invocation gets
-/// a stdin pipe, the channel sends the helper `stdin:`, and the copy of the
-/// forwarded stdin to the pipe goes into `stdin`. Only the first invocation
-/// of a multi-invocation task gets the forwarded stdin. The later
-/// invocations get none. https://github.com/gominimal/minimal/issues/3094
-/// tracks this gap.
-async fn run_invocations_in(
-    env: &mut mctx::Env<'_>,
-    invocations: Vec<sandbox::config::Invocation>,
-    dir: Option<&str>,
-    stream: &UnixStream,
-    err_tag: &'static str,
-    mut stdin: Option<&mut Option<crate::exec::ForwardedStdin>>,
-) -> Result<(), Error> {
-    let io = |what: &'static str| move |e: std::io::Error| Error::IO(what, Default::default(), e);
-    let shared = Arc::new(Mutex::new(
-        stream.try_clone().map_err(io("creating writers"))?,
-    ));
-    for (idx, invocation) in invocations.iter().enumerate() {
-        // One plan, container and attach per invocation: hakoniwa unshares
-        // per spawn, so each one needs its own network.
-        let planned = env.plan_launch().await?;
-        let container = env.container(planned.plan())?;
-        let mut cmd = env.invocation_command(&container, invocation)?;
-        if let Some(dir) = dir {
-            cmd.current_dir(dir);
-        }
-        let mut stdin = stdin.as_deref_mut().filter(|_| idx == 0);
-        if stdin.is_some() {
-            cmd.stdin(hakoniwa::Stdio::piped());
-        }
-        cmd.stdout(hakoniwa::Stdio::MakePipe);
-        cmd.stderr(hakoniwa::Stdio::MakePipe);
-        let mut child = sandbox::forker::on_fork_thread(move || cmd.spawn())
-            .map_err(|e| Error::Other(anyhow::anyhow!("spawn failed: {e}")))?;
-        let guard = match planned.attach_child(&mut child).await {
-            Ok(guard) => guard,
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(e.into());
-            }
-        };
-        if let Some(slot) = stdin.as_deref_mut() {
-            let started = match child.stdin.take() {
-                Some(pipe) => crate::exec::ForwardedStdin::start(
-                    stream,
-                    std::fs::File::from(std::os::fd::OwnedFd::from(pipe)),
-                ),
-                None => Err(std::io::Error::other("the task has no stdin pipe")),
-            };
-            match started {
-                Ok(forwarded) => {
-                    *slot = Some(forwarded);
-                    // The helper sends its stdin only after this line, so
-                    // the request line the listener read is all it read.
-                    let mut stream = shared
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let _ = writeln!(stream, "stdin:");
-                }
-                Err(e) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    if let Some(guard) = guard {
-                        guard.teardown().await;
-                    }
-                    return Err(forwarded_stdin_error(&e));
-                }
-            }
-        }
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let (out, err) = (shared.clone(), shared.clone());
-        let status = crate::traced::spawn_blocking(move || {
-            let out = std::thread::spawn(move || stdout.map(|p| forward_lines(p, &out, "msg")));
-            let err = std::thread::spawn(move || stderr.map(|p| forward_lines(p, &err, err_tag)));
-            let _ = out.join();
-            let _ = err.join();
-            child.wait()
-        })
-        .await;
-        // The task ended, so a read of the forwarded stdin that fails now
-        // does not fail the run.
-        if let Some(Some(forwarded)) = stdin.as_deref() {
-            forwarded.task_ended();
-        }
-        if let Some(guard) = guard {
-            guard.teardown().await;
-        }
-        drop(container);
-        let status = status
-            .map_err(|e| Error::Other(anyhow::anyhow!("waiting for the task failed: {e}")))?
-            .map_err(|e| Error::Other(anyhow::anyhow!("waiting for the task failed: {e}")))?;
-        if !status.success() {
-            return Err(Error::Execution {
-                idx,
-                code: status.code,
-                reason: status.reason.clone(),
-                stderr: String::new(),
-                stdout: String::new(),
-            });
-        }
+/// Runs a task's invocations. [`mctx::Env`] runs them in the box's sandbox.
+/// A test gives a runner of its own, so the relay around a run is checked on
+/// a host that cannot start a sandbox.
+trait InvocationRunner {
+    fn run_invocations(
+        &mut self,
+        invocations: Vec<sandbox::config::Invocation>,
+        stdout: &mut StreamWriter,
+        stderr: &mut StreamWriter,
+        options: sandbox::RunOptions,
+    ) -> impl Future<Output = Result<(), Error>> + Send;
+}
+
+impl InvocationRunner for mctx::Env<'_> {
+    async fn run_invocations(
+        &mut self,
+        invocations: Vec<sandbox::config::Invocation>,
+        stdout: &mut StreamWriter,
+        stderr: &mut StreamWriter,
+        options: sandbox::RunOptions,
+    ) -> Result<(), Error> {
+        self.run_with_options(invocations, Some(stdout), Some(stderr), options)
+            .await
     }
-    Ok(())
+}
+
+/// Runs a task's invocations through the one run path, with its output
+/// relayed to `stream` as `msg:` and `<note_tag>:` lines. `start_dir` and
+/// `forward_stdin` set the run options. A forwarded stdin that started is
+/// left in `forwarded`. `Ok(true)` is a run that passed. The caller sends
+/// the exit line with [`BoxChannel::end_task_run`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one call site in run_task, which hands over each fact of the run"
+)]
+async fn run_invocations_relayed<R: InvocationRunner>(
+    runner: &mut R,
+    stream: &mut UnixStream,
+    note_tag: &'static str,
+    task_name: &str,
+    invocations: Vec<sandbox::config::Invocation>,
+    start_dir: Option<String>,
+    forward_stdin: bool,
+    forwarded: &mut Option<crate::exec::ForwardedStdin>,
+) -> Result<bool, Error> {
+    // One run path for every task: an `inherit_cwd` task, a task
+    // whose helper forwards its stdin, and a default task differ
+    // only in the run options.
+    tracing::debug!(
+        task = %task_name,
+        start_dir = start_dir.as_deref().unwrap_or("<the box's working directory>"),
+        stdin_forwarded = forward_stdin,
+        "in-box task run uses the sandbox run path",
+    );
+    let started: StartedStdin = Arc::new(Mutex::new(None));
+    let options = sandbox::RunOptions {
+        current_dir: start_dir,
+        stdin: if forward_stdin {
+            Some(forwarded_stdin_slot(stream, started.clone())?)
+        } else {
+            None
+        },
+        ..sandbox::RunOptions::default()
+    };
+    let (mut stdout_writer, mut stderr_writer) = StreamWriter::pair_tagged(stream, note_tag)
+        .map_err(|e| Error::IO("creating writers", Default::default(), e))?;
+    let ran = runner
+        .run_invocations(invocations, &mut stdout_writer, &mut stderr_writer, options)
+        .await;
+    // A last line without a newline still reaches the helper. No
+    // await here: `mctx::Error` is not `Send`, and `ran` holds one.
+    stdout_writer.finish_line();
+    stderr_writer.finish_line();
+    let started = started
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    match started {
+        Some(Ok(stdin)) => {
+            // The task ended, so a read of the forwarded stdin that
+            // fails now does not fail the run.
+            stdin.task_ended();
+            *forwarded = Some(stdin);
+        }
+        Some(Err(e)) => return Err(forwarded_stdin_error(&e)),
+        None => {}
+    }
+    ran?;
+    Ok(true)
+}
+
+/// Where the stdin slot of a run leaves the forwarded stdin it started, or
+/// the error that stopped it.
+type StartedStdin = Arc<Mutex<Option<std::io::Result<crate::exec::ForwardedStdin>>>>;
+
+/// The stdin slot of a run whose helper forwards its stdin (T123). The slot
+/// gets the first invocation's stdin pipe, starts the copy of the forwarded
+/// stdin to it, and sends the helper `stdin:`. The helper sends its stdin
+/// only after this line, so the request line the listener read is all it
+/// read. The later invocations of a multi-invocation task get no stdin.
+/// https://github.com/gominimal/minimal/issues/3094 tracks this gap.
+fn forwarded_stdin_slot(
+    stream: &UnixStream,
+    started: StartedStdin,
+) -> Result<sandbox::StdinSlot, Error> {
+    let connection = stream
+        .try_clone()
+        .map_err(|e| Error::IO("creating writers", Default::default(), e))?;
+    Ok(Box::new(move |pipe: std::fs::File| {
+        let result = crate::exec::ForwardedStdin::start(&connection, pipe);
+        let failure = result.as_ref().err().map(|e| e.to_string());
+        if result.is_ok() {
+            // The sandbox reads no output of the task before the slot
+            // returns, so no output line comes before this one.
+            let _ = writeln!(&connection, "stdin:");
+        }
+        *started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
+        match failure {
+            Some(e) => Err(std::io::Error::other(e)),
+            None => Ok(()),
+        }
+    }))
 }
 
 /// The failure of a run whose stdin could not reach its task.
@@ -3719,6 +3744,7 @@ fn forwarded_stdin_error(e: &std::io::Error) -> Error {
 }
 
 /// Copies `pipe` to `stream` as one `<tag>:` line per line, until EOF.
+#[cfg(test)]
 fn forward_lines(pipe: impl std::io::Read, stream: &Mutex<UnixStream>, tag: &str) {
     use std::io::BufRead as _;
     let mut reader = std::io::BufReader::new(pipe);
@@ -3778,6 +3804,14 @@ impl StreamWriter {
         ))
     }
 
+    /// Sends the text after the last newline as a line of its own.
+    fn finish_line(&mut self) {
+        if !self.buf.is_empty() {
+            self.buf.push(b'\n');
+            self.emit_lines();
+        }
+    }
+
     fn emit_lines(&mut self) {
         while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
             let line = String::from_utf8_lossy(&self.buf[..pos]);
@@ -3805,10 +3839,13 @@ impl tokio::io::AsyncWrite for StreamWriter {
         Poll::Ready(Ok(()))
     }
 
+    /// Sends the text after the last newline as a line of its own, so a
+    /// task's last line reaches the helper without a newline too.
     fn poll_shutdown(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
+        self.finish_line();
         Poll::Ready(Ok(()))
     }
 }
@@ -4534,6 +4571,154 @@ mod tests {
         assert_eq!(
             send_with(Some(tp), Some("on")),
             format!("traceparent%{tp}%net-expose%8770")
+        );
+    }
+
+    /// A `set_env:` line hands the helper a variable name that began as
+    /// package metadata. Bash evaluates the name of a `declare`d variable
+    /// for array subscripts, so a crafted one — `X[$(touch /tmp/pwned)]` —
+    /// runs the command in the user's live shell. The helper must refuse
+    /// such a name without evaluating it, while still exporting the valid
+    /// names around it. Regression guard for the env_state_wiring path.
+    #[cfg(unix)]
+    #[test]
+    fn a_set_env_line_with_a_crafted_name_is_refused_not_evaluated() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let helper = tmp.path().join("min_helper.sh");
+        std::fs::write(&helper, MIN_SCRIPT).unwrap();
+
+        // The payload's marker: the crafted name would `touch` it if bash
+        // evaluated the subscript. It must not exist after the helper runs.
+        let marker = tmp.path().join("pwned");
+
+        // A socat stand-in that answers a request with three `set_env:`
+        // lines — a crafted name, a valid one after it, then `done:`.
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let socat = bin.join("socat");
+        std::fs::write(
+            &socat,
+            format!(
+                "#!/bin/sh\nprintf 'set_env:X[$(touch {})]:/state/gocache\\n'\nprintf 'set_env:GOCACHE:/state/gocache\\n'\nprintf 'done:\\n'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&socat, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                ". '{}'; __min_rpc status; rc=$?; echo \"GOCACHE=$GOCACHE\"; exit $rc",
+                helper.display()
+            ))
+            .env("PATH", &path)
+            .env_remove("GOCACHE")
+            .output();
+        let Ok(out) = out else {
+            eprintln!("no bash to run the min helper with — skipping");
+            return;
+        };
+
+        assert!(!marker.exists(), "the crafted name ran its payload");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("min: refusing to export environment variable with an invalid name"),
+            "the refusal must say so in plain words, got: {stderr}"
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("GOCACHE=/state/gocache"),
+            "a valid name alongside must still export, got: {stdout}"
+        );
+        assert!(
+            !stdout.contains("pwned"),
+            "the crafted name must not join the export summary, got: {stdout}"
+        );
+    }
+
+    /// A valid name can still match a local of `__min_rpc` or of its
+    /// caller, and an assignment by name writes that local, not the shell's
+    /// variable. The helper must write and export the global whatever the
+    /// name. And since `declare` reads a value opening with `(` as an array
+    /// list when the global is an array, such a value is refused, not run.
+    /// The protocol reader's own `line` is one such local: were it the
+    /// global, the next read would overwrite a `set_env:line:` assignment.
+    /// The mctx helper has the same test.
+    #[cfg(unix)]
+    #[test]
+    fn a_set_env_line_writes_the_global_even_when_a_local_shares_its_name() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let helper = tmp.path().join("min_helper.sh");
+        std::fs::write(&helper, MIN_SCRIPT).unwrap();
+
+        // Created only if the parenthesised value were expanded.
+        let marker = tmp.path().join("ran");
+
+        // A socat stand-in that answers with a name the helper also uses
+        // for a local, a parenthesised value for an array global, then
+        // `done:`.
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let socat = bin.join("socat");
+        std::fs::write(
+            &socat,
+            format!(
+                "#!/bin/sh\nprintf 'set_env:varname:/state/varname\\n'\nprintf 'set_env:LIST:($(touch {}))\\n'\nprintf 'set_env:line:/state/line\\n'\nprintf 'done:\\n'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&socat, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "LIST=(one); . '{}'; __min_rpc status; rc=$?; \
+                 echo \"global=$varname exported=$(printenv varname) list=$LIST line=$line exported_line=$(printenv line)\"; exit $rc",
+                helper.display()
+            ))
+            .env("PATH", &path)
+            .env_remove("varname")
+            .env_remove("line")
+            .output();
+        let Ok(out) = out else {
+            eprintln!("no bash to run the min helper with — skipping");
+            return;
+        };
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("global=/state/varname exported=/state/varname"),
+            "a name shared with a local must still set and export the global, got: {stdout}"
+        );
+        assert!(!marker.exists(), "a parenthesised value was expanded");
+        assert!(
+            stdout.contains("list=one"),
+            "a refused value must leave the global as it was, got: {stdout}"
+        );
+        assert!(
+            stdout.contains("line=/state/line exported_line=/state/line"),
+            "the reader's own `line` must not take or overwrite the shell's, got: {stdout}"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("would be read as an array"),
+            "the refusal must say so, got: {stderr}"
         );
     }
 
@@ -6369,10 +6554,26 @@ exit $rc
         BoxChannel,
         mpsc::Sender<ChannelRequest>,
     ) {
-        let cwd = tempdir().unwrap();
-        let state = tempdir().unwrap();
-        let home = tempdir().unwrap();
-        let rootfs = tempdir().unwrap();
+        setup_channel_under(session, name, repo, &std::env::temp_dir())
+    }
+
+    /// [`setup_channel_in`] with the channel's directories under `base`.
+    fn setup_channel_under(
+        session: crate::box_actor::WeakBoxHandle,
+        name: &str,
+        repo: &Path,
+        base: &Path,
+    ) -> (
+        TempDir,
+        TempDir,
+        TempDir,
+        BoxChannel,
+        mpsc::Sender<ChannelRequest>,
+    ) {
+        let cwd = tempfile::tempdir_in(base).unwrap();
+        let state = tempfile::tempdir_in(base).unwrap();
+        let home = tempfile::tempdir_in(base).unwrap();
+        let rootfs = tempfile::tempdir_in(base).unwrap();
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let config = ConfigBuilder::new()
             .with_state_dir(state.path().to_path_buf())
@@ -6503,6 +6704,339 @@ exit $rc
             .lines()
             .map_while(Result::ok)
             .collect()
+    }
+
+    /// A directory that can hold a sandbox: one that is not `nodev` or
+    /// `noexec`, since the sandbox remounts its rootfs and runs from it.
+    /// `/run` and `/state` are not candidates: the sandbox mounts its own
+    /// over them, so a task cannot reach a path the channel made there.
+    fn sandbox_base_dir() -> Option<PathBuf> {
+        use nix::sys::statvfs::{FsFlags, statvfs};
+        let target_tmp = std::env::var_os("CARGO_TARGET_DIR")
+            .map(|dir| PathBuf::from(dir).join("tmp"))
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp"));
+        let _ = std::fs::create_dir_all(&target_tmp);
+        [std::env::temp_dir(), PathBuf::from("/var/tmp"), target_tmp]
+            .into_iter()
+            .find(|dir| {
+                tempfile::tempdir_in(dir).is_ok()
+                    && statvfs(dir).is_ok_and(|st| {
+                        !st.flags()
+                            .intersects(FsFlags::ST_NODEV | FsFlags::ST_NOEXEC)
+                    })
+            })
+    }
+
+    /// Sends one request line to the channel and returns every line of its
+    /// answer.
+    async fn channel_reply(chan: &mut BoxChannel, line: &str) -> Vec<String> {
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        #[expect(
+            clippy::large_futures,
+            reason = "the handle future carries the harness's whole channel; the test awaits \
+                      it to completion"
+        )]
+        chan.handle(line, &mut ours).await;
+        drop(ours);
+        let mut raw = Vec::new();
+        std::io::Read::read_to_end(&mut &theirs, &mut raw).unwrap();
+        String::from_utf8_lossy(&raw)
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// D2983: an `inherit_cwd` task and a default task run through the one
+    /// sandbox run path, end to end through `BoxChannel::run_task`. The
+    /// `inherit_cwd` task starts in the caller's directory, the default one
+    /// in the box's working directory, and both relay their exit as the
+    /// last line: `exit:0` for a task that passes, and the same nonzero
+    /// line for a task that fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_task_relays_exit_through_both_paths() {
+        // A host that denies the unprivileged user namespace (stock Ubuntu
+        // 24.04+ runners) cannot start the sandbox a task runs in.
+        if let Some(reason) = sandbox::user_namespaces_restriction() {
+            eprintln!(
+                "skipping run_task_relays_exit_through_both_paths: this host denies the \
+                 unprivileged user namespace every sandbox starts by unsharing: {reason}"
+            );
+            return;
+        }
+        let Some(base) = sandbox_base_dir() else {
+            eprintln!("no directory on this host can hold a sandbox — skipping");
+            return;
+        };
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fakepkgs = manifest_dir
+            .join("../mctx/testdata/fakepkgs")
+            .canonicalize()
+            .unwrap();
+        let repo = tempfile::tempdir_in(&base).unwrap();
+        std::fs::write(
+            repo.path().join("minimal.toml"),
+            format!(
+                "[upstream]\ndir = \"{}\"\n\n\
+                 [tasks.cwd-pwd]\npackages = [\"uroot\"]\ninherit_cwd = true\nexec = \"/bbin/pwd\"\n\n\
+                 [tasks.plain-pwd]\npackages = [\"uroot\"]\nexec = \"/bbin/pwd\"\n\n\
+                 [tasks.cwd-fail]\npackages = [\"uroot\"]\ninherit_cwd = true\nexec = \"/bbin/gosh -c 'pwd; printf no-newline; exit 3'\"\n\n\
+                 [tasks.plain-fail]\npackages = [\"uroot\"]\nexec = \"/bbin/gosh -c 'pwd; printf no-newline; exit 3'\"\n\n\
+                 [tasks.cwd-stdin]\npackages = [\"uroot\"]\ninherit_cwd = true\nexec = \"/bbin/cat\"\n",
+                fakepkgs.display()
+            ),
+        )
+        .unwrap();
+
+        let server = crate::test_harness::TestServer::new().await;
+        let mut client = server.connect().await;
+        let id =
+            crate::test_harness::create_configured_session(&mut client, "runweb", "/tmp").await;
+        let handle = server
+            .state
+            .sessions_manager()
+            .await
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the session resolves");
+        let (_state, _rootfs, cwd, mut chan, _sender) =
+            setup_channel_under(handle.downgrade(), "runweb", repo.path(), &base);
+        std::fs::create_dir(cwd.path().join("sub")).unwrap();
+        // The harness drops the home tempdir it made. A run mounts the home,
+        // so make it again. `repo` is removed at the end of the test.
+        std::fs::create_dir_all(chan.home.as_utf8_path().as_std_path()).unwrap();
+
+        let run = |task: &str| format!("run%/workbench/sub{RUN_GROUP_SEP}{task}");
+        let cwd_pwd = channel_reply(&mut chan, &run("cwd-pwd")).await;
+        let plain_pwd = channel_reply(&mut chan, &run("plain-pwd")).await;
+        assert_eq!(
+            cwd_pwd.last().map(String::as_str),
+            Some("exit:0"),
+            "{cwd_pwd:?}"
+        );
+        assert_eq!(
+            plain_pwd.last().map(String::as_str),
+            Some("exit:0"),
+            "{plain_pwd:?}"
+        );
+        assert!(
+            cwd_pwd.iter().any(|l| l == "msg:/workbench/sub"),
+            "an inherit_cwd task starts in the caller's directory: {cwd_pwd:?}"
+        );
+        assert!(
+            plain_pwd.iter().any(|l| l == "msg:/workbench"),
+            "a default task starts in the box's working directory: {plain_pwd:?}"
+        );
+
+        // A task that fails with code 3, after a last line without a
+        // newline: both paths send that line, then the same exit line.
+        let cwd_fail = channel_reply(&mut chan, &run("cwd-fail")).await;
+        let plain_fail = channel_reply(&mut chan, &run("plain-fail")).await;
+        assert_eq!(
+            cwd_fail,
+            ["msg:/workbench/sub", "msg:no-newline", "exit:3"],
+            "a failed inherit_cwd task relays its own exit"
+        );
+        assert_eq!(
+            plain_fail,
+            ["msg:/workbench", "msg:no-newline", "exit:3"],
+            "a failed default task relays the same exit line"
+        );
+
+        // A forwarded stdin reaches an inherit_cwd task on the same path.
+        let (mut ours, mut theirs) = UnixStream::pair().unwrap();
+        theirs.write_all(b"from the helper\n").unwrap();
+        theirs.shutdown(std::net::Shutdown::Write).unwrap();
+        let line = format!(
+            "{}{RUN_GROUP_SEP}{RUN_GROUP_SEP}{RUN_STDIN_FLAG}",
+            run("cwd-stdin")
+        );
+        #[expect(
+            clippy::large_futures,
+            reason = "the handle future carries the harness's whole channel; the test awaits \
+                      it to completion"
+        )]
+        chan.handle(&line, &mut ours).await;
+        drop(ours);
+        let mut raw = String::new();
+        std::io::Read::read_to_string(&mut theirs, &mut raw).unwrap();
+        assert_eq!(raw, "stdin:\nmsg:from the helper\nexit:0\n");
+    }
+
+    /// A runner that starts no sandbox. It prints the directory the run
+    /// options give, or the box's working directory, and then the stdin it
+    /// gets and a last line without a newline. It ends with `code`.
+    struct FakeRunner {
+        code: i32,
+        seen: Vec<(Option<String>, bool)>,
+    }
+
+    impl InvocationRunner for FakeRunner {
+        async fn run_invocations(
+            &mut self,
+            invocations: Vec<sandbox::config::Invocation>,
+            stdout: &mut StreamWriter,
+            _stderr: &mut StreamWriter,
+            options: sandbox::RunOptions,
+        ) -> Result<(), Error> {
+            use std::io::Read as _;
+            use tokio::io::AsyncWriteExt as _;
+
+            assert_eq!(invocations.len(), 1, "the run gets the task's invocations");
+            self.seen
+                .push((options.current_dir.clone(), options.stdin.is_some()));
+            // The sandbox hands the stdin pipe to its slot before it reads
+            // any output, so the fake does the same.
+            let stdin = options.stdin.map(|slot| {
+                let (reader, writer) = std::io::pipe().unwrap();
+                slot(std::fs::File::from(std::os::fd::OwnedFd::from(writer)))
+                    .expect("the slot takes the pipe");
+                reader
+            });
+            let dir = options
+                .current_dir
+                .unwrap_or_else(|| format!("/{}", sandbox::SESSION_DEFAULT_WD));
+            stdout
+                .write_all(format!("{dir}\n").as_bytes())
+                .await
+                .unwrap();
+            if let Some(mut reader) = stdin {
+                let got = spawn_blocking(move || {
+                    let mut got = Vec::new();
+                    reader.read_to_end(&mut got).map(|_| got)
+                })
+                .await
+                .unwrap()
+                .unwrap();
+                stdout.write_all(&got).await.unwrap();
+            }
+            stdout.write_all(b"no-newline").await.unwrap();
+            if self.code == 0 {
+                return Ok(());
+            }
+            Err(Error::Execution {
+                idx: 0,
+                code: self.code,
+                reason: "the fake task failed".to_string(),
+                stderr: String::new(),
+                stdout: String::new(),
+            })
+        }
+    }
+
+    /// Runs one task through the relay that `BoxChannel::run_task` uses, with
+    /// `runner` in place of the sandbox, and returns what the helper reads.
+    async fn relay_with(
+        runner: &mut FakeRunner,
+        start_dir: Option<String>,
+        helper_stdin: Option<&[u8]>,
+    ) -> String {
+        let (mut ours, mut theirs) = UnixStream::pair().unwrap();
+        if let Some(bytes) = helper_stdin {
+            theirs.write_all(bytes).unwrap();
+            theirs.shutdown(std::net::Shutdown::Write).unwrap();
+        }
+        let invocation = sandbox::config::Invocation {
+            executable: "/bbin/pwd".to_string(),
+            args: Vec::new(),
+            envs: Default::default(),
+        };
+        let mut forwarded = None;
+        let result = run_invocations_relayed(
+            runner,
+            &mut ours,
+            "err",
+            "fake",
+            vec![invocation],
+            start_dir,
+            helper_stdin.is_some(),
+            &mut forwarded,
+        )
+        .await;
+        BoxChannel::end_task_run(&mut ours, true, "err", "fake", result, forwarded.as_mut());
+        if let Some(forwarded) = forwarded {
+            forwarded.finish(FORWARDED_STDIN_CLOSE_WAIT);
+        }
+        drop(ours);
+        let mut raw = String::new();
+        std::io::Read::read_to_string(&mut theirs, &mut raw).unwrap();
+        raw
+    }
+
+    /// D2983: an `inherit_cwd` task and a default task go through the same
+    /// relay, and only the run options differ. Both send the task's output
+    /// and then the same exit line. A fake runner stands in for the
+    /// sandbox, so this test needs no user namespace and never skips.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_task_relays_exit_through_both_paths_with_a_fake_runner() {
+        let working = tempfile::tempdir().unwrap();
+        std::fs::create_dir(working.path().join("sub")).unwrap();
+        let inherit = start_dir_in_box(true, Some("/workbench/sub"), working.path()).unwrap();
+        let default = start_dir_in_box(false, Some("/workbench/sub"), working.path()).unwrap();
+        assert_eq!(inherit.as_deref(), Some("/workbench/sub"));
+        assert_eq!(default, None);
+
+        for (code, exit) in [(0, "exit:0"), (3, "exit:3")] {
+            let mut runner = FakeRunner {
+                code,
+                seen: Vec::new(),
+            };
+            let cwd = relay_with(&mut runner, inherit.clone(), None).await;
+            let plain = relay_with(&mut runner, default.clone(), None).await;
+            assert_eq!(
+                cwd,
+                format!("msg:/workbench/sub\nmsg:no-newline\n{exit}\n"),
+                "an inherit_cwd task relays its own exit"
+            );
+            assert_eq!(
+                plain,
+                format!("msg:/workbench\nmsg:no-newline\n{exit}\n"),
+                "a default task relays the same exit line"
+            );
+            assert_eq!(
+                runner.seen,
+                [(Some("/workbench/sub".to_string()), false), (None, false)],
+                "the run options carry the start directory and no stdin"
+            );
+        }
+
+        // A forwarded stdin reaches an inherit_cwd task on the same path.
+        let mut runner = FakeRunner {
+            code: 0,
+            seen: Vec::new(),
+        };
+        let raw = relay_with(&mut runner, inherit.clone(), Some(b"from the helper\n")).await;
+        assert_eq!(
+            raw,
+            "stdin:\nmsg:/workbench/sub\nmsg:from the helper\nmsg:no-newline\nexit:0\n"
+        );
+        assert_eq!(runner.seen, [(Some("/workbench/sub".to_string()), true)]);
+    }
+
+    /// D2983: the text after the last newline reaches the helper as a line
+    /// when the writer shuts down, as the run's output did when it ran
+    /// through a path of its own.
+    #[tokio::test]
+    async fn stream_writer_flushes_last_line_on_shutdown() {
+        use std::io::Read as _;
+        use tokio::io::AsyncWriteExt as _;
+
+        let (tx, mut rx) = UnixStream::pair().unwrap();
+        let (mut out, mut err) = StreamWriter::pair_tagged(&tx, "err").unwrap();
+        drop(tx);
+        out.write_all(b"one\nno newline").await.unwrap();
+        err.write_all(b"warning without newline").await.unwrap();
+        out.shutdown().await.unwrap();
+        err.shutdown().await.unwrap();
+        // A second shutdown sends nothing more.
+        out.shutdown().await.unwrap();
+        drop((out, err));
+        let mut got = String::new();
+        rx.read_to_string(&mut got).unwrap();
+        assert_eq!(
+            got,
+            "msg:one\nmsg:no newline\nerr:warning without newline\n"
+        );
     }
 
     #[tokio::test]
@@ -7339,6 +7873,77 @@ exit $rc
         );
     }
 
+    /// A variable name from package metadata is handed to the shell helper
+    /// verbatim, where bash evaluates a `declare`d name for array subscripts —
+    /// `X[$(touch /tmp/pwned)]` would run the command. An invalid name is
+    /// refused: not recorded, not sent as a `set_env:` line, only explained.
+    #[tokio::test]
+    async fn a_var_with_an_invalid_name_is_refused() {
+        let (_state, _rootfs, _cwd, chan) = setup_channel();
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+
+        chan.announce_env(&mut ours, "X[$(touch /tmp/pwned)]", "/state/gocache");
+        drop(ours);
+
+        let lines = read_lines(&theirs);
+        assert_eq!(
+            lines,
+            vec![
+                "msg:min: refusing to export environment variable with an invalid name: X[$(touch /tmp/pwned)]"
+            ],
+            "an invalid name must be explained and nothing else sent"
+        );
+        assert!(
+            chan.runtime_env.snapshot().is_empty(),
+            "an invalid name must not reach the daemon's environment"
+        );
+    }
+
+    /// The refusal echoes the name, so a name carrying a newline would add a
+    /// protocol line of its own, such as a `set_env:` the helper acts on.
+    /// The echo escapes control characters and stays one `msg:` line.
+    #[tokio::test]
+    async fn a_refused_name_is_echoed_on_one_line() {
+        let (_state, _rootfs, _cwd, chan) = setup_channel();
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+
+        chan.announce_env(&mut ours, "A\nset_env:B", "/state/gocache");
+        drop(ours);
+
+        assert_eq!(
+            read_lines(&theirs),
+            vec![
+                "msg:min: refusing to export environment variable with an invalid name: A\\nset_env:B"
+            ],
+            "a refused name must not start a line of its own"
+        );
+        assert!(chan.runtime_env.snapshot().is_empty());
+    }
+
+    /// The helpers refuse a value opening with `(`, so the daemon must
+    /// refuse it too: a recorded value the shell never exported would reach
+    /// later injections and disagree with the session's own shell.
+    #[tokio::test]
+    async fn a_value_the_helpers_refuse_is_not_recorded() {
+        let (_state, _rootfs, _cwd, chan) = setup_channel();
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+
+        chan.announce_env(&mut ours, "LIST", "(one two)");
+        drop(ours);
+
+        assert_eq!(
+            read_lines(&theirs),
+            vec![
+                "msg:min: refusing to export LIST: a value starting with ( would be read as an array"
+            ],
+            "a refused value must be explained and nothing else sent"
+        );
+        assert!(
+            chan.runtime_env.snapshot().is_empty(),
+            "a value the shell refuses must not reach the daemon's environment"
+        );
+    }
+
     #[tokio::test]
     async fn search_finds_known_package() {
         let (_state, _rootfs, _cwd, mut chan) = setup_channel();
@@ -7478,6 +8083,18 @@ exit $rc
     #[test]
     fn state_dirs_from_env_vars_ignores_bare_state() {
         let env = BTreeMap::from([("WEIRD".to_string(), "/state/".to_string())]);
+        assert!(state_dirs_from_env_vars(&env).is_empty());
+    }
+
+    /// `.` and `..` are single components by the `/`-count alone, but
+    /// joining them onto the state base would leave it, so they are
+    /// dropped like any other unusable prefix.
+    #[test]
+    fn state_dirs_from_env_vars_drops_dot_components() {
+        let env = BTreeMap::from([
+            ("DOT".to_string(), "/state/.".to_string()),
+            ("DOTDOT".to_string(), "/state/..".to_string()),
+        ]);
         assert!(state_dirs_from_env_vars(&env).is_empty());
     }
 

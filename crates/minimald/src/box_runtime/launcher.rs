@@ -163,6 +163,14 @@ pub(crate) struct LaunchSpec {
     pub(crate) for_hooks: bool,
 }
 
+/// Whether a launch in `mode` places the box in a classifier leaf. Only a
+/// host-address box is placed: a none box has no traffic to decide, and an
+/// own-IP box runs in a network namespace of its own, with its verdict on
+/// the address it holds (NET-079, D2996).
+pub(crate) fn placed_in_classifier_leaf(mode: NetworkMode) -> bool {
+    matches!(mode, NetworkMode::HostNet)
+}
+
 /// The first process a launch starts, as [`LaunchSpec::entrypoint`]
 /// decides it. Every launcher starts what this says.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1277,7 +1285,7 @@ impl BoxLauncher for SandboxLauncher {
         // broken image, so the live read and the decision share that one
         // blocking hop, and the same one table is what the placement below
         // answers over too.
-        let (leaf, decision) = if matches!(network_mode, NetworkMode::HostNet) {
+        let (leaf, decision) = if placed_in_classifier_leaf(network_mode) {
             let (mountinfo, decision) = re_read_classifier_fact(
                 classifier_root.clone(),
                 classifier_mountinfo.clone(),

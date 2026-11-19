@@ -13,7 +13,8 @@
 //! * `<label>.key`: the key's public area and its private blob, as the TPM
 //!   wrote them. Only the TPM that made the blob can load it.
 //! * `<label>.auth`: the key's authorization value. Only the proxy's user
-//!   can read it.
+//!   can read it, and the store refuses to load a key whose authorization
+//!   file belongs to another user or that other users can read or write.
 //!
 //! The store passes the authorization value to `tpm2-tools` on standard
 //! input, never in an argument list, which other users of the host can read.
@@ -933,6 +934,75 @@ impl TpmStore {
     }
 }
 
+/// The most bytes the store reads from an authorization file. The store
+/// writes `AUTH_LEN` bytes; the bound keeps a damaged file from taking the
+/// proxy's memory.
+const AUTH_FILE_MAX: usize = 4 * AUTH_LEN;
+
+/// Whether the proxy's user, `uid`, may use an authorization file whose
+/// owner is `owner` and whose mode is `mode` (BEP-088). The file must
+/// belong to `uid`, and no other user may read or write it.
+fn check_auth_file(path: &Path, owner: u32, mode: u32, uid: u32) -> Result<(), TpmKept> {
+    if owner != uid {
+        return Err(TpmKept::OtherOwner {
+            path: path.to_path_buf(),
+            owner,
+        });
+    }
+    let mode = mode & 0o7777;
+    if mode & 0o077 != 0 {
+        return Err(TpmKept::NotPrivate {
+            path: path.to_path_buf(),
+            mode,
+        });
+    }
+    Ok(())
+}
+
+/// Reads a stored key's authorization file at start (BEP-088, BEP-089).
+/// The file must belong to the proxy's user, and no other user may read or
+/// write it. The check and the read use one open file, so the file that is
+/// read is the file that was checked. A file longer than `AUTH_FILE_MAX`
+/// is refused after reading one byte past the bound, never the whole file.
+fn read_auth(role: Role, path: &Path) -> Result<Zeroizing<Vec<u8>>, KeyError> {
+    use std::io::Read as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let failed = |err: &io::Error| {
+        read_error(
+            role,
+            path,
+            err,
+            TpmLost::MissingAuthFile {
+                path: path.to_path_buf(),
+            },
+        )
+    };
+    let file = fs::File::open(path).map_err(|err| failed(&err))?;
+    let meta = file.metadata().map_err(|err| failed(&err))?;
+    // SAFETY: `geteuid` takes no argument, reads process state and cannot
+    // fail.
+    let uid = unsafe { libc::geteuid() };
+    check_auth_file(path, meta.uid(), meta.mode(), uid)
+        .map_err(|case| KeyError::TpmKept { role, case })?;
+    // Sized up front for the most the read can return, so the buffer never
+    // grows and leaves the value behind in a smaller one, unzeroed.
+    let mut auth = Zeroizing::new(Vec::with_capacity(AUTH_FILE_MAX + 1));
+    file.take(AUTH_FILE_MAX as u64 + 1)
+        .read_to_end(&mut auth)
+        .map_err(|err| failed(&err))?;
+    if auth.len() > AUTH_FILE_MAX {
+        return Err(KeyError::Store {
+            role,
+            detail: format!(
+                "did not read {}: it holds more than {AUTH_FILE_MAX} bytes, and an \
+                 authorization value is {AUTH_LEN}",
+                path.display()
+            ),
+        });
+    }
+    Ok(auth)
+}
+
 /// Writes `bytes` to `path` through a file beside it that only the proxy's
 /// user can read, so a reader never sees half a file.
 fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -1057,6 +1127,10 @@ impl TpmKey {
 impl HeldKey for TpmKey {
     fn role(&self) -> Role {
         self.role
+    }
+
+    fn store(&self) -> Option<&'static str> {
+        Some("tpm")
     }
 
     fn public(&self) -> ProxyPublicKey {
@@ -1199,17 +1273,7 @@ impl KeyStore for TpmStore {
             }
             return Ok(None);
         };
-        let auth_path = self.auth_path(role, Slot::Held);
-        let auth = fs::read(&auth_path).map(Zeroizing::new).map_err(|err| {
-            read_error(
-                role,
-                &auth_path,
-                &err,
-                TpmLost::MissingAuthFile {
-                    path: auth_path.clone(),
-                },
-            )
-        })?;
+        let auth = read_auth(role, &self.auth_path(role, Slot::Held))?;
         let key = self.open(role, &bytes, auth)?;
         tracing::info!(
             role = %role,
@@ -1661,7 +1725,9 @@ mod tests {
         let mut file = public_area(key_template(role).attributes, &some_public());
         file.extend_from_slice(&[0, 3, 1, 2, 3]);
         fs::write(store.key_path(role, Slot::Held), file).expect("write key file");
-        fs::write(store.auth_path(role, Slot::Held), [7u8; AUTH_LEN]).expect("write auth file");
+        let auth = store.auth_path(role, Slot::Held);
+        fs::write(&auth, [7u8; AUTH_LEN]).expect("write auth file");
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).expect("chmod auth file");
     }
 
     fn start_error(store: &TpmStore) -> crate::keys::StartError {
@@ -1919,5 +1985,247 @@ mod tests {
             );
             assert!(path.exists());
         }
+    }
+
+    /// A store in `dir` whose stand-in tools load any key, so only the
+    /// store's own checks can refuse one.
+    fn store_that_loads_anything(dir: &Path) -> TpmStore {
+        let tools = dir.join("tools");
+        fs::create_dir(&tools).expect("tools dir");
+        fake_tool(&tools, "tpm2_createprimary", "exit 0");
+        fake_tool(&tools, "tpm2_load", "exit 0");
+        let keys = dir.join("keys");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&keys)
+            .expect("keys dir");
+        let mut store = TpmStore::new(keys, DEVICE_TCTI);
+        store.tools = Some(tools);
+        store
+    }
+
+    // BEP-088: an authorization file that only the proxy's user can read
+    // loads. The control for the refusal below.
+    #[test]
+    fn a_tpm_auth_file_only_its_user_can_read_loads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_that_loads_anything(dir.path());
+        let role = Role::Root;
+        write_key_files(&store, role);
+        let auth = store.auth_path(role, Slot::Held);
+        for mode in [0o600, 0o400] {
+            fs::set_permissions(&auth, fs::Permissions::from_mode(mode)).expect("chmod");
+            let found = store.find(role).map(|key| key.is_some());
+            assert!(
+                matches!(found, Ok(true)),
+                "an auth file at mode {mode:o} loads: {found:?}"
+            );
+        }
+    }
+
+    // BEP-088: the authorization file is for the proxy's user alone. A
+    // stored key whose authorization file other users can read or write is
+    // refused at start, with the chmod that fixes it, and the key is kept.
+    #[test]
+    fn a_tpm_auth_file_other_users_can_read_refuses_start_and_keeps_the_key() {
+        use crate::keys::StartError;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_that_loads_anything(dir.path());
+        let role = Role::Root;
+        write_key_files(&store, role);
+        let auth = store.auth_path(role, Slot::Held);
+        for mode in [0o644, 0o640, 0o604, 0o620, 0o606] {
+            fs::set_permissions(&auth, fs::Permissions::from_mode(mode)).expect("chmod");
+            let expected = TpmKept::NotPrivate {
+                path: auth.clone(),
+                mode,
+            };
+            let found = store.find(role).map(|key| key.is_some());
+            assert_eq!(
+                found,
+                Err(KeyError::TpmKept {
+                    role,
+                    case: expected.clone(),
+                }),
+                "mode {mode:o}"
+            );
+            // Through the start, which calls `find`.
+            assert_eq!(
+                start_error(&store),
+                StartError::TpmKept {
+                    role,
+                    case: expected,
+                },
+                "mode {mode:o}"
+            );
+            // The refusal changes neither file.
+            let after = fs::metadata(&auth).expect("stat auth").permissions().mode() & 0o7777;
+            assert_eq!(after, mode);
+            assert!(store.key_path(role, Slot::Held).exists());
+        }
+
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o644)).expect("chmod");
+        assert_eq!(
+            start_error(&store).to_string(),
+            format!(
+                "The proxy did not start: other users can read or write {path}, which holds the authorization of the proxy's root key (mode 0644). The key is kept; run `chmod 600 {path}`, then start the proxy again.",
+                path = auth.display()
+            )
+        );
+
+        // The chmod it names is the fix.
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).expect("chmod");
+        assert!(matches!(
+            store.find(role).map(|key| key.is_some()),
+            Ok(true)
+        ));
+    }
+
+    // BEP-088: an authorization file that belongs to another user is
+    // refused at start, and the key is kept.
+    #[test]
+    fn a_tpm_auth_file_of_another_user_refuses_start_and_keeps_the_key() {
+        use crate::keys::StartError;
+        let path = PathBuf::from("/home/u/.minimal/bep/tpm/signing.auth");
+        let err = KeyError::TpmKept {
+            role: Role::Signing,
+            case: TpmKept::OtherOwner {
+                path: path.clone(),
+                owner: 1234,
+            },
+        };
+        assert_eq!(
+            StartError::from_store(err).to_string(),
+            "The proxy did not start: /home/u/.minimal/bep/tpm/signing.auth, which holds the authorization of the proxy's signing key, belongs to user id 1234 and not to this user. The key is kept; start the proxy as the user that owns the file."
+        );
+
+        // Through `find`. Only root can give a file away, so this half runs
+        // only as root.
+        // SAFETY: `geteuid` takes no argument, reads process state and
+        // cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_that_loads_anything(dir.path());
+        write_key_files(&store, Role::Signing);
+        let auth = store.auth_path(Role::Signing, Slot::Held);
+        std::os::unix::fs::chown(&auth, Some(65534), None).expect("chown");
+        assert_eq!(
+            store.find(Role::Signing).map(|key| key.is_some()),
+            Err(KeyError::TpmKept {
+                role: Role::Signing,
+                case: TpmKept::OtherOwner {
+                    path: auth,
+                    owner: 65534,
+                },
+            })
+        );
+    }
+
+    // BEP-088: the owner check runs without root. A file of another user is
+    // refused, whatever its mode, and a file of this user that only it can
+    // use passes.
+    #[test]
+    fn the_auth_file_check_refuses_another_owner_and_modes_others_can_use() {
+        let path = Path::new("/home/u/.minimal/bep/tpm/root.auth");
+        // SAFETY: `geteuid` takes no argument, reads process state and
+        // cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        let other = uid.wrapping_add(1);
+
+        // The controls: this user's file at a private mode, with or without
+        // the file type bits a stat returns.
+        for mode in [0o600, 0o400, 0o100_600, 0o100_400] {
+            assert_eq!(
+                check_auth_file(path, uid, mode, uid),
+                Ok(()),
+                "mode {mode:o}"
+            );
+        }
+
+        for owner in [other, 0, 65534] {
+            if owner == uid {
+                continue;
+            }
+            for mode in [0o600, 0o644] {
+                assert_eq!(
+                    check_auth_file(path, owner, mode, uid),
+                    Err(TpmKept::OtherOwner {
+                        path: path.to_path_buf(),
+                        owner,
+                    }),
+                    "owner {owner}, mode {mode:o}"
+                );
+            }
+        }
+
+        for mode in [0o644, 0o640, 0o604, 0o620, 0o602, 0o610, 0o601, 0o606] {
+            assert_eq!(
+                check_auth_file(path, uid, 0o100_000 | mode, uid),
+                Err(TpmKept::NotPrivate {
+                    path: path.to_path_buf(),
+                    mode,
+                }),
+                "mode {mode:o}"
+            );
+        }
+    }
+
+    // An authorization file longer than the store ever writes is refused at
+    // start without reading it whole, and the key is not replaced. A file
+    // at the bound loads: the control.
+    #[test]
+    fn an_oversized_tpm_auth_file_refuses_start_without_reading_it_whole() {
+        use crate::keys::StartError;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_that_loads_anything(dir.path());
+        let role = Role::Root;
+        write_key_files(&store, role);
+        let auth = store.auth_path(role, Slot::Held);
+
+        fs::write(&auth, vec![7u8; AUTH_FILE_MAX]).expect("write auth file");
+        assert!(matches!(
+            store.find(role).map(|key| key.is_some()),
+            Ok(true)
+        ));
+
+        let refused = || KeyError::Store {
+            role,
+            detail: format!(
+                "did not read {}: it holds more than {AUTH_FILE_MAX} bytes, and an \
+                 authorization value is {AUTH_LEN}",
+                auth.display()
+            ),
+        };
+        fs::write(&auth, vec![7u8; AUTH_FILE_MAX + 1]).expect("write auth file");
+        assert_eq!(
+            store.find(role).map(|key| key.is_some()),
+            Err(refused()),
+            "one byte past the bound"
+        );
+
+        // A sparse file of 8 GiB: a read of the whole file would allocate
+        // 8 GiB, and the refusal comes from reading one byte past the bound.
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&auth)
+            .expect("open auth file");
+        file.set_len(8 << 30).expect("grow auth file");
+        drop(file);
+        assert_eq!(
+            store.find(role).map(|key| key.is_some()),
+            Err(refused()),
+            "8 GiB"
+        );
+        assert_eq!(
+            start_error(&store),
+            StartError::Store(refused()),
+            "through the start"
+        );
+
+        // The refusal changes neither file.
+        assert_eq!(fs::metadata(&auth).expect("stat auth").len(), 8 << 30);
+        assert!(store.key_path(role, Slot::Held).exists());
     }
 }

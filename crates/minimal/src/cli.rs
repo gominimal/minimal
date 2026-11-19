@@ -301,7 +301,7 @@ pub enum SessionCommand {
 #[derive(Debug, Args)]
 pub struct SetupZedArgs {
     /// Session identifier (UUID, unique id prefix, or session name)
-    #[arg(add = completion::session_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub session: String,
     /// Zed settings file to edit (default: `~/.config/zed/settings.json`)
     #[arg(long, value_name = "FILE")]
@@ -315,7 +315,7 @@ pub struct SetupZedArgs {
 #[derive(Debug, Args)]
 pub struct HooksArgs {
     /// Session identifier (UUID, unique id prefix, or session name)
-    #[arg(add = completion::session_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub session: String,
     /// Emit the raw JSON the daemon returned instead of a table
     #[arg(long)]
@@ -325,7 +325,7 @@ pub struct HooksArgs {
 #[derive(Debug, Args)]
 pub struct ExecArgs {
     /// Session identifier (UUID, unique id prefix, or session name).
-    #[arg(add = completion::session_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub session: String,
     /// Command to execute in the session context
     ///
@@ -340,7 +340,7 @@ pub struct ExecArgs {
 #[derive(Debug, Args)]
 pub struct SessionRunArgs {
     /// Session identifier (UUID, unique id prefix, or session name).
-    #[arg(add = completion::session_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub session: String,
     /// Name of a task declared in the session project's minimal.toml
     pub task: String,
@@ -349,7 +349,7 @@ pub struct SessionRunArgs {
 #[derive(Debug, Args)]
 pub struct PolicyArgs {
     /// Session identifier (UUID, unique id prefix, or session name)
-    #[arg(add = completion::session_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub session: String,
     /// Write one JSON document instead of text (the default)
     #[arg(short = 'o', long = "output", value_enum)]
@@ -485,7 +485,7 @@ pub enum BoxCommand {
     List(BoxListArgs),
     /// Show one box: its id, name, type, parent, project, state, how it
     /// ended, the identity it runs under, and its provider and host.
-    /// `--network` shows the box's network section in its place
+    /// `--network` shows the box's effective network policy in its place
     Show(BoxShowArgs),
     /// Stop a running box and keep it: its record, its events and its
     /// files stay until `min box rm` removes them. `--force` kills every
@@ -559,7 +559,7 @@ pub enum BoxCommand {
 pub struct BoxLogsArgs {
     /// The box: its id, the start of its id, or its name, as `min box list`
     /// prints them
-    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: String,
     /// Show the output so far, then keep showing new output as the box
     /// writes it, until the box is removed or the command is interrupted
@@ -596,11 +596,11 @@ pub struct BoxLogsExecArgs {
 pub struct BoxEventsArgs {
     /// The box: its id, the start of its id, or its name, as `min box list`
     /// prints them
-    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: Option<String>,
     /// Show the events of every child box of this box together, in time
     /// order, each event naming its box
-    #[arg(long, value_name = "BOX", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(long, value_name = "BOX", add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub parent: Option<String>,
     /// Write each event as one JSON object on its own line
     #[arg(short = 'o', long = "output", value_enum)]
@@ -765,16 +765,19 @@ pub enum BoxListOutputFormat {
 pub struct BoxShowArgs {
     /// The box: its id, the start of its id, or its name, as `min box list`
     /// prints them
-    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: String,
-    /// Show only the box's `[network]` section, as the box was created
-    /// with it: its network mode, ingress and egress, with the flags of
-    /// the command that created it applied
+    /// Show the box's effective network policy in place of the box: the
+    /// ingress and egress rules in force, and the ports the box published
+    /// while it runs. With `-o json`, write it as one JSON document. `-o
+    /// yaml` is not available with this flag
     #[arg(long)]
     pub network: bool,
     /// Write the box and its running commands in this format instead of
-    /// text
-    #[arg(short = 'o', long = "output", value_enum, conflicts_with = "network")]
+    /// text. With `--network`, only `json` is available
+    // BCLI-025: `--network` takes `-o json`, and `cmd_box_show` refuses
+    // `-o yaml` with it as a usage error.
+    #[arg(short = 'o', long = "output", value_enum)]
     pub output: Option<BoxShowOutputFormat>,
 }
 
@@ -795,7 +798,7 @@ pub enum BoxShowOutputFormat {
 pub struct BoxStopArgs {
     /// The box: its id, the start of its id, or its name, as `min box list`
     /// prints them
-    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: String,
     /// Kill every process in the box at once, with no grace period
     #[arg(long)]
@@ -811,7 +814,7 @@ pub struct BoxStopArgs {
 pub struct BoxRestartArgs {
     /// The box: its id, the start of its id, or its name, as `min box list`
     /// prints them
-    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: String,
 }
 
@@ -821,7 +824,7 @@ pub struct BoxAttachArgs {
     /// The box: its id, the start of its id, its name, or
     /// provider/host/name, as `min box list` prints them. Omit it to attach
     /// to this project's box
-    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: Option<String>,
     /// Attach to a command that `min box exec -t` started in the box, by the
     /// exec id it printed. Needs a box
@@ -834,7 +837,7 @@ pub struct BoxAttachArgs {
 pub struct BoxResumeArgs {
     /// The box: its id, the start of its id, its name, or
     /// provider/host/name, as `min box list` prints them
-    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: String,
 }
 
@@ -843,7 +846,7 @@ pub struct BoxResumeArgs {
 pub struct BoxRmArgs {
     /// The box: its id, the start of its id, or its name, as `min box list`
     /// prints them
-    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: String,
     /// Remove a running box too: stop it at once, then remove it
     #[arg(long)]
@@ -856,7 +859,7 @@ pub struct BoxRmArgs {
 pub struct BoxWaitArgs {
     /// The box: its id, the start of its id, or its name, as `min box list`
     /// prints them
-    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: String,
     /// Stop waiting after this long: a number of seconds, or a number
     /// followed by s, m or h, such as 30s, 5m or 1h. The box keeps running,
@@ -875,7 +878,7 @@ pub struct BoxWaitArgs {
 pub struct BoxExecArgs {
     /// The box: its id, the start of its id, or its name, as `min box list`
     /// prints them
-    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: String,
     /// Give the command a terminal and connect this terminal to it. The
     /// command's exec id is printed on stderr
@@ -1111,7 +1114,7 @@ impl std::error::Error for BoxExecTimedOut {}
 pub struct BoxRenameArgs {
     /// The box: its id, the start of its id, or its name, as `min box list`
     /// prints them
-    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: String,
     /// The new name for the box
     pub new_name: String,
@@ -1128,7 +1131,7 @@ pub struct BoxPruneArgs {
     pub older_than: Option<std::time::Duration>,
     /// Remove only the child boxes of this box: its id, the start of its
     /// id, or its name
-    #[arg(long, value_name = "BOX", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(long, value_name = "BOX", add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub parent: Option<String>,
     /// Remove the boxes without asking first
     #[arg(long, short)]
@@ -1166,11 +1169,11 @@ pub struct BoxAuditArgs {
     /// The box: its id, or its name. A name reads the running box of that
     /// name, else the newest box created under it. `self` is the box this
     /// command runs in
-    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: Option<String>,
     /// Show the records of every child box of this box (an id, a name or
     /// `self`) together, each record naming its box
-    #[arg(long, value_name = "BOX", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(long, value_name = "BOX", add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub parent: Option<String>,
     /// Write each record as one JSON line, as the proxy wrote it
     #[arg(short = 'o', long = "output", value_enum)]
@@ -1197,7 +1200,7 @@ pub struct BoxSpecArgs {
     /// start of its id, or its name, as `min box list` prints them. With
     /// none, show the project's proxy rows. Use --repo-dir to name another
     /// project
-    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: Option<String>,
     /// The format of an entry's or a box's spec (default: toml)
     #[arg(short = 'o', long = "output", value_enum)]
@@ -2202,7 +2205,7 @@ pub struct AttachArgs {
     /// The session box: its id, the start of its id, its name, or
     /// provider/host/name, as `min session list` prints them. Omit it to
     /// attach to this project's session box
-    #[arg(add = completion::session_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub session: Option<String>,
 }
 
@@ -2221,7 +2224,7 @@ pub struct LsArgs {
 #[command(group(ArgGroup::new("target").args(["session", "all"]).required(true).multiple(false)))]
 pub struct DestroyArgs {
     /// Session identifier (UUID, unique id prefix, or session name)
-    #[arg(add = completion::session_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub session: Option<String>,
     /// Destroy all sessions
     #[arg(long)]
@@ -2252,7 +2255,7 @@ pub enum NetCommand {
 #[derive(Debug, Args)]
 pub struct NetForwardArgs {
     /// Session identifier (UUID, unique id prefix, or session name)
-    #[arg(add = completion::session_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub session: String,
     /// Ports to relay, as `<LOCAL>:<PORT>` — the laptop-side listener and
     /// the box-side port it forwards to (`8080:3000` answers on
@@ -2297,7 +2300,7 @@ pub struct StopArgs {
 #[derive(Debug, Args)]
 pub struct RenameArgs {
     /// Session identifier (UUID, unique id prefix, or session name)
-    #[arg(add = completion::session_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub session: String,
     /// New name for the session
     pub new_name: String,

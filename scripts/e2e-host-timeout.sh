@@ -38,6 +38,12 @@ e2e_timeout() {
     sleep "$secs" &
     sleep_pid=$!
     wait "$sleep_pid"
+    # The limit has passed, and from here the verdict is this watcher's own.
+    # The caller stops the watcher as soon as CMD ends, and CMD ends because
+    # of the kill below: a TERM that lands between that kill and the exit
+    # would run the trap, exit 0, and report an ended CMD as one that ended
+    # by itself with 143. So TERM is ignored from here on.
+    trap '' TERM
     # CMD can end before the parent reaps it. kill still succeeds on that
     # zombie, so check the state first: a zombie ended in time. Without ps
     # the check finds nothing and the kill decides.

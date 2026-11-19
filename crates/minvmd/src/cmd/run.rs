@@ -158,7 +158,7 @@ fn run_supervisor(detach: bool, timeout_secs: u64, root: tracing::span::EnteredS
     paths::migrate_legacy_host_dirs(&crate::state::state_base_dir());
 
     // R2.4: fail fast with an actionable error if the hypervisor backend is
-    // unavailable (Linux: /dev/kvm). No-op on macOS. Runs in the foreground
+    // unavailable (Linux: /dev/kvm; macOS: kern.hv_support). Runs in the foreground
     // caller so the user sees the error directly, even under --detach.
     crate::cmd::ensure_hypervisor_accessible()?;
     // Likewise the sun_path limit: libkrun aborts on an over-long UDS path
@@ -1333,10 +1333,16 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
             }
             // The wire the peer carries: the acceptor's socket, this boot's
             // token, and the per-source cap that is each registered box's
-            // share of the pool. The default cap is the recorded working
-            // value (spec NET-132), named here so the two cannot drift.
-            let wire = switch::bep_host::BepWire::new(proxy_sock, token)
-                .with_per_source_cap(switch::bep_host::DEFAULT_PER_SOURCE_CAP);
+            // share of the pool. The cap resolves from the env override,
+            // then `config.toml`, then the recorded default (spec NET-132).
+            let (per_box_cap, per_box_cap_source) = crate::cmd::effective_bep_per_box_cap();
+            tracing::info!(
+                per_box_cap,
+                source = per_box_cap_source.label(),
+                "Box Egress Proxy per-box connection cap"
+            );
+            let wire =
+                switch::bep_host::BepWire::new(proxy_sock, token).with_per_source_cap(per_box_cap);
             // The stand-in binds before it returns, so it listens for the
             // boot's life. The proxy listens only once its watcher sees its
             // socket, and stops with its exit.

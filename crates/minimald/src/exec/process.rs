@@ -759,12 +759,14 @@ impl Process for HakoniwaProcess {
                 // signal death), so a SIGKILL reports 137 rather than 1. The
                 // `exit_code` field is `None` for signals and would collapse
                 // to 1 downstream; `code` is what the session path reports too.
+                // A SIGKILL that ends the container itself arrives as 125, and
+                // [`task_exit_code`] turns it into 137 as well.
                 Ok(Ok(status)) => {
                     self.failure = sandbox_failure(&status, self.killed);
                     if let Some(reason) = &self.failure {
                         tracing::warn!(pid = self.pid, %reason, "task: the sandbox failed");
                     }
-                    WaitState::Exited(Some(status.code))
+                    WaitState::Exited(Some(task_exit_code(&status)))
                 }
                 Ok(Err(_)) | Err(_) => WaitState::Failed,
             };
@@ -808,8 +810,26 @@ pub(super) const SANDBOX_FAILURE_CODE: i32 = 125;
 
 /// hakoniwa's reason for a container that a SIGKILL ended. It reports that
 /// as [`SANDBOX_FAILURE_CODE`] with no inner exit code, the same shape as a
-/// sandbox failure, whether or not the command had started.
+/// sandbox failure, whether or not the command had started; the task reports
+/// 137 for it ([`task_exit_code`]).
 pub(super) const CONTAINER_SIGKILL_REASON: &str = "container received signal SIGKILL";
+
+/// The exit status a task reports for hakoniwa's account of its end: the
+/// shell-convention `code`, except that a container a SIGKILL ended reports
+/// 137 (`128 + SIGKILL`), as a command a SIGKILL ended does, rather than
+/// hakoniwa's 125. The daemon kills a task that way, and a status under 128
+/// would read as the command's own failure. A command that exits 125 itself
+/// carries its own exit code and keeps 125, and so does a sandbox failure.
+pub(super) fn task_exit_code(status: &hakoniwa::ExitStatus) -> i32 {
+    if status.code == SANDBOX_FAILURE_CODE
+        && status.exit_code.is_none()
+        && status.reason == CONTAINER_SIGKILL_REASON
+    {
+        128 + libc::SIGKILL
+    } else {
+        status.code
+    }
+}
 
 /// The reason a task's sandbox failed, or `None` for any other end of the
 /// task. hakoniwa reports a sandbox failure as code 125 with no inner

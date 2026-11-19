@@ -257,6 +257,14 @@ pub trait HeldKey {
         Build::CURRENT
     }
 
+    /// The name of the store that holds the key: `keychain`, `tpm` or
+    /// `secret-service`. `None` for a key that no host store holds, as a
+    /// test key. The published identity carries it, so `min auth status`
+    /// can name a software key (BEP-090).
+    fn store(&self) -> Option<&'static str> {
+        None
+    }
+
     /// The raw ECDH shared secret (the x-coordinate) with `peer`.
     /// [`seal::open_held`](crate::seal::open_held) opens a sealed value
     /// through it, so the private half stays in the store.
@@ -477,6 +485,21 @@ pub enum TpmKept {
         /// The file.
         path: PathBuf,
     },
+    /// Other users can read or write the key's authorization file, which
+    /// only the proxy's user may read (BEP-088).
+    NotPrivate {
+        /// The authorization file.
+        path: PathBuf,
+        /// Its permission bits.
+        mode: u32,
+    },
+    /// The key's authorization file belongs to another user (BEP-088).
+    OtherOwner {
+        /// The authorization file.
+        path: PathBuf,
+        /// The user id that owns it.
+        owner: u32,
+    },
 }
 
 impl TpmKept {
@@ -484,7 +507,7 @@ impl TpmKept {
     pub fn response(&self) -> &str {
         match self {
             Self::Unavailable { response } => response,
-            Self::Unreadable { .. } => "none",
+            Self::Unreadable { .. } | Self::NotPrivate { .. } | Self::OtherOwner { .. } => "none",
         }
     }
 }
@@ -494,6 +517,16 @@ impl fmt::Display for TpmKept {
         match self {
             Self::Unavailable { response } => write!(f, "the TPM cannot load it now ({response})"),
             Self::Unreadable { path } => write!(f, "this user cannot read {}", path.display()),
+            Self::NotPrivate { path, mode } => write!(
+                f,
+                "other users can read or write {} (mode {mode:04o})",
+                path.display()
+            ),
+            Self::OtherOwner { path, owner } => write!(
+                f,
+                "{} belongs to user id {owner}, not to this user",
+                path.display()
+            ),
         }
     }
 }
@@ -704,6 +737,23 @@ impl fmt::Display for StartError {
             } => write!(
                 f,
                 "The proxy did not start: this user cannot read {}, which holds the proxy's {role} key. The key is kept.",
+                path.display()
+            ),
+            // BEP-088: the authorization file is for the proxy's user alone.
+            Self::TpmKept {
+                role,
+                case: TpmKept::NotPrivate { path, mode },
+            } => write!(
+                f,
+                "The proxy did not start: other users can read or write {path}, which holds the authorization of the proxy's {role} key (mode {mode:04o}). The key is kept; run `chmod 600 {path}`, then start the proxy again.",
+                path = path.display()
+            ),
+            Self::TpmKept {
+                role,
+                case: TpmKept::OtherOwner { path, owner },
+            } => write!(
+                f,
+                "The proxy did not start: {}, which holds the authorization of the proxy's {role} key, belongs to user id {owner} and not to this user. The key is kept; start the proxy as the user that owns the file.",
                 path.display()
             ),
             Self::TpmLost { role, case } => {
@@ -1541,6 +1591,10 @@ mod keychain {
 
         fn exportable(&self) -> bool {
             self.key.external_representation().is_some()
+        }
+
+        fn store(&self) -> Option<&'static str> {
+            Some("keychain")
         }
 
         fn agree(&self, peer: &ProxyPublicKey) -> Result<Zeroizing<Vec<u8>>, KeyError> {
