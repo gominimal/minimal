@@ -1824,6 +1824,9 @@ impl BoxActor {
         // later attach must not replace it. See [`HostOrigin::Exec`].
         self.host_origin = HostOrigin::Exec;
         self.publish_host();
+        // BOX-040: a new host started the box's entrypoint. An ended box is
+        // refused above, so no resume reaches this launch.
+        self.record_started("exec").await;
         if entrypoint_run {
             self.clear_ends_with_run().await;
         }
@@ -2042,6 +2045,13 @@ impl BoxActor {
         // here, so nothing may replace it out from under that client.
         self.host_origin = HostOrigin::Interactive;
         self.publish_host();
+        // BOX-040: a new host started the box's entrypoint. On a resume,
+        // `finish_resume` writes `started` after `resumed`.
+        if self.resume_in_flight {
+            self.resume_attach_minted = true;
+        } else {
+            self.record_started("attach").await;
+        }
         outcome
     }
 
@@ -2534,6 +2544,9 @@ impl BoxActor {
         }
         self.unrecorded_stop = None;
         let state = boxes::core::record::RecordState::Stopped(ending);
+        // BOX-040: the record left `running`, so the next start writes
+        // `started` again.
+        self.started_recorded = false;
         tracing::info!(
             box_id = %box_id,
             exit_code = state.exit_code(),
