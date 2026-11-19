@@ -69,9 +69,11 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
 
         for input in build.build_deps.iter() {
             match input {
-                BuildDep::Local { full_path, .. } => {
-                    build_deps.push(SandboxMapped::FileCopy(full_path.to_path_buf()))
-                }
+                BuildDep::Local {
+                    full_path,
+                    filename,
+                    ..
+                } => build_deps.push(package_file_copy(full_path, filename)?),
                 BuildDep::Source(source) => {
                     let resolved_src = crate::SourceLoad {
                         source,
@@ -102,7 +104,13 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
                         // cached source under a concurrent build of the same source
                         // (build-servers#231). The cache re-hashes on every hit, so only a
                         // reader already past that check could see the change.
-                        Materialized::File(path) => build_deps.push(SandboxMapped::FileCopy(path)),
+                        Materialized::File(path) => build_deps.push(match &source.from {
+                            graph::SourceFetch::Local { filename, .. } => {
+                                package_file_copy(&path, filename)?
+                            }
+                            graph::SourceFetch::Web { .. } => SandboxMapped::file_copy(path)
+                                .ok_or_else(|| anyhow!("a fetched source has no file name"))?,
+                        }),
                         Materialized::TempDir(td) => build_deps.push(SandboxMapped::TempDir(td)),
                     }
                 }
@@ -539,6 +547,23 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
     }
 }
 
+/// Maps a file that package content names into the working directory.
+///
+/// `full_path` is the resolved path the decoder checked (or, after the wire, the
+/// receiver's copy of it), so the bytes copied are those that were checked even
+/// if a link in the package is pointed elsewhere afterwards. The copy is named
+/// for the last component of the declared `filename`, as it was before links
+/// were resolved: `link.patch -> files/a.patch` is staged as `link.patch`.
+fn package_file_copy(full_path: &std::path::Path, filename: &str) -> Result<SandboxMapped, Error> {
+    let name = std::path::Path::new(filename)
+        .file_name()
+        .ok_or_else(|| anyhow!("package file `{filename}` has no file name"))?;
+    Ok(SandboxMapped::FileCopy {
+        src: full_path.to_path_buf(),
+        name: name.to_os_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -722,6 +747,85 @@ mod tests {
         );
     }
 
+    /// A package file named through a link inside the package is copied from the
+    /// target the decoder checked, under the name the package declared, so a build
+    /// command naming `link.patch` finds it. A `Local` input and a non-extracted
+    /// local `Source` both go this way; a plain input is mapped as it always was.
+    #[cfg(unix)]
+    #[test]
+    fn a_package_file_through_a_link_is_staged_under_its_declared_name() {
+        let tmp = TempDir::new().unwrap();
+        let cache_dir = TempDir::new().unwrap();
+        let cache = Cache::at_dir(cache_dir.path()).unwrap();
+        let pkg = tmp.path().join("pkg");
+        let files = pkg.join("files");
+        std::fs::create_dir_all(&files).unwrap();
+        std::fs::write(files.join("a.patch"), "patch").unwrap();
+        std::fs::write(files.join("b.src"), "source").unwrap();
+        std::fs::write(pkg.join("plain.patch"), "plain").unwrap();
+        std::os::unix::fs::symlink("files/a.patch", pkg.join("link.patch")).unwrap();
+        std::os::unix::fs::symlink("files/b.src", pkg.join("link.src")).unwrap();
+        let ncl = pkg.join("pkg.ncl");
+        std::fs::write(
+            &ncl,
+            indoc! {r#"
+                let {BuildSpec, Local, Source, ..} = import "minimal.ncl" in
+                {
+                    name = "linked",
+                    build_deps = [
+                        {file = "link.patch"} | Local,
+                        {file = "link.src", extract = false} | Source,
+                        {file = "plain.patch"} | Local,
+                    ],
+                    cmd = "true",
+                } | BuildSpec
+            "#},
+        )
+        .unwrap();
+        let dg = graph_from(&format!("import \"{}\"", ncl.to_str().unwrap()));
+        let bsr = *dg.by_name("linked").unwrap();
+        let fetcher = UnusedFetcher;
+        let mut sb = spec_build(&bsr, &fetcher);
+        let opts = Options {
+            cache: cache.clone(),
+            graph: &dg,
+            exec_base: "/not-exists".into(),
+            ot: None,
+            daemon_id: None,
+        };
+        let build = dg.get(&bsr).unwrap();
+        let op = OpTracker::new_root();
+        let deps = futures::executor::block_on(sb.build_deps_mapped(build, &opts, &op)).unwrap();
+
+        let a = files.join("a.patch").canonicalize().unwrap();
+        let b = files.join("b.src").canonicalize().unwrap();
+        let plain = pkg.join("plain.patch").canonicalize().unwrap();
+        assert_eq!(
+            deps,
+            vec![
+                SandboxMapped::FileCopy {
+                    src: a.clone(),
+                    name: "link.patch".into(),
+                },
+                SandboxMapped::FileCopy {
+                    src: b.clone(),
+                    name: "link.src".into(),
+                },
+                SandboxMapped::FileCopy {
+                    src: plain.clone(),
+                    name: "plain.patch".into(),
+                },
+            ]
+        );
+        // Negative control: when only the resolved path was carried, a link was
+        // staged as a copy named for its target (`a.patch`). That is a different
+        // entry, so the assertions above tell the fix from the regression.
+        assert_ne!(deps[0], SandboxMapped::file_copy(a).unwrap());
+        assert_ne!(deps[1], SandboxMapped::file_copy(b).unwrap());
+        // A plain input's resolved name is its declared name: nothing changed.
+        assert_eq!(deps[2], SandboxMapped::file_copy(plain).unwrap());
+    }
+
     /// A non-extracted source reaches the sandbox's writable /build as a private
     /// copy of the cached file. A hardlink there would be the download cache's own
     /// inode, so a build appending to its input changed the cached source for any
@@ -770,7 +874,13 @@ mod tests {
         let build = dg.get(&bsr).unwrap();
         let op = OpTracker::new_root();
         let deps = futures::executor::block_on(sb.build_deps_mapped(build, &opts, &op)).unwrap();
-        assert_eq!(deps, vec![SandboxMapped::FileCopy(cached)]);
+        assert_eq!(
+            deps,
+            vec![SandboxMapped::FileCopy {
+                src: cached,
+                name: "payload.tar.gz".into(),
+            }]
+        );
     }
 
     fn network_build() -> Graph {

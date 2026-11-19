@@ -485,7 +485,9 @@ fn spawn_detached(cli: &Cli) -> Result<(), MainError> {
     use std::os::unix::process::CommandExt as _;
     use std::time::{Duration, Instant};
 
-    const DETACH_TIMEOUT_SECS: u64 = 8;
+    // The child may first wait out a departing daemon's lock
+    // (`SHUTDOWN_DEPARTURE_WAIT`) before its own startup.
+    const DETACH_TIMEOUT_SECS: u64 = 8 + minimald_rpc::SHUTDOWN_DEPARTURE_WAIT.as_secs();
 
     let exe = std::env::current_exe().map_err(|e| MainError::IO(e, "resolving current exe"))?;
     let args: Vec<String> = std::env::args()
@@ -548,6 +550,46 @@ fn spawn_detached(cli: &Cli) -> Result<(), MainError> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Wait, bounded by `wait`, while the instance lock at `lock_path` is held by
+/// a daemon on its way out: one whose socket at `sock_path` refuses a
+/// connection (or is gone), because a departing daemon closes its listener
+/// before it drains. Returns at once when nothing holds the lock, and when
+/// the socket accepts: that holder is a live daemon, and the caller's own
+/// lock attempt refuses to start beside it. Returns when the wait runs out
+/// too; the caller's lock attempt then reports the holder.
+async fn wait_for_departing_daemon(
+    lock_path: &std::path::Path,
+    sock_path: &std::path::Path,
+    wait: std::time::Duration,
+) -> std::io::Result<()> {
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut announced = false;
+    while lock_held(lock_path)? {
+        match tokio::net::UnixStream::connect(sock_path).await {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                ) => {}
+            // Accepted, or an error that proves nothing: not a departing daemon.
+            _ => return Ok(()),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(());
+        }
+        if !announced {
+            tracing::info!(
+                wait = ?wait,
+                "the instance lock is held by a daemon that has stopped listening; \
+                 waiting for it to exit"
+            );
+            announced = true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Ok(())
 }
 
 /// Whether some process holds an exclusive advisory lock on `path`.
@@ -1118,6 +1160,23 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
         cli.client_instance_dir()
             .sub_path_unchecked(paths::MINIMALD_LOCK_FILE)
     };
+    // A native daemon that was just told to stop keeps the lock through its
+    // connection drain, after it has already stopped listening. A daemon
+    // started in that window (the next `min` after `min stop`) waits for it
+    // rather than refusing; a holder still listening is a live daemon, and
+    // the `try_write` below refuses at once, as before.
+    if !cli.listen_args().unwrap().vsock && !is_minimal_microvm() {
+        let sock = cli.listen_on();
+        wait_for_departing_daemon(
+            instance_lock_path.as_utf8_path().as_std_path(),
+            std::path::Path::new(sock.as_utf8_path().as_str()),
+            // The departing daemon's drain, which it holds the lock
+            // through, and a margin for its exit.
+            minimald_rpc::SHUTDOWN_DEPARTURE_WAIT,
+        )
+        .await
+        .map_err(|e| MainError::IO(e, "probing instance lock"))?;
+    }
     let mut instance_lock = fd_lock::RwLock::new(
         open_lock_file(instance_lock_path)
             .map_err(|e| MainError::IO(e, "opening instance lock"))?,
@@ -1718,6 +1777,105 @@ mod tests {
         assert!(egress.runtime.is_none());
         assert!(egress.relay.is_none());
         egress.tear_down();
+    }
+
+    /// Holds the exclusive lock on `path` from another thread, the way a
+    /// running daemon does, until the returned sender is dropped or sent to.
+    fn hold_lock(path: &std::path::Path) -> std::sync::mpsc::Sender<()> {
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let file = open_lock_file(path).unwrap();
+        std::thread::spawn(move || {
+            let mut lock = fd_lock::RwLock::new(file);
+            let _guard = lock.try_write().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        locked_rx.recv().unwrap();
+        release_tx
+    }
+
+    /// A lock held by a daemon whose socket refuses (it closed its listener
+    /// and is draining) is waited for: the wait returns once the holder lets
+    /// go, and the lock is then free to take.
+    #[tokio::test]
+    async fn a_departing_daemons_lock_is_waited_for_until_it_is_released() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let lock_path = dir.path().join("minimald.lock");
+        let sock_path = dir.path().join("ssh.sock");
+        // A socket file nothing listens on: what a departing daemon leaves.
+        drop(std::os::unix::net::UnixListener::bind(&sock_path).unwrap());
+        let release = hold_lock(&lock_path);
+        let released_after = std::time::Duration::from_millis(400);
+        std::thread::spawn(move || {
+            std::thread::sleep(released_after);
+            let _ = release.send(());
+        });
+
+        let started = std::time::Instant::now();
+        wait_for_departing_daemon(&lock_path, &sock_path, std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        let waited = started.elapsed();
+        assert!(
+            waited >= released_after,
+            "returned after {waited:?}, before the holder released the lock"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(3),
+            "kept waiting {waited:?} after the lock was released"
+        );
+        let mut lock = fd_lock::RwLock::new(open_lock_file(&lock_path).unwrap());
+        assert!(lock.try_write().is_ok(), "the lock is free after the wait");
+    }
+
+    /// A lock held by a daemon whose socket still accepts is a live daemon:
+    /// the wait returns at once, and the lock attempt after it refuses, as a
+    /// second daemon beside a running one always has.
+    #[tokio::test]
+    async fn a_live_daemons_lock_is_not_waited_for() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let lock_path = dir.path().join("minimald.lock");
+        let sock_path = dir.path().join("ssh.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+        let _release = hold_lock(&lock_path);
+
+        let started = std::time::Instant::now();
+        wait_for_departing_daemon(&lock_path, &sock_path, std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        let waited = started.elapsed();
+        assert!(
+            waited < std::time::Duration::from_secs(1),
+            "waited {waited:?} on a live daemon's lock"
+        );
+        let mut lock = fd_lock::RwLock::new(open_lock_file(&lock_path).unwrap());
+        let err = lock
+            .try_write()
+            .expect_err("a live daemon's lock stays held");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    /// The wait is bounded: a holder that never lets go, behind a refusing
+    /// socket, costs the wait and no more.
+    #[tokio::test]
+    async fn the_wait_for_a_departing_daemon_is_bounded() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let lock_path = dir.path().join("minimald.lock");
+        let sock_path = dir.path().join("ssh.sock");
+        let _release = hold_lock(&lock_path);
+
+        let wait = std::time::Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        wait_for_departing_daemon(&lock_path, &sock_path, wait)
+            .await
+            .unwrap();
+        let waited = started.elapsed();
+        assert!(waited >= wait, "gave up after {waited:?}, before {wait:?}");
+        assert!(
+            waited < std::time::Duration::from_secs(2),
+            "waited {waited:?}, past its bound"
+        );
     }
 
     /// The microVM's relay runtime is built up front and taken down outside

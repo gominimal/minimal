@@ -102,9 +102,12 @@ pub struct PortMapping {
 /// the `minimald` unit fixture and the `minvmd` integration test share one
 /// list and cannot drift.
 ///
-/// Docker Hub serves image blobs through a 307 redirect that lands on either
-/// of its CDNs, `production.cloudflare.docker.com` or
-/// `production.cloudfront.docker.com`, so a container pull needs both.
+/// Docker Hub serves image blobs through a 307 redirect that lands on one of
+/// three places: its CDNs, `production.cloudflare.docker.com` and
+/// `production.cloudfront.docker.com`, or the bucket behind them,
+/// `docker-images-prod.s3.dualstack.us-east-1.amazonaws.com`. The registry
+/// picks per request, so a container pull needs all three: with only the two
+/// CDNs listed, a pull that was sent to the bucket failed at the name lookup.
 #[doc(hidden)]
 pub const NET068_TOOLCHAIN_EGRESS_HOSTS: &[&str] = &[
     "github.com",
@@ -117,6 +120,7 @@ pub const NET068_TOOLCHAIN_EGRESS_HOSTS: &[&str] = &[
     "auth.docker.io",
     "production.cloudflare.docker.com",
     "production.cloudfront.docker.com",
+    "docker-images-prod.s3.dualstack.us-east-1.amazonaws.com",
 ];
 
 /// Egress policy for a session: the `egress` section as declared, before

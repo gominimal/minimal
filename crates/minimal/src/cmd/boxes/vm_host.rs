@@ -190,9 +190,12 @@ pub(crate) async fn vm_host_answerer_status_at(
 /// machine the session is about to rely on: which VM host daemon answers
 /// the zone decides where the names resolve from, and a start that said
 /// nothing left the holder discoverable only from `min ls`. The same line
-/// `min ls` prints for the state ([`crate::resolver::vm_host_answerer_line`]),
-/// so the two surfaces name one holder the same way. Pure, so the test
-/// asserts the wording without capturing stderr.
+/// `min ls` prints for the state ([`crate::resolver::vm_host_answerer_line_beside`]),
+/// so the two surfaces name one holder the same way. That includes a
+/// failing DNS service: when its job holds the port and is not running,
+/// both name it, and both name `min finalize-install` only when that
+/// command offers the reinstall. The service state is read only for the
+/// service's port held with no channel, so the other states stay pure.
 ///
 /// `None` for the pre-acquisition state — a daemon still bringing its
 /// answerer up has nothing to name yet, and the start prints nothing for
@@ -201,7 +204,47 @@ pub(crate) async fn vm_host_answerer_status_at(
 pub(crate) fn vm_host_answerer_start_line(
     status: minimald_rpc::ZoneAnswererStatus,
 ) -> Option<String> {
-    crate::resolver::vm_host_answerer_line(status).map(|line| format!("DNS service: {line}"))
+    let service = if crate::resolver::port_held_by_service_job(&status) {
+        dns_service_state_blocking(&status)
+    } else {
+        crate::resolver::DnsServiceState::default()
+    };
+    vm_host_answerer_start_line_beside(status, service)
+}
+
+/// [`vm_host_answerer_start_line`] over a DNS service state already read.
+/// Pure, so the test asserts the wording without capturing stderr.
+#[must_use]
+pub(crate) fn vm_host_answerer_start_line_beside(
+    status: minimald_rpc::ZoneAnswererStatus,
+    service: crate::resolver::DnsServiceState,
+) -> Option<String> {
+    crate::resolver::vm_host_answerer_line_beside(status, service)
+        .map(|line| format!("DNS service: {line}"))
+}
+
+/// [`crate::resolver::dns_service_state_on_this_host`] for the one status
+/// the session start prints, from a synchronous caller. The read runs on a
+/// thread of its own with its own runtime, so it works whether or not the
+/// caller runs inside one. A read that does not run claims nothing.
+fn dns_service_state_blocking(
+    status: &minimald_rpc::ZoneAnswererStatus,
+) -> crate::resolver::DnsServiceState {
+    let status = status.clone();
+    std::thread::Builder::new()
+        .name("dns-service-state".to_string())
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map(|runtime| {
+                    runtime.block_on(crate::resolver::dns_service_state_on_this_host([&status]))
+                })
+                .unwrap_or_default()
+        })
+        .ok()
+        .and_then(|thread| thread.join().ok())
+        .unwrap_or_default()
 }
 
 /// Releases the zone hold a destroyed session's activation made, when the
@@ -235,12 +278,19 @@ pub(crate) async fn release_held_box_name(
 /// box under that name takes a fresh id (BEP-082). The VM host daemon
 /// serves that withdraw by name alone: it retires and revokes nothing.
 /// Then the old name's hold is released. Best-effort, as the hold is.
+///
+/// With no control socket (a native host) no VM host daemon holds a row or
+/// a name for the box, so the move asks for nothing and logs nothing
+/// (BCLI-058).
 pub(crate) async fn move_held_box_name(
     control_sock: Option<std::path::PathBuf>,
     id: boxes::SessionId,
     old_name: Option<&str>,
     new_name: &str,
 ) {
+    if control_sock.is_none() {
+        return;
+    }
     if let Some(old_name) = old_name {
         withdraw_box_row(
             control_sock.clone(),
@@ -1442,6 +1492,67 @@ mod tests {
         );
     }
 
+    /// A resume that the VM host refuses, here because the VM cannot reach
+    /// the DNS service for box names, fails the attach with the VM host's
+    /// reason, which names `min finalize-install --show`.
+    #[tokio::test]
+    async fn resume_refused_by_vm_host_names_its_reason() {
+        // minvmd's `NO_ANSWERER`, word for word.
+        const REASON: &str = "the running VM cannot reach Minimal's DNS service for box names, \
+                              so this box cannot be given an address; run `min \
+                              finalize-install --show` to check the service's setup, or see \
+                              minvmd.log for the cause (`min dirs` shows where logs are kept)";
+        let dir = tempfile::TempDir::new().unwrap();
+        let requests = fake_vm_host(
+            dir.path().join(minvmd::control::CONTROL_SOCK_FILE),
+            serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::Error {
+                // minvmd's refusal as it crosses the wire.
+                error: format!("could not give the box an address: {REASON}"),
+            })
+            .unwrap(),
+        )
+        .await;
+        let record = boxes::Record {
+            id: boxes::SessionId::nil(),
+            name: Some("web".to_string()),
+            username: None,
+            project_path: paths::HostAbsPath::try_new("/p").unwrap(),
+            network: NetworkMode::OwnIp,
+            policy: boxes::BoxPolicy::default(),
+            status: boxes::BoxState::default(),
+            reason: None,
+            exit_code: None,
+            signal: None,
+            hooks_enabled: true,
+            task_addresses: Vec::new(),
+            box_addresses: Some(boxes::BoxAddresses {
+                switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
+                loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
+            }),
+            host_ip_enforcement: None,
+            box_id: None,
+            host_row_bound: false,
+            bound_ports: std::collections::BTreeSet::new(),
+            ends_with_run: false,
+            sealed_deliveries: Vec::new(),
+            root_certificate: None,
+            box_type: None,
+            parent: None,
+            project_root: None,
+            attrs: Default::default(),
+        };
+        let error = resume_box_row(&dir.path().join("ssh.sock"), Some(&record))
+            .await
+            .expect_err("a refused resume fails the attach");
+        assert_eq!(requests.lock().unwrap().len(), 1, "one resume was asked");
+        let refusal = error
+            .downcast_ref::<minimal_client::box_registration::HostRefusal>()
+            .expect("the error carries the VM host's refusal");
+        assert_eq!(refusal.reason(), REASON);
+        // The reason prints once, after the box it is about.
+        assert_eq!(format!("{error:#}"), format!("box web: {REASON}"));
+    }
+
     /// NET-045/NET-138: the host-side registration carries the box's
     /// dynamic-ingress grant — the stance and the range — from the same
     /// create inputs the session record holds, so the host-side row holds
@@ -1993,6 +2104,21 @@ mod tests {
             None,
             "the pre-acquisition state prints nothing at session start"
         );
+        // D3472: a failing DNS service prints the line `min ls` prints.
+        let held = minimald_rpc::ZoneAnswererStatus::PortHeldNoChannel { port: 7_656 };
+        for reinstall_offered in [true, false] {
+            let service = crate::resolver::DnsServiceState {
+                job: crate::resolver::AnswererJob::NotRunning,
+                reinstall_offered,
+            };
+            assert_eq!(
+                vm_host_answerer_start_line_beside(held.clone(), service),
+                Some(format!(
+                    "DNS service: {}",
+                    crate::resolver::failing_dns_service_line(7_656, reinstall_offered)
+                )),
+            );
+        }
     }
 
     /// T66's destroy side: the client holding a destroyed session's record
@@ -2379,6 +2505,96 @@ mod tests {
             )],
             "a stop retires the box as stopped"
         );
+    }
+
+    /// BEP-043: the dashboard's rename of a running `host_ip` box makes the
+    /// move `min session rename` and `min box rename` make, over the control
+    /// socket beside the dashboard's ssh socket. It withdraws the old name
+    /// by the box's id, moves the name's hold and retires nothing, so the
+    /// box keeps its egress rules.
+    #[tokio::test]
+    async fn dashboard_rename_of_host_ip_box_retires_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (requests, residency) = fake_vm_host_with_residency(
+            dir.path().join(minvmd::control::CONTROL_SOCK_FILE),
+            r#"{"name":"web","held":true}"#.to_string(),
+        )
+        .await;
+        let id = boxes::SessionId::mint();
+        let record = boxes::Record {
+            id,
+            name: Some("web".to_string()),
+            username: None,
+            project_path: paths::HostAbsPath::try_new("/p").unwrap(),
+            network: NetworkMode::HostNet,
+            policy: boxes::BoxPolicy {
+                egress: None,
+                ingress: None,
+                credentialed_upstream: None,
+                quic443: None,
+            },
+            status: boxes::BoxState::default(),
+            reason: None,
+            exit_code: None,
+            signal: None,
+            hooks_enabled: true,
+            task_addresses: Vec::new(),
+            box_addresses: None,
+            host_ip_enforcement: None,
+            box_id: None,
+            host_row_bound: false,
+            bound_ports: std::collections::BTreeSet::new(),
+            ends_with_run: false,
+            sealed_deliveries: Vec::new(),
+            root_certificate: None,
+            box_type: None,
+            parent: None,
+            project_root: None,
+            attrs: Default::default(),
+        };
+        assert!(holds_name(&record), "a host_ip box holds its name");
+
+        // `dash::rpc::rename`'s move, after the in-VM daemon renamed it.
+        let ssh_sock = dir.path().join("ssh.sock");
+        rename_box_with_vm_host(control_sock_beside(&ssh_sock), &record, "api").await;
+
+        assert!(
+            residency.lock().unwrap().is_empty(),
+            "the dashboard's rename sends no retire"
+        );
+        let seen = requests.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            3,
+            "one withdraw, one release, one hold: {seen:?}"
+        );
+        let minimald_rpc::BoxControlRequest::Withdraw(withdraw) =
+            serde_json_lenient::from_str(&seen[0]).expect("the request is the wire type")
+        else {
+            panic!(
+                "the old name is withdrawn by the withdraw verb: {}",
+                seen[0]
+            );
+        };
+        assert_eq!(withdraw.name, "web");
+        assert_eq!(
+            withdraw.box_id,
+            Some(minimald_rpc::BoxId::from_bytes(id.to_bytes())),
+            "the withdraw carries the box's id"
+        );
+        let minimald_rpc::BoxControlRequest::ReleaseBoxName(release) =
+            serde_json_lenient::from_str(&seen[1]).expect("the request is the wire type")
+        else {
+            panic!("the old name is released by the release verb: {}", seen[1]);
+        };
+        assert_eq!(release.name, "web");
+        let minimald_rpc::BoxControlRequest::HoldBoxName(hold) =
+            serde_json_lenient::from_str(&seen[2]).expect("the request is the wire type")
+        else {
+            panic!("the new name is held by the hold verb: {}", seen[2]);
+        };
+        assert_eq!(hold.name, "api");
+        assert_eq!(hold.session_id, Some(id));
     }
 
     /// The `host_ip` hold's attach-exit side: the shell-exit prompt's
@@ -3310,7 +3526,7 @@ mod tests {
         let args = ActivateArgs {
             name: Some("gate-web".to_string()),
             path: Some(project.path().to_str().unwrap().to_string()),
-            network: CliNetworkMode::OwnIp,
+            network: Some(CliNetworkMode::OwnIp),
             sync: Some(SyncMode::None),
             no_loadouts: true,
             no_prompt: true,
@@ -3397,7 +3613,7 @@ mod tests {
         let args = ActivateArgs {
             name: Some("web".to_string()),
             path: Some(project.path().to_str().unwrap().to_string()),
-            network: CliNetworkMode::OwnIp,
+            network: Some(CliNetworkMode::OwnIp),
             no_prompt: true,
             attach: false,
             ..bare_activate_args()

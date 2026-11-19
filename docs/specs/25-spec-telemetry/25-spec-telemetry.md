@@ -124,8 +124,7 @@ workflow is a maintainer-owned change (gominimal/minimal#2075). A test marked
 and its issue, and fails on request (`TEST_KNOWN_GAPS=1`) so a lane can
 list the gaps. It is removed when the requirement gets a real test. These
 are the known gaps on 2026-10-07, each with an issue to follow. TEL-009
-has lab scenario 785 only. TEL-034 has its VM test in the tree, gated
-`MINVMD_E2E=1` so it runs on the VM lane only, and lab scenario 715b. TEL-044 has unit tests for its
+has lab scenario 785 only. TEL-044 has unit tests for its
 scrub and lab scenario 782 for the whole path. TEL-047 has
 no check, because nothing reports a box's injected environment yet
 (minimal#2036, spec 24). macOS was verified by hand once, on arm64 on
@@ -592,7 +591,7 @@ has a unit test. No repeatable macOS VM lane exists yet (minimal#2037).
             crates/sandbox/src/lib.rs::every_seal_refuses_a_vsock_socket;
             crates/minvmd/tests/otel_vsock_integration.rs::the_guest_daemons_records_reach_the_host_spool_and_endpoint_over_vsock;
             crates/minvmd/tests/otel_integration.rs::a_boot_and_stop_share_one_trace_with_the_guest_daemon
-            (real VMs; gated `MINVMD_E2E=1`)
+            (real VMs; gated `MINVMD_E2E=1`; the Linux KVM CI lane runs both)
   lab:      715b, 715f, 715i, 715j, 715k, 715l
   - On a stop, the guest's spans reach the host before the VM goes down,
     within a bounded grace after the guest acknowledges Shutdown (TEL-049),
@@ -766,11 +765,13 @@ has a unit test. No repeatable macOS VM lane exists yet (minimal#2037).
   each request and no `TRACEPARENT`, and the daemon SHALL record nothing for
   that request: a non-recording span and no command line.
   tier:     T0
-  verify:   cargo nextest run -p minimald an_opted_out_request_leaves_no_daemon_span
+  verify:   cargo nextest run -p minimald an_opted_out_request_leaves_no_daemon_span an_opted_out_helper_request_records_no_span_and_opts_its_task_out an_opted_out_helper_request_keeps_its_line_out_of_the_log
   test:     crates/minimald/src/exec.rs::an_opted_out_request_leaves_no_daemon_span;
             crates/minimal-client/src/lib.rs::do_not_track_sends_the_opt_out_and_no_traceparent;
             crates/minimald/src/env.rs::an_opted_out_helper_request_records_no_span_and_opts_its_task_out
-            (the in-box helper's `otel%off%` request)
+            (the in-box helper's `otel%off%` request);
+            crates/minimald/src/env.rs::an_opted_out_helper_request_keeps_its_line_out_of_the_log
+            (the channel's own trace record)
   lab:      785, 712e
 - **TEL-046** IF the host receiver on vsock port 7353 is unreachable THEN THE
   SYSTEM SHALL keep the guest daemon spooling, SHALL retry the connection

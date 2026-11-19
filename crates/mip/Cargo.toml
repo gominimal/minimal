@@ -23,6 +23,13 @@ ot.workspace = true
 orchestrator.workspace = true
 remote-client.workspace = true
 sandbox.workspace = true
+# The user's `[patches]` policy, which a task run by name has its patches
+# judged against (inbox#1128); with the path, walk and TOML crates the gate
+# uses.
+boxes.workspace = true
+camino.workspace = true
+toml.workspace = true
+walkdir.workspace = true
 # The installer's data prefix, for the AppArmor loader path the
 # user-namespace preflight names.
 paths.workspace = true
@@ -53,6 +60,7 @@ version.workspace = true
 
 [dev-dependencies]
 serial_test.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

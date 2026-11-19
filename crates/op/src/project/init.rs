@@ -197,10 +197,10 @@ fn generate_mfile(
         content.push('\n');
     }
 
-    content.push_str("[defaults]\n");
+    content.push_str("[defaults.task]\n");
     content.push_str("state_key = \"dev\"\n");
     content.push('\n');
-    content.push_str("[session] # min session attach\n");
+    content.push_str("[defaults.session] # min session attach\n");
     content.push_str("packages = [\"base\", \"vim\"");
     if std::fs::exists(repo_dir.join(".git")).unwrap_or_default() {
         content.push_str(", \"git\"");
@@ -401,6 +401,47 @@ mod tests {
         assert!(!out.contains("runtime_packages"));
 
         // Has some session config
-        assert!(out.contains("[session]"));
+        assert!(out.contains("[defaults.session]"));
+    }
+
+    // D3112: init writes the entry layout, so a fresh project's file reads
+    // with no legacy-table hint.
+    #[test]
+    fn generate_mfile_writes_entry_layout_with_no_legacy_tables() {
+        let origin = SpecOrigin::Repo(Repo::Git {
+            url: "u".to_string(),
+            rev: "r".to_string(),
+            tracking: None,
+        });
+        let cwd = TempDir::new().unwrap();
+        std::fs::create_dir(cwd.path().join(".git")).unwrap();
+
+        let out = generate_mfile(None, &origin, cwd.path());
+        let doc: toml_edit::DocumentMut = out.parse().expect("the generated file parses");
+
+        // The legacy tables that mfile reads with a hint: a top-level
+        // [session], and a state_key or profile key directly under [defaults].
+        assert!(
+            doc.get("session").is_none(),
+            "no top-level [session]:\n{out}"
+        );
+        let defaults = doc["defaults"].as_table().expect("[defaults] is a table");
+        assert!(
+            defaults.iter().all(|(_, v)| v.is_table()),
+            "no plain key under [defaults]:\n{out}"
+        );
+        assert_eq!(
+            doc["defaults"]["task"]["state_key"].as_str(),
+            Some("dev"),
+            "{out}"
+        );
+        let packages: Vec<_> = doc["defaults"]["session"]["packages"]
+            .as_array()
+            .expect("packages is an array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(packages, ["base", "vim", "git"], "{out}");
+        mfile::File::from_toml_bytes(out.as_bytes()).expect("the generated file loads");
     }
 }

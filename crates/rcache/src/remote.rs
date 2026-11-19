@@ -57,6 +57,15 @@ pub enum Error<BE: std::fmt::Debug> {
         object: String,
         status: Option<usize>,
     },
+    /// The TLS certificate presented while fetching `object` did not verify
+    /// against the trust store (`cause` is the verification failure, naming
+    /// the host when known). Distinct from [`Error::Unavailable`] because it
+    /// is not a connectivity problem and never transient: it recurs
+    /// identically until the cause is fixed. Two causes are common: a
+    /// TLS-inspecting proxy re-signing traffic with a CA this environment does
+    /// not trust, or a wrong system clock that makes a valid certificate look
+    /// expired or not yet valid.
+    TlsCert { object: String, cause: String },
 }
 
 impl<BE: std::fmt::Debug> std::fmt::Display for Error<BE> {
@@ -75,6 +84,16 @@ impl<BE: std::fmt::Debug> std::fmt::Display for Error<BE> {
                     "cache server was unreachable for {object}; try again shortly"
                 ),
             },
+            Error::TlsCert { object, cause } => write!(
+                f,
+                "TLS certificate verification failed while fetching {object}: {cause}. \
+                 This is not a connectivity problem, and retrying will not clear it: \
+                 the same verification fails the same way until the cause is fixed. \
+                 A TLS-inspecting proxy (a corporate VPN, Cloudflare WARP, Zscaler, or \
+                 similar) re-signing HTTPS traffic with a certificate authority this \
+                 environment does not trust is one cause. A wrong system clock, which \
+                 makes a valid certificate look expired or not yet valid, is another."
+            ),
             _ => write!(f, "{:?}", self),
         }
     }
@@ -128,12 +147,15 @@ const FETCH_BACKOFF_BASE: Duration = Duration::from_millis(500);
 /// (`FETCH_BACKOFF_BASE` doubling per attempt) between tries. `what` names
 /// the object in the log. The caller decides what a spent retry budget
 /// means (the index reports `Unavailable`; an artifact surfaces the error).
+/// The outcome comes back with the number of attempts it took, a failure's
+/// as well as a success's, so a span can say whether a slow or failed fetch
+/// was one long transfer or several.
 async fn retrying_transient<T, E, Fut>(
     what: &str,
     retries: u32,
     is_transient: impl Fn(&E) -> bool,
     mut once: impl FnMut() -> Fut,
-) -> Result<T, E>
+) -> (Result<T, E>, u32)
 where
     E: std::fmt::Display,
     Fut: std::future::Future<Output = Result<T, E>>,
@@ -142,7 +164,7 @@ where
     loop {
         attempt += 1;
         match once().await {
-            Ok(v) => return Ok(v),
+            Ok(v) => return (Ok(v), attempt),
             Err(e) if attempt <= retries && is_transient(&e) => {
                 let delay = FETCH_BACKOFF_BASE * 2u32.pow(attempt - 1);
                 tracing::warn!(
@@ -155,7 +177,7 @@ where
                 if attempt > 1 {
                     tracing::warn!("fetching {what} failed after {attempt} attempts: {e}");
                 }
-                return Err(e);
+                return (Err(e), attempt);
             }
         }
     }
@@ -643,7 +665,7 @@ impl<B: FetchBackend> RemoteCache<B> {
         // Pinned on the heap, the loop's state is a pointer in the caller's
         // state, and the depth stops here.
         let (index, gcs_generation) = Box::pin(async {
-            let fetched = retrying_transient(
+            let (fetched, _attempts) = retrying_transient(
                 source.object(),
                 DEFAULT_FETCH_RETRIES,
                 Self::is_transient,
@@ -652,20 +674,28 @@ impl<B: FetchBackend> RemoteCache<B> {
             .await;
             match fetched {
                 Ok(pair) => Ok(pair),
-                // The same class of failure artifact downloads already
-                // survive: report it in terms of what was fetched, not
-                // the raw transport error.
-                Err(e) if Self::is_transient(&e) => {
-                    let status = match &e {
-                        Error::Fetch { status } => Some(*status),
-                        _ => None,
-                    };
-                    Err(Error::Unavailable {
-                        object: source.object().to_string(),
-                        status,
-                    })
+                Err(e) => {
+                    // A certificate failure is named (and surfaced, since it
+                    // is non-transient) rather than collapsed into the
+                    // generic "unreachable" below, which would be wrong twice
+                    // over: it connected, and retrying cannot fix it.
+                    let e = Self::name_tls_cert_error(e, source.object());
+                    if Self::is_transient(&e) {
+                        // The same class of failure artifact downloads already
+                        // survive: report it in terms of what was fetched, not
+                        // the raw transport error.
+                        let status = match &e {
+                            Error::Fetch { status } => Some(*status),
+                            _ => None,
+                        };
+                        Err(Error::Unavailable {
+                            object: source.object().to_string(),
+                            status,
+                        })
+                    } else {
+                        Err(e)
+                    }
                 }
-                Err(e) => Err(e),
             }
         })
         .await?;
@@ -869,12 +899,19 @@ impl<B: FetchBackend> RemoteCache<B> {
     /// gone on refetch; persistent corruption pays the backoff and then
     /// surfaces as the same loud `HashMismatch`). Not retried: a request that
     /// could not be built (`Request`), a 4xx, which is an answer and comes
-    /// back the same way every time, local I/O errors, and a spec or snapshot
-    /// the index does not have. Both the index path and the artifact path
-    /// classify an error status as `Fetch { status }`, so the rule is one.
+    /// back the same way every time, local I/O errors, a spec or snapshot
+    /// the index does not have, and a TLS certificate-verification failure
+    /// (a `Backend` error the backend classifies as such), which recurs
+    /// identically until the trust path is fixed and so surfaces at once
+    /// rather than paying the backoff. Both the index path and the artifact
+    /// path classify an error status as `Fetch { status }`, so the rule is
+    /// one.
     fn is_transient(e: &Error<<B::Response as FetchResponse>::Error>) -> bool {
         match e {
-            Error::Backend(_) | Error::HashMismatch { .. } => true,
+            // A transport failure is transient unless it is a certificate
+            // problem, which retrying cannot fix.
+            Error::Backend(be) => B::Response::tls_cert_error(be).is_none(),
+            Error::HashMismatch { .. } => true,
             Error::Fetch { status } => *status >= 500 || *status == 429,
             // A response cut off mid-record (the whole-record check above).
             Error::IO(e) => e.kind() == std::io::ErrorKind::UnexpectedEof,
@@ -882,10 +919,47 @@ impl<B: FetchBackend> RemoteCache<B> {
         }
     }
 
+    /// Rewrites a transport error that is really a TLS certificate-verification
+    /// failure into [`Error::TlsCert`], naming `object`; every other error
+    /// passes through unchanged. Applied where a spent fetch surfaces, so the
+    /// certificate cause reaches the user in place of a generic "unreachable"
+    /// (the index path) or a raw transport-error dump (the artifact path).
+    fn name_tls_cert_error(
+        e: Error<<B::Response as FetchResponse>::Error>,
+        object: &str,
+    ) -> Error<<B::Response as FetchResponse>::Error> {
+        if let Error::Backend(be) = &e
+            && let Some(cause) = B::Response::tls_cert_error(be)
+        {
+            return Error::TlsCert {
+                object: object.to_string(),
+                cause,
+            };
+        }
+        e
+    }
+
     /// Download the given spec hash into the local cache. Transient fetch
     /// failures are retried up to [`Self::with_fetch_retries`] times with
     /// exponential backoff; extraction is not retried.
-    #[tracing::instrument(skip_all, fields(span_name = %span_name), err)]
+    ///
+    /// The span says what the wait was (gominimal/minimal#3223): the
+    /// `source` it fetched from (scheme and host), the artifact's `bytes`,
+    /// how many `attempts` the fetch took, and the seconds the fetch and
+    /// the extraction each cost, so a long one reads as a large transfer, a
+    /// stalled connection that retried, or a slow extraction.
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            span_name = %span_name,
+            source = %self.base.origin(),
+            bytes = tracing::field::Empty,
+            attempts = tracing::field::Empty,
+            fetch_s = tracing::field::Empty,
+            extract_s = tracing::field::Empty,
+        ),
+        err
+    )]
     pub async fn materialize(
         &self,
         spec_hash: &SpecHash,
@@ -905,13 +979,27 @@ impl<B: FetchBackend> RemoteCache<B> {
         });
 
         let start = Instant::now();
-        let mut tar_file = retrying_transient(
+        let (fetched, attempts) = retrying_transient(
             &hex::encode(sha256),
             self.fetch_retries,
             Self::is_transient,
             || self.fetch_verified(sha256, &materialize_op),
         )
-        .await?;
+        .await;
+        // Recorded before a failed fetch returns: a fetch that retried and
+        // then gave up is the one a span most needs to explain.
+        let span = tracing::Span::current();
+        span.record("attempts", attempts);
+        span.record("fetch_s", start.elapsed().as_secs_f64());
+        // Name the artifact object (`<sha256>.zst`), not `span_name`: all
+        // three callers already prefix the error with the package name, so
+        // naming it here too would print it twice.
+        let mut tar_file = fetched
+            .map_err(|e| Self::name_tls_cert_error(e, &format!("{}.zst", hex::encode(sha256))))?;
+        if let Ok(meta) = tar_file.metadata() {
+            span.record("bytes", meta.len());
+        }
+        let extract_start = Instant::now();
 
         tar_file
             .seek(std::io::SeekFrom::Start(0))
@@ -929,12 +1017,15 @@ impl<B: FetchBackend> RemoteCache<B> {
         // renderer never observes the ExtractPkg state — so the extract spinner
         // is never drawn.
         let dest = cache_hnd.path().to_path_buf();
-        tokio::task::spawn_blocking(move || {
+        let extracted = tokio::task::spawn_blocking(move || {
             archive::extract_compressed_tar(tar_file, archive::Compression::Zstd, &dest, None)
         })
         .await
         .expect("extract task is awaited immediately and never cancelled")
-        .map_err(Error::ArchiveError)?;
+        .map_err(Error::ArchiveError);
+        // Recorded whether or not the extraction succeeded.
+        span.record("extract_s", extract_start.elapsed().as_secs_f64());
+        extracted?;
 
         materialize_op.set_done();
 
@@ -957,6 +1048,9 @@ mod tests {
         }
         fn filename(&self) -> String {
             self.0.rsplit('/').next().unwrap_or(&self.0).to_string()
+        }
+        fn origin(&self) -> String {
+            "mock://cache".to_string()
         }
     }
 
@@ -1006,6 +1100,13 @@ mod tests {
             self.consumed = true;
             Ok(Some(Bytes::from(self.data.clone())))
         }
+
+        // The mock's backend error is a plain `io::Error`; classify it with
+        // the same message heuristic the real backends use, so the rcache
+        // retry/surfacing logic can be exercised without a real TLS stack.
+        fn tls_cert_error(err: &Self::Error) -> Option<String> {
+            tls_cert_cause(err, None)
+        }
     }
 
     /// Per-URL queues of (status, body) responses.
@@ -1017,6 +1118,12 @@ mod tests {
         /// Responses served before `responses` takes over. Lets a test
         /// script failures-then-success.
         scripted: std::sync::Mutex<ScriptedResponses>,
+        /// Per-URL queues of error messages. A queued message makes `execute`
+        /// return an `io::Error` carrying it, instead of any response — the
+        /// one way to drive a transport failure (such as a certificate error)
+        /// through the fetch/retry/surfacing path, which the response-only
+        /// script cannot reach.
+        errors: std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
         /// Total executed requests; an Arc so tests can keep counting after
         /// the backend moves into the RemoteCache.
         calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -1034,6 +1141,14 @@ mod tests {
             self.scripted.lock().unwrap().insert(url.to_string(), seq);
             self
         }
+
+        /// Script a queue of transport errors for `url`: each `execute` of it
+        /// pops one message and returns it as an `io::Error` until the queue
+        /// empties, after which the scripted/static responses take over.
+        fn script_errors(self, url: &str, msgs: Vec<String>) -> Self {
+            self.errors.lock().unwrap().insert(url.to_string(), msgs);
+            self
+        }
     }
 
     impl FetchBackend for MockBackend {
@@ -1046,6 +1161,11 @@ mod tests {
         }
         async fn execute(&self, req: MockUrl) -> Result<MockResponse, std::io::Error> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(seq) = self.errors.lock().unwrap().get_mut(&req.0)
+                && !seq.is_empty()
+            {
+                return Err(std::io::Error::other(seq.remove(0)));
+            }
             if let Some(seq) = self.scripted.lock().unwrap().get_mut(&req.0)
                 && !seq.is_empty()
             {
@@ -1824,6 +1944,169 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
+    /// What one `materialize` span recorded, field by field.
+    #[derive(Clone, Debug, Default, PartialEq)]
+    struct MaterializeFields {
+        attempts: Option<u64>,
+        bytes: Option<u64>,
+        fetch_s: Option<f64>,
+        extract_s: Option<f64>,
+    }
+
+    impl tracing::field::Visit for MaterializeFields {
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            match field.name() {
+                "attempts" => self.attempts = Some(value),
+                "bytes" => self.bytes = Some(value),
+                _ => {}
+            }
+        }
+
+        fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+            match field.name() {
+                "fetch_s" => self.fetch_s = Some(value),
+                "extract_s" => self.extract_s = Some(value),
+                _ => {}
+            }
+        }
+
+        fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+    }
+
+    /// Records the fields of each `materialize` span, in the order the spans
+    /// are created.
+    #[derive(Clone, Default)]
+    struct MaterializeSpans(std::sync::Arc<std::sync::Mutex<MaterializeLog>>);
+
+    #[derive(Default)]
+    struct MaterializeLog {
+        spans: Vec<MaterializeFields>,
+        /// The index in `spans` of each `materialize` span, by id.
+        by_id: std::collections::HashMap<u64, usize>,
+    }
+
+    impl MaterializeSpans {
+        fn all(&self) -> Vec<MaterializeFields> {
+            self.0.lock().unwrap().spans.clone()
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for MaterializeSpans {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attrs.metadata().name() == "materialize" {
+                let mut log = self.0.lock().unwrap();
+                let at = log.spans.len();
+                log.spans.push(MaterializeFields::default());
+                log.by_id.insert(id.into_u64(), at);
+            }
+        }
+
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut recorded = MaterializeFields::default();
+            values.record(&mut recorded);
+            let mut log = self.0.lock().unwrap();
+            if let Some(&at) = log.by_id.get(&id.into_u64()) {
+                let seen = &mut log.spans[at];
+                seen.attempts = recorded.attempts.or(seen.attempts);
+                seen.bytes = recorded.bytes.or(seen.bytes);
+                seen.fetch_s = recorded.fetch_s.or(seen.fetch_s);
+                seen.extract_s = recorded.extract_s.or(seen.extract_s);
+            }
+        }
+    }
+
+    /// gominimal/minimal#3223: a fetch that retried and then gave up still
+    /// says on its span how many attempts it made and how long they took.
+    /// No artifact arrived, so there is no size and no extraction.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_failed_fetch_records_its_attempts_and_time() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let spans = MaterializeSpans::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(spans.clone()));
+
+        let (spec_hash, art_url, mut responses) = artifact_fixture();
+        responses.insert(art_url, b"always wrong".to_vec());
+        let rc = RemoteCache::new(
+            MockBackend::new(responses),
+            MockUrl("mock://cache".to_string()),
+            None,
+            None,
+            IndexSource::Root,
+        )
+        .await
+        .unwrap()
+        .with_fetch_retries(1);
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = lcache::Cache::at_dir(tmp.path()).unwrap();
+
+        let err = rc.materialize(&spec_hash, &cache, "pkg").await.unwrap_err();
+        assert!(matches!(err, Error::HashMismatch { .. }), "{err:?}");
+        let seen = spans.all();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].attempts, Some(2), "{seen:?}");
+        assert!(seen[0].fetch_s.is_some(), "{seen:?}");
+        assert_eq!((seen[0].bytes, seen[0].extract_s), (None, None), "{seen:?}");
+    }
+
+    /// gominimal/minimal#3223: an artifact that arrives whole but does not
+    /// extract still says on its span what the fetch cost and how long the
+    /// extraction ran before it failed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_extraction_records_its_time() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let spans = MaterializeSpans::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(spans.clone()));
+
+        // Bytes that match the index's hash, so the fetch succeeds, but are
+        // not a zstd archive, so the extraction fails.
+        let spec_hash = SpecHash::from_bytes([0xAB; 32]);
+        let artifact = b"not a zstd archive".to_vec();
+        let mut sha256 = [0u8; 32];
+        sha256.copy_from_slice(&sha2::Sha256::digest(&artifact));
+        let mut responses = std::collections::HashMap::new();
+        responses.insert(
+            format!("mock://cache/{INDEX_FILENAME}"),
+            index_bytes_for(&spec_hash, sha256),
+        );
+        responses.insert(
+            format!("mock://cache/{}.zst", hex::encode(sha256)),
+            artifact.clone(),
+        );
+        let rc = RemoteCache::new(
+            MockBackend::new(responses),
+            MockUrl("mock://cache".to_string()),
+            None,
+            None,
+            IndexSource::Root,
+        )
+        .await
+        .unwrap()
+        .with_fetch_retries(0);
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = lcache::Cache::at_dir(tmp.path()).unwrap();
+
+        let err = rc.materialize(&spec_hash, &cache, "pkg").await.unwrap_err();
+        assert!(matches!(err, Error::ArchiveError(_)), "{err:?}");
+        let seen = spans.all();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].attempts, Some(1), "{seen:?}");
+        assert_eq!(seen[0].bytes, Some(artifact.len() as u64), "{seen:?}");
+        assert!(seen[0].fetch_s.is_some(), "{seen:?}");
+        assert!(seen[0].extract_s.is_some(), "{seen:?}");
+    }
+
     #[tokio::test]
     async fn materialize_error_status_is_not_hashed() {
         let (spec_hash, art_url, responses) = artifact_fixture();
@@ -1891,5 +2174,154 @@ mod tests {
             matches!(err, Error::Backend(AnyRespError::InvalidUrl(_))),
             "expected InvalidUrl, got {err:?}"
         );
+    }
+
+    /// A transport error that is really a certificate-verification failure is
+    /// not retried: retrying cannot fix the trust path, so it surfaces at
+    /// once. An ordinary transport error stays transient.
+    #[test]
+    fn certificate_failures_are_not_transient() {
+        let cert: Error<std::io::Error> = Error::Backend(std::io::Error::other(
+            "invalid peer certificate: UnknownIssuer",
+        ));
+        assert!(
+            !RemoteCache::<MockBackend>::is_transient(&cert),
+            "a certificate failure must not be retried"
+        );
+
+        let transport: Error<std::io::Error> =
+            Error::Backend(std::io::Error::other("connection reset by peer"));
+        assert!(
+            RemoteCache::<MockBackend>::is_transient(&transport),
+            "an ordinary transport error stays transient"
+        );
+    }
+
+    /// A spent certificate failure is rewritten to [`Error::TlsCert`], naming
+    /// the object; an ordinary transport error passes through unchanged (so
+    /// the index path can still collapse it to `Unavailable`).
+    #[test]
+    fn name_tls_cert_error_renames_only_certificate_failures() {
+        let named = RemoteCache::<MockBackend>::name_tls_cert_error(
+            Error::Backend(std::io::Error::other(
+                "invalid peer certificate: UnknownIssuer",
+            )),
+            "index.shisha",
+        );
+        match named {
+            Error::TlsCert { object, cause } => {
+                assert_eq!(object, "index.shisha");
+                assert!(cause.contains("UnknownIssuer"), "{cause}");
+            }
+            other => panic!("expected TlsCert, got {other:?}"),
+        }
+
+        let passthrough = RemoteCache::<MockBackend>::name_tls_cert_error(
+            Error::Backend(std::io::Error::other("connection reset by peer")),
+            "index.shisha",
+        );
+        assert!(
+            matches!(passthrough, Error::Backend(_)),
+            "a non-certificate error must pass through unchanged"
+        );
+    }
+
+    /// End-to-end on the index path: a certificate failure the backend
+    /// returns from `execute` surfaces as [`Error::TlsCert`] (naming the index
+    /// object), after a single attempt — not collapsed to the generic
+    /// "unreachable", and not retried. Scripting more failures than attempts
+    /// proves the one call is the whole budget. Guards the
+    /// `name_tls_cert_error` call on the index path: drop it and this fails.
+    #[tokio::test(start_paused = true)]
+    async fn index_certificate_failure_surfaces_at_once() {
+        let backend = MockBackend::default().script_errors(
+            &format!("mock://cache/{INDEX_FILENAME}"),
+            vec!["invalid peer certificate: UnknownIssuer".to_string(); 4],
+        );
+        let calls = backend.calls.clone();
+
+        let err = RemoteCache::new(
+            backend,
+            MockUrl("mock://cache".to_string()),
+            None,
+            None,
+            IndexSource::Root,
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            Error::TlsCert { object, cause } => {
+                assert_eq!(object, INDEX_FILENAME);
+                assert!(cause.contains("UnknownIssuer"), "{cause}");
+            }
+            other => panic!("expected TlsCert, got {other:?}"),
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a certificate failure is not retried"
+        );
+    }
+
+    /// End-to-end on the artifact path: the index fetch succeeds, then every
+    /// artifact fetch hits a certificate failure. It surfaces as
+    /// [`Error::TlsCert`] naming the artifact object (`<sha256>.zst`, not the
+    /// package name), after a single artifact attempt. Guards the
+    /// `name_tls_cert_error` call in `materialize`: drop it and this fails.
+    #[tokio::test(start_paused = true)]
+    async fn materialize_certificate_failure_surfaces_at_once() {
+        let (spec_hash, art_url, responses) = artifact_fixture();
+        let expected_object = art_url.strip_prefix("mock://cache/").unwrap().to_string();
+        let backend = MockBackend::new(responses).script_errors(
+            &art_url,
+            vec!["invalid peer certificate: UnknownIssuer".to_string(); 4],
+        );
+        let calls = backend.calls.clone();
+
+        let rc = RemoteCache::new(
+            backend,
+            MockUrl("mock://cache".to_string()),
+            None,
+            None,
+            IndexSource::Root,
+        )
+        .await
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = lcache::Cache::at_dir(tmp.path()).unwrap();
+
+        let err = rc.materialize(&spec_hash, &cache, "pkg").await.unwrap_err();
+        match err {
+            Error::TlsCert { object, cause } => {
+                assert_eq!(object, expected_object);
+                assert!(cause.contains("UnknownIssuer"), "{cause}");
+            }
+            other => panic!("expected TlsCert, got {other:?}"),
+        }
+        // One index fetch + one artifact attempt: the cert failure is not retried.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// The certificate error reads as a diagnosis, not a transient outage: it
+    /// names the object and cause, says retrying will not clear it, and gives
+    /// both common causes (an inspecting proxy and a wrong clock) without
+    /// asserting either, rather than the old generic "cache server was
+    /// unreachable". It names no proxy as *the* cause, because a wrong clock
+    /// produces the same `invalid peer certificate` reason.
+    #[test]
+    fn tls_cert_error_display_is_actionable() {
+        let err: Error<std::io::Error> = Error::TlsCert {
+            object: "index.shisha".to_string(),
+            cause: "invalid peer certificate: UnknownIssuer (from cache.minimal.dev)".to_string(),
+        };
+        let shown = err.to_string();
+        assert!(shown.contains("index.shisha"), "{shown}");
+        assert!(shown.contains("cache.minimal.dev"), "{shown}");
+        assert!(shown.contains("retrying will not clear it"), "{shown}");
+        // Both causes are offered; neither is asserted as the sole one.
+        assert!(shown.contains("proxy"), "{shown}");
+        assert!(shown.contains("clock"), "{shown}");
+        assert!(!shown.contains("unreachable"), "{shown}");
     }
 }

@@ -111,6 +111,44 @@ pub struct GetVersionResponse {
     pub version: String,
     pub long_version: String,
     pub stdlib_version: String,
+    /// The version of the expansion the daemon applies to a box spec, as
+    /// [`expander_version`] forms it (BOX-074). `None` from a daemon that
+    /// predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expander_version: Option<String>,
+}
+
+/// The expander version of a build: the Box Spec shape version and the
+/// projection version, joined by a dot (BOX-074). The client and the
+/// daemon each pass their own `mfile` constants, so two builds that
+/// expand and project a spec the same way report the same version.
+#[must_use]
+pub fn expander_version(spec_version: u32, projection_version: i64) -> String {
+    format!("{spec_version}.{projection_version}")
+}
+
+/// What the client prints when its expander version differs from the
+/// daemon's (BOX-074), or `None` when the two match. `daemon` is `None`
+/// when the daemon reports no expander version. The create goes ahead:
+/// the daemon's digest comparison and admission check are the checks
+/// that refuse it.
+#[must_use]
+pub fn expander_skew_message(cli: &str, daemon: Option<&str>) -> Option<String> {
+    let first = match daemon {
+        Some(daemon) if daemon == cli => return None,
+        Some(daemon) => format!(
+            "This `min` uses minimal.toml expansion version {cli}, \
+             and minimald uses expansion version {daemon}."
+        ),
+        None => format!(
+            "This `min` uses minimal.toml expansion version {cli}, \
+             and minimald does not report its expansion version."
+        ),
+    };
+    Some(format!(
+        "{first} The command continues. minimald refuses to create the box \
+         if it reads the box settings differently from this `min`."
+    ))
 }
 
 impl OneshotSshRpc for GetVersion {
@@ -634,6 +672,38 @@ pub struct BoxConfig {
     /// box's name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_ip_registration: Option<String>,
+}
+
+/// The [`BoxConfig::attrs`] key that carries the client's projection
+/// digest of the spec it sends: the base64url SHA-256 of the spec's
+/// Gatehouse §6.3.2 projection (BOX-071). The daemon stores it in the
+/// box's record under the same key, beside its own digest under
+/// [`DAEMON_PROJECTION_DIGEST_ATTR`]. A client that predates the key
+/// sends none, and the record then holds the daemon's digest alone.
+pub const CLIENT_PROJECTION_DIGEST_ATTR: &str = "projection_digest.client";
+
+/// The record `attrs` key under which the daemon stores the digest it
+/// recomputed from the spec it received (BOX-071). Daemon-owned: a
+/// client that sends this key has it stripped at creation.
+pub const DAEMON_PROJECTION_DIGEST_ATTR: &str = "projection_digest.daemon";
+
+impl BoxConfig {
+    /// The projection digest the client computed for the spec it sends,
+    /// [`CLIENT_PROJECTION_DIGEST_ATTR`] (BOX-071). `None` when the client
+    /// sent none.
+    #[must_use]
+    pub fn client_projection_digest(&self) -> Option<&str> {
+        self.attrs
+            .get(CLIENT_PROJECTION_DIGEST_ATTR)
+            .map(String::as_str)
+    }
+
+    /// Sets the projection digest the client computed for the spec it
+    /// sends (BOX-071).
+    pub fn set_client_projection_digest(&mut self, digest: impl Into<String>) {
+        self.attrs
+            .insert(CLIENT_PROJECTION_DIGEST_ATTR.to_owned(), digest.into());
+    }
 }
 
 /// The client verb that asked for a box ([`BoxConfig::creating_verb`]).
@@ -3249,6 +3319,88 @@ impl OneshotSshRpc for GetBoxSpec {
     type Response = Errorable<GetBoxSpecResponse>;
 }
 
+/// An RPC that a command which waited for a box calls before it copies
+/// the box's declared exports (BOX-198). The daemon grants the command
+/// each export of the box's last end that no other command holds or has
+/// reported, and refuses the rest. The connection the RPC came over holds
+/// each granted export until the command reports it with
+/// [`ReportExport`], or until that connection ends (BOX-202).
+pub struct ClaimExports;
+
+/// The request for a [`ClaimExports`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClaimExportsRequest {
+    /// The box, as a listing reports its id.
+    pub id: SessionId,
+    /// The export paths to claim, as the box's spec declares them.
+    pub paths: Vec<String>,
+}
+
+/// The response for a [`ClaimExports`] RPC. A box that has not ended is
+/// an [`Errorable::Err`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClaimExportsResponse {
+    /// The end the claim is for: the count of `exited` events on the box's
+    /// record, so the box's first end is 1.
+    pub end: u64,
+    /// The paths this command holds now, in request order.
+    pub granted: Vec<String>,
+    /// The paths that another command holds or reported for this end, in
+    /// request order.
+    pub refused: Vec<String>,
+}
+
+impl OneshotSshRpc for ClaimExports {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ClaimExports");
+    type Request<'a> = ClaimExportsRequest;
+    type Response = Errorable<ClaimExportsResponse>;
+}
+
+/// An RPC that reports how one claimed export went (BOX-195). The daemon
+/// appends one `file_exported` event to the box's record, and keeps the
+/// export claimed for the end, so no later command copies it again.
+pub struct ReportExport;
+
+/// One file an export wrote under the project root.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExportedFileReport {
+    /// The file's path, relative to the project root.
+    pub path: String,
+    /// Its size in bytes.
+    pub size: u64,
+    /// Its sha256, in lowercase hex.
+    pub sha256: String,
+}
+
+/// The request for a [`ReportExport`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReportExportRequest {
+    /// The box, as a listing reports its id.
+    pub id: SessionId,
+    /// The end the claim was granted for ([`ClaimExportsResponse::end`]).
+    pub end: u64,
+    /// The export's path, as the spec declares it.
+    pub path: String,
+    /// Whether every file and folder of the export was written.
+    pub copied: bool,
+    /// Each file this command wrote for the export.
+    pub files: Vec<ExportedFileReport>,
+}
+
+/// The response for a [`ReportExport`] RPC. A path that this connection
+/// does not hold is an [`Errorable::Err`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReportExportResponse {
+    /// The `ts` of the `file_exported` event the daemon appended.
+    pub ts: u64,
+}
+
+impl OneshotSshRpc for ReportExport {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ReportExport");
+    type Request<'a> = ReportExportRequest;
+    type Response = Errorable<ReportExportResponse>;
+}
+
 /// An RPC to reap one box: delete its record, its events and its
 /// filesystem (BOX-019, BOX-045).
 ///
@@ -3526,6 +3678,20 @@ impl OneshotSshRpc for SessionDelta {
 /// An RPC asking the daemon to shut down its session manager so the process
 /// can terminate gracefully.
 pub struct Shutdown;
+
+/// How long a daemon that answered [`ShutdownResponse::ShuttingDown`] drains
+/// the connections it already accepted before it aborts them. It holds its
+/// instance lock through that drain. A daemon of this build closes its
+/// listener before the drain; an older one keeps it bound until the drain
+/// ends, so a client waiting for the socket to refuse needs this long.
+pub const SHUTDOWN_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long to wait for a daemon that answered [`ShutdownResponse::ShuttingDown`]
+/// to be gone: its drain ([`SHUTDOWN_DRAIN_GRACE`]) and a margin for its exit.
+/// A client waits this long for the daemon's socket to refuse, and a starting
+/// daemon this long for the departing one to release the instance lock.
+pub const SHUTDOWN_DEPARTURE_WAIT: std::time::Duration =
+    SHUTDOWN_DRAIN_GRACE.saturating_add(std::time::Duration::from_secs(1));
 
 /// The request for a [`Shutdown`] RPC.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]

@@ -2,7 +2,7 @@ use crate::network::{NetPlan, Network};
 use crate::{Error, Sandbox};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
@@ -98,9 +98,26 @@ pub enum SandboxMapped {
     File(PathBuf),
     Dir(PathBuf),
     TempDir(tempfile::TempDir),
-    /// Special case of [`SandboxMapped::File`] where the path is
+    /// Special case of [`SandboxMapped::File`] where the file is
     /// copied-in + permissions applied, rather than hardlinked.
-    FileCopy(PathBuf),
+    FileCopy {
+        /// The file whose bytes and mode are copied. For a package file this is
+        /// the resolved path that was checked, never a link.
+        src: PathBuf,
+        /// The single file name the copy gets in the working directory. For a
+        /// package file this is the declared name, which can differ from the
+        /// name of `src` when the declared path is a link inside the package.
+        name: OsString,
+    },
+}
+
+impl SandboxMapped {
+    /// A [`SandboxMapped::FileCopy`] of `src` under its own file name, or
+    /// `None` if `src` has none (it ends in `..` or is a root).
+    pub fn file_copy(src: PathBuf) -> Option<Self> {
+        let name = src.file_name()?.to_os_string();
+        Some(Self::FileCopy { src, name })
+    }
 }
 
 impl PartialEq for SandboxMapped {
@@ -109,14 +126,16 @@ impl PartialEq for SandboxMapped {
             (Self::File(f1), Self::File(f2)) => f1.eq(f2),
             (Self::Dir(d1), Self::Dir(d2)) => d1.eq(d2),
             (Self::TempDir(d1), Self::TempDir(d2)) => d1.path().eq(d2.path()),
-            (Self::FileCopy(f1), Self::FileCopy(f2)) => f1.eq(f2),
+            (Self::FileCopy { src: s1, name: n1 }, Self::FileCopy { src: s2, name: n2 }) => {
+                s1.eq(s2) && n1.eq(n2)
+            }
             _ => false,
         }
     }
 }
 impl Eq for SandboxMapped {}
 
-// Ordered on (variant tag, path), mirroring the `PartialEq`/`Hash` key above,
+// Ordered on (variant tag, path, copy name), mirroring the `PartialEq`/`Hash` key above,
 // so `BTreeSet<SandboxMapped>` iterates — and the rootfs therefore assembles —
 // in the same order in every process. Assembly is first-writer-wins
 // hardlinking, so an unordered collection let a per-process hash seed decide
@@ -128,12 +147,15 @@ impl PartialOrd for SandboxMapped {
 }
 impl Ord for SandboxMapped {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        fn key(m: &SandboxMapped) -> (u8, &Path) {
+        // The copy name is part of the key: two copies of one file under
+        // different names are different entries, as `PartialEq` says.
+        fn key(m: &SandboxMapped) -> (u8, &Path, &OsStr) {
+            let none = OsStr::new("");
             match m {
-                SandboxMapped::File(p) => (0, p),
-                SandboxMapped::Dir(p) => (1, p),
-                SandboxMapped::TempDir(t) => (2, t.path()),
-                SandboxMapped::FileCopy(p) => (3, p),
+                SandboxMapped::File(p) => (0, p, none),
+                SandboxMapped::Dir(p) => (1, p, none),
+                SandboxMapped::TempDir(t) => (2, t.path(), none),
+                SandboxMapped::FileCopy { src, name } => (3, src, name),
             }
         }
         key(self).cmp(&key(other))
@@ -155,9 +177,10 @@ impl Hash for SandboxMapped {
                 "t".hash(state);
                 p.path().hash(state);
             }
-            Self::FileCopy(p) => {
+            Self::FileCopy { src, name } => {
                 "fc".hash(state);
-                p.hash(state);
+                src.hash(state);
+                name.hash(state);
             }
         }
     }
@@ -484,6 +507,33 @@ pub struct Invocation {
 }
 
 impl Config {
+    /// The session tree, home or workbench, that the host path `host` is in,
+    /// with the tree's host path, `host` relative to it, and how the box
+    /// shows the tree (`~`, `/workbench`) with its name, for a refusal;
+    /// `None` outside a session layout or outside both trees.
+    #[cfg(target_os = "linux")]
+    fn session_tree_of(&self, host: &Path) -> Option<(PathBuf, PathBuf, String, &'static str)> {
+        let WdSetup::Session {
+            home,
+            working,
+            working_name_override,
+            ..
+        } = &self.wd
+        else {
+            return None;
+        };
+        // The same trees, lookup and view the closure's binds use
+        // (`session_bind`), so the daemon's create and the closure's bind
+        // pick one tree for a host path and name it one way.
+        let wd = working_name_override
+            .as_deref()
+            .unwrap_or(crate::SESSION_DEFAULT_WD);
+        let trees = crate::session_bind::Tree::session(home, working, wd);
+        let (tree, rel) = crate::session_bind::in_tree(&trees, host)?;
+        let view = crate::session_bind::TreeView::of(&tree.mount, tree.name);
+        Some((tree.host.clone(), rel, view.shown.to_string(), tree.name))
+    }
+
     /// The home directory a command in this sandbox sees, as an absolute path
     /// inside the sandbox. One definition, used for both `$HOME` and the
     /// synthesized passwd entry so the two can never disagree.
@@ -1007,16 +1057,38 @@ impl Config {
                     }
 
                     // Missing and needs to be created.
+                    let contents = if m.host_path.ends_with(".json") {
+                        "{}"
+                    } else {
+                        ""
+                    };
+                    // Inside a session's home or workbench the box owns every
+                    // name, and a dangling link there would carry `fs::write`
+                    // or `create_dir_all` out of the tree. The path is created
+                    // beneath the tree, never out of it (inbox#1152).
+                    #[cfg(target_os = "linux")]
+                    if let Some((root, rel, shown, name)) =
+                        self.session_tree_of(Path::new(&m.host_path))
+                    {
+                        let view = crate::session_bind::TreeView {
+                            shown: &shown,
+                            name,
+                        };
+                        let bytes = contents.as_bytes();
+                        let created = crate::session_bind::create_beneath(
+                            &root, view, &rel, m.is_file, bytes,
+                        );
+                        created.map_err(|e| {
+                            Error::IO(
+                                "create mapped path in the session's home or workbench",
+                                m.host_path.clone().into(),
+                                e,
+                            )
+                        })?;
+                        continue;
+                    }
                     if m.is_file {
-                        fs::write(
-                            &m.host_path,
-                            if m.host_path.ends_with(".json") {
-                                "{}"
-                            } else {
-                                ""
-                            },
-                        )
-                        .map_err(|e| {
+                        fs::write(&m.host_path, contents).map_err(|e| {
                             Error::IO("create mapped file", m.host_path.clone().into(), e)
                         })?;
                     } else {
@@ -1125,6 +1197,43 @@ fn fit_box_name(name: &str, budget: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two copies of one file under different names stage two files, so the
+    /// set that assembles them must keep both: equality, order and hash all
+    /// read the name.
+    #[test]
+    fn copies_of_one_file_under_two_names_are_two_entries() {
+        use std::collections::HashSet;
+        let named = SandboxMapped::FileCopy {
+            src: "/pkg/files/a.patch".into(),
+            name: "link.patch".into(),
+        };
+        let own = SandboxMapped::file_copy("/pkg/files/a.patch".into()).unwrap();
+        assert_eq!(
+            own,
+            SandboxMapped::FileCopy {
+                src: "/pkg/files/a.patch".into(),
+                name: "a.patch".into(),
+            }
+        );
+        assert_ne!(named, own);
+        assert_ne!(named.cmp(&own), std::cmp::Ordering::Equal);
+        let fresh = || SandboxMapped::file_copy("/pkg/files/a.patch".into()).unwrap();
+        let mut set = BTreeSet::new();
+        set.insert(named);
+        set.insert(own);
+        set.insert(fresh());
+        assert_eq!(set.len(), 2);
+        let hashed: HashSet<_> = set.into_iter().collect();
+        assert_eq!(hashed.len(), 2);
+        assert!(hashed.contains(&fresh()));
+    }
+
+    #[test]
+    fn a_path_with_no_file_name_has_no_own_copy() {
+        assert_eq!(SandboxMapped::file_copy("/".into()), None);
+        assert_eq!(SandboxMapped::file_copy("/pkg/..".into()), None);
+    }
 
     #[test]
     fn the_devpts_remount_keeps_the_box_ptmx_open_and_caps_at_box_pty_max() {

@@ -611,6 +611,9 @@ mod tests {
         fn filename(&self) -> String {
             self.filename.clone()
         }
+        fn origin(&self) -> String {
+            "fake://cache".to_string()
+        }
     }
 
     /// A FetchBackend that panics on `get` / `execute`. Used by offline-mode
