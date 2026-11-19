@@ -3372,8 +3372,9 @@ pub(crate) fn stamp_client_projection_digest(
 }
 
 /// Adds each `--vpn-network-names` value to the `network.vpn_network_names`
-/// list of the spec on `request` (BCLI-024). A name the list already holds
-/// is not added again. The daemon stores the list with the box's spec, and
+/// list of the spec on `request` (BCLI-024). The list already holds the
+/// names the entry declares, so a flag value adds to them, after them. A
+/// name the list already holds is not added again. The daemon stores the list with the box's spec, and
 /// does not enforce it (BOX-076). Nothing changes when `names` is empty.
 ///
 /// # Errors

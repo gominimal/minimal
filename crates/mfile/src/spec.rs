@@ -401,7 +401,8 @@ impl BoxSpec {
 /// entry sets none. The expansion refuses a value that is not a list of
 /// strings (see [`check_section`]), and a value that is not a string is
 /// left out here.
-fn entry_vpn_network_names(extra: &toml::Table) -> Vec<String> {
+#[must_use]
+pub fn entry_vpn_network_names(extra: &toml::Table) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     let listed = extra
         .get("network")
@@ -758,11 +759,7 @@ struct DocNetwork {
     bep: Option<StoredExport>,
 }
 
-kept_fields!(
-    DocNetwork,
-    "network",
-    [dynamic_ingress, bep,]
-);
+kept_fields!(DocNetwork, "network", [dynamic_ingress, bep,]);
 
 /// Refuses the flat `[network]` egress key `flat` in a stored spec, and
 /// names the nested `egress.*` key that a stored spec carries in its place.
