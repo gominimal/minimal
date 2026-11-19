@@ -1771,10 +1771,10 @@ fn root_constraint_refusal(
 }
 
 /// The admission check of BOX-160 for a start from a box's stored spec
-/// (BOX-025, BOX-176): the stored bytes go through
-/// [`root_constraint_refusal`], the check a create of the same spec meets,
-/// with the record's type in the place of the creating verb's. A start is
-/// refused wherever a create of that spec would be.
+/// (BOX-025, BOX-176): `spec`, the stored spec as its caller parsed it,
+/// goes through [`root_constraint_refusal`], the check a create of the
+/// same spec meets, with the record's type in the place of the creating
+/// verb's. A start is refused wherever a create of that spec would be.
 ///
 /// # Errors
 ///
@@ -1782,17 +1782,10 @@ fn root_constraint_refusal(
 /// from it rather than a create. A create refuses it with exit 3, and so
 /// does the start.
 pub(crate) fn stored_spec_root_refusal(
-    stored: &[u8],
+    spec: &serde_json_lenient::Value,
     record_type: &str,
 ) -> Result<(), std::io::Error> {
-    let refused = |why: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, why);
-    let spec =
-        serde_json_lenient::from_slice::<serde_json_lenient::Value>(stored).map_err(|e| {
-            refused(format!(
-                "The settings it was created with cannot be read: {e}."
-            ))
-        })?;
-    let why = match root_constraint_refusal(&spec, record_type) {
+    let why = match root_constraint_refusal(spec, record_type) {
         Ok(()) => return Ok(()),
         Err(AdmissionRootRefusal::Constraint(refusal)) => format!(
             "The settings it was created with set `{key}` to `{value}`, and a {kind} \
@@ -1811,13 +1804,23 @@ pub(crate) fn stored_spec_root_refusal(
              `{key}` to `{value}`, and the built-in type `{builtin_type}` is its own root."
         ),
         Err(AdmissionRootRefusal::UnknownRoot(UnknownRootRefusal { key, value, .. })) => {
-            format!(
-                "The settings it was created with set `{key}` to `{value}`, which names no \
-                 built-in type."
-            )
+            // As the create's refusal words it: a `type.root` that is not
+            // a built-in type, or a project type that does not name the
+            // built-in type it extends.
+            if key == "type.root" {
+                format!(
+                    "The settings it was created with set `type.root` to `{value}`, which is \
+                     not a built-in type."
+                )
+            } else {
+                format!(
+                    "The settings it was created with set `box.type` to `{value}`, but they \
+                     do not name the built-in type that `{value}` extends."
+                )
+            }
         }
     };
-    Err(refused(why))
+    Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, why))
 }
 
 /// Checks `spec` against the constraints of the built-in `root`, for a

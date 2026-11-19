@@ -330,14 +330,18 @@ a terminal (`tty`), is connected without one (`attached`) or runs on its own
 
 | Flag | Short | Description |
 |------|-------|-------------|
-| `--network` | | Show the box's effective network policy in place of the box: the ingress and egress rules in force, and the ports the box published while it runs |
+| `--network` | | Show the box's effective network policy in place of the box: the ingress and egress rules in force, the ports the box published while it runs, and the VPN networks the box keeps |
 | `--output <json\|yaml>` | `-o` | Write the box and its running commands in this format instead of text. With `--network`, only `json` is available |
 
 `--network` prints the rules the box runs under. A box with no egress rules
 of its own shows the default it gets, such as `deny-all (default)`. The ports
 the box published while it runs follow, under
-`live ingress (published at runtime)`. With `-o json`, `--network` writes
-one JSON document, `min/v1/session-policy`, in place of the text. The
+`live ingress (published at runtime)`. The VPN networks the box keeps
+follow last, under `vpn networks (not connected yet)`. They are the
+entry's `network.vpn_network_names`, then each `--vpn-network-names`
+value. `minimald` does not connect the box to a VPN yet. With `-o json`,
+`--network` writes one JSON document, `min/v1/session-policy`, in place
+of the text. The document lists the names in `vpn_network_names`. The
 command refuses `-o yaml` with `--network`, with exit code 2.
 
 A `build boxes` block follows while a package builds for the box, with one

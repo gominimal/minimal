@@ -15226,9 +15226,9 @@ async fn resume_restarts_from_stored_spec_same_id_and_name() {
 }
 
 /// BOX-025: a box whose stored spec carries a schema key that the typed
-/// spec does not read, such as `io.exec_enabled` or
-/// `network.vpn_network_names`, resumes. It does not stay stopped on an
-/// unknown field.
+/// spec does not read, such as `io.exec_enabled`, resumes. So does one
+/// with `network.vpn_network_names`, which the typed spec reads. It does
+/// not stay stopped on an unknown field.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resume_reads_stored_spec_with_exec_enabled_and_vpn_names() {
     use boxes::core::record::RecordState;
@@ -15249,7 +15249,7 @@ async fn resume_reads_stored_spec_with_exec_enabled_and_vpn_names() {
     let stored = std::fs::read(record_dir(&server, id).await.join("spec.json")).unwrap();
     let read = crate::box_runtime::stored_spec(&stored).expect("the daemon reads the stored spec");
     assert!(read.kept_keys.contains_key("io.exec_enabled"));
-    assert!(read.kept_keys.contains_key("network.vpn_network_names"));
+    assert_eq!(read.network.vpn_network_names, ["corp"]);
 
     stop_through_daemon(&server, id).await;
 
@@ -15503,7 +15503,10 @@ async fn resume_refuses_stored_spec_its_root_excludes_keeps_state() {
         &mut client,
         id,
         RecordState::Stopped(ending),
-        &["`box.type` to `no-such-root`", "names no built-in type"],
+        &[
+            "`box.type` to `no-such-root`",
+            "do not name the built-in type that `no-such-root` extends",
+        ],
         3,
     )
     .await;
@@ -16421,10 +16424,13 @@ async fn until_complete_ends_on_entrypoint_return_without_client_then_a_run_read
     }
 }
 
-// BOX-015, T43: a task box with its own network address runs its project's
-// activate hooks in a shell that holds the box's host-side row. The shell
-// never exits, so a run that relayed it would wait for a task that never
-// starts. The run is refused at once, and the refusal says why.
+// BOX-015, T43, #3077: a task box with its own network address runs its
+// project's activate hooks in a shell that holds the box's host-side row.
+// The shell never exits, so a run that relayed it would wait for a task
+// that never starts. No VM host daemon answers here that the row stands,
+// so replacing the shell would leave the box rowless. The run is refused at
+// once, and the refusal says why. The standing-row run is
+// `until_complete_ends_on_entrypoint_return_without_client_runs_a_task_behind_a_hook_shell`.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn until_complete_ends_on_entrypoint_return_without_client_refuses_a_run_behind_a_hook_shell()
@@ -16488,6 +16494,121 @@ async fn until_complete_ends_on_entrypoint_return_without_client_refuses_a_run_b
         stderr.starts_with("Task check did not start in box "),
         "the refusal names the task and the box, with no spawn-failure prefix: {stderr:?}"
     );
+}
+
+// #3077, NET-138, BOX-038: a task box with its own network address runs
+// its project's activate hooks in a shell that binds the box's host-side
+// row. A task run asks the VM host daemon whether that row stands, replaces
+// the hook shell with the box's entrypoint, and rejoins the row. The run
+// relays the task's output and returns the task's exit code.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn until_complete_ends_on_entrypoint_return_without_client_runs_a_task_behind_a_hook_shell() {
+    use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
+
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("activated");
+    let switch_address = std::net::Ipv4Addr::new(100, 64, 128, 25);
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let sock = daemon_switch_control(&server).await;
+    let door_sock = sock.with_file_name("row-door.sock");
+    let (door, mut reads, replies) = fake_report_door(&door_sock).await;
+    replies
+        .send(minimald_rpc::BoxControlReply::BoxIdMinted {
+            minted_box_id: HANDED_BOX_ID,
+        })
+        .expect("the report door stand-in lives");
+
+    let mut spec = mfile::spec::BoxSpec::for_task(
+        "check",
+        &mfile::Task::default(),
+        mfile::spec::SpecFlags::default(),
+    )
+    .expect("a task that is not interactive has a spec");
+    spec.entrypoint = mfile::spec::Entrypoint::Exec(vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "echo task-ran; exit 7".to_string(),
+    ]);
+    let mut req = own_ip_handed_session_req(
+        "check",
+        switch_address,
+        std::net::Ipv4Addr::new(127, 0, 64, 25),
+    );
+    req.config.creating_verb = minimald_rpc::CreatingVerb::Task;
+    req.spec = Some(serde_json_lenient::to_value(&spec).expect("a spec serializes"));
+    crate::net::listeners::seed_vm_report_door_for_tests(&sock, &door_sock);
+    let id = client.call::<CreateSession>(&req).await.unwrap().id;
+    crate::net::listeners::clear_vm_report_door_for_tests(&sock);
+    assert_eq!(id, HANDED_BOX_ID, "the box takes the VM host daemon's id");
+    match reads.recv().await.expect("the report door stand-in lives") {
+        minimald_rpc::BoxControlRequest::MintBoxId(_) => {}
+        other => panic!("expected a mint ask, got {other:?}"),
+    }
+    crate::test_harness::unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: contribution_with_hook(boxes::wire::primitives::WireLifecycleHook {
+                    on_activate: Some(inline(marker_body(&marker))),
+                    ..Default::default()
+                }),
+            })
+            .await
+            .unwrap(),
+    );
+    finalize_session(&mut client, id).await;
+    assert!(marker.exists(), "the activate hook launched the box");
+
+    // Once before the hook shell ends, and again once the task's host is up.
+    crate::net::listeners::seed_vm_report_door_for_tests(&sock, &door_sock);
+    for _ in 0..2 {
+        replies
+            .send(minimald_rpc::BoxControlReply::RowStanding {
+                switch_address,
+                row_standing: true,
+            })
+            .expect("the report door stand-in lives");
+    }
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        client.exec(
+            &[(crate::MINIMAL_SESSION_ID_ENV, &id.to_string())],
+            false,
+            &task_box_run_request(),
+            b"",
+        ),
+    )
+    .await
+    .expect("the run ends when the task returns")
+    .expect("the daemon takes the run");
+    crate::net::listeners::clear_vm_report_door_for_tests(&sock);
+    let stderr = String::from_utf8_lossy(&outcome.stderr);
+    assert_eq!(outcome.exit_status, Some(7), "{outcome:?}: {stderr}");
+    assert!(
+        !stderr.contains(super::ENTRYPOINT_BEHIND_HOOK_SHELL),
+        "the run was not refused: {stderr:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&outcome.stdout).contains("task-ran"),
+        "the run relays the task's output: {outcome:?}"
+    );
+    for _ in 0..2 {
+        let read = tokio::time::timeout(Duration::from_secs(5), reads.recv())
+            .await
+            .expect("the run asked the VM host daemon whether the row stands")
+            .expect("the report door stand-in lives");
+        assert_eq!(
+            read,
+            minimald_rpc::BoxControlRequest::RowStanding(minimald_rpc::RowStandingRequest {
+                switch_address,
+                box_id: Some(HANDED_BOX_ID),
+            }),
+            "the run reads the box's own row, nothing else"
+        );
+    }
+    door.abort();
 }
 
 // BOX-038, T43: a task box holds a shell for its activate hooks, and the
@@ -17319,11 +17440,28 @@ async fn restart_box_in(server: &TestServer, id: SessionId) -> Result<bool, supe
 }
 
 /// The refusal a restart of `id` answers. Panics when it was not refused.
+///
+/// A refused restart of an ended box ends the actor it started, and the
+/// manager evicts that actor a moment later. A restart sent in between
+/// reaches the ending actor and is answered "The session ended before its
+/// restart finished." So this waits for the eviction before it returns, as
+/// [`stop_through_daemon`] does after a stop.
 async fn restart_refusal(server: &TestServer, id: SessionId) -> minimald_rpc::RestartRefusal {
-    match restart_box_in(server, id).await {
+    let manager = server.state.sessions_manager().await;
+    let before = manager.running_count().await;
+    let refusal = match restart_box_in(server, id).await {
         Err(super::RestartError::Refused(refusal)) => refusal,
         other => panic!("the restart was not refused: {other:?}"),
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while manager.running_count().await > before {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the actor a refused restart started was not evicted"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    refusal
 }
 
 /// The types of the events of `id`, in the order they were written.
@@ -17483,6 +17621,94 @@ async fn restart_refuses_box_not_until_stopped_keeps_state() {
     assert_eq!(refusal.kind, RestartRefusalKind::Lifetime);
     assert_eq!(
         read_record(&server, bare).await.state().unwrap(),
+        RecordState::Running
+    );
+}
+
+/// BOX-160, BOX-176: a restart meets the admission check a create of its
+/// stored spec meets, as a resume does. An until_stopped box whose stored
+/// spec its root excludes is refused with exit 3, and the record stays as
+/// it was, byte for byte. A project type that does not name the built-in
+/// type it extends is refused as the create refuses it. The control: the
+/// spec the create accepted restarts once it is stored again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_refuses_stored_spec_its_root_excludes_keeps_state() {
+    use boxes::core::record::RecordState;
+    use minimald_rpc::RestartRefusalKind;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_session_with_spec(
+        &mut client,
+        Some("restart-root"),
+        "/uwu",
+        Some(until_stopped_spec(true)),
+    )
+    .await;
+    let ending = stop_through_daemon(&server, id).await;
+    let record_path = record_dir(&server, id).await.join("record.json");
+    let spec_of_type = |box_type: &str| {
+        let mut spec = until_stopped_spec(true);
+        spec["box"]["type"] = box_type.into();
+        spec
+    };
+
+    // The `task` root allows no terminal.
+    rewrite_spec(&server, id, &spec_of_type(boxes::TASK_BOX_TYPE)).await;
+    let before = std::fs::read(&record_path).unwrap();
+    let refusal = restart_refusal(&server, id).await;
+    assert_eq!(
+        (refusal.kind, refusal.exit_code),
+        (RestartRefusalKind::Spec, 3),
+        "{refusal}"
+    );
+    for words in [
+        "It stays stopped.",
+        "`io.pty_enabled` to `true`",
+        "the built-in type `task` allows only `false`",
+        "min session destroy restart-root",
+    ] {
+        assert!(
+            refusal.message.contains(words),
+            "{words:?} not in {refusal}"
+        );
+    }
+    assert_eq!(std::fs::read(&record_path).unwrap(), before);
+
+    // A project type whose spec does not name the built-in type it extends.
+    rewrite_spec(&server, id, &spec_of_type("ci")).await;
+    let refusal = restart_refusal(&server, id).await;
+    assert_eq!(
+        (refusal.kind, refusal.exit_code),
+        (RestartRefusalKind::Spec, 3),
+        "{refusal}"
+    );
+    for words in [
+        "It stays stopped.",
+        "`box.type` to `ci`, but they do not name",
+        "the built-in type that `ci` extends",
+    ] {
+        assert!(
+            refusal.message.contains(words),
+            "{words:?} not in {refusal}"
+        );
+    }
+    assert_eq!(std::fs::read(&record_path).unwrap(), before);
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        RecordState::Stopped(ending)
+    );
+
+    // The control: the box as the create filed it restarts.
+    rewrite_spec(&server, id, &until_stopped_spec(true)).await;
+    assert!(
+        !restart_box_in(&server, id)
+            .await
+            .expect("a stored spec the create accepted restarts"),
+        "the box was stopped"
+    );
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
         RecordState::Running
     );
 }
@@ -17773,6 +17999,214 @@ async fn restart_records_exited_then_started_only() {
     assert_eq!(added, [BoxEventType::Started], "{added:?}");
 }
 
+/// The kinds of the events `id` recorded, once `want` of them are written.
+/// The end of a box writes its `exited` event after its record, so a test
+/// that saw the record waits here for the event.
+async fn event_kinds_once(
+    server: &TestServer,
+    id: SessionId,
+    want: usize,
+) -> Vec<boxes::events::BoxEventType> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let kinds: Vec<_> = event_kinds(server, id)
+            .await
+            .iter()
+            .map(|e| e.kind)
+            .collect();
+        if kinds.len() >= want || tokio::time::Instant::now() >= deadline {
+            return kinds;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// BOX-040: a task box records `started` when its run starts the
+/// entrypoint, between its `created` and its `exited`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn created_task_box_records_started() {
+    use boxes::events::BoxEventType;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_task_box(&mut client, &["/bin/sh", "-c", "exit 0"]).await;
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        client.exec(
+            &[(crate::MINIMAL_SESSION_ID_ENV, &id.to_string())],
+            false,
+            &task_box_run_request(),
+            b"",
+        ),
+    )
+    .await
+    .expect("the run ends when the entrypoint returns")
+    .expect("the daemon takes the run");
+    assert_eq!(outcome.exit_status, Some(0), "{outcome:?}");
+    let manager = server.state.sessions_manager().await;
+    record_once_exited(&manager, id).await;
+
+    let kinds = event_kinds_once(&server, id, 3).await;
+    assert_eq!(
+        kinds,
+        [
+            BoxEventType::Created,
+            BoxEventType::Started,
+            BoxEventType::Exited
+        ],
+        "{kinds:?}"
+    );
+}
+
+/// BOX-040: a session box records `started` when its first attach starts
+/// its shell, after its `created`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn created_session_box_records_started() {
+    use boxes::events::BoxEventType;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_session_with_spec(
+        &mut client,
+        Some("started-session"),
+        "/uwu",
+        Some(resume_spec(true)),
+    )
+    .await;
+    attach_and_echo(&mut client, id)
+        .await
+        .expect("the attach starts the shell");
+
+    let kinds = event_kinds_once(&server, id, 2).await;
+    assert_eq!(
+        kinds,
+        [BoxEventType::Created, BoxEventType::Started],
+        "{kinds:?}"
+    );
+}
+
+/// BOX-040: an attach that resumes a stopped session box records
+/// `resumed` and then `started`, and no second `started`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resumed_session_box_records_started() {
+    use boxes::events::BoxEventType;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_session_with_spec(
+        &mut client,
+        Some("resumed-session"),
+        "/uwu",
+        Some(resume_spec(true)),
+    )
+    .await;
+    attach_and_echo(&mut client, id)
+        .await
+        .expect("the attach starts the shell");
+    stop_through_daemon(&server, id).await;
+    let before = event_kinds(&server, id).await.len();
+
+    attach_and_echo(&mut client, id)
+        .await
+        .expect("an attach to a stopped PTY box resumes it");
+    let kinds = event_kinds_once(&server, id, before + 2).await;
+    assert_eq!(
+        kinds[before..],
+        [BoxEventType::Resumed, BoxEventType::Started],
+        "{kinds:?}"
+    );
+}
+
+/// BOX-040: an `until_stopped` box stays `running` when its shell returns,
+/// so the host that a second attach mints, and the host that a `min exec`
+/// after that shell returns mints, write no second `started`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reattached_running_box_records_started_once() {
+    use boxes::events::BoxEventType;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_until_stopped_session(&mut client).await;
+
+    let mut channel = client.open_shell(id).await;
+    await_echo(&mut channel).await;
+    keep_exit(&mut channel).await;
+
+    let mut channel = client.open_shell(id).await;
+    await_echo(&mut channel).await;
+    let kinds: Vec<_> = event_kinds(&server, id)
+        .await
+        .iter()
+        .map(|e| e.kind)
+        .collect();
+    assert_eq!(
+        kinds,
+        [BoxEventType::Created, BoxEventType::Started],
+        "a second attach to a running box writes no second started: {kinds:?}"
+    );
+
+    keep_exit(&mut channel).await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves");
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an exec launches a host in the running box");
+    assert!(host.is_alive());
+    let kinds: Vec<_> = event_kinds(&server, id)
+        .await
+        .iter()
+        .map(|e| e.kind)
+        .collect();
+    assert_eq!(
+        kinds,
+        [BoxEventType::Created, BoxEventType::Started],
+        "an exec after the shell returned writes no second started: {kinds:?}"
+    );
+}
+
+/// BOX-040: a resume whose attach mints a host that then wedges stores that
+/// host, so the entrypoint started. The attach refuses busy, and the box
+/// still records `resumed` and then `started`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resumed_session_box_records_started_when_attach_wedges() {
+    use boxes::events::BoxEventType;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_session_with_spec(
+        &mut client,
+        Some("resumed-wedged"),
+        "/uwu",
+        Some(resume_spec(true)),
+    )
+    .await;
+    attach_and_echo(&mut client, id)
+        .await
+        .expect("the attach starts the shell");
+    stop_through_daemon(&server, id).await;
+    let before = event_kinds(&server, id).await.len();
+
+    super::mint_attach_seam::seed(id, super::mint_attach_seam::Failure::HostWedged);
+    let mut channel = client.open_shell(id).await;
+    let refusal = collect_to_close(&mut channel).await;
+    assert!(
+        refusal.contains("the session is busy; run the attach again in a moment"),
+        "the wedged host reads as busy, got: {refusal:?}"
+    );
+    let kinds = event_kinds_once(&server, id, before + 2).await;
+    assert_eq!(
+        kinds[before..],
+        [BoxEventType::Resumed, BoxEventType::Started],
+        "{kinds:?}"
+    );
+}
+
 /// BOX-176, BOX-178: an argv until_stopped box that holds a host-side row
 /// and sets `hooks_on_resume` cannot start its entrypoint behind the shell
 /// its `on_activate` hooks run in. Its restart fails after the stop: the
@@ -17815,10 +18249,19 @@ async fn restart_argv_box_behind_hook_shell_with_host_row_fails_stopped() {
             let text = error.to_string();
             assert!(
                 text.contains(
-                    "Session `argv-behind-hooks` did not start again. It is stopped now."
+                    "Session `argv-behind-hooks` did not start again. It is stopped now. \
+                     The box has its own network address. \
+                     Its command must replace the shell that ran the project's activate hooks. \
+                     A restart cannot keep the address when that shell ends, \
+                     so the command did not start."
                 ),
                 "{text}"
             );
+            assert!(
+                !text.contains(super::ENTRYPOINT_BEHIND_HOOK_SHELL),
+                "a restart does not print the task-run text: {text}"
+            );
+            assert!(!text.contains("session spawn:"), "{text}");
         }
         other => panic!("the restart did not fail: {other:?}"),
     }

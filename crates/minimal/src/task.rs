@@ -123,8 +123,8 @@ pub(crate) fn take_expanded_exports(spec: &mut mfile::spec::BoxSpec, expanded: &
 
 /// Puts the stored spec of a task run on `request` (BOX-068). `spec` is
 /// the declared task's spec, `None` for an interactive task. `expanded` is
-/// the task entry's expansion, whose `[[file_exports]]` items the spec takes
-/// (BOX-203). Then each `--vpn-network-names` value, `vpn_network_names`,
+/// the task entry's expansion, whose `[[file_exports]]` items and
+/// `network.vpn_network_names` the spec takes (BOX-203, BCLI-024). Then each `--vpn-network-names` value, `vpn_network_names`,
 /// goes on the stored spec (BCLI-024). That edits the stored JSON, so it
 /// runs after `put_spec`, and once.
 ///
@@ -142,6 +142,9 @@ pub(crate) fn put_task_spec(
     if let Some(spec) = spec {
         if let Some(expanded) = expanded {
             take_expanded_exports(spec, expanded);
+            // The expansion holds the names `[defaults]` and the task's
+            // type declare too. A flag value adds to them below.
+            spec.network.vpn_network_names = mfile::spec::entry_vpn_network_names(expanded);
         }
         crate::put_spec(request, spec)?;
     } else {
