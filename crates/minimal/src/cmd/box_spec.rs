@@ -552,6 +552,26 @@ fn session_defaults_rows(
     Ok((bep, secrets, quic443))
 }
 
+/// The egress of an entry with an empty body of the `session` Box Type:
+/// the same entry that [`session_defaults_rows`] expands, read over
+/// `[defaults]` and `[defaults.session]`.
+fn session_defaults_egress(project: &Path) -> anyhow::Result<crate::ProjectEgress> {
+    let Some((_, bytes)) = project_file_bytes(project)? else {
+        return Ok(Default::default());
+    };
+    let file: toml::Table = toml::from_slice(&bytes).map_err(|error| crate::ProjectFileInvalid {
+        error: mfile::Error::Format(error),
+    })?;
+    let entry = mfile::entry::BoxEntry {
+        name: mfile::entry::DEFAULT_ENTRY_NAME.to_owned(),
+        table: mfile::entry::EntryTable::Sessions,
+        box_type: Some(boxes::SESSION_BOX_TYPE.to_owned()),
+        body: toml::Table::new(),
+        implicit: true,
+    };
+    super::box_verbs::entry_egress(&file, entry)
+}
+
 /// The network mode and the effective egress that `min box start` gives
 /// the session box of `project`, with `--network` from `args`. The same
 /// helpers as the start resolve them, so the start and the preview check
@@ -573,8 +593,10 @@ fn project_network(
     let mut project_egress = match super::box_verbs::project_egress(project, None) {
         Ok(project_egress) => project_egress,
         // The bare form is read-only and never refuses for the session
-        // entry pick (D3598). With no single entry, it previews no project
-        // egress, and the flags still apply.
+        // entry pick (D3598). With no single entry, it previews the egress
+        // of the empty-body session entry that `session_defaults_rows`
+        // reads the grants from, so the check sees the `[defaults.network]`
+        // and `[defaults.session.network]` egress of those grants.
         Err(error)
             if error
                 .downcast_ref::<crate::SessionEntryUndecided>()
@@ -582,9 +604,9 @@ fn project_network(
         {
             tracing::debug!(
                 error = %error,
-                "min box spec: no single session entry, previewing no project egress"
+                "min box spec: no single session entry, previewing the egress of the merged [defaults] and [defaults.session] tables"
             );
-            Default::default()
+            session_defaults_egress(project.as_std_path())?
         }
         Err(error) => return Err(error),
     };

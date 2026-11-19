@@ -18682,7 +18682,28 @@ async fn box_spec_bare_reads_defaults_network_bep_matches_start_projection() {
     assert!(bare.contains("GH_TOKEN"), "{bare}");
 }
 
-// BCLI-021: `min box spec <entry>` with the `[network]` override flags
+// D3598: with no single session entry, bare `min box spec` checks the
+// grants it reads from the merged `[defaults]` and `[defaults.session]`
+// tables against the egress of that same entry. A `[defaults.network]`
+// egress that admits the GitHub hosts lets an `own_ip` preview render the
+// broker grant, and the command does not refuse.
+#[tokio::test]
+async fn box_spec_bare_reads_defaults_network_bep_undecided_entry_own_ip_egress() {
+    let (_project, global) = spec_project(
+        "[defaults.network.bep]\nsteering = \"proxy_env\"\n\n\
+         [defaults.network.egress]\nallow_dns_hosts = [\"github.com\", \"api.github.com\", \
+         \"uploads.github.com\", \"codeload.github.com\"]\n\n\
+         [defaults.session.secrets.GH_TOKEN]\nsource = \"broker\"\nscopes = [\"github:full\"]\n\n\
+         [sessions.one]\npackages = [\"git\"]\n\n\
+         [sessions.two]\npackages = [\"git\"]\n",
+    );
+    let bare = box_spec_text(&global, &["min", "box", "spec", "--network", "own_ip"])
+        .await
+        .expect("the rows render, and the egress admits the grant");
+    assert!(bare.contains("GH_TOKEN"), "{bare}");
+}
+
+// BCLI-021:`min box spec <entry>` with the `[network]` override flags
 // renders the network that `min box start` sends with the same flags:
 // the mode, the egress and the ingress, each flag marked as the source.
 #[tokio::test]

@@ -1552,7 +1552,7 @@ fn task_egress_from(bytes: &[u8], task: &str) -> anyhow::Result<ProjectEgress> {
 
 /// The egress of `entry` in the parsed `file`: its `[defaults]`,
 /// `[defaults.<type>]` and entry layers, read as [`project_egress`] says.
-fn entry_egress(
+pub(crate) fn entry_egress(
     file: &toml::Table,
     entry: mfile::entry::BoxEntry,
 ) -> anyhow::Result<ProjectEgress> {
