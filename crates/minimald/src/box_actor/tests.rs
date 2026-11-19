@@ -18876,6 +18876,58 @@ async fn resumed_session_box_records_started() {
     );
 }
 
+/// BOX-040: an `until_stopped` box stays `running` when its shell returns,
+/// so the host that a second attach mints, and the host that a `min exec`
+/// after that shell returns mints, write no second `started`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reattached_running_box_records_started_once() {
+    use boxes::events::BoxEventType;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_until_stopped_session(&mut client).await;
+
+    let mut channel = client.open_shell(id).await;
+    await_echo(&mut channel).await;
+    keep_exit(&mut channel).await;
+
+    let mut channel = client.open_shell(id).await;
+    await_echo(&mut channel).await;
+    let kinds: Vec<_> = event_kinds(&server, id)
+        .await
+        .iter()
+        .map(|e| e.kind)
+        .collect();
+    assert_eq!(
+        kinds,
+        [BoxEventType::Created, BoxEventType::Started],
+        "a second attach to a running box writes no second started: {kinds:?}"
+    );
+
+    keep_exit(&mut channel).await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves");
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an exec launches a host in the running box");
+    assert!(host.is_alive());
+    let kinds: Vec<_> = event_kinds(&server, id)
+        .await
+        .iter()
+        .map(|e| e.kind)
+        .collect();
+    assert_eq!(
+        kinds,
+        [BoxEventType::Created, BoxEventType::Started],
+        "an exec after the shell returned writes no second started: {kinds:?}"
+    );
+}
+
 /// BOX-040: a resume whose attach mints a host that then wedges stores that
 /// host, so the entrypoint started. The attach refuses busy, and the box
 /// still records `resumed` and then `started`.

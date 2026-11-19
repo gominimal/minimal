@@ -2480,6 +2480,9 @@ impl BoxActor {
         }
         self.unrecorded_stop = None;
         let state = boxes::core::record::RecordState::Stopped(ending);
+        // BOX-040: the record left `running`, so the next start writes
+        // `started` again.
+        self.started_recorded = false;
         tracing::info!(
             box_id = %box_id,
             exit_code = state.exit_code(),
