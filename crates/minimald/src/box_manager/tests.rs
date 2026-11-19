@@ -78,9 +78,9 @@ async fn create_and_configure(
     (state, cache, mngr, id, response)
 }
 
-/// A project mfile whose `[session.vars]` entry forces the composer down
+/// A project mfile whose `[defaults.session.env_vars]` entry forces the composer down
 /// the Pending path: a daemon-collected var must be gated by the client.
-const PENDING_VAR_MFILE: &str = "[session.vars]\nRUST_LOG = \"info\"\n";
+const PENDING_VAR_MFILE: &str = "[defaults.session.env_vars]\nRUST_LOG = \"info\"\n";
 
 /// Drives a session to the point of awaiting a verdict: created,
 /// workspace seeded with [`PENDING_VAR_MFILE`], loadout configured and
@@ -1435,7 +1435,7 @@ async fn abort_refuses_active_session() {
 }
 
 /// The full Pending → verdict → Active flow through the session
-/// actor's state machine: a project `[session.vars]` entry pends
+/// actor's state machine: a project `[defaults.session.env_vars]` entry pends
 /// the loadout, `get_session` resolves the live Draft actor, an
 /// approving verdict promotes the on-disk record to `Active`,
 /// and the finalized composition (carrying the gated var) stays
