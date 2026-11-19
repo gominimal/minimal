@@ -1678,6 +1678,9 @@ fn exec_box_program(
         // cover never came would keep the tree bind, writable, in its mount
         // namespace.
         let mut refused: Option<String> = None;
+        // Whether the first cgroup2 mount was refused with EBUSY: the one
+        // refusal the retry over the fallback below is for.
+        let mut refused_busy = false;
         if force_cover_fallback {
             // The test knob: the fallback branch, deterministically.
             refused = Some("forced".to_string());
@@ -1696,6 +1699,7 @@ fn exec_box_program(
             } == -1
             {
                 let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                refused_busy = errno == libc::EBUSY;
                 refused = Some(format!("errno {errno}"));
             } else {
                 write_closure_report(closure_report, &format!("cover cgroup2{devpts_refused}"));
@@ -1727,9 +1731,10 @@ fn exec_box_program(
                     closure_report,
                 );
             }
-            // One more attempt at the design's cover, over the fallback:
-            // the first mount was refused with EBUSY, not for any cause a
-            // different mount could share. cgroup2 has one superblock per
+            // One more attempt at the design's cover, over the fallback,
+            // made only when the first mount was refused with EBUSY: that
+            // refusal comes from the launch's own bind, not from a cause
+            // a second mount would share. cgroup2 has one superblock per
             // hierarchy, and `do_add_mount` refuses a fresh mount of the
             // same superblock at a mountpoint its bind already covers —
             // which the launch's own read-write bind of the classifier
@@ -1740,14 +1745,14 @@ fn exec_box_program(
             // and the box reads its `memory.max` where a runtime looks —
             // the bind, and the fallback beneath the new mount, stay
             // hidden. A refusal here leaves the recorded fallback standing
-            // untouched, as the only cover the box got; the forced knob
-            // never reaches this, so the fallback it asks for is the one
-            // its tests assert on.
+            // untouched, as the only cover the box got. Any other errno, and
+            // the forced knob, never reach this, so the fallback they get is
+            // the one the report names and the knob's tests assert on.
             //
             // SAFETY: `mount(2)` exactly as the refused attempt above —
             // same source, target, and flags — only with the fallback
             // mounted over the bind first. Async-signal-safe.
-            if !force_cover_fallback
+            if refused_busy
                 && unsafe {
                     libc::mount(
                         c"cgroup2".as_ptr(),
