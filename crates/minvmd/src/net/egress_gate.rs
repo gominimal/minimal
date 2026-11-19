@@ -483,8 +483,8 @@ const DENY_ALL_DNS_RULE: &str = "egress-deny-all-dns-query";
 
 /// The rule name for an allow-list box's DNS datagram the host drops rather
 /// than write on to the switch (NET-141, decided host-side for own-address
-/// rows): a query naming anything its `allow_dns_hosts` does not match
-/// outside the box zone ([`dns_pins::dns_query_refusal`]). Its own rule, not
+/// rows): a query naming anything its `allow_dns_hosts` does not match,
+/// other than a box-zone A lookup ([`dns_pins::dns_query_refusal`]). Its own rule, not
 /// the row verdict's: the verdict admitted the frame to the box's resolver,
 /// and what this names is a name no resolver beyond it may be asked.
 const UNMATCHED_NAME_DNS_RULE: &str = "egress-unmatched-dns-name";
@@ -5472,14 +5472,15 @@ async fn relay_frames_to_switch(
         } else {
             None
         };
-        // NET-141, decided here for own-address rows: a deny-all box's query
-        // that names anything outside the box zone (or asks a zone name for
-        // anything but A), an allow-list box's query that names anything its
-        // list does not match outside the box zone, and either one's
-        // datagram that does not parse as a standard query, is dropped by not
-        // being written on — silently toward the guest, like every drop
-        // here — and said once per box per name per interval. Before the
-        // write, so no resolver beyond the box ever sees the name.
+        // NET-141, decided here for own-address rows: a query to the box's
+        // own resolver from a deny-all box that names anything outside the
+        // box zone (or asks a zone name for anything but A), from an
+        // allow-list box that names anything its list does not match other
+        // than by such a zone A lookup, and from either one that does not
+        // parse as a standard query, is dropped by not being written on —
+        // silently toward the guest, like every drop here — and said once
+        // per box per name per interval. Before the write, so no resolver
+        // beyond the box ever sees the name.
         if let Some((query, datagram)) = &dns
             && let Some(refusal) = dns_pins::dns_query_refusal(table, query, datagram)
         {
@@ -7656,7 +7657,7 @@ impl DropLimiter {
                         query_type,
                         rule_matched = rule,
                         "dropped a box's DNS query naming something its allow_dns_hosts does \
-                         not match, outside the box zone, at the host-side egress gate",
+                         not match at the host-side egress gate",
                     );
                 }
                 true
@@ -20747,8 +20748,8 @@ mod tests {
     /// name; zone A lookups (`host.min.internal` among them) pass byte for
     /// byte; a zone name asked for any other type, a multi-question query
     /// with a zone A in front, an unparseable datagram, and TCP to the
-    /// resolver are all dropped; and an allow-list row is decided by its
-    /// own list, not the deny-all rule.
+    /// resolver are all dropped; and an allow-list row's declared name
+    /// passes whatever its type.
     #[tokio::test]
     async fn deny_all_row_query_outside_zone_dropped_host_side() {
         use hickory_proto::rr::RecordType;
@@ -20872,12 +20873,12 @@ mod tests {
             "each dropped name says so: {logged}"
         );
 
-        // A row that is not deny-all is decided by its own list: the
-        // allow-list box's lookup of its declared name, and a zone name of a
-        // type the deny-all rule drops, both reach the switch.
+        // A row that is not deny-all is decided by its own list too: the
+        // allow-list box's lookups of its declared name reach the switch
+        // whatever their type, where the deny-all rule passes only zone A.
         for (port, name, rtype) in [
             (40006, "example.com.", RecordType::A),
-            (40007, "host.min.internal.", RecordType::TXT),
+            (40007, "example.com.", RecordType::TXT),
         ] {
             let query = query_from(lister, port, &dns_query_of(&[(qname(name), rtype)]));
             send_frame(&mut h.guest, &query).await;
@@ -20890,8 +20891,8 @@ mod tests {
     }
 
     /// NET-141, decided host-side for an own-address allow-list row: a
-    /// query for a name the box's `allow_dns_hosts` does not match, outside
-    /// the box zone, is dropped at the relay — never written on to the
+    /// query for a name the box's `allow_dns_hosts` does not match, other
+    /// than a box-zone A lookup, is dropped at the relay — never written on to the
     /// switch, so no resolver beyond the box's own is asked it, and nothing
     /// written back toward the guest — with one rate-limited warn line
     /// naming the box and the name. The declared name and the zone pass
