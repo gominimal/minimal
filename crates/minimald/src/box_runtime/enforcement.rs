@@ -1522,13 +1522,20 @@ pub(crate) fn untracked_task_run(id: boxes::SessionId) -> TaskRunId {
 }
 
 /// Starts a task run of box `id`. Drop it once the run's exit is delivered.
+/// A run started while a stop of the box is under way records no container,
+/// during that stop or after it.
 pub(crate) fn begin_task_run(id: boxes::SessionId) -> TaskRun {
     static NEXT_RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let key = TaskRunId {
         id,
         run: NEXT_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     };
-    task_containers().runs.insert(key, false);
+    // A run that begins while a stop of its box is under way is overtaken
+    // from the start: the stop has taken, or will take, the box's records
+    // without it.
+    let mut containers = task_containers();
+    let overtaken = containers.stopping.contains_key(&id);
+    containers.runs.insert(key, overtaken);
     TaskRun { key }
 }
 

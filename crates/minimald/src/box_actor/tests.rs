@@ -16223,6 +16223,28 @@ fn a_task_run_a_stop_overtook_records_no_container_after_the_stop() {
     drop(overtaken);
 }
 
+/// BOX-013: a task run that begins while a stop of its box is under way
+/// records no container, even once that stop has ended: the stop took the
+/// box's records without it, and would never signal what it records.
+#[test]
+fn a_task_run_begun_during_a_stop_records_no_container_after_it() {
+    let box_id = SessionId::mint();
+    // A stand-in pid, pinned by a pidfd on this process: never signalled.
+    let pin = |_| crate::box_runtime::pidfd_open(std::process::id());
+    let stop = crate::box_runtime::begin_task_stop(box_id);
+    let begun = crate::box_runtime::begin_task_run(box_id);
+    drop(stop);
+    assert!(
+        matches!(
+            crate::box_runtime::record_task_container_opening(begun.id(), 4_000_008, pin),
+            Err(crate::box_runtime::TaskContainerRefused::BoxStopped)
+        ),
+        "a run begun during the stop is refused once the stop has ended"
+    );
+    assert_eq!(crate::box_runtime::task_containers_recorded(box_id), 0);
+    drop(begun);
+}
+
 /// BOX-013: a stop that ends the processes and cannot write the `stopped`
 /// record keeps the box hosted. No launch starts new processes in it until a
 /// retried stop writes the record with the ending of the first stop.
