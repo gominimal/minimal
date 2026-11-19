@@ -1175,9 +1175,16 @@ impl Context {
                          name, such as \"dev\"."
                     ));
                 }
+                // The key is one directory name, so the state directory's path
+                // failed to resolve: a symlink on it, or a path that cannot be read.
+                // The reason follows a colon, so each of its three forms ("resolves
+                // to ..., which is outside the state base ...", "cannot resolve the
+                // state base ...", "cannot resolve ... under the state base ...")
+                // reads as a statement of its own.
                 Error::Other(anyhow!(
-                    "refusing to use state key {key:?}: {reason}. Choose a state key \
-                     that is a single directory name"
+                    "The state directory for task `{name}` and state key {key:?} cannot be used: \
+                     {reason}. Check that path for a symlink or a permission problem, then \
+                     run the task again."
                 ))
             })?
             .ok_or_else(|| {
@@ -1825,6 +1832,99 @@ mod tests {
                 "/state/-home-user-src-my%2Dproject/env"
             )))
         );
+    }
+
+    /// A context on the `fakerepo` project with its state and cache in the
+    /// given directories, for the state-key tests of `make_env`.
+    fn fakerepo_context(state: &Path, cache: &Path) -> Context {
+        let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+        let config = ConfigBuilder::new()
+            .with_state_dir(state.to_path_buf())
+            .with_cache_dir(cache.to_path_buf())
+            .with_repo_dir(manifest.join("testdata").join("fakerepo"))
+            .with_stdlib_dir(manifest.join("../stdlib/minimal-ncl"))
+            .build()
+            .unwrap();
+        Context::new(config).unwrap()
+    }
+
+    /// The message `make_env` refuses a state key with, for a task named
+    /// `build`. Panics if the environment is made.
+    async fn make_env_refusal(ctx: &mut Context, key: &str) -> String {
+        let mut graph = Graph::new();
+        let key = key.to_owned();
+        match ctx
+            .make_env(
+                "build",
+                &mut graph,
+                None,
+                Some(&key),
+                None,
+                None,
+                Vec::<String>::new(),
+                PatchHome::Ambient,
+            )
+            .await
+        {
+            Ok(_) => panic!("state key {key:?} must be refused"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// A state key that is not one directory name reaches `make_env` only
+    /// from a caller that did not load it from the project's file, as that
+    /// load refuses it. `make_env` still refuses it, and names the task and
+    /// where to set `state_key`.
+    #[tokio::test]
+    async fn make_env_names_the_task_for_a_state_key_that_is_not_one_name() {
+        let (state, cache) = (tempdir().unwrap(), tempdir().unwrap());
+        let mut ctx = fakerepo_context(state.path(), cache.path());
+        for (key, reason) in [
+            ("..", "it names the parent directory"),
+            ("a/b", "it contains '/'"),
+        ] {
+            assert_eq!(
+                make_env_refusal(&mut ctx, key).await,
+                format!(
+                    "Task `build` has the state key {key:?}, and {reason}. Set `state_key` on \
+                     the task or in `[defaults.task]` to one directory name, such as \"dev\"."
+                )
+            );
+        }
+    }
+
+    /// A state key that is one directory name, whose state directory
+    /// resolves outside the state base through a symlink, is refused with
+    /// the task, the key and where the path leads, and a next step that fits
+    /// that cause. It does not tell the person to choose another key.
+    #[tokio::test]
+    async fn make_env_refuses_a_state_directory_behind_a_symlink() {
+        let (state, cache, outside) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
+        let mut ctx = fakerepo_context(state.path(), cache.path());
+        let base = ctx.daemon.config.state_base_dir();
+        let dir = durable_state_dir(ctx.minimal_file(), "dev", base.clone(), ctx.state_root())
+            .unwrap()
+            .expect("fakerepo's minimal file has a directory");
+        // `dir` is `<base>/<project>/dev`: make `<project>` a symlink out.
+        let project = dir.parent().unwrap();
+        std::fs::create_dir_all(&base).unwrap();
+        std::os::unix::fs::symlink(outside.path(), project).unwrap();
+
+        let msg = make_env_refusal(&mut ctx, "dev").await;
+        assert!(
+            msg.starts_with(
+                "The state directory for task `build` and state key \"dev\" cannot be used: resolves to "
+            ),
+            "{msg}"
+        );
+        assert!(msg.contains("which is outside the state base"), "{msg}");
+        assert!(
+            msg.ends_with(
+                "Check that path for a symlink or a permission problem, then run the task again."
+            ),
+            "{msg}"
+        );
+        assert!(!msg.contains("Choose a state key"), "{msg}");
     }
 
     /// NET-155: a context made for a box carries the box's classifier leaf,

@@ -847,58 +847,16 @@ pub(crate) fn empty_typed_list(box_type: &str, scoped: bool) -> String {
 /// Resolves the address `address` over `hosts` among the boxes of
 /// `box_type` only, so a type noun never reaches a box of another type.
 /// An address that only a box of another type holds is refused as one
-/// that no box holds. The verb, the box id and the outcome go to the log.
+/// that no box holds. A box on a stopped VM is refused with the command
+/// that starts the VM, as every `min box` verb refuses it (BCLI-002,
+/// NET-058). The verb, the box id and the outcome go to the log.
 pub(crate) async fn resolve_box_of_type(
-    mut hosts: Vec<crate::cmd::list::LocalHost>,
+    hosts: Vec<crate::cmd::list::LocalHost>,
     address: &str,
     box_type: &str,
     verb: &'static str,
 ) -> Result<ResolvedBox, anyhow::Error> {
-    if let BoxAddress::Qualified { provider, host, .. } = parse_box_address(address) {
-        hosts.retain(|h| h.provider == provider && h.host == host);
-    }
-    let mut listings = Vec::with_capacity(hosts.len());
-    for host in hosts {
-        let boxes = read_host_boxes(&host).await.inspect_err(|err| {
-            tracing::info!(verb, outcome = "error", host = %host.host, "{err:#}");
-        })?;
-        let boxes = boxes.map(|records| {
-            records
-                .into_iter()
-                .filter(|entry| entry.box_type.as_deref() == Some(box_type))
-                .collect()
-        });
-        listings.push(HostListing { host, boxes });
-    }
-    match resolve_box_address(address, &listings) {
-        Ok(resolved) => {
-            tracing::info!(
-                verb,
-                box_id = %resolved.box_id,
-                host = %resolved.host.host,
-                outcome = "resolved"
-            );
-            Ok(resolved)
-        }
-        Err(refusal) => {
-            for listing in &listings {
-                if let Err(why) = &listing.boxes {
-                    tracing::info!(verb, host = %listing.host.host, "host did not answer: {why}");
-                }
-            }
-            // The same outcome names `resolve_box_on_hosts` records, so an
-            // unreachable host reads apart from a missing box in the log.
-            let outcome = match &refusal {
-                BoxAddressRefusal::Ambiguous { .. }
-                | BoxAddressRefusal::AmbiguousIdStart { .. } => "ambiguous",
-                BoxAddressRefusal::NotFound { .. } => "not found",
-                BoxAddressRefusal::OnStoppedVm { .. } => "on a stopped VM",
-                BoxAddressRefusal::Unreachable { .. } => "host unreachable",
-            };
-            tracing::info!(verb, address, box_type, outcome, "{refusal}");
-            Err(refusal.into())
-        }
-    }
+    resolve_box_over(hosts, address, Some(box_type), verb).await
 }
 
 /// `min session stop` and `min task stop`: `min box stop`, with the box
