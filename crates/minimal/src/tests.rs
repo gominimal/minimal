@@ -8084,6 +8084,127 @@ async fn box_verb_on_stopped_vm_box_refuses_with_start_hint() {
     );
 }
 
+/// BCLI-002, NET-058: every `min box` verb that takes a box, and the
+/// `min session stop|rm|logs` type-noun forms, refuse a box on a stopped VM
+/// with the VM's name and the command that starts it, and exit 4. None of
+/// them answers such a box as not found.
+#[tokio::test]
+async fn every_box_verb_refuses_box_on_stopped_vm() {
+    let (state, _default_vm) = running_default_vm().await;
+    stopped_vm_with_boxes(state.path(), "alpha", &[("beta", boxes::SessionId::mint())]);
+    let global = vm_globals(state.path(), None);
+    let hosts = || local_hosts(&global).expect("the local hosts");
+    let expected = "box 'beta' is on VM 'alpha', which is stopped. \
+                    Start it with: min --vm alpha session attach beta"
+        .to_owned();
+    let session = boxes::SESSION_BOX_TYPE;
+    let logs = BoxLogsArgs {
+        target: "beta".to_owned(),
+        follow: false,
+        raw: false,
+    };
+    let cp_dest = tempfile::tempdir().expect("a local dir");
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let mut results: Vec<(&str, anyhow::Error)> = Vec::new();
+
+    let exec = cmd::box_exec_on_hosts(
+        hosts(),
+        cmd::daemon_host_kind(&global),
+        &box_exec_request("beta", &[], &["true"]),
+        false,
+        global.config_dir.as_deref(),
+        None,
+        &mut out,
+        &mut err,
+    )
+    .await;
+    results.push(("box exec", exec.expect_err("exec")));
+    let attach = cmd::box_attach_exec_target(hosts(), "beta", FIRST_EXEC_ID).await;
+    results.push(("box attach --exec", attach.expect_err("attach")));
+    let rm = cmd::rm_box_on_hosts(hosts(), "beta", false).await;
+    results.push(("box rm", rm.expect_err("rm")));
+    let stop = cmd::stop_box_on_hosts(hosts(), &mut Vec::new(), "beta", false).await;
+    results.push(("box stop", stop.expect_err("stop")));
+    let stop_exec =
+        cmd::box_stop_exec_on_hosts(hosts(), &mut Vec::new(), "beta", FIRST_EXEC_ID).await;
+    results.push(("box stop --exec", stop_exec.expect_err("stop --exec")));
+    let wait = cmd::box_wait_all_on_hosts(
+        hosts(),
+        &["beta".to_owned()],
+        None,
+        None,
+        std::time::Duration::from_millis(20),
+    )
+    .await;
+    results.push(("box wait", wait.expect_err("wait")));
+    let wait_exec =
+        cmd::box_wait_exec_on_hosts(hosts(), "beta", FIRST_EXEC_ID, None, &mut err).await;
+    results.push(("box wait --exec", wait_exec.expect_err("wait --exec")));
+    let events = cmd::box_events_on_hosts(
+        hosts(),
+        &events_args(Some("beta"), None, false),
+        &mut Vec::new(),
+        &mut Vec::new(),
+    )
+    .await;
+    results.push(("box events", events.expect_err("events")));
+    let cp = cmd::box_cp_on_hosts(hosts(), "beta:notes.txt", cp_dest.path()).await;
+    results.push(("box cp", cp.expect_err("cp")));
+    // `min box rename` and `min box prune --parent` start the daemon first,
+    // then pass the address to this resolver with their own verb.
+    let rename = cmd::resolve_box_on_hosts(hosts(), "beta", "box rename").await;
+    results.push(("box rename", rename.expect_err("rename")));
+    let restart = cmd::restart_box_on_hosts_with(
+        hosts(),
+        &mut Vec::new(),
+        "beta",
+        async |_client, _request| Err(anyhow::anyhow!("the restart is never sent")),
+    )
+    .await;
+    results.push(("box restart", restart.expect_err("restart")));
+    let box_logs = cmd::box_logs_on_hosts(hosts(), &logs, None, "box logs", false, &mut out).await;
+    results.push(("box logs", box_logs.expect_err("logs")));
+    let logs_exec =
+        cmd::box_logs_exec_on_hosts(hosts(), "beta", FIRST_EXEC_ID, &mut out, &mut err).await;
+    results.push(("box logs --exec", logs_exec.expect_err("logs --exec")));
+    let prune = cmd::resolve_box_on_hosts(hosts(), "beta", "box prune").await;
+    results.push(("box prune --parent", prune.expect_err("prune --parent")));
+    let stop_args = BoxStopArgs {
+        target: "beta".to_owned(),
+        force: false,
+        exec: None,
+    };
+    let session_stop =
+        cmd::typed_box_stop_on_hosts(hosts(), &mut Vec::new(), &stop_args, session, "stop").await;
+    results.push(("session stop", session_stop.expect_err("session stop")));
+    let rm_args = BoxRmArgs {
+        target: "beta".to_owned(),
+        force: false,
+    };
+    let session_rm = cmd::typed_box_rm_on_hosts(hosts(), &rm_args, session, "rm").await;
+    results.push((
+        "session rm",
+        session_rm.map(|_| ()).expect_err("session rm"),
+    ));
+    let session_logs =
+        cmd::box_logs_on_hosts(hosts(), &logs, Some(session), "logs", false, &mut out).await;
+    results.push(("session logs", session_logs.expect_err("session logs")));
+
+    for (verb, error) in &results {
+        assert_eq!(address_refusal(error), (expected.clone(), 4), "min {verb}");
+        let refusal = error
+            .downcast_ref::<BoxAddressRefusal>()
+            .expect("a box address refusal");
+        assert_eq!(
+            refusal.hint(),
+            "Start it with: min --vm alpha session attach beta",
+            "min {verb}"
+        );
+    }
+    assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+}
+
 /// NET-152: `min ls` lists a stopped VM's boxes from its persisted records:
 /// each row's STATUS reads `stopped` and its VM cell `alpha (stopped)`, the
 /// table rule runs under the VM column, and `--json` carries the boxes with
