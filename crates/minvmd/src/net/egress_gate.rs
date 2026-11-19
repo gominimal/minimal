@@ -5711,13 +5711,13 @@ pub(crate) const HOST_IP_BOXES_RULE: &str = "egress-host-ip-boxes";
 /// is named, and the rate-limited drop line still covers it.
 const FIRST_OPENING_DROP_SOURCES: usize = 64;
 
-/// The first dropped opening packet of each box, logged once (D3574). A
-/// node-plane drop and a `host_ip` drop come from the node's own address,
-/// and a guest relay carries the frames of one VM, so the source address on
-/// one relay names the box the drop is for. The rate-limited drop line can
-/// name a later frame, or an ACK, in place of the packet that opened the
-/// connection. This line names the opening packet itself, with the source,
-/// the destination and the port, once per rule and source.
+/// The first dropped opening packet, logged once per rule and source
+/// address on this relay (D3574). A node-plane drop and a `host_ip` drop
+/// leave from the node's own address, and every `host_ip` box shares that
+/// address with the node plane, so the latch does not name a box. The
+/// rate-limited drop line can name a later frame, or an ACK, in place of
+/// the packet that opened the connection. This line names the opening
+/// packet itself, with the source, the destination and the port.
 #[derive(Debug, Default)]
 struct FirstOpeningDrops {
     seen: std::collections::HashSet<(&'static str, [u8; 4])>,
@@ -5737,8 +5737,8 @@ impl FirstOpeningDrops {
     }
 
     /// Logs the drop of an opening packet from `src` under `rule`, the
-    /// first time that box drops one under that rule. Returns whether a
-    /// line was written.
+    /// first time this relay drops one from that source under that rule.
+    /// Returns whether a line was written.
     fn note(
         &mut self,
         rule: &'static str,
@@ -5758,8 +5758,9 @@ impl FirstOpeningDrops {
             destination = %Ipv4Addr::from(dst),
             port = %if dst_port == 0 { "none".to_string() } else { dst_port.to_string() },
             rule_matched = rule,
-            "dropped the first opening packet of a box leaving the VM; later drops of this \
-             box under this rule are only in the rate-limited drop line",
+            "dropped the first opening packet leaving the VM under this rule from this source \
+             address; later drops under this rule from this source are only in the \
+             rate-limited drop line",
         );
         true
     }
@@ -8554,26 +8555,25 @@ mod tests {
     /// The default switch subnet, the plan every registry below is built for.
     const SUBNET: SwitchSubnet = switch::DEFAULT_SUBNET;
 
-    /// D3574: the first dropped opening packet of each box is logged once,
-    /// with the source, the destination and the port, for a node-plane drop
-    /// and a `host_ip` drop. A packet that opens nothing is not named, and a
-    /// second opening packet of the same box under the same rule is not
-    /// named again.
+    /// D3574: the first dropped opening packet is logged once per rule and
+    /// source address, with the source, the destination and the port, for a
+    /// node-plane drop and a `host_ip` drop. A packet that opens nothing is
+    /// not named. Every `host_ip` box leaves from the node address, so a
+    /// second `host_ip` box's opening under the same rule writes no line.
     #[test]
-    fn node_plane_drop_is_logged_once_per_box() {
+    fn first_opening_drop_is_logged_once_per_rule_and_source() {
         use super::{FirstOpeningDrops, NODE_PLANE_UNPINNED_RULE};
         let (log, _guard) = capture_log();
         let mut drops = FirstOpeningDrops::default();
         let node = [192, 168, 127, 2];
-        let other = [192, 168, 127, 3];
         let google = [142, 250, 80, 4];
         let cloudflare = [1, 1, 1, 1];
 
         assert!(!drops.note(NODE_PLANE_UNPINNED_RULE, node, google, 443, false));
         assert!(drops.note(NODE_PLANE_UNPINNED_RULE, node, google, 443, true));
         assert!(!drops.note(NODE_PLANE_UNPINNED_RULE, node, cloudflare, 443, true));
-        assert!(drops.note(NODE_PLANE_UNPINNED_RULE, other, cloudflare, 443, true));
         assert!(drops.note(HOST_IP_BOXES_RULE, node, cloudflare, 443, true));
+        // A second `host_ip` box sends from the same node address: no line.
         assert!(!drops.note(HOST_IP_BOXES_RULE, node, google, 443, true));
 
         let lines: Vec<String> = log
@@ -8582,7 +8582,7 @@ mod tests {
             .filter(|line| line.contains("dropped the first opening packet"))
             .map(str::to_string)
             .collect();
-        assert_eq!(lines.len(), 3, "one line per box and rule: {lines:#?}");
+        assert_eq!(lines.len(), 2, "one line per rule and source: {lines:#?}");
         assert!(lines[0].contains("source=192.168.127.2"), "{}", lines[0]);
         assert!(
             lines[0].contains("destination=142.250.80.4"),
@@ -8591,9 +8591,10 @@ mod tests {
         );
         assert!(lines[0].contains("port=443"), "{}", lines[0]);
         assert!(lines[0].contains(NODE_PLANE_UNPINNED_RULE), "{}", lines[0]);
-        assert!(lines[1].contains("source=192.168.127.3"), "{}", lines[1]);
-        assert!(lines[2].contains(HOST_IP_BOXES_RULE), "{}", lines[2]);
-        assert!(lines[2].contains("destination=1.1.1.1"), "{}", lines[2]);
+        assert!(lines[1].contains("source=192.168.127.2"), "{}", lines[1]);
+        assert!(lines[1].contains(HOST_IP_BOXES_RULE), "{}", lines[1]);
+        assert!(lines[1].contains("destination=1.1.1.1"), "{}", lines[1]);
+        assert!(lines[1].contains("port=443"), "{}", lines[1]);
     }
 
     /// The lease of the one published box below: the one source its frames
