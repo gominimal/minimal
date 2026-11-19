@@ -456,7 +456,11 @@ fn project_rows(global: &GlobalArgs, args: &BoxSpecArgs, out: &mut Vec<u8>) -> a
     // The rows read the expanded session entry, the same expansion that
     // `min box start` grants from, so `[defaults.network.bep]` and the
     // entry's own tables both reach them.
-    let utf8_project = camino::Utf8Path::from_path(&project)
+    // The expansion records the project root, which must be absolute, so
+    // the default `.` resolves against the working directory first.
+    let absolute = std::path::absolute(&project)
+        .with_context(|| format!("Cannot resolve the project path {}.", project.display()))?;
+    let utf8_project = camino::Utf8Path::from_path(&absolute)
         .ok_or_else(|| anyhow::anyhow!("The project path {} is not UTF-8.", project.display()))?;
     let (bep, secrets, quic443) = match crate::project_bep_and_grants(utf8_project, None) {
         Ok((bep, secrets, _, quic443)) => (bep, secrets, quic443),
@@ -474,7 +478,7 @@ fn project_rows(global: &GlobalArgs, args: &BoxSpecArgs, out: &mut Vec<u8>) -> a
                 error = %error,
                 "min box spec: no single session entry, rendering the merged [defaults] and [defaults.session] tables"
             );
-            session_defaults_rows(&project)?
+            session_defaults_rows(utf8_project)?
         }
         Err(error) => return Err(error),
     };
@@ -493,46 +497,35 @@ fn project_rows(global: &GlobalArgs, args: &BoxSpecArgs, out: &mut Vec<u8>) -> a
 }
 
 /// The `network.bep`, `secrets` and `network.quic443` of an entry with an
-/// empty body of the `session` Box Type, expanded over the project's
-/// `[defaults]` and `[defaults.session]` (BOX-048). Bare `min box spec`
-/// reads these when the project has no single session entry to expand.
+/// empty body of the `session` Box Type. The entry expands as `min box
+/// start` expands a picked entry: over `[defaults]`, `[defaults.session]`
+/// and the layers of the `session` type chain (BOX-048, BOX-064). Bare
+/// `min box spec` reads these when the project has no single session entry
+/// to expand.
 fn session_defaults_rows(
-    project: &Path,
+    project: &camino::Utf8Path,
 ) -> anyhow::Result<(BepSettings, SecretGrants, Option<Quic443>)> {
-    let invalid = |error| crate::ProjectFileInvalid { error };
     let format_error = |error| crate::ProjectFileInvalid {
         error: mfile::Error::Format(error),
     };
-    let Some((_, bytes)) = project_file_bytes(project)? else {
+    let Some((_, bytes)) = project_file_bytes(project.as_std_path())? else {
         return Ok(Default::default());
     };
-    let mut doc: toml::Table = toml::from_slice(&bytes).map_err(format_error)?;
-    mfile::legacy::canonicalize(&mut doc, mfile::legacy::this_release()).map_err(invalid)?;
-    let defaults = doc
-        .get("defaults")
-        .and_then(toml::Value::as_table)
-        .cloned()
-        .unwrap_or_default();
-    let project_types: std::collections::BTreeSet<String> = doc
-        .get("box_types")
-        .and_then(toml::Value::as_table)
-        .map(|types| types.keys().cloned().collect())
-        .unwrap_or_default();
     let entry = mfile::entry::BoxEntry {
         name: mfile::entry::DEFAULT_ENTRY_NAME.to_owned(),
         table: mfile::entry::EntryTable::Sessions,
-        box_type: Some("session".to_owned()),
+        box_type: Some(boxes::SESSION_BOX_TYPE.to_owned()),
         body: toml::Table::new(),
         implicit: true,
     };
-    let layers = mfile::expand::Layers::default().with_file_defaults(
-        &defaults,
-        entry.box_type.as_deref(),
-        &project_types,
-    );
-    let spec = mfile::expand::expand(&entry, &layers)
-        .map_err(invalid)?
-        .spec;
+    let expanded = crate::box_entry(
+        project,
+        &bytes,
+        entry,
+        true,
+        &crate::SelectedLoadouts::default(),
+    )?;
+    let spec = &expanded.spec;
     let secrets = spec
         .get("secrets")
         .cloned()
