@@ -1484,6 +1484,10 @@ pub(crate) mod tests {
                 "production.cloudfront.docker.com.",
                 Ipv4Addr::new(18, 238, 238, 89),
             ),
+            (
+                "docker-images-prod.s3.dualstack.us-east-1.amazonaws.com.",
+                Ipv4Addr::new(52, 216, 8, 147),
+            ),
         ];
         // The names here pair each host with a representative address, so
         // they cannot be read off the shared constant; they are held to it

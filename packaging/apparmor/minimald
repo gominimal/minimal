@@ -16,6 +16,12 @@
 #   Install:  sudo scripts/install-apparmor-profile.sh
 #   Docs:     docs/reference/linux-host-setup.md
 #
+# The `userns` rule and the abi/4.0 below exist from AppArmor 4.0. A host
+# whose parser is older (Debian 12 ships 3.0) cannot load this file, and
+# does not restrict unprivileged user namespaces either, so it needs no
+# profile: the installer and `min finalize-install` install nothing there
+# rather than carry a second rendering that could not say `userns` anyway.
+#
 # The attachment paths live in tunables/minimald (see the comments there).
 
 abi <abi/4.0>,

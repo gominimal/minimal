@@ -277,6 +277,11 @@ pub struct Context {
     /// network attaches to it, so the box's egress verdict decides the
     /// build's connections.
     pub(crate) box_network: Option<op::BuildNetwork>,
+    /// The workspace a box's `minimal.toml` edits and re-reads must stay
+    /// inside, for a context the daemon builds for a box (inbox#1245).
+    /// `None` for a context whose caller chose the project itself, as the
+    /// host CLI does.
+    pub(crate) mfile_edit_root: Option<PathBuf>,
 }
 
 impl fmt::Display for Context {
@@ -437,6 +442,7 @@ impl Context {
             mfile,
             classifier_leaf: None,
             box_network: None,
+            mfile_edit_root: None,
         })
     }
 
@@ -461,6 +467,7 @@ impl Context {
             mfile,
             classifier_leaf: None,
             box_network: None,
+            mfile_edit_root: None,
         }
     }
 
@@ -475,6 +482,7 @@ impl Context {
             mfile,
             classifier_leaf: None,
             box_network: None,
+            mfile_edit_root: None,
         }
     }
 
@@ -505,6 +513,18 @@ impl Context {
         self.box_network.as_ref()
     }
 
+    /// Confines every edit this context makes to its `minimal.toml`, and
+    /// every re-read of it ([`Self::cloned_reinit`]), to the directory
+    /// `root`, the workspace of the box the daemon built it for
+    /// (inbox#1245). The box controls that directory, so a link there must
+    /// not carry the edit or the read to a file outside it; see
+    /// [`mfile::File::edit_within`] and [`mfile::File::from_dir_within`].
+    /// Build the context itself with [`MFileSearchStrategy::Within`] so its
+    /// first read is confined too.
+    pub fn confine_mfile_edits_to(&mut self, root: PathBuf) {
+        self.mfile_edit_root = Some(root);
+    }
+
     /// Returns a clone of the shared daemon-scoped context. Cheap —
     /// just an `Arc` clone. Useful when a caller needs to hand the
     /// same daemon-scoped state to another `Context` or subsystem
@@ -528,9 +548,13 @@ impl Context {
     /// per-session repo override), then any config-provided override,
     /// then a recursive search from the daemon's cwd as a last-ditch
     /// fallback for CLI-style callers that constructed via
-    /// [`Self::new`].
+    /// [`Self::new`]. A context confined to a box's workspace
+    /// ([`Self::confine_mfile_edits_to`]) re-reads beneath that workspace
+    /// instead.
     pub fn cloned_reinit(&self) -> Result<Self, Error> {
-        let strategy = if let Some(path) = self.mfile.repo_path() {
+        let strategy = if let Some(root) = self.mfile_edit_root.as_ref() {
+            MFileSearchStrategy::Within(root.clone())
+        } else if let Some(path) = self.mfile.repo_path() {
             MFileSearchStrategy::Override(path.to_path_buf())
         } else if let Some(path) = self.daemon.config.repo_dir_override() {
             MFileSearchStrategy::Override(path.to_path_buf())
@@ -541,6 +565,7 @@ impl Context {
         Ok(Self {
             classifier_leaf: self.classifier_leaf.clone(),
             box_network: self.box_network.clone(),
+            mfile_edit_root: self.mfile_edit_root.clone(),
             ..Self::from_daemon(Arc::clone(&self.daemon), mfile)
         })
     }
@@ -1282,74 +1307,105 @@ impl Context {
             }
         };
 
-        let toml = std::fs::read_to_string(&mfile_path)
-            .map_err(|e| Error::IO("reading minimal.toml for add", mfile_path.to_path_buf(), e))?;
-        let mut doc = toml
-            .parse::<DocumentMut>()
-            .map_err(|e| Error::Other(anyhow!("parsing minimal.toml: {}", e)))?;
-
-        let resolved: Vec<String> = deps
-            .as_bsrs(graph)?
-            .into_iter()
-            .map(|bsr| graph.get(&bsr).unwrap().name.clone())
-            .collect();
-
+        // A context built for a box reads and writes its minimal.toml only
+        // beneath the box's workspace (inbox#1245): a link there must not
+        // carry the edit to a file outside it.
         let mut did_edit = false;
-        match mode {
-            AddDepMode::BuildPackages => {
-                if let Some(h) = doc["stack"].as_table_mut() {
-                    did_edit |= upsert_toml_packages_list(h, "build_packages", &resolved)?;
-                    println!("Added {} to stack.build_packages", resolved.join(", "));
-                } else {
-                    return Err(Error::Other(anyhow!(
-                        "could not find [stack] in minimal.toml: needed for update"
-                    )));
+        let edit = |toml: &str| -> Result<Option<String>, Error> {
+            let mut doc = toml
+                .parse::<DocumentMut>()
+                .map_err(|e| Error::Other(anyhow!("parsing minimal.toml: {}", e)))?;
+
+            let resolved: Vec<String> = deps
+                .as_bsrs(graph)?
+                .into_iter()
+                .map(|bsr| graph.get(&bsr).unwrap().name.clone())
+                .collect();
+
+            match mode {
+                AddDepMode::BuildPackages => {
+                    if let Some(h) = doc["stack"].as_table_mut() {
+                        did_edit |= upsert_toml_packages_list(h, "build_packages", &resolved)?;
+                        println!("Added {} to stack.build_packages", resolved.join(", "));
+                    } else {
+                        return Err(Error::Other(anyhow!(
+                            "could not find [stack] in minimal.toml: needed for update"
+                        )));
+                    }
+                }
+                AddDepMode::RuntimePackages => {
+                    if let Some(h) = doc["stack"].as_table_mut() {
+                        did_edit |= upsert_toml_packages_list(h, "runtime_packages", &resolved)?;
+                        println!("Added {} to stack.runtime_packages", resolved.join(", "));
+                    } else {
+                        return Err(Error::Other(anyhow!(
+                            "could not find [stack] in minimal.toml: needed for update"
+                        )));
+                    }
+                }
+                AddDepMode::TaskPackages { name } => {
+                    if let Some(tasks) = doc.get_mut("tasks")
+                        && let Some(t) = tasks.get_mut(&name)
+                        && let Some(t) = t.as_table_mut()
+                    {
+                        did_edit |= upsert_toml_packages_list(t, "packages", &resolved)?;
+                        println!("Added {} to tasks.{}.packages", resolved.join(", "), name);
+                    } else {
+                        return Err(Error::Other(anyhow!(
+                            "could not find [tasks.{}] in minimal.toml: needed for update",
+                            name
+                        )));
+                    }
+                }
+                AddDepMode::SessionPackages => {
+                    if let Some(h) = doc["session"].as_table_mut() {
+                        did_edit |= upsert_toml_packages_list(h, "packages", &resolved)?;
+                    } else {
+                        doc.insert(
+                            "session",
+                            Item::Table(toml_edit::Table::from_iter([(
+                                "packages",
+                                Item::Value(Value::Array(Array::from_iter(resolved.iter()))),
+                            )])),
+                        );
+                        did_edit = true;
+                    }
+                    println!("Added {} to session.packages", resolved.join(", "));
                 }
             }
-            AddDepMode::RuntimePackages => {
-                if let Some(h) = doc["stack"].as_table_mut() {
-                    did_edit |= upsert_toml_packages_list(h, "runtime_packages", &resolved)?;
-                    println!("Added {} to stack.runtime_packages", resolved.join(", "));
-                } else {
-                    return Err(Error::Other(anyhow!(
-                        "could not find [stack] in minimal.toml: needed for update"
-                    )));
+
+            Ok(if did_edit {
+                Some(doc.to_string())
+            } else {
+                None
+            })
+        };
+        match self.mfile_edit_root.as_deref() {
+            Some(root) => mfile::File::edit_within(root, &mfile_path, |content| {
+                let toml = content.ok_or_else(|| {
+                    Error::IO(
+                        "reading minimal.toml for add",
+                        mfile_path.to_path_buf(),
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "minimal.toml disappeared",
+                        ),
+                    )
+                })?;
+                edit(toml)
+            })?,
+            None => {
+                let toml = std::fs::read_to_string(&mfile_path).map_err(|e| {
+                    Error::IO("reading minimal.toml for add", mfile_path.to_path_buf(), e)
+                })?;
+                if let Some(new) = edit(&toml)? {
+                    std::fs::write(&mfile_path, new)
+                        .map_err(|e| Error::Other(anyhow::Error::from(e)))?;
                 }
-            }
-            AddDepMode::TaskPackages { name } => {
-                if let Some(tasks) = doc.get_mut("tasks")
-                    && let Some(t) = tasks.get_mut(&name)
-                    && let Some(t) = t.as_table_mut()
-                {
-                    did_edit |= upsert_toml_packages_list(t, "packages", &resolved)?;
-                    println!("Added {} to tasks.{}.packages", resolved.join(", "), name);
-                } else {
-                    return Err(Error::Other(anyhow!(
-                        "could not find [tasks.{}] in minimal.toml: needed for update",
-                        name
-                    )));
-                }
-            }
-            AddDepMode::SessionPackages => {
-                if let Some(h) = doc["session"].as_table_mut() {
-                    did_edit |= upsert_toml_packages_list(h, "packages", &resolved)?;
-                } else {
-                    doc.insert(
-                        "session",
-                        Item::Table(toml_edit::Table::from_iter([(
-                            "packages",
-                            Item::Value(Value::Array(Array::from_iter(resolved.iter()))),
-                        )])),
-                    );
-                    did_edit = true;
-                }
-                println!("Added {} to session.packages", resolved.join(", "));
             }
         }
 
         if did_edit {
-            std::fs::write(&mfile_path, doc.to_string())
-                .map_err(|e| Error::Other(anyhow::Error::from(e)))?;
             *self = self.cloned_reinit()?;
         }
         Ok(())
@@ -1900,6 +1956,130 @@ mod tests {
                 .unwrap()
                 .contains("[session]\npackages = [\"uroot\"]")
         );
+    }
+
+    /// A context confined to a box's workspace re-reads its `minimal.toml`
+    /// beneath the workspace: a file swapped for a link out of it is
+    /// refused rather than read.
+    #[test]
+    fn cloned_reinit_refuses_a_confined_mfile_that_links_out() {
+        let state = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let content = "[session]\npackages = [\"base\"]\n";
+        let mfile_path = workspace.path().join("minimal.toml");
+        std::fs::write(&mfile_path, content).unwrap();
+        let outside_path = outside.path().join("minimal.toml");
+        std::fs::write(&outside_path, content).unwrap();
+
+        let config = ConfigBuilder::new()
+            .with_state_dir(state.path().to_path_buf())
+            .with_repo_dir(workspace.path().to_path_buf())
+            .with_stdlib_dir(
+                std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("../stdlib/minimal-ncl"),
+            )
+            .build()
+            .unwrap();
+        let mut ctx = Context::new_with_strategy(
+            config,
+            MFileSearchStrategy::Within(workspace.path().to_path_buf()),
+        )
+        .unwrap();
+        ctx.confine_mfile_edits_to(workspace.path().to_path_buf());
+        // Control: the same reload of the regular file succeeds.
+        ctx.cloned_reinit()
+            .expect("a confined context reloads a regular minimal.toml");
+        // The context reloads once the file is a link out of the workspace.
+        std::fs::rename(&mfile_path, workspace.path().join("was-minimal.toml")).unwrap();
+        std::os::unix::fs::symlink(&outside_path, &mfile_path).unwrap();
+
+        let err = ctx.cloned_reinit().unwrap_err();
+
+        // Where every link is refused (off Linux, or a kernel without
+        // `openat2`) the refusal says only that it is a link.
+        assert!(
+            matches!(
+                &err,
+                Error::MFile(mfile::Error::IO(_, _, io))
+                    if io.to_string().contains("leads outside its workspace")
+                        || io.to_string().contains("cannot follow a link here")
+            ),
+            "error: {err:?}"
+        );
+    }
+
+    /// inbox#1245: a context confined to a box's workspace edits a regular
+    /// `minimal.toml` there, and refuses to edit one that links out of it,
+    /// leaving both files as they were.
+    #[test]
+    fn add_deps_refuses_a_confined_mfile_that_links_out() {
+        let state = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let content = format!(
+            indoc! {
+                "
+                [upstream]
+                dir = \"{}\"
+
+                [stack]
+                use = \"fake-stack\"
+                "
+            },
+            std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                .join("testdata")
+                .join("fakerepo-with-stack")
+                .to_str()
+                .unwrap()
+        );
+        let mfile_path = workspace.path().join("minimal.toml");
+        std::fs::write(&mfile_path, &content).unwrap();
+
+        let config = ConfigBuilder::new()
+            .with_state_dir(state.path().to_path_buf())
+            .with_repo_dir(workspace.path().to_path_buf())
+            .with_stdlib_dir(
+                std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("../stdlib/minimal-ncl"),
+            )
+            .build()
+            .unwrap();
+        let mut ctx = Context::new(config).unwrap();
+        ctx.confine_mfile_edits_to(workspace.path().to_path_buf());
+        let graph = ctx.graph_from_all_packages().unwrap();
+
+        // Control: the confined context edits the regular file in the
+        // workspace, and keeps the confinement across the reload.
+        ctx.add_deps(&graph, ["uroot"], AddDepMode::BuildPackages)
+            .unwrap();
+        let edited = std::fs::read_to_string(&mfile_path).unwrap();
+        assert!(edited.contains("build_packages = [\"uroot\"]"), "{edited}");
+
+        // The box swaps its `minimal.toml` for a link out of the workspace.
+        let outside_path = outside.path().join("minimal.toml");
+        std::fs::write(&outside_path, &edited).unwrap();
+        let staged = workspace.path().join("minimal.toml.link");
+        std::os::unix::fs::symlink(&outside_path, &staged).unwrap();
+        std::fs::rename(&staged, &mfile_path).unwrap();
+
+        let err = ctx
+            .add_deps(&graph, ["extra-runtime-pkg"], AddDepMode::RuntimePackages)
+            .unwrap_err();
+
+        // Where every link is refused (off Linux, or a kernel without
+        // `openat2`) the refusal says only that it is a link.
+        assert!(
+            matches!(
+                &err,
+                Error::MFile(mfile::Error::IO(_, _, io))
+                    if io.to_string().contains("leads outside its workspace")
+                        || io.to_string().contains("cannot follow a link here")
+            ),
+            "error: {err:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&outside_path).unwrap(), edited);
+        assert_eq!(std::fs::read_link(&mfile_path).unwrap(), outside_path);
     }
 
     #[test]
