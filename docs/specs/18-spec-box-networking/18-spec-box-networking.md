@@ -393,7 +393,7 @@ box that holds it returns to `running`. These terms follow the decision in
   verify:   cargo nextest run -p minimald expose_unenrolled_local_rpc_evaluates_dynamic_ingress
   <!-- S5/AC1; prose 28; feature+event; `dynamic_ingress` is design §7.1's name and supersedes 03-spec R2.3's `dynamic_allowed_ports`, which no crate implements (Design reasoning, field names) -->
 
-- **NET-044** WHEN a dynamic ingress request is decided `allow` THE SYSTEM SHALL publish the port and show the mapping in `min session policy`.
+- **NET-044** WHEN a dynamic ingress request is decided `allow` THE SYSTEM SHALL publish the port and show the mapping in `min box show <box> --network`.
   tier:     T0
   verify:   cargo nextest run -p minimald expose_allow_publishes_and_lists
   <!-- S5/AC2; prose 29; event-driven; "publish" means reachable, as in NET-040 and NET-016: the box's relay gate admits the port in the same step the forward is bound, for an `allow` and for a yes-answered `ask` (NET-045) alike, and no pending window exists; with nothing listening on the port yet, the box's own kernel answers with a reset; the admission is kept apart from NET-016/NET-017's listen-published set, so a listener closing never withdraws it, and the expose's revocation (the box's stop) does -->
@@ -508,15 +508,15 @@ box that holds it returns to `running`. These terms follow the decision in
   verify:   cargo nextest run -p boxes spec_accepts_egress_fields
   <!-- S8a/AC1 + S8b/AC1; prose 39; ubiquitous; NET-066 and NET-067 require `allow_dns_hosts` and the local Box Egress Proxy validates its grants against it; `deny_subnets` is the box's half of NET-067's denied range (design §5.3) -->
 
-- **NET-061** THE SYSTEM SHALL show a box's effective egress rules in `min session policy`.
+- **NET-061** THE SYSTEM SHALL show a box's effective egress rules in `min box show <box> --network`.
   tier:     T0
   verify:   cargo nextest run -p minimal policy_shows_effective_egress
   <!-- S8a/AC1; prose 39; ubiquitous -->
 
-- **NET-146** THE SYSTEM SHALL show in `min ls`, for every box, the effective egress posture that `min session policy` shows for that box.
+- **NET-146** THE SYSTEM SHALL show in `min ls`, for every box, the effective egress posture that `min box show <box> --network` shows for that box.
   tier:     T0
   verify:   cargo nextest run -p minimal ls_egress_matches_session_policy
-  <!-- S8a/AC1, S9a; ubiquitous; the posture is the named default, deny-all, or declared rules, in the words `min session policy` uses; the listing never shows an internal enforcement value in their place, and never a blank for a box whose egress is decided; where a host-address box runs with its rules unenforced (NET-079), the listing says so in the same words as `min session policy` -->
+  <!-- S8a/AC1, S9a; ubiquitous; the posture is the named default, deny-all, or declared rules, in the words `min box show <box> --network` uses; the listing never shows an internal enforcement value in their place, and never a blank for a box whose egress is decided; where a host-address box runs with its rules unenforced (NET-079), the listing says so in the same words as `min box show <box> --network` -->
 
 - **NET-062** WHILE a box runs with an own address, IF it opens a connection to a destination its egress rules do not allow THEN THE SYSTEM SHALL drop the connection without resetting it.
   tier:     T2
@@ -662,7 +662,7 @@ box that holds it returns to `running`. These terms follow the decision in
     verify: cargo nextest run -p minimal deny_all_in_force_note_printed
     <!-- S9a/AC2; prose 48; optional-feature+event; the in-force note that replaces NET-076's announcement; the verify test is Linux-only (`#[cfg(target_os = "linux")]`), as it drives the compiled binary against a local daemon -->
 
-- **NET-075** WHERE the deny-all default is in force and the opt-out flag is not set, WHILE an own-address box has no `egress` section THE SYSTEM SHALL show `deny-all` in `min session policy`.
+- **NET-075** WHERE the deny-all default is in force and the opt-out flag is not set, WHILE an own-address box has no `egress` section THE SYSTEM SHALL show `deny-all` in `min box show <box> --network`.
   tier:     T0
   verify:   cargo nextest run -p minimal policy_shows_deny_all_default
   <!-- S9a/AC1; prose 47; feature+state -->
@@ -828,7 +828,7 @@ box that holds it returns to `running`. These terms follow the decision in
   - WHERE the box host is native, WHEN `min box show --network` reports a host-address box THE SYSTEM SHALL state that the host's `[host-exposures]` table does not apply to the box, in place of a list of exposures.
     tier:   T0
     verify: cargo nextest run -p minimal native_host_ip_network_view_says_host_exposures_do_not_apply
-    <!-- S10a; design v0.9.2 §7.1 Lanes: a native host-address box shares the host's network namespace, so the table is not applied, and the box's network view says so rather than listing exposures; BCLI-042's `min session policy` alias prints the same view; the message states the situation alone, with no remedy, because no setting applies the table to such a box; the exact text goes in the task and the test that pins it; event-driven -->
+    <!-- S10a; design v0.9.2 §7.1 Lanes: a native host-address box shares the host's network namespace, so the table is not applied, and the box's network view says so rather than listing exposures; `min box show <box> --network` (BCLI-025) prints the same view; the message states the situation alone, with no remedy, because no setting applies the table to such a box; the exact text goes in the task and the test that pins it; event-driven -->
 
 - **NET-161** WHILE the box host is VM-backed or the box is an own-address box, WHEN the `[host-exposures]` table changes THE SYSTEM SHALL decide each later flow to the host-gateway alias by the changed table.
   tier:     T0
@@ -1025,11 +1025,11 @@ box that holds it returns to `running`. These terms follow the decision in
   tier:     T0
   verify:   cargo nextest run -p minimal deny_all_egress_flag_declares_every_allow_list_empty
   <!-- S9b/AC2; event-driven; one argument group defines the flag for every command that takes the egress flags, with one meaning, and it conflicts with every `--allow-*` and `--deny-*` flag; an empty value for any of those flags stays a validation error and never becomes an empty list; in the box spec form deny-all is every allow list present and empty, and an absent list in the expanded spec grants nothing in its dimension (NET-074), so the spec loader keeps the two apart and resolves neither early; the predicate that reads a resolved section as deny-all consults the two destination lists, `allow_protocols` being a filter over what they grant; an unset section on a host-address box admits everything because no requirement narrows it (NET-120), which makes this flag the CLI's one deny-all declaration for that mode; mixed forms such as no addresses but some names are not offered, since the classifier decides addresses, never names -->
-  - WHILE a box's `egress` section is declared deny-all THE SYSTEM SHALL show `deny-all` in `min session policy`.
+  - WHILE a box's `egress` section is declared deny-all THE SYSTEM SHALL show `deny-all` in `min box show <box> --network`.
     tier:   T0
     verify: cargo nextest run -p minimal policy_shows_declared_deny_all
     <!-- state-driven; the display NET-075 requires for the own-address default, here for a declaration; on a host-address box it sits beside the box's per-box enforcement value -->
-  - WHILE a box has no `egress` section THE SYSTEM SHALL show its effective default by name in `min session policy`, marked as a default and not as a declaration.
+  - WHILE a box has no `egress` section THE SYSTEM SHALL show its effective default by name in `min box show <box> --network`, marked as a default and not as a declaration.
     tier:   T0
     verify: cargo nextest run -p minimal policy_shows_unset_egress_as_named_default
     <!-- state-driven; the effective default is `deny-all` for an own-address box under the deny-all default (NET-075) and `allow-all` for a host-address box or under the opt-out (NET-077); the policy view never shows an unset section as nothing, since a declared deny-all and an unset section admit opposite things -->
@@ -1186,7 +1186,7 @@ box that holds it returns to `running`. These terms follow the decision in
   - WHEN a box's effective egress is shown THE SYSTEM SHALL show the baseline set beside it.
     tier:   T0
     verify: cargo nextest run -p minimal policy_shows_baseline_set
-    <!-- event-driven; `min session policy` (NET-061) -->
+    <!-- event-driven; `min box show <box> --network` (NET-061) -->
 
 ## Non-goals
 
