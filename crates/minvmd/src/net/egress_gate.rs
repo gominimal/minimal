@@ -5297,7 +5297,6 @@ async fn relay_frames_to_switch(
 ) -> io::Result<()> {
     let mut len_buf = [0u8; 2];
     let mut frame = vec![0u8; max_frame()];
-    let mut dns_tcp = dns_pins::DnsTcpStreams::default();
     let mut first_openings = FirstOpeningDrops::default();
     loop {
         match guest.read_exact(&mut len_buf).await {
@@ -5511,118 +5510,18 @@ async fn relay_frames_to_switch(
             limiter.warn_refused_dns_query(&refusal);
             continue;
         }
-        // The first fragment of a TCP segment to that resolver is dropped
-        // whatever its TCP header holds: the gate reads only whole segments.
-        // It is read from the frame's summary, so a fragment that ends
-        // before the TCP flags byte is decided too.
+        // TCP to that resolver from a decided row is dropped whatever it
+        // carries: the gate decides DNS over UDP only. It is read from the
+        // frame's summary, so a first fragment, which carries the ports, is
+        // decided too, however short. A later fragment reads as port 0, and
+        // the control-surface check refuses it at the gateway.
         if let (Some(src), Some(dst), Some(proto)) =
             (summary.source(), summary.destination(), summary.protocol())
-            && let Some(refusal) = dns_pins::tcp_first_fragment_refusal(
-                table,
-                &frame[..n],
-                src,
-                dst,
-                proto,
-                summary.destination_port(),
-            )
+            && let Some(refusal) =
+                dns_pins::tcp_query_refusal(table, src, dst, proto, summary.destination_port())
         {
             limiter.warn_refused_dns_query(&refusal);
             continue;
-        }
-        // The same decision for DNS over TCP to the box's own resolver: the
-        // connection's length-prefixed messages are read in order, and the
-        // frame that completes a refused message is dropped, as is every
-        // later frame of that connection carrying data
-        // ([`dns_pins::DnsTcpStreams`]). The connection's read position
-        // moves only once the frame is written on, below.
-        let mut dns_tcp_advance = None;
-        if let Some(pkt) = l4.as_ref()
-            && pkt.proto == egress::IPPROTO_TCP
-            && pkt.dst.port() == RESOLVER_PORT
-        {
-            match dns_tcp.decide(table, pkt, &frame[..n], Instant::now()) {
-                dns_pins::TcpDnsVerdict::Pass => {}
-                dns_pins::TcpDnsVerdict::Forward(advance) => dns_tcp_advance = Some(advance),
-                dns_pins::TcpDnsVerdict::Drop(refusal) => {
-                    if let Some(refusal) = refusal {
-                        limiter.warn_refused_dns_query(&refusal);
-                    }
-                    continue;
-                }
-                // A refused connection: the frame is dropped and a reset at
-                // the gate's next undecided byte goes on in its place. An
-                // entry past its idle bound is released only once the queue
-                // took the reset; otherwise the connection's next frame
-                // draws it again.
-                dns_pins::TcpDnsVerdict::Reset {
-                    refusal,
-                    reset,
-                    release,
-                } => {
-                    if let Some(refusal) = refusal {
-                        limiter.warn_refused_dns_query(&refusal);
-                    }
-                    let mut framed = Vec::with_capacity(2 + reset.len());
-                    framed.extend_from_slice(&(reset.len() as u16).to_le_bytes());
-                    framed.extend_from_slice(&reset);
-                    match switch.try_send(framed) {
-                        Ok(()) => {
-                            if let Some(release) = release {
-                                dns_tcp.commit(release);
-                            }
-                        }
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            limiter.warn_backpressure(
-                                QueueDirection::TowardSwitch,
-                                summary.source(),
-                                Who::of(table, summary.source()),
-                            );
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::ConnectionAborted,
-                                "the relay's switch writer is gone",
-                            ));
-                        }
-                    }
-                    continue;
-                }
-            }
-        }
-        // An opening that reclaims entries of connections it must reset
-        // writes those resets on first. The queue space for the resets and
-        // the opening is reserved together, without waiting: when it has no
-        // room for all of them, none is written on and no entry is given
-        // up.
-        let mut frame_permit = None;
-        if let Some(advance) = dns_tcp_advance.as_ref()
-            && !advance.resets().is_empty()
-        {
-            let mut permits = match switch.try_reserve_many(advance.resets().len() + 1) {
-                Ok(permits) => permits,
-                Err(mpsc::error::TrySendError::Full(())) => {
-                    limiter.warn_backpressure(
-                        QueueDirection::TowardSwitch,
-                        summary.source(),
-                        Who::of(table, summary.source()),
-                    );
-                    continue;
-                }
-                Err(mpsc::error::TrySendError::Closed(())) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::ConnectionAborted,
-                        "the relay's switch writer is gone",
-                    ));
-                }
-            };
-            // The resets lead the zip so it never takes a permit past them.
-            for (reset, permit) in advance.resets().iter().zip(permits.by_ref()) {
-                let mut framed = Vec::with_capacity(2 + reset.len());
-                framed.extend_from_slice(&(reset.len() as u16).to_le_bytes());
-                framed.extend_from_slice(reset);
-                permit.send(framed);
-            }
-            frame_permit = permits.next();
         }
         // One combined write keeps the length prefix and the frame together
         // even if the switch closes between two writes — and the queue keeps
@@ -5639,22 +5538,8 @@ async fn relay_frames_to_switch(
         let mut framed = Vec::with_capacity(2 + n);
         framed.extend_from_slice(&(n as u16).to_le_bytes());
         framed.extend_from_slice(&frame[..n]);
-        let sent = match frame_permit {
-            Some(permit) => {
-                permit.send(framed);
-                Ok(())
-            }
-            None => switch.try_send(framed),
-        };
-        match sent {
-            // The connection's read position moves only for a frame the
-            // queue took: a dropped one leaves its entry as it was, so the
-            // box's retransmission of it is decided again.
-            Ok(()) => {
-                if let Some(advance) = dns_tcp_advance {
-                    dns_tcp.commit(advance);
-                }
-            }
+        match switch.try_send(framed) {
+            Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
                 limiter.warn_backpressure(
                     QueueDirection::TowardSwitch,
@@ -21277,376 +21162,26 @@ mod tests {
         }
     }
 
-    /// Sends `frame` from the guest and asserts the switch receives it byte
-    /// for byte.
-    async fn passes(h: &mut super::test_support::GateHarness, frame: &[u8], what: &str) {
-        send_frame(&mut h.guest, frame).await;
-        assert_eq!(
-            expect_frame(&mut h.switch).await,
-            frame,
-            "{what} reaches the switch"
-        );
-    }
-
-    /// Asserts the next frame at the switch is the gate's reset of the box's
-    /// connection from `port` to its resolver, at sequence number `seq`.
-    async fn expect_reset(h: &mut super::test_support::GateHarness, port: u16, seq: u32) {
-        let frame = expect_frame(&mut h.switch).await;
-        let reset = super::forward_revoke::parse_tcp_segment(&frame)
-            .expect("the frame at the switch is a TCP segment");
-        assert_eq!(
-            reset.flags,
-            boxes::core::egress::TCP_RST,
-            "the frame is a bare reset"
-        );
-        assert_eq!(
-            (reset.src, reset.src_port, reset.dst, reset.dst_port),
-            (LEASE, port, SUBNET.dns_server().octets(), 53),
-            "the reset ends the box's connection from {port} to its resolver"
-        );
-        assert_eq!(
-            reset.seq, seq,
-            "the reset sits at the gate's next undecided byte"
-        );
-    }
-
-    /// NET-141 over TCP, decided host-side for an own-address allow-list
-    /// row whose rules admit TCP to its resolver's address: each
-    /// length-prefixed message on a connection to the box's own resolver is
-    /// decided by the datagram's rule. A declared name passes, whole or split
-    /// across two segments, and a byte-identical retransmission of a decided
-    /// segment passes. The segment that completes an unmatched name's
-    /// message is dropped, and a reset from the box at the gate's next
-    /// undecided byte goes to the switch in its place. Every later segment
-    /// of that connection, with or without data, is dropped and draws the
-    /// reset again. A retransmission whose bytes differ from the decided
-    /// ones is refused the same way. A length prefix past the bound is
-    /// dropped at once, the same way. A query to an address other than the
-    /// resolver is not this gate's and passes. Each drop says so in the
-    /// unmatched-name rule's line.
+    /// NET-141 over TCP, decided host-side for own-address rows: TCP to the
+    /// box's own resolver on port 53 from an allow-list row or a deny-all
+    /// row is dropped whatever it carries, an opening and a data segment
+    /// alike, and so is a first fragment of such a segment. A later fragment
+    /// reads as port 0 and is refused at the gateway too. The allow-list
+    /// row's drops say so in the unmatched-name rule's line, named
+    /// `<tcp dns>`. TCP from the allow-list row to another address its
+    /// subnets admit passes, at port 53 and at any other port, and a row
+    /// that declared no names reaches its resolver over TCP.
     #[tokio::test]
-    async fn allow_list_row_tcp_query_decided_like_a_datagram() {
+    async fn decided_rows_tcp_to_the_resolver_never_reaches_the_switch() {
         use hickory_proto::rr::RecordType;
 
         use super::UNMATCHED_NAME_DNS_RULE;
         use crate::net::dns_pins::tests::{
-            dns_query_of, qname, tcp_dns_message, tcp_segment_frame,
-        };
-
-        const SYN: u8 = 0x02;
-        const ACK: u8 = 0x10;
-        const PSH_ACK: u8 = 0x18;
-        let registry = BoxRegistry::new(SUBNET);
-        registry.register(
-            BoxRegistration::new("weather", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
-                .with_egress_policy(EgressPolicy {
-                    allow_protocols: Some(vec![boxes::IpProto::Tcp, boxes::IpProto::Udp]),
-                    allow_subnets: Some(vec!["0.0.0.0/0".to_string()]),
-                    allow_dns_hosts: Some(vec!["example.com".to_string()]),
-                    deny_subnets: None,
-                }),
-        );
-        let mut h = gate_over(registry).await;
-        let resolver = SUBNET.dns_server();
-        let segment = |dst: Ipv4Addr, port: u16, flags: u8, seq: u32, payload: &[u8]| {
-            tcp_segment_frame(Ipv4Addr::from(LEASE), port, dst, 53, flags, seq, payload)
-        };
-        let query = |name: &str| tcp_dns_message(&dns_query_of(&[(qname(name), RecordType::A)]));
-        let declared = query("example.com.");
-        let unmatched = query("example.org.");
-        let len = |bytes: &[u8]| u32::try_from(bytes.len()).expect("a query fits in u32");
-        // The marker every drop below is proved against: a declared query on
-        // a connection of its own, opened here.
-        passes(
-            &mut h,
-            &segment(resolver, 41900, SYN, 900, &[]),
-            "the marker's opening",
-        )
-        .await;
-        let mut marker_seq = 901;
-        let mut marker = async |h: &mut super::test_support::GateHarness| {
-            passes(
-                h,
-                &segment(resolver, 41900, PSH_ACK, marker_seq, &declared),
-                "the declared marker query",
-            )
-            .await;
-            marker_seq += len(&declared);
-            expect_silence(&mut h.switch).await;
-        };
-
-        // A declared query passes; the unmatched one behind it on the same
-        // connection is dropped, and so are the declared one after that and
-        // a segment without data, each drawing the reset again.
-        passes(
-            &mut h,
-            &segment(resolver, 41000, SYN, 1000, &[]),
-            "the opening",
-        )
-        .await;
-        passes(
-            &mut h,
-            &segment(resolver, 41000, PSH_ACK, 1001, &declared),
-            "the declared query",
-        )
-        .await;
-        let after = 1001 + len(&declared);
-        send_frame(
-            &mut h.guest,
-            &segment(resolver, 41000, PSH_ACK, after, &unmatched),
-        )
-        .await;
-        expect_reset(&mut h, 41000, after).await;
-        send_frame(
-            &mut h.guest,
-            &segment(resolver, 41000, PSH_ACK, after + len(&unmatched), &declared),
-        )
-        .await;
-        expect_reset(&mut h, 41000, after).await;
-        send_frame(&mut h.guest, &segment(resolver, 41000, ACK, after, &[])).await;
-        expect_reset(&mut h, 41000, after).await;
-        marker(&mut h).await;
-
-        // Split across two segments: the declared query's halves both pass,
-        // and a retransmission of the first half passes; the unmatched
-        // query's first half passes and the half that completes it is
-        // dropped.
-        let (head, tail) = declared.split_at(5);
-        passes(
-            &mut h,
-            &segment(resolver, 41001, SYN, 2000, &[]),
-            "the opening",
-        )
-        .await;
-        passes(
-            &mut h,
-            &segment(resolver, 41001, PSH_ACK, 2001, head),
-            "the first half",
-        )
-        .await;
-        passes(
-            &mut h,
-            &segment(resolver, 41001, PSH_ACK, 2001 + len(head), tail),
-            "the half that completes the declared query",
-        )
-        .await;
-        passes(
-            &mut h,
-            &segment(resolver, 41001, PSH_ACK, 2001, head),
-            "a retransmission of the first half",
-        )
-        .await;
-        // A retransmission at the same sequence number that carries an
-        // unmatched query in place of the declared one is refused and draws
-        // the reset at the next undecided byte.
-        assert_eq!(unmatched.len(), declared.len(), "the two queries line up");
-        send_frame(
-            &mut h.guest,
-            &segment(resolver, 41001, PSH_ACK, 2001, &unmatched),
-        )
-        .await;
-        expect_reset(&mut h, 41001, 2001 + len(&declared)).await;
-        marker(&mut h).await;
-
-        let (head, tail) = unmatched.split_at(5);
-        passes(
-            &mut h,
-            &segment(resolver, 41002, SYN, 3000, &[]),
-            "the opening",
-        )
-        .await;
-        passes(
-            &mut h,
-            &segment(resolver, 41002, PSH_ACK, 3001, head),
-            "the unmatched query's first half",
-        )
-        .await;
-        send_frame(
-            &mut h.guest,
-            &segment(resolver, 41002, PSH_ACK, 3001 + len(head), tail),
-        )
-        .await;
-        expect_reset(&mut h, 41002, 3001 + len(head)).await;
-        marker(&mut h).await;
-
-        // A length prefix past the bound is dropped before the message.
-        passes(
-            &mut h,
-            &segment(resolver, 41003, SYN, 4000, &[]),
-            "the opening",
-        )
-        .await;
-        let mut oversized = 4097u16.to_be_bytes().to_vec();
-        oversized.extend_from_slice(&[0; 64]);
-        send_frame(
-            &mut h.guest,
-            &segment(resolver, 41003, PSH_ACK, 4001, &oversized),
-        )
-        .await;
-        expect_reset(&mut h, 41003, 4001).await;
-        marker(&mut h).await;
-
-        wait_for_log(&h.log, "name=\"<over the size limit>\"").await;
-        wait_for_log(&h.log, "name=\"<retransmission differs>\"").await;
-        let logged = h.log.contents();
-        assert!(
-            logged.contains("source=100.64.0.9")
-                && logged.contains("namespace=\"weather\"")
-                && logged.contains("name=\"example.org\"")
-                && logged.contains(&format!("rule_matched=\"{UNMATCHED_NAME_DNS_RULE}\"")),
-            "each drop names the box and the name: {logged}"
-        );
-        // Nothing was written back toward the guest: the drop is silent.
-        expect_silence(&mut h.guest).await;
-
-        // A TCP query to an address other than the box's resolver is not
-        // this gate's: the row's rules admitted it, and it passes.
-        let elsewhere = Ipv4Addr::new(192, 0, 2, 53);
-        passes(
-            &mut h,
-            &segment(elsewhere, 41004, SYN, 5000, &[]),
-            "the opening",
-        )
-        .await;
-        passes(
-            &mut h,
-            &segment(elsewhere, 41004, PSH_ACK, 5001, &unmatched),
-            "an unmatched query to another address",
-        )
-        .await;
-    }
-
-    /// NET-141 over TCP, failing closed at a connection's close: a close
-    /// (FIN) at a sequence number other than the next undecided byte is
-    /// dropped and the connection's entry kept, so an opening on the same
-    /// port that follows is dropped and the half that completes an
-    /// unmatched query never reaches the switch: the half that completes it
-    /// at the first opening's sequence number draws the reset instead. A
-    /// refused connection's entry stays within its idle bound: every later
-    /// frame of it, a new opening on the same port included, is dropped and
-    /// draws the reset again.
-    #[tokio::test]
-    async fn allow_list_row_tcp_close_never_restarts_the_stream() {
-        use hickory_proto::rr::RecordType;
-
-        use crate::net::dns_pins::tests::{
-            dns_query_of, qname, tcp_dns_message, tcp_segment_frame,
+            dns_query_of, qname, tcp_dns_message, tcp_segment_frame, udp_payload_frame,
         };
 
         const SYN: u8 = 0x02;
         const PSH_ACK: u8 = 0x18;
-        const FIN_ACK: u8 = 0x11;
-        let registry = BoxRegistry::new(SUBNET);
-        registry.register(
-            BoxRegistration::new("weather", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
-                .with_egress_policy(EgressPolicy {
-                    allow_protocols: Some(vec![boxes::IpProto::Tcp, boxes::IpProto::Udp]),
-                    allow_subnets: Some(vec!["0.0.0.0/0".to_string()]),
-                    allow_dns_hosts: Some(vec!["example.com".to_string()]),
-                    deny_subnets: None,
-                }),
-        );
-        let mut h = gate_over(registry).await;
-        let resolver = SUBNET.dns_server();
-        let segment = |port: u16, flags: u8, seq: u32, payload: &[u8]| {
-            tcp_segment_frame(
-                Ipv4Addr::from(LEASE),
-                port,
-                resolver,
-                53,
-                flags,
-                seq,
-                payload,
-            )
-        };
-        let query = |name: &str| tcp_dns_message(&dns_query_of(&[(qname(name), RecordType::A)]));
-        let declared = query("example.com.");
-        let unmatched = query("example.org.");
-        let len = |bytes: &[u8]| u32::try_from(bytes.len()).expect("a query fits in u32");
-        // The marker every drop below is proved against: a declared query on
-        // a connection of its own, opened here.
-        passes(
-            &mut h,
-            &segment(41900, SYN, 900, &[]),
-            "the marker's opening",
-        )
-        .await;
-        let mut marker_seq = 901;
-        let mut marker = async |h: &mut super::test_support::GateHarness| {
-            passes(
-                h,
-                &segment(41900, PSH_ACK, marker_seq, &declared),
-                "the declared marker query",
-            )
-            .await;
-            marker_seq += len(&declared);
-            expect_silence(&mut h.switch).await;
-        };
-
-        // An unmatched query's first half passes. A close at the wrong
-        // sequence number, an opening on the same port, and the completing
-        // half (at the new opening's sequence number and at the old one)
-        // are all dropped.
-        let (head, tail) = unmatched.split_at(5);
-        passes(&mut h, &segment(41010, SYN, 6000, &[]), "the opening").await;
-        passes(
-            &mut h,
-            &segment(41010, PSH_ACK, 6001, head),
-            "the unmatched query's first half",
-        )
-        .await;
-        send_frame(
-            &mut h.guest,
-            &segment(41010, FIN_ACK, 6001 + len(head) + 7, &[]),
-        )
-        .await;
-        send_frame(&mut h.guest, &segment(41010, SYN, 7000, &[])).await;
-        send_frame(&mut h.guest, &segment(41010, PSH_ACK, 7001, tail)).await;
-        send_frame(
-            &mut h.guest,
-            &segment(41010, PSH_ACK, 6001 + len(head), tail),
-        )
-        .await;
-        expect_reset(&mut h, 41010, 6001 + len(head)).await;
-        marker(&mut h).await;
-
-        // A refused connection within its idle bound: the reset reaches the
-        // switch before any later frame of the port, and every later frame
-        // of it (the box's close, data, a new opening on the same port) is
-        // dropped and draws the reset again. The release past the idle bound
-        // is proved on the table itself.
-        passes(&mut h, &segment(41011, SYN, 8000, &[]), "the opening").await;
-        send_frame(&mut h.guest, &segment(41011, PSH_ACK, 8001, &unmatched)).await;
-        expect_reset(&mut h, 41011, 8001).await;
-        for frame in [
-            segment(41011, FIN_ACK, 8001, &[]),
-            segment(41011, PSH_ACK, 8001, &declared),
-            segment(41011, SYN, 9000, &[]),
-        ] {
-            send_frame(&mut h.guest, &frame).await;
-            expect_reset(&mut h, 41011, 8001).await;
-        }
-        marker(&mut h).await;
-        expect_silence(&mut h.switch).await;
-        // Nothing was written back toward the guest: the drops are silent.
-        expect_silence(&mut h.guest).await;
-    }
-
-    /// NET-141 over TCP: the first fragment of a segment to the box's own
-    /// resolver is dropped even when it ends before the TCP flags byte, so
-    /// the gate never writes on part of a segment it cannot read. A whole
-    /// segment on the same connection still passes.
-    #[tokio::test]
-    async fn allow_list_row_tcp_short_first_fragment_never_reaches_the_switch() {
-        use hickory_proto::rr::RecordType;
-
-        use crate::net::dns_pins::tests::{
-            dns_query_of, qname, tcp_dns_message, tcp_segment_frame,
-        };
-
-        const SYN: u8 = 0x02;
-        const PSH_ACK: u8 = 0x18;
-        // The Ethernet header's length: the IPv4 header follows it.
         const IP: usize = 14;
         let registry = BoxRegistry::new(SUBNET);
         registry.register(
@@ -21658,154 +21193,99 @@ mod tests {
                     deny_subnets: None,
                 }),
         );
+        let sealed = [100, 64, 0, 10];
+        registry.register(
+            BoxRegistration::new("sealed", Ipv4Addr::from(sealed), Ipv4Addr::LOCALHOST)
+                .with_egress_policy(EgressPolicy::deny_all()),
+        );
+        let unrestricted = [100, 64, 0, 11];
+        registry.register(
+            BoxRegistration::new(
+                "unrestricted",
+                Ipv4Addr::from(unrestricted),
+                Ipv4Addr::LOCALHOST,
+            )
+            .with_egress_policy(EgressPolicy {
+                allow_protocols: None,
+                allow_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+                allow_dns_hosts: None,
+                deny_subnets: None,
+            }),
+        );
         let mut h = gate_over(registry).await;
         let resolver = SUBNET.dns_server();
-        let segment = |flags: u8, seq: u32, payload: &[u8]| {
-            tcp_segment_frame(
-                Ipv4Addr::from(LEASE),
-                41020,
-                resolver,
-                53,
-                flags,
-                seq,
-                payload,
-            )
-        };
-        let declared = tcp_dns_message(&dns_query_of(&[(qname("example.com."), RecordType::A)]));
-        passes(&mut h, &segment(SYN, 1000, &[]), "the opening").await;
-
-        // The first 8 bytes of the segment's TCP header, sent as the first
-        // fragment of its datagram: the ports are readable, the flags are
-        // not.
-        let whole = segment(PSH_ACK, 1001, &declared);
-        let mut fragment = whole[..IP + 20 + 8].to_vec();
-        fragment[IP + 2..IP + 4].copy_from_slice(&28u16.to_be_bytes());
-        fragment[IP + 6] |= 0x20;
-        assert!(
-            dns_pins::parse_ipv4_l4(&fragment).is_none(),
-            "the fragment ends before the TCP flags byte"
+        let segment =
+            |lease: [u8; 4], dst: Ipv4Addr, port: u16, flags: u8, seq: u32, payload: &[u8]| {
+                tcp_segment_frame(Ipv4Addr::from(lease), 41000, dst, port, flags, seq, payload)
+            };
+        let query = tcp_dns_message(&dns_query_of(&[(qname("example.com."), RecordType::A)]));
+        // The marker every drop below is proved against: the allow-list
+        // row's declared name over UDP.
+        let marker = udp_payload_frame(
+            Ipv4Addr::from(LEASE),
+            40100,
+            resolver,
+            53,
+            &dns_query_of(&[(qname("example.com."), RecordType::A)]),
         );
-        send_frame(&mut h.guest, &fragment).await;
-        passes(&mut h, &whole, "the whole segment").await;
+
+        // An opening and a data segment to the resolver from either decided
+        // row, a declared name's query among them.
+        let mut dropped = Vec::new();
+        for lease in [LEASE, sealed] {
+            dropped.push(segment(lease, resolver, 53, SYN, 1000, &[]));
+            dropped.push(segment(lease, resolver, 53, PSH_ACK, 1001, &query));
+        }
+        // A first fragment that ends inside the TCP header: the ports are
+        // readable, the rest of the segment is not.
+        let whole = segment(LEASE, resolver, 53, PSH_ACK, 1001, &query);
+        let mut first = whole[..IP + 20 + 8].to_vec();
+        first[IP + 2..IP + 4].copy_from_slice(&28u16.to_be_bytes());
+        first[IP + 6] |= 0x20;
+        dropped.push(first);
+        // A later fragment of the same segment: no readable port.
+        let mut later = whole.clone();
+        later[IP + 6..IP + 8].copy_from_slice(&3u16.to_be_bytes());
+        dropped.push(later);
+        for frame in &dropped {
+            send_frame(&mut h.guest, frame).await;
+        }
+        send_frame(&mut h.guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            marker,
+            "no TCP segment to the resolver reached the switch; the marker did"
+        );
         expect_silence(&mut h.switch).await;
-        wait_for_log(&h.log, "name=\"<fragment>\"").await;
+        wait_for_log(&h.log, "name=\"<tcp dns>\"").await;
+        let logged = h.log.contents();
+        assert!(
+            logged.contains("source=100.64.0.9")
+                && logged.contains("namespace=\"weather\"")
+                && logged.contains(&format!("rule_matched=\"{UNMATCHED_NAME_DNS_RULE}\"")),
+            "the drop line names the box and the rule: {logged}"
+        );
         // Nothing was written back toward the guest: the drop is silent.
         expect_silence(&mut h.guest).await;
-    }
 
-    /// NET-141 over TCP at a full switch queue: a segment to the box's own
-    /// resolver that the queue has no room for is dropped and leaves the
-    /// connection's entry as it was. A later segment that continues past it
-    /// is a gap and is dropped, the box's retransmission of the dropped
-    /// segment is decided again and passes, and the continuation passes
-    /// after it.
-    #[tokio::test]
-    async fn tcp_dns_segment_dropped_at_a_full_queue_leaves_the_connection_as_it_was() {
-        use hickory_proto::rr::RecordType;
-
-        use crate::net::dns_pins::tests::{
-            dns_query_of, qname, tcp_dns_message, tcp_segment_frame,
-        };
-
-        const SYN: u8 = 0x02;
-        const PSH_ACK: u8 = 0x18;
-        let registry = BoxRegistry::new(SUBNET);
-        registry.register(
-            BoxRegistration::new("weather", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
-                .with_egress_policy(EgressPolicy {
-                    allow_protocols: Some(vec![boxes::IpProto::Tcp, boxes::IpProto::Udp]),
-                    allow_subnets: Some(vec!["0.0.0.0/0".to_string()]),
-                    allow_dns_hosts: Some(vec!["example.com".to_string()]),
-                    deny_subnets: None,
-                }),
-        );
-        let table = registry.table();
-        let pins = dns_pins::DnsPins::new(registry.subnet());
-        let replies = ReplyTables::new();
-        let baseline = NodePlaneBaseline::built_in(registry.subnet());
-        let limiter = DropLimiter::new();
-        let forwards = PublishedForwards::new();
-        let mut attributed = Vec::new();
-        let mut carried = crate::box_registry::RelayCarry::default();
-        let (log, _guard) = capture_log();
-        let (ours, mut guest) = UnixStream::pair().expect("a socket pair");
-        let (read, _write) = ours.into_split();
-        let mut reader = super::Prefixed::new(Vec::new(), read);
-        // A queue of one frame, drained only by the script below, so which
-        // frame finds it full is known.
-        let (queue, mut drain) = mpsc::channel::<Vec<u8>>(1);
-
-        let resolver = SUBNET.dns_server();
-        let segment = |seq: u32, flags: u8, payload: &[u8]| {
-            tcp_segment_frame(
-                Ipv4Addr::from(LEASE),
-                41030,
-                resolver,
-                53,
-                flags,
-                seq,
-                payload,
-            )
-        };
-        let declared = tcp_dns_message(&dns_query_of(&[(qname("example.com."), RecordType::A)]));
-        let len = u32::try_from(declared.len()).expect("a query fits in u32");
-        let opening = segment(1000, SYN, &[]);
-        let dropped = segment(1001, PSH_ACK, &declared);
-        let continuation = segment(1001 + len, PSH_ACK, &declared);
-        let filler = ipv4_frame(LEASE, 6, [10, 1, 2, 3], 80);
-
-        let relay = super::relay_frames_to_switch(
-            &mut reader,
-            &queue,
-            &table,
-            &pins,
-            &replies,
-            &baseline,
-            &limiter,
-            &forwards,
-            &mut attributed,
-            &mut carried,
-        );
-        // Each queued entry is the frame behind its 2-byte length.
-        async fn next(drain: &mut mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
-            let framed = drain.recv().await.expect("the relay holds the queue");
-            framed[2..].to_vec()
+        // TCP from the allow-list row to another address its subnets admit
+        // is not this gate's, at port 53 and at any other port, and a row
+        // that declared no names reaches its resolver over TCP.
+        let elsewhere = Ipv4Addr::new(192, 0, 2, 53);
+        for frame in [
+            segment(LEASE, elsewhere, 53, SYN, 2000, &[]),
+            segment(LEASE, elsewhere, 53, PSH_ACK, 2001, &query),
+            segment(LEASE, elsewhere, 443, SYN, 3000, &[]),
+            segment(unrestricted, resolver, 53, SYN, 4000, &[]),
+            segment(unrestricted, resolver, 53, PSH_ACK, 4001, &query),
+        ] {
+            send_frame(&mut h.guest, &frame).await;
+            assert_eq!(
+                expect_frame(&mut h.switch).await,
+                frame,
+                "the segment reaches the switch"
+            );
         }
-        let script = async {
-            send_frame(&mut guest, &opening).await;
-            assert_eq!(next(&mut drain).await, opening, "the opening is written on");
-            // The filler takes the queue's one slot, and the segment behind
-            // it finds the queue full.
-            send_frame(&mut guest, &filler).await;
-            while drain.is_empty() {
-                tokio::task::yield_now().await;
-            }
-            send_frame(&mut guest, &dropped).await;
-            wait_for_log(&log, "egress-backpressure").await;
-            assert_eq!(next(&mut drain).await, filler, "the filler is written on");
-            // The continuation starts past the connection's next undecided
-            // byte, which the dropped segment did not move: it is dropped.
-            // The retransmission is decided again and written on.
-            send_frame(&mut guest, &continuation).await;
-            send_frame(&mut guest, &dropped).await;
-            assert_eq!(
-                next(&mut drain).await,
-                dropped,
-                "the retransmission of the dropped segment is written on, \
-                 and the continuation before it is not"
-            );
-            send_frame(&mut guest, &continuation).await;
-            assert_eq!(
-                next(&mut drain).await,
-                continuation,
-                "the continuation passes once the segment before it did"
-            );
-            guest.shutdown().await.expect("the guest closes its side");
-        };
-        let (result, ()) = tokio::time::timeout(DEADLINE, async { tokio::join!(relay, script) })
-            .await
-            .expect("the relay and the script finish within the deadline");
-        result.expect("the relay ends cleanly at the guest's close");
     }
 
     /// A relay whose guest side never reads must keep draining its switch

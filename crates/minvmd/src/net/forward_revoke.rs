@@ -354,21 +354,6 @@ pub(crate) fn challenge_reset(
     Some(rst_frame(&key, &tail, segment.ack))
 }
 
-/// A reset on the connection `segment` came from a box on, from the box's
-/// address and port toward its peer's, at sequence number `seq`, between the
-/// same hardware addresses as `segment`.
-pub(crate) fn reset_from_box(segment: &TcpSegment, seq: u32) -> Vec<u8> {
-    let key = (segment.src, segment.src_port, segment.dst, segment.dst_port);
-    let tail = FlowTail {
-        box_mac: segment.src_mac,
-        peer_mac: segment.dst_mac,
-        peer_ack: None,
-        box_next: None,
-        seen: Instant::now(),
-    };
-    rst_frame(&key, &tail, seq)
-}
-
 /// One reset segment, as a whole Ethernet frame with both checksums.
 fn rst_frame(key: &FlowKey, tail: &FlowTail, seq: u32) -> Vec<u8> {
     let (box_addr, box_port, peer_addr, peer_port) = *key;
