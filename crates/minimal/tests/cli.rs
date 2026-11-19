@@ -5263,3 +5263,41 @@ async fn activate_exits_8_when_the_vm_host_is_out_of_addresses() {
         "the error carries the daemon's reason: {stderr}"
     );
 }
+
+/// A `MINIMAL_PROVIDER` that names no provider refuses a flagless command
+/// with the step that fixes it, while `--provider` still wins over it and
+/// the shell's completion helper prints nothing and succeeds.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_unknown_minimal_provider_refuses_flagless_commands_only() {
+    let state = tempfile::TempDir::new().unwrap();
+    let config_dir = tempfile::TempDir::new().unwrap();
+    let min = |args: &[&str]| {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"));
+        command
+            .env("MINIMAL_PROVIDER", "vm")
+            .args(["--minimal-dir".as_ref(), state.path().as_os_str()])
+            .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+            .arg("--no-input")
+            .args(args);
+        command
+    };
+    let refused = min(&["ls"]).output().await.unwrap();
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .lines()
+            .any(|line| line
+                == "error: MINIMAL_PROVIDER=vm names no provider. Set MINIMAL_PROVIDER to local or \
+         local-minvmd, or unset it."),
+        "{refused:?}"
+    );
+    let completion = min(&["complete-session-str"]).output().await.unwrap();
+    assert!(completion.status.success(), "{completion:?}");
+    assert!(completion.stdout.is_empty(), "{completion:?}");
+    let flagged = min(&["--provider", "local", "version"])
+        .output()
+        .await
+        .unwrap();
+    assert!(flagged.status.success(), "{flagged:?}");
+}

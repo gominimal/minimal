@@ -61,7 +61,15 @@ pub async fn run(mut cli: Cli) -> Result<(), anyhow::Error> {
     // `provider` key of config.toml, then the VM provider where /dev/kvm
     // opens (Linux only). Resolved before the alias, so an old name in
     // either place gets the same hint as the flag.
-    hosts::resolve_default_provider(&mut cli.global_args)?;
+    if let Err(error) = hosts::resolve_default_provider(&mut cli.global_args) {
+        // The shell's completion helper never fails: a provider that does
+        // not resolve offers no candidates, as the dynamic completer does.
+        if matches!(cli.command, Some(Command::CompleteSessionStr(_))) {
+            tracing::debug!(%error, "no provider resolved: no completions");
+            return Ok(());
+        }
+        return Err(error);
+    }
     // BCLI-046: `--provider local-minimald` reads as `local`. Its hint
     // prints after the command ends, never before an attached shell.
     let alias_hint = hosts::read_provider_alias(&mut cli.global_args);
