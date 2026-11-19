@@ -387,8 +387,8 @@ fn project_rows(global: &GlobalArgs, args: &BoxSpecArgs, out: &mut Vec<u8>) -> a
         .repo_dir
         .clone()
         .unwrap_or_else(|| PathBuf::from("."));
-    let file = match mfile::File::from_dir_recursive(&project) {
-        Ok(file) => file,
+    match mfile::File::from_dir_recursive(&project) {
+        Ok(_) => {}
         Err(mfile::Error::NotFound) => anyhow::bail!(
             "No {} found in {} or its parent directories.",
             mfile::MFILE_NAME,
@@ -407,8 +407,8 @@ fn project_rows(global: &GlobalArgs, args: &BoxSpecArgs, out: &mut Vec<u8>) -> a
         Ok((bep, secrets, _, quic443)) => (bep, secrets, quic443),
         // A project whose start cannot pick one session entry still gets
         // its preview: the bare form is read-only and never refuses for
-        // the pick. The rows then read the `[defaults.session]` table, as they did
-        // before the expansion.
+        // the pick. The rows then read an entry with an empty body, so
+        // `[defaults]` and `[defaults.session]` merge as for any entry.
         Err(error)
             if error
                 .downcast_ref::<crate::SessionEntryUndecided>()
@@ -417,15 +417,9 @@ fn project_rows(global: &GlobalArgs, args: &BoxSpecArgs, out: &mut Vec<u8>) -> a
             tracing::debug!(
                 project = %project.display(),
                 error = %error,
-                "min box spec: no single session entry, rendering the [defaults.session] table"
+                "min box spec: no single session entry, rendering the merged [defaults] and [defaults.session] tables"
             );
-            let session = file.session.unwrap_or_default();
-            let network = session.network.unwrap_or_default();
-            (
-                network.bep.unwrap_or_default(),
-                session.secrets,
-                network.quic443,
-            )
+            session_defaults_rows(&project)?
         }
         Err(error) => return Err(error),
     };
@@ -441,6 +435,71 @@ fn project_rows(global: &GlobalArgs, args: &BoxSpecArgs, out: &mut Vec<u8>) -> a
         None,
         out,
     )
+}
+
+/// The `network.bep`, `secrets` and `network.quic443` of an entry with an
+/// empty body of the `session` Box Type, expanded over the project's
+/// `[defaults]` and `[defaults.session]` (BOX-048). Bare `min box spec`
+/// reads these when the project has no single session entry to expand.
+fn session_defaults_rows(
+    project: &Path,
+) -> anyhow::Result<(BepSettings, SecretGrants, Option<Quic443>)> {
+    let invalid = |error| crate::ProjectFileInvalid { error };
+    let format_error = |error| crate::ProjectFileInvalid {
+        error: mfile::Error::Format(error),
+    };
+    let Some((_, bytes)) = project_file_bytes(project)? else {
+        return Ok(Default::default());
+    };
+    let mut doc: toml::Table = toml::from_slice(&bytes).map_err(format_error)?;
+    mfile::legacy::canonicalize(&mut doc, mfile::legacy::this_release()).map_err(invalid)?;
+    let defaults = doc
+        .get("defaults")
+        .and_then(toml::Value::as_table)
+        .cloned()
+        .unwrap_or_default();
+    let project_types: std::collections::BTreeSet<String> = doc
+        .get("box_types")
+        .and_then(toml::Value::as_table)
+        .map(|types| types.keys().cloned().collect())
+        .unwrap_or_default();
+    let entry = mfile::entry::BoxEntry {
+        name: mfile::entry::DEFAULT_ENTRY_NAME.to_owned(),
+        table: mfile::entry::EntryTable::Sessions,
+        box_type: Some("session".to_owned()),
+        body: toml::Table::new(),
+        implicit: true,
+    };
+    let layers = mfile::expand::Layers::default().with_file_defaults(
+        &defaults,
+        entry.box_type.as_deref(),
+        &project_types,
+    );
+    let spec = mfile::expand::expand(&entry, &layers)
+        .map_err(invalid)?
+        .spec;
+    let secrets = spec
+        .get("secrets")
+        .cloned()
+        .map(boxes::core::bep::deserialize_project_secrets)
+        .transpose()
+        .map_err(format_error)?
+        .unwrap_or_default();
+    let network = spec.get("network").and_then(toml::Value::as_table);
+    let bep = network
+        .and_then(|network| network.get("bep"))
+        .cloned()
+        .map(toml::Value::try_into)
+        .transpose()
+        .map_err(format_error)?
+        .unwrap_or_default();
+    let quic443 = network
+        .and_then(|network| network.get("quic443"))
+        .cloned()
+        .map(toml::Value::try_into)
+        .transpose()
+        .map_err(format_error)?;
+    Ok((bep, secrets, quic443))
 }
 
 /// Writes the Box Egress Proxy rows for `secrets` (BEP-038) to `out`, for

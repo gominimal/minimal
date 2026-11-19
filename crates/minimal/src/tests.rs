@@ -18280,7 +18280,8 @@ async fn box_spec_bare_reads_defaults_network_bep() {
 
 // D3598: bare `min box spec` stays a read-only preview when the start
 // cannot pick one session entry. Two session entries and no `default`
-// render the `[defaults.session]` table's rows, not the start's refusal.
+// render the merged `[defaults]` and `[defaults.session]` rows, not the
+// start's refusal.
 #[tokio::test]
 async fn box_spec_bare_reads_defaults_network_bep_undecided_entry() {
     let (_project, global) = spec_project(
@@ -18293,6 +18294,25 @@ async fn box_spec_bare_reads_defaults_network_bep_undecided_entry() {
         .await
         .expect("the rows render without a picked session entry");
     assert!(bare.contains("\nsteering  proxy_env\n"), "{bare}");
+}
+
+// D3598: with no single session entry, bare `min box spec` still merges
+// the top-level `[defaults]` under `[defaults.session]`, so a
+// `[defaults.network.bep]` steering mode reaches its row and the command
+// succeeds.
+#[tokio::test]
+async fn box_spec_bare_reads_defaults_network_bep_top_level_undecided_entry() {
+    let (_project, global) = spec_project(
+        "[defaults.network.bep]\nsteering = \"proxy_env\"\n\n\
+         [defaults.session.secrets.GH_TOKEN]\nsource = \"broker\"\nscopes = [\"github:full\"]\n\n\
+         [sessions.one]\npackages = [\"git\"]\n\n\
+         [sessions.two]\npackages = [\"git\"]\n",
+    );
+    let bare = box_spec_text(&global, &["min", "box", "spec", "--network", "own_ip"])
+        .await
+        .expect("the rows render without a picked session entry");
+    assert!(bare.contains("\nsteering  proxy_env\n"), "{bare}");
+    assert!(bare.contains("GH_TOKEN"), "{bare}");
 }
 
 // BCLI-021: `min box spec <entry>` with the `[network]` override flags
