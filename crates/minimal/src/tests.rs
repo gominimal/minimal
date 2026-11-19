@@ -856,11 +856,6 @@ const MIN_VALUE_FLAGS: [&str; 6] = [
     "-C",
 ];
 
-/// The marker that lets one line of `scripts/session-e2e.sh` keep
-/// `min session policy`. NET-058's two steps keep the verb until a box verb
-/// gives NET-058's refusal for a box on a stopped VM (gominimal/minimal#3589).
-const REMOVED_VERB_MARKER: &str = "removed-verb-ok: gominimal/minimal#3589";
-
 /// The removed spellings (BCLI-042) on one line of a script or a reference
 /// page, each as `min ...`. The line is read as words: quotes, backticks
 /// and shell punctuation separate words.
@@ -868,12 +863,12 @@ fn removed_spellings_in_line(line: &str) -> Vec<String> {
     // Each command on the line is read alone, so a flag of one command
     // never counts for the command before it.
     line.split([';', '|', '&'])
-        .flat_map(|command| removed_spellings_in_command(line, command))
+        .flat_map(removed_spellings_in_command)
         .collect()
 }
 
-/// The removed spellings in one command of `line`.
-fn removed_spellings_in_command(line: &str, command: &str) -> Vec<String> {
+/// The removed spellings in one command of a line.
+fn removed_spellings_in_command(command: &str) -> Vec<String> {
     let spaced: String = command
         .chars()
         .map(|c| if "`'\"()".contains(c) { ' ' } else { c })
@@ -882,9 +877,6 @@ fn removed_spellings_in_command(line: &str, command: &str) -> Vec<String> {
     let mut found = Vec::new();
     for (i, pair) in words.windows(2).enumerate() {
         if pair[0] == "session" && REMOVED_SESSION_VERBS.contains(&pair[1]) {
-            if pair[1] == "policy" && line.contains(REMOVED_VERB_MARKER) {
-                continue;
-            }
             found.push(format!("min session {}", pair[1]));
         }
         if pair == ["task", "run"]
@@ -1073,10 +1065,6 @@ fn removed_spellings_in_line_reads_each_form() {
             vec!["min session run"],
         ),
         ("mnl session policy \"$b\"", vec!["min session policy"]),
-        (
-            "mnl session policy \"$b\"  # removed-verb-ok: gominimal/minimal#3589",
-            vec![],
-        ),
         ("mnl stop --force >/dev/null 2>&1 || true", vec!["min stop"]),
         (
             "min ${E2E_MINIMAL_ARGS:-} --minimal-dir \"$D\" stop --force",
