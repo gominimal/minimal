@@ -1017,8 +1017,9 @@ pub struct File {
 
 /// The entry keys that `[session]` and a task keep among their unknown
 /// fields but that a box spec reads (BOX-049, BOX-203), so they are not
-/// reported as unknown.
-const SPEC_READ_ENTRY_KEYS: &[&str] = &["timeout", "file_exports"];
+/// reported as unknown. A task's `secrets` table is read by the entry
+/// expansion and reaches the box's spec (#3650).
+const SPEC_READ_ENTRY_KEYS: &[&str] = &["timeout", "file_exports", "secrets"];
 
 /// An entry's unknown fields, in key order, less the ones a box spec reads.
 fn unknown_entry_keys(extra: &HashMap<String, toml::Value>) -> Vec<&str> {
@@ -4817,6 +4818,38 @@ mod tests {
 
         let out = capture.contents();
         assert!(!out.contains("unknown fields"), "{out}");
+    }
+
+    /// #3650: a task's `[tasks.<name>.secrets]` table reaches the box's
+    /// spec through the entry expansion, so the load does not report it as
+    /// an unknown field.
+    #[test]
+    fn secrets_entry_key_is_not_reported_unknown() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MFILE_NAME),
+            "[tasks.ci]\nexec = [\"true\"]\n\n[tasks.ci.secrets.GH_TOKEN]\nsource = \"broker\"\n",
+        )
+        .unwrap();
+
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        File::from_dir(dir.path()).expect("secrets on a task loads");
+        drop(guard);
+
+        let out = capture.contents();
+        assert!(!out.contains("unknown fields"), "{out}");
+
+        // Another unknown key in the same task is still reported, alone.
+        let task: Task = toml::from_str(
+            "exec = [\"true\"]\ncolour = 1\n[secrets.GH_TOKEN]\nsource = \"broker\"\n",
+        )
+        .unwrap();
+        assert_eq!(unknown_entry_keys(&task.extra), ["colour"]);
     }
 
     /// BOX-049: `timeout` in `[session]` or a task is a box setting, so the
