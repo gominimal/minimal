@@ -349,6 +349,9 @@ impl BoxSpec {
             .and_then(|(t, ranking)| ranking.map(|r| (t, r)))
             .and_then(|(t, ranking)| entry_lifetime(t, ranking))
             .unwrap_or(Lifetime::UntilComplete);
+        // BOX-203: the entry's exports, for the command that waits for the
+        // box to copy them when it ends.
+        let file_exports = extra.and_then(|(t, _)| crate::expand::stored_file_exports(t));
         let mut seen = std::collections::BTreeSet::new();
         let packages = packages
             .iter()
@@ -372,7 +375,7 @@ impl BoxSpec {
                 policy: flags.policy,
             },
             lifecycle_hooks: None,
-            file_exports: None,
+            file_exports,
             kept_keys: std::collections::BTreeMap::new(),
         }
     }
@@ -1856,6 +1859,86 @@ mod tests {
 
     // BCLI-029: a session entry's spec takes its lifetime from the
     // expansion, so `until_stopped` reaches the stored spec, and an entry
+    // BOX-203: a session entry's `[[file_exports]]` items, its own and the
+    // ones `[defaults]` declares, reach the stored spec as written.
+    #[test]
+    fn for_session_entry_stores_file_exports() {
+        let file = r#"
+            [defaults]
+            file_exports = [{ path = "shared.txt" }]
+
+            [sessions.dev]
+            packages = ["git"]
+
+            [[sessions.dev.file_exports]]
+            path = "notes.md"
+
+            [sessions.plain]
+        "#;
+        let dev = expand_in(file, "dev").expect("dev expands");
+        let spec =
+            BoxSpec::for_session_entry("dev", &dev.spec, &dev.report, &[], SpecFlags::default());
+        let paths: Vec<_> = spec
+            .file_exports
+            .as_ref()
+            .expect("the spec stores the exports")
+            .iter()
+            .filter_map(|item| crate::expand::file_export_path(&item.0))
+            .collect();
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        assert!(paths.contains(&"notes.md"), "{paths:?}");
+        assert!(paths.contains(&"shared.txt"), "{paths:?}");
+
+        // The stored bytes carry the list as the top-level `file_exports`.
+        let stored = toml::Table::try_from(&spec).unwrap();
+        assert_eq!(
+            stored["file_exports"].as_array().map(Vec::len),
+            Some(2),
+            "{stored:?}"
+        );
+
+        // An entry with no exports stores no list.
+        let plain = expand_in(file, "plain").expect("plain expands");
+        let mut plain_spec = plain.spec.clone();
+        plain_spec.remove("file_exports");
+        let spec = BoxSpec::for_session_entry(
+            "plain",
+            &plain_spec,
+            &plain.report,
+            &[],
+            SpecFlags::default(),
+        );
+        assert_eq!(spec.file_exports, None);
+    }
+
+    // BOX-203: a task's `[[file_exports]]` items reach its stored spec, and
+    // a task with none stores no list.
+    #[test]
+    fn for_task_stores_file_exports() {
+        let file: crate::File = toml::from_str(
+            r#"
+            [tasks.build]
+            exec = ["make"]
+
+            [[tasks.build.file_exports]]
+            path = "dist/out.txt"
+
+            [tasks.plain]
+            exec = ["true"]
+            "#,
+        )
+        .unwrap();
+        let build = BoxSpec::for_task("build", &file.tasks["build"], SpecFlags::default()).unwrap();
+        let exports = build.file_exports.as_ref().expect("the spec stores them");
+        assert_eq!(exports.len(), 1, "{exports:?}");
+        assert_eq!(
+            crate::expand::file_export_path(&exports[0].0),
+            Some("dist/out.txt")
+        );
+        let plain = BoxSpec::for_task("plain", &file.tasks["plain"], SpecFlags::default()).unwrap();
+        assert_eq!(plain.file_exports, None);
+    }
+
     // that sets none keeps `until_complete`.
     #[test]
     fn box_spec_takes_lifetime_from_expansion() {
