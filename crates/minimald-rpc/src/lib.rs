@@ -111,6 +111,44 @@ pub struct GetVersionResponse {
     pub version: String,
     pub long_version: String,
     pub stdlib_version: String,
+    /// The version of the expansion the daemon applies to a box spec, as
+    /// [`expander_version`] forms it (BOX-074). `None` from a daemon that
+    /// predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expander_version: Option<String>,
+}
+
+/// The expander version of a build: the Box Spec shape version and the
+/// projection version, joined by a dot (BOX-074). The client and the
+/// daemon each pass their own `mfile` constants, so two builds that
+/// expand and project a spec the same way report the same version.
+#[must_use]
+pub fn expander_version(spec_version: u32, projection_version: i64) -> String {
+    format!("{spec_version}.{projection_version}")
+}
+
+/// What the client prints when its expander version differs from the
+/// daemon's (BOX-074), or `None` when the two match. `daemon` is `None`
+/// when the daemon reports no expander version. The create goes ahead:
+/// the daemon's digest comparison and admission check are the checks
+/// that refuse it.
+#[must_use]
+pub fn expander_skew_message(cli: &str, daemon: Option<&str>) -> Option<String> {
+    let first = match daemon {
+        Some(daemon) if daemon == cli => return None,
+        Some(daemon) => format!(
+            "This `min` uses minimal.toml expansion version {cli}, \
+             and minimald uses expansion version {daemon}."
+        ),
+        None => format!(
+            "This `min` uses minimal.toml expansion version {cli}, \
+             and minimald does not report its expansion version."
+        ),
+    };
+    Some(format!(
+        "{first} The command continues. minimald refuses to create the box \
+         if it reads the box settings differently from this `min`."
+    ))
 }
 
 impl OneshotSshRpc for GetVersion {
@@ -636,6 +674,38 @@ pub struct BoxConfig {
     pub host_ip_registration: Option<String>,
 }
 
+/// The [`BoxConfig::attrs`] key that carries the client's projection
+/// digest of the spec it sends: the base64url SHA-256 of the spec's
+/// Gatehouse §6.3.2 projection (BOX-071). The daemon stores it in the
+/// box's record under the same key, beside its own digest under
+/// [`DAEMON_PROJECTION_DIGEST_ATTR`]. A client that predates the key
+/// sends none, and the record then holds the daemon's digest alone.
+pub const CLIENT_PROJECTION_DIGEST_ATTR: &str = "projection_digest.client";
+
+/// The record `attrs` key under which the daemon stores the digest it
+/// recomputed from the spec it received (BOX-071). Daemon-owned: a
+/// client that sends this key has it stripped at creation.
+pub const DAEMON_PROJECTION_DIGEST_ATTR: &str = "projection_digest.daemon";
+
+impl BoxConfig {
+    /// The projection digest the client computed for the spec it sends,
+    /// [`CLIENT_PROJECTION_DIGEST_ATTR`] (BOX-071). `None` when the client
+    /// sent none.
+    #[must_use]
+    pub fn client_projection_digest(&self) -> Option<&str> {
+        self.attrs
+            .get(CLIENT_PROJECTION_DIGEST_ATTR)
+            .map(String::as_str)
+    }
+
+    /// Sets the projection digest the client computed for the spec it
+    /// sends (BOX-071).
+    pub fn set_client_projection_digest(&mut self, digest: impl Into<String>) {
+        self.attrs
+            .insert(CLIENT_PROJECTION_DIGEST_ATTR.to_owned(), digest.into());
+    }
+}
+
 /// The client verb that asked for a box ([`BoxConfig::creating_verb`]).
 /// A closed set: a value outside it does not deserialize.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -770,7 +840,10 @@ pub struct RegisterBoxRequest {
     /// connection open: the client writes one `commit` line once its
     /// session is active, and a close or an error before that line
     /// withdraws the row, so an activation that dies between registering
-    /// and committing leaves no row holding its name. A client that omits
+    /// and committing leaves no row holding its name. A `host_ip`
+    /// registration has no row and is held the same way: a close before
+    /// the commit withdraws its registration name, unless a box is already
+    /// admitted under its id. A client that omits
     /// the field, or a daemon that predates it, keeps the one-shot
     /// registration: one line each way, and the row lives until its
     /// creator withdraws it.
@@ -870,6 +943,37 @@ pub struct WithdrawBoxRequest {
         with = "boxes::box_id_hex::option"
     )]
     pub box_id: Option<BoxId>,
+}
+
+/// A renamed session's request that the VM host daemon move its box to
+/// the new name ([`BoxControlRequest::RenameBox`], #1116). A rename is a
+/// session RPC to the in-VM daemon; the host keeps the box's row, its
+/// creation and its published address under the name the box was
+/// registered by until its creator says otherwise. This is that word: the
+/// host re-keys the row and its creation to `new_name`, so the new name
+/// answers the box's address and the old one answers nothing.
+///
+/// The pair and the box id prove the creator, as a withdrawal's do
+/// ([`WithdrawBoxRequest`]); the id is required, because a rename is the
+/// one verb where the name the row is under is not the name the client
+/// holds. A row at the pair under another id is another box's, and the
+/// rename is refused with [`BoxControlReply::Error`]; so is a new name
+/// another box's row holds. A pair the host holds nothing for (no row, no
+/// creation of the id) is answered as the echo: there is nothing to move.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RenameBoxRequest {
+    /// The name the session had before the rename, for the host's log
+    /// line. The host finds the box by the id, never by this.
+    pub name: String,
+    /// The session's name now: the name the row moves to.
+    pub new_name: String,
+    /// The switch address the registration handed back.
+    pub switch_address: std::net::Ipv4Addr,
+    /// The loopback address the registration handed back.
+    pub loopback_address: std::net::Ipv4Addr,
+    /// The box id the registration handed back.
+    #[serde(with = "boxes::box_id_hex")]
+    pub box_id: BoxId,
 }
 
 /// A creator's request for its box's row back
@@ -1581,6 +1685,12 @@ pub enum BoxControlRequest {
     /// Withdraw the row a registration filled: the destroyed or failed
     /// session's creator presenting the pair the registration handed back.
     Withdraw(WithdrawBoxRequest),
+    /// Move a renamed session's box row to its new name
+    /// ([`RenameBoxRequest`], #1116): the creator presenting the pair and
+    /// the box id its registration handed back. Served on the host's
+    /// control socket only, answered with [`BoxControlReply::Addresses`]
+    /// echoing the pair.
+    RenameBox(RenameBoxRequest),
     /// Read the machine's zone-answerer status (see [`ZoneAnswererStatus`])
     /// — the read-only verb: no row is touched, no state changes, the reply
     /// is the status the answerer's acquisition last left.
@@ -2760,6 +2870,96 @@ impl OneshotSshRpc for StopBox {
     type Response = Errorable<StopBoxResponse>;
 }
 
+/// An RPC to restart a box whose spec sets `lifetime = "until_stopped"`
+/// (BOX-176).
+///
+/// The daemon checks the box first: its lifetime, then its name, its stored
+/// spec and its volumes, in the order a resume checks them. A check that
+/// fails answers [`RestartBoxResponse::Refused`] and changes nothing. A box
+/// that passes is stopped as [`StopBox`] stops it, when it runs, and then
+/// started again from the spec stored at its creation, under the same id
+/// and name. A start that fails leaves the box `stopped` and answers the
+/// start's error.
+pub struct RestartBox;
+
+/// The request for a [`RestartBox`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RestartBoxRequest {
+    /// The box to restart.
+    pub id: SessionId,
+}
+
+/// The response for a [`RestartBox`] RPC: the box runs again, or a check
+/// refused the restart and the box is as it was.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum RestartBoxResponse {
+    /// The box runs again, from its stored spec.
+    Restarted {
+        /// The box was running, and the restart stopped it first.
+        was_running: bool,
+    },
+    /// A check refused the restart before it stopped anything.
+    Refused(RestartRefusal),
+}
+
+/// Why a [`RestartBox`] was refused (BOX-176). The box's state is
+/// unchanged, and a running box still runs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RestartRefusal {
+    /// Which check refused.
+    pub kind: RestartRefusalKind,
+    /// The exit code a client ends with on this refusal.
+    pub exit_code: u8,
+    /// The refusal for the user: what was refused, why, and the next step.
+    pub message: String,
+}
+
+impl std::fmt::Display for RestartRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RestartRefusal {}
+
+/// The check that refused a [`RestartBox`], in the order the daemon runs
+/// them.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RestartRefusalKind {
+    /// The box's spec does not set `lifetime = "until_stopped"`. Exit 2.
+    Lifetime,
+    /// Another running box holds the box's name. Exit 2.
+    Name,
+    /// This daemon cannot start the box from its stored spec. Exit 3.
+    Spec,
+    /// An upload into the box's workspace is in flight. Exit 2.
+    Upload,
+    /// A refusal kind this client does not know, from a newer daemon.
+    #[serde(other)]
+    Unknown,
+}
+
+impl RestartRefusalKind {
+    /// The kind's name, as the daemon log spells it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Lifetime => "lifetime",
+            Self::Name => "name",
+            Self::Spec => "spec",
+            Self::Upload => "upload",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl OneshotSshRpc for RestartBox {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "RestartBox");
+    type Request<'a> = RestartBoxRequest;
+    type Response = Errorable<RestartBoxResponse>;
+}
+
 /// An RPC to list the box records this host keeps, in any state
 /// (BOX-158).
 pub struct ListBoxes;
@@ -2810,6 +3010,12 @@ pub struct BoxListingEntry {
     /// sends none, and the box reads as one with no terminal.
     #[serde(default)]
     pub pty_enabled: bool,
+    /// The `lifetime` the box's stored spec sets, such as `until_stopped`,
+    /// so a client can name the command that starts the box again
+    /// (BCLI-009). `None` for a spec that sets none, a box filed with no
+    /// spec, and a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifetime: Option<String>,
 }
 
 /// The response for a [`ListBoxes`] RPC.
@@ -2889,6 +3095,117 @@ impl OneshotSshRpc for ShowBox {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ShowBox");
     type Request<'a> = ShowBoxRequest;
     type Response = Errorable<ShowBoxResponse>;
+}
+
+/// An RPC to read the spec a box was created with: the stored copy beside
+/// its record (BOX-068), for `min box spec <box>` (BCLI-022).
+pub struct GetBoxSpec;
+
+/// The request for a [`GetBoxSpec`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GetBoxSpecRequest {
+    /// The box to read, as a listing reports its id.
+    pub id: SessionId,
+}
+
+/// The response for a [`GetBoxSpec`] RPC. An id that no retained record
+/// names is the [`Errorable::Err`] that starts with
+/// [`UNKNOWN_SESSION_ID_LEAD`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GetBoxSpecResponse {
+    /// The stored spec, as its creating client sent it. `None` for a box
+    /// with no stored spec: one created before specs were stored, or by a
+    /// client that sent none.
+    #[serde(default)]
+    pub spec: Option<serde_json_lenient::Value>,
+}
+
+impl OneshotSshRpc for GetBoxSpec {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetBoxSpec");
+    type Request<'a> = GetBoxSpecRequest;
+    type Response = Errorable<GetBoxSpecResponse>;
+}
+
+/// An RPC that a command which waited for a box calls before it copies
+/// the box's declared exports (BOX-198). The daemon grants the command
+/// each export of the box's last end that no other command holds or has
+/// reported, and refuses the rest. The connection the RPC came over holds
+/// each granted export until the command reports it with
+/// [`ReportExport`], or until that connection ends (BOX-202).
+pub struct ClaimExports;
+
+/// The request for a [`ClaimExports`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClaimExportsRequest {
+    /// The box, as a listing reports its id.
+    pub id: SessionId,
+    /// The export paths to claim, as the box's spec declares them.
+    pub paths: Vec<String>,
+}
+
+/// The response for a [`ClaimExports`] RPC. A box that has not ended is
+/// an [`Errorable::Err`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClaimExportsResponse {
+    /// The end the claim is for: the count of `exited` events on the box's
+    /// record, so the box's first end is 1.
+    pub end: u64,
+    /// The paths this command holds now, in request order.
+    pub granted: Vec<String>,
+    /// The paths that another command holds or reported for this end, in
+    /// request order.
+    pub refused: Vec<String>,
+}
+
+impl OneshotSshRpc for ClaimExports {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ClaimExports");
+    type Request<'a> = ClaimExportsRequest;
+    type Response = Errorable<ClaimExportsResponse>;
+}
+
+/// An RPC that reports how one claimed export went (BOX-195). The daemon
+/// appends one `file_exported` event to the box's record, and keeps the
+/// export claimed for the end, so no later command copies it again.
+pub struct ReportExport;
+
+/// One file an export wrote under the project root.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExportedFileReport {
+    /// The file's path, relative to the project root.
+    pub path: String,
+    /// Its size in bytes.
+    pub size: u64,
+    /// Its sha256, in lowercase hex.
+    pub sha256: String,
+}
+
+/// The request for a [`ReportExport`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReportExportRequest {
+    /// The box, as a listing reports its id.
+    pub id: SessionId,
+    /// The end the claim was granted for ([`ClaimExportsResponse::end`]).
+    pub end: u64,
+    /// The export's path, as the spec declares it.
+    pub path: String,
+    /// Whether every file and folder of the export was written.
+    pub copied: bool,
+    /// Each file this command wrote for the export.
+    pub files: Vec<ExportedFileReport>,
+}
+
+/// The response for a [`ReportExport`] RPC. A path that this connection
+/// does not hold is an [`Errorable::Err`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReportExportResponse {
+    /// The `ts` of the `file_exported` event the daemon appended.
+    pub ts: u64,
+}
+
+impl OneshotSshRpc for ReportExport {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ReportExport");
+    type Request<'a> = ReportExportRequest;
+    type Response = Errorable<ReportExportResponse>;
 }
 
 /// An RPC to reap one box: delete its record, its events and its
@@ -3168,6 +3485,20 @@ impl OneshotSshRpc for SessionDelta {
 /// An RPC asking the daemon to shut down its session manager so the process
 /// can terminate gracefully.
 pub struct Shutdown;
+
+/// How long a daemon that answered [`ShutdownResponse::ShuttingDown`] drains
+/// the connections it already accepted before it aborts them. It holds its
+/// instance lock through that drain. A daemon of this build closes its
+/// listener before the drain; an older one keeps it bound until the drain
+/// ends, so a client waiting for the socket to refuse needs this long.
+pub const SHUTDOWN_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long to wait for a daemon that answered [`ShutdownResponse::ShuttingDown`]
+/// to be gone: its drain ([`SHUTDOWN_DRAIN_GRACE`]) and a margin for its exit.
+/// A client waits this long for the daemon's socket to refuse, and a starting
+/// daemon this long for the departing one to release the instance lock.
+pub const SHUTDOWN_DEPARTURE_WAIT: std::time::Duration =
+    SHUTDOWN_DRAIN_GRACE.saturating_add(std::time::Duration::from_secs(1));
 
 /// The request for a [`Shutdown`] RPC.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -3983,6 +4314,46 @@ mod stop_box_tests {
 }
 
 #[cfg(test)]
+mod restart_box_tests {
+    use super::*;
+
+    /// BOX-176: a restart's answer and its typed refusal read back as sent,
+    /// and an error reply reads back as an error, not as an answer.
+    #[test]
+    fn restart_box_reply_round_trips() {
+        let responses = [
+            RestartBoxResponse::Restarted { was_running: true },
+            RestartBoxResponse::Refused(RestartRefusal {
+                kind: RestartRefusalKind::Name,
+                exit_code: 2,
+                message: "refused".to_string(),
+            }),
+        ];
+        for response in responses {
+            let wire: Errorable<RestartBoxResponse> = Errorable::Ok(response.clone());
+            let bytes = serde_json_lenient::to_vec(&wire).unwrap();
+            let back: Errorable<RestartBoxResponse> =
+                serde_json_lenient::from_slice(&bytes).unwrap();
+            assert_eq!(back, Errorable::Ok(response));
+        }
+        let error: Errorable<RestartBoxResponse> =
+            serde_json_lenient::from_str(r#"{"error":"it failed"}"#).unwrap();
+        assert_eq!(
+            error,
+            Errorable::Err {
+                error: "it failed".to_string()
+            }
+        );
+        let newer: RestartRefusalKind = serde_json_lenient::from_str(r#""quota""#).unwrap();
+        assert_eq!(newer, RestartRefusalKind::Unknown);
+        assert_eq!(
+            RestartBox::NAME,
+            constcat::concat!(RPC_SUBSYSTEM_PREFIX, "RestartBox")
+        );
+    }
+}
+
+#[cfg(test)]
 mod box_listing_tests {
     use super::*;
 
@@ -3998,6 +4369,7 @@ mod box_listing_tests {
             exit_code: None,
             signal: None,
             pty_enabled: true,
+            lifetime: None,
         }
     }
 
@@ -4137,3 +4509,31 @@ mod mint_box_id_tests {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod rename_box_tests {
+    use super::*;
+
+    /// #1116: the host-side rename verb survives the wire under its own
+    /// tag, and a request without the box id is no rename: the id is the
+    /// proof, so a line that lacks it does not decode.
+    #[test]
+    fn rename_box_request_round_trips_and_requires_the_box_id() {
+        let request = BoxControlRequest::RenameBox(RenameBoxRequest {
+            name: "web".to_string(),
+            new_name: "front".to_string(),
+            switch_address: std::net::Ipv4Addr::new(100, 64, 0, 7),
+            loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 3),
+            box_id: BoxId::mint(),
+        });
+        let line = serde_json_lenient::to_string(&request).unwrap();
+        assert!(line.contains(r#""verb":"rename_box""#), "{line}");
+        let back: BoxControlRequest = serde_json_lenient::from_str(&line).unwrap();
+        assert_eq!(back, request);
+
+        let without_id = r#"{"verb":"rename_box","name":"web","new_name":"front",
+            "switch_address":"100.64.0.7","loopback_address":"127.0.64.3"}"#;
+        serde_json_lenient::from_str::<BoxControlRequest>(without_id)
+            .expect_err("a rename without the box id is refused at the parse");
+    }
+}

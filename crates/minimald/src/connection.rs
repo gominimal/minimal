@@ -492,14 +492,14 @@ impl russh::server::Handler for ConnectionHandler {
                 .attach(conn_username, channel, config, attacher)
                 .await
             {
-                let _ = hnd
-                    .data(id, format!("Error attaching to session: {e}\r\n"))
-                    .await;
-                // A refusal with its own exit status (a refused resume,
-                // BOX-025) ends the client's attach with it, not 255.
-                if let Some(code) = e.exit_code() {
-                    let _ = hnd.exit_status_request(id, code).await;
-                }
+                let (line, code) = attach_refusal(&e);
+                let _ = hnd.data(id, line).await;
+                // Every refusal ends the client's attach with an exit status,
+                // never ssh's 255: the client reads 255 as a dropped
+                // connection and its blind unwind can move the cursor back
+                // over the line above. A refused resume (BOX-025) carries
+                // its own status.
+                let _ = hnd.exit_status_request(id, code).await;
                 let _ = hnd.close(id).await;
             }
         };
@@ -1033,8 +1033,113 @@ where
     }
 }
 
+/// What the attach channel carries for a refused attach: the line the
+/// client's terminal shows (BCLI-068), and the exit status its ssh ends with.
+fn attach_refusal(error: &crate::box_actor::AttachError) -> (String, u32) {
+    (attach_refusal_line(error), error.exit_code())
+}
+
+/// The line a refused attach writes to the client's terminal (BCLI-068).
+fn attach_refusal_line(cause: &impl std::fmt::Display) -> String {
+    format!("Cannot attach to the box: {cause}\r\n")
+}
+
 #[cfg(test)]
 mod tests {
+    /// An attach refusal sends an exit status, so the client's ssh never
+    /// ends with its transport status 255. A row that minvmd released keeps
+    /// its text, and a refused resume keeps its own status.
+    #[test]
+    fn attach_refusal_sends_an_exit_status_for_every_refusal() {
+        use crate::box_actor::AttachError;
+        let (line, code) = super::attach_refusal(&AttachError::BoxHostRowEnded);
+        assert_eq!(code, 1);
+        assert!(
+            line.contains("the VM host daemon released this session's network addresses"),
+            "{line}"
+        );
+        assert!(line.ends_with("\r\n"), "{line:?}");
+        let refusals = [
+            AttachError::NoPty,
+            AttachError::SessionPending,
+            AttachError::WorkspaceUploadInFlight,
+            AttachError::SessionBusy,
+            AttachError::ContextCreationFailed("x".to_string()),
+            AttachError::SpawnFailed(std::io::Error::other("x")),
+            AttachError::LoadoutFailed(std::io::Error::other("x")),
+            AttachError::LaunchRecordUnwritable(std::io::Error::other("x")),
+        ];
+        for refusal in &refusals {
+            let (_, code) = super::attach_refusal(refusal);
+            assert!(code != 0 && code != 255, "{refusal}: {code}");
+        }
+        let (_, code) =
+            super::attach_refusal(&AttachError::ResumeRefused(std::io::Error::other("x"), 3));
+        assert_eq!(code, 3, "a refused resume keeps its own status");
+    }
+
+    /// The shell handler sends a refused attach's exit status on the
+    /// channel before it closes it, so the client's ssh ends with that
+    /// status, never with its transport status 255. The refusal here is an
+    /// attach while the box's workspace upload still streams.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attach_refusal_sends_an_exit_status_before_the_close() {
+        use crate::test_harness::{TestServer, create_session_req};
+        use minimald_rpc::CreateSession;
+        use russh::ChannelMsg;
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = client
+            .call::<CreateSession>(&create_session_req("uploading-box", "/uwu"))
+            .await
+            .unwrap()
+            .id;
+        let handle = server
+            .state
+            .sessions_manager()
+            .await
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("the box resolves");
+        let upload = crate::rpc::WorkspaceUploadInFlight::begin(handle)
+            .await
+            .expect("the upload mark lands");
+
+        let mut channel = client.open_shell(session_id).await;
+        let mut text = Vec::new();
+        let mut exit_status = None;
+        loop {
+            let message = tokio::time::timeout(std::time::Duration::from_secs(5), channel.wait())
+                .await
+                .expect("the refused channel closes within the timeout");
+            match message {
+                Some(ChannelMsg::Data { data }) => text.extend_from_slice(&data),
+                Some(ChannelMsg::ExitStatus { exit_status: code }) => exit_status = Some(code),
+                Some(ChannelMsg::Eof | ChannelMsg::Close) | None => break,
+                Some(_) => {}
+            }
+        }
+        let text = String::from_utf8_lossy(&text);
+        assert!(text.starts_with("Cannot attach to the box:"), "{text:?}");
+        assert_eq!(
+            exit_status,
+            Some(1),
+            "the exit status arrives before the close: {text:?}"
+        );
+        upload.finish().await.expect("the upload mark clears");
+    }
+
+    /// A refused attach names the box and its cause, not the session.
+    #[test]
+    fn attach_refusal_line_names_the_box() {
+        assert_eq!(
+            super::attach_refusal_line(&"the box is stopping"),
+            "Cannot attach to the box: the box is stopping\r\n"
+        );
+    }
+
     /// A direct-tcpip open from the native client carries the CLI's
     /// traceparent as its originator address; an OpenSSH client's address
     /// there is not a context, so the forward starts a fresh trace as before.

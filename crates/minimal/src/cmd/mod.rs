@@ -33,15 +33,20 @@ pub mod output;
 mod project;
 mod secret;
 mod session;
+pub mod types;
 
 // The Ctrl-C cleanup (`arm_activation_interrupt`) withdraws the row the
 // activation registered with the VM host daemon; the withdrawal lives with
 // the session commands, as does the host-kind rule its gate keys on.
 pub(crate) use box_verbs::{daemon_host_kind, vm_host_control_sock, withdraw_box_row};
+// The `min box spec` render, for the in-process daemon tests.
+#[cfg(test)]
+pub(crate) use box_spec::box_spec_to;
 
 pub use admin::*;
 pub use auth::{cmd_auth_login, cmd_auth_logout, cmd_auth_status};
 pub use box_audit::AuditSelfUnsupportedUnenrolled;
+pub use box_spec::SpecFileInvalid;
 pub use box_verbs::*;
 pub use finalize_install::*;
 pub use list::*;
@@ -49,6 +54,7 @@ pub use net::*;
 pub use project::*;
 pub use secret::{cmd_secret_list, cmd_secret_rm, cmd_secret_set};
 pub use session::*;
+pub use types::{BoxTypeNotFound, BoxTypesCause, BoxTypesInvalid};
 
 pub async fn run(mut cli: Cli) -> Result<(), anyhow::Error> {
     // BCLI-046: `--provider local-minimald` reads as `local`. Its hint
@@ -67,6 +73,7 @@ pub async fn run(mut cli: Cli) -> Result<(), anyhow::Error> {
         span_id = tracing::field::Empty,
         parent_span_id = tracing::field::Empty,
         otel.status_code = tracing::field::Empty,
+        otel.status_description = tracing::field::Empty,
     );
     // A caller may run `min` inside its own trace (a CI job, a test
     // harness, or a script in a session, whose daemon put the exec's
@@ -122,6 +129,7 @@ fn command_verb(command: Option<&Command>) -> &'static str {
         Some(Command::Session(SessionArgs { command })) => match command {
             SessionCommand::List(_) => "session list",
             SessionCommand::Activate(_) => "session activate",
+            SessionCommand::Start(_) => "session start",
             SessionCommand::Attach(_) => "session attach",
             SessionCommand::Exec(_) => "session exec",
             SessionCommand::Run(_) => "session run",
@@ -131,23 +139,31 @@ fn command_verb(command: Option<&Command>) -> &'static str {
             SessionCommand::SetupZed(_) => "session setup-zed",
             SessionCommand::Hooks(_) => "session hooks",
             SessionCommand::Logs(_) => "session logs",
+            SessionCommand::Stop(_) => "session stop",
+            SessionCommand::Rm(_) => "session rm",
         },
         Some(Command::Loadout(_)) => "loadout list",
         Some(Command::Task(TaskArgs { command })) => match command {
             TaskCommand::Run(_) => "task run",
             TaskCommand::List(_) => "task list",
             TaskCommand::Logs(_) => "task logs",
+            TaskCommand::Stop(_) => "task stop",
+            TaskCommand::Rm(_) => "task rm",
         },
         Some(Command::Box(BoxArgs { command })) => match command {
             BoxCommand::Spec(_) => "box spec",
             BoxCommand::Audit(_) => "box audit",
             BoxCommand::List(_) => "box list",
+            BoxCommand::Start(_) => "box start",
             BoxCommand::Run(_) => "box run",
             BoxCommand::Show(_) => "box show",
             BoxCommand::Stop(_) => "box stop",
             BoxCommand::Rm(_) => "box rm",
+            BoxCommand::Restart(_) => "box restart",
             BoxCommand::Attach(_) => "box attach",
+            BoxCommand::Resume(_) => "box resume",
             BoxCommand::Exec(_) => "box exec",
+            BoxCommand::Wait(_) => "box wait",
             BoxCommand::Events(_) => "box events",
             BoxCommand::Cp(_) => "box cp",
             BoxCommand::Rename(_) => "box rename",
@@ -161,6 +177,10 @@ fn command_verb(command: Option<&Command>) -> &'static str {
         },
         Some(Command::Provider(ProviderArgs { command })) => match command {
             ProviderCommand::List(_) => "provider list",
+        },
+        Some(Command::Type(TypeArgs { command })) => match command {
+            TypeCommand::List(_) => "type list",
+            TypeCommand::Show(_) => "type show",
         },
         Some(Command::Net(_)) => "net forward",
         Some(Command::FinalizeInstall(_)) => "finalize-install",
@@ -322,9 +342,18 @@ where
     };
     span.record("outcome", outcome);
     // A failed command marks its root span as an error, whether or not the
-    // failure was expected. A hand-off is not a failure.
-    if outcome == "error" {
+    // failure was expected, and says why in the status itself, so a trace
+    // filter on failed commands reads the cause without opening the span's
+    // events (gominimal/minimal#3223), never quoting a daemon reply that
+    // did not decode. A hand-off is not a failure.
+    if let Err(e) = &result
+        && outcome == "error"
+    {
         span.record("otel.status_code", "ERROR");
+        span.record(
+            "otel.status_description",
+            minimal_client::span_status_description(e).as_str(),
+        );
     }
     // Release every handle on the span, so it closes here.
     drop(slot);
@@ -377,8 +406,12 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Ls(args)) => cmd_ls(&cli.global_args, args).await,
         Some(Command::Stop(args)) => cmd_stop(&cli.global_args, args).await,
         Some(Command::Session(SessionArgs { command })) => match command {
-            SessionCommand::List(args) => cmd_ls(&cli.global_args, args).await,
+            SessionCommand::List(args) => {
+                let session = boxes::SESSION_BOX_TYPE;
+                cmd_typed_box_list(&cli.global_args, args, session, "session list").await
+            }
             SessionCommand::Activate(args) => cmd_activate(&cli.global_args, args).await,
+            SessionCommand::Start(args) => cmd_session_start(&cli.global_args, args).await,
             SessionCommand::Attach(args) => cmd_attach(&cli.global_args, args).await,
             SessionCommand::Exec(args) => cmd_exec(&cli.global_args, args).await,
             SessionCommand::Run(args) => cmd_session_run(&cli.global_args, args).await,
@@ -391,6 +424,14 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
                 let session = Some(boxes::SESSION_BOX_TYPE);
                 cmd_box_logs(&cli.global_args, args, session, "session logs").await
             }
+            SessionCommand::Stop(args) => {
+                let session = boxes::SESSION_BOX_TYPE;
+                cmd_typed_box_stop(&cli.global_args, args, session, "session stop").await
+            }
+            SessionCommand::Rm(args) => {
+                let session = boxes::SESSION_BOX_TYPE;
+                cmd_typed_box_rm(&cli.global_args, args, session, "session rm").await
+            }
         },
         Some(Command::Loadout(LoadoutArgs {
             command: LoadoutCommand::List(args),
@@ -402,22 +443,34 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
                 let task = Some(boxes::TASK_BOX_TYPE);
                 cmd_box_logs(&cli.global_args, args, task, "task logs").await
             }
+            TaskCommand::Stop(args) => task::cmd_task_stop(&cli.global_args, args).await,
+            TaskCommand::Rm(args) => task::cmd_task_rm(&cli.global_args, args).await,
         },
         Some(Command::Box(BoxArgs { command })) => match command {
-            BoxCommand::Spec(args) => box_spec::cmd_box_spec(&cli.global_args, args),
+            BoxCommand::Spec(args) => box_spec::cmd_box_spec(&cli.global_args, args).await,
             BoxCommand::Audit(args) => box_audit::cmd_box_audit(&cli.global_args, args).await,
             BoxCommand::List(args) => cmd_box_list(&cli.global_args, args).await,
+            BoxCommand::Start(args) => cmd_box_start(&cli.global_args, args).await,
             BoxCommand::Run(args) => task::cmd_box_run(&cli.global_args, args).await,
             BoxCommand::Show(args) => cmd_box_show(&cli.global_args, args).await,
-            BoxCommand::Stop(args) => cmd_box_stop(&cli.global_args, args).await,
+            BoxCommand::Stop(args) => match args.exec.as_deref() {
+                Some(exec) => cmd_box_stop_exec(&cli.global_args, &args.target, exec).await,
+                None => cmd_box_stop(&cli.global_args, args).await,
+            },
             BoxCommand::Rm(args) => cmd_box_rm(&cli.global_args, args).await,
+            BoxCommand::Restart(args) => cmd_box_restart(&cli.global_args, args).await,
             BoxCommand::Attach(args) => cmd_box_attach(&cli.global_args, args).await,
+            BoxCommand::Resume(args) => cmd_box_resume(&cli.global_args, args).await,
             BoxCommand::Exec(args) => cmd_box_exec(&cli.global_args, args).await,
+            BoxCommand::Wait(args) => cmd_box_wait(&cli.global_args, args).await,
             BoxCommand::Events(args) => cmd_box_events(&cli.global_args, args).await,
             BoxCommand::Cp(args) => cmd_box_cp(&cli.global_args, args).await,
             BoxCommand::Rename(args) => cmd_box_rename(&cli.global_args, args).await,
             BoxCommand::Prune(args) => cmd_box_prune(&cli.global_args, args).await,
-            BoxCommand::Logs(args) => cmd_box_logs(&cli.global_args, args, None, "box logs").await,
+            BoxCommand::Logs(args) => match args.exec.as_deref() {
+                Some(exec) => cmd_box_logs_exec(&cli.global_args, &args.logs.target, exec).await,
+                None => cmd_box_logs(&cli.global_args, args.logs, None, "box logs").await,
+            },
         },
         Some(Command::Host(HostArgs { command })) => match command {
             HostCommand::List => {
@@ -433,6 +486,14 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Provider(ProviderArgs { command })) => match command {
             ProviderCommand::List(args) => {
                 hosts::cmd_provider_list(&cli.global_args, &args, &mut std::io::stdout())
+            }
+        },
+        Some(Command::Type(TypeArgs { command })) => match command {
+            TypeCommand::List(args) => {
+                types::cmd_type_list(&cli.global_args, &args, &mut std::io::stdout())
+            }
+            TypeCommand::Show(args) => {
+                types::cmd_type_show(&cli.global_args, &args, &mut std::io::stdout())
             }
         },
         Some(Command::Net(NetArgs {
@@ -1951,24 +2012,31 @@ mod handoff_tests {
         closed.0.lock().unwrap().clone()
     }
 
-    /// Records each span's `otel.status_code`, if it gets one, in the order
-    /// the spans are created.
+    /// Records each span's `otel.status_code` and `otel.status_description`,
+    /// each kept apart, in the order the spans are created.
     #[derive(Clone, Default)]
     struct Statuses(Arc<Mutex<StatusLog>>);
 
+    /// One span's status as recorded: its code and its description.
+    #[derive(Clone, Debug, Default, PartialEq)]
+    struct Status {
+        code: Option<String>,
+        description: Option<String>,
+    }
+
     #[derive(Default)]
     struct StatusLog {
-        statuses: Vec<Option<String>>,
+        statuses: Vec<Status>,
         /// The index in `statuses` of each open span, by span id.
         by_id: std::collections::HashMap<u64, usize>,
     }
 
-    struct StatusField(Option<String>);
-
-    impl tracing::field::Visit for StatusField {
+    impl tracing::field::Visit for Status {
         fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            if field.name() == "otel.status_code" {
-                self.0 = Some(value.to_owned());
+            match field.name() {
+                "otel.status_code" => self.code = Some(value.to_owned()),
+                "otel.status_description" => self.description = Some(value.to_owned()),
+                _ => {}
             }
         }
 
@@ -1984,7 +2052,7 @@ mod handoff_tests {
         ) {
             let mut log = self.0.lock().unwrap();
             let at = log.statuses.len();
-            log.statuses.push(None);
+            log.statuses.push(Status::default());
             log.by_id.insert(id.into_u64(), at);
         }
 
@@ -1994,17 +2062,23 @@ mod handoff_tests {
             values: &tracing::span::Record<'_>,
             _: Context<'_, S>,
         ) {
-            let mut field = StatusField(None);
-            values.record(&mut field);
+            let mut recorded = Status::default();
+            values.record(&mut recorded);
             let mut log = self.0.lock().unwrap();
-            if let (Some(status), Some(&at)) = (field.0, log.by_id.get(&id.into_u64())) {
-                log.statuses[at] = Some(status);
+            if let Some(&at) = log.by_id.get(&id.into_u64()) {
+                let status = &mut log.statuses[at];
+                if recorded.code.is_some() {
+                    status.code = recorded.code;
+                }
+                if recorded.description.is_some() {
+                    status.description = recorded.description;
+                }
             }
         }
     }
 
     impl Statuses {
-        fn all(&self) -> Vec<Option<String>> {
+        fn all(&self) -> Vec<Status> {
             self.0.lock().unwrap().statuses.clone()
         }
     }
@@ -2122,7 +2196,13 @@ mod handoff_tests {
                 .with(closed.clone())
                 .with(statuses.clone()),
         );
-        let cmd = || tracing::info_span!("cmd", otel.status_code = tracing::field::Empty);
+        let cmd = || {
+            tracing::info_span!(
+                "cmd",
+                otel.status_code = tracing::field::Empty,
+                otel.status_description = tracing::field::Empty
+            )
+        };
         let ok = run_in_root(cmd(), async { Ok(()) }).await;
         assert!(matches!(ok, Ok(None)));
         let err = run_in_root(cmd(), async { Err(anyhow::anyhow!("no session found")) })
@@ -2134,6 +2214,15 @@ mod handoff_tests {
             .unwrap();
         assert!(matches!(handoff, Some(Handoff::Exit(1))), "{handoff:?}");
         assert_eq!(closed_names(&closed), ["cmd", "cmd", "cmd"]);
-        assert_eq!(statuses.all(), [None, Some("ERROR".to_owned()), None]);
+        // The failed command's span carries the ERROR code, and its status
+        // description the error's text (#3223); the others carry neither.
+        let failed = Status {
+            code: Some("ERROR".to_owned()),
+            description: Some("no session found".to_owned()),
+        };
+        assert_eq!(
+            statuses.all(),
+            [Status::default(), failed, Status::default()]
+        );
     }
 }

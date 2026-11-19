@@ -572,6 +572,7 @@ pub(crate) fn host_install_for_this_host(global: &GlobalArgs) -> crate::resolver
         other_items_unfinished: other_items_for_this_host(global, None)
             .iter()
             .any(|item| item.state != ItemState::Done),
+        ..crate::resolver::HostInstall::default()
     }
 }
 
@@ -653,14 +654,15 @@ async fn names_item_on_this_host(global: &GlobalArgs) -> Item {
     let (answerer, held_no_channel) = match read {
         Ok(found) => found,
         Err(_) => {
-            return Item::waiting(
-                NAMES_ID,
-                NAMES_LABEL,
+            return reinstall_or_waiting(
+                global,
+                None,
                 format!(
                     "no daemon answered within {}s",
                     DAEMON_READ_DEADLINE.as_secs()
                 ),
-            );
+            )
+            .await;
         }
     };
     let Some((port, bound)) = answerer else {
@@ -670,7 +672,7 @@ async fn names_item_on_this_host(global: &GlobalArgs) -> Item {
             Some(port) => crate::resolver::port_held_no_channel_warning(port),
             None => NO_PORT.to_string(),
         };
-        return Item::waiting(NAMES_ID, NAMES_LABEL, cause);
+        return reinstall_or_waiting(global, held_no_channel, cause).await;
     };
     let (detection, answerer_step) = crate::cmd::session::advisory_host_reads(global).await;
     // The range read the live-surface verdict makes, so the item names the
@@ -690,6 +692,64 @@ async fn names_item_on_this_host(global: &GlobalArgs) -> Item {
         blocker.as_deref(),
     );
     names_item(verdict, port)
+}
+
+/// The names item when no daemon reports a port its channel reaches — no
+/// daemon answered in time, none runs, or none reports a port (D3472).
+/// When the installed DNS service is stale or not running and `min
+/// finalize-install` can reinstall it, that service is what holds the
+/// port (or will, once it runs), so the item offers its reinstall at that
+/// port. Otherwise the item waits on a daemon, for `cause`.
+async fn reinstall_or_waiting(
+    global: &GlobalArgs,
+    held_no_channel: Option<u16>,
+    cause: String,
+) -> Item {
+    let (detection, answerer_step) = crate::cmd::session::advisory_host_reads(global).await;
+    if answerer_step.reinstall_offered() {
+        let service_port = held_no_channel.unwrap_or(minvmd::net::answerer::DEFAULT_ANSWERER_PORT);
+        let range_present =
+            crate::resolver::live_name_surface_with_range_at(&detection, Some(service_port), false)
+                .await
+                .and_then(|verdict| verdict.range_present);
+        if let Some(item) = reinstall_item(&detection, service_port, range_present, &answerer_step)
+        {
+            return item;
+        }
+    }
+    Item::waiting(NAMES_ID, NAMES_LABEL, cause)
+}
+
+/// The names item when no daemon reports a port its channel reaches and
+/// the installed DNS service is stale or not running (D3472): the item the
+/// verdict decides at the service's port, so the script reinstalls the
+/// service. `None` when `min finalize-install` offers no reinstall
+/// ([`crate::resolver::AnswererStep::reinstall_offered`]): the caller then
+/// reports the item as waiting on a daemon. Pure over the reads.
+pub(crate) fn reinstall_item(
+    detection: &(
+        crate::resolver::Hook,
+        Option<String>,
+        crate::resolver::RangeStep,
+    ),
+    port: u16,
+    range_present: Option<bool>,
+    answerer_step: &crate::resolver::AnswererStep,
+) -> Option<Item> {
+    if !answerer_step.reinstall_offered() {
+        return None;
+    }
+    let (hook, blocker, range_step) = detection;
+    let verdict = crate::resolver::names_verdict_at(
+        hook,
+        port,
+        false,
+        range_present,
+        range_step,
+        answerer_step,
+        blocker.as_deref(),
+    );
+    Some(names_item(verdict, port))
 }
 
 /// The answerer port the daemons report (with whether it is bound), and
@@ -750,9 +810,35 @@ pub(crate) mod linux {
     /// placed, but one started by an earlier release does not. No single quote:
     /// the block echoes it in one.
     pub(crate) const DAEMON_RUNNING_NOTE: &str = "note: a Minimal daemon is running. If a box \
-         you start next still says this machine cannot enforce its egress, restart the daemon: \
-         min stop (it refuses while boxes are live: stop them first, or min stop --force ends \
-         them), and your next min command starts it again.";
+         you start next still says this machine cannot enforce its egress yet, restart the daemon. Run \
+         min host stop local0, which stops each running box and then the daemon. Then run min ls, \
+         which starts the daemon again.";
+
+    /// [`DAEMON_RUNNING_NOTE`] for the daemon of `minimal_dir`, the
+    /// `--minimal-dir` this run was given: both commands carry the flag, so
+    /// they stop and start the daemon the step placed, not the default one.
+    /// The directory prints absolute, as the daemon resolves it
+    /// (`std::path::absolute`): a relative one would name another directory
+    /// when the person runs the commands from another working directory.
+    /// No quoting is needed: the socket path is the absolute directory joined
+    /// with more names, and the block refuses a socket path outside
+    /// `[A-Za-z0-9._/-]` before it renders this note.
+    pub(crate) fn daemon_running_note(minimal_dir: Option<&str>) -> String {
+        match minimal_dir {
+            None => DAEMON_RUNNING_NOTE.to_string(),
+            Some(dir) => {
+                let dir = std::path::absolute(dir)
+                    .map(|abs| abs.display().to_string())
+                    .unwrap_or_else(|_| dir.to_string());
+                DAEMON_RUNNING_NOTE
+                    .replace(
+                        "min host stop local0,",
+                        &format!("min host stop local0 --minimal-dir {dir},"),
+                    )
+                    .replace("min ls,", &format!("min ls --minimal-dir {dir},"))
+            }
+        }
+    }
 
     /// What the step's `--place-listener` prints when no process holds the
     /// daemon's socket, so no daemon is running: the classifier block prints
@@ -1070,10 +1156,23 @@ pub(crate) mod linux {
     /// identities as two cgroup matches and translates nothing, and an
     /// association later adds the reserved addresses to the same matches
     /// without a reinstall.
+    #[cfg(test)]
     pub(crate) fn classifier_item_over(
         facts: &ClassifierFacts,
         operator: &str,
         socket: &str,
+    ) -> Item {
+        classifier_item_over_in(facts, operator, socket, None)
+    }
+
+    /// [`classifier_item_over`] for the daemon of `minimal_dir`, the
+    /// `--minimal-dir` this run was given, which the block's restart note
+    /// names (see [`daemon_running_note`]).
+    pub(crate) fn classifier_item_over_in(
+        facts: &ClassifierFacts,
+        operator: &str,
+        socket: &str,
+        minimal_dir: Option<&str>,
     ) -> Item {
         if let Some(uid) = facts.other_owner {
             return Item::cannot(
@@ -1222,8 +1321,8 @@ pub(crate) mod linux {
                         } else {
                             "the step that enforces deny-all egress is installed but its \
                              systemd units are missing or not enabled, so a daemon restart \
-                             can leave deny-all boxes refused, and a reboot can leave \
-                             deny-all egress not enforced"
+                             can leave deny-all boxes running unenforced, and a reboot can \
+                             leave deny-all egress not enforced"
                                 .to_string()
                         },
                         format!(
@@ -1236,6 +1335,7 @@ pub(crate) mod linux {
                             operator,
                             socket,
                             facts.requested_mask.or(facts.recorded_mask),
+                            &daemon_running_note(minimal_dir),
                         ),
                     );
                 }
@@ -1301,7 +1401,7 @@ pub(crate) mod linux {
     /// `--ct-mark-mask` both now and in the boot unit: the mask's record
     /// lives in cgroupfs, which a reboot empties, so the unit is what keeps
     /// the operator's bits across one.
-    fn classifier_steps(operator: &str, socket: &str, mask: Option<u32>) -> String {
+    fn classifier_steps(operator: &str, socket: &str, mask: Option<u32>, note: &str) -> String {
         let mask = mask
             .map(|bits| format!(" --ct-mark-mask 0x{bits:08x}"))
             .unwrap_or_default();
@@ -1413,7 +1513,7 @@ pub(crate) mod linux {
              case \"$place_units:$place_out\" in\n\
              no:*) ;;\n\
              *'{PLACE_NO_HOLDER}'*) ;;\n\
-             *) echo '{DAEMON_RUNNING_NOTE}' ;;\n\
+             *) echo '{note}' ;;\n\
              esac\n"
         )
     }
@@ -1472,24 +1572,38 @@ pub(crate) mod linux {
     /// sudoers drop-in are installed root-owned. Otherwise it names the
     /// helper's path and carries the classifier step, which installs both,
     /// or it is blocked by what blocks that step.
+    #[cfg(test)]
     pub(crate) fn quic443_helper_item_over(
         helper: Quic443HelperFacts,
         classifier: &ClassifierFacts,
         operator: &str,
         socket: &str,
     ) -> Item {
+        quic443_helper_item_over_in(helper, classifier, operator, socket, None)
+    }
+
+    /// [`quic443_helper_item_over`] for the daemon of `minimal_dir`, as
+    /// [`classifier_item_over_in`].
+    pub(crate) fn quic443_helper_item_over_in(
+        helper: Quic443HelperFacts,
+        classifier: &ClassifierFacts,
+        operator: &str,
+        socket: &str,
+        minimal_dir: Option<&str>,
+    ) -> Item {
         if helper.helper_root_owned && helper.sudoers_root_owned {
             return Item::done(QUIC443_HELPER_ID, QUIC443_HELPER_LABEL);
         }
         // The classifier item as if its table were absent: its step is the
         // one that installs the helper, so its script or its cause is ours.
-        let step = classifier_item_over(
+        let step = classifier_item_over_in(
             &ClassifierFacts {
                 table_present: false,
                 ..*classifier
             },
             operator,
             socket,
+            minimal_dir,
         );
         match step.script {
             // The wording is the task's diagnostics line (#2607).
@@ -1551,9 +1665,14 @@ pub(crate) mod linux {
                 Err(_) => false,
             },
         };
+        let minimal_dir = global
+            .minimal_dir
+            .as_deref()
+            .map(|dir| dir.display().to_string());
+        let minimal_dir = minimal_dir.as_deref();
         [
-            classifier_item_over(&facts, &operator, &socket),
-            quic443_helper_item_over(helper, &facts, &operator, &socket),
+            classifier_item_over_in(&facts, &operator, &socket, minimal_dir),
+            quic443_helper_item_over_in(helper, &facts, &operator, &socket, minimal_dir),
         ]
     }
 
@@ -2772,6 +2891,98 @@ mod tests {
         assert!(!script.contains("#!/bin/sh"), "{script}");
     }
 
+    /// D3472: when the port is held with no channel and the installed DNS
+    /// service is not running, `--show` offers the step that reinstalls it
+    /// at that port, with a script, and does not report the item waiting.
+    #[test]
+    fn finalize_install_show_offers_reinstall_for_a_failing_answerer() {
+        use crate::resolver::{AnswererStep, BootUnit, Hook, RangeStep, VerifiedSource};
+        let port = minvmd::net::answerer::DEFAULT_ANSWERER_PORT;
+        let detection = (
+            Hook {
+                source: "test".to_string(),
+                port: Some(port),
+                detail: "routes the zone".to_string(),
+                boot_unit: BootUnit::Installed { port: Some(port) },
+            },
+            None,
+            RangeStep::not_needed(),
+        );
+        let verified = |service: AnswererStep| AnswererStep::SourceVerified {
+            service: Box::new(service),
+            source: VerifiedSource {
+                path: crate::resolver::TEST_ANSWERER_SOURCE.to_string(),
+                sha256: "0".repeat(64),
+                bundle: Vec::new(),
+                requirement: None,
+            },
+        };
+        for (service, fact) in [
+            (
+                AnswererStep::NotRunning,
+                "Minimal's DNS service is installed but not running",
+            ),
+            (
+                AnswererStep::CopyDiffers,
+                "the installed DNS service runs a different minzoned than the one this version \
+                 of Minimal ships",
+            ),
+        ] {
+            let item = reinstall_item(&detection, port, Some(true), &verified(service))
+                .expect("a failing service is offered, not left waiting");
+            assert_eq!(item.state, ItemState::Missing, "{item:?}");
+            let today = item.today.clone().unwrap_or_default();
+            assert!(today.contains(fact), "{today}");
+            let script = item.script.as_deref().expect("the item carries a script");
+            assert!(script.contains(&port.to_string()), "{script}");
+            let plan = Plan { items: vec![item] };
+            let summary = plan.summary();
+            assert!(!summary.contains(WAITING), "{summary}");
+            assert!(
+                summary.contains(&format!("  ✗ {NAMES_LABEL}\n")),
+                "{summary}"
+            );
+            let shown = plan.script().expect("--show --script prints a script");
+            assert!(shown.starts_with("#!/bin/sh\n"), "{shown}");
+            // The fixture's copy source is a quotable path, so the step
+            // carries the copy: the script replaces the installed program
+            // with the pinned bytes.
+            assert!(today.contains("; this step"), "{today}");
+            let group = if cfg!(target_os = "macos") {
+                "wheel"
+            } else {
+                "root"
+            };
+            assert!(
+                shown.contains(&format!(
+                    "install -m 0755 -o root -g {group} \"{}\" \"$t\"",
+                    crate::resolver::TEST_ANSWERER_SOURCE
+                )),
+                "the script copies the shipped minzoned: {shown}"
+            );
+            assert!(
+                shown.contains(&format!("case \"$h\" in {}) ;;", "0".repeat(64))),
+                "the script checks the copy against the pinned hash: {shown}"
+            );
+            assert!(
+                shown.contains("mv -f \"$t\" \""),
+                "the script replaces the installed copy: {shown}"
+            );
+        }
+        // A service that holds, or none at all, is no reinstall: the caller
+        // reports the item waiting on a daemon, as before.
+        for service in [AnswererStep::Installed, AnswererStep::Absent] {
+            assert!(reinstall_item(&detection, port, Some(true), &verified(service)).is_none());
+        }
+        // A failing service with no verified copy source is no reinstall
+        // either: `--show` has no copy to carry.
+        let unavailable = AnswererStep::SourceUnavailable {
+            service: Box::new(AnswererStep::NotRunning),
+            reason: "no copy of minzoned ships beside min".to_string(),
+        };
+        assert!(reinstall_item(&detection, port, Some(true), &unavailable).is_none());
+    }
+
     /// The names item's facts are a list in the summary and one line in
     /// the JSON, which carries no layout; a carried service step joins the
     /// step text as this platform's list reads.
@@ -3384,13 +3595,14 @@ mod tests {
             sock,
         );
         assert_eq!(unitless.state, ItemState::Missing, "{unitless:?}");
-        // An unplaced daemon refuses a deny-all box (the probe cannot read
-        // the table); only the reboot, which loses the tree, runs it unenforced.
-        // Any one missing unit or link lands here, so the sentence says "can".
+        // An unplaced daemon places no box, so its deny-all box runs
+        // unenforced (gominimal/minimal#3067), and so does one after a reboot
+        // that loses the tree. Any one missing unit or link lands here, so the
+        // sentence says "can".
         let today = unitless.today.as_deref().unwrap();
         for words in [
             "units are missing or not enabled",
-            "a daemon restart can leave deny-all boxes refused",
+            "a daemon restart can leave deny-all boxes running unenforced",
             "a reboot can leave deny-all egress not enforced",
         ] {
             assert!(today.contains(words), "{unitless:?}");
@@ -3788,6 +4000,53 @@ mod tests {
         }
     }
 
+    /// gominimal/minimal#3305: a run given `--minimal-dir` placed that
+    /// directory's daemon, so the restart note's two commands carry the same
+    /// flag, and a run without one names neither.
+    #[test]
+    fn the_restart_note_names_the_minimal_dir_it_was_given() {
+        use linux::{
+            Cgroup2Mount, ClassifierFacts, DAEMON_RUNNING_NOTE, classifier_item_over_in,
+            daemon_running_note,
+        };
+        assert_eq!(daemon_running_note(None), DAEMON_RUNNING_NOTE);
+        let dir = "/home/alice/m";
+        let note = daemon_running_note(Some(dir));
+        assert!(note.contains("Run min host stop local0 --minimal-dir /home/alice/m, which"));
+        assert!(note.contains("Then run min ls --minimal-dir /home/alice/m, which starts"));
+        assert!(!note.contains('\''));
+        // A relative directory prints absolute, as the daemon resolves it.
+        let cwd = std::env::current_dir().expect("a working directory");
+        let abs = cwd.join("m").display().to_string();
+        let relative = daemon_running_note(Some("m"));
+        assert!(
+            relative.contains(&format!("min host stop local0 --minimal-dir {abs},")),
+            "{relative}"
+        );
+        assert!(
+            relative.contains(&format!("min ls --minimal-dir {abs},")),
+            "{relative}"
+        );
+        let facts = ClassifierFacts {
+            table_present: false,
+            recorded_mask: None,
+            requested_mask: None,
+            copy_current: false,
+            units_enabled: Some(false),
+            other_owner: None,
+            root: false,
+            mount: Cgroup2Mount::Delegated,
+            unplaced_daemon: None,
+            placer_listening: Some(true),
+        };
+        let sock = "/home/alice/m/providers/local-minimald0/ssh.sock";
+        let script = classifier_item_over_in(&facts, "alice", sock, Some(dir))
+            .script
+            .expect("a missing item carries its block");
+        assert!(script.contains(&format!("echo '{note}'")), "{script}");
+        assert!(!script.contains(DAEMON_RUNNING_NOTE), "{script}");
+    }
+
     #[test]
     fn classifier_step_places_the_daemon_on_every_start() {
         use crate::resolver::{
@@ -4161,13 +4420,13 @@ mod tests {
             )),
             "the step still says {PLACE_NO_HOLDER:?} when no process holds the socket"
         );
-        // The note says to restart with plain `min stop` first and what `--force` costs, and
-        // the block can echo it whole.
-        assert!(
-            DAEMON_RUNNING_NOTE
-                .contains("restart the daemon: min stop (it refuses while boxes are live")
-        );
-        assert!(DAEMON_RUNNING_NOTE.contains("min stop --force ends them)"));
+        // The note names the one command that stops the running boxes and then the daemon,
+        // and the block can echo it whole.
+        assert!(DAEMON_RUNNING_NOTE.contains("restart the daemon. Run min host stop local0,"));
+        assert!(DAEMON_RUNNING_NOTE.contains("stops each running box and then the daemon."));
+        // Not every command starts the daemon: `min host stop` on a stopped host does not.
+        assert!(DAEMON_RUNNING_NOTE.contains("Then run min ls, which starts the daemon again."));
+        assert!(!DAEMON_RUNNING_NOTE.contains("--force"));
         assert!(!DAEMON_RUNNING_NOTE.contains("sessions survive"));
         assert!(!DAEMON_RUNNING_NOTE.contains('\''));
     }

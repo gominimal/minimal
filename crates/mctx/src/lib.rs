@@ -21,11 +21,16 @@ use rcache::{Error as RemoteError, RemoteBinProvider, RemoteCache, RemoteCacheWr
 mod error;
 pub use error::{Error, remote_cache_setup_error};
 mod config;
-pub use config::{Config, ConfigBuilder, ConfigError, DEFAULT_REMOTE_CACHE_BUCKET};
+pub use config::{
+    Config, ConfigBuilder, ConfigError, DEFAULT_REMOTE_CACHE_BUCKET, TaskPatchPolicy,
+};
 mod env;
+// The hook a task run by name has its `[patches]` judged through (inbox#1128).
+mod patch_hook;
 use graph::Error as GraphError;
 use graph::{BinProvider, BuildSpecRef, Graph, MaskingBinProvider, Transitives};
 use mfile::{EnvPatches, EnvVarValue, LinkConfig, Task};
+pub use patch_hook::{GatedTask, TaskPatchGate, gate_task_patches};
 pub use sandbox::config::Invocation;
 
 mod mfile_search_strategy;
@@ -277,6 +282,15 @@ pub struct Context {
     /// network attaches to it, so the box's egress verdict decides the
     /// build's connections.
     pub(crate) box_network: Option<op::BuildNetwork>,
+    /// The workspace a box's `minimal.toml` edits and re-reads must stay
+    /// inside, for a context the daemon builds for a box (inbox#1245).
+    /// `None` for a context whose caller chose the project itself, as the
+    /// host CLI does.
+    pub(crate) mfile_edit_root: Option<PathBuf>,
+    /// The project directory a task's durable state is keyed on, if not the
+    /// directory the mfile was read from (gominimal/minimal#1373). `None`
+    /// keys it on the mfile's own directory.
+    pub(crate) state_root: Option<PathBuf>,
 }
 
 impl fmt::Display for Context {
@@ -437,6 +451,8 @@ impl Context {
             mfile,
             classifier_leaf: None,
             box_network: None,
+            mfile_edit_root: None,
+            state_root: None,
         })
     }
 
@@ -461,6 +477,8 @@ impl Context {
             mfile,
             classifier_leaf: None,
             box_network: None,
+            mfile_edit_root: None,
+            state_root: None,
         }
     }
 
@@ -475,6 +493,8 @@ impl Context {
             mfile,
             classifier_leaf: None,
             box_network: None,
+            mfile_edit_root: None,
+            state_root: None,
         }
     }
 
@@ -505,6 +525,34 @@ impl Context {
         self.box_network.as_ref()
     }
 
+    /// Confines every edit this context makes to its `minimal.toml`, and
+    /// every re-read of it ([`Self::cloned_reinit`]), to the directory
+    /// `root`, the workspace of the box the daemon built it for
+    /// (inbox#1245). The box controls that directory, so a link there must
+    /// not carry the edit or the read to a file outside it; see
+    /// [`mfile::File::edit_exclusively_within`] and
+    /// [`mfile::File::from_dir_within`]. Build the context itself with
+    /// [`MFileSearchStrategy::Within`] so its first read is confined too.
+    pub fn confine_mfile_edits_to(&mut self, root: PathBuf) {
+        self.mfile_edit_root = Some(root);
+    }
+
+    /// Keys every task's durable state on `dir` rather than on the
+    /// directory the mfile was read from (gominimal/minimal#1373). For a
+    /// daemon that parses every box's mfile from a tree laid out afresh
+    /// each session, native or VM, and so has a stable host path to key on
+    /// and no stable mfile directory.
+    #[must_use]
+    pub fn with_state_root(mut self, dir: PathBuf) -> Self {
+        self.state_root = Some(dir);
+        self
+    }
+
+    /// The project directory task state is keyed on, if one was set.
+    pub fn state_root(&self) -> Option<&Path> {
+        self.state_root.as_deref()
+    }
+
     /// Returns a clone of the shared daemon-scoped context. Cheap —
     /// just an `Arc` clone. Useful when a caller needs to hand the
     /// same daemon-scoped state to another `Context` or subsystem
@@ -528,9 +576,13 @@ impl Context {
     /// per-session repo override), then any config-provided override,
     /// then a recursive search from the daemon's cwd as a last-ditch
     /// fallback for CLI-style callers that constructed via
-    /// [`Self::new`].
+    /// [`Self::new`]. A context confined to a box's workspace
+    /// ([`Self::confine_mfile_edits_to`]) re-reads beneath that workspace
+    /// instead.
     pub fn cloned_reinit(&self) -> Result<Self, Error> {
-        let strategy = if let Some(path) = self.mfile.repo_path() {
+        let strategy = if let Some(root) = self.mfile_edit_root.as_ref() {
+            MFileSearchStrategy::Within(root.clone())
+        } else if let Some(path) = self.mfile.repo_path() {
             MFileSearchStrategy::Override(path.to_path_buf())
         } else if let Some(path) = self.daemon.config.repo_dir_override() {
             MFileSearchStrategy::Override(path.to_path_buf())
@@ -541,6 +593,8 @@ impl Context {
         Ok(Self {
             classifier_leaf: self.classifier_leaf.clone(),
             box_network: self.box_network.clone(),
+            mfile_edit_root: self.mfile_edit_root.clone(),
+            state_root: self.state_root.clone(),
             ..Self::from_daemon(Arc::clone(&self.daemon), mfile)
         })
     }
@@ -1105,14 +1159,40 @@ impl Context {
             self.repo_dir()?.to_path_buf()
         };
         let state_base_dir = match state_key {
-            Some(name) if !name.is_empty() => mfile
-                .state_dir(name, self.daemon.config.state_base_dir())
-                .ok_or_else(|| {
-                    Error::Other(anyhow!(
-                        "cannot determine state directory for state key {name:?}: \
-                         the location of the minimal file on disk is unknown"
-                    ))
-                })?,
+            Some(key) if !key.is_empty() => durable_state_dir(
+                mfile,
+                key,
+                self.daemon.config.state_base_dir(),
+                self.state_root(),
+            )
+            .map_err(|reason| {
+                // The file's load refuses such a key, so this is a key handed
+                // in some other way: name the task and where the key is set.
+                if mfile::File::validate_state_component(key).is_err() {
+                    return Error::Other(anyhow!(
+                        "Task `{name}` has the state key {key:?}, and {reason}. Set \
+                         `state_key` on the task or in `[defaults.task]` to one directory \
+                         name, such as \"dev\"."
+                    ));
+                }
+                // The key is one directory name, so the state directory's path
+                // failed to resolve: a symlink on it, or a path that cannot be read.
+                // The reason follows a colon, so each of its three forms ("resolves
+                // to ..., which is outside the state base ...", "cannot resolve the
+                // state base ...", "cannot resolve ... under the state base ...")
+                // reads as a statement of its own.
+                Error::Other(anyhow!(
+                    "The state directory for task `{name}` and state key {key:?} cannot be used: \
+                     {reason}. Check that path for a symlink or a permission problem, then \
+                     run the task again."
+                ))
+            })?
+            .ok_or_else(|| {
+                Error::Other(anyhow!(
+                    "cannot determine state directory for state key {key:?}: \
+                     the location of the minimal file on disk is unknown"
+                ))
+            })?,
             _ => {
                 let tmp = self.daemon.cache.temp_dir().map_err(|e| {
                     Error::Other(
@@ -1329,10 +1409,11 @@ impl Context {
 
         // The whole read-edit-write runs under `File::edit_exclusively`'s
         // lock so a concurrent `min` command cannot interleave between our read
-        // and our write (the write itself is an atomic replace).
+        // and our write (the write itself is an atomic replace). A context
+        // built for a box keeps the edit inside the box's workspace.
         let mut did_edit = false;
         let mut added = None;
-        mfile::File::edit_exclusively(&mfile_path, |content| {
+        let edit = |content: Option<&str>| -> Result<Option<String>, Error> {
             let toml = content.ok_or_else(|| {
                 Error::IO(
                     "reading minimal.toml for add",
@@ -1397,25 +1478,38 @@ impl Context {
                     }
                 }
                 AddDepMode::SessionPackages => {
-                    if let Some(h) = doc["session"].as_table_like_mut() {
-                        edited |= upsert_toml_packages_list(h, "packages", &resolved)?;
+                    // BOX-050: the session packages live under
+                    // [defaults.session]. A legacy [session] table moves
+                    // there first, so the file reads with no rename hint.
+                    edited |= move_legacy_session_table(&mut doc)?;
+                    let defaults = defaults_item(&mut doc)?;
+                    let inline = defaults.is_inline_table();
+                    let defaults = defaults.as_table_like_mut().ok_or_else(not_a_table)?;
+                    if let Some(s) = defaults.get_mut("session") {
+                        let s = s.as_table_like_mut().ok_or_else(not_a_table)?;
+                        edited |= upsert_toml_packages_list(s, "packages", &resolved)?;
                     } else {
-                        doc.insert(
-                            "session",
-                            Item::Table(toml_edit::Table::from_iter([(
-                                "packages",
-                                Item::Value(Value::Array(Array::from_iter(resolved.iter()))),
-                            )])),
-                        );
+                        let session = toml_edit::Table::from_iter([(
+                            "packages",
+                            Item::Value(Value::Array(Array::from_iter(resolved.iter()))),
+                        )]);
+                        defaults.insert("session", fit_item(Item::Table(session), inline));
                         edited = true;
                     }
-                    added = Some(format!("Added {} to session.packages", resolved.join(", ")));
+                    added = Some(format!(
+                        "Added {} to defaults.session.packages",
+                        resolved.join(", ")
+                    ));
                 }
             }
 
             did_edit = edited;
             Ok(if edited { Some(doc.to_string()) } else { None })
-        })?;
+        };
+        match self.mfile_edit_root.as_deref() {
+            Some(root) => mfile::File::edit_exclusively_within(root, &mfile_path, edit),
+            None => mfile::File::edit_exclusively(&mfile_path, edit),
+        }?;
 
         // Printed only once the write has succeeded.
         if let Some(added) = added {
@@ -1436,8 +1530,95 @@ pub enum AddDepMode {
     RuntimePackages,
     /// Add the specified packages to a task with a given name.
     TaskPackages { name: String },
-    /// Add the specified packages to session.packages.
+    /// Add the specified packages to defaults.session.packages. A legacy
+    /// top-level [session] table moves to [defaults.session] first.
     SessionPackages,
+}
+
+/// The refusal when `defaults` or `defaults.session` is not a table.
+fn not_a_table() -> Error {
+    Error::Other(anyhow!(
+        "`defaults` and `defaults.session` in minimal.toml must be tables: fix them, then run the command again"
+    ))
+}
+
+/// The top-level `defaults` item, made as an implicit table when the file
+/// has none, so that only `[defaults.session]` prints.
+fn defaults_item(doc: &mut DocumentMut) -> Result<&mut Item, Error> {
+    let item = doc.entry("defaults").or_insert_with(|| {
+        let mut t = toml_edit::Table::new();
+        t.set_implicit(true);
+        Item::Table(t)
+    });
+    if item.is_table_like() {
+        Ok(item)
+    } else {
+        Err(not_a_table())
+    }
+}
+
+/// `item` in the form a parent table can hold: an inline table when the
+/// parent is inline, else unchanged.
+fn fit_item(item: Item, inline: bool) -> Item {
+    if !inline || item.is_value() {
+        return item;
+    }
+    match item.into_value() {
+        Ok(v) => Item::Value(v),
+        Err(item) => item,
+    }
+}
+
+/// Whether two TOML values are the same, ignoring their decor.
+fn same_value(a: &Value, b: &Value) -> bool {
+    a.to_string().trim() == b.to_string().trim()
+}
+
+/// Moves a top-level `[session]` table to `[defaults.session]`, with its
+/// keys and its inline form (BOX-050). Where `[defaults.session]` already
+/// exists, the keys merge as the reader merges them: an array takes the
+/// legacy items first, and any other key keeps the `[defaults.session]`
+/// value. Returns whether the document changed.
+fn move_legacy_session_table(doc: &mut DocumentMut) -> Result<bool, Error> {
+    if !doc.get("session").is_some_and(Item::is_table_like) {
+        return Ok(false);
+    }
+    // A bad `defaults` is refused before the [session] table moves.
+    defaults_item(doc)?;
+    let Some(old) = doc.remove("session") else {
+        return Ok(false);
+    };
+    let defaults = defaults_item(doc)?;
+    let inline = defaults.is_inline_table();
+    let defaults = defaults.as_table_like_mut().ok_or_else(not_a_table)?;
+    let Some(new) = defaults.get_mut("session") else {
+        defaults.insert("session", fit_item(old, inline));
+        return Ok(true);
+    };
+    let new_inline = new.is_inline_table();
+    let new = new.as_table_like_mut().ok_or_else(not_a_table)?;
+    let old = old.as_table_like().ok_or_else(not_a_table)?;
+    for (key, value) in old.iter() {
+        match (value.as_array(), new.get_mut(key)) {
+            (Some(items), Some(newer)) => {
+                if let Some(newer) = newer.as_array_mut() {
+                    let missing: Vec<Value> = items
+                        .iter()
+                        .filter(|i| !newer.iter().any(|n| same_value(n, i)))
+                        .cloned()
+                        .collect();
+                    for (at, item) in missing.into_iter().enumerate() {
+                        newer.insert_formatted(at, item);
+                    }
+                }
+            }
+            (_, Some(_)) => {}
+            (_, None) => {
+                new.insert(key, fit_item(value.clone(), new_inline));
+            }
+        }
+    }
+    Ok(true)
 }
 
 fn upsert_toml_packages_list<T: TableLike + ?Sized>(
@@ -1530,6 +1711,22 @@ fn detach_array_close(arr: &mut Array) -> String {
     tail[..i].trim_end().to_owned()
 }
 
+/// The durable state directory for `state_key`: keyed on `state_root` when
+/// one is set, else on the directory `mfile` was read from. `None` when
+/// neither is known. An error when the state key is not a single directory
+/// name, or when the directory resolves outside `base`.
+fn durable_state_dir(
+    mfile: &mfile::File,
+    state_key: &str,
+    base: PathBuf,
+    state_root: Option<&Path>,
+) -> Result<Option<PathBuf>, String> {
+    match state_root {
+        Some(root) => mfile.state_dir_under(state_key, base, root).map(Some),
+        None => mfile.state_dir(state_key, base),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1601,6 +1798,125 @@ mod tests {
             &ctx_a.daemon_context(),
             &ctx_b.daemon_context()
         ));
+    }
+
+    /// gominimal/minimal#1373: a state root keys a task's durable state on
+    /// the project, not on where this daemon's copy of the mfile sits.
+    /// Without one, the key stays the mfile's own directory.
+    #[test]
+    fn state_root_keys_durable_state_on_the_project() {
+        let repo = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("testdata")
+            .join("fakerepo");
+        let mfile = MFileSearchStrategy::Override(repo)
+            .find_mfile()
+            .expect("fakerepo has a minimal.toml");
+        let base = PathBuf::from("/state");
+
+        assert_eq!(
+            durable_state_dir(&mfile, "env", base.clone(), None),
+            mfile.state_dir("env", base.clone())
+        );
+        let root = Path::new("/home/user/src/my-project");
+        assert_eq!(
+            durable_state_dir(&mfile, "env", base.clone(), Some(root)),
+            Ok(Some(PathBuf::from(
+                "/state/-home-user-src-my%2Dproject/env"
+            )))
+        );
+    }
+
+    /// A context on the `fakerepo` project with its state and cache in the
+    /// given directories, for the state-key tests of `make_env`.
+    fn fakerepo_context(state: &Path, cache: &Path) -> Context {
+        let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+        let config = ConfigBuilder::new()
+            .with_state_dir(state.to_path_buf())
+            .with_cache_dir(cache.to_path_buf())
+            .with_repo_dir(manifest.join("testdata").join("fakerepo"))
+            .with_stdlib_dir(manifest.join("../stdlib/minimal-ncl"))
+            .build()
+            .unwrap();
+        Context::new(config).unwrap()
+    }
+
+    /// The message `make_env` refuses a state key with, for a task named
+    /// `build`. Panics if the environment is made.
+    async fn make_env_refusal(ctx: &mut Context, key: &str) -> String {
+        let mut graph = Graph::new();
+        let key = key.to_owned();
+        match ctx
+            .make_env(
+                "build",
+                &mut graph,
+                None,
+                Some(&key),
+                None,
+                None,
+                Vec::<String>::new(),
+                PatchHome::Ambient,
+            )
+            .await
+        {
+            Ok(_) => panic!("state key {key:?} must be refused"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// A state key that is not one directory name reaches `make_env` only
+    /// from a caller that did not load it from the project's file, as that
+    /// load refuses it. `make_env` still refuses it, and names the task and
+    /// where to set `state_key`.
+    #[tokio::test]
+    async fn make_env_names_the_task_for_a_state_key_that_is_not_one_name() {
+        let (state, cache) = (tempdir().unwrap(), tempdir().unwrap());
+        let mut ctx = fakerepo_context(state.path(), cache.path());
+        for (key, reason) in [
+            ("..", "it names the parent directory"),
+            ("a/b", "it contains '/'"),
+        ] {
+            assert_eq!(
+                make_env_refusal(&mut ctx, key).await,
+                format!(
+                    "Task `build` has the state key {key:?}, and {reason}. Set `state_key` on \
+                     the task or in `[defaults.task]` to one directory name, such as \"dev\"."
+                )
+            );
+        }
+    }
+
+    /// A state key that is one directory name, whose state directory
+    /// resolves outside the state base through a symlink, is refused with
+    /// the task, the key and where the path leads, and a next step that fits
+    /// that cause. It does not tell the person to choose another key.
+    #[tokio::test]
+    async fn make_env_refuses_a_state_directory_behind_a_symlink() {
+        let (state, cache, outside) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
+        let mut ctx = fakerepo_context(state.path(), cache.path());
+        let base = ctx.daemon.config.state_base_dir();
+        let dir = durable_state_dir(ctx.minimal_file(), "dev", base.clone(), ctx.state_root())
+            .unwrap()
+            .expect("fakerepo's minimal file has a directory");
+        // `dir` is `<base>/<project>/dev`: make `<project>` a symlink out.
+        let project = dir.parent().unwrap();
+        std::fs::create_dir_all(&base).unwrap();
+        std::os::unix::fs::symlink(outside.path(), project).unwrap();
+
+        let msg = make_env_refusal(&mut ctx, "dev").await;
+        assert!(
+            msg.starts_with(
+                "The state directory for task `build` and state key \"dev\" cannot be used: resolves to "
+            ),
+            "{msg}"
+        );
+        assert!(msg.contains("which is outside the state base"), "{msg}");
+        assert!(
+            msg.ends_with(
+                "Check that path for a symlink or a permission problem, then run the task again."
+            ),
+            "{msg}"
+        );
+        assert!(!msg.contains("Choose a state key"), "{msg}");
     }
 
     /// NET-155: a context made for a box carries the box's classifier leaf,
@@ -1970,8 +2286,122 @@ mod tests {
         assert!(
             String::from_utf8(std::fs::read(&mfile_path).unwrap())
                 .unwrap()
-                .contains("[session]\npackages = [\"uroot\"]")
+                .contains("[defaults.session]\npackages = [\"uroot\"]")
         );
+        assert!(
+            !String::from_utf8(std::fs::read(&mfile_path).unwrap())
+                .unwrap()
+                .contains("[session]")
+        );
+    }
+
+    /// A context confined to a box's workspace re-reads its `minimal.toml`
+    /// beneath the workspace: a file swapped for a link out of it is
+    /// refused rather than read.
+    #[test]
+    fn cloned_reinit_refuses_a_confined_mfile_that_links_out() {
+        let state = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let content = "[defaults.session]\npackages = [\"base\"]\n";
+        let mfile_path = workspace.path().join("minimal.toml");
+        std::fs::write(&mfile_path, content).unwrap();
+        let outside_path = outside.path().join("minimal.toml");
+        std::fs::write(&outside_path, content).unwrap();
+
+        let config = ConfigBuilder::new()
+            .with_state_dir(state.path().to_path_buf())
+            .with_repo_dir(workspace.path().to_path_buf())
+            .with_stdlib_dir(
+                std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("../stdlib/minimal-ncl"),
+            )
+            .build()
+            .unwrap();
+        let mut ctx = Context::new_with_strategy(
+            config,
+            MFileSearchStrategy::Within(workspace.path().to_path_buf()),
+        )
+        .unwrap();
+        ctx.confine_mfile_edits_to(workspace.path().to_path_buf());
+        // The context reloads once the file is a link out of the workspace.
+        std::fs::rename(&mfile_path, workspace.path().join("was-minimal.toml")).unwrap();
+        std::os::unix::fs::symlink(&outside_path, &mfile_path).unwrap();
+
+        let err = ctx.cloned_reinit().unwrap_err();
+
+        // Where every link is refused (off Linux, or a kernel without
+        // `openat2`) the refusal says only that it is a link.
+        assert!(
+            matches!(
+                &err,
+                Error::MFile(mfile::Error::IO(_, _, io))
+                    if io.to_string().contains("leads outside its workspace")
+                        || io.to_string().contains("cannot follow a link here")
+            ),
+            "error: {err:?}"
+        );
+    }
+
+    /// inbox#1245: a context confined to a box's workspace refuses to edit a
+    /// `minimal.toml` that links out of it, and leaves both files as they
+    /// were.
+    #[test]
+    fn add_deps_refuses_a_confined_mfile_that_links_out() {
+        let state = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let outside_path = outside.path().join("minimal.toml");
+        let content = format!(
+            indoc! {
+                "
+                [upstream]
+                dir = \"{}\"
+
+                [stack]
+                use = \"fake-stack\"
+                "
+            },
+            std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                .join("testdata")
+                .join("fakerepo-with-stack")
+                .to_str()
+                .unwrap()
+        );
+        std::fs::write(&outside_path, &content).unwrap();
+        let link = workspace.path().join("minimal.toml");
+        std::os::unix::fs::symlink(&outside_path, &link).unwrap();
+
+        let config = ConfigBuilder::new()
+            .with_state_dir(state.path().to_path_buf())
+            .with_repo_dir(workspace.path().to_path_buf())
+            .with_stdlib_dir(
+                std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("../stdlib/minimal-ncl"),
+            )
+            .build()
+            .unwrap();
+        let mut ctx = Context::new(config).unwrap();
+        ctx.confine_mfile_edits_to(workspace.path().to_path_buf());
+        let graph = ctx.graph_from_all_packages().unwrap();
+
+        let err = ctx
+            .add_deps(&graph, ["uroot"], AddDepMode::BuildPackages)
+            .unwrap_err();
+
+        // Where every link is refused (off Linux, or a kernel without
+        // `openat2`) the refusal says only that it is a link.
+        assert!(
+            matches!(
+                &err,
+                Error::MFile(mfile::Error::IO(_, _, io))
+                    if io.to_string().contains("leads outside its workspace")
+                        || io.to_string().contains("cannot follow a link here")
+            ),
+            "error: {err:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&outside_path).unwrap(), content);
+        assert_eq!(std::fs::read_link(&link).unwrap(), outside_path);
     }
 
     #[test]
@@ -2073,18 +2503,99 @@ mod tests {
             .is_err()
         );
 
-        // Adding to an inline [session] must not replace the whole table.
+        // Adding to an inline [session] moves it to [defaults.session] and
+        // keeps its inline form and its other keys.
         ctx.add_deps(&graph, ["uroot"], AddDepMode::SessionPackages)
             .unwrap();
         let doc = read_doc();
-        assert!(doc["session"].is_inline_table(), "session lost inline form");
-        assert_eq!(str_list(&doc["session"]["packages"]), ["uroot"]);
-        assert_eq!(doc["session"]["vars"]["ANSWER"].as_str(), Some("42"));
+        assert!(doc.get("session").is_none(), "[session] stayed: {doc}");
+        let session = &doc["defaults"]["session"];
+        assert!(session.is_inline_table(), "session lost inline form");
+        assert_eq!(str_list(&session["packages"]), ["uroot"]);
+        assert_eq!(session["vars"]["ANSWER"].as_str(), Some("42"));
 
         // The surviving settings must still parse into the config.
         let session = ctx.minimal_file().session.clone().unwrap_or_default();
         assert!(session.vars.keys().any(|k| k.as_ref() == "ANSWER"));
         assert!(session.packages.contains(&"uroot".to_string()));
+    }
+
+    // BOX-050: adding a session package writes [defaults.session], moves a
+    // legacy [session] table there, and leaves a file that reads with no
+    // legacy hint.
+    #[test]
+    fn add_session_package_writes_defaults_session() {
+        let state = tempdir().unwrap();
+        let cwd = tempdir().unwrap();
+        let mfile_path = cwd.path().join("minimal.toml");
+        std::fs::write(
+            &mfile_path,
+            format!(
+                indoc! {
+                    "
+                    [upstream]
+                    dir = \"{}\"
+
+                    [stack]
+                    use = \"fake-stack\"
+
+                    # The session.
+                    [session]
+                    packages = [\"uroot\"]
+
+                    [session.vars]
+                    ANSWER = \"42\"
+
+                    [defaults.session]
+                    packages = []
+                    "
+                },
+                std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("testdata")
+                    .join("fakerepo-with-stack")
+                    .to_str()
+                    .unwrap()
+            ),
+        )
+        .unwrap();
+
+        let config = ConfigBuilder::new()
+            .with_state_dir(state.path().to_path_buf())
+            .with_repo_dir(cwd.path().to_path_buf())
+            .with_stdlib_dir(
+                std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("../stdlib/minimal-ncl"),
+            )
+            .build()
+            .unwrap();
+
+        let mut ctx = Context::new(config).unwrap();
+        let graph = ctx.graph_from_all_packages().unwrap();
+        ctx.add_deps(&graph, ["extra-runtime-pkg"], AddDepMode::SessionPackages)
+            .unwrap();
+
+        let text = std::fs::read_to_string(&mfile_path).unwrap();
+        let doc = text.parse::<DocumentMut>().unwrap();
+        assert!(doc.get("session").is_none(), "[session] stayed: {text}");
+        let session = &doc["defaults"]["session"];
+        let packages: Vec<&str> = session["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(packages, ["uroot", "extra-runtime-pkg"], "{text}");
+        assert_eq!(session["vars"]["ANSWER"].as_str(), Some("42"), "{text}");
+
+        // The written file carries no legacy table, so a read prints no hint.
+        let mut raw: toml::Table = toml::from_str(&text).unwrap();
+        let hints = mfile::legacy::canonicalize(&mut raw, mfile::legacy::this_release()).unwrap();
+        assert!(hints.is_empty(), "legacy hints {hints:?} for:\n{text}");
+
+        let session = ctx.minimal_file().session.clone().unwrap_or_default();
+        assert!(session.packages.contains(&"uroot".to_string()));
+        assert!(session.packages.contains(&"extra-runtime-pkg".to_string()));
+        assert!(session.vars.keys().any(|k| k.as_ref() == "ANSWER"));
     }
 
     #[test]

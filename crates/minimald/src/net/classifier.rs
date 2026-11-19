@@ -310,6 +310,21 @@ pub enum Cause {
     /// what failed to be read, and a person reading it decides what to look
     /// at.
     ProbeUnreadable,
+    /// The step is installed, but this native daemon is not in its own
+    /// leaf: the placement unit is missing or out of date, or a start
+    /// outran it (gominimal/inbox#1206). A daemon outside the tree cannot
+    /// migrate a box into a leaf, so no box it launches is placed, and an
+    /// unplaced box is never refused on a probe cause (the launch's
+    /// `refused_unenforced_host_address_box`): every host-address box, a
+    /// deny-all one included, runs unenforced. Its probe reads only as a
+    /// table whose effect could not be read, so the decision is re-spelled
+    /// over the daemon's placement ([`Decision::over_daemon_placement`]),
+    /// and the advisory says what the launch does instead of what a placed
+    /// daemon would. `min finalize-install` reinstalls the placement unit,
+    /// which places the daemon at its next start, so the install command
+    /// is named. Native only: a guest daemon outside its tree refuses every
+    /// host-address box on that ground itself.
+    DaemonNotPlaced,
 }
 
 impl Cause {
@@ -339,6 +354,10 @@ impl Cause {
                  own control connection or the probe's placement failed, so \
                  whether the table is refusing is unknown"
             }
+            Self::DaemonNotPlaced => {
+                "this daemon is not in its classifier leaf, so it cannot place a \
+                 host-address box in one"
+            }
         }
     }
 
@@ -365,11 +384,13 @@ impl Cause {
     /// decided while nothing refuses it, so the launch refuses it and the
     /// boxes that need no verdict enforced still run. The match stays
     /// exhaustive over causes, never claiming a host kind that cannot
-    /// produce it.
+    /// produce it. [`Cause::DaemonNotPlaced`] is native only; its guest arm
+    /// is the guest's own unplaced state, where no box can be placed and
+    /// every host-address box is refused.
     pub fn host_ip_box_outcome(self, guest: bool) -> &'static str {
         if guest {
             return match self {
-                Self::CannotConfine => {
+                Self::CannotConfine | Self::DaemonNotPlaced => {
                     "its host-address boxes are refused: it cannot place one in a \
                      leaf that confines"
                 }
@@ -383,9 +404,10 @@ impl Cause {
             };
         }
         match self {
-            Self::StepNotInstalled | Self::CannotConfine | Self::GuestTableNotLoaded => {
-                "its host-address boxes run unenforced"
-            }
+            Self::StepNotInstalled
+            | Self::CannotConfine
+            | Self::GuestTableNotLoaded
+            | Self::DaemonNotPlaced => "its host-address boxes run unenforced",
             Self::TableNotEffective | Self::ProbeUnreadable => {
                 "its deny-all host-address boxes are refused and its other \
                  host-address boxes run unenforced"
@@ -402,10 +424,14 @@ impl Cause {
     /// the marker vouches for but the probe does not names nothing either:
     /// the marker is what the install's item reads, so with it present the
     /// install is a no-op, not a reload. A probe that could not read the
-    /// table names nothing: no command is known to make a probe run.
+    /// table names nothing: no command is known to make a probe run. A
+    /// daemon outside its leaf names the install, which reinstalls the unit
+    /// that places the daemon at its next start.
     pub fn install_command(self) -> Option<String> {
         match self {
-            Self::StepNotInstalled => Some(sandbox::classifier::install_hint()),
+            Self::StepNotInstalled | Self::DaemonNotPlaced => {
+                Some(sandbox::classifier::install_hint())
+            }
             Self::CannotConfine
             | Self::GuestTableNotLoaded
             | Self::TableNotEffective
@@ -429,7 +455,9 @@ impl Cause {
 /// the box declares egress. The two probe causes refuse a deny-all box at
 /// placement rather than run it unenforced ([`Cause::host_ip_box_outcome`]),
 /// so over those the line says the box is refused instead of claiming it
-/// runs. The install is named only where running it enforces the
+/// runs. A daemon outside its leaf places no box, so nothing is refused
+/// there ([`Cause::DaemonNotPlaced`]): the box runs, and the line says
+/// so. The install is named only where running it enforces the
 /// declaration: a cause no install ends names the own-address start alone
 /// and says why the install cannot help, and a declaration the classifier
 /// cannot enforce on a host address names the own-address start alone too,
@@ -514,6 +542,27 @@ impl Decision {
             decided: false,
             cause: Some(cause),
             carve_out: None,
+        }
+    }
+
+    /// This decision as an unplaced native daemon reads it: a
+    /// [`Cause::ProbeUnreadable`] read by a daemon outside its own leaf is
+    /// re-spelled [`Cause::DaemonNotPlaced`], because such a daemon's probe
+    /// child cannot be placed, so it reads only as a table it could not
+    /// read, while the launch that follows places no box and so refuses
+    /// none. [`Cause::TableNotEffective`] is kept as read: that reading needs
+    /// a probe child placed in the deny leaf, which proves this daemon can
+    /// place a box whatever its own leaf says, and its remedy is the
+    /// table's, not the placement's. The other causes already say the boxes
+    /// run unenforced, and a decided host, a placed daemon and the guest
+    /// keep their decision as read.
+    #[must_use]
+    pub fn over_daemon_placement(self, guest: bool, daemon_unplaced: bool) -> Self {
+        match self.cause {
+            Some(Cause::ProbeUnreadable) if !guest && daemon_unplaced => {
+                Self::undecidable(Cause::DaemonNotPlaced)
+            }
+            _ => self,
         }
     }
 
@@ -722,8 +771,16 @@ pub(crate) async fn run_nft_script(nft: &Path, script: &str) -> std::io::Result<
                 format!("cannot run {}: {error}", nft.display()),
             )
         })?;
+    // nft may exit before it has read the whole script (a refusal on its first lines): the write then
+    // ends in EPIPE, and what nft said is in its stderr below, which is the error to report. Only an nft
+    // that exits 0 without reading its whole script is an error of its own.
+    let mut unread = false;
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(script.as_bytes()).await?;
+        match stdin.write_all(script.as_bytes()).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => unread = true,
+            Err(error) => return Err(error),
+        }
     }
     let ran = tokio::time::timeout(TABLE_LIST_DEADLINE, child.wait_with_output())
         .await
@@ -734,6 +791,12 @@ pub(crate) async fn run_nft_script(nft: &Path, script: &str) -> std::io::Result<
             )
         })??;
     if ran.status.success() {
+        if unread {
+            return Err(std::io::Error::other(format!(
+                "{} exited 0 before reading its whole script",
+                nft.display()
+            )));
+        }
         return Ok(());
     }
     Err(std::io::Error::other(format!(
@@ -3447,12 +3510,54 @@ pub fn decide_now(root: &Path, mountinfo: Option<&str>, guest: bool) -> Decision
 ///
 /// [`enter_daemon_leaf`]: sandbox::classifier::enter_daemon_leaf
 pub fn daemon_fetch_leaf(root: &Path) -> Option<&'static str> {
-    let members =
-        std::fs::read_to_string(sandbox::classifier::daemon_leaf(root).join(PROCS_FILE)).ok()?;
-    members
-        .lines()
-        .any(|member| member.trim().parse::<u32>() == Ok(std::process::id()))
+    daemon_in_leaf(root)
+        .ok()?
         .then_some(sandbox::classifier::DAEMON_LEAF)
+}
+
+/// Whether this process is among the members of its daemon leaf's
+/// `cgroup.procs`, read once. `Err` is a leaf that is not there
+/// (`NotFound`) or one whose members could not be read; [`unplaced_over`]
+/// keeps the two apart.
+pub fn daemon_in_leaf(root: &Path) -> std::io::Result<bool> {
+    let members = std::fs::read_to_string(sandbox::classifier::daemon_leaf(root).join(PROCS_FILE))?;
+    Ok(members
+        .lines()
+        .any(|member| member.trim().parse::<u32>() == Ok(std::process::id())))
+}
+
+/// Whether one read of the daemon leaf ([`daemon_in_leaf`]) counts this
+/// daemon as standing outside it: every read but one that finds this
+/// process among the leaf's members does, on purpose.
+///
+/// The only cause this re-spells is an unreadable probe
+/// ([`Decision::over_daemon_placement`]), which [`decide`] reaches only
+/// past its step checks, so a host without the step keeps
+/// [`Cause::StepNotInstalled`] whatever this says. Over an unreadable
+/// probe, the box that follows either runs unenforced (not placed) or is
+/// refused at launch (placed). Saying the box can still reach the network
+/// is wrong only in the second case, where the box is refused anyway.
+/// Keeping the probe's "refuses to start the box" would be wrong in the
+/// first, claiming a refusal for a box that has the network
+/// (gominimal/minimal#3240). So a daemon not proven in its leaf counts as
+/// unplaced: a leaf read whole without this process, a missing leaf beside
+/// an installed tree, and a leaf whose members could not be read. Pure:
+/// start-up logs that read error once, and a launch's re-read does not.
+///
+/// Counting the daemon unplaced never changes a launch's outcome: the
+/// launcher places a box by its own migration probe
+/// (`create_session_leaf`), and the gate refuses a placed deny-all box over
+/// [`Cause::DaemonNotPlaced`] as it does over [`Cause::ProbeUnreadable`].
+/// Only the words of a box that is not placed change, to the ones that are
+/// true of it.
+pub fn unplaced_over(in_leaf: &std::io::Result<bool>) -> bool {
+    !matches!(in_leaf, Ok(true))
+}
+
+/// Whether this daemon stands outside a daemon leaf the step installed,
+/// over one fresh read of it ([`unplaced_over`]).
+pub fn daemon_unplaced(root: &Path) -> bool {
+    unplaced_over(&daemon_in_leaf(root))
 }
 
 /// How long a daemon waits for the placer to finish: the placer scans every
@@ -7125,6 +7230,146 @@ mod tests {
         );
     }
 
+    /// D2996, NET-068: a hostname-allowlist box's own loopback connect, such
+    /// as git's to 127.0.0.1, meets no refusing rule of the guest's table.
+    /// The declaration is not deny-all, so its verdict is allow. An own-IP
+    /// box runs in a network namespace of its own and is placed in no leaf.
+    /// Every refusing rule of the guest's table is reached only from a socket
+    /// of the boxes subtree, and the IPv4 rules that do not need the deny
+    /// subtree name a destination off the loopback. So the one refusal a
+    /// guest flow on `lo` can meet is `deny_out`, and in the guest the socket
+    /// that meets it there is the effect probe's, in its deny leaf.
+    #[test]
+    fn hostname_allowlist_box_loopback_connect_is_admitted() {
+        let hostname_allowlist = boxes::EgressPolicy {
+            allow_protocols: Some(vec![boxes::IpProto::Tcp]),
+            allow_subnets: Some(Vec::new()),
+            allow_dns_hosts: Some(
+                boxes::NET068_TOOLCHAIN_EGRESS_HOSTS
+                    .iter()
+                    .map(|host| (*host).to_string())
+                    .collect(),
+            ),
+            deny_subnets: None,
+        };
+        assert_eq!(
+            verdict_of(Some(&hostname_allowlist)),
+            Verdict::Allow,
+            "a hostname allowlist admits destinations, so it is never placed in the deny subtree"
+        );
+
+        let guest_ip = IpAddr::V4(crate::net::SwitchSubnet::default().daemon_ip());
+        let ruleset = String::from_utf8(guest_ruleset(guest_ip, guest_ip))
+            .expect("the guest's render is text");
+        let slice = Path::new(sandbox::classifier::TREE_ROOT)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("the tree root is a named slice");
+        let boxes_rel = format!("{slice}/{}", sandbox::classifier::BOXES_DIR);
+        let deny_rel = format!("{boxes_rel}/{}", sandbox::config::DENY_DIR);
+
+        // The chains that refuse, by the rules that reject in them.
+        let mut refusing = Vec::new();
+        let mut chain = None;
+        for line in ruleset.lines().map(str::trim) {
+            if let Some(rest) = line.strip_prefix("chain ") {
+                chain = rest.split_whitespace().next();
+            } else if line.contains("reject")
+                && let Some(name) = chain
+                && !refusing.contains(&name)
+            {
+                refusing.push(name);
+            }
+        }
+        assert_eq!(
+            refusing,
+            ["output", "proxy_lane", "deny_out", "ipv6_refuse"],
+            "the guest's table refuses in these chains and no other: {ruleset}"
+        );
+
+        // An own-IP box is placed in no leaf. Only a host-address launch is.
+        assert!(
+            !crate::box_runtime::placed_in_classifier_leaf(boxes::NetworkMode::OwnIp),
+            "an own-IP box is placed in no classifier leaf"
+        );
+        assert!(
+            crate::box_runtime::placed_in_classifier_leaf(boxes::NetworkMode::HostNet),
+            "a host-address box is placed in a classifier leaf"
+        );
+
+        // The base chains' rules that reject or jump to a refusing chain all
+        // match a socket of the boxes subtree. A socket in no leaf of it, as
+        // an own-IP box's is, never reaches a refusal.
+        for base in ["output", "ipv6_out"] {
+            let rules = chain_rules(&ruleset, base);
+            assert!(
+                !rules.is_empty(),
+                "the guest's table has a {base} chain with rules: {ruleset}"
+            );
+            for rule in rules {
+                if !(rule.contains("reject") || rule.contains("jump ")) {
+                    continue;
+                }
+                assert!(
+                    rule.contains("socket cgroupv2")
+                        && (rule.contains(&format!("\"{boxes_rel}"))
+                            || rule.contains(&format!("@{QUIC443_LEAF_SET}"))),
+                    "{base} refuses only a socket of the boxes subtree: {rule}"
+                );
+            }
+        }
+
+        // Of those, only the deny subtree's jump has no destination off the
+        // loopback: the proxy lane names the proxy's address, the IPv6
+        // refusal leaves `lo` out, and the QUIC rules are UDP to 443.
+        for rule in chain_rules(&ruleset, "output") {
+            if rule.ends_with("jump deny_out") {
+                assert!(
+                    rule.contains(&format!("\"{deny_rel}\"")),
+                    "only the deny subtree goes to deny_out: {rule}"
+                );
+            } else if rule.ends_with("jump proxy_lane") {
+                let proxy = guest_proxy_listener();
+                assert!(
+                    !proxy.ip().is_loopback()
+                        && rule.contains(&format!("ip daddr {} ", proxy.ip())),
+                    "the proxy lane's jump names the proxy's own address: {rule}"
+                );
+            } else if rule.contains("reject") {
+                assert!(
+                    rule.contains("udp dport 443"),
+                    "the other refusals of the output chain are QUIC's: {rule}"
+                );
+            }
+        }
+        let ipv6_out = chain_rules(&ruleset, "ipv6_out");
+        assert!(
+            !ipv6_out.is_empty(),
+            "the guest's table has an ipv6_out chain with rules: {ruleset}"
+        );
+        assert!(
+            ipv6_out
+                .iter()
+                .all(|rule| rule.contains("oifname != \"lo\"")),
+            "the IPv6 refusal leaves the loopback out"
+        );
+
+        // The probe that a guest's boot runs connects to its own loopback
+        // listener from a leaf of the deny subtree. Its refusal is the
+        // `minimal-classifier: refused` line on `lo` a guest's boot log
+        // carries, and it is no box's.
+        let root = Path::new("/sys/fs/cgroup").join(slice);
+        assert_eq!(
+            probe_leaf(&root).parent(),
+            Some(
+                root.join(sandbox::classifier::BOXES_DIR)
+                    .join(sandbox::config::DENY_DIR)
+                    .as_path()
+            ),
+            "the effect probe connects out of the deny subtree"
+        );
+    }
+
     /// NET-079: the guest loads the installer's own render, not a second
     /// spelling of it kept in step. The daemon compiles the installer in
     /// from the one file — `include_str!`, never a copy staged anywhere a
@@ -10044,5 +10289,146 @@ mod tests {
             .await
             .expect_err("refused");
         assert!(error.to_string().contains("no such table"), "{error}");
+
+        // An nft that refuses before reading its whole script still reports what it said: a script past
+        // the pipe's buffer makes nft exit before it reads it, and the write then ends in EPIPE.
+        let big = "# padding\n".repeat(20_000);
+        let error = run_nft_script(&refusing, &big)
+            .await
+            .expect_err("refused before reading");
+        assert!(error.to_string().contains("no such table"), "{error}");
+        // and one that exits 0 without reading it is its own error, not a success
+        let silent = dir.path().join("silent");
+        std::fs::write(&silent, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&silent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = run_nft_script(&silent, &big)
+            .await
+            .expect_err("exit 0 without reading the script");
+        assert!(
+            error
+                .to_string()
+                .contains("before reading its whole script"),
+            "{error}"
+        );
+    }
+
+    /// gominimal/minimal#3067: a native daemon outside its leaf places no
+    /// box, so its deny-all box runs unenforced. The advisory, the start-up
+    /// outcome and the remedy say that, in the words the issue binds.
+    #[test]
+    fn an_unplaced_daemon_says_its_deny_all_box_runs_unenforced() {
+        let deny_all = boxes::EgressPolicy::deny_all();
+        assert_eq!(
+            advisory_text(Cause::DaemonNotPlaced, &deny_all),
+            "note: you asked this box for no network access, but this machine can't \
+             enforce it yet, so the box can still reach the network.\n  Enforce it: \
+             min finalize-install   (or start the box with --network own_ip, which \
+             enforces it now)"
+        );
+        assert_eq!(
+            Cause::DaemonNotPlaced.host_ip_box_outcome(false),
+            "its host-address boxes run unenforced"
+        );
+        assert_eq!(
+            Cause::DaemonNotPlaced.install_command(),
+            Some(sandbox::classifier::install_hint())
+        );
+        // A placed daemon's probe causes still refuse a deny-all box.
+        for cause in [Cause::TableNotEffective, Cause::ProbeUnreadable] {
+            assert!(
+                advisory_text(cause, &deny_all).contains("so it refuses to start the box"),
+                "{cause:?}"
+            );
+        }
+    }
+
+    /// Only an unreadable probe read by an unplaced native daemon is
+    /// re-spelled; every other decision keeps what it read.
+    #[test]
+    fn a_probe_cause_over_an_unplaced_native_daemon_is_its_placement() {
+        let read = Decision::undecidable(Cause::ProbeUnreadable);
+        assert_eq!(
+            read.clone().over_daemon_placement(false, true).cause(),
+            Some(Cause::DaemonNotPlaced),
+            "ProbeUnreadable, native, unplaced"
+        );
+        assert_eq!(
+            read.clone().over_daemon_placement(false, false).cause(),
+            Some(Cause::ProbeUnreadable)
+        );
+        assert_eq!(
+            read.over_daemon_placement(true, true).cause(),
+            Some(Cause::ProbeUnreadable)
+        );
+        // A table that read as not in force placed its probe child, so this
+        // daemon can place a box: the cause and its remedy stay the table's.
+        for kept in [
+            Cause::TableNotEffective,
+            Cause::StepNotInstalled,
+            Cause::CannotConfine,
+        ] {
+            assert_eq!(
+                Decision::undecidable(kept)
+                    .over_daemon_placement(false, true)
+                    .cause(),
+                Some(kept)
+            );
+        }
+        let decided = Decision::decided().over_daemon_placement(false, true);
+        assert!(decided.can_decide_per_box(), "{decided:?}");
+    }
+
+    /// A daemon is unplaced unless a read of its leaf finds it there; the
+    /// step not installed keeps its own cause, because only an unreadable
+    /// probe is re-spelled and the step checks come first.
+    #[test]
+    fn a_daemon_is_unplaced_unless_its_leaf_lists_it() {
+        let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+        assert!(
+            daemon_unplaced(tree.path()),
+            "no leaf, so not proven in one"
+        );
+        assert_eq!(
+            Decision::undecidable(Cause::StepNotInstalled)
+                .over_daemon_placement(false, daemon_unplaced(tree.path()))
+                .cause(),
+            Some(Cause::StepNotInstalled),
+            "a host without the step keeps its cause"
+        );
+        assert_eq!(
+            Decision::undecidable(Cause::ProbeUnreadable)
+                .over_daemon_placement(false, daemon_unplaced(tree.path()))
+                .cause(),
+            Some(Cause::DaemonNotPlaced),
+            "an unreadable probe beside a missing daemon leaf is the placement"
+        );
+        let leaf = sandbox::classifier::daemon_leaf(tree.path());
+        std::fs::create_dir_all(&leaf).expect("the daemon leaf");
+        std::fs::write(leaf.join(PROCS_FILE), "1\n").expect("another member");
+        assert!(
+            daemon_unplaced(tree.path()),
+            "a leaf this process is not in"
+        );
+        std::fs::write(
+            leaf.join(PROCS_FILE),
+            format!("1\n{}\n", std::process::id()),
+        )
+        .expect("this process as a member");
+        assert!(!daemon_unplaced(tree.path()), "a leaf this process is in");
+        // A leaf whose members cannot be read proves no placement, and it
+        // counts as unplaced, so the advisory never claims a refusal for a
+        // box that may run unenforced.
+        std::fs::remove_file(leaf.join(PROCS_FILE)).expect("drop the members file");
+        std::fs::create_dir(leaf.join(PROCS_FILE)).expect("an unreadable members file");
+        let read = daemon_in_leaf(tree.path());
+        assert!(
+            read.as_ref()
+                .is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound),
+            "{read:?}"
+        );
+        assert!(
+            daemon_unplaced(tree.path()),
+            "a leaf whose members cannot be read"
+        );
     }
 }

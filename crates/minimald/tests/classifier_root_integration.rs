@@ -1442,7 +1442,7 @@ impl op::SourceFetcher for NoSources {
         &self,
         url: &str,
         _sha256: &str,
-        _leaf: Option<&sandbox::config::ClassifierLeaf>,
+        _place: Option<op::SourcePlace<'_>>,
         _op: &ot::OpTracker,
     ) -> anyhow::Result<(PathBuf, bool)> {
         anyhow::bail!("the probe build has no sources, but it asked for {url}")
@@ -1727,7 +1727,7 @@ fn web_source_fetch_in_a_box_leaf_follows_its_verdict_over_a_loaded_table() {
         let op = ot::OpTracker::new_root();
 
         let refused = storage
-            .download_web(&url, &sha, Some(&deny), &op)
+            .download_web(&url, &sha, Some(op::SourcePlace::Leaf(&deny)), &op)
             .await
             .expect_err("the deny leaf's fetch is refused");
         eprintln!("the deny leaf's fetch: {refused:#}");
@@ -1736,7 +1736,12 @@ fn web_source_fetch_in_a_box_leaf_follows_its_verdict_over_a_loaded_table() {
         // loaded chain itself.
         let procs = deny.procs();
         let measured = storage
-            .download_web_with_verification_and_caching(&url, &sha, Some(&procs), false, &op)
+            .download_web_with_verification_and_caching(
+                &url,
+                &sha,
+                Some(&common::Placement::Cgroup(procs)),
+                &op,
+            )
             .await
             .expect_err("the loaded table refuses a socket made in the deny leaf");
         let text = format!("{measured:#}");
@@ -1756,7 +1761,7 @@ fn web_source_fetch_in_a_box_leaf_follows_its_verdict_over_a_loaded_table() {
         );
 
         let (path, connected) = storage
-            .download_web(&url, &sha, Some(&allow), &op)
+            .download_web(&url, &sha, Some(op::SourcePlace::Leaf(&allow)), &op)
             .await
             .expect("the same fetch in the allow leaf reaches the source");
         assert!(connected, "the allow leaf's fetch opened a connection");

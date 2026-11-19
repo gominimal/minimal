@@ -1,5 +1,22 @@
 use super::*;
 
+/// Writes `content`, a box's default `minimal.toml`, to `toml_path` in the
+/// box's workspace `wsp` if no file is there yet. Under the lock `min
+/// init`/`add`/`update` take, and only if the file is still missing there,
+/// so a concurrent writer's file is never clobbered by the default. The
+/// write stays inside the workspace ([`mfile::File::edit_exclusively_within`]):
+/// the box controls it, so a link there that leads out of it is refused.
+pub(super) fn write_default_mfile(
+    wsp: &std::path::Path,
+    toml_path: &std::path::Path,
+    content: String,
+) -> Result<(), String> {
+    mfile::File::edit_exclusively_within::<mfile::Error>(wsp, toml_path, |existing| {
+        Ok(existing.is_none().then_some(content))
+    })
+    .map_err(|e| e.to_string())
+}
+
 /// The daemon log's one line for an activation refused on a declared host
 /// port that something else holds (NET-144): the session, the port, the
 /// address and the holder (`box:<name>` or `host`).
@@ -79,6 +96,22 @@ pub(crate) fn box_build_leaf(
 }
 
 /// The network the package builds of the box `record` attach to, when the
+/// box has no classifier leaf (NET-155). A box with no network gets
+/// [`op::BuildNetwork::none`], so its builds never take the daemon's network
+/// or the daemon's fetch. A host-address box gets `None`, because a box with
+/// no leaf of that kind has no per-box enforcement.
+pub(crate) fn box_build_network(
+    record: &boxes::Record,
+    switch: &Arc<Mutex<crate::net::SwitchClient>>,
+    deny_all_opt_out: bool,
+) -> Option<op::BuildNetwork> {
+    match record.network {
+        boxes::NetworkMode::NoNet => Some(op::BuildNetwork::none()),
+        _ => own_address_build_network(record, switch, deny_all_opt_out),
+    }
+}
+
+/// The network the package builds of the box `record` attach to, when the
 /// box has a network namespace of its own and so no classifier leaf: an
 /// own-address box (NET-155). Each build gets the network a task of the box
 /// gets ([`crate::exec::task_network`]): a task address of the box's own,
@@ -101,6 +134,7 @@ pub(crate) fn own_address_build_network(
     );
     let denies_all =
         crate::net::classifier::verdict_of(egress.as_ref()) == sandbox::config::Verdict::Deny;
+    let admits_name = move |host: &str| crate::net::dns_gate::admits_name(egress.as_ref(), host);
     let record = record.clone();
     let switch = Arc::clone(switch);
     Some(
@@ -116,7 +150,8 @@ pub(crate) fn own_address_build_network(
                 switch: Arc::clone(&switch),
             }) as Arc<dyn sandbox::Network>
         })
-        .with_denies_all(denies_all),
+        .with_denies_all(denies_all)
+        .with_admits_name(admits_name),
     )
 }
 
@@ -172,6 +207,26 @@ pub(crate) fn placed_box_build_refusal(box_name: &str) -> String {
          egress rules, and its shell is not running to apply them to the build. \
          Run `min session attach {box_name}` to start its shell, then run the \
          build again."
+    )
+}
+
+/// The context with its task state keyed on the record's host project, not
+/// on the workspace tree this daemon parsed the mfile from. Every box
+/// parses its mfile from the tree under `/tree`, native or VM, and that
+/// tree is laid out afresh under a new session id each time, so a key taken
+/// from it changes every session: every run starts empty and leaves an
+/// orphan behind (gominimal/minimal#1373, gominimal/minimal#1729). The host
+/// path does not change with the session, so a task's state is durable
+/// across sessions and bounded per project. Its own function, so a test can
+/// hold the wiring: removing the keying makes a context whose state root is
+/// `None`.
+pub(super) fn keyed_on_project(ctx: mctx::Context, record: &boxes::Record) -> mctx::Context {
+    ctx.with_state_root(
+        record
+            .project_path
+            .as_utf8_path()
+            .as_std_path()
+            .to_path_buf(),
     )
 }
 
@@ -398,7 +453,7 @@ impl BoxActor {
                 hooks_enabled,
             )
         };
-        let (outcome, graph_names) = match tokio::runtime::Handle::current().runtime_flavor() {
+        let (outcome, composed) = match tokio::runtime::Handle::current().runtime_flavor() {
             tokio::runtime::RuntimeFlavor::MultiThread => {
                 tokio::task::block_in_place(scaffold_and_compose)
             }
@@ -409,7 +464,10 @@ impl BoxActor {
         // `Pending` park resuming through `handle_verdict` — the
         // finalize check judges against the graph this same compose
         // evaluated, never a re-evaluation.
-        self.composed_graph_names = graph_names;
+        (self.composed_graph_names, self.composed_upstream_pin) = match composed {
+            Some(composed) => (Some(composed.names), composed.pin),
+            None => (None, None),
+        };
 
         match outcome {
             // The composition is complete: promote the record
@@ -978,7 +1036,7 @@ impl BoxActor {
         })?;
         let network = match leaf {
             Some(_) => None,
-            None => own_address_build_network(&record, &self.net_switch, self.deny_all_opt_out),
+            None => box_build_network(&record, &self.net_switch, self.deny_all_opt_out),
         };
         Ok(crate::box_ops::BuildPlacement {
             box_name,
@@ -1263,17 +1321,12 @@ impl BoxActor {
         if wsp.as_utf8_path().join(mfile::MFILE_NAME).exists() {
             return Ok(());
         }
-        match mfile::File::from_dir(wsp.as_utf8_path()) {
+        // Read beneath the workspace: the box controls it.
+        match mfile::File::from_dir_within(wsp.as_utf8_path()) {
             Ok(_) => Ok(()), // it exists
             Err(mfile::Error::NotFound) => {
                 let (toml_path, content) = self.default_mfile_plan(wsp)?;
-                // Under the lock `min init`/`add`/`update` take, and only if
-                // the file is still missing there, so a concurrent writer's
-                // file is never clobbered by the default.
-                mfile::File::edit_exclusively::<mfile::Error>(&toml_path, |existing| {
-                    Ok(existing.is_none().then_some(content))
-                })
-                .map_err(|e| e.to_string())
+                write_default_mfile(wsp.as_utf8_path().as_std_path(), &toml_path, content)
             }
             Err(e) => Err(e.to_string()),
         }
@@ -1306,7 +1359,9 @@ impl BoxActor {
             let config = self.workspace_config(wsp)?;
 
             use op::ProjectOp as _;
-            let mut env = mctx::ProjectSetup::for_init(config).map_err(|e| e.to_string())?;
+            let root = wsp.as_utf8_path().as_std_path().to_path_buf();
+            let mut env =
+                mctx::ProjectSetup::for_init_within(config, root).map_err(|e| e.to_string())?;
             let plan = op::InitProject.run(&mut env).map_err(|e| e.to_string())?;
 
             Ok((plan.toml_path, plan.content))
@@ -1320,7 +1375,9 @@ impl BoxActor {
     /// The workspace mfile it parses is either the client's uploaded one or
     /// the default [`Self::configure_loadout`] scaffolded. The scaffold is
     /// repeated here as a backstop — it early-returns when the mfile exists,
-    /// so it only fires for a session whose compose predates it.
+    /// so it only fires for a session whose compose predates it. The
+    /// context's task state is keyed on the record's host project
+    /// ([`keyed_on_project`]).
     ///
     /// [`Config`]: mctx::Config
     pub(super) async fn build_context(
@@ -1340,18 +1397,29 @@ impl BoxActor {
                 _ => scaffold(),
             }?;
         }
-        let ctx = mctx::Context::new(self.workspace_config(&wsp)?).map_err(|e| e.to_string())?;
+        // The box controls everything under its workspace, so a read of its
+        // minimal.toml, here and on every reload, and an edit of it (`min
+        // add` in the box) must not follow a link there to a file outside the
+        // workspace.
+        let root = wsp.as_utf8_path().as_std_path().to_path_buf();
+        let mut ctx = mctx::Context::new_with_strategy(
+            self.workspace_config(&wsp)?,
+            mctx::MFileSearchStrategy::Within(root.clone()),
+        )
+        .map_err(|e| e.to_string())?;
+        ctx.confine_mfile_edits_to(root);
         // NET-155: an own-address box has no classifier leaf. Every package
         // build its context starts, the activation launch's among them,
         // attaches to a network of the box's own, under the box's egress
-        // rules.
+        // rules. A box with no network has none to give them.
         let record = self
             .record
             .record()
             .await
             .map_err(|e| format!("reading session record: {e}"))?;
+        let ctx = keyed_on_project(ctx, &record);
         Ok(
-            match own_address_build_network(&record, &self.net_switch, self.deny_all_opt_out) {
+            match box_build_network(&record, &self.net_switch, self.deny_all_opt_out) {
                 Some(network) => ctx.with_box_network(network),
                 None => ctx,
             },
@@ -1417,71 +1485,82 @@ impl BoxActor {
                     warn_check_expired(self.package_check_deadline);
                     return Ok(true);
                 }
-                let unknown: Vec<String> = match self.composed_graph_names.as_ref() {
-                    // A handful of set lookups: judged inline, no
-                    // blocking-pool round-trip.
-                    Some(known) => comp
-                        .packages()
-                        .iter()
-                        .filter(|p| !known.contains(p.package()))
-                        .map(|p| {
-                            format!(
-                                "{} (declared by {})",
-                                crate::env::unknown_package(p.package()),
-                                boxes::core::source::Provenanced::source(p)
-                            )
-                        })
-                        .collect(),
-                    None => {
-                        let ctx = match self.build_context(true).await {
-                            Ok(ctx) => ctx,
-                            Err(error) => {
-                                tracing::warn!(
-                                    %error,
-                                    "package check skipped at finalize: no session context"
-                                );
-                                return Ok(true);
-                            }
-                        };
-                        // CPU-heavy (nickel evaluation), so on the blocking pool, as
-                        // the launch runs it.
-                        let graph = crate::traced::spawn_blocking(move || {
-                            let mut ctx = ctx;
-                            ctx.graph_from_all_packages().map_err(|e| e.to_string())
-                        })
-                        .await
-                        .map_err(std::io::Error::other)?;
-                        let graph = match graph {
-                            Ok(graph) => graph,
-                            Err(error) => {
-                                tracing::warn!(
-                                    %error,
-                                    "package check skipped at finalize: no package graph"
-                                );
-                                return Ok(true);
-                            }
-                        };
-                        comp.packages()
-                            .iter()
-                            .filter_map(|p| {
-                                crate::env::session_package(&graph, p.package())
-                                    .err()
-                                    .map(|e| {
-                                        format!(
-                                            "{e} (declared by {})",
-                                            boxes::core::source::Provenanced::source(p)
-                                        )
-                                    })
+                let (unknown, pin): (Vec<String>, Option<crate::env::UpstreamPin>) =
+                    match self.composed_graph_names.as_ref() {
+                        // A handful of set lookups: judged inline, no
+                        // blocking-pool round-trip.
+                        Some(known) => (
+                            comp.packages()
+                                .iter()
+                                .filter(|p| !known.contains(p.package()))
+                                .map(|p| {
+                                    format!(
+                                        "{} (declared by {})",
+                                        crate::env::unknown_package(p.package()),
+                                        boxes::core::source::Provenanced::source(p)
+                                    )
+                                })
+                                .collect(),
+                            self.composed_upstream_pin.clone(),
+                        ),
+                        None => {
+                            let ctx = match self.build_context(true).await {
+                                Ok(ctx) => ctx,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        %error,
+                                        "package check skipped at finalize: no session context"
+                                    );
+                                    return Ok(true);
+                                }
+                            };
+                            let pin = crate::env::UpstreamPin::of(ctx.minimal_file());
+                            // CPU-heavy (nickel evaluation), so on the blocking pool, as
+                            // the launch runs it.
+                            let graph = crate::traced::spawn_blocking(move || {
+                                let mut ctx = ctx;
+                                ctx.graph_from_all_packages().map_err(|e| e.to_string())
                             })
-                            .collect()
-                    }
-                };
+                            .await
+                            .map_err(std::io::Error::other)?;
+                            let graph = match graph {
+                                Ok(graph) => graph,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        %error,
+                                        "package check skipped at finalize: no package graph"
+                                    );
+                                    return Ok(true);
+                                }
+                            };
+                            let unknown = comp
+                                .packages()
+                                .iter()
+                                .filter_map(|p| {
+                                    crate::env::session_package(&graph, p.package()).err().map(
+                                        |e| {
+                                            format!(
+                                                "{e} (declared by {})",
+                                                boxes::core::source::Provenanced::source(p)
+                                            )
+                                        },
+                                    )
+                                })
+                                .collect();
+                            (unknown, pin)
+                        }
+                    };
                 if unknown.is_empty() {
                     return Ok(false);
                 }
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("{}; the session was not activated", unknown.join("; ")),
+                // The pin note is added once, after every unknown name,
+                // not to each name: one commit judged them all.
+                Err(crate::env::with_upstream_pin(
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("{}; the session was not activated", unknown.join("; ")),
+                    ),
+                    pin.as_ref(),
                 ))
             })
             .await;

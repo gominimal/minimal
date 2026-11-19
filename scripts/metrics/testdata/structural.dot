@@ -1,0 +1,7 @@
+digraph {
+    "k" -> "k::a" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "k::a" -> "k" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "k::a" -> "k::a::tests" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "k::a::tests" -> "k::b" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "k::b" -> "k::a" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+}

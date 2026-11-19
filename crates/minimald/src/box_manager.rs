@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, io::ErrorKind::NotFound};
 
 use crate::{
-    box_actor::{BoxActor, BoxActorConfig, BoxHandle},
+    box_actor::{BoxActor, BoxActorConfig, BoxHandle, RestartError},
     box_runtime::HostAttrs,
     store::{BoxRecordHandle, RecordPredicate, Store, StoreHandle},
 };
@@ -149,15 +149,18 @@ fn create_classifier_tree() -> (std::path::PathBuf, Option<String>) {
 
 /// The host's classifier fact a create answers over (NET-079). Another
 /// mode's box reads the node fact as it stands. A host-address create reads
-/// it too, unless the stored fact says the probe could not read the table:
-/// that is the one cause a later read can clear without anything on the
-/// host changing (a daemon not yet placed in its leaf at start reads so),
-/// so the create re-reads the host rather than answer from a stale read.
+/// it too, unless the stored fact says the probe could not read the table
+/// or the daemon was not in its leaf: those are the causes a later read can
+/// clear without anything on the host changing (the placement unit places a
+/// daemon whose start outran it), so the create re-reads the host rather
+/// than answer from a stale read.
 /// A re-read that does not run keeps the stored fact. A host-address create
 /// also re-reads when the daemon stands in another cgroup than the one the
 /// fact was read in (gominimal/inbox#1054: `min finalize-install` placed a
 /// running daemon after its start-up reading), so it never answers in the
-/// second before the daemon's own cgroup watch would notice the move.
+/// second before the daemon's own cgroup watch would notice the move; when
+/// that re-read fails, the create goes on to the probe-unreadable retry
+/// below rather than answer the stale fact as re-read.
 // The create lines carry the fact as `host_fact`, never as
 // `host_ip_enforcement`: that field marks the per-launch classifier record,
 // and readers of the log take every line with it as a launch decision.
@@ -189,7 +192,13 @@ async fn create_host_ip_fact(
         return fact;
     }
     let stored = crate::box_runtime::host_ip_enforcement_fact();
-    if stored.cause != Some(crate::net::classifier::Cause::ProbeUnreadable) {
+    if !matches!(
+        stored.cause,
+        Some(
+            crate::net::classifier::Cause::ProbeUnreadable
+                | crate::net::classifier::Cause::DaemonNotPlaced
+        )
+    ) {
         tracing::info!(
             session_name,
             reread = false,
@@ -607,7 +616,9 @@ impl BoxManagerHandle {
                 .filter(|(record, _)| {
                     project_root.is_none_or(|root| record.project_root.as_ref() == Some(root))
                 })
-                .map(|(record, pty)| box_listing_entry(record, *pty))
+                .map(|(record, traits)| {
+                    box_listing_entry(record, traits.pty, traits.lifetime.clone())
+                })
                 .collect();
             boxes.sort_by_key(|entry| entry.box_id);
             tracing::Span::current().record("count", boxes.len());
@@ -649,7 +660,7 @@ impl BoxManagerHandle {
                 .or_else(|| records.iter().find(|(record, _)| record.id == id));
             tracing::Span::current().record("found", record.is_some());
             tracing::info!(session_id = %id, found = record.is_some(), "read a box record");
-            let Some((record, pty)) = record else {
+            let Some((record, traits)) = record else {
                 return Ok(None);
             };
             // BOX-159: the disk a reap frees, for a box a reap can take.
@@ -660,7 +671,7 @@ impl BoxManagerHandle {
             };
             tracing::Span::current().record("disk", disk_bytes.is_some());
             Ok(Some(minimald_rpc::ShowBoxResponse {
-                record: box_listing_entry(record, *pty),
+                record: box_listing_entry(record, traits.pty, traits.lifetime.clone()),
                 // BOX-140: no host this daemon runs on is enrolled with a
                 // Gatehouse, so every box reports the identity none.
                 identity: minimald_rpc::BoxIdentity::None,
@@ -720,6 +731,65 @@ impl BoxManagerHandle {
 }
 
 impl BoxManagerHandle {
+    /// The spec box `id` was created with: the stored copy beside its
+    /// record (BOX-068), for `GetBoxSpec` (BCLI-022). `id` resolves as
+    /// [`Self::show_box`] resolves it. `None` for an id no retained record
+    /// names. `Some(None)` for a box with no stored spec.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the records or the spec file cannot be read, and
+    /// `InvalidData` for a spec file that is not JSON.
+    pub async fn get_box_spec(
+        &self,
+        id: SessionId,
+    ) -> Result<Option<Option<serde_json_lenient::Value>>, BoxManagerError> {
+        use tracing::Instrument as _;
+        let span = tracing::info_span!(
+            "box.spec",
+            session_id = %id,
+            found = tracing::field::Empty,
+            stored = tracing::field::Empty
+        );
+        async {
+            let Some(record) = self.retained_record(id).await? else {
+                tracing::Span::current().record("found", false);
+                tracing::info!(session_id = %id, found = false, "read a box spec");
+                return Ok(None);
+            };
+            tracing::Span::current().record("found", true);
+            let (send, recv) = Responder::channel();
+            // A send error means the manager is gone: the recv fails as well.
+            let _ = self
+                .sender
+                .send(ManagerMessage::EventsSource(record.id, send))
+                .await;
+            let object = recv.await.map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    minimald_rpc::SHUTDOWN_REFUSAL,
+                )
+            })??;
+            let Some(object) = object else {
+                // The box was reaped between the two reads.
+                tracing::info!(session_id = %id, found = false, "read a box spec");
+                return Ok(None);
+            };
+            let bytes = object.load_spec()?;
+            tracing::Span::current().record("stored", bytes.is_some());
+            tracing::info!(session_id = %id, found = true, stored = bytes.is_some(), "read a box spec");
+            bytes
+                .map(|bytes| {
+                    serde_json_lenient::from_slice(&bytes)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+                })
+                .transpose()
+                .map(Some)
+        }
+        .instrument(span)
+        .await
+    }
+
     /// The retained record that `id` names, read as [`Self::show_box`]
     /// reads it: as a record's `box_id` first and as its `id` second.
     async fn retained_record(
@@ -856,7 +926,7 @@ impl BoxManagerHandle {
                     .ok_or_else(|| unknown_box(key))?;
             }
             // The reaped box has no terminal left to attach to.
-            let reaped = box_listing_entry(&record, false);
+            let reaped = box_listing_entry(&record, false, None);
             let (send, recv) = Responder::channel();
             // A send error means the manager is gone: the recv fails as well.
             let _ = self.sender.send(ManagerMessage::ReapEnded(key, send)).await;
@@ -1114,7 +1184,7 @@ impl BoxManagerHandle {
                 let disk_bytes = self.box_disk_bytes(&record).await;
                 reply.matched.push(minimald_rpc::PrunePreviewEntry {
                     // As a prune reports a reaped box: no terminal is left.
-                    record: box_listing_entry(&record, false),
+                    record: box_listing_entry(&record, false, None),
                     disk_bytes,
                 });
             }
@@ -1187,7 +1257,11 @@ fn unknown_box(id: SessionId) -> BoxManagerError {
 /// ending is not a row of the BOX-011 table reports its status with the
 /// stored `reason`, `exit_code` and `signal` as they are.
 /// `pty_enabled` is whether the box has a terminal ([`record_has_pty`]).
-fn box_listing_entry(record: &boxes::Record, pty_enabled: bool) -> minimald_rpc::BoxListingEntry {
+fn box_listing_entry(
+    record: &boxes::Record,
+    pty_enabled: bool,
+    lifetime: Option<String>,
+) -> minimald_rpc::BoxListingEntry {
     let (state, reason, exit_code, signal) = match record.state() {
         Ok(state) => (
             state.name(),
@@ -1222,6 +1296,7 @@ fn box_listing_entry(record: &boxes::Record, pty_enabled: bool) -> minimald_rpc:
         exit_code,
         signal,
         pty_enabled,
+        lifetime,
     }
 }
 
@@ -1237,6 +1312,26 @@ pub(crate) fn record_has_pty(record: &boxes::Record, stored_spec: Option<&[u8]>)
             .as_deref()
             .is_none_or(|box_type| box_type == boxes::SESSION_BOX_TYPE),
     }
+}
+
+/// What a listing reads from a box's stored spec beside its record.
+#[derive(Debug, Clone)]
+pub(crate) struct ListedTraits {
+    /// Whether the box has a terminal ([`record_has_pty`]).
+    pub pty: bool,
+    /// The `box.lifetime` its stored spec sets ([`stored_spec_lifetime`]).
+    pub lifetime: Option<String>,
+}
+
+/// The `box.lifetime` a box's stored spec sets, such as `until_stopped`
+/// (BCLI-009). `None` for a box filed with no spec, a spec that sets none,
+/// and bytes that are not a JSON object.
+pub(crate) fn stored_spec_lifetime(stored_spec: Option<&[u8]>) -> Option<String> {
+    let spec = serde_json_lenient::from_slice::<serde_json_lenient::Value>(stored_spec?).ok()?;
+    spec.get("box")?
+        .get("lifetime")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 /// The bytes the daemon stores for a box's spec (BOX-068): the spec the
@@ -1264,12 +1359,515 @@ fn spec_bytes(spec: &serde_json_lenient::Value) -> Result<Vec<u8>, BoxManagerErr
         .map_err(|e| BoxManagerError::other(format!("could not serialize the box spec: {e}")))
 }
 
+/// The refusal of a create whose spec carries a value that the constraints
+/// of its type's built-in root exclude (BOX-160). The daemon checks this
+/// at admission, whatever the client checked before it sent the spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RootConstraintRefusal {
+    /// The spec's Box Type, its `box.type`.
+    pub(crate) box_type: String,
+    /// The built-in type that `box_type` is built on.
+    pub(crate) root: String,
+    /// The key's dotted path in the spec, such as `io.pty_enabled`.
+    pub(crate) key: String,
+    /// The value the spec carries, as one line of JSON.
+    pub(crate) value: String,
+    /// The values the root allows, as the message names them.
+    pub(crate) allowed: String,
+}
+
+impl RootConstraintRefusal {
+    /// The exit code of the refusal: 3, a configuration error.
+    pub(crate) const EXIT_CODE: i32 = 3;
+
+    /// The exit code of the refusal.
+    pub(crate) fn exit_code(&self) -> i32 {
+        Self::EXIT_CODE
+    }
+
+    /// The box the refusal speaks of, after its article: its type, and the
+    /// built-in type that type extends when the two differ.
+    fn kind(&self) -> String {
+        let Self { box_type, root, .. } = self;
+        if box_type == root {
+            format!("box of the built-in type `{root}`")
+        } else {
+            format!("box of type `{box_type}`, which extends the built-in type `{root}`,")
+        }
+    }
+}
+
+impl std::fmt::Display for RootConstraintRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            key,
+            value,
+            allowed,
+            ..
+        } = self;
+        let kind = self.kind();
+        write!(
+            f,
+            "The box spec sets `{key}` to `{value}`. \
+             A {kind} allows {allowed} for `{key}`. \
+             No box was created. Change the value in minimal.toml, then create the box again."
+        )
+    }
+}
+
+impl std::error::Error for RootConstraintRefusal {}
+
+/// The top-level spec sections that can carry a flat setting, such as
+/// `io` for `pty_enabled` or `box` for `loadout_mode`.
+const FLAT_KEY_SECTIONS: [&str; 6] = ["box", "execution", "install", "io", "nesting", "network"];
+
+/// The refusal of a create whose spec does not name its Box Type's
+/// built-in root (BOX-160). Either `box.type` is not a built-in type and
+/// `type.root` is absent, or `type.root` is not a built-in type, or
+/// `box.type` is a built-in type and `type.root` names a different one.
+/// A built-in type is its own root, so a different `type.root` would
+/// check the spec against the wrong constraints. In each case the daemon
+/// has no root it can trust, so it refuses the spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnknownRootRefusal {
+    /// The key that names the type, `box.type` or `type.root`.
+    pub(crate) key: &'static str,
+    /// The value the spec carries at `key`, as one line of text.
+    pub(crate) value: String,
+    /// The built-in `box.type` that a different `type.root` contradicts,
+    /// when that is the reason for the refusal.
+    pub(crate) builtin_type: Option<&'static str>,
+}
+
+impl UnknownRootRefusal {
+    /// The exit code of the refusal: 3, a configuration error.
+    pub(crate) const EXIT_CODE: i32 = RootConstraintRefusal::EXIT_CODE;
+
+    /// The exit code of the refusal.
+    pub(crate) fn exit_code(&self) -> i32 {
+        Self::EXIT_CODE
+    }
+}
+
+impl std::fmt::Display for UnknownRootRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            key,
+            value,
+            builtin_type,
+        } = self;
+        if let Some(builtin_type) = builtin_type {
+            return write!(
+                f,
+                "The box spec sets `box.type` to `{builtin_type}` and `type.root` to `{value}`. \
+                 The built-in type `{builtin_type}` is its own root. \
+                 No box was created. Remove `type.root` from the spec, \
+                 or set it to `{builtin_type}`, then create the box again."
+            );
+        }
+        let builtins: Vec<String> = mfile::box_types::BUILTIN_BOX_TYPES
+            .iter()
+            .map(|b| format!("`{b}`"))
+            .collect();
+        let situation = if *key == "type.root" {
+            format!("The box spec sets `type.root` to `{value}`, which is not a built-in type.")
+        } else {
+            format!(
+                "The box spec sets `box.type` to `{value}`, \
+                 but it does not name the built-in type that `{value}` extends."
+            )
+        };
+        write!(
+            f,
+            "{situation} The built-in types are {}. No box was created.",
+            builtins.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for UnknownRootRefusal {}
+
+/// Why the admission check of BOX-160 refuses a create.
+#[derive(Debug)]
+enum AdmissionRootRefusal {
+    /// The spec names a type with no built-in root.
+    UnknownRoot(UnknownRootRefusal),
+    /// The spec carries a value its root's constraints exclude.
+    Constraint(RootConstraintRefusal),
+}
+
+/// The two projection digests of a create's spec (BOX-071): the one the
+/// client sent, and the one the daemon recomputed from the spec it
+/// received.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ProjectionDigests {
+    /// The client's digest, or why the create carries none.
+    client: ClientDigest,
+    /// The daemon's digest, `None` when the create carries no spec or the
+    /// spec has no projection.
+    daemon: Option<String>,
+    /// Why the daemon has no digest for a spec that the create carries.
+    unprojected: Option<String>,
+}
+
+/// The client's projection digest on a create (BOX-071).
+///
+/// A malformed value stays distinct from an absent one, so that BOX-072
+/// can refuse it as a differing digest and not accept it as a client that
+/// predates the key. The malformed value itself is never kept.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum ClientDigest {
+    /// The client sent no digest.
+    #[default]
+    Absent,
+    /// The client sent a value that is not a digest in form.
+    Malformed,
+    /// The client sent a digest in form.
+    Digest(String),
+}
+
+impl ProjectionDigests {
+    /// The client's digest as the span and the log name it: the digest,
+    /// `malformed`, or `none`. A malformed value is never named as sent.
+    fn client_word(&self) -> &str {
+        match &self.client {
+            ClientDigest::Absent => "none",
+            ClientDigest::Malformed => "malformed",
+            ClientDigest::Digest(digest) => digest.as_str(),
+        }
+    }
+
+    /// Records both digests on the create's span and writes them to the
+    /// daemon log.
+    fn record(&self, span: &tracing::Span, session_name: &str) {
+        let client = self.client_word();
+        let daemon = self.daemon.as_deref().unwrap_or("none");
+        span.record("client_projection_digest", client);
+        span.record("daemon_projection_digest", daemon);
+        match &self.unprojected {
+            Some(why) => tracing::warn!(
+                session_name,
+                client_projection_digest = client,
+                daemon_projection_digest = daemon,
+                reason = %why,
+                "the daemon computed no projection digest for the box spec"
+            ),
+            None => tracing::info!(
+                session_name,
+                client_projection_digest = client,
+                daemon_projection_digest = daemon,
+                policy = PROJECTION_POLICY_NONE,
+                "computed the box spec's projection digest"
+            ),
+        }
+    }
+}
+
+/// The projection digests of a create (BOX-071): the client's from
+/// `config`, and the daemon's recomputed from `spec`, the spec the create
+/// carries. A spec that names no type is of `verb_type`.
+fn projection_digests(
+    config: &minimald_rpc::BoxConfig,
+    spec: Option<&serde_json_lenient::Value>,
+    verb_type: &str,
+) -> ProjectionDigests {
+    let client = match config.client_projection_digest() {
+        None => ClientDigest::Absent,
+        Some(digest) if is_projection_digest(digest) => ClientDigest::Digest(digest.to_owned()),
+        Some(digest) => {
+            tracing::warn!(
+                digest_len = digest.len(),
+                "ignored a client projection digest that is not 43 base64url characters"
+            );
+            ClientDigest::Malformed
+        }
+    };
+    let (daemon, unprojected) = match spec.map(|s| mfile::projection::spec_digest(s, verb_type)) {
+        None => (None, None),
+        Some(Ok(digest)) => (Some(digest), None),
+        Some(Err(why)) => (None, Some(why.to_string())),
+    };
+    ProjectionDigests {
+        client,
+        daemon,
+        unprojected,
+    }
+}
+
+/// The refusal of a create whose client projection digest differs from
+/// the one the daemon recomputed from the spec it received (BOX-072).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectionDigestRefusal;
+
+impl std::fmt::Display for ProjectionDigestRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "No box was created. minimald read different box settings from the box spec \
+             than the `min` that sent it. This can happen when `min` and minimald are \
+             different builds. Run `min stop` to stop minimald, then run the \
+             command again to start minimald from the same build as `min`.",
+        )
+    }
+}
+
+impl std::error::Error for ProjectionDigestRefusal {}
+
+impl ProjectionDigests {
+    /// Whether the create must be refused (BOX-072): the client sent a
+    /// digest, or a value that is not one, and it differs from the
+    /// daemon's. A client that sends no digest predates the key, and a
+    /// create with no spec has nothing to compare, so neither is refused.
+    fn mismatch(&self, has_spec: bool) -> bool {
+        has_spec
+            && match &self.client {
+                ClientDigest::Absent => false,
+                ClientDigest::Malformed => true,
+                ClientDigest::Digest(client) => self.daemon.as_deref() != Some(client.as_str()),
+            }
+    }
+}
+
+/// The policy that a create evaluates against the projection (BOX-073).
+/// No host this daemon runs on is enrolled, so the create evaluates no
+/// policy, and the span and the log say `none`.
+pub(crate) const PROJECTION_POLICY_NONE: &str = "none";
+
+/// Whether `digest` has the form of a projection digest: SHA-256 as
+/// base64url with no padding, 43 characters. A client value of any other
+/// form is not stored, logged or recorded on the span: the span and the
+/// log say `malformed` in its place.
+fn is_projection_digest(digest: &str) -> bool {
+    digest.len() == 43
+        && digest
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// The spec's Box Type and the built-in type it is built on (BOX-071): the
+/// type is `box.type`. A built-in type is its own root (Gatehouse §6.3.2),
+/// so the root of a built-in `box.type` is the type itself, and the root
+/// of a project type is `type.root`. A spec with no `box.type` is of
+/// `verb_type`, the type the creating verb files the box under.
+///
+/// # Errors
+///
+/// [`UnknownRootRefusal`] when the spec does not name a built-in root: a
+/// built-in `box.type` with a different `type.root`, a `type.root` that is
+/// not a built-in type, or a project type with no `type.root`. A spec that
+/// names a type with no root, or the wrong one, never passes unchecked.
+fn spec_type_root(
+    spec: &serde_json_lenient::Value,
+    verb_type: &str,
+) -> Result<(String, &'static str), UnknownRootRefusal> {
+    let text =
+        |v: &serde_json_lenient::Value| v.as_str().map_or_else(|| v.to_string(), str::to_owned);
+    let box_type = spec
+        .get("box")
+        .and_then(|b| b.get("type"))
+        .map_or_else(|| verb_type.to_owned(), text);
+    let type_root = spec.get("type").and_then(|t| t.get("root")).map(text);
+    if let Some(builtin_type) = mfile::box_types::builtin(&box_type) {
+        return match type_root {
+            Some(root) if root != builtin_type => Err(UnknownRootRefusal {
+                key: "type.root",
+                value: root,
+                builtin_type: Some(builtin_type),
+            }),
+            _ => Ok((box_type, builtin_type)),
+        };
+    }
+    let (key, root) = match type_root {
+        Some(root) => ("type.root", root),
+        None => ("box.type", box_type.clone()),
+    };
+    match mfile::box_types::builtin(&root) {
+        Some(root) => Ok((box_type, root)),
+        None => Err(UnknownRootRefusal {
+            key,
+            value: root,
+            builtin_type: None,
+        }),
+    }
+}
+
+/// The values a constraint that is not a table admits: a list's items, or
+/// the value itself.
+fn admitted(constraint: &serde_json_lenient::Value) -> &[serde_json_lenient::Value] {
+    match constraint {
+        serde_json_lenient::Value::Array(items) => items,
+        other => std::slice::from_ref(other),
+    }
+}
+
+/// The values a constraint allows, as the refusal names them.
+fn constraint_words(constraint: &serde_json_lenient::Value) -> String {
+    let words: Vec<String> = admitted(constraint)
+        .iter()
+        .map(|v| format!("`{v}`"))
+        .collect();
+    match words.as_slice() {
+        [] => "no value".to_owned(),
+        [one] => format!("only {one}"),
+        [rest @ .., last] => format!("only {} or {last}", rest.join(", ")),
+    }
+}
+
+/// The first place in `value`, at key path `path`, that `constraint`
+/// excludes: the path, the value and the constraint that excludes it. A
+/// table constrains only the keys it names. A list value is checked item
+/// by item.
+fn first_excluded(
+    path: &str,
+    constraint: &serde_json_lenient::Value,
+    value: &serde_json_lenient::Value,
+) -> Option<(String, String, serde_json_lenient::Value)> {
+    use serde_json_lenient::Value;
+    let exclude = |value: &Value| Some((path.to_owned(), value.to_string(), constraint.clone()));
+    match (constraint, value) {
+        (Value::Object(c), Value::Object(v)) => c.iter().find_map(|(k, cv)| {
+            v.get(k)
+                .and_then(|vv| first_excluded(&format!("{path}.{k}"), cv, vv))
+        }),
+        (Value::Object(_), _) => exclude(value),
+        (_, Value::Array(items)) => items
+            .iter()
+            .find(|item| !admitted(constraint).contains(item))
+            .and_then(exclude),
+        _ if admitted(constraint).contains(value) => None,
+        _ => exclude(value),
+    }
+}
+
+/// Checks a create's spec against the constraints of its type's built-in
+/// root (BOX-160), at admission. A flat setting is checked at its flat
+/// key and under each section that carries it. The check reads the spec
+/// and never changes it.
+///
+/// A spec with no `box.type` is of `verb_type`, the type the creating
+/// verb files the box under. The daemon files the record under
+/// `verb_type` whatever `box.type` says, so the spec is also checked
+/// against the constraints of `verb_type`. A spec cannot pass as one type
+/// and be filed as another that excludes its values.
+///
+/// # Errors
+///
+/// [`AdmissionRootRefusal::UnknownRoot`] when the spec names a type with
+/// no built-in root, and [`AdmissionRootRefusal::Constraint`] for the
+/// first value a constraint excludes, naming the type, its root and the key.
+fn root_constraint_refusal(
+    spec: &serde_json_lenient::Value,
+    verb_type: &str,
+) -> Result<(), AdmissionRootRefusal> {
+    let (box_type, root) =
+        spec_type_root(spec, verb_type).map_err(AdmissionRootRefusal::UnknownRoot)?;
+    builtin_root_refusal(spec, box_type, root)?;
+    match mfile::box_types::builtin(verb_type) {
+        Some(verb_root) if verb_root != root => {
+            builtin_root_refusal(spec, verb_root.to_owned(), verb_root)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The admission check of BOX-160 for a start from a box's stored spec
+/// (BOX-025, BOX-176): `spec`, the stored spec as its caller parsed it,
+/// goes through [`root_constraint_refusal`], the check a create of the
+/// same spec meets, with the record's type in the place of the creating
+/// verb's. A start is refused wherever a create of that spec would be.
+///
+/// # Errors
+///
+/// Why the stored spec breaks its type's built-in root, worded for a start
+/// from it rather than a create. A create refuses it with exit 3, and so
+/// does the start.
+pub(crate) fn stored_spec_root_refusal(
+    spec: &serde_json_lenient::Value,
+    record_type: &str,
+) -> Result<(), std::io::Error> {
+    let why = match root_constraint_refusal(spec, record_type) {
+        Ok(()) => return Ok(()),
+        Err(AdmissionRootRefusal::Constraint(refusal)) => format!(
+            "The settings it was created with set `{key}` to `{value}`, and a {kind} \
+             allows {allowed} for `{key}`.",
+            key = refusal.key,
+            value = refusal.value,
+            kind = refusal.kind(),
+            allowed = refusal.allowed,
+        ),
+        Err(AdmissionRootRefusal::UnknownRoot(UnknownRootRefusal {
+            key,
+            value,
+            builtin_type: Some(builtin_type),
+        })) => format!(
+            "The settings it was created with set `box.type` to `{builtin_type}` and \
+             `{key}` to `{value}`, and the built-in type `{builtin_type}` is its own root."
+        ),
+        Err(AdmissionRootRefusal::UnknownRoot(UnknownRootRefusal { key, value, .. })) => {
+            // As the create's refusal words it: a `type.root` that is not
+            // a built-in type, or a project type that does not name the
+            // built-in type it extends.
+            if key == "type.root" {
+                format!(
+                    "The settings it was created with set `type.root` to `{value}`, which is \
+                     not a built-in type."
+                )
+            } else {
+                format!(
+                    "The settings it was created with set `box.type` to `{value}`, but they \
+                     do not name the built-in type that `{value}` extends."
+                )
+            }
+        }
+    };
+    Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, why))
+}
+
+/// Checks `spec` against the constraints of the built-in `root`, for a
+/// box of type `box_type`.
+fn builtin_root_refusal(
+    spec: &serde_json_lenient::Value,
+    box_type: String,
+    root: &str,
+) -> Result<(), AdmissionRootRefusal> {
+    let constraints = serde_json_lenient::to_value(mfile::box_types::builtin_constraints(root))
+        .expect("a TOML table serializes as JSON");
+    let Some(constraints) = constraints.as_object() else {
+        return Ok(());
+    };
+    for (key, constraint) in constraints {
+        let mut places = vec![(key.clone(), spec.get(key))];
+        if !constraint.is_object() {
+            for section in FLAT_KEY_SECTIONS {
+                if let Some(nested) = spec.get(section).and_then(|s| s.get(key)) {
+                    places.push((format!("{section}.{key}"), Some(nested)));
+                }
+            }
+        }
+        for (path, value) in places {
+            let Some(value) = value else {
+                continue;
+            };
+            if let Some((key, value, constraint)) = first_excluded(&path, constraint, value) {
+                return Err(AdmissionRootRefusal::Constraint(RootConstraintRefusal {
+                    box_type,
+                    root: root.to_owned(),
+                    key,
+                    value,
+                    allowed: constraint_words(&constraint),
+                }));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The Box Spec sections that a spec can carry and that this daemon does
 /// not enforce (BOX-076): the top-level key, the key inside it when the
 /// section is one key of a table, and the section as the log names it.
-const UNENFORCED_SECTIONS: [(&str, Option<&str>, &str); 5] = [
+/// `[[file_exports]]` is not one: the command that waits for the box
+/// copies it on the client (BOX-185).
+const UNENFORCED_SECTIONS: [(&str, Option<&str>, &str); 4] = [
     ("file_imports", None, "[[file_imports]]"),
-    ("file_exports", None, "[[file_exports]]"),
     ("github_imports", None, "[[github_imports]]"),
     ("otel", None, "[otel]"),
     (
@@ -1278,6 +1876,14 @@ const UNENFORCED_SECTIONS: [(&str, Option<&str>, &str); 5] = [
         "[network] vpn_network_names",
     ),
 ];
+
+/// How many `lifecycle_hooks` the received spec carries, each with its
+/// `declared_by` (BOX-179). `None` for a spec with no hook list.
+fn stored_hook_count(spec: &serde_json_lenient::Value) -> Option<usize> {
+    spec.get("lifecycle_hooks")
+        .and_then(serde_json_lenient::Value::as_array)
+        .map(Vec::len)
+}
 
 /// The sections of `spec` that the daemon carries in the stored spec but
 /// does not enforce, in the order of [`UNENFORCED_SECTIONS`], each once.
@@ -1296,6 +1902,122 @@ fn unenforced_sections(spec: &serde_json_lenient::Value) -> Vec<&'static str> {
         .collect()
 }
 
+/// The identity every box on this daemon runs under, as the create span
+/// records it (BOX-140). No host this daemon runs on has an identity
+/// plane, so the mode is always `none`.
+pub(crate) const IDENTITY_MODE_NONE: &str = "none";
+
+/// The names of the `[secrets]` entries of `spec` that set
+/// `source = "broker"`, in name order.
+fn brokered_secrets(spec: &serde_json_lenient::Value) -> Vec<String> {
+    let Some(secrets) = spec.get("secrets").and_then(|s| s.as_object()) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = secrets
+        .iter()
+        .filter(|(_, entry)| entry.get("source").and_then(|s| s.as_str()) == Some("broker"))
+        .map(|(name, _)| name.clone())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Whether the `[secrets]` entry `entry` asks for a `github:` scope, the
+/// same test as [`boxes::core::bep::SecretGrant::is_github`].
+fn is_github_grant(entry: &serde_json_lenient::Value) -> bool {
+    entry
+        .get("scopes")
+        .and_then(|s| s.as_array())
+        .is_some_and(|scopes| {
+            scopes
+                .iter()
+                .filter_map(|scope| scope.as_str())
+                .any(|scope| scope.starts_with("github:"))
+        })
+}
+
+/// The names of the brokered secrets of `spec` that a create refuses
+/// while no identity plane is configured (BOX-081), in name order. With no
+/// node-local proxy, every brokered secret is refused. A node-local proxy
+/// serves only a GitHub grant, so with a proxy the brokered secrets with
+/// no `github:` scope are refused. A `source = "store"` secret is never
+/// refused here (BOX-141).
+fn refused_broker_grants(spec: &serde_json_lenient::Value, proxy_serves: bool) -> Vec<String> {
+    let mut names = brokered_secrets(spec);
+    if proxy_serves {
+        let secrets = spec.get("secrets").and_then(|s| s.as_object());
+        names.retain(|name| {
+            !secrets
+                .and_then(|secrets| secrets.get(name))
+                .is_some_and(is_github_grant)
+        });
+    }
+    names
+}
+
+/// The refusal of a create whose spec carries a brokered secret that
+/// nothing on this host can serve (BOX-081), with the names of the refused
+/// secrets. `proxy_serves` says whether the request carries one
+/// well-formed root certificate ([`proxy_root_certificate`]). A client sets
+/// it only from an identity that a node-local proxy published.
+fn unenrolled_broker_refusal(
+    spec: &serde_json_lenient::Value,
+    proxy_serves: bool,
+) -> Option<(boxes::core::bep::ActivationRefused, Vec<String>)> {
+    let grants = refused_broker_grants(spec, proxy_serves);
+    if grants.is_empty() {
+        return None;
+    }
+    // The refusal text calls a grant a "GitHub grant" unless this flag is
+    // set, and then it says "secret". A grant with no `github:` scope is
+    // not a GitHub grant, so the text must say "secret" for it.
+    let secrets = spec.get("secrets").and_then(|s| s.as_object());
+    let not_github = grants.iter().any(|name| {
+        !secrets
+            .and_then(|secrets| secrets.get(name))
+            .is_some_and(is_github_grant)
+    });
+    Some((
+        boxes::core::bep::unenrolled_node(
+            grants.clone(),
+            not_github,
+            // When `proxy_serves` is true, this cause's text is wrong: a
+            // proxy is present and serves only GitHub grants. The cause
+            // for that case lives in `crates/boxes` (#3277).
+            boxes::core::bep::ProxyAbsence::NotServed,
+            // A spec comes from any entry, and not with the minimal.toml
+            // table that set its `secrets`, so the refusal names none.
+            None,
+        ),
+        grants,
+    ))
+}
+
+/// Whether `certificate` counts as the node-local proxy's root
+/// certificate for the BOX-081 gate. This daemon has no fact of its own
+/// about the proxy: on a microVM host the proxy runs beside the host
+/// daemon, outside this guest. So the gate takes the certificate the
+/// caller read from the proxy's published identity, and it accepts only
+/// one well-formed certificate block. An empty or malformed value counts
+/// as no certificate, and the brokered secret is refused.
+///
+/// The daemon cannot compare the value with a proxy root it knows, so the
+/// check is advisory: it trusts the caller. A caller that sends a made-up
+/// certificate passes it. Even then, only a GitHub grant passes, because
+/// a node-local proxy serves no other brokered secret.
+fn proxy_root_certificate(certificate: Option<&str>) -> bool {
+    certificate.is_some_and(crate::env::is_one_certificate)
+}
+
+/// The un-enrolled refusal an error from a create carries, if any.
+pub(crate) fn unenrolled_refusal(
+    error: &std::io::Error,
+) -> Option<&boxes::core::bep::ActivationRefused> {
+    error
+        .get_ref()?
+        .downcast_ref::<boxes::core::bep::ActivationRefused>()
+}
+
 enum ManagerMessage {
     List(Responder<Vec<BoxInfo>>),
     /// Every retained record, in any state (BOX-158). Read-only against
@@ -1303,7 +2025,7 @@ enum ManagerMessage {
     Records(Responder<Vec<boxes::Record>>),
     /// [`Self::Records`], each record with whether its box has a terminal
     /// ([`record_has_pty`]), for the listing and the read (BCLI-068).
-    Listing(Responder<Vec<(boxes::Record, bool)>>),
+    Listing(Responder<Vec<(boxes::Record, ListedTraits)>>),
     GetRecord(BoxKeyPredicate, Responder<Option<boxes::Record>>),
     /// The retained box an events read follows (BOX-162): its on-disk
     /// object, so the read runs off the mainloop. `None` for an id no
@@ -2893,6 +3615,62 @@ impl BoxManagerHandle {
         Some(answer)
     }
 
+    /// Restarts the box `id` (BOX-176), with the daemon's grace period
+    /// between SIGTERM and SIGKILL when the box runs. Answers whether the
+    /// box was running.
+    ///
+    /// # Errors
+    ///
+    /// [`RestartError::Refused`] when a check refused the restart and left
+    /// the box as it was. [`RestartError::Failed`] with `NotFound` for an id
+    /// no record names, `ConnectionRefused` while the daemon shuts down, or
+    /// the error the start ended on, which leaves the box `stopped`.
+    pub(crate) async fn restart_box(&self, id: SessionId) -> Result<bool, RestartError> {
+        self.restart_box_with_grace(id, crate::box_actor::STOP_GRACE)
+            .await
+    }
+
+    /// [`Self::restart_box`] with the grace period `grace`. The restart
+    /// resolves the box and hands it to the box's actor, which runs the
+    /// checks, the stop and the start in its message loop.
+    pub(crate) async fn restart_box_with_grace(
+        &self,
+        id: SessionId,
+        grace: std::time::Duration,
+    ) -> Result<bool, RestartError> {
+        if self.in_shutdown.is_cancelled() {
+            return Err(RestartError::Failed(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                minimald_rpc::SHUTDOWN_REFUSAL,
+            )));
+        }
+        let unknown = || {
+            RestartError::Failed(std::io::Error::new(
+                NotFound,
+                format!(
+                    "{} `{}`",
+                    minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                    id.as_ref()
+                ),
+            ))
+        };
+        let record = self
+            .get_record(BoxKeyPredicate::Id(id))
+            .await
+            .map_err(RestartError::Failed)?
+            .ok_or_else(unknown)?;
+        // The user the box's processes run as, as a host launched with no
+        // client takes it.
+        let username = record.username.clone().unwrap_or_else(|| "user".into());
+        tracing::info!(session_id = %id, "restart: dispatching to the session");
+        let session = self
+            .get_session(BoxKeyPredicate::Id(id))
+            .await
+            .map_err(RestartError::Failed)?
+            .ok_or_else(unknown)?;
+        session.restart_box(username, grace).await
+    }
+
     /// The state and directories of the box `id` when the box is stopped
     /// or exited, read from the store with no actor started (BOX-017).
     /// Answers `None` for an id no record names, for a box being torn
@@ -3623,7 +4401,17 @@ impl BoxManager {
             spec_bytes = tracing::field::Empty,
             name_given = tracing::field::Empty,
             name = tracing::field::Empty,
+            // BOX-140: the identity the box runs under.
+            identity = IDENTITY_MODE_NONE,
             fresh,
+            // BOX-160: the admission refusal, when the create is refused.
+            refusal = tracing::field::Empty,
+            // BOX-071: the client's and the daemon's projection digests.
+            client_projection_digest = tracing::field::Empty,
+            daemon_projection_digest = tracing::field::Empty,
+            // BOX-073: the host is not enrolled, so no policy is evaluated
+            // against the projection.
+            policy = PROJECTION_POLICY_NONE,
         )
     )]
     async fn create_session(
@@ -3727,6 +4515,141 @@ impl BoxManager {
         // BOX-076: the sections the daemon carries but does not enforce,
         // read before the spec becomes its stored bytes.
         let unenforced = spec.as_ref().map(unenforced_sections).unwrap_or_default();
+        // BOX-068, BOX-179: the hooks the stored spec keeps, each with its
+        // declarer, counted for the log line that stores the spec.
+        let stored_hooks = spec.as_ref().and_then(stored_hook_count);
+        // BOX-081: no identity plane is configured on this host, so a
+        // brokered secret is refused unless a node-local proxy serves the
+        // box and the secret is a GitHub grant. The refusal comes before the record exists, so it leaves no
+        // record, id or name behind. A certificate that is not one
+        // well-formed block does not count as the proxy's.
+        let proxy_serves = proxy_root_certificate(config.root_certificate.as_deref());
+        if config.root_certificate.is_some() && !proxy_serves {
+            tracing::info!(
+                session_name = config
+                    .name
+                    .as_deref()
+                    .unwrap_or(crate::rpc::ANONYMOUS_SESSION),
+                "the create carries a root certificate that is not one well-formed \
+                 certificate block, so no node-local proxy counts as serving the box"
+            );
+        }
+        if let Some((refusal, grants)) = spec
+            .as_ref()
+            .and_then(|spec| unenrolled_broker_refusal(spec, proxy_serves))
+        {
+            tracing::info!(
+                session_name = config.name.as_deref().unwrap_or(crate::rpc::ANONYMOUS_SESSION),
+                identity = IDENTITY_MODE_NONE,
+                secrets = ?grants,
+                code = boxes::core::bep::GATEHOUSE_UNENROLLED_NODE,
+                exit_code = refusal.exit_code(),
+                proxy_serves,
+                "refused a create: the spec carries a brokered secret that nothing on this \
+                 host serves, and no identity plane is configured"
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                refusal,
+            ));
+        }
+        // BOX-160: the daemon re-checks the spec against its root's
+        // constraints at admission, whatever the client checked. The
+        // refusal comes before the record exists, so it leaves nothing.
+        // A spec with no `box.type` is checked as the type the creating
+        // verb files the box under, so leaving the type out skips nothing.
+        let verb_type = match config.creating_verb {
+            minimald_rpc::CreatingVerb::Session => boxes::SESSION_BOX_TYPE,
+            minimald_rpc::CreatingVerb::Task => boxes::TASK_BOX_TYPE,
+        };
+        let session_name = config
+            .name
+            .as_deref()
+            .unwrap_or(crate::rpc::ANONYMOUS_SESSION);
+        match spec
+            .as_ref()
+            .map(|spec| root_constraint_refusal(spec, verb_type))
+        {
+            Some(Err(AdmissionRootRefusal::Constraint(refusal))) => {
+                span.record("refusal", tracing::field::display(&refusal));
+                tracing::info!(
+                    session_name,
+                    box_type = %refusal.box_type,
+                    root = %refusal.root,
+                    key = %refusal.key,
+                    value = %refusal.value,
+                    exit_code = refusal.exit_code(),
+                    "refused a create: the box spec carries a value its type's built-in root excludes"
+                );
+                // The reply carries the refusal's text but not its code,
+                // so `min` exits 1 and not 3 (#3313).
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    refusal,
+                ));
+            }
+            Some(Err(AdmissionRootRefusal::UnknownRoot(refusal))) => {
+                span.record("refusal", tracing::field::display(&refusal));
+                tracing::info!(
+                    session_name,
+                    key = refusal.key,
+                    value = %refusal.value,
+                    exit_code = refusal.exit_code(),
+                    builtin_type = refusal.builtin_type,
+                    "refused a create: the box spec does not name its type's built-in root"
+                );
+                // The reply carries the refusal's text but not its code,
+                // so `min` exits 1 and not 3 (#3313).
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    refusal,
+                ));
+            }
+            Some(Ok(())) | None => {}
+        }
+        // BOX-071: the daemon recomputes the projection digest from the
+        // spec it received, and the record stores it beside the client's.
+        // The daemon's key is its own: a client that sends it has it
+        // dropped.
+        config
+            .attrs
+            .remove(minimald_rpc::DAEMON_PROJECTION_DIGEST_ATTR);
+        let digests = projection_digests(&config, spec.as_ref(), verb_type);
+        // A client value that is not a digest in form is not stored. A
+        // client digest is stored only beside a daemon digest: with no
+        // spec, or a spec the daemon cannot project, the record has
+        // nothing to compare it with. The log still names it.
+        if !matches!(digests.client, ClientDigest::Digest(_)) || digests.daemon.is_none() {
+            config
+                .attrs
+                .remove(minimald_rpc::CLIENT_PROJECTION_DIGEST_ATTR);
+        }
+        if let Some(daemon) = &digests.daemon {
+            config.attrs.insert(
+                minimald_rpc::DAEMON_PROJECTION_DIGEST_ATTR.to_owned(),
+                daemon.clone(),
+            );
+        }
+        digests.record(&span, session_name);
+        // BOX-072: a client that projected the spec to another digest
+        // read it otherwise. The refusal comes before the record exists,
+        // so it leaves no record, id or name behind.
+        if digests.mismatch(spec.is_some()) {
+            let refusal = ProjectionDigestRefusal;
+            span.record("refusal", "projection digest mismatch");
+            tracing::info!(
+                session_name,
+                client_projection_digest = digests.client_word(),
+                daemon_projection_digest = digests.daemon.as_deref().unwrap_or("none"),
+                "refused a create: the client's projection digest differs from the daemon's"
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                refusal,
+            ));
+        }
+        // BOX-073: this host is not enrolled, so the create evaluates no
+        // policy against the projection. The span's `policy` field says so.
         // BOX-068: the spec is checked before the record exists, so a
         // refused spec leaves no record, id or name behind.
         let spec = match spec.as_ref().map(spec_bytes).transpose() {
@@ -3919,6 +4842,7 @@ impl BoxManager {
                         session_id = %session_id,
                         spec_bytes = bytes.len(),
                         spec_path = %path.as_str(),
+                        lifecycle_hooks = ?stored_hooks,
                         "stored the box spec"
                     );
                     // BOX-076: one warning for each unenforced section.
@@ -4149,8 +5073,11 @@ impl BoxManager {
                                 None
                             }
                         };
-                        let pty = record_has_pty(&record, stored.as_deref());
-                        records.push((record, pty));
+                        let traits = ListedTraits {
+                            pty: record_has_pty(&record, stored.as_deref()),
+                            lifetime: stored_spec_lifetime(stored.as_deref()),
+                        };
+                        records.push((record, traits));
                     }
                     Ok::<_, BoxManagerError>(records)
                 })
@@ -5242,6 +6169,431 @@ pub(crate) fn write_box_event(
     Ok(event)
 }
 
+/// The keys of the `data` object of a `file_exported` event (BOX-195).
+pub mod export_data {
+    /// The export's path, as the spec declares it.
+    pub const PATH: &str = "path";
+    /// Whether every file and folder of the export was written.
+    pub const COPIED: &str = "copied";
+    /// Each file the command wrote, with its `path`, `size` and `sha256`.
+    pub const FILES: &str = "files";
+    /// The end the export was claimed for: the count of `exited` events
+    /// on the record when the claim was granted.
+    pub const END: &str = "end";
+}
+
+/// Where one export of one end of a box stands (BOX-198): one line of the
+/// box's export claims file, written when the daemon grants the export.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ExportClaimEntry {
+    /// The record id of the box.
+    #[serde(rename = "box")]
+    pub box_id: SessionId,
+    /// The end the export was granted for.
+    pub end: u64,
+    /// The export's path, as the spec declares it.
+    pub path: String,
+    /// The id, on this daemon run, of the connection that holds the claim.
+    pub connection: u64,
+    /// The id of the daemon run that granted the claim.
+    pub boot: String,
+}
+
+/// The name of the file beside a box's events that holds its export claims
+/// (BOX-198). It is part of the box's record, so it goes with the box.
+pub(crate) const EXPORT_CLAIMS_FILE: &str = "export_claims.jsonl";
+
+/// The id of this daemon run. A claim that an earlier run granted holds
+/// nothing, because its connection ended with that run (BOX-202).
+static BOOT_ID: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| uuid::Uuid::now_v7().to_string());
+
+/// The connections of this daemon run that claimed exports, each with its
+/// id and its liveness. This is only a cache of liveness: the claims are
+/// on the box's record. A connection that ended leaves the cache, and its
+/// id is never given again, so its claims hold nothing (BOX-202).
+#[derive(Debug, Default)]
+pub(crate) struct ExportHolders {
+    /// The id the next new connection gets.
+    next: u64,
+    /// Each live connection's id and liveness.
+    live: Vec<(u64, std::sync::Weak<()>)>,
+}
+
+impl ExportHolders {
+    /// Drops each connection that ended.
+    fn prune(&mut self) {
+        self.live.retain(|(_, live)| live.strong_count() > 0);
+    }
+
+    /// The id of the connection whose liveness is `holder`, if it claimed
+    /// before and is live.
+    fn find(&self, holder: &std::sync::Weak<()>) -> Option<u64> {
+        self.live
+            .iter()
+            .find(|(_, live)| std::sync::Weak::ptr_eq(live, holder) && live.strong_count() > 0)
+            .map(|(id, _)| *id)
+    }
+
+    /// The id of the connection whose liveness is `holder`. A connection
+    /// seen for the first time gets a new id.
+    fn id_of(&mut self, holder: &std::sync::Weak<()>) -> u64 {
+        if let Some(id) = self.find(holder) {
+            return id;
+        }
+        self.next += 1;
+        self.live.push((self.next, holder.clone()));
+        self.next
+    }
+
+    /// Whether `entry` still holds its export: its daemon run is this one
+    /// and its connection is live.
+    fn holds(&self, entry: &ExportClaimEntry) -> bool {
+        entry.boot == *BOOT_ID
+            && self
+                .live
+                .iter()
+                .any(|(id, live)| *id == entry.connection && live.strong_count() > 0)
+    }
+}
+
+/// The cache of live claiming connections. Its lock is also held from the
+/// read of a box's claims and events to the write of a grant or a report,
+/// so two commands never both hold one export of an end.
+static EXPORT_CLAIMS: std::sync::LazyLock<std::sync::Mutex<ExportHolders>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Locks [`EXPORT_CLAIMS`]. A panic while the lock was held leaves the
+/// cache whole, so a poisoned lock is still used.
+pub(crate) fn export_claims() -> std::sync::MutexGuard<'static, ExportHolders> {
+    EXPORT_CLAIMS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The path of the export claims file of the box whose events are at
+/// `object`.
+fn export_claims_path(object: &boxes::store::DiskBox) -> camino::Utf8PathBuf {
+    object
+        .events_path()
+        .as_utf8_path()
+        .with_file_name(EXPORT_CLAIMS_FILE)
+}
+
+/// Every claim entry on the record of the box at `object`. A line that does
+/// not parse, torn by a crash, is skipped: the run that wrote it is over,
+/// so it holds nothing.
+fn read_export_claims(
+    object: &boxes::store::DiskBox,
+) -> Result<Vec<ExportClaimEntry>, std::io::Error> {
+    let path = export_claims_path(object);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    Ok(text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| match serde_json_lenient::from_str(line) {
+            Ok(entry) => Some(entry),
+            Err(error) => {
+                tracing::warn!(
+                    claims_path = %path,
+                    %error,
+                    "skipped an export claim line that does not parse"
+                );
+                None
+            }
+        })
+        .collect())
+}
+
+/// Appends `entries` to the export claims file of the box at `object`, and
+/// syncs it before this returns (BOX-198). The box's directory is never
+/// created here.
+fn append_export_claims(
+    object: &boxes::store::DiskBox,
+    entries: &[ExportClaimEntry],
+) -> Result<(), std::io::Error> {
+    use std::io::Write as _;
+
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let mut bytes = Vec::new();
+    for entry in entries {
+        serde_json_lenient::to_writer(&mut bytes, entry)?;
+        bytes.push(b'\n');
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(export_claims_path(object))?;
+    file.write_all(&bytes)?;
+    file.sync_data()
+}
+
+/// The paths of the exports of end `end` that a `file_exported` event in
+/// `events` reports.
+fn reported_exports(events: &[BoxEvent], end: u64) -> std::collections::HashSet<&str> {
+    events
+        .iter()
+        .filter(|event| {
+            event.kind == BoxEventType::FileExported
+                && event
+                    .data
+                    .get(export_data::END)
+                    .and_then(serde_json_lenient::Value::as_u64)
+                    == Some(end)
+        })
+        .filter_map(|event| {
+            event
+                .data
+                .get(export_data::PATH)
+                .and_then(serde_json_lenient::Value::as_str)
+        })
+        .collect()
+}
+
+impl BoxManagerHandle {
+    /// The record of the ended box `id`, its events reader, and its last
+    /// end: the count of its `exited` events.
+    async fn ended_box_events(
+        &self,
+        id: SessionId,
+    ) -> Result<(boxes::Record, BoxEventsReader, Vec<BoxEvent>, u64), BoxManagerError> {
+        let Some(record) = self.retained_record(id).await? else {
+            return Err(unknown_box(id));
+        };
+        let mut reader = self.box_events(record.id).await?;
+        let events = reader.read_new()?;
+        let end = events
+            .iter()
+            .filter(|event| event.kind == BoxEventType::Exited)
+            .count() as u64;
+        Ok((record, reader, events, end))
+    }
+
+    /// Claims the exports `paths` of the last end of box `id` for the
+    /// connection whose liveness is `holder` (BOX-198). Each path that no
+    /// live connection holds and no command reported for that end is
+    /// granted, and the rest are refused. The grant is recorded before
+    /// this returns, so two callers never both hold one export of an end.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` for an id no record names, `InvalidInput` for a box that
+    /// is running or has never ended, or an I/O error if its events cannot
+    /// be read.
+    pub async fn claim_exports(
+        &self,
+        id: SessionId,
+        paths: &[String],
+        holder: &std::sync::Weak<()>,
+    ) -> Result<minimald_rpc::ClaimExportsResponse, BoxManagerError> {
+        let (record, mut reader, mut events, end) = self.ended_box_events(id).await?;
+        let ended = matches!(
+            record.status,
+            boxes::BoxState::Stopped | boxes::BoxState::Exited
+        );
+        if !ended || end == 0 {
+            tracing::info!(
+                session_id = %record.id,
+                status = ?record.status,
+                end,
+                "export claim: the box has not ended; nothing is granted"
+            );
+            // The client puts this reason after "because". A box with an
+            // end that runs now was resumed. Any other box has no end.
+            let reason = if end > 0 {
+                "the box is running again, so its files can change"
+            } else {
+                "the box has not ended"
+            };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                reason,
+            ));
+        }
+        let mut granted = Vec::new();
+        let mut refused = Vec::new();
+        // The lock is held from the last read of the claims and the events
+        // to the write of the grant, so two callers never both hold one
+        // export of an end.
+        let mut holders = export_claims();
+        holders.prune();
+        events.extend(reader.read_new()?);
+        let reported = reported_exports(&events, end);
+        // An entry holds its export while its connection is live on this
+        // daemon run (BOX-202) and no report for the export is written.
+        let held: std::collections::HashSet<String> = read_export_claims(&reader.object)?
+            .into_iter()
+            .filter(|entry| entry.box_id == record.id && entry.end == end && holders.holds(entry))
+            .map(|entry| entry.path)
+            .collect();
+        for path in paths {
+            if granted.contains(path) || refused.contains(path) {
+                continue;
+            }
+            if reported.contains(path.as_str()) || held.contains(path) {
+                refused.push(path.clone());
+            } else {
+                granted.push(path.clone());
+            }
+        }
+        let connection = holders.id_of(holder);
+        let entries: Vec<ExportClaimEntry> = granted
+            .iter()
+            .map(|path| ExportClaimEntry {
+                box_id: record.id,
+                end,
+                path: path.clone(),
+                connection,
+                boot: BOOT_ID.clone(),
+            })
+            .collect();
+        // The grant is on the record before the command hears of it.
+        if let Err(error) = append_export_claims(&reader.object, &entries) {
+            tracing::warn!(
+                session_id = %record.id,
+                end,
+                %error,
+                "export claim: the claim was not written to the box's record; nothing is granted"
+            );
+            return Err(error);
+        }
+        drop(holders);
+        tracing::info!(
+            session_id = %record.id,
+            end,
+            connection,
+            granted = ?granted,
+            refused = ?refused,
+            "export claim"
+        );
+        Ok(minimald_rpc::ClaimExportsResponse {
+            end,
+            granted,
+            refused,
+        })
+    }
+
+    /// Appends the `file_exported` event of one export that the connection
+    /// whose liveness is `holder` claimed (BOX-195). The event keeps the
+    /// export refused for the end, so no later command copies it again. A
+    /// report that is not written leaves the claim held, so the end of the
+    /// connection releases it (BOX-200, BOX-202).
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` for an id no record names, `PermissionDenied` when
+    /// `holder` does not hold the export for that end, or the I/O error of
+    /// the read of the claims or of the append.
+    pub async fn report_export(
+        &self,
+        report: &minimald_rpc::ReportExportRequest,
+        holder: &std::sync::Weak<()>,
+    ) -> Result<BoxEvent, BoxManagerError> {
+        let Some(record) = self.retained_record(report.id).await? else {
+            return Err(unknown_box(report.id));
+        };
+        let mut reader = self.box_events(record.id).await?;
+        // The lock is held from the check of the claim to the write of the
+        // event, so one claim is reported once.
+        let holders = export_claims();
+        let events = reader.read_new()?;
+        let connection = holders.find(holder);
+        // A claims file that cannot be read is an I/O error, not a refusal:
+        // the claim can still be held.
+        let holds = match connection {
+            Some(connection)
+                if !reported_exports(&events, report.end).contains(report.path.as_str()) =>
+            {
+                read_export_claims(&reader.object)
+                    .inspect_err(|error| {
+                        tracing::warn!(
+                            session_id = %record.id,
+                            export = %report.path,
+                            %error,
+                            "export report: the export claims could not be read"
+                        );
+                    })?
+                    .iter()
+                    .any(|entry| {
+                        entry.box_id == record.id
+                            && entry.end == report.end
+                            && entry.path == report.path
+                            && entry.connection == connection
+                            && holders.holds(entry)
+                    })
+            }
+            _ => false,
+        };
+        if !holds {
+            tracing::info!(
+                session_id = %record.id,
+                end = report.end,
+                export = %report.path,
+                connection = ?connection,
+                "export report refused: this connection does not hold the export"
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "this command does not hold the export `{}` of the box",
+                    report.path
+                ),
+            ));
+        }
+        let files: Vec<serde_json_lenient::Value> = report
+            .files
+            .iter()
+            .map(|file| {
+                serde_json_lenient::json!({
+                    "path": file.path,
+                    "size": file.size,
+                    "sha256": file.sha256,
+                })
+            })
+            .collect();
+        let mut data = EventData::new();
+        data.insert(export_data::PATH.into(), report.path.clone().into());
+        data.insert(export_data::COPIED.into(), report.copied.into());
+        data.insert(export_data::FILES.into(), files.into());
+        data.insert(export_data::END.into(), report.end.into());
+        let written = write_box_event(&reader.object, BoxEventType::FileExported, data);
+        drop(holders);
+        written.inspect_err(|error| {
+            tracing::warn!(
+                session_id = %record.id,
+                export = %report.path,
+                %error,
+                "export report: the file_exported event was not written; the claim stays held"
+            );
+        })
+    }
+
+    /// Every export claim on the record of box `id` (BOX-198).
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` for an id no record names, or an I/O error if the claims
+    /// cannot be read.
+    #[cfg(test)]
+    pub(crate) async fn export_claim_entries(
+        &self,
+        id: SessionId,
+    ) -> Result<Vec<ExportClaimEntry>, BoxManagerError> {
+        let reader = self.box_events(id).await?;
+        read_export_claims(&reader.object)
+    }
+}
+
 /// A read of one box's events (BOX-162): every retained event in the order
 /// it was written, then, for a follower, each new one as it is written.
 #[derive(Debug)]
@@ -5657,6 +7009,39 @@ mod create_stamp_tests {
                 .is_none(),
             "a refused spec files no record"
         );
+    }
+
+    /// BCLI-022: `GetBoxSpec` answers with the spec stored beside the
+    /// box's record, as the creating client sent it. A box with no stored
+    /// spec answers with none, and an id no record names finds no box.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_box_spec_returns_stored_spec() {
+        let (_state, _cache, mngr) = manager().await;
+        let spec = serde_json_lenient::json!({
+            "v": 0,
+            "entry": "default",
+            "box": {"type": "session", "lifetime": "until_complete"},
+            "install": {"packages": ["git"]},
+            "network": {"mode": "own_ip"},
+        });
+        let id = mngr
+            .create_box_with_spec(
+                config("specced", "/home/dev/proj"),
+                Some(spec.clone()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(mngr.get_box_spec(id).await.unwrap(), Some(Some(spec)));
+
+        let id = mngr
+            .create_box_with_spec(config("no-spec", "/home/dev/proj"), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(mngr.get_box_spec(id).await.unwrap(), Some(None));
+
+        assert_eq!(mngr.get_box_spec(SessionId::mint()).await.unwrap(), None);
     }
 
     async fn record(mngr: &BoxManagerHandle, id: SessionId) -> boxes::Record {

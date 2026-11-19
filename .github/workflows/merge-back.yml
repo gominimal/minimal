@@ -1,0 +1,119 @@
+name: merge-back
+
+# Merges a promoted release line into main with the `ours` strategy, so that
+# the release tag is reachable from main. A person starts this after a stable
+# promotion. docs/internal/release-pipeline.md describes the flow.
+#
+# This does nothing until a person sets the repository variable
+# MERGE_BACK_ENABLED to `true`. Leave it unset until Karl agrees the design, and
+# follow the manual merge in the release steps until then. The
+# minimal-release-ops App is already a bypass actor on the `main` ruleset, so the variable is the
+# only thing stopping the push.
+
+on:
+    workflow_dispatch:
+        inputs:
+            version:
+                description: "Promoted version, X.Y.Z"
+                required: true
+                type: string
+            reviewed:
+                description: "Line commits a person checked, space-separated: main has the fix, or does not need it"
+                required: false
+                type: string
+                default: ""
+
+permissions: {}
+
+concurrency:
+    group: merge-back
+    cancel-in-progress: false
+
+jobs:
+    merge-back:
+        # Only main's copy of this workflow and of merge-back.sh may push to
+        # main, so a dispatch from any other branch does nothing.
+        if: vars.MERGE_BACK_ENABLED == 'true' && github.ref == 'refs/heads/main'
+        # The minimal-release-ops key lives in the `release` environment, which
+        # only main and release/* can deploy to.
+        environment: release
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        permissions:
+            contents: read
+            issues: write
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  fetch-depth: 0
+                  persist-credentials: false
+
+            - name: Look for unported commits
+              id: check
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  REVIEWED: ${{ inputs.reviewed }}
+                  VERSION: ${{ inputs.version }}
+              run: |
+                  set -euo pipefail
+                  gh auth setup-git
+                  read -ra reviewed <<<"$REVIEWED"
+                  status=0
+                  scripts/merge-back.sh check "$VERSION" "${reviewed[@]}" >"$RUNNER_TEMP/unported.md" || status=$?
+                  cat "$RUNNER_TEMP/unported.md"
+                  case "$status" in
+                      0) ;;
+                      3) echo "unported=true" >>"$GITHUB_OUTPUT" ;;
+                      *) exit "$status" ;;
+                  esac
+
+            - name: Open an issue and stop
+              if: steps.check.outputs.unported == 'true'
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  REPO: ${{ github.repository }}
+                  TITLE: "Merge-back of v${{ inputs.version }} has unported commits"
+              run: |
+                  set -euo pipefail
+                  {
+                      echo "These line commits have no identical patch on \`main\`. The merge drops any change that only the line has, so it did not run."
+                      echo
+                      cat "$RUNNER_TEMP/unported.md"
+                      echo
+                      echo "Land each missing fix on \`main\`. Then run this workflow again, and list in \`reviewed\` each commit that \`main\` has in another form or does not need."
+                  } >"$RUNNER_TEMP/body.md"
+                  number="$(gh issue list --repo "$REPO" --state open --search "\"$TITLE\" in:title" \
+                      --json number,title --jq '.[] | select(.title == env.TITLE) | .number' | head -n 1)"
+                  if [ -n "$number" ]; then
+                      gh issue edit "$number" --repo "$REPO" --body-file "$RUNNER_TEMP/body.md"
+                  else
+                      gh issue create --repo "$REPO" --title "$TITLE" --body-file "$RUNNER_TEMP/body.md"
+                  fi
+                  exit 1
+
+            # A bypass applies to the App, so any token it mints with contents
+            # write can bypass the `main` ruleset. Minted only after the check.
+            - name: Mint token (minimal-release-ops)
+              id: app-token
+              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+              with:
+                  app-id: ${{ vars.MINIMAL_RELEASE_OPS_APP_ID }}
+                  private-key: ${{ secrets.MINIMAL_RELEASE_OPS_PRIVATE_KEY }}
+                  owner: gominimal
+                  repositories: minimal
+                  permission-contents: write
+
+            - name: Merge and push
+              env:
+                  GH_TOKEN: ${{ steps.app-token.outputs.token }}
+                  GIT_AUTHOR_NAME: minimal-release-ops[bot]
+                  GIT_AUTHOR_EMAIL: 354583747+minimal-release-ops[bot]@users.noreply.github.com
+                  GIT_COMMITTER_NAME: minimal-release-ops[bot]
+                  GIT_COMMITTER_EMAIL: 354583747+minimal-release-ops[bot]@users.noreply.github.com
+                  REVIEWED: ${{ inputs.reviewed }}
+                  VERSION: ${{ inputs.version }}
+              run: |
+                  set -euo pipefail
+                  gh auth setup-git
+                  read -ra reviewed <<<"$REVIEWED"
+                  scripts/merge-back.sh merge "$VERSION" "${reviewed[@]}"

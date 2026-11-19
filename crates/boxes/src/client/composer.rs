@@ -230,6 +230,7 @@ fn composition_to_wire(
         lifecycle_hooks: lifecycle_hooks.into_iter().map(Into::into).collect(),
         requested_packages: packages.into_iter().map(Into::into).collect(),
         orientation: orientation.into(),
+        entry: None,
     }
 }
 

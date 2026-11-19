@@ -6,6 +6,11 @@ use super::*;
 /// Actor messages to a [`Host`].
 pub(super) enum Message {
     Kill(bool),
+    /// A stop or a removal of the box is under way (BCLI-068). The host
+    /// records it and answers on the sender. The stop or removal then
+    /// signals the box's processes, and the host's teardown tells the
+    /// attached binding that the box ended, not that its process exited.
+    BoxEnding(BoxEnd, oneshot::Sender<()>),
     /// Rename the session: update the host's display name and republish the
     /// new `MINIMAL_SESSION_NAME` through the per-attach environment channel,
     /// so the already-running shell picks it up at its next prompt.
@@ -310,6 +315,35 @@ impl HostHandle {
             // kill did not land, and the caller must not block awaiting a loop
             // that will never observe it.
             Err(_e) => Err(()),
+        }
+    }
+
+    /// Tells the host that a stop or a removal of its box is under way, and
+    /// waits until the host has recorded it (BCLI-068). Called before the
+    /// stop or removal signals the box's processes, so the host already
+    /// knows the cause when it sees the process end. The attached binding
+    /// then ends with no shell-exit prompt.
+    ///
+    /// Best-effort and bounded: a dead or wedged host answers nothing, and
+    /// the stop or removal goes on without it.
+    pub(crate) async fn announce_end(&self, end: BoxEnd) {
+        let (reply, answered) = oneshot::channel();
+        let sent = self
+            .sender
+            .send_timeout(
+                Message::BoxEnding(end, reply),
+                crate::box_actor::HOST_PROBE_TIMEOUT,
+            )
+            .await;
+        let recorded = sent.is_ok()
+            && tokio::time::timeout(crate::box_actor::HOST_PROBE_TIMEOUT, answered)
+                .await
+                .is_ok_and(|answer| answer.is_ok());
+        if !recorded {
+            tracing::info!(
+                ?end,
+                "the host did not record the stop or removal; an attached client can see the shell-exit prompt"
+            );
         }
     }
 

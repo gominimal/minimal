@@ -264,5 +264,5 @@ mutation towards tokens that mean something to the parser.
 Shipped so far: `arg_schema_parse`, `graph_from_bytes`, `jq_parse_json`,
 `mfile_from_toml`.
 
-Related: `minimal run mutants` mutation-tests `graph`'s wire decoder in the
+Related: `minimal run metrics-mutants` mutation-tests `graph`'s wire decoder in the
 Linux sandbox; surviving mutants pinpoint untested encode/decode branches.

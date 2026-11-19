@@ -539,6 +539,20 @@ fn normalized(name: &str) -> String {
     lowered.strip_suffix('.').unwrap_or(&lowered).to_string()
 }
 
+/// Whether the `allow_dns_hosts` of a box that admits something lets it look
+/// up `host` (NET-141): the answer [`DnsGate::refuses`] gives the box's own
+/// query. A box that declared no names, or the empty list, is refused nothing.
+pub(crate) fn admits_name(policy: Option<&boxes::EgressPolicy>, host: &str) -> bool {
+    let Some(names) = policy
+        .and_then(|policy| policy.allow_dns_hosts.as_ref())
+        .filter(|names| !names.is_empty())
+    else {
+        return true;
+    };
+    let host = normalized(host);
+    names.iter().any(|name| normalized(name) == host) || super::dns::is_zone_name(&host)
+}
+
 /// The SOA record an NXDOMAIN for a name off the box's allow list cites
 /// (NET-141, NET-079): [`boxes::core::zone_answer::out_of_zone_soa`] on the
 /// wire. Its owner is the root, so it covers the asked name, and its 15 s
@@ -1274,7 +1288,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::net::switch::tests::{
         ACK, LEASE, RelayHarness, SYN, arp_frame, egress_tcp_frame, egress_tcp_segment,
-        read_framed, spawn_test_relay, spawn_test_relay_with,
+        read_framed, spawn_native_relay_with, spawn_test_relay, spawn_test_relay_with,
     };
     use crate::net::switch::udp_datagram;
     use crate::test_harness::captured_log;
@@ -1747,6 +1761,10 @@ pub(crate) mod tests {
             (
                 "production.cloudfront.docker.com.",
                 Ipv4Addr::new(18, 238, 238, 89),
+            ),
+            (
+                "docker-images-prod.s3.dualstack.us-east-1.amazonaws.com.",
+                Ipv4Addr::new(52, 216, 8, 147),
             ),
         ];
         // The names here pair each host with a representative address, so
@@ -2684,6 +2702,88 @@ pub(crate) mod tests {
             assert_eq!(
                 next, sentinel,
                 "{name} pinned nothing: its answer stays refused"
+            );
+        }
+    }
+
+    /// D3001: an own-address box on a native host, with the shape the
+    /// session e2e activates (`--allow-subnets 100.64.0.0/10
+    /// --allow-protocols tcp`), resolves a sibling's `<box>.min.internal`
+    /// name. A native daemon runs its own switch on a per-daemon /24 whose
+    /// third octet is never 0 (`server.rs`, `switch_subnet_for_octet`), so
+    /// the box, its sibling and its resolver all sit off the default
+    /// switch's `100.64.0.x`. The UDP query to that /24's gateway port 53
+    /// goes on to the switch unchanged, though the box declared TCP only.
+    /// The switch resolver's zone reply then reaches the box unchanged.
+    #[tokio::test]
+    async fn a_sibling_box_name_resolves_through_the_relay() {
+        let tcp_subnets = boxes::BoxPolicy {
+            egress: Some(boxes::EgressPolicy {
+                allow_protocols: Some(vec![boxes::IpProto::Tcp]),
+                allow_subnets: Some(vec!["100.64.0.0/10".to_string()]),
+                allow_dns_hosts: None,
+                deny_subnets: None,
+            }),
+            ingress: None,
+            credentialed_upstream: None,
+            quic443: None,
+        };
+        // The native attach's shape: a per-daemon /24 off the default
+        // switch's first /24, the box's own name on its gate, and the
+        // host-exposures table only a native relay reads.
+        let subnet = crate::net::SwitchSubnet::new(Ipv4Addr::new(100, 64, 37, 0), 24)
+            .expect("a /24 inside the switch /16");
+        let resolver = subnet.dns_server();
+        assert_eq!(resolver, Ipv4Addr::new(100, 64, 37, 1));
+        let lease = Ipv4Addr::new(100, 64, 37, 9);
+        let sibling = Ipv4Addr::new(100, 64, 37, 10);
+        let config = tempfile::tempdir().expect("a config dir");
+        let table = Arc::new(client_config::host_exposures::HostExposuresFile::new(
+            config.path().join("config.toml"),
+        ));
+        let mut harness =
+            spawn_native_relay_with(lease, "e2e-nnat-a", &tcp_subnets, subnet, |gate| {
+                gate.use_host_exposures(table);
+            });
+        for (port, name) in [
+            (40100, "e2e-nnat-b.min.internal."),
+            (40101, "e2e-nnat-b.local.min.internal."),
+        ] {
+            let query =
+                udp_payload_frame(lease, port, resolver, 53, &dns_query(name, RecordType::A));
+            harness.box_end.write_all(&query).unwrap();
+            let forwarded =
+                tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+                    .await
+                    .expect("the sibling's A query is forwarded to the switch resolver")
+                    .expect("the switch side stays open");
+            assert_eq!(
+                forwarded, query,
+                "{name}: the query reaches the switch unchanged"
+            );
+
+            let reply =
+                udp_payload_frame(resolver, 53, lease, port, &dns_response(name, &[sibling]));
+            harness.switch.write_all(&wire_frame(&reply)).await.unwrap();
+            let passed = read_box_frame(&harness)
+                .await
+                .expect("the resolver's zone reply reaches the box");
+            assert_eq!(passed, reply, "{name}: the reply reaches the box unchanged");
+            let (_, payload) = udp_datagram(&passed).expect("the reply is a UDP frame");
+            let message = Message::from_vec(payload).expect("the reply parses");
+            assert_eq!(message.metadata.response_code, ResponseCode::NoError);
+            let answered: Vec<Ipv4Addr> = message
+                .answers
+                .iter()
+                .filter_map(|record| match &record.data {
+                    RData::A(a) => Some(a.0),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                answered,
+                vec![sibling],
+                "{name}: the box reads the sibling's address"
             );
         }
     }
@@ -4235,6 +4335,23 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn admits_name_answers_as_the_gate_does() {
+        let policy = |hosts: Option<&[&str]>| boxes::EgressPolicy {
+            allow_subnets: Some(Vec::new()),
+            allow_dns_hosts: hosts.map(|hosts| hosts.iter().map(ToString::to_string).collect()),
+            allow_protocols: None,
+            deny_subnets: None,
+        };
+        let listed = policy(Some(&["storage.googleapis.com."]));
+        assert!(admits_name(Some(&listed), "Storage.GoogleApis.com"));
+        assert!(!admits_name(Some(&listed), "example.com"));
+        assert!(admits_name(Some(&listed), "web.min.internal"));
+        assert!(admits_name(None, "example.com"));
+        assert!(admits_name(Some(&policy(None)), "example.com"));
+        assert!(admits_name(Some(&policy(Some(&[]))), "example.com"));
     }
 
     /// Every refused name is logged, however many names a box asks for

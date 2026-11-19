@@ -54,6 +54,71 @@ pub enum Error {
     /// A `[tasks.<name>]` entry sets `interactive = true` (BOX-054). Carries
     /// the task name. Exits 3.
     InteractiveTask(String),
+    /// A task or `[defaults.task]` sets a non-empty `state_key` that is not
+    /// one directory name. Carries the table header, the value, and why
+    /// [`crate::File::validate_state_component`] refused it. Exits 3.
+    InvalidStateKey {
+        entry: String,
+        value: String,
+        reason: String,
+    },
+    /// A selected loadout sets `loadout_mode`, which only the layers up to
+    /// and including the entry can set (BOX-172). Carries the loadout's
+    /// name, when the caller knows it. Exits 3.
+    LoadoutSetsLoadoutMode {
+        loadout: Option<String>,
+    },
+    /// A `--loadout` flag names a loadout for a box whose `loadout_mode` is
+    /// `sealed` (BOX-173). Carries the named loadouts, the layer that set
+    /// the mode (`None` when no layer sets it), the entry's table header,
+    /// and the type whose constraint holds the mode, if one does. Exits 3.
+    NamedLoadoutOnSealedBox {
+        loadouts: Vec<String>,
+        layer: Option<String>,
+        entry: String,
+        held_by: Option<String>,
+    },
+    /// A Box Type constraint holds a key at a value other than the one the
+    /// layers set (BOX-061, BOX-181). Carries the key, the layer that set
+    /// the value, the value, the type as the message names it, and the
+    /// values the constraint admits. Exits 3.
+    ///
+    /// This check duplicates `check_constraints` and
+    /// `BoxTypeError::ConstraintBroken`. When #3292 merges, the two become
+    /// one check and this variant goes:
+    /// <https://github.com/gominimal/minimal/issues/3304>.
+    ConstraintViolated {
+        key: String,
+        layer: String,
+        found: String,
+        box_type: String,
+        admitted: Vec<String>,
+    },
+    /// The entry's Box Type does not resolve, or the entry cannot use it.
+    /// Exits 3.
+    BoxType(Box<crate::box_types::BoxTypeError>),
+    /// A selected loadout sets a variable to a resolved value other than
+    /// the one the layers up to and including the entry, or another
+    /// selected loadout, give it (BOX-183). Carries the variable and the
+    /// two sources, as the message names them. Exits 3.
+    LoadoutVarConflict {
+        name: String,
+        first: String,
+        second: String,
+    },
+    /// One layer sets a variable twice, to different values (BOX-184).
+    /// Carries the variable and the layer, as the message names it. Exits 3.
+    DuplicateVar {
+        name: String,
+        layer: String,
+    },
+    /// A `[[file_exports]]` path is absolute, has a `..` component, or
+    /// names the project root itself (BOX-189). Carries the path and the
+    /// layer that set it, as the message names it. Exits 3.
+    ExportOutsideProject {
+        path: String,
+        layer: String,
+    },
 }
 
 /// What is wrong with a key of an expanded box spec.
@@ -70,6 +135,16 @@ pub enum SpecKeyProblem {
         expected: &'static str,
         found: &'static str,
     },
+    /// The value is a string, but not one the key accepts. Carries the
+    /// value the layer wrote and the values the key accepts, in order.
+    UnknownValue {
+        found: String,
+        accepted: &'static [&'static str],
+    },
+    /// A project lifecycle hook sets `declared_by`, which only the
+    /// expansion writes (BOX-179). Carries the hook as the message names
+    /// it.
+    DeclarerSet { hook: String },
 }
 
 /// The naming rule that an entry name breaks.
@@ -110,6 +185,15 @@ impl fmt::Display for EntryHeader<'_> {
     }
 }
 
+/// `words` with its first letter in upper case, to open a sentence.
+fn sentence_start(words: &str) -> String {
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
 impl Error {
     /// The exit code a command ends with on this error, when the
     /// architecture's exit-code table fixes one. An invalid entry name is a
@@ -120,7 +204,15 @@ impl Error {
             Error::InvalidEntryName { .. }
             | Error::InvalidSpecKey { .. }
             | Error::LegacyTable { .. }
-            | Error::InteractiveTask(_) => Some(3),
+            | Error::InteractiveTask(_)
+            | Error::InvalidStateKey { .. }
+            | Error::LoadoutSetsLoadoutMode { .. }
+            | Error::NamedLoadoutOnSealedBox { .. }
+            | Error::ConstraintViolated { .. }
+            | Error::BoxType(_)
+            | Error::LoadoutVarConflict { .. }
+            | Error::DuplicateVar { .. }
+            | Error::ExportOutsideProject { .. } => Some(3),
             _ => None,
         }
     }
@@ -132,6 +224,8 @@ impl fmt::Display for Error {
             Error::IO(ctx, path, e) => {
                 write!(f, "{} I/O error at path {}: {}", ctx, path.display(), e)
             }
+            // `Display` carries the parse error and `source()` returns none,
+            // so `{}` and `{:#}` each print its snippet once.
             Error::Format(e) => write!(f, "invalid TOML: {}", e),
             Error::LinkConfig {
                 path, line, table, ..
@@ -242,6 +336,20 @@ impl fmt::Display for Error {
                     "{layer} sets `{key}` to {found}, but `{key}` takes \
                      {expected}. Fix the value."
                 ),
+                SpecKeyProblem::UnknownValue { found, accepted } => {
+                    let accepted: Vec<String> = accepted.iter().map(|a| format!("`{a}`")).collect();
+                    write!(
+                        f,
+                        "{layer} sets `{key}` to {found:?}. `{key}` accepts only \
+                         {}. Fix the value.",
+                        accepted.join(" or ")
+                    )
+                }
+                SpecKeyProblem::DeclarerSet { hook } => write!(
+                    f,
+                    "{layer} sets `{key}` in {hook}. A project cannot set \
+                     the declarer of its own hook. Remove `{key}` from that hook."
+                ),
             },
             Error::LegacyTable { path, legacy } => {
                 match path {
@@ -261,6 +369,106 @@ impl fmt::Display for Error {
                 EntryHeader("tasks", name),
                 EntryHeader("sessions", name)
             ),
+            Error::InvalidStateKey {
+                entry,
+                value,
+                reason,
+            } => write!(
+                f,
+                "`{entry}` in minimal.toml sets `state_key` to {value:?}, and {reason}. A \
+                 state key is one directory name, such as \"dev\": not `.` or `..`, and with \
+                 no `/` or NUL byte."
+            ),
+            Error::LoadoutSetsLoadoutMode { loadout } => {
+                let (which, that) = match loadout {
+                    Some(name) => (format!("loadout `{name}`"), format!("loadout `{name}`")),
+                    None => ("a selected loadout".to_owned(), "that loadout".to_owned()),
+                };
+                write!(
+                    f,
+                    "{which} sets `loadout_mode`, but a loadout cannot set \
+                     `loadout_mode`. Remove `loadout_mode` from {that}."
+                )
+            }
+            Error::NamedLoadoutOnSealedBox {
+                loadouts,
+                layer,
+                entry,
+                held_by,
+            } => {
+                let names: Vec<String> = loadouts.iter().map(|l| format!("`{l}`")).collect();
+                let noun = if names.len() == 1 {
+                    "loadout"
+                } else {
+                    "loadouts"
+                };
+                write!(
+                    f,
+                    "`--loadout` names {noun} {}, but this box takes no loadout. ",
+                    names.join(", ")
+                )?;
+                match layer {
+                    Some(layer) => write!(
+                        f,
+                        "{} sets `loadout_mode` to `sealed`. ",
+                        sentence_start(layer)
+                    )?,
+                    None => write!(
+                        f,
+                        "No layer of minimal.toml sets `loadout_mode`, and a box \
+                         without it is sealed. "
+                    )?,
+                }
+                write!(f, "Run the command without `--loadout`")?;
+                match held_by {
+                    None => write!(f, ", or set `loadout_mode = \"open\"` in `{entry}`."),
+                    Some(box_type) => write!(
+                        f,
+                        ". {box_type} constrains `loadout_mode` to `sealed`, so \
+                         `{entry}` cannot set it to `open`."
+                    ),
+                }
+            }
+            // The type error's own message is the whole message.
+            Error::BoxType(error) => write!(f, "{error}"),
+            Error::ConstraintViolated {
+                key,
+                layer,
+                found,
+                box_type,
+                admitted,
+            } => {
+                let admitted: Vec<String> = admitted.iter().map(|a| format!("`{a}`")).collect();
+                write!(
+                    f,
+                    "{layer} sets `{key}` to {found:?}, but {box_type} \
+                     constrains `{key}` to {}. Fix the value.",
+                    admitted.join(" or ")
+                )
+            }
+            Error::LoadoutVarConflict {
+                name,
+                first,
+                second,
+            } => write!(
+                f,
+                "The variable `{name}` has two different values. {first} sets one \
+                 value, and {second} sets the other. A loadout cannot change a \
+                 variable that is already set. Remove `{name}` from one of them, \
+                 or add `{name}` to the `ignore` list under `[vars]` in \
+                 user_policy.toml to drop every value of `{name}`."
+            ),
+            Error::DuplicateVar { name, layer } => write!(
+                f,
+                "{layer} sets the variable `{name}` twice, to different values. \
+                 Remove one of the two settings."
+            ),
+            Error::ExportOutsideProject { path, layer } => write!(
+                f,
+                "{layer} exports `{path}`, which points outside the folder \
+                 that holds minimal.toml or names that folder itself. Give \
+                 the path of a file or folder inside that folder."
+            ),
         }
     }
 }
@@ -269,7 +477,9 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::IO(_, _, e) => Some(e),
-            Error::Format(e) => Some(e),
+            // `Display` carries the parse error, so a chain printer such as
+            // `{:#}` prints it once.
+            Error::Format(_) => None,
             // The serde error only restates serde's internal enum name,
             // which the Display above replaces; it stays for Debug.
             Error::LinkConfig { .. } => None,
@@ -282,6 +492,48 @@ impl std::error::Error for Error {
             Error::InvalidSpecKey { .. } => None,
             Error::LegacyTable { .. } => None,
             Error::InteractiveTask(_) => None,
+            Error::InvalidStateKey { .. } => None,
+            Error::LoadoutSetsLoadoutMode { .. } => None,
+            Error::NamedLoadoutOnSealedBox { .. } => None,
+            Error::ConstraintViolated { .. } => None,
+            // `Display` prints the type error, so a chain printer prints it
+            // once.
+            Error::BoxType(_) => None,
+            Error::LoadoutVarConflict { .. } => None,
+            Error::DuplicateVar { .. } => None,
+            Error::ExportOutsideProject { .. } => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+    use std::error::Error as _;
+
+    /// Renders an error the way anyhow's `{:#}` does: the error, then each
+    /// cause in its `source()` chain, joined with `": "`.
+    fn render_chain(e: &(dyn std::error::Error + 'static)) -> String {
+        let mut out = e.to_string();
+        let mut cur = e.source();
+        while let Some(cause) = cur {
+            out.push_str(": ");
+            out.push_str(&cause.to_string());
+            cur = cause.source();
+        }
+        out
+    }
+
+    #[test]
+    fn format_error_display_carries_toml_error_once() {
+        let err = crate::entry::read_entries(b"[boxes.dev\ntype = \"session\"\n")
+            .expect_err("an unterminated table header must not parse");
+        assert!(matches!(err, Error::Format(_)), "got {err:?}");
+        let shown = err.to_string();
+        assert_eq!(shown.matches("TOML parse error").count(), 1, "{shown}");
+        assert_eq!(shown.matches("[boxes.dev").count(), 1, "{shown}");
+        assert!(err.source().is_none());
+        let chained = render_chain(&err);
+        assert_eq!(chained.matches("TOML parse error").count(), 1, "{chained}");
     }
 }

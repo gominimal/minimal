@@ -60,6 +60,117 @@ impl ReqwestUrl {
     }
 }
 
+/// The `User-Agent` a web fetch sends, such as
+/// `minimal/0.8.0 (+https://minimal.dev)`.
+///
+/// Some hosts refuse a request that carries no agent: ftp.gnu.org answers it
+/// 403, so a package whose source is a GNU tarball could not build
+/// (inbox#1218). A release build names its version, read from the
+/// `MINIMAL_RELEASE_VERSION` the release workflow builds with. Any other
+/// build sends `minimal (+https://minimal.dev)`. The `version` crate is not
+/// used: it is rebuilt on every commit, and so would be this crate and every
+/// crate that depends on it.
+pub fn user_agent() -> &'static str {
+    static AGENT: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| agent_for(option_env!("MINIMAL_RELEASE_VERSION")));
+    &AGENT
+}
+
+/// The agent for a build whose release version is `release`. A version with
+/// a character outside SemVer's is left out, so the agent is always a valid
+/// header value and the client always builds.
+fn agent_for(release: Option<&str>) -> String {
+    match release.map(str::trim).filter(|v| is_semver_text(v)) {
+        Some(version) => format!("minimal/{version} (+https://minimal.dev)"),
+        None => "minimal (+https://minimal.dev)".to_string(),
+    }
+}
+
+/// `v` is not empty and has only the characters a SemVer version is spelled
+/// with.
+fn is_semver_text(v: &str) -> bool {
+    !v.is_empty()
+        && v.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+}
+
+/// The builder of every client that fetches a web source. It sets
+/// [`user_agent`], so a caller adds only what its fetch needs, such as a
+/// proxy.
+pub fn web_client_builder() -> reqwest::ClientBuilder {
+    Client::builder().user_agent(user_agent())
+}
+
+#[cfg(test)]
+mod user_agent_tests {
+    use super::*;
+    use reqwest::header::HeaderValue;
+
+    #[test]
+    fn a_release_build_names_its_version() {
+        assert_eq!(
+            agent_for(Some("0.8.0")),
+            "minimal/0.8.0 (+https://minimal.dev)"
+        );
+        assert_eq!(
+            agent_for(Some("0.8.0-rc.1+g1e236070")),
+            "minimal/0.8.0-rc.1+g1e236070 (+https://minimal.dev)"
+        );
+    }
+
+    #[test]
+    fn a_build_without_a_usable_version_sends_the_bare_agent() {
+        const UNUSABLE: [Option<&str>; 5] = [
+            None,
+            Some(""),
+            Some("  "),
+            Some("0.8.0\r\nx: y"),
+            Some("0.8 0"),
+        ];
+        for release in UNUSABLE {
+            assert_eq!(
+                agent_for(release),
+                "minimal (+https://minimal.dev)",
+                "{release:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_agent_is_a_valid_header_value() {
+        HeaderValue::from_str(user_agent()).expect("a valid header value");
+        web_client_builder().build().expect("the client builds");
+    }
+}
+
+/// Walks `err`'s source chain for a TLS certificate-verification failure,
+/// which rustls surfaces as `"invalid peer certificate: <reason>"` (for
+/// example `UnknownIssuer`). Returns the matched message, with `host`
+/// appended when it is known, or `None` for every other error.
+///
+/// It matches by message rather than by downcasting to a `rustls` type so
+/// that `common` need not depend on `rustls` or track its version. The
+/// result is a human-readable diagnostic, not a value anything branches on
+/// for security, so a message heuristic is appropriate here.
+pub fn tls_cert_cause(
+    err: &(dyn std::error::Error + 'static),
+    host: Option<&str>,
+) -> Option<String> {
+    const MARKER: &str = "invalid peer certificate";
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = current {
+        let msg = e.to_string();
+        if msg.contains(MARKER) {
+            return Some(match host {
+                Some(host) => format!("{msg} (from {host})"),
+                None => msg,
+            });
+        }
+        current = e.source();
+    }
+    None
+}
+
 /// The response to an RPC for some resource.
 pub trait FetchResponse: std::fmt::Debug + Sized {
     type Error: std::fmt::Debug;
@@ -78,6 +189,18 @@ pub trait FetchResponse: std::fmt::Debug + Sized {
     /// return `None` via the default impl. Used by writers to do
     /// compare-and-swap on subsequent writes.
     fn generation(&self) -> Option<i64> {
+        None
+    }
+
+    /// Classifies a backend error as a TLS certificate-verification failure,
+    /// returning `Some(cause)` with a human-readable cause (naming the host
+    /// when known) or `None` for every other error. Such a failure is
+    /// deterministic — it recurs identically until the trust path is fixed —
+    /// so callers treat it as non-transient and surface the cause rather than
+    /// retrying it or reporting it as a connectivity failure. The usual cause
+    /// is a TLS-inspecting proxy re-signing traffic with a CA the client does
+    /// not trust. Only backends that terminate TLS override the default.
+    fn tls_cert_error(_err: &Self::Error) -> Option<String> {
         None
     }
 }
@@ -105,6 +228,10 @@ impl FetchResponse for Response {
     fn chunk(&mut self) -> impl Future<Output = Result<Option<Bytes>, Self::Error>> {
         Response::chunk(self)
     }
+
+    fn tls_cert_error(err: &Self::Error) -> Option<String> {
+        tls_cert_cause(err, err.url().and_then(UpstreamReqwestUrl::host_str))
+    }
 }
 
 /// A URL which can be consumed by implementations of [FetchBackend].
@@ -113,6 +240,13 @@ pub trait FetchUrl: std::fmt::Debug + Clone {
     fn join(&self, input: &str) -> Result<Self, Self::JoinError>;
 
     fn filename(&self) -> String;
+
+    /// Where the URL points, for a span or a log line: the scheme, host and
+    /// port, and nothing of the user, path or query, which may carry a
+    /// token. Each implementation says this itself, with no default: a
+    /// generic default could only print the whole URL (its `Debug`), which is
+    /// what this method exists to keep out of a span.
+    fn origin(&self) -> String;
 }
 
 impl FetchUrl for ReqwestUrl {
@@ -120,6 +254,15 @@ impl FetchUrl for ReqwestUrl {
 
     fn join(&self, input: &str) -> Result<Self, Self::JoinError> {
         UpstreamReqwestUrl::join(&self.0, input).map(ReqwestUrl)
+    }
+    fn origin(&self) -> String {
+        // `port` is `None` for the scheme's default port, so a cache on a
+        // port of its own is told apart from one on the same host's default.
+        let host = self.0.host_str().unwrap_or("");
+        match self.0.port() {
+            Some(port) => format!("{}://{host}:{port}", self.0.scheme()),
+            None => format!("{}://{host}", self.0.scheme()),
+        }
     }
     fn filename(&self) -> String {
         let path = self.0.path();
@@ -180,6 +323,16 @@ pub struct GcsUrl {
 
 impl FetchUrl for GcsUrl {
     type JoinError = ();
+
+    fn origin(&self) -> String {
+        // `bucket` holds the storage API's resource name,
+        // `projects/_/buckets/<id>`, and a bucket's URL names the id alone.
+        let id = self
+            .bucket
+            .strip_prefix("projects/_/buckets/")
+            .unwrap_or(&self.bucket);
+        format!("gs://{id}")
+    }
 
     fn join(&self, input: &str) -> Result<Self, Self::JoinError> {
         let mut out = self.clone();
@@ -323,6 +476,13 @@ impl FetchUrl for AnyUrl {
             AnyUrl::Gcs(u) => u.filename(),
         }
     }
+
+    fn origin(&self) -> String {
+        match self {
+            AnyUrl::Https(u) => u.origin(),
+            AnyUrl::Gcs(u) => u.origin(),
+        }
+    }
 }
 
 /// A [FetchResponse] from either backend.
@@ -394,6 +554,13 @@ impl FetchResponse for AnyResponse {
         match self {
             AnyResponse::Https(r) => FetchResponse::generation(r),
             AnyResponse::Gcs(r) => FetchResponse::generation(r),
+        }
+    }
+
+    fn tls_cert_error(err: &Self::Error) -> Option<String> {
+        match err {
+            AnyRespError::Https(e) => <Response as FetchResponse>::tls_cert_error(e),
+            AnyRespError::Gcs(_) | AnyRespError::InvalidUrl(_) => None,
         }
     }
 }
@@ -468,6 +635,29 @@ mod any_backend_tests {
             bucket: "projects/_/buckets/b".into(),
             object: object.into(),
         })
+    }
+
+    /// An origin names the scheme, host and a non-default port, and nothing
+    /// of the user, path or query, where a token may be (#3223).
+    #[test]
+    fn origin_keeps_scheme_host_and_port_and_drops_user_path_and_query() {
+        let url = "https://user:pw@cache.example.com/pkgs/a.tar?token=s3cr3t#frag";
+        assert_eq!(https(url).origin(), "https://cache.example.com");
+        let url = "http://cache.example.com:8443/pkgs/a.tar?token=s3cr3t";
+        assert_eq!(https(url).origin(), "http://cache.example.com:8443");
+        // The scheme's own port is the default, so it is not repeated.
+        assert_eq!(
+            https("https://cache.example.com:443/x").origin(),
+            "https://cache.example.com"
+        );
+        // A bucket is named as its URL names it, not by the storage API's
+        // resource path, so a filter on `gs://b` finds its spans.
+        assert_eq!(gcs("pkgs/a.tar").origin(), "gs://b");
+        let bare = AnyUrl::Gcs(GcsUrl {
+            bucket: "b".into(),
+            object: "pkgs/a.tar".into(),
+        });
+        assert_eq!(bare.origin(), "gs://b");
     }
 
     #[test]
@@ -546,5 +736,55 @@ mod transport_error_tests {
         assert!(!FetchResponse::is_success(&resp));
         assert_eq!(FetchResponse::status_code(&resp), 0);
         assert!(FetchResponse::error_for_status(resp).is_err());
+    }
+
+    #[derive(Debug)]
+    struct StubError {
+        message: String,
+        source: Option<Box<StubError>>,
+    }
+
+    impl std::fmt::Display for StubError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.message)
+        }
+    }
+
+    impl std::error::Error for StubError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.source
+                .as_deref()
+                .map(|s| s as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    /// The rustls certificate reason, surfaced several layers down an error's
+    /// source chain (as it is under a reqwest connect error), is found and
+    /// annotated with the host.
+    #[test]
+    fn tls_cert_cause_finds_marker_in_source_chain() {
+        let err = StubError {
+            message: "error sending request for url (https://cache.minimal.dev/index.shisha)"
+                .into(),
+            source: Some(Box::new(StubError {
+                message: "invalid peer certificate: UnknownIssuer".into(),
+                source: None,
+            })),
+        };
+
+        let cause = tls_cert_cause(&err, Some("cache.minimal.dev")).expect("a cert cause");
+        assert!(cause.contains("UnknownIssuer"), "{cause}");
+        assert!(cause.contains("cache.minimal.dev"), "{cause}");
+    }
+
+    /// A transport failure that is not a certificate problem is not matched,
+    /// so it keeps its normal (transient, retried) handling.
+    #[test]
+    fn tls_cert_cause_ignores_non_cert_errors() {
+        let err = StubError {
+            message: "connection reset by peer".into(),
+            source: None,
+        };
+        assert!(tls_cert_cause(&err, Some("cache.minimal.dev")).is_none());
     }
 }

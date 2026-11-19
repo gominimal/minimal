@@ -35,13 +35,125 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
         .map_err(activate_refusal)
 }
 
+/// `min session start [<entry>]`: create a box from a session entry and
+/// attach this terminal to it, or print its id and return (BCLI-029).
+pub async fn cmd_session_start(
+    global: &GlobalArgs,
+    args: SessionStartArgs,
+) -> Result<(), anyhow::Error> {
+    start_entry(global, args.into()).await
+}
+
+/// The entry `min session start` starts (BCLI-071): the typed session
+/// entry, else the session entry named `default`, else the project's only
+/// session entry. The count includes the implicit `default` session entry.
+///
+/// The lookups of an explicit entry come first, in the order of
+/// `pick_session_entry` (`boxes/create.rs`): a typed project entry, then
+/// with no entry typed a project session entry named `default`.
+///
+/// # Errors
+///
+/// [`SessionEntryUndecided::TypeUnresolved`] when the typed entry's own
+/// type is unresolved, or from [`start_candidates`] when the pick depends
+/// on the implicit `default` or on the session count: an entry of a project
+/// Box Type can be a session. Else a [`StartEntryRefusal`] when no session
+/// entry can be picked.
+pub(crate) fn pick_session_start_entry(
+    entries: &[mfile::entry::BoxEntry],
+    typed: Option<&str>,
+) -> Result<mfile::entry::BoxEntry, anyhow::Error> {
+    if let Some(typed) = typed {
+        if let Some(entry) = entries.iter().find(|entry| entry.name == typed) {
+            return if is_session_entry(entry) {
+                Ok(entry.clone())
+            } else if type_unresolved(entry) {
+                Err(type_unresolved_refusal(entry).into())
+            } else {
+                Err(StartEntryRefusal::NotSession {
+                    entry: entry.name.clone(),
+                    box_type: entry.box_type.clone(),
+                }
+                .into())
+            };
+        }
+        if typed != mfile::entry::DEFAULT_ENTRY_NAME {
+            return Err(StartEntryRefusal::Unknown {
+                verb: StartVerb::Session,
+                entry: typed.to_string(),
+                entries: listed_entries(entries)
+                    .into_iter()
+                    .filter(is_session_entry)
+                    .map(|entry| entry.name)
+                    .collect(),
+            }
+            .into());
+        }
+    } else if let Some(default) = entries
+        .iter()
+        .find(|entry| entry.name == mfile::entry::DEFAULT_ENTRY_NAME && is_session_entry(entry))
+    {
+        return Ok(default.clone());
+    }
+    // Only the implicit `default` or the session count is left to decide.
+    let candidates = start_candidates(entries)?;
+    pick_session_candidate(entries, &candidates, typed).map_err(Into::into)
+}
+
+/// The pick of [`pick_session_start_entry`] from the `candidates` that
+/// [`start_candidates`] gives for `entries`.
+fn pick_session_candidate(
+    entries: &[mfile::entry::BoxEntry],
+    candidates: &[mfile::entry::BoxEntry],
+    typed: Option<&str>,
+) -> Result<mfile::entry::BoxEntry, StartEntryRefusal> {
+    let sessions: Vec<&mfile::entry::BoxEntry> =
+        candidates.iter().filter(|e| is_session_entry(e)).collect();
+    let names = || sessions.iter().map(|entry| entry.name.clone()).collect();
+    if let Some(typed) = typed {
+        return match candidates.iter().find(|entry| entry.name == typed) {
+            Some(entry) if is_session_entry(entry) => Ok(entry.clone()),
+            Some(entry) => Err(StartEntryRefusal::NotSession {
+                entry: entry.name.clone(),
+                box_type: entry.box_type.clone(),
+            }),
+            None => Err(StartEntryRefusal::Unknown {
+                verb: StartVerb::Session,
+                entry: typed.to_string(),
+                entries: names(),
+            }),
+        };
+    }
+    if let Some(default) = sessions
+        .iter()
+        .find(|entry| entry.name == mfile::entry::DEFAULT_ENTRY_NAME)
+    {
+        return Ok((*default).clone());
+    }
+    match sessions.as_slice() {
+        [only] => Ok((*only).clone()),
+        // No session entry and no implicit `default`: an entry of another
+        // type holds the name `default` (BOX-165).
+        [] => Err(StartEntryRefusal::DefaultBlocked {
+            box_type: entries
+                .iter()
+                .find(|entry| entry.name == mfile::entry::DEFAULT_ENTRY_NAME)
+                .and_then(|entry| entry.box_type.clone()),
+        }),
+        _ => Err(StartEntryRefusal::Several {
+            verb: StartVerb::Session,
+            entries: names(),
+        }),
+    }
+}
+
 /// The error `min session activate` ends with (NET-144). When the daemon
 /// refused the activation because a declared host port is already in use,
 /// the refusal's own text replaces the whole chain: it names the port, its
 /// holder and the next step, and the stage and RPC context around it add
 /// nothing a person can act on. The activate cleanup has already destroyed
 /// the box by then. Any other error passes through as it is.
-fn activate_refusal(error: anyhow::Error) -> anyhow::Error {
+pub(crate) fn activate_refusal(error: anyhow::Error) -> anyhow::Error {
     let refusal = error
         .chain()
         .find_map(|cause| minimald_rpc::PortInUseRefusal::find_in(&cause.to_string()));
@@ -51,69 +163,12 @@ fn activate_refusal(error: anyhow::Error) -> anyhow::Error {
     }
 }
 
-/// Attach to an existing session. Both interactive and `--command` paths
-/// shell out to `ssh` — the daemon's shell_request handler mints a PTY-backed
-/// session shell, and ssh handles termios/PTY management for us.
-///
-/// When `args.session` is `None`, the session is resolved from the current
-/// working directory (or the only existing session), opening an interactive
-/// picker when the choice is ambiguous; see [`attach::resolve_for_attach`]
-/// and [`resolve_smart_attach`].
-///
-/// When `args.session` names a box, the name alone decides where to look
-/// (NET-058): the selected VM's daemon first — the common case costs nothing
-/// beyond the one lookup it always made — and, when that daemon does not know
-/// the name, [`attach::resolve_box_vm`] resolves the VM that owns it across
-/// every VM's socket, so no global flag is needed to reach a box on another
-/// VM.
+/// `min session attach [<box>]`: `min box attach` that sees only boxes of
+/// type session (BCLI-032). A named box resolves among the session boxes,
+/// and with none named the project's session box with a terminal is the
+/// one. A stopped or exited box resumes as the attach starts (BCLI-007).
 pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), anyhow::Error> {
-    ensure_daemon(global)?;
-
-    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
-        .context("Failed to resolve daemon socket path")?;
-
-    let mut client = client::Client::connect(&sock)
-        .await
-        .context("Failed to connect to minimald")?;
-    // Connects directly rather than through `connect_daemon` (it needs `sock`
-    // for the ssh hand-off), so the gate is applied by hand — with no session
-    // named, this path creates one, and a skewed activation is #1251 exactly.
-    // Both arms below gate on the build the daemon reports on the lookup they
-    // were already making, so the gate costs no round trip of its own.
-    let (id, name, sock) = match args.session {
-        Some(ref s) => {
-            let (record, sock) =
-                resolve_attach_target_version_gated(global, &mut client, sock, s).await?;
-            (record.id, record.name, sock)
-        }
-        None => match resolve_smart_attach(
-            &list_sessions_version_gated(&mut client).await?.sessions,
-            global,
-        )? {
-            SmartAttach::Attach(entry) => (entry.id, entry.name, sock),
-            SmartAttach::CreateForCwd => return activate_new_for_attach(global).await,
-            SmartAttach::NoSessions => {
-                bail!("no sessions exist; use 'min session activate' to create one")
-            }
-        },
-    };
-
-    tracing::info!(
-        session_id = %id,
-        session_name = ?name,
-        "found session"
-    );
-
-    let host_asks = host_asks_box(global, name.as_deref());
-    box_via_ssh(
-        daemon_host_kind(global),
-        &sock,
-        id,
-        None,
-        global.config_dir.as_deref(),
-        host_asks.as_deref(),
-    )
-    .await
+    cmd_session_attach(global, args.session.as_deref()).await
 }
 
 /// Executes a command in an existing session.
@@ -223,17 +278,15 @@ pub async fn cmd_session_run(
     .await
 }
 
-/// Print the effective networking rules for a session.
+/// Print the effective networking rules for a session, through the render
+/// `min box show <box> --network` uses.
 pub async fn cmd_session_policy(
     global: &GlobalArgs,
     args: PolicyArgs,
 ) -> Result<(), anyhow::Error> {
     // `-o json` is the machine-readable rendering: one document on stdout,
-    // one error object on stderr when the walk fails. A separate walk with
-    // typed failures (below) rather than a flag threaded through the text
-    // one, because *which* failure it was is part of what a script reads —
-    // the text walk answers with a message only — and because the text
-    // rendering is not touched at all.
+    // one error object on stderr when the walk fails. Its own resolve step,
+    // because *which* failure it was is part of what a script reads.
     if args.output == Some(PolicyOutputFormat::Json) {
         return box_policy_as_json(global, &args.session).await;
     }
@@ -242,111 +295,24 @@ pub async fn cmd_session_policy(
 
     let client = connect_daemon(global).await?;
 
-    // The effective reply carries only the rules, but the ingress block is
-    // suppressed for host-address sessions (see [`format_policy`]), so the
-    // command also resolves the record the policy rides on for its network
-    // mode. The name alone decides which VM is asked (NET-058): a box on
-    // another VM is read from that VM's daemon, with no global flag.
+    // The name alone decides which VM is asked (NET-058): a box on another
+    // VM is read from that VM's daemon, with no global flag.
     let example = format!("session policy {}", args.session);
     let (mut client, record) =
         resolve_box_on_any_vm(global, client, &args.session, &example).await?;
-    // The follow-up lookups go by the resolved id, so a session named by an
-    // id prefix reaches the same session they do.
-    let box_id = record.id.to_string();
-
-    // The daemon resolves the effective egress (NET-074/NET-077), because
-    // the rollout phase and its opt-out are the daemon's own facts; built
-    // here rather than through a `SessionLookup` conversion so the request
-    // types stay the rpc crate's, where the wire contract lives.
-    use minimald_rpc::{GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest};
-    let lookup = match SessionLookup::parse(&box_id) {
-        SessionLookup::Id(id) => GetEffectiveSessionPolicyRequest::Id(id),
-        SessionLookup::Name(n) => GetEffectiveSessionPolicyRequest::Name(n),
-    };
-
-    let resp = client
-        .oneshot_rpc::<GetEffectiveSessionPolicy>(lookup)
-        .await
-        .context("GetEffectiveSessionPolicy RPC failed")?;
-
-    // NET-079's per-box enforcement answers beside the rules, over its own
-    // runtime-facts reply — never as a field on the policy, because the
-    // policy struct is `deny_unknown_fields`: an older `min` would reject the
-    // whole rules reply over a key it has no field for, so the fact rides a
-    // separate reply the way live ingress does. A client that cannot get it
-    // — an older daemon, a session mid-teardown — renders the rules with no
-    // enforcement row, silently: the row is an optional fact beside the
-    // declaration, and the same silence is what a session that is not
-    // host-address already prints.
-    let facts_lookup = match SessionLookup::parse(&box_id) {
-        SessionLookup::Id(id) => minimald_rpc::GetSessionRuntimeFactsRequest::Id(id),
-        SessionLookup::Name(n) => minimald_rpc::GetSessionRuntimeFactsRequest::Name(n),
-    };
-    let facts = match client
-        .oneshot_rpc::<minimald_rpc::GetSessionRuntimeFacts>(facts_lookup)
-        .await
-    {
-        Ok(minimald_rpc::Errorable::Ok(facts)) => Some(facts),
-        Ok(minimald_rpc::Errorable::Err { .. }) | Err(_) => None,
-    };
-    let host_ip_enforcement = facts.as_ref().and_then(|facts| facts.host_ip_enforcement);
-    let shared_port_collisions = facts
-        .as_ref()
-        .map(|facts| facts.shared_port_collisions.clone())
-        .unwrap_or_default();
-    // (NET-044) — the rows that make a `min net expose` visible rather than
-    // only permitted. Fetched through the text walk's own degrade of the
-    // shared fetch: warn on stderr and print no section — the JSON
-    // rendering below degrades differently, saying the unknown in the
-    // document instead.
-    let live = fetch_live_ingress_degrading(&mut client, &box_id).await;
-
-    match resp {
-        minimald_rpc::Errorable::Ok(policy) => {
-            // The fabric the display builds the baseline set from: the
-            // microVM backend's run path builds its registry and the
-            // helper's enumeration from the default plan, so that is the
-            // plan the display can name for it. Keyed on the backend this
-            // command actually talks to — `client_host_kind`, the same
-            // key `resolve_socket_path` turns on — not on `use_minvmd()`,
-            // which is true only under an explicit `--provider
-            // local-minvmd`: on macOS that kind is `Minvmd` without the
-            // flag, minvmd being the only backend there. The native
-            // daemon's own per-daemon switch is a plan the reply does not
-            // carry — and it has no host-side gate the set would describe —
-            // so that arm passes `None` and the block is left out rather
-            // than printed from a plan the session does not attach to.
-            let host_kind = daemon_host_kind(global);
-            let fabric =
-                (host_kind == paths::HostKind::Minvmd).then_some(switch::SwitchSubnet::default());
-            // NET-160: the host exposures row turns on the host kind itself,
-            // not on `fabric`.
-            let native_host = host_kind == paths::HostKind::Minimald;
-            let mut out = std::io::stdout();
-            format_policy_on_host(
-                &mut out,
-                &policy,
-                record.network,
-                host_ip_enforcement,
-                &shared_port_collisions,
-                fabric,
-                native_host,
-            )?;
-            write_live_ingress(&mut out, &live)?;
-            if let Some(facts) = &facts {
-                write_unaudited_listen_ports(
-                    &mut out,
-                    &facts.unaudited_listen_ports,
-                    facts.audit_log.as_deref(),
-                )?;
-            }
-            out.flush().context("Failed to write policy")?;
-            Ok(())
-        }
-        minimald_rpc::Errorable::Err { error } => {
-            bail!("{error}")
-        }
-    }
+    // Keyed on the backend this command actually talks to —
+    // `client_host_kind`, the same key `resolve_socket_path` turns on — not
+    // on `use_minvmd()`, which is true only under an explicit `--provider
+    // local-minvmd`.
+    let mut out = std::io::stdout();
+    write_box_network(
+        &mut out,
+        &mut client,
+        &record,
+        daemon_host_kind(global),
+        false,
+    )
+    .await
 }
 
 /// Register a session as an SSH remote in Zed's `settings.json`.
@@ -737,21 +703,14 @@ pub async fn cmd_rename(global: &GlobalArgs, args: RenameArgs) -> Result<(), any
 
     match resp {
         minimald_rpc::Errorable::Ok(_) => {
-            // A `host_ip` box holds its name in the zone (NODATA) in place
-            // of a row: the hold moves with the name, so the old name no box
-            // owns answers NXDOMAIN again and the new one is the one the
-            // destroy releases.
-            if holds_name(&record) {
-                let control_sock =
-                    vm_host_control_sock(daemon_host_kind(global), global.minimal_dir.as_deref());
-                move_held_box_name(
-                    control_sock,
-                    record.id,
-                    record.name.as_deref(),
-                    &args.new_name,
-                )
-                .await;
-            }
+            // The VM host keeps the box under the name it was registered
+            // by until it is told: a `host_ip` box's zone hold (NODATA) and
+            // an own-address box's row both move with the name, so the old
+            // name answers NXDOMAIN again and the new one is the one the
+            // box answers under and the destroy releases (#1116).
+            let control_sock =
+                vm_host_control_sock(daemon_host_kind(global), global.minimal_dir.as_deref());
+            rename_box_with_vm_host(control_sock, &record, &args.new_name).await;
             println!(
                 "Renamed session {} ({}) → {}",
                 record.id,
@@ -764,6 +723,237 @@ pub async fn cmd_rename(global: &GlobalArgs, args: RenameArgs) -> Result<(), any
             bail!("{error}")
         }
     }
+}
+
+// BCLI-030: the type nouns' `list`, `stop` and `rm` are the `min box`
+// verbs, filtered to one Box Type. `min session` passes the session type,
+// and `min task` the task type.
+
+/// `min session list` and `min task list`: `min box list`, with only the
+/// boxes of `box_type`. `verb` is the command as the person typed it, for
+/// the log.
+pub(crate) async fn cmd_typed_box_list(
+    global: &GlobalArgs,
+    args: BoxListArgs,
+    box_type: &str,
+    verb: &'static str,
+) -> Result<(), anyhow::Error> {
+    let scope = if args.all {
+        None
+    } else {
+        let cwd = crate::attach::cwd_host_path(global)?;
+        Some(box_list_scope(cwd.as_ref())?)
+    };
+    ensure_daemon(global)?;
+    let hosts = crate::cmd::list::local_hosts(global)?;
+    let mut out = std::io::stdout().lock();
+    let mut err = std::io::stderr().lock();
+    let request = TypedBoxList {
+        box_type,
+        verb,
+        project_root: scope,
+        output: args.output,
+    };
+    typed_box_list_on_hosts(hosts, request, &mut out, &mut err).await
+}
+
+/// What one typed listing asks for: the Box Type, the verb for the log,
+/// the project (every project when `None`) and the rendering.
+pub(crate) struct TypedBoxList<'a> {
+    pub(crate) box_type: &'a str,
+    pub(crate) verb: &'static str,
+    pub(crate) project_root: Option<paths::HostAbsPath>,
+    pub(crate) output: Option<BoxListOutputFormat>,
+}
+
+/// The typed listing over the local `hosts`: the `min box list` table, or
+/// its JSON array, with only the boxes of the requested type. A host that
+/// does not answer is named on `err`, and the list goes on without it. The
+/// selected host that does not answer ends the command, as it does for
+/// `min box list`.
+pub(crate) async fn typed_box_list_on_hosts(
+    hosts: Vec<crate::cmd::list::LocalHost>,
+    request: TypedBoxList<'_>,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> Result<(), anyhow::Error> {
+    let TypedBoxList {
+        box_type,
+        verb,
+        project_root,
+        output,
+    } = request;
+    let mut listed = Vec::new();
+    for host in hosts {
+        let records = match read_host_boxes(&host).await? {
+            Ok(records) => records,
+            Err(why) if host.selected => {
+                tracing::info!(verb, outcome = "error", host = %host.host, "{why}");
+                bail!("{why}");
+            }
+            Err(why) => {
+                tracing::info!(verb, outcome = "host unreachable", host = %host.host, "{why}");
+                writeln!(err, "{}", unreachable_host_line(&host.host))?;
+                continue;
+            }
+        };
+        listed.extend(
+            records
+                .into_iter()
+                .filter(|entry| entry.box_type.as_deref() == Some(box_type))
+                .filter(|entry| {
+                    project_root
+                        .as_ref()
+                        .is_none_or(|root| entry.project_root.as_ref() == Some(root))
+                })
+                .map(|record| ListedBox {
+                    provider: host.provider.to_string(),
+                    host: host.host.clone(),
+                    record,
+                }),
+        );
+    }
+    tracing::info!(verb, outcome = "ok", boxes = listed.len());
+    let mut out = out;
+    match output {
+        Some(BoxListOutputFormat::Json) => render_box_list_json(&mut out, &listed)?,
+        None if listed.is_empty() => {
+            writeln!(
+                out,
+                "{}",
+                empty_typed_list(box_type, project_root.is_some())
+            )?;
+        }
+        None => render_box_list(&mut out, &listed, project_root.is_some())?,
+    }
+    Ok(())
+}
+
+/// The line a typed listing prints when no box of `box_type` matches: for
+/// the current project when `scoped`, else for the local hosts. It names
+/// the type, so a project with boxes of another type does not read as
+/// empty.
+pub(crate) fn empty_typed_list(box_type: &str, scoped: bool) -> String {
+    if scoped {
+        format!(
+            "This project has no {box_type} boxes. \
+             Run `min {box_type} list --all` to list the {box_type} boxes of every project."
+        )
+    } else {
+        format!("No {box_type} boxes on this machine.")
+    }
+}
+
+/// Resolves the address `address` over `hosts` among the boxes of
+/// `box_type` only, so a type noun never reaches a box of another type.
+/// An address that only a box of another type holds is refused as one
+/// that no box holds. A box on a stopped VM is refused with the command
+/// that starts the VM, as every `min box` verb refuses it (BCLI-002,
+/// NET-058). The verb, the box id and the outcome go to the log.
+pub(crate) async fn resolve_box_of_type(
+    hosts: Vec<crate::cmd::list::LocalHost>,
+    address: &str,
+    box_type: &str,
+    verb: &'static str,
+) -> Result<ResolvedBox, anyhow::Error> {
+    resolve_box_over(hosts, address, Some(box_type), verb).await
+}
+
+/// `min session stop` and `min task stop`: `min box stop`, with the box
+/// resolved among the boxes of `box_type` only.
+pub(crate) async fn cmd_typed_box_stop(
+    global: &GlobalArgs,
+    args: BoxStopArgs,
+    box_type: &str,
+    verb: &'static str,
+) -> Result<(), anyhow::Error> {
+    ensure_daemon(global)?;
+    let hosts = crate::cmd::list::local_hosts(global)?;
+    let mut out = std::io::stdout().lock();
+    let stopped = typed_box_stop_on_hosts(hosts, &mut out, &args, box_type, verb).await?;
+    // As `min box stop` does: the VM host daemon retires the stopped box's
+    // `host_ip` egress rules. A stop of one exec leaves the box running.
+    if let Some(stopped) = stopped {
+        let control_sock = box_host_control_sock(&stopped.host);
+        retire_stopped_box_with_vm_host(control_sock, stopped.box_id).await;
+    }
+    Ok(())
+}
+
+/// The typed stop over the local `hosts`. With `--exec`, stops that one
+/// command and returns `None`. Else stops the box and returns it.
+pub(crate) async fn typed_box_stop_on_hosts(
+    hosts: Vec<crate::cmd::list::LocalHost>,
+    out: &mut impl std::io::Write,
+    args: &BoxStopArgs,
+    box_type: &str,
+    verb: &'static str,
+) -> Result<Option<ResolvedBox>, anyhow::Error> {
+    let target = args.target.as_str();
+    let resolved = resolve_box_of_type(hosts, target, box_type, verb).await?;
+    let box_id = resolved.box_id;
+    let stopped = async {
+        match args.exec.as_deref() {
+            // The exec stop goes to the box this type resolved, with no
+            // second lookup, so a box of another type that holds the same
+            // name is never reached. The line names the typed address.
+            Some(exec) => {
+                box_stop_exec_in_resolved(&resolved, out, target, exec, verb).await?;
+                Ok(None)
+            }
+            None => {
+                let mut client = gated_box_host_client(&resolved.host).await?;
+                stop_listed_box(&mut client, out, box_id, target, args.force).await?;
+                Ok(Some(resolved))
+            }
+        }
+    }
+    .await;
+    let outcome = if stopped.is_ok() { "ok" } else { "error" };
+    tracing::info!(verb, box_id = %box_id, outcome);
+    stopped
+}
+
+/// `min session rm` and `min task rm`: `min box rm`, with the box resolved
+/// among the boxes of `box_type` only.
+pub(crate) async fn cmd_typed_box_rm(
+    global: &GlobalArgs,
+    args: BoxRmArgs,
+    box_type: &str,
+    verb: &'static str,
+) -> Result<(), anyhow::Error> {
+    ensure_daemon(global)?;
+    let hosts = crate::cmd::list::local_hosts(global)?;
+    let (host, removed) = typed_box_rm_on_hosts(hosts, &args, box_type, verb).await?;
+    // The same cleanup as `min box rm`: withdraw the box's row on the VM
+    // host daemon, or release the name it held.
+    let control_sock = box_host_control_sock(&host);
+    let name = removed.name.as_deref();
+    let row_id = removed.box_addresses.and(removed.box_id);
+    withdraw_box_row(control_sock.clone(), name, removed.box_addresses, row_id).await;
+    release_held_box_name(control_sock, removed.id, name, removed.box_addresses).await;
+    writeln!(std::io::stdout().lock(), "Removed {}.", args.target)?;
+    Ok(())
+}
+
+/// The typed removal over the local `hosts`. Returns the host that kept
+/// the box and the box it removed. Prints nothing.
+pub(crate) async fn typed_box_rm_on_hosts(
+    hosts: Vec<crate::cmd::list::LocalHost>,
+    args: &BoxRmArgs,
+    box_type: &str,
+    verb: &'static str,
+) -> Result<(crate::cmd::list::LocalHost, RemovedBox), anyhow::Error> {
+    let target = args.target.as_str();
+    let ResolvedBox { host, box_id } = resolve_box_of_type(hosts, target, box_type, verb).await?;
+    let removed = async {
+        let mut client = gated_box_host_client(&host).await?;
+        rm_listed_box(&mut client, box_id, target, args.force).await
+    }
+    .await;
+    let outcome = if removed.is_ok() { "ok" } else { "error" };
+    tracing::info!(verb, box_id = %box_id, outcome);
+    Ok((host, removed?))
 }
 
 #[cfg(test)]

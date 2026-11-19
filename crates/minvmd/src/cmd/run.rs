@@ -23,7 +23,28 @@ use anyhow::{Result, bail};
 use anyhow::Context as _;
 
 /// Default timeout in seconds for `run --detach` to wait for the host UDS.
-pub const DEFAULT_DETACH_TIMEOUT_SECS: u64 = 8;
+///
+/// The default budget must cover the supervisor's whole start path, not just
+/// the boot: phase 1 can first wait out [`ALIVE_LOCK_RELEASE_WAIT`] on a
+/// just-stopped daemon's alive lock, and only then spend the original
+/// readiness allowance on the boot itself. An explicit `--timeout` is a
+/// user's bound on the detach poll and is passed through unchanged, whatever
+/// it is.
+pub const DEFAULT_DETACH_TIMEOUT_SECS: u64 =
+    ALIVE_LOCK_RELEASE_WAIT_SECS + DETACH_BOOT_READINESS_SECS;
+
+/// The boot-readiness share of [`DEFAULT_DETACH_TIMEOUT_SECS`]: the poll
+/// budget the detach loop had before the alive-lock wait existed.
+const DETACH_BOOT_READINESS_SECS: u64 = 8;
+
+/// How long `minvmd run`'s first phase waits for a just-stopped supervisor to
+/// release the alive lock before bailing, in seconds. The old supervisor
+/// writes its final `Stopped` state before `min stop` returns but releases the
+/// alive lock only at process exit, so a start issued immediately after
+/// `min stop` can lose the race and must briefly wait instead of failing.
+/// The [`Duration`] form lives beside the start path; this bare count feeds
+/// [`DEFAULT_DETACH_TIMEOUT_SECS`] on every build, libkrun or not.
+const ALIVE_LOCK_RELEASE_WAIT_SECS: u64 = 10;
 
 /// Run the `run` subcommand.
 ///
@@ -137,7 +158,7 @@ fn run_supervisor(detach: bool, timeout_secs: u64, root: tracing::span::EnteredS
     paths::migrate_legacy_host_dirs(&crate::state::state_base_dir());
 
     // R2.4: fail fast with an actionable error if the hypervisor backend is
-    // unavailable (Linux: /dev/kvm). No-op on macOS. Runs in the foreground
+    // unavailable (Linux: /dev/kvm; macOS: kern.hv_support). Runs in the foreground
     // caller so the user sees the error directly, even under --detach.
     crate::cmd::ensure_hypervisor_accessible()?;
     // Likewise the sun_path limit: libkrun aborts on an over-long UDS path
@@ -292,6 +313,79 @@ fn parent_pid(pid: u32) -> Option<u32> {
     fields.next().and_then(|s| s.parse::<u32>().ok())
 }
 
+/// Moves the supervisor log of the previous start to `run.log.old`, so a
+/// failed start does not erase the story of the start before it. No log is
+/// not an error.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn keep_previous_run_log(log: &std::path::Path) -> std::io::Result<()> {
+    let mut old = log.as_os_str().to_owned();
+    old.push(".old");
+    match std::fs::rename(log, old) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+/// The text of `log` from byte `start` on, lossily decoded. A log shorter
+/// than `start` moved aside since then ([`cap_bep_log`]), so all of it is
+/// this start's. A log that cannot be read reads as empty.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn read_log_from(log: &std::path::Path, start: u64) -> String {
+    let Ok(bytes) = std::fs::read(log) else {
+        return String::new();
+    };
+    let start = usize::try_from(start)
+        .ok()
+        .filter(|&start| start <= bytes.len())
+        .unwrap_or(0);
+    String::from_utf8_lossy(&bytes[start..]).into_owned()
+}
+
+/// The most lines of the proxy's refusal that a failed start repeats.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+const BEP_REFUSAL_MAX_LINES: usize = 40;
+
+/// The refusal `bep serve` printed over an unreadable audit log, from its
+/// first line ([`bep::UNREADABLE_AUDIT_LOG_REFUSAL`]) on, when `text` holds
+/// one.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn unreadable_audit_refusal(text: &str) -> Option<String> {
+    let at = text.find(bep::UNREADABLE_AUDIT_LOG_REFUSAL)?;
+    let refusal: Vec<&str> = text[at..].lines().take(BEP_REFUSAL_MAX_LINES).collect();
+    Some(refusal.join("\n").trim_end().to_owned())
+}
+
+/// The error of a detached start whose supervisor exited before the VM was
+/// ready. When this start's proxy log or `run.log` holds the proxy's refusal
+/// over an unreadable audit log, the error repeats that refusal, which names
+/// `bep serve --quarantine-unreadable`.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn detach_failure_message(
+    status: std::process::ExitStatus,
+    run_log_path: &std::path::Path,
+    run_log: &str,
+    bep_log_path: Option<&std::path::Path>,
+    bep_log: &str,
+) -> String {
+    let head = format!(
+        "the detached supervisor exited during startup ({status}). \
+         Its error output is in {}.",
+        run_log_path.display()
+    );
+    let (refusal, source) = match unreadable_audit_refusal(bep_log) {
+        Some(refusal) => (refusal, bep_log_path.unwrap_or(run_log_path)),
+        None => match unreadable_audit_refusal(run_log) {
+            Some(refusal) => (refusal, run_log_path),
+            None => return head,
+        },
+    };
+    format!(
+        "{head}\nThe Box Egress Proxy (bep) refused to start in this start. \
+         It wrote this to {}:\n{refusal}",
+        source.display()
+    )
+}
+
 /// Spawn `minvmd run` as a detached background supervisor, then poll until
 /// the VM is serving (up to `timeout_secs`).
 #[cfg(minvmd_libkrun)]
@@ -316,6 +410,18 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
     let state_dir = crate::state::StateDir::new(crate::state::StateDir::default_path())
         .context("opening state dir")?;
     let log_path = state_dir.dir().join("run.log");
+    if let Err(error) = keep_previous_run_log(&log_path) {
+        tracing::warn!(log = %log_path.display(), %error, "could not keep the previous supervisor log");
+    }
+    // The proxy's log is appended across boots: note where this start's
+    // bytes begin, so a failure reads only what this start wrote.
+    let bep_log_path = crate::net::resolve_switch_sock()
+        .ok()
+        .map(|sock| sock.with_file_name(BEP_LOG_FILE));
+    let bep_log_start = bep_log_path
+        .as_deref()
+        .and_then(|path| std::fs::metadata(path).ok())
+        .map_or(0, |meta| meta.len());
     let log = std::fs::File::create(&log_path)
         .with_context(|| format!("creating supervisor log at {}", log_path.display()))?;
     cmd.stdin(std::process::Stdio::null())
@@ -360,11 +466,23 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
         let vmm_owned = state.vmm_pid.is_some_and(vmm_owned_by_live_supervisor);
         match classify_detach_poll(ready, child_status, daemon_alive, state.vmm_pid, vmm_owned) {
             DetachPoll::Ready => return Ok(()),
-            DetachPoll::Failed(status) => bail!(
-                "the detached supervisor exited during startup ({status}); \
-                 see {} for its error output",
-                log_path.display()
-            ),
+            DetachPoll::Failed(status) => {
+                let run_log = read_log_from(&log_path, 0);
+                let bep_log = bep_log_path
+                    .as_deref()
+                    .map(|path| read_log_from(path, bep_log_start))
+                    .unwrap_or_default();
+                bail!(
+                    "{}",
+                    detach_failure_message(
+                        status,
+                        &log_path,
+                        &run_log,
+                        bep_log_path.as_deref(),
+                        &bep_log
+                    )
+                )
+            }
             DetachPoll::LeakedVmm(pid) => bail!(
                 "the supervisor exited but a leaked __krun-vmm (pid {pid}) still holds the \
                  alive lock; run `min stop` (or `kill -9 {pid}`), then retry"
@@ -664,70 +782,71 @@ fn spawn_node_mirror(
         })
 }
 
-/// Foreground supervisor: boot the VM, manage lifecycle state, supervise until
-/// the VMM child exits.
-///
-/// `root` (the process's root span, entered) and the `supervisor.start` span
-/// under it end once the VM is ready; the rest of the VM's life runs under a
-/// `supervisor.serve` root linked to them (`telemetry::SupervisorStart`).
+/// The [`std::time::Duration`] form of [`ALIVE_LOCK_RELEASE_WAIT_SECS`],
+/// held by the start path it bounds.
 #[cfg(minvmd_libkrun)]
-fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
-    use std::io::Read as _;
-    use std::os::unix::net::UnixListener;
-    use std::path::PathBuf;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+const ALIVE_LOCK_RELEASE_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(ALIVE_LOCK_RELEASE_WAIT_SECS);
 
-    use minimald_rpc::ProxyDownCause;
+/// Poll interval for that wait: each attempt re-takes the lifecycle lock and
+/// re-reads state, so a transition to Running/Starting is seen promptly.
+#[cfg(any(minvmd_libkrun, test))]
+const ALIVE_LOCK_RELEASE_POLL: std::time::Duration = std::time::Duration::from_millis(200);
 
-    use crate::cmd::MARKER_SOCK_ENV;
-    use crate::image::resolve_boot_images;
+/// Acquire the alive lock for a start, waiting (bounded) when a stopped or
+/// stopping daemon still holds it, then reject a live minimald and commit the
+/// Stopped → Starting transition. On any other lifecycle the caller's bail
+/// messages are preserved verbatim.
+#[cfg(any(minvmd_libkrun, test))]
+fn acquire_alive_lock_for_start(
+    state_dir: &crate::state::StateDir,
+    lock_wait: std::time::Duration,
+) -> Result<crate::state::AliveLock> {
+    use anyhow::Context as _;
+
     use crate::lifecycle::{Action, Lifecycle, next_state};
-    use crate::net::answerer::DEFAULT_ANSWERER_PORT;
-    use crate::state::{StartingGuard, State, StateDir};
+    use crate::state::State;
 
-    // One span per supervisor phase, like minimald's per-connection `conn`
-    // span: every record the supervisor emits carries `vm`, so a detached
-    // supervisor's lines in the shared log (`<state>/logs/minvmd.log`, common
-    // to every VM on the host) stay attributable once a second VM runs —
-    // grep instead of manual fields on each line. This one, `supervisor.start`,
-    // is the parent of the switch start and of `vm.boot` (and so of the guest's
-    // `guest.ready`), and ends with the process root at READY below.
-    let start_phase = crate::telemetry::SupervisorStart::enter(root);
-
-    // Fail-fast: resolve paths before touching lifecycle state.
-    // (UDS path lengths were already checked in `run_supervisor`.)
-    let (_kernel, _rootfs, _initramfs) =
-        resolve_boot_images().context("resolving boot image paths")?;
-
-    let state_dir = StateDir::new(StateDir::default_path()).context("opening state dir")?;
-
-    // ── Phase 1: Stopped → Starting (under lock) ───────────────────────────
-    // The alive lock outlives the block: held for the whole supervisor life
-    // and inherited by the VMM child, so observers can tell a live daemon/VM
-    // from stale state.
-    let alive_lock;
-    {
+    let mut logged_wait = false;
+    let deadline = std::time::Instant::now() + lock_wait;
+    loop {
         let mut lock = state_dir
             .lifecycle_lock()
             .context("opening lifecycle lock")?;
         let _guard = lock.write().context("acquiring lifecycle write lock")?;
         let state = state_dir.read_state().context("reading state")?;
 
-        alive_lock = match state_dir
+        let acquired = state_dir
             .try_acquire_alive_lock()
-            .context("acquiring alive lock")?
-        {
+            .context("acquiring alive lock")?;
+
+        let alive_lock = match acquired {
             Some(l) => l,
-            None => match state.lifecycle {
-                Lifecycle::Running => {
-                    bail!("minvmd is already running (vmm_pid={:?})", state.vmm_pid)
+            None => {
+                let waits = matches!(state.lifecycle, Lifecycle::Stopped | Lifecycle::Stopping);
+                if !waits || std::time::Instant::now() >= deadline {
+                    match state.lifecycle {
+                        Lifecycle::Running => {
+                            bail!("minvmd is already running (vmm_pid={:?})", state.vmm_pid)
+                        }
+                        Lifecycle::Starting => bail!("minvmd is already starting"),
+                        Lifecycle::Stopping => {
+                            bail!("minvmd is stopping; wait for it to finish before restarting")
+                        }
+                        _ => bail!("another minvmd (a `boot` VM?) holds the alive lock"),
+                    }
                 }
-                Lifecycle::Starting => bail!("minvmd is already starting"),
-                Lifecycle::Stopping => {
-                    bail!("minvmd is stopping; wait for it to finish before restarting")
+                drop(_guard);
+                drop(lock);
+                if !logged_wait {
+                    logged_wait = true;
+                    tracing::info!(
+                        "a stopped daemon still holds the alive lock; waiting for its release"
+                    );
                 }
-                _ => bail!("another minvmd (a `boot` VM?) holds the alive lock"),
-            },
+                std::thread::sleep(ALIVE_LOCK_RELEASE_POLL);
+                continue;
+            }
         };
 
         // Both backends bind the same ssh.sock; don't steal a live native
@@ -762,7 +881,51 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
                 ..State::stopped()
             })
             .context("writing Starting state")?;
+
+        return Ok(alive_lock);
     }
+}
+
+/// Foreground supervisor: boot the VM, manage lifecycle state, supervise until
+/// the VMM child exits.
+///
+/// `root` (the process's root span, entered) and the `supervisor.start` span
+/// under it end once the VM is ready; the rest of the VM's life runs under a
+/// `supervisor.serve` root linked to them (`telemetry::SupervisorStart`).
+#[cfg(minvmd_libkrun)]
+fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
+    use std::io::Read as _;
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use minimald_rpc::ProxyDownCause;
+
+    use crate::cmd::MARKER_SOCK_ENV;
+    use crate::image::resolve_boot_images;
+    use crate::lifecycle::{Action, Lifecycle, next_state};
+    use crate::net::answerer::DEFAULT_ANSWERER_PORT;
+    use crate::state::{StartingGuard, State, StateDir};
+    // One span per supervisor phase, like minimald's per-connection `conn`
+    // span: every record the supervisor emits carries `vm`, so a detached
+    // supervisor's lines in the shared log (`<state>/logs/minvmd.log`, common
+    // to every VM on the host) stay attributable once a second VM runs —
+    // grep instead of manual fields on each line. This one, `supervisor.start`,
+    // is the parent of the switch start and of `vm.boot` (and so of the guest's
+    // `guest.ready`), and ends with the process root at READY below.
+    let start_phase = crate::telemetry::SupervisorStart::enter(root);
+
+    // Fail-fast: resolve paths before touching lifecycle state.
+    // (UDS path lengths were already checked in `run_supervisor`.)
+    let (_kernel, _rootfs, _initramfs) =
+        resolve_boot_images().context("resolving boot image paths")?;
+
+    let state_dir = StateDir::new(StateDir::default_path()).context("opening state dir")?;
+
+    // ── Phase 1: Stopped → Starting (under lock) ───────────────────────────
+    // The alive lock is held for the whole supervisor life and inherited by
+    // the VMM child, so observers can tell a live daemon/VM from stale state.
+    let alive_lock = acquire_alive_lock_for_start(&state_dir, ALIVE_LOCK_RELEASE_WAIT)?;
 
     // StartingGuard: resets lifecycle to Stopped on drop if we bail before
     // committing (R4.6). Holds no lock so concurrent readers observe the
@@ -1170,10 +1333,16 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
             }
             // The wire the peer carries: the acceptor's socket, this boot's
             // token, and the per-source cap that is each registered box's
-            // share of the pool. The default cap is the recorded working
-            // value (spec NET-132), named here so the two cannot drift.
-            let wire = switch::bep_host::BepWire::new(proxy_sock, token)
-                .with_per_source_cap(switch::bep_host::DEFAULT_PER_SOURCE_CAP);
+            // share of the pool. The cap resolves from the env override,
+            // then `config.toml`, then the recorded default (spec NET-132).
+            let (per_box_cap, per_box_cap_source) = crate::cmd::effective_bep_per_box_cap();
+            tracing::info!(
+                per_box_cap,
+                source = per_box_cap_source.label(),
+                "Box Egress Proxy per-box connection cap"
+            );
+            let wire =
+                switch::bep_host::BepWire::new(proxy_sock, token).with_per_source_cap(per_box_cap);
             // The stand-in binds before it returns, so it listens for the
             // boot's life. The proxy listens only once its watcher sees its
             // socket, and stops with its exit.
@@ -2683,9 +2852,21 @@ struct NodePortAssignment {
 /// answerer port would be an admitted port with nothing behind it.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn assign_node_proxy_port(dir: &std::path::Path) -> Result<NodePortAssignment> {
+    assign_node_proxy_port_from(dir, NODE_DEFAULT_PROXY_PORT)
+}
+
+/// [`assign_node_proxy_port`] with the preferred port passed in. The
+/// supervisor passes [`NODE_DEFAULT_PROXY_PORT`]; a unit test passes a port
+/// it holds itself, so the draw never binds or dials the host's real 7654,
+/// which a running daemon or a session e2e beside the test may own.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn assign_node_proxy_port_from(
+    dir: &std::path::Path,
+    preferred: u16,
+) -> Result<NodePortAssignment> {
     let proxy = match node_port_override(crate::vm::NODE_PROXY_PORT_ENV)? {
         Some(proxy) => configured_node_port(dir, proxy)?,
-        None => assign_node_port(dir, NODE_DEFAULT_PROXY_PORT, false)?,
+        None => assign_node_port(dir, preferred, false)?,
     };
     log_node_port_assignment(&proxy);
     Ok(proxy)
@@ -4001,6 +4182,85 @@ mod tests {
         );
     }
 
+    // D1229: a detached start that fails after the proxy refused an
+    // unreadable audit log repeats that refusal, which names the flag that
+    // moves the unreadable segments aside.
+    #[test]
+    fn detach_failure_names_quarantine_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let bep_log = dir.path().join(super::BEP_LOG_FILE);
+        std::fs::write(&bep_log, "an earlier boot's line\n").unwrap();
+        let start = std::fs::metadata(&bep_log).unwrap().len();
+        let refusal = format!(
+            "{}\nThe audit log has 1 line that bep cannot read, in:\n  /a/audit-0.jsonl\n\
+             To move that segment into /a/quarantine and start, \
+             run `bep serve` again with `--quarantine-unreadable`.\n",
+            bep::UNREADABLE_AUDIT_LOG_REFUSAL
+        );
+        let mut text = std::fs::read_to_string(&bep_log).unwrap();
+        text.push_str("ERROR refused the start\n");
+        text.push_str(&refusal);
+        std::fs::write(&bep_log, text).unwrap();
+        let run_log = dir.path().join("run.log");
+
+        let this_start = super::read_log_from(&bep_log, start);
+        assert!(!this_start.contains("an earlier boot"), "{this_start}");
+        let message =
+            super::detach_failure_message(exited(1), &run_log, "", Some(&bep_log), &this_start);
+        assert!(
+            message.contains(&run_log.display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains("refused to start"), "{message}");
+        assert!(
+            message.contains(bep::UNREADABLE_AUDIT_LOG_REFUSAL),
+            "{message}"
+        );
+        assert!(message.contains("`bep serve`"), "{message}");
+        assert!(message.contains("--quarantine-unreadable"), "{message}");
+        assert!(
+            message.contains(&bep_log.display().to_string()),
+            "{message}"
+        );
+
+        // The refusal found in run.log is named there too.
+        let from_run = super::detach_failure_message(exited(1), &run_log, &refusal, None, "");
+        assert!(from_run.contains("--quarantine-unreadable"), "{from_run}");
+
+        // A failure with no refusal in either log says nothing of the proxy.
+        let plain = super::detach_failure_message(exited(1), &run_log, "boom", Some(&bep_log), "");
+        assert!(!plain.contains("quarantine"), "{plain}");
+        assert!(plain.contains("exited during startup"), "{plain}");
+
+        // A log shorter than its start offset moved aside: all of it counts.
+        assert_eq!(
+            super::read_log_from(&bep_log, u64::MAX).len(),
+            std::fs::metadata(&bep_log).unwrap().len() as usize
+        );
+    }
+
+    // D1229: a new detached start keeps the previous start's run.log.
+    #[test]
+    fn detach_start_keeps_previous_run_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("run.log");
+        super::keep_previous_run_log(&log).expect("no log is not an error");
+        assert!(!dir.path().join("run.log.old").exists());
+        std::fs::write(&log, "the previous start").unwrap();
+        super::keep_previous_run_log(&log).unwrap();
+        assert!(!log.exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("run.log.old")).unwrap(),
+            "the previous start"
+        );
+        std::fs::write(&log, "the next start").unwrap();
+        super::keep_previous_run_log(&log).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("run.log.old")).unwrap(),
+            "the next start"
+        );
+    }
+
     #[test]
     fn detach_poll_ready_predicate_wins_over_child_exit() {
         // The child exited, but the readiness predicate already holds: the VM
@@ -4192,14 +4452,27 @@ mod tests {
         // the TCP probe refuses nothing that is actually free, so a lone VM
         // still lands on the default proxy port — the case the session e2e's
         // hardcoded 7654 depends on.
-        let freed = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
-        let free = freed.local_addr().unwrap().port();
-        drop(freed);
+        // The port is released before the draw probes it, so another
+        // process on the host can take it in between (#2653): a skip is
+        // that lost race only while the port is held again, so the draw
+        // asks for a fresh port then, and a skip of a port nothing holds
+        // fails at once.
+        let mut handed = None;
+        for _ in 0..NODE_PORT_RACE_ATTEMPTS {
+            let freed = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+            let free = freed.local_addr().unwrap().port();
+            drop(freed);
+            let assigned = super::assign_node_port(ports.path(), free, false).unwrap();
+            if assigned.port == free || super::tcp_bind_probe(free).is_ok() {
+                handed = Some((free, assigned));
+                break;
+            }
+        }
+        let (free, assigned) = handed.expect("a released port stays free for one draw");
         assert!(
             !super::loopback_answers(free),
             "the loopback probe leaves a free port alone"
         );
-        let assigned = super::assign_node_port(ports.path(), free, false).unwrap();
         assert_eq!(
             assigned.port, free,
             "a free preferred port is handed unchanged"
@@ -4214,11 +4487,22 @@ mod tests {
         );
 
         // The answerer's UDP probe is unchanged by the TCP probe's second
-        // check: a free UDP port is handed as asked.
-        let freed_udp = std::net::UdpSocket::bind(("0.0.0.0", 0)).unwrap();
-        let free_udp = freed_udp.local_addr().unwrap().port();
-        drop(freed_udp);
-        let assigned_udp = super::assign_node_port(ports.path(), free_udp, true).unwrap();
+        // check: a free UDP port is handed as asked, under the same race.
+        let mut handed_udp = None;
+        for _ in 0..NODE_PORT_RACE_ATTEMPTS {
+            let freed_udp = std::net::UdpSocket::bind(("0.0.0.0", 0)).unwrap();
+            let free_udp = freed_udp.local_addr().unwrap().port();
+            drop(freed_udp);
+            let assigned_udp = super::assign_node_port(ports.path(), free_udp, true).unwrap();
+            if assigned_udp.port == free_udp
+                || std::net::UdpSocket::bind(("0.0.0.0", free_udp)).is_ok()
+            {
+                handed_udp = Some((free_udp, assigned_udp));
+                break;
+            }
+        }
+        let (free_udp, assigned_udp) =
+            handed_udp.expect("a released UDP port stays free for one draw");
         assert_eq!(
             assigned_udp.port, free_udp,
             "a free UDP preferred port is handed unchanged"
@@ -4374,8 +4658,15 @@ mod tests {
         // whatever the host picked, it is a real port the guest can bind as
         // handed (the cmdline and bind halves are the vm.rs and minimald
         // tests of the same name).
-        let assigned = super::assign_node_proxy_port(ports.path()).unwrap();
+        // Preferred at the port this test still holds, never the real
+        // default: a running daemon or a session e2e may own 7654 on this
+        // host, and the draw's probes would bind and dial it.
+        let assigned = super::assign_node_proxy_port_from(ports.path(), busy).unwrap();
         assert!(assigned.port != 0, "the node's proxy port is assigned");
+        assert_ne!(
+            assigned.port, busy,
+            "the proxy assignment skips a held preferred port like any draw"
+        );
 
         // The answerer's probe is the same default-first over UDP, held on
         // the same wildcard the UDP probe addresses.
@@ -4490,9 +4781,62 @@ mod tests {
             crate::control::PublishDecision::FailStart { port, .. } if port == pin
         ));
         // Once the holder exits, the watcher's check passes and takes the
-        // reservation.
+        // reservation. The pin is the first question: a regression in
+        // reclaiming a just-released pin fails here. Another test in the
+        // process can take the released pin before the check probes it, and
+        // the check then correctly answers Skip; only then does the test fall
+        // back to fresh freed ports for the remaining attempts, which prove
+        // the same reclaim on a port nothing raced for. The check folds every
+        // refusal into the same None, so each fallback waits for the pin's
+        // own verdict to name the race: a bind refusal or a loopback answer
+        // is another test holding the freed pin, while the pin's reservation
+        // still held — the assignment carried none to leak — or the probe's
+        // own error is a regression no fresh port may paper over.
         drop(held);
-        assert!(super::proxy_reclaim_check(ports.path().to_path_buf())(pin).is_some());
+        let check = |port| super::proxy_reclaim_check(ports.path().to_path_buf())(port);
+        let mut reclaimed = check(pin);
+        let mut fresh_attempts = 0;
+        while reclaimed.is_none() && fresh_attempts < NODE_PORT_RACE_ATTEMPTS {
+            match super::candidate_verdict(ports.path(), pin, false, &super::node_port_probe(false))
+            {
+                // The race this retry exists for: a parallel test holds the
+                // freed pin, so the fallback asks a fresh port instead.
+                super::CandidateCheck::Skip(super::SKIP_BIND_REFUSED)
+                | super::CandidateCheck::Skip(super::SKIP_LOOPBACK_ANSWERING) => {}
+                // The parallel test released the pin between the check's
+                // probe and this one: ask the check itself again, so only a
+                // reservation the check took satisfies the assertion. The
+                // verdict's own reservation goes first — its flock is the
+                // one the retry's take contends with, so keeping it makes
+                // the retry skip the very pin the verdict just proved free.
+                // The verdict names the race; it never stands in for the
+                // check's answer, or a check that always fails would pass
+                // here.
+                super::CandidateCheck::Free(reservation) => {
+                    drop(reservation);
+                    reclaimed = check(pin);
+                    if reclaimed.is_some() {
+                        break;
+                    }
+                }
+                super::CandidateCheck::Skip(reason) => {
+                    panic!("the released pin {pin} was not reclaimed: {reason}")
+                }
+                super::CandidateCheck::Error(error) => {
+                    panic!("probing the released pin {pin} errored: {error:#}")
+                }
+            }
+            fresh_attempts += 1;
+            let freed = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let free = freed.local_addr().unwrap().port();
+            drop(freed);
+            reclaimed = check(free);
+        }
+        assert!(
+            reclaimed.is_some(),
+            "the watcher takes neither the released pin {pin} (another test took it in \
+             the window) nor any of {fresh_attempts} fresh freed ports after it"
+        );
 
         let reserved = crate::net::answerer::DEFAULT_ANSWERER_PORT;
         let err = super::configured_node_port(ports.path(), reserved)
@@ -4513,22 +4857,35 @@ mod tests {
     /// e2e lanes check it.
     #[test]
     fn node_port_draw_skips_a_held_preferred_port_and_hands_it_back_once_released() {
-        // The preferred port: hold it on the loopback the TCP probe
-        // addresses, so the first draw sees it refused.
-        let stale = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let default = stale.local_addr().unwrap().port();
         let ports = tempfile::tempdir().expect("a test reservation dir");
-        let drawn_before = super::assign_node_port(ports.path(), default, false).unwrap();
-        assert_eq!(drawn_before.preferred, default);
-        assert_eq!(drawn_before.skipped, Some(super::SKIP_BIND_REFUSED));
-        assert_ne!(
-            drawn_before.port, default,
-            "the held default is not handed to the proxy"
-        );
+        // Released, the port is anyone's on the host until the second draw
+        // probes it (#2653): a second draw that skips a port something holds
+        // again lost that race, so the whole round runs again on a fresh
+        // port. A skip of a port nothing holds fails at once.
+        let mut handed_back = None;
+        for _ in 0..NODE_PORT_RACE_ATTEMPTS {
+            // The preferred port: hold it on the loopback the TCP probe
+            // addresses, so the first draw sees it refused.
+            let stale = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let default = stale.local_addr().unwrap().port();
+            let drawn_before = super::assign_node_port(ports.path(), default, false).unwrap();
+            assert_eq!(drawn_before.preferred, default);
+            assert_eq!(drawn_before.skipped, Some(super::SKIP_BIND_REFUSED));
+            assert_ne!(
+                drawn_before.port, default,
+                "the held default is not handed to the proxy"
+            );
 
-        // Release the holder, and the same draw hands the port back.
-        drop(stale);
-        let drawn_after = super::assign_node_port(ports.path(), default, false).unwrap();
+            // Release the holder, and the same draw hands the port back.
+            drop(stale);
+            let drawn_after = super::assign_node_port(ports.path(), default, false).unwrap();
+            if drawn_after.port == default || super::tcp_bind_probe(default).is_ok() {
+                handed_back = Some((default, drawn_after));
+                break;
+            }
+        }
+        let (default, drawn_after) =
+            handed_back.expect("a released preferred port stays free for one draw");
         assert_eq!(drawn_after.port, default);
         assert_eq!(drawn_after.skipped, None);
     }
@@ -4717,16 +5074,20 @@ mod tests {
             &first
         };
         // The loser's skip reason is whichever check it lost to: the
-        // reservation when both walks' probes passed, or a bind probe that
+        // reservation when both walks' probes passed, a bind probe that
         // collided with the winner's own probe — which holds the port
-        // momentarily. Both are the draw telling the host why it moved on;
-        // the invariant the test owns is the one above: the two walks never
-        // share a port, and the reservation (the test below) is what keeps
-        // it that way when the probes both pass.
+        // momentarily — or the loopback probe finding the winner's own
+        // listener answering in that same window. All three are the draw
+        // telling the host why it moved on; the invariant the test owns is
+        // the one above: the two walks never share a port, and the
+        // reservation (the test below) is what keeps it that way when the
+        // probes both pass.
         assert!(
             matches!(
                 loser.skipped,
-                Some(super::SKIP_RESERVED_BY_ANOTHER_VM) | Some(super::SKIP_BIND_REFUSED)
+                Some(super::SKIP_RESERVED_BY_ANOTHER_VM)
+                    | Some(super::SKIP_BIND_REFUSED)
+                    | Some(super::SKIP_LOOPBACK_ANSWERING)
             ),
             "the draw that moved on says why, got {:?}",
             loser.skipped
@@ -5594,6 +5955,130 @@ mod tests {
                 "an open mirror allocates nothing"
             )),
             None
+        );
+    }
+
+    /// A stopping daemon releases the alive lock only at process exit, which
+    /// trails the `Stopped` state write that `min stop` already returned on,
+    /// so a start issued right after `min stop` races it. The first phase
+    /// must wait (bounded) for that release instead of bailing.
+    #[test]
+    fn start_waits_for_a_stopped_daemons_alive_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sd = crate::state::StateDir::new(tmp.path().to_path_buf()).unwrap();
+        sd.write_state(&crate::state::State::stopped()).unwrap();
+        let held = sd.try_acquire_alive_lock().unwrap().expect("acquire");
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(held);
+        });
+
+        // Hold the acquired lock while asserting, then let it drop with the
+        // test's scope.
+        let _alive =
+            super::acquire_alive_lock_for_start(&sd, std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            sd.read_state().unwrap().lifecycle,
+            crate::lifecycle::Lifecycle::Starting
+        );
+        releaser.join().expect("releaser");
+    }
+
+    /// The wait is bounded: a Stopped daemon that never releases the lock
+    /// still bails with the alive-lock message.
+    #[test]
+    fn start_stops_waiting_for_an_alive_lock_that_never_frees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sd = crate::state::StateDir::new(tmp.path().to_path_buf()).unwrap();
+        sd.write_state(&crate::state::State::stopped()).unwrap();
+        let _held = sd.try_acquire_alive_lock().unwrap().expect("acquire");
+
+        let err = super::acquire_alive_lock_for_start(&sd, std::time::Duration::from_millis(200))
+            .err()
+            .expect("a Stopped daemon that never frees the lock must refuse the start");
+        assert!(
+            err.to_string()
+                .contains("another minvmd (a `boot` VM?) holds the alive lock"),
+            "got: {err}"
+        );
+    }
+
+    /// A Stopping daemon that never releases the lock bails with the
+    /// stopping message once the wait expires.
+    #[test]
+    fn start_stops_waiting_for_a_stopping_daemon() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sd = crate::state::StateDir::new(tmp.path().to_path_buf()).unwrap();
+        sd.write_state(&crate::state::State {
+            lifecycle: crate::lifecycle::Lifecycle::Stopping,
+            vmm_pid: Some(999_999_999),
+            ..crate::state::State::stopped()
+        })
+        .unwrap();
+        let _held = sd.try_acquire_alive_lock().unwrap().expect("acquire");
+
+        let err = super::acquire_alive_lock_for_start(&sd, std::time::Duration::from_millis(200))
+            .err()
+            .expect("a Stopping daemon that never frees the lock must refuse the start");
+        assert!(
+            err.to_string()
+                .contains("minvmd is stopping; wait for it to finish before restarting"),
+            "got: {err}"
+        );
+    }
+
+    /// A Running daemon holding the lock is not waited for: the start bails
+    /// immediately with the running message.
+    #[test]
+    fn start_does_not_wait_for_a_running_daemon() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sd = crate::state::StateDir::new(tmp.path().to_path_buf()).unwrap();
+        sd.write_state(&crate::state::State {
+            lifecycle: crate::lifecycle::Lifecycle::Running,
+            vmm_pid: Some(42),
+            started_at: Some(0),
+            ..crate::state::State::stopped()
+        })
+        .unwrap();
+        let _held = sd.try_acquire_alive_lock().unwrap().expect("acquire");
+
+        let started = std::time::Instant::now();
+        let err = super::acquire_alive_lock_for_start(&sd, std::time::Duration::from_secs(5))
+            .err()
+            .expect("a Running daemon must refuse the start");
+        assert!(
+            err.to_string().contains("minvmd is already running"),
+            "got: {err}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "a Running daemon must not be waited for"
+        );
+    }
+
+    /// The default detach budget must cover the supervisor's whole start
+    /// path: the alive-lock wait a start after `min stop` can spend in
+    /// phase 1, plus the boot-readiness allowance the detach poll had
+    /// before that wait existed. A default shorter than the wait lets the
+    /// parent report a timeout while the child is still waiting on the
+    /// lock — after which the child acquires it and boots the VM the
+    /// caller was told failed.
+    #[test]
+    fn default_detach_budget_covers_the_alive_lock_wait_plus_boot() {
+        let default = super::DEFAULT_DETACH_TIMEOUT_SECS;
+        let lock_wait = super::ALIVE_LOCK_RELEASE_WAIT_SECS;
+        let boot_readiness = super::DETACH_BOOT_READINESS_SECS;
+        assert!(
+            default > lock_wait,
+            "the default detach budget ({default}) must exceed the alive-lock wait \
+             ({lock_wait}) so a delayed release cannot outlast it"
+        );
+        assert_eq!(
+            default,
+            lock_wait + boot_readiness,
+            "the default detach budget must be the alive-lock wait plus the \
+             boot-readiness allowance"
         );
     }
 }

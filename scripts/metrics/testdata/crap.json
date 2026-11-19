@@ -1,0 +1,81 @@
+{
+  "$schema": "https://raw.githubusercontent.com/minikin/cargo-crap/main/schemas/report-v1.json",
+  "version": "0.7.0",
+  "entries": [
+    {
+      "file": "/x/crates/graph/src/wire.rs",
+      "function": "read_frames",
+      "line": 70,
+      "cyclomatic": 7.0,
+      "coverage": 0.0,
+      "crap": 48.2,
+      "crate": "graph",
+      "uncovered": [{"start": 70, "end": 82}]
+    },
+    {
+      "file": "/x/crates/graph/src/wire.rs",
+      "function": "decode_header",
+      "line": 38,
+      "cyclomatic": 6.0,
+      "coverage": 20.0,
+      "crap": 31.5,
+      "crate": "graph",
+      "uncovered": [{"start": 44, "end": 51}]
+    },
+    {
+      "file": "/x/crates/graph/src/plan.rs",
+      "function": "order",
+      "line": 12,
+      "cyclomatic": 5.0,
+      "coverage": 25.0,
+      "crap": 30.0,
+      "crate": "graph",
+      "uncovered": [{"start": 14, "end": 20}]
+    },
+    {
+      "file": "/x/crates/graph/src/lib.rs",
+      "function": "new",
+      "line": 5,
+      "cyclomatic": 1.0,
+      "coverage": 100.0,
+      "crap": 1.0,
+      "crate": "graph"
+    },
+    {
+      "file": "/x/crates/graph/tests/it.rs",
+      "function": "round_trips",
+      "line": 3,
+      "cyclomatic": 4.0,
+      "coverage": 0.0,
+      "crap": 20.0,
+      "crate": "graph",
+      "uncovered": [{"start": 3, "end": 9}]
+    },
+    {
+      "file": "/x/crates/decode/src/lib.rs",
+      "function": "eval",
+      "line": 18,
+      "cyclomatic": 3.0,
+      "coverage": 50.0,
+      "crap": 12.0,
+      "crate": "decode",
+      "uncovered": [{"start": 24, "end": 29}]
+    },
+    {
+      "file": "/x/crates/decode/src/lib.rs",
+      "function": "is_hidden",
+      "line": 33,
+      "cyclomatic": 1.0,
+      "coverage": 100.0,
+      "crap": 1.0,
+      "crate": "decode"
+    }
+  ],
+  "diagnostics": {
+    "analyzed_files": 4,
+    "lcov_files": 4,
+    "matched_files": 4,
+    "source_only": {"count": 0, "examples": []},
+    "lcov_only": {"count": 0, "examples": []}
+  }
+}

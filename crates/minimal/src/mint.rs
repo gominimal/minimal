@@ -84,6 +84,145 @@ pub fn control_path() -> Option<PathBuf> {
     std::env::home_dir().map(|home| home.join(".minimal/bep/control.sock"))
 }
 
+/// How much of the end of `bep.log` [`last_error_line`] reads.
+const LOG_TAIL_BYTES: u64 = 64 * 1024;
+
+/// The longest error line a refusal quotes, in characters.
+const ERROR_LINE_CHARS: usize = 300;
+
+/// The error that ends the proxy's log at `log`, or `None` when the file
+/// is not read or this run of the proxy did not end in an error.
+///
+/// `bep.log` keeps the records of earlier runs, so only the end of the
+/// log counts. When `control` is the socket file that the last `bep serve`
+/// made as it started to listen, its modification time is where that run
+/// starts: records time-stamped before it, and the lines before the first
+/// record after it, belong to earlier runs and are not read. With no such
+/// file, the start is not known, and only the end-of-log rule applies.
+///
+/// When the last `tracing` record is an `ERROR`, its text after the level
+/// is kept, with the lines with no level after it as part of it, joined by
+/// spaces. After any other record, lines with no level are what `bep`
+/// printed when it stopped, and the first of them is kept, so the tail of
+/// a backtrace is not quoted. An `INFO`, `WARN`, `DEBUG` or `TRACE` record
+/// with no such lines after it gives `None`: an error before it did not
+/// stop the proxy. Colour codes are removed, and other control characters
+/// are escaped.
+pub(crate) fn last_error_line(log: &Path, control: Option<&Path>) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(log).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(LOG_TAIL_BYTES)))
+        .ok()?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail).ok()?;
+    let tail = String::from_utf8_lossy(&tail);
+    let since = control
+        .and_then(|control| std::fs::symlink_metadata(control).ok())
+        .and_then(|meta| meta.modified().ok())
+        .map(run_start_stamp);
+    let line = final_error(&tail, since.as_deref())?;
+    let line: String = line
+        .chars()
+        .flat_map(|c| {
+            if c.is_control() {
+                c.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![c]
+            }
+        })
+        .take(ERROR_LINE_CHARS)
+        .collect();
+    (!line.is_empty()).then_some(line)
+}
+
+/// The length of a `tracing` time stamp to the second:
+/// `YYYY-MM-DDTHH:MM:SS`.
+const STAMP_LEN: usize = 19;
+
+/// `at` in UTC to the second, in the form that starts a `tracing` record,
+/// so the two compare as strings.
+pub(crate) fn run_start_stamp(at: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(at)
+        .format("%Y-%m-%dT%H:%M:%S")
+        .to_string()
+}
+
+/// The time stamp, to the second, that starts `line`, when it has one.
+fn record_stamp(line: &str) -> Option<&str> {
+    let word = line.split_whitespace().next()?;
+    let stamp = word.get(..STAMP_LEN)?;
+    let shape = stamp.bytes().enumerate().all(|(i, b)| match i {
+        4 | 7 => b == b'-',
+        10 => b == b'T',
+        13 | 16 => b == b':',
+        _ => b.is_ascii_digit(),
+    });
+    shape.then_some(stamp)
+}
+
+/// The error that ends `tail`, a run of log lines, as [`last_error_line`]
+/// describes it, before its characters are escaped. `since` is the start
+/// of this run as [`run_start_stamp`] gives it: the lines before the first
+/// record stamped at or after it are not read, and with no such record
+/// nothing is.
+fn final_error(tail: &str, since: Option<&str>) -> Option<String> {
+    const LEVELS: [&str; 5] = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"];
+    let lines: Vec<String> = tail
+        .lines()
+        .map(strip_ansi)
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let start = match since {
+        Some(since) => lines
+            .iter()
+            .position(|line| record_stamp(line).is_some_and(|stamp| stamp >= since))?,
+        None => 0,
+    };
+    let lines = &lines[start..];
+    let level = |line: &str| {
+        line.split_whitespace()
+            .take(3)
+            .find(|word| LEVELS.contains(word))
+            .map(str::to_owned)
+    };
+    let last = lines.iter().rposition(|line| level(line).is_some());
+    let Some(last) = last else {
+        return lines.first().map(|line| line.trim().to_owned());
+    };
+    let after = &lines[last + 1..];
+    if level(&lines[last]).as_deref() == Some("ERROR") {
+        let (_, text) = lines[last].split_once("ERROR")?;
+        let parts: Vec<&str> = std::iter::once(text.trim())
+            .chain(after.iter().map(|line| line.trim()))
+            .filter(|part| !part.is_empty())
+            .collect();
+        return Some(parts.join(" "));
+    }
+    after.first().map(|line| line.trim().to_owned())
+}
+
+/// `line` with its ANSI colour sequences (`ESC [ ... letter`) removed.
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.clone().next() == Some('[') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Why a box's members were not minted, or the box was not registered.
 #[derive(Debug)]
 pub enum MintError {
@@ -104,6 +243,11 @@ pub enum MintError {
         path: PathBuf,
         /// Why.
         error: io::Error,
+        /// The proxy's log file, `bep.log`, when the caller knows it and
+        /// it exists.
+        log: Option<PathBuf>,
+        /// The last error line in that log, when it has one.
+        last_error: Option<String>,
     },
     /// The control socket connection failed during a request.
     Control(io::Error),
@@ -195,6 +339,25 @@ impl fmt::Display for StoreOnlyMintError {
 impl std::error::Error for StoreOnlyMintError {}
 
 impl MintError {
+    /// Gives a [`MintError::NotRunning`] the proxy's log at `log`, when that
+    /// file exists, and its last error line. Other errors are unchanged.
+    #[must_use]
+    pub(crate) fn with_proxy_log(self, log: Option<&Path>) -> Self {
+        match self {
+            Self::NotRunning { path, error, .. } => {
+                let log = log.filter(|log| log.exists());
+                let last_error = log.and_then(|log| last_error_line(log, Some(&path)));
+                Self::NotRunning {
+                    path,
+                    error,
+                    log: log.map(Path::to_owned),
+                    last_error,
+                }
+            }
+            other => other,
+        }
+    }
+
     /// The error's text. `stored` says the box declares store references
     /// only, so the text names no GitHub grant.
     fn write_for(&self, f: &mut fmt::Formatter<'_>, stored: bool) -> fmt::Result {
@@ -226,12 +389,23 @@ impl MintError {
             Self::Identity { error, .. } => {
                 write!(f, "Cannot start the box: it declares {declares}. {error}")
             }
-            Self::NotRunning { path, error } => write!(
-                f,
-                "Cannot start the box: it declares {declares}, and the Box Egress Proxy \
-                 does not answer on {}: {error}.",
-                path.display()
-            ),
+            Self::NotRunning {
+                path,
+                error,
+                log,
+                last_error,
+            } => {
+                write!(
+                    f,
+                    "Cannot start the box: it declares {declares}, and the Box Egress Proxy \
+                     does not answer on {}: {error}.",
+                    path.display()
+                )?;
+                if let Some(log) = log {
+                    write!(f, " The proxy's log is at {}.", log.display())?;
+                }
+                boxes::core::bep::write_restart_step(f, last_error.as_deref())
+            }
             Self::Control(error) => write!(
                 f,
                 "Cannot start the box: the connection to the Box Egress Proxy failed: {error}."
@@ -941,6 +1115,8 @@ impl ControlClient {
         let not_running = |error| MintError::NotRunning {
             path: path.to_owned(),
             error,
+            log: None,
+            last_error: None,
         };
         let stream = UnixStream::connect(path).map_err(not_running)?;
         stream
@@ -1828,6 +2004,7 @@ mod tests {
         PublishedKey {
             public: URL_SAFE_NO_PAD.encode(key.to_sec1_bytes()),
             kid: key.kid(),
+            store: None,
         }
     }
 

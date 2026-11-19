@@ -347,6 +347,19 @@ impl EnvChannel<'_> {
             }
             Some((t, g)) => (t, g),
         };
+        // The same `[patches]` gate `mip run <task>` applies, before the
+        // task's patches reach `make_env` (inbox#1128): a nested `run` is
+        // another way to run a project task by name, and without the gate a
+        // task with no patches could run one that has them, past the policy.
+        let task = match crate::gate_task_patches(&build_ctx, task_name, task) {
+            Err(e) => return EnvChannel::write_error(e, stream),
+            Ok(gated) => {
+                if let Some(notice) = gated.ignored_notice(task_name) {
+                    writeln!(stream, "msg:{notice}").ok();
+                }
+                gated.task
+            }
+        };
         let parsed_args = if !task.args.is_empty() {
             Some(match task.args.parse(args) {
                 Err(e) => {
@@ -1496,16 +1509,38 @@ impl<'a> Env<'a> {
         W1: tokio::io::AsyncWrite + Unpin + Send,
         W2: tokio::io::AsyncWrite + Unpin + Send,
     {
+        self.run_with_options(
+            invocations,
+            stdout_writer,
+            stderr_writer,
+            sandbox::RunOptions::default(),
+        )
+        .await
+    }
+
+    /// [`Self::run`] with the run's working directory, stdin pipe and
+    /// cancellation in `options`, passed to the sandbox as they are.
+    pub async fn run_with_options<W1, W2>(
+        &mut self,
+        invocations: Vec<Invocation>,
+        stdout_writer: Option<W1>,
+        stderr_writer: Option<W2>,
+        options: sandbox::RunOptions,
+    ) -> Result<(), Error>
+    where
+        W1: tokio::io::AsyncWrite + Unpin + Send,
+        W2: tokio::io::AsyncWrite + Unpin + Send,
+    {
         #[cfg(target_os = "linux")]
         {
             self.sandbox
-                .run(invocations, stdout_writer, stderr_writer)
+                .run_with_cancel(invocations, stdout_writer, stderr_writer, options)
                 .await
                 .map_err(Error::from)
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (invocations, stdout_writer, stderr_writer);
+            let _ = (invocations, stdout_writer, stderr_writer, options);
             Err(op::sandbox_unsupported().into())
         }
     }
@@ -1592,7 +1627,7 @@ impl tokio::io::AsyncWrite for StreamWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ConfigBuilder;
+    use crate::{ConfigBuilder, TaskPatchPolicy};
     use sandbox::Channel;
     use std::io::{BufRead, BufReader};
     use tempfile::tempdir;
@@ -2393,6 +2428,147 @@ mod tests {
         reader.lines().map_while(|l| l.ok()).collect()
     }
 
+    /// A stand-in for `mip`'s user-policy gate (which lives in `mip`, behind
+    /// the [`crate::TaskPatchGate`] hook): it refuses a task that declares
+    /// the entry `deny`, drops the entry `ignore`, and lets the rest through.
+    #[derive(Debug)]
+    struct TestGate {
+        deny: &'static str,
+        ignore: &'static str,
+    }
+
+    impl crate::TaskPatchGate for TestGate {
+        fn gate(
+            &self,
+            _ctx: &Context,
+            task_name: &str,
+            mut task: mfile::Task,
+        ) -> Result<crate::GatedTask, Error> {
+            let declares =
+                |p: &EnvPatches, e: &str| p.dir.contains_key(e) || p.file.contains_key(e);
+            if declares(&task.patch, self.deny) {
+                return Err(Error::Other(anyhow::anyhow!(
+                    "task `{task_name}` declares `{}`: policy denied it (test gate)",
+                    self.deny
+                )));
+            }
+            let mut ignored = Vec::new();
+            if declares(&task.patch, self.ignore) {
+                task.patch.dir.remove(self.ignore);
+                task.patch.file.remove(self.ignore);
+                ignored.push(self.ignore.to_owned());
+            }
+            Ok(crate::GatedTask { task, ignored })
+        }
+    }
+
+    /// The fixture's denied entry, which task `peek-denied` declares.
+    const DENIED: &str = "/min-test-1128-denied";
+
+    /// A [`TestGate`] that denies `deny` and ignores `ignore`.
+    fn test_gate(deny: &'static str, ignore: &'static str) -> TaskPatchPolicy {
+        TaskPatchPolicy::Gated(std::sync::Arc::new(TestGate { deny, ignore }))
+    }
+
+    /// Helper: a Context over the `patchrepo` fixture, whose task
+    /// `peek-denied` declares `patch.dir."/min-test-1128-denied"`, built with
+    /// `policy` (inbox#1128). Returns the state dir, which must outlive the
+    /// context.
+    fn setup_patchrepo_ctx(policy: TaskPatchPolicy) -> (TempDir, Context) {
+        let state = tempdir().unwrap();
+        let manifest_dir =
+            std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).to_path_buf();
+        let config = ConfigBuilder::new()
+            .with_state_dir(state.path().to_path_buf())
+            .with_repo_dir(manifest_dir.join("testdata").join("patchrepo"))
+            .with_stdlib_dir(manifest_dir.join("../stdlib/minimal-ncl"))
+            .with_no_fetch(true)
+            .with_task_patch_policy(policy)
+            .build()
+            .unwrap();
+        (state, Context::new(config).unwrap())
+    }
+
+    /// The nested-run path to inbox#1128: a sandbox sends `run%<task>` over
+    /// `/run/minenv_sock` for a project task whose patch the context's gate
+    /// refuses. The channel passes the task through the same hook `mip run
+    /// <task>` does and reports the refusal, before any environment is built
+    /// for it. `mip`'s tests cover the user-policy gate itself.
+    #[test]
+    fn env_channel_nested_run_refuses_a_denied_patch() {
+        let (state_dir, mut ctx) = setup_patchrepo_ctx(test_gate(DENIED, ""));
+        let mut graph = ctx.graph_from_all_packages().unwrap();
+        graph.top_levels = vec![];
+        let mut chan = EnvChannel {
+            graph: &mut graph,
+            ctx: &mut ctx,
+            task_name: "outer".to_string(),
+            state_dir: state_dir.path().to_path_buf(),
+            has_packages: HashSet::new(),
+            ot: None,
+            daemon_id: None,
+        };
+
+        let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let rootfs = tempdir().unwrap();
+        chan.handle(&mut ours, "run%peek-denied", rootfs.path());
+        drop(ours);
+
+        let lines = read_lines(&theirs);
+        let text = lines.join("\n");
+        assert!(
+            text.contains("policy denied"),
+            "unexpected output: {lines:?}"
+        );
+        assert!(text.contains(DENIED), "unexpected output: {lines:?}");
+        assert!(
+            lines.last().is_some_and(|l| l.starts_with("error:")),
+            "the channel reports a failure: {lines:?}"
+        );
+    }
+
+    /// The hook both paths call: under the daemon's default, `Ungated`, the
+    /// task comes back with its patches as declared (inbox#602 is the
+    /// daemon's); under `Gated` the context's gate decides, refusing an entry
+    /// or dropping one as ignored. A task without patches passes either way,
+    /// without reaching the gate.
+    #[test]
+    fn the_task_patch_gate_follows_the_context_policy() {
+        for (policy, refused) in [
+            (TaskPatchPolicy::Ungated, false),
+            (test_gate(DENIED, ""), true),
+        ] {
+            let (_state, mut ctx) = setup_patchrepo_ctx(policy.clone());
+            let graph = ctx.graph_from_all_packages().unwrap();
+            let (task, graph) = ctx.task(graph, "peek-denied").unwrap().unwrap();
+            let declared = task.patch.clone();
+            match crate::gate_task_patches(&ctx, "peek-denied", task) {
+                Ok(gated) => {
+                    assert!(!refused, "{policy:?} let a denied patch through");
+                    assert_eq!(gated.task.patch, declared);
+                    assert!(gated.ignored.is_empty());
+                }
+                Err(e) => {
+                    assert!(refused, "{policy:?} refused: {e}");
+                    assert!(format!("{e}").contains("policy denied"), "{e}");
+                }
+            }
+            let (task, _) = ctx.task(graph, "no-patches").unwrap().unwrap();
+            let gated = crate::gate_task_patches(&ctx, "no-patches", task).unwrap();
+            assert!(gated.task.patch.dir.is_empty() && gated.task.patch.file.is_empty());
+        }
+
+        // An entry the gate ignores is dropped from the task and reported.
+        let (_state, mut ctx) = setup_patchrepo_ctx(test_gate("", DENIED));
+        let graph = ctx.graph_from_all_packages().unwrap();
+        let (task, _) = ctx.task(graph, "peek-denied").unwrap().unwrap();
+        let gated = crate::gate_task_patches(&ctx, "peek-denied", task).unwrap();
+        assert!(!gated.task.patch.dir.contains_key(DENIED));
+        assert_eq!(gated.ignored, vec![DENIED.to_owned()]);
+        let notice = gated.ignored_notice("peek-denied").unwrap();
+        assert!(notice.contains(DENIED), "{notice}");
+    }
+
     #[test]
     fn env_channel_errs_unknown_command() {
         let (state_dir, mut ctx, mut graph) = setup_ctx_and_graph();
@@ -2506,5 +2682,154 @@ mod tests {
             HashSet::from_iter([*chan.graph.by_name("uroot").unwrap()])
         );
         assert!(std::fs::exists(rootfs.path().join("bin")).unwrap());
+    }
+
+    /// A `set_env:` line hands the helper a variable name that began as
+    /// package metadata. Bash evaluates the name of a `declare`d variable
+    /// for array subscripts, so a crafted one — `X[$(touch /tmp/pwned)]` —
+    /// runs the command in the user's live shell. The helper must refuse
+    /// such a name without evaluating it, while still exporting the valid
+    /// names around it. The minimald helper has the same guard with the
+    /// same test; this is mctx's copy.
+    #[cfg(unix)]
+    #[test]
+    fn a_set_env_line_with_a_crafted_name_is_refused_not_evaluated() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempdir().unwrap();
+        let helper = tmp.path().join("min_helper.sh");
+        std::fs::write(&helper, MIN_SCRIPT).unwrap();
+
+        // The payload's marker: the crafted name would `touch` it if bash
+        // evaluated the subscript. It must not exist after the helper runs.
+        let marker = tmp.path().join("pwned");
+
+        // A socat stand-in that answers a request with three `set_env:`
+        // lines — a crafted name, a valid one after it, then `done:`.
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let socat = bin.join("socat");
+        std::fs::write(
+            &socat,
+            format!(
+                "#!/bin/sh\nprintf 'set_env:X[$(touch {})]:/state/gocache\\n'\nprintf 'set_env:GOCACHE:/state/gocache\\n'\nprintf 'done:\\n'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&socat, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                ". '{}'; __min_rpc status; rc=$?; echo \"GOCACHE=$GOCACHE\"; exit $rc",
+                helper.display()
+            ))
+            .env("PATH", &path)
+            .env_remove("GOCACHE")
+            .output();
+        let Ok(out) = out else {
+            eprintln!("no bash to run the min helper with — skipping");
+            return;
+        };
+
+        assert!(!marker.exists(), "the crafted name ran its payload");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("min: refusing to export environment variable with an invalid name"),
+            "the refusal must say so in plain words, got: {stderr}"
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("GOCACHE=/state/gocache"),
+            "a valid name alongside must still export, got: {stdout}"
+        );
+        assert!(
+            !stdout.contains("pwned"),
+            "the crafted name must not join the export summary, got: {stdout}"
+        );
+    }
+
+    /// A valid name can still match a local of `__min_rpc` or of its
+    /// caller, and an assignment by name writes that local, not the shell's
+    /// variable. The helper must write and export the global whatever the
+    /// name. And since `declare` reads a value opening with `(` as an array
+    /// list when the global is an array, such a value is refused, not run.
+    /// The protocol reader's own `line` is one such local: were it the
+    /// global, the next read would overwrite a `set_env:line:` assignment.
+    /// The minimald helper has the same test.
+    #[cfg(unix)]
+    #[test]
+    fn a_set_env_line_writes_the_global_even_when_a_local_shares_its_name() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempdir().unwrap();
+        let helper = tmp.path().join("min_helper.sh");
+        std::fs::write(&helper, MIN_SCRIPT).unwrap();
+
+        // Created only if the parenthesised value were expanded.
+        let marker = tmp.path().join("ran");
+
+        // A socat stand-in that answers with a name the helper also uses
+        // for a local, a parenthesised value for an array global, then
+        // `done:`.
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let socat = bin.join("socat");
+        std::fs::write(
+            &socat,
+            format!(
+                "#!/bin/sh\nprintf 'set_env:varname:/state/varname\\n'\nprintf 'set_env:LIST:($(touch {}))\\n'\nprintf 'set_env:line:/state/line\\n'\nprintf 'done:\\n'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&socat, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "LIST=(one); . '{}'; __min_rpc status; rc=$?; \
+                 echo \"global=$varname exported=$(printenv varname) list=$LIST line=$line exported_line=$(printenv line)\"; exit $rc",
+                helper.display()
+            ))
+            .env("PATH", &path)
+            .env_remove("varname")
+            .env_remove("line")
+            .output();
+        let Ok(out) = out else {
+            eprintln!("no bash to run the min helper with — skipping");
+            return;
+        };
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("global=/state/varname exported=/state/varname"),
+            "a name shared with a local must still set and export the global, got: {stdout}"
+        );
+        assert!(!marker.exists(), "a parenthesised value was expanded");
+        assert!(
+            stdout.contains("list=one"),
+            "a refused value must leave the global as it was, got: {stdout}"
+        );
+        assert!(
+            stdout.contains("line=/state/line exported_line=/state/line"),
+            "the reader's own `line` must not take or overwrite the shell's, got: {stdout}"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("would be read as an array"),
+            "the refusal must say so, got: {stderr}"
+        );
     }
 }
