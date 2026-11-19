@@ -2294,21 +2294,35 @@ ae_sid="$(printf '%s\n' "$out" | tail -n1 | tr -d '\r')"
 # T58: a restart ends the attach with a line that names the restart. The
 # attach reads the box after it ends. When that read lands between the
 # restart's stop and its start, the line says the box was stopped. That
-# is the code's answer for that order, so it is a warning here.
-attach_end_start restart "$ae_name"
-mnl box restart "$ae_name" </dev/null >"$WORK/ae-restart-cmd.out" 2>&1 || {
-  echo "::error::'min box restart $ae_name' failed while a terminal was attached"
-  cat "$WORK/ae-restart-cmd.out" 2>/dev/null || true
-  kill "$AE_PID" 2>/dev/null || true
-  fail
-}
-attach_end_wait restart "$ae_name"
-if grep -qF "Detached: $ae_name was restarted. Run min box attach $ae_name to attach again." "$WORK/ae-restart.out"; then
-  echo "restart while attached: exit 254, and the line names the restart"
-elif grep -qF "Detached: $ae_name was stopped." "$WORK/ae-restart.out"; then
-  echo "::warning::the attach read $ae_name between the restart's stop and its start, so its line says stopped; exit 254 and no prompt still hold"
-else
-  echo "::error::the attach that the restart ended printed no line that names the restart"
+# is the code's answer for that order, so the step tries again. It fails
+# when no try shows the restart line, so a restart that always says
+# stopped does not pass.
+ae_restarted=""
+for ae_try in 1 2 3; do
+  # A restart can keep /home, so clear the last try's marker first.
+  mnl box exec "$ae_name" -- rm -f /home/ae-restart-live </dev/null >/dev/null 2>&1 || true
+  attach_end_start restart "$ae_name"
+  mnl box restart "$ae_name" </dev/null >"$WORK/ae-restart-cmd.out" 2>&1 || {
+    echo "::error::'min box restart $ae_name' failed while a terminal was attached"
+    cat "$WORK/ae-restart-cmd.out" 2>/dev/null || true
+    kill "$AE_PID" 2>/dev/null || true
+    fail
+  }
+  attach_end_wait restart "$ae_name"
+  if grep -qF "Detached: $ae_name was restarted. Run min box attach $ae_name to attach again." "$WORK/ae-restart.out"; then
+    echo "restart while attached: exit 254, and the line names the restart (try $ae_try)"
+    ae_restarted=1
+    break
+  elif grep -qF "Detached: $ae_name was stopped." "$WORK/ae-restart.out"; then
+    echo "::warning::try $ae_try: the attach read $ae_name between the restart's stop and its start, so its line says stopped; trying again"
+  else
+    echo "::error::the attach that the restart ended printed no line that names the restart"
+    echo "--- transcript ---"; cat "$WORK/ae-restart.out" 2>/dev/null || true
+    fail
+  fi
+done
+if [ -z "$ae_restarted" ]; then
+  echo "::error::in $ae_try tries, the attach that the restart ended never printed the line that names the restart"
   echo "--- transcript ---"; cat "$WORK/ae-restart.out" 2>/dev/null || true
   fail
 fi
