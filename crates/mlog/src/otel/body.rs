@@ -205,15 +205,17 @@ mod tests {
             .with_log_processor(super::FillBody)
             .with_simple_exporter(exporter.clone())
             .build();
-        let export = super::BodyFromError(OpenTelemetryTracingBridge::new(&provider))
-            .with_filter(LevelFilter::INFO);
+        // The export layer is built in each branch: a `Filtered` layer is
+        // typed by the subscriber below it, and the branches differ there.
+        let bridge = || super::BodyFromError(OpenTelemetryTracingBridge::new(&provider));
         if debug_elsewhere {
             let subscriber = tracing_subscriber::registry()
                 .with(Identity::new().with_filter(LevelFilter::TRACE))
-                .with(export);
+                .with(bridge().with_filter(LevelFilter::INFO));
             tracing::subscriber::with_default(subscriber, f);
         } else {
-            let subscriber = tracing_subscriber::registry().with(export);
+            let subscriber =
+                tracing_subscriber::registry().with(bridge().with_filter(LevelFilter::INFO));
             tracing::subscriber::with_default(subscriber, f);
         }
         let text = |v: &AnyValue| match v {
