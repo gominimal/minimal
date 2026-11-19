@@ -195,6 +195,11 @@ pub struct ExpansionReport {
     /// The layer that set each variable of `vars` and `vars_lenient`, by
     /// variable name (BOX-180).
     pub vars: BTreeMap<String, Origin>,
+    /// The layer that set each key of the `network` table, by the key's
+    /// name below `network`: `mode`, `egress`, `bep`. The `network` table
+    /// merges by these keys, so each one can come from its own layer.
+    /// `values["network"]` names the last layer that set any of them.
+    pub network: BTreeMap<String, Origin>,
     /// Whether the expanded entry is the implicit default session entry,
     /// which the file does not declare (BOX-165).
     pub implicit: bool,
@@ -1237,9 +1242,15 @@ fn merge_vars(
 /// the command, so a layer replaces such a list whole and keeps every item.
 const ARGV_KEYS: &[&str] = &["cmdcmd", "exec"];
 
+/// The key of the spec's network settings, which merges by sub-table.
+const NETWORK_KEY: &str = "network";
+
 /// Merges one key of a layer into the spec: a list onto a list unions,
 /// each item once, and any other value replaces the spec's. An argument
-/// vector (`ARGV_KEYS`) always replaces, item for item.
+/// vector (`ARGV_KEYS`) always replaces, item for item. A `network` table
+/// merges onto a `network` table by key, and a sub-table such as `egress`
+/// or `bep` merges onto a sub-table by key, so a later layer replaces only
+/// the keys it sets.
 fn merge_value(
     spec: &mut toml::Table,
     report: &mut ExpansionReport,
@@ -1247,6 +1258,10 @@ fn merge_value(
     value: &toml::Value,
     origin: &Origin,
 ) {
+    if key == NETWORK_KEY {
+        merge_network(spec, report, value, origin);
+        return;
+    }
     if ARGV_KEYS.contains(&key) {
         let value_origin = match value {
             toml::Value::Array(items) => ValueOrigin::List(vec![origin.clone(); items.len()]),
@@ -1284,6 +1299,47 @@ fn merge_value(
     };
     spec.insert(key.to_owned(), value);
     report.values.insert(key.to_owned(), value_origin);
+}
+
+/// Merges a layer's `network` value into the spec. A table onto a table
+/// merges by key, and a sub-table onto a sub-table merges by key: each key
+/// the layer sets replaces the spec's. Any other value replaces the whole
+/// `network` value. The report keeps the layer of each key below
+/// `network`.
+fn merge_network(
+    spec: &mut toml::Table,
+    report: &mut ExpansionReport,
+    value: &toml::Value,
+    origin: &Origin,
+) {
+    report
+        .values
+        .insert(NETWORK_KEY.to_owned(), ValueOrigin::Value(origin.clone()));
+    let (Some(toml::Value::Table(have)), toml::Value::Table(add)) =
+        (spec.get_mut(NETWORK_KEY), value)
+    else {
+        spec.insert(NETWORK_KEY.to_owned(), value.clone());
+        report.network.clear();
+        if let toml::Value::Table(add) = value {
+            for sub in add.keys() {
+                report.network.insert(sub.clone(), origin.clone());
+            }
+        }
+        return;
+    };
+    for (sub, item) in add {
+        match (have.get_mut(sub), item) {
+            (Some(toml::Value::Table(old)), toml::Value::Table(new)) => {
+                for (k, v) in new {
+                    old.insert(k.clone(), v.clone());
+                }
+            }
+            _ => {
+                have.insert(sub.clone(), item.clone());
+            }
+        }
+        report.network.insert(sub.clone(), origin.clone());
+    }
 }
 
 /// A copy of `table` with every table, at every depth, in key order.
@@ -1941,6 +1997,66 @@ mod tests {
             overrides: table("timeout = \"30m\""),
             ..Layers::default()
         }
+    }
+
+    // BOX-048, #3597: a later layer that sets one `network` sub-table keeps
+    // the other sub-tables of an earlier layer, and a sub-table merges by
+    // key. The report names the layer of each key below `network`.
+    #[test]
+    fn network_merges_by_sub_table() {
+        let file = r#"
+            [defaults.network.egress]
+            allow_dns_hosts = ["a.example"]
+            deny_subnets = ["10.0.0.0/8"]
+
+            [defaults.session.network.bep]
+            proxy_env = true
+
+            [sessions.dev.network]
+            mode = "own_ip"
+            egress = { deny_subnets = ["192.168.0.0/16"] }
+        "#;
+        let e = expand_in(file, "dev", Layers::default()).expect("expands");
+        assert_eq!(
+            e.spec["network"],
+            toml::Value::Table(table(indoc::indoc! {r#"
+                mode = "own_ip"
+                bep = { proxy_env = true }
+                egress = { allow_dns_hosts = ["a.example"], deny_subnets = ["192.168.0.0/16"] }
+            "#}))
+        );
+        let layer_of = |key: &str| e.report.network.get(key).map(|o| o.layer);
+        assert_eq!(layer_of("bep"), Some(Layer::DefaultsType));
+        assert_eq!(layer_of("egress"), Some(Layer::Entry));
+        assert_eq!(layer_of("mode"), Some(Layer::Entry));
+        assert_eq!(
+            e.report.values["network"],
+            ValueOrigin::Value(Origin::of(Layer::Entry))
+        );
+
+        // Without the entry's table, each sub-table keeps its own layer.
+        let file = file.split("[sessions.dev.network]").next().unwrap_or_default();
+        let file = format!("{file}[sessions.dev]\n");
+        let e = expand_in(&file, "dev", Layers::default()).expect("expands");
+        let network = e.spec["network"].as_table().expect("a table");
+        assert!(network.contains_key("bep"));
+        assert!(network.contains_key("egress"));
+        assert_eq!(
+            e.report.network.get("egress").map(|o| o.layer),
+            Some(Layer::Defaults)
+        );
+        assert_eq!(
+            e.report.network.get("bep").map(|o| o.layer),
+            Some(Layer::DefaultsType)
+        );
+
+        // A value that is not a table replaces the whole `network` value.
+        let replaced = fold(&[
+            (Origin::of(Layer::Defaults), &table("network = { mode = \"none\" }")),
+            (Origin::of(Layer::Entry), &table("network = \"x\"")),
+        ]);
+        assert_eq!(replaced.spec["network"].as_str(), Some("x"));
+        assert!(replaced.report.network.is_empty());
     }
 
     // BOX-065: one file and one set of overrides expand to the same bytes
