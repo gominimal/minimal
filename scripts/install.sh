@@ -503,7 +503,11 @@ maybe_remove_finalize_install() {
     done
     _ns_rm="$_ns_rm $(shq "$_ns_chan")"
     if [ "$os" = darwin ]; then
-        _ns_undo="sudo launchctl bootout system/dev.gominimal.zone; sudo launchctl bootout system/dev.minimal.local-range; sudo launchctl bootout system/dev.gominimal.zone.logcap; sudo rm -f$_ns_rm; sudo rm -rf$_ns_rm_r; sudo rmdir $(shq "${_ns_chan%/*}") $(shq "$_fi_root/Library/Application Support/minimal") 2>/dev/null || true"
+        # The local range unit added 127.0.64.1-254 to lo0. The aliases go
+        # with it, unless a VM is running: its boxes use them. pgrep -q and
+        # bare names keep the line free of unquoted paths. /etc/resolver and
+        # /Library/PrivilegedHelperTools go only when empty (rmdir).
+        _ns_undo="sudo launchctl bootout system/dev.gominimal.zone; sudo launchctl bootout system/dev.minimal.local-range; sudo launchctl bootout system/dev.gominimal.zone.logcap; sudo rm -f$_ns_rm; sudo rm -rf$_ns_rm_r; if pgrep -qx minvmd; then echo 'note: the loopback IPs boxes use stay on lo0 while a VM is running. Stop every VM, then run this line again.' >&2; else i=1; while [ \$i -le 254 ]; do sudo ifconfig lo0 -alias 127.0.64.\$i 2>/dev/null; i=\$((i + 1)); done; fi; sudo rmdir $(shq "${_ns_chan%/*}") $(shq "$_fi_root/Library/Application Support/minimal") $(shq "$_fi_root/etc/resolver") $(shq "$_fi_root/Library/PrivilegedHelperTools") 2>/dev/null || true"
     else
         _ns_undo="sudo systemctl disable --now minzoned.socket minzoned.service; sudo rm -f$_ns_rm; sudo systemctl daemon-reload; sudo systemctl reset-failed minzoned.socket minzoned.service; [ ! -e $(shq "$_fi_root/sys/class/net/minzone0") ] || { sudo resolvectl revert minzone0; sudo ip link del minzone0; }; sudo rmdir $(shq "${_ns_chan%/*}") $(shq "$_lib_dir") 2>/dev/null || true"
     fi
@@ -511,6 +515,7 @@ maybe_remove_finalize_install() {
     # --undo` removes; the manual remedy, one root command line per item.
     _fi_list=
     _fi_owned=
+    _fi_dns=
     _fi_undo=
     _aa_unowned=
     _qb_found=
@@ -518,6 +523,7 @@ maybe_remove_finalize_install() {
         if [ -e "$_fi_root$_ns_p" ]; then
             _fi_list="the host DNS setup ($_ns_p)"
             _fi_owned=1
+            _fi_dns=1
             _fi_undo="      $_ns_undo"
             break
         fi
@@ -647,6 +653,9 @@ maybe_remove_finalize_install() {
     if [ -n "$_fi_owned" ]; then
         say "  \`min finalize-install --undo\` removes what min finalize-install installed, while min"
         say "  is installed. With min gone, remove everything listed with:"
+        if [ "$os" = darwin ] && [ -n "$_fi_dns" ]; then
+            say "  The DNS service (launchd job dev.gominimal.zone) keeps running until these commands run."
+        fi
     else
         say "  it was installed separately with root; remove it too with:"
     fi

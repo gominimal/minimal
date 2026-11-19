@@ -369,6 +369,11 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     if e.downcast_ref::<minimal::ProjectFileInvalid>().is_some() {
         return 3;
     }
+    // `min box spec` of a project whose `minimal.toml` does not load
+    // exits 3, as the start does.
+    if e.downcast_ref::<minimal::SpecFileInvalid>().is_some() {
+        return minimal::SpecFileInvalid::EXIT_CODE;
+    }
     // BCLI-019, BCLI-020: `min type` of a project whose box types do not
     // load exits 3, and `min type show` of a name that is no type exits 4.
     if e.downcast_ref::<minimal::BoxTypesInvalid>().is_some() {
@@ -1930,6 +1935,30 @@ mod tests {
         assert_eq!(printed.matches("TOML parse error").count(), 1, "{printed}");
         assert_eq!(printed.matches("invalid TOML").count(), 1, "{printed}");
         assert_eq!(printed.matches("[boxes.dev").count(), 1, "{printed}");
+        assert!(!printed.contains("Cannot show the spec"), "{printed}");
+    }
+
+    /// `min box spec` of a project whose `minimal.toml` does not load says
+    /// that the spec cannot show, not that the box cannot start, and the
+    /// run ends with exit 3.
+    #[test]
+    fn invalid_project_file_for_box_spec_says_spec_cannot_show() {
+        let error = mfile::entry::read_entries(b"[boxes.dev\ntype = \"session\"\n")
+            .expect_err("the file does not parse");
+        let e = anyhow::Error::new(minimal::SpecFileInvalid { error });
+        let mut stderr = Vec::new();
+        let code = answer_failure(&e, false, false, None, &mut stderr);
+        let printed = String::from_utf8(stderr).unwrap();
+        assert_eq!(code, ExitCode::from(3), "{printed}");
+        assert!(
+            printed.contains(
+                "Cannot show the spec: the project's minimal.toml does not load: \
+                 invalid TOML: TOML parse error"
+            ),
+            "{printed}"
+        );
+        assert!(!printed.contains("Cannot start the box"), "{printed}");
+        assert_eq!(printed.matches("TOML parse error").count(), 1, "{printed}");
     }
 
     /// A project `minimal.toml` that cannot be read prints its io error

@@ -12,10 +12,47 @@ use super::*;
 pub async fn cmd_box_show(global: &GlobalArgs, args: BoxShowArgs) -> Result<(), anyhow::Error> {
     use minimald_rpc::{Errorable, ShowBox, ShowBoxRequest};
 
+    // The policy has a text form and a JSON document, and no YAML one: the
+    // usage error comes before any box is looked up.
+    if args.network && args.output == Some(BoxShowOutputFormat::Yaml) {
+        return Err(NetworkFlagRefusal {
+            message: "`min box show --network` does not write YAML. \
+                      Run it with `-o json`, or with no `-o` for text."
+                .to_owned(),
+        }
+        .into());
+    }
     ensure_daemon(global)?;
     let ResolvedBox { host, box_id: id } =
         resolve_box_on_local_hosts(global, &args.target, "box show").await?;
     let mut client = box_host_client(&host).await?;
+    if args.network {
+        // BCLI-025: the box's effective network policy, with the ports it
+        // published while running.
+        let record = stored_box_record(&mut client, id)
+            .await
+            .inspect_err(|error| {
+                tracing::info!(verb = "box show", box_id = %id, network = true, outcome = "error", "{error}");
+            })?
+            .ok_or_else(|| {
+                // The box was removed after the address resolved.
+                tracing::info!(verb = "box show", box_id = %id, network = true, outcome = "not found");
+                BoxAddressRefusal::NotFound {
+                    address: args.target.clone(),
+                }
+            })?;
+        let mut out = std::io::stdout();
+        write_box_network(
+            &mut out,
+            &mut client,
+            &record,
+            local_host_kind(&host),
+            args.output == Some(BoxShowOutputFormat::Json),
+        )
+        .await?;
+        tracing::info!(verb = "box show", box_id = %id, network = true, outcome = "ok", host = %host.host);
+        return Ok(());
+    }
     let shown = match client
         .oneshot_rpc::<ShowBox>(ShowBoxRequest { id })
         .await
@@ -35,14 +72,6 @@ pub async fn cmd_box_show(global: &GlobalArgs, args: BoxShowArgs) -> Result<(), 
             bail!("{error}")
         }
     };
-    if args.network {
-        // BCLI-025: the network section the box was created with.
-        let mut section = Vec::new();
-        show_stored_network(&mut section, &mut client, id, &args.target).await?;
-        tracing::info!(verb = "box show", box_id = %id, network = true, outcome = "ok", host = %host.host);
-        std::io::Write::write_all(&mut std::io::stdout().lock(), &section)?;
-        return Ok(());
-    }
     tracing::info!(verb = "box show", box_id = %id, outcome = "ok", host = %host.host);
     let mut out = std::io::stdout().lock();
     match args.output {
@@ -248,33 +277,136 @@ fn yaml_quote(text: &str) -> String {
     quoted
 }
 
-/// Writes the `[network]` section that box `id` stores on the host `client`
-/// talks to (BCLI-025), overrides included. `target` is the address the
-/// caller gave, for the refusal when the host has no such box.
+/// The kind of daemon `host` is: a VM host for the `local-minvmd`
+/// provider, else the native daemon.
+pub(crate) fn local_host_kind(host: &crate::cmd::list::LocalHost) -> paths::HostKind {
+    if host.provider == crate::cmd::list::LOCAL_MINVMD_PROVIDER {
+        paths::HostKind::Minvmd
+    } else {
+        paths::HostKind::Minimald
+    }
+}
+
+/// Writes the effective network policy of the box `record` names, on the
+/// host `client` talks to, a host of `host_kind` (BCLI-025): the rules the
+/// gate enforces, the ports the box published while running, and the
+/// listen ports the audit log held back. With `json`, it writes the one
+/// `min/v1/session-policy` document in their place.
+///
+/// `min box show <box> --network` and `min session policy` both render
+/// through this.
 ///
 /// # Errors
 ///
-/// Fails when the record cannot be read, the host has no box `id`, or
-/// `out` fails.
-pub(crate) async fn show_stored_network(
+/// Fails when the daemon cannot give the effective policy, or `out` fails.
+pub(crate) async fn write_box_network(
     out: &mut impl std::io::Write,
     client: &mut client::Client,
-    id: boxes::SessionId,
-    target: &str,
+    record: &boxes::Record,
+    host_kind: paths::HostKind,
+    json: bool,
 ) -> Result<(), anyhow::Error> {
-    let record = stored_box_record(client, id)
+    if json {
+        return write_box_policy_json(out, client, record, host_kind).await;
+    }
+    // The follow-up lookups go by the resolved id, so a box named by an id
+    // prefix reaches the same box they do.
+    let box_id = record.id.to_string();
+
+    // The daemon resolves the effective egress (NET-074/NET-077), because
+    // the rollout phase and its opt-out are the daemon's own facts.
+    use minimald_rpc::{GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest};
+    let lookup = match SessionLookup::parse(&box_id) {
+        SessionLookup::Id(id) => GetEffectiveSessionPolicyRequest::Id(id),
+        SessionLookup::Name(n) => GetEffectiveSessionPolicyRequest::Name(n),
+    };
+    let resp = client
+        .oneshot_rpc::<GetEffectiveSessionPolicy>(lookup)
         .await
-        .inspect_err(|error| {
-            tracing::info!(verb = "box show", box_id = %id, network = true, outcome = "error", "{error}");
-        })?
-        .ok_or_else(|| {
-            // The box was removed after the address resolved.
-            tracing::info!(verb = "box show", box_id = %id, network = true, outcome = "not found");
-            BoxAddressRefusal::NotFound {
-                address: target.to_owned(),
-            }
-        })?;
-    write_stored_network(out, record.network, &record.policy)
+        .context("GetEffectiveSessionPolicy RPC failed")?;
+
+    // NET-079's per-box enforcement answers beside the rules, over its own
+    // runtime-facts reply — never as a field on the policy, because the
+    // policy struct is `deny_unknown_fields`. A client that cannot get it
+    // — an older daemon, a box mid-teardown — renders the rules with no
+    // enforcement row, silently.
+    let facts_lookup = match SessionLookup::parse(&box_id) {
+        SessionLookup::Id(id) => minimald_rpc::GetSessionRuntimeFactsRequest::Id(id),
+        SessionLookup::Name(n) => minimald_rpc::GetSessionRuntimeFactsRequest::Name(n),
+    };
+    let facts = match client
+        .oneshot_rpc::<minimald_rpc::GetSessionRuntimeFacts>(facts_lookup)
+        .await
+    {
+        Ok(minimald_rpc::Errorable::Ok(facts)) => Some(facts),
+        Ok(minimald_rpc::Errorable::Err { .. }) | Err(_) => None,
+    };
+    // (NET-044) — the rows that make a `min net expose` visible rather than
+    // only permitted. The text walk warns on stderr and prints no section
+    // when the daemon cannot list them.
+    let live = fetch_live_ingress_degrading(client, &box_id).await;
+
+    let policy = match resp {
+        minimald_rpc::Errorable::Ok(policy) => policy,
+        minimald_rpc::Errorable::Err { error } => bail!("{error}"),
+    };
+    render_box_network(
+        out,
+        &policy,
+        record.network,
+        facts.as_ref(),
+        &live,
+        host_kind,
+    )
+}
+
+/// Writes the text form of a box's effective network policy: `policy` for a
+/// box of `network` mode on a host of `host_kind`, with the runtime `facts`
+/// the host gave, if any, and the `live` ports the box published.
+///
+/// # Errors
+///
+/// Fails when `out` fails.
+pub(crate) fn render_box_network(
+    out: &mut impl std::io::Write,
+    policy: &boxes::EffectiveBoxPolicy,
+    network: boxes::NetworkMode,
+    facts: Option<&minimald_rpc::BoxRuntimeFacts>,
+    live: &[minimald_rpc::LiveMapping],
+    host_kind: paths::HostKind,
+) -> Result<(), anyhow::Error> {
+    let host_ip_enforcement = facts.and_then(|facts| facts.host_ip_enforcement);
+    let shared_port_collisions = facts
+        .map(|facts| facts.shared_port_collisions.as_slice())
+        .unwrap_or_default();
+    // The fabric the display builds the baseline set from: the microVM
+    // backend's run path builds its registry and the helper's enumeration
+    // from the default plan, so that is the plan the display can name for
+    // it. The native daemon's own per-daemon switch is a plan the reply
+    // does not carry, so that arm passes `None` and the block is left out.
+    let fabric = (host_kind == paths::HostKind::Minvmd).then_some(switch::SwitchSubnet::default());
+    // NET-160: the host exposures row turns on the host kind itself, not on
+    // `fabric`.
+    let native_host = host_kind == paths::HostKind::Minimald;
+    format_policy_on_host(
+        out,
+        policy,
+        network,
+        host_ip_enforcement,
+        shared_port_collisions,
+        fabric,
+        native_host,
+    )?;
+    write_live_ingress(out, live)?;
+    if let Some(facts) = facts {
+        write_unaudited_listen_ports(
+            out,
+            &facts.unaudited_listen_ports,
+            facts.audit_log.as_deref(),
+        )?;
+    }
+    out.flush().context("Failed to write policy")?;
+    Ok(())
 }
 
 /// The record box `id` has on the host `client` talks to, with the network
