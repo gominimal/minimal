@@ -1598,9 +1598,11 @@ fn is_zone_name(name: &Name) -> bool {
 /// with its root dot stripped: each declared name compared as
 /// [`normalized`] spells it, without building it.
 fn declares(declared: &[String], name: &str) -> bool {
-    declared
-        .iter()
-        .any(|host| host.strip_suffix('.').unwrap_or(host).eq_ignore_ascii_case(name))
+    declared.iter().any(|host| {
+        host.strip_suffix('.')
+            .unwrap_or(host)
+            .eq_ignore_ascii_case(name)
+    })
 }
 
 /// The host-side DNS gate (NET-141, decided outside the VM for own-address
