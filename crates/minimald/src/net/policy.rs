@@ -86,7 +86,7 @@ impl ControlChannel {
     /// the box did not withdraw when the box's row is withdrawn (design
     /// §7.1). On a native host the daemon drives the switch directly.
     #[must_use]
-    pub fn host_unbinds_declared_forwards(&self) -> bool {
+    pub fn has_host_gate(&self) -> bool {
         matches!(self, Self::Vsock { .. })
     }
 }
@@ -503,7 +503,7 @@ pub async fn apply_ingress_naming_holders(
 ) -> io::Result<Vec<PortForwarder>> {
     apply_declared(
         control,
-        control.host_unbinds_declared_forwards(),
+        control.has_host_gate(),
         published,
         ptask_ip,
         ingress,
@@ -542,7 +542,7 @@ pub async fn bind_declared_at_publish(
 ) -> io::Result<Vec<PortForwarder>> {
     apply_declared(
         control,
-        control.host_unbinds_declared_forwards(),
+        control.has_host_gate(),
         published,
         switch_address,
         ingress,
@@ -554,7 +554,7 @@ pub async fn bind_declared_at_publish(
 }
 
 /// [`apply_ingress_naming_holders`], with `host_holds_listeners` read off the
-/// control channel ([`ControlChannel::host_unbinds_declared_forwards`]) by
+/// control channel ([`ControlChannel::has_host_gate`]) by
 /// the caller, so a test can drive the VM-backed answers over a unix socket.
 /// Behind a VM host's gate a listener the switch already holds is the
 /// box's own forward, bound at publish ([`bind_declared_at_publish`]), or
@@ -664,8 +664,8 @@ fn is_address_in_use(error: &io::Error) -> bool {
 /// holds at `published`, found by a short-lived bind of each one in this
 /// daemon's network namespace — the same bind the forwarder makes at the
 /// box's first spawn when `control` reaches a switch this daemon spawned.
-/// When the host unbinds the declared forwards
-/// ([`ControlChannel::host_unbinds_declared_forwards`]), the forwarder
+/// When a host-side gate sits in front of the switch
+/// ([`ControlChannel::has_host_gate`]), the forwarder
 /// binds on the host OS, not where this daemon runs, so a bind here would
 /// test the wrong ports: the probe reports nothing and the spawn's own
 /// apply says a taken port. A port in `yielded` is skipped, because another
@@ -681,7 +681,7 @@ pub fn host_ports_in_use(
     ingress: &IngressPolicy,
     yielded: &[u16],
 ) -> Vec<u16> {
-    if control.host_unbinds_declared_forwards() {
+    if control.has_host_gate() {
         return Vec::new();
     }
     ingress
@@ -830,13 +830,13 @@ pub async fn bind_handed_port(
         mapping.internal_port,
         gate.cloned(),
     );
-    handed_bind(control.host_unbinds_declared_forwards(), answer, forwarder)
+    handed_bind(control.has_host_gate(), answer, forwarder)
 }
 
 /// Reads the forwarder's answer to a hand-over's expose
 /// ([`bind_handed_port`]). `host_holds_listeners` is whether a host-side
 /// gate sits in front of the switch
-/// ([`ControlChannel::host_unbinds_declared_forwards`]).
+/// ([`ControlChannel::has_host_gate`]).
 fn handed_bind(
     host_holds_listeners: bool,
     answer: io::Result<()>,
@@ -3741,7 +3741,7 @@ mod tests {
             let sock = dir.path().join("gvproxy.sock");
             let forwarder = forwarder_answering_once(sock.clone(), 500, "proxy already running\n");
             let control = ControlChannel::Unix(sock);
-            assert!(!control.host_unbinds_declared_forwards());
+            assert!(!control.has_host_gate());
 
             let Err(native) = bind_handed_port(&control, PUBLISHED, LEASE, &mapping(), None).await
             else {
@@ -3912,7 +3912,7 @@ mod tests {
             let (forwarder, mut asked) =
                 spawn_forwarder_answering(sock.clone(), Duration::ZERO, |_| 200);
             let control = ControlChannel::Unix(sock);
-            assert!(!control.host_unbinds_declared_forwards());
+            assert!(!control.has_host_gate());
 
             release_declared_ingress(&control, &[declared_at("127.0.64.202:18202")]).await;
             forwarder.abort();

@@ -875,7 +875,7 @@ impl BoxActor {
                         let switch_address = record
                             .box_addresses
                             .map(|addresses| addresses.switch_address);
-                        match (control.host_unbinds_declared_forwards(), switch_address) {
+                        match (control.has_host_gate(), switch_address) {
                             // A VM-backed host: bind at publish.
                             (true, Some(switch_address)) => {
                                 if let Err(e) = crate::net::policy::bind_declared_at_publish(
