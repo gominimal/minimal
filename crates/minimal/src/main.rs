@@ -1356,6 +1356,14 @@ mod tests {
                 4,
             ),
             (
+                minimal::BoxAddressRefusal::OnStoppedVm {
+                    name: address("beta"),
+                    vm: address("alpha"),
+                },
+                "not_found",
+                4,
+            ),
+            (
                 minimal::BoxAddressRefusal::Unreachable {
                     address: address("web"),
                     hosts: vec![address("beta.local-minvmd0")],
@@ -1381,7 +1389,7 @@ mod tests {
             ),
         ] {
             let text = refusal.to_string();
-            let hint = refusal.hint();
+            let hint = refusal.hint().into_owned();
             let err = anyhow::Error::from(refusal).context("showing the box");
             let MachineModeAnswer::Object(failure) = machine_mode_answer(&err) else {
                 panic!("a box address refusal is an error object: {err:#}");

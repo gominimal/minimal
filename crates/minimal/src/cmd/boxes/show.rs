@@ -306,8 +306,11 @@ pub(crate) async fn write_box_network(
     host_kind: paths::HostKind,
     json: bool,
 ) -> Result<(), anyhow::Error> {
+    // BCLI-024: the VPN networks the box's stored spec keeps, from the
+    // entry and from `--vpn-network-names`.
+    let vpn_network_names = stored_vpn_network_names(client, record.id).await;
     if json {
-        return write_box_policy_json(out, client, record, host_kind).await;
+        return write_box_policy_json(out, client, record, host_kind, &vpn_network_names).await;
     }
     // The follow-up lookups go by the resolved id, so a box named by an id
     // prefix reaches the same box they do.
@@ -357,7 +360,66 @@ pub(crate) async fn write_box_network(
         facts.as_ref(),
         &live,
         host_kind,
-    )
+    )?;
+    write_vpn_network_names(out, &vpn_network_names)
+}
+
+/// The `network.vpn_network_names` of the spec box `id` stores, in its
+/// order (BCLI-024). Empty when the box stores no spec, its spec lists no
+/// names, or the host cannot give the spec. A failure goes to the log, and
+/// the policy still shows.
+pub(crate) async fn stored_vpn_network_names(
+    client: &mut client::Client,
+    id: boxes::SessionId,
+) -> Vec<String> {
+    use minimald_rpc::{Errorable, GetBoxSpec, GetBoxSpecRequest};
+    let spec = match client
+        .oneshot_rpc::<GetBoxSpec>(GetBoxSpecRequest { id })
+        .await
+    {
+        Ok(Errorable::Ok(reply)) => reply.spec,
+        Ok(Errorable::Err { error }) => {
+            tracing::debug!(box_id = %id, "vpn networks: the box's spec is not readable: {error}");
+            None
+        }
+        Err(e) => {
+            tracing::debug!(box_id = %id, "vpn networks: could not read the box's spec: {e:#}");
+            None
+        }
+    };
+    spec.as_ref()
+        .and_then(|spec| {
+            spec.get("network")?
+                .get("vpn_network_names")?
+                .as_array()
+                .cloned()
+        })
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|name| name.as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Writes the text rows of the box's VPN networks, one name to a row,
+/// under the policy (BCLI-024). Writes nothing when `names` is empty.
+///
+/// # Errors
+///
+/// Fails when `out` fails.
+pub(crate) fn write_vpn_network_names(
+    out: &mut impl std::io::Write,
+    names: &[String],
+) -> Result<(), anyhow::Error> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    // `minimald` keeps the names and does not connect the box to a VPN.
+    writeln!(out, "vpn networks (not connected yet)").context(OutputWriteError)?;
+    for name in names {
+        writeln!(out, "  {name}").context(OutputWriteError)?;
+    }
+    out.flush().context(OutputWriteError)?;
+    Ok(())
 }
 
 /// Writes the text form of a box's effective network policy: `policy` for a

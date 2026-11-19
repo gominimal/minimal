@@ -265,7 +265,7 @@ fn every_daemon_connection_is_classified() {
             // so a skewed host still answers which boxes it holds.
             "cmd/boxes/address.rs::connect_box_host = gated",
             "cmd/boxes/address.rs::probe_other_host = ungated",
-            "cmd/boxes/address.rs::read_host_boxes = ungated",
+            "cmd/boxes/address.rs::read_host = ungated",
             // A read-only look at a box after `min box attach` ended, to say
             // why the host ended it. The attach itself went through the
             // address resolution above, and the read builds nothing.
@@ -7753,6 +7753,137 @@ async fn box_name_resolves_vm_without_flag_refuses_a_name_two_vms_hold() {
             .await
             .expect("--vm picks the selected VM's box");
     assert_eq!(record.id, shared);
+}
+
+/// BCLI-002, NET-058: a box verb that names a box on a stopped VM is refused
+/// with the VM's name and the command that starts it, and exits 4. The box
+/// is found by its name, its id and its `provider/host/name`. A name that a
+/// running VM's box and a stopped VM's records both hold resolves to the
+/// running box. A name that a running VM holds only as a box that does not
+/// run, and that a stopped VM's records hold too, is ambiguous and exits 2.
+/// `min box spec` refuses the box on the stopped VM as `min box show` does,
+/// and a name that no VM holds is not found.
+#[tokio::test]
+async fn box_verb_on_stopped_vm_box_refuses_with_start_hint() {
+    let (state, default_vm) = running_default_vm().await;
+    let api = create_box_on(&default_vm, "api").await;
+    let beta = boxes::SessionId::mint();
+    stopped_vm_with_boxes(
+        state.path(),
+        "alpha",
+        &[("beta", beta), ("api", boxes::SessionId::mint())],
+    );
+    let global = vm_globals(state.path(), None);
+    let expected = "box 'beta' is on VM 'alpha', which is stopped. \
+                    Start it with: min --vm alpha session attach beta";
+
+    for address in [
+        "beta".to_owned(),
+        beta.to_string(),
+        "local-minvmd/alpha.local-minvmd0/beta".to_owned(),
+    ] {
+        let err = cmd::resolve_box_on_local_hosts(&global, &address, "box show")
+            .await
+            .expect_err("a box on a stopped VM is refused");
+        assert_eq!(err.to_string(), expected, "{address}");
+        let refusal = err
+            .downcast_ref::<BoxAddressRefusal>()
+            .expect("the refusal is a box address refusal");
+        assert_eq!(
+            refusal,
+            &BoxAddressRefusal::OnStoppedVm {
+                name: "beta".to_owned(),
+                vm: "alpha".to_owned(),
+            },
+            "{address}"
+        );
+        assert_eq!(refusal.exit_code(), 4, "{address}");
+        assert_eq!(refusal.code(), "not_found", "{address}");
+    }
+
+    // A running VM's box wins over a stopped VM's record of the same name.
+    let resolved = cmd::resolve_box_on_local_hosts(&global, "api", "box show")
+        .await
+        .expect("the running box resolves");
+    assert_eq!(resolved.box_id, api);
+    assert!(resolved.host.selected, "{}", resolved.host.host);
+
+    // `min box spec` resolves through the same lookup, so it refuses the box
+    // on the stopped VM the same way.
+    let err = box_spec_text(&global, &["min", "box", "spec", "beta"])
+        .await
+        .expect_err("box spec refuses a box on a stopped VM");
+    assert_eq!(err.to_string(), expected);
+    let refusal = err
+        .downcast_ref::<BoxAddressRefusal>()
+        .expect("box spec's refusal is a box address refusal");
+    assert_eq!(refusal.exit_code(), 4);
+    assert_eq!(
+        refusal.hint(),
+        "Start it with: min --vm alpha session attach beta"
+    );
+
+    // A name that a running VM holds only as a box that is not running, and
+    // that a stopped VM's records also hold, is ambiguous across the two
+    // hosts: the refusal exits 2 and lists both boxes with their states.
+    let web = create_box_on(&default_vm, "web").await;
+    cmd::stop_box_on_hosts(
+        local_hosts(&global).expect("the local hosts"),
+        &mut Vec::new(),
+        "web",
+        false,
+    )
+    .await
+    .expect("stop the running VM's 'web'");
+    let stopped_web = boxes::SessionId::mint();
+    stopped_vm_with_boxes(state.path(), "delta", &[("web", stopped_web)]);
+    let err = cmd::resolve_box_on_local_hosts(&global, "web", "box show")
+        .await
+        .expect_err("two hosts hold 'web' and neither box runs");
+    let refusal = err
+        .downcast_ref::<BoxAddressRefusal>()
+        .expect("the refusal is a box address refusal");
+    assert!(
+        matches!(refusal, BoxAddressRefusal::Ambiguous { .. }),
+        "{refusal:?}"
+    );
+    assert_eq!(refusal.exit_code(), 2);
+    let text = err.to_string();
+    let rows: Vec<&str> = text
+        .lines()
+        .skip(1)
+        .filter(|l| l.starts_with("  "))
+        .collect();
+    assert_eq!(rows.len(), 2, "{text}");
+    let default_row = rows
+        .iter()
+        .find(|row| row.contains(&web.to_string()))
+        .unwrap_or_else(|| panic!("the running VM's 'web' is listed: {text}"));
+    assert_eq!(
+        *default_row,
+        format!("  local-minvmd/local-minvmd0/web  stopped  {web}"),
+        "{text}"
+    );
+    let delta_row = rows
+        .iter()
+        .find(|row| row.contains(&stopped_web.to_string()))
+        .unwrap_or_else(|| panic!("the stopped VM's 'web' is listed: {text}"));
+    assert_eq!(
+        *delta_row,
+        format!("  local-minvmd/delta.local-minvmd0/web  stopped  {stopped_web}"),
+        "{text}"
+    );
+
+    // A name that no VM holds is not found.
+    let err = cmd::resolve_box_on_local_hosts(&global, "nobody", "box show")
+        .await
+        .expect_err("an unknown name is not found");
+    assert_eq!(
+        err.downcast_ref::<BoxAddressRefusal>(),
+        Some(&BoxAddressRefusal::NotFound {
+            address: "nobody".to_owned(),
+        })
+    );
 }
 
 /// NET-152: `min ls` lists a stopped VM's boxes from its persisted records:
@@ -22931,6 +23062,163 @@ fn task_run_stores_vpn_network_names_with_declared_file_exports() {
         spec["network"]["vpn_network_names"],
         serde_json_lenient::json!(["corp"]),
         "the stored spec keeps the names: {spec}"
+    );
+}
+
+// BCLI-024, BCLI-025: an entry that declares `vpn_network_names = ["corp"]`,
+// started or run with `--vpn-network-names lab`, stores `["corp", "lab"]`.
+// A flag value the entry declares is not added twice. `min box show <box>
+// --network` lists both names, in text and in `-o json`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vpn_network_names_kept_and_flag_adds() {
+    let toml = "[sessions.default.network]\nvpn_network_names = [\"corp\"]\n\n\
+                [tasks.build]\nexec = [\"make\"]\n\n\
+                [tasks.build.network]\nvpn_network_names = [\"corp\"]\n";
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join(mfile::MFILE_NAME), toml).unwrap();
+    let root = camino::Utf8Path::from_path(project.path()).unwrap();
+    let both = serde_json_lenient::json!(["corp", "lab"]);
+
+    // The start path: `min box start` and `min session start`.
+    let mut started = None;
+    for verb in ["box", "session"] {
+        for argv in [
+            vec!["min", verb, "start", "--vpn-network-names", "lab"],
+            vec![
+                "min",
+                verb,
+                "start",
+                "--vpn-network-names",
+                "corp",
+                "--vpn-network-names",
+                "lab",
+            ],
+        ] {
+            let start = parsed_start(&argv);
+            let StartPlan::Session { args, options, .. } =
+                plan_start(&start, &start_entries(toml), true).expect("the start is planned")
+            else {
+                panic!("{verb}: the default entry is a session");
+            };
+            let request = planned_session_request(&args, &options, root);
+            assert_eq!(
+                request.spec.as_ref().unwrap()["network"]["vpn_network_names"],
+                both,
+                "{argv:?}"
+            );
+            started = Some(request);
+        }
+    }
+
+    // The run path: `min task run` and `min box run`.
+    for verb in ["task", "box"] {
+        let spec = run_spec(
+            project.path(),
+            &["min", verb, "run", "--vpn-network-names", "lab", "build"],
+        );
+        assert_eq!(spec["network"]["vpn_network_names"], both, "{verb}: {spec}");
+        // With no flag, the stored spec keeps the declared name.
+        let spec = run_spec(project.path(), &["min", verb, "run", "build"]);
+        assert_eq!(
+            spec["network"]["vpn_network_names"],
+            serde_json_lenient::json!(["corp"]),
+            "{verb}: {spec}"
+        );
+    }
+
+    // `min box show <box> --network` lists both names.
+    let (_state, global, server) = show_network_daemon().await;
+    let mut daemon = server.connect().await;
+    let request = started.expect("a start was planned");
+    let id = match daemon.call::<minimald_rpc::CreateSession>(&request).await {
+        minimald_rpc::Errorable::Ok(created) => created.id,
+        minimald_rpc::Errorable::Err { error } => panic!("the create failed: {error}"),
+    };
+    let mut client = connect_daemon(&global).await.expect("the daemon answers");
+    let record = stored_box_record(&mut client, id)
+        .await
+        .expect("the record is read")
+        .expect("the host has the box");
+
+    let mut out = Vec::new();
+    write_box_network(
+        &mut out,
+        &mut client,
+        &record,
+        paths::HostKind::Minimald,
+        false,
+    )
+    .await
+    .expect("the policy is shown");
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.ends_with("vpn networks (not connected yet)\n  corp\n  lab\n"),
+        "{text}"
+    );
+
+    let mut out = Vec::new();
+    write_box_network(
+        &mut out,
+        &mut client,
+        &record,
+        paths::HostKind::Minimald,
+        true,
+    )
+    .await
+    .expect("the document is written");
+    let document: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(&out).expect("one JSON document");
+    assert_eq!(document["schema"], POLICY_JSON_SCHEMA, "{document}");
+    assert_eq!(document["vpn_network_names"], both, "{document}");
+
+    // A box that keeps no names has no `vpn_network_names` key, and no
+    // text rows.
+    let bare = tempfile::tempdir().unwrap();
+    let bare_root = camino::Utf8Path::from_path(bare.path()).unwrap();
+    let start = parsed_start(&["min", "box", "start"]);
+    let StartPlan::Session { args, options, .. } =
+        plan_start(&start, &start_entries("[sessions.default]\n"), true)
+            .expect("the start is planned")
+    else {
+        panic!("the default entry is a session");
+    };
+    let request = planned_session_request(&args, &options, bare_root);
+    let id = match daemon.call::<minimald_rpc::CreateSession>(&request).await {
+        minimald_rpc::Errorable::Ok(created) => created.id,
+        minimald_rpc::Errorable::Err { error } => panic!("the create failed: {error}"),
+    };
+    let record = stored_box_record(&mut client, id)
+        .await
+        .expect("the record is read")
+        .expect("the host has the box");
+    let mut out = Vec::new();
+    write_box_network(
+        &mut out,
+        &mut client,
+        &record,
+        paths::HostKind::Minimald,
+        false,
+    )
+    .await
+    .expect("the policy is shown");
+    let text = String::from_utf8(out).unwrap();
+    assert!(!text.contains("vpn networks"), "{text}");
+    let mut out = Vec::new();
+    write_box_network(
+        &mut out,
+        &mut client,
+        &record,
+        paths::HostKind::Minimald,
+        true,
+    )
+    .await
+    .expect("the document is written");
+    let document: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(&out).expect("one JSON document");
+    assert_eq!(document["schema"], POLICY_JSON_SCHEMA, "{document}");
+    assert!(
+        document.get("vpn_network_names").is_none(),
+        "no names, no key: {document}"
     );
 }
 
