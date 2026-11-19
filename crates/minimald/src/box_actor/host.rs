@@ -2410,6 +2410,31 @@ pub(crate) fn stopped_event_data(
     data
 }
 
+/// The key of an `exited` event's `data` that names the ending reason of
+/// the stop half of a restart (BCLI-068). Its one value is
+/// [`STOPPED_BY_RESTART`]. The `reason` key stays `stopped`, as BOX-011
+/// gives it for every stopped record, and a plain stop writes no such key.
+/// A client that reads the box `stopped` after its attach ended reads this
+/// key, so it names the restart before the restart's start runs.
+pub(crate) const STOPPED_BY: &str = "stopped_by";
+
+/// The value of [`STOPPED_BY`] for the stop half of a restart.
+pub(crate) const STOPPED_BY_RESTART: &str = "restart";
+
+/// The `data` of the `exited` event the stop that `end` names records:
+/// [`stopped_event_data`], plus the `restart` ending reason for the stop
+/// half of a restart.
+fn ending_event_data(
+    ending: boxes::core::record::StopEnding,
+    end: box_runtime::BoxEnd,
+) -> boxes::events::EventData {
+    let mut data = stopped_event_data(ending);
+    if end == box_runtime::BoxEnd::Restart {
+        data.insert(STOPPED_BY.to_string(), STOPPED_BY_RESTART.into());
+    }
+    data
+}
+
 impl BoxActor {
     /// Stops the box and keeps its record (BOX-013): signals every process
     /// in it, tears its host down, sets the record to `stopped` with how the
@@ -2420,17 +2445,43 @@ impl BoxActor {
         force: bool,
         grace: std::time::Duration,
     ) -> Result<boxes::core::record::StopEnding, std::io::Error> {
+        self.stop_box_as(box_runtime::BoxEnd::Stop, force, grace)
+            .await
+    }
+
+    /// [`Self::stop_box`] for the stop half of a restart. An attached
+    /// client is told of a restart, not a stop, and the `exited` event
+    /// carries the `restart` ending reason before the start runs
+    /// (BCLI-068).
+    pub(super) async fn stop_box_for_restart(
+        &mut self,
+        grace: std::time::Duration,
+    ) -> Result<boxes::core::record::StopEnding, std::io::Error> {
+        self.stop_box_as(box_runtime::BoxEnd::Restart, false, grace)
+            .await
+    }
+
+    /// [`Self::stop_box`], with `end` naming the stop to an attached
+    /// client and on the `exited` event.
+    async fn stop_box_as(
+        &mut self,
+        end: box_runtime::BoxEnd,
+        force: bool,
+        grace: std::time::Duration,
+    ) -> Result<boxes::core::record::StopEnding, std::io::Error> {
         let box_id = *self.record.id();
         let span = tracing::info_span!(
             "box.stop",
             box_id = %box_id,
             force,
             grace_ms = u64::try_from(grace.as_millis()).unwrap_or(u64::MAX),
+            restart = end == box_runtime::BoxEnd::Restart,
             ending_signal = tracing::field::Empty,
             ending_exit_code = tracing::field::Empty,
         );
         let stopped =
-            tracing::Instrument::instrument(self.stop_box_inner(force, grace), span.clone()).await;
+            tracing::Instrument::instrument(self.stop_box_inner(end, force, grace), span.clone())
+                .await;
         if let Ok(ending) = &stopped {
             let state = boxes::core::record::RecordState::Stopped(*ending);
             if let Some(signal) = state.signal() {
@@ -2445,6 +2496,7 @@ impl BoxActor {
 
     async fn stop_box_inner(
         &mut self,
+        end: box_runtime::BoxEnd,
         force: bool,
         grace: std::time::Duration,
     ) -> Result<boxes::core::record::StopEnding, std::io::Error> {
@@ -2479,10 +2531,10 @@ impl BoxActor {
             // unrecorded ending, its processes run now. This stop signals
             // them, and the record keeps how they ended.
             (_, Some((host, task))) => {
-                // BCLI-068: the host knows of the stop before any signal, so
-                // an attached client is told the box was stopped, and sees
-                // no shell-exit prompt.
-                host.announce_end(box_runtime::BoxEnd::Stop).await;
+                // BCLI-068: the host knows of the stop or the restart before
+                // any signal, so an attached client is told the box was
+                // stopped or restarted, and sees no shell-exit prompt.
+                host.announce_end(end).await;
                 let container_pid = probe_host(host.get_attrs())
                     .await
                     .and_then(|attrs| attrs.container_pid);
@@ -2559,7 +2611,7 @@ impl BoxActor {
             Ok(object) => crate::box_manager::write_box_event(
                 &object,
                 boxes::events::BoxEventType::Exited,
-                stopped_event_data(ending),
+                ending_event_data(ending, end),
             )
             .map(drop),
             Err(error) => Err(error),
