@@ -865,6 +865,38 @@ pub struct ChainLink {
     pub snapshot: String,
 }
 
+/// Whether a package's `env_state_wiring` prefix names one directory under
+/// /state. The prefix is joined onto the state directory, so it must first
+/// pass [`File::validate_state_component`], the rule for every state key and
+/// state dir name (not empty, `.` or `..`, and no `/` or NUL). It is also sent
+/// to the shell helpers on a `set_env:` line, and they print it unquoted in an
+/// `export` command for the person to run. So it may hold only ASCII letters,
+/// digits, `.`, `_` and `-`: no character a shell reads as syntax, no space,
+/// no `:` or `\`, and no control character. The Nickel contract on the
+/// attribute (`attr_classes.ncl`) applies the same set.
+#[must_use]
+pub fn is_state_prefix(prefix: &str) -> bool {
+    File::validate_state_component(prefix).is_ok()
+        && prefix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// The refusal for a package's `env_state_wiring` prefix that fails
+/// [`is_state_prefix`]. The package graph and the session composition both
+/// refuse such a prefix with this text. The values are escaped, so a newline
+/// or an escape sequence in one prints as text and the refusal stays one line.
+#[must_use]
+pub fn state_prefix_refusal(package: &str, prefix: &str) -> String {
+    format!(
+        "package `{}` declares `env_state_wiring` with prefix \"{}\". A prefix is one directory \
+         name under /state. It may use only ASCII letters, digits, `.`, `_` and `-`, and it \
+         cannot be `.` or `..`. Change the prefix in the package's spec.",
+        package.escape_debug(),
+        prefix.escape_debug(),
+    )
+}
+
 /// Object key of the per-commit index snapshot for a repo + commit:
 /// `<host>/<owner>/<repo>/<commit>.shisha`, matching the publisher's keying.
 pub fn commit_index_object(repo_url: &str, commit_sha: &str) -> String {
@@ -984,9 +1016,9 @@ pub struct File {
 }
 
 /// The entry keys that `[session]` and a task keep among their unknown
-/// fields but that a box spec reads (BOX-049), so they are not reported
-/// as unknown.
-const SPEC_READ_ENTRY_KEYS: &[&str] = &["timeout"];
+/// fields but that a box spec reads (BOX-049, BOX-203), so they are not
+/// reported as unknown.
+const SPEC_READ_ENTRY_KEYS: &[&str] = &["timeout", "file_exports"];
 
 /// An entry's unknown fields, in key order, less the ones a box spec reads.
 fn unknown_entry_keys(extra: &HashMap<String, toml::Value>) -> Vec<&str> {
@@ -1363,11 +1395,12 @@ impl File {
 
     /// Loads the minimal file from `dir` as the package graph reads a
     /// layer: [`Self::from_dir`] without the interactive-task refusal
-    /// (BOX-054). The graph reads only a layer's `[upstream]`, `[params]`
-    /// and `[stdlib]`, and never runs its tasks. An upstream package
-    /// repository can still declare `interactive = true` tasks, and the
-    /// user cannot fix that file. The project's own file gets the refusal
-    /// when it loads through [`Self::from_dir`].
+    /// (BOX-054) and without the refusal of a `state_key` that is not one
+    /// directory name. The graph reads only a layer's `[upstream]`,
+    /// `[params]` and `[stdlib]`, and never runs its tasks. An upstream
+    /// package repository can still declare `interactive = true` tasks or
+    /// such a key, and the user cannot fix that file. The project's own file
+    /// gets both refusals when it loads through [`Self::from_dir`].
     pub fn from_dir_for_graph<P: AsRef<Path>>(dir: P) -> Result<Self, Error> {
         Self::load_dir(dir.as_ref(), TaskCheck::Skip)
     }
@@ -2694,8 +2727,10 @@ impl File {
             Err("it contains '/'".to_string())
         } else if component.contains('\0') {
             Err("it contains a NUL byte".to_string())
-        } else if component == "." || component == ".." {
-            Err(format!("it is {component:?}"))
+        } else if component == "." {
+            Err("it names the current directory".to_string())
+        } else if component == ".." {
+            Err("it names the parent directory".to_string())
         } else {
             Ok(())
         }
@@ -4061,7 +4096,7 @@ mod tests {
             Path::new("/home/user/project"),
         )
         .unwrap_err();
-        assert_eq!(err, "it is \"..\"");
+        assert_eq!(err, "it names the parent directory");
     }
 
     /// A state directory replaced by a symlink pointing outside the state
@@ -4628,6 +4663,30 @@ mod tests {
         assert_eq!(file.defaults.state_key.as_deref(), Some("dev"));
     }
 
+    /// For `.` and `..` the refusal says what the key names, so the value is
+    /// not printed a second time as its own reason.
+    #[test]
+    fn a_dot_state_key_is_refused_with_what_it_names() {
+        let dir = tempdir().unwrap();
+        for (key, names) in [(".", "the current"), ("..", "the parent")] {
+            std::fs::write(
+                dir.path().join(MFILE_NAME),
+                format!("[tasks.build]\nexec = \"true\"\nstate_key = {key:?}\n"),
+            )
+            .unwrap();
+            let err = File::from_dir(dir.path()).expect_err(key);
+            assert_eq!(err.exit_code(), Some(3), "{err}");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "`[tasks.build]` in minimal.toml sets `state_key` to {key:?}, and it names \
+                     {names} directory. A state key is one directory name, such as \"dev\": not \
+                     `.` or `..`, and with no `/` or NUL byte."
+                )
+            );
+        }
+    }
+
     /// The package graph reads an upstream layer without the state-key check:
     /// the layer's tasks never run, so its keys are never used, and the user
     /// cannot fix that file.
@@ -4734,6 +4793,30 @@ mod tests {
             let parsed: File = toml::from_str(&file).unwrap();
             parsed.validate().expect(&file);
         }
+    }
+
+    /// BOX-203: `[[file_exports]]` on a task is a box setting, so the load
+    /// does not report it as an unknown field.
+    #[test]
+    fn file_exports_entry_key_is_not_reported_unknown() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MFILE_NAME),
+            "[tasks.build]\nexec = [\"make\"]\n\n[[tasks.build.file_exports]]\npath = \"out.txt\"\n",
+        )
+        .unwrap();
+
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        File::from_dir(dir.path()).expect("file_exports on a task loads");
+        drop(guard);
+
+        let out = capture.contents();
+        assert!(!out.contains("unknown fields"), "{out}");
     }
 
     /// BOX-049: `timeout` in `[session]` or a task is a box setting, so the

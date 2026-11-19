@@ -498,13 +498,22 @@ cat >"$remedybin/sudo" <<'STUB'
 exec "$@"
 STUB
 chmod +x "$remedybin/sudo"
-for _rb_cmd in systemctl nft gpasswd apparmor_parser ip resolvectl launchctl; do
+for _rb_cmd in systemctl nft gpasswd apparmor_parser ip resolvectl launchctl ifconfig; do
     cat >"$remedybin/$_rb_cmd" <<STUB
 #!/bin/sh
 printf '%s %s\\n' "$_rb_cmd" "\$*" >>"$remedy_calls"
 STUB
     chmod +x "$remedybin/$_rb_cmd"
 done
+# pgrep logs its call and finds no process unless $remedy_vm exists, so a
+# scenario can say a VM is running.
+remedy_vm="$root/remedy.vm"
+cat >"$remedybin/pgrep" <<STUB
+#!/bin/sh
+printf 'pgrep %s\\n' "\$*" >>"$remedy_calls"
+[ -e "$remedy_vm" ]
+STUB
+chmod +x "$remedybin/pgrep"
 for _rb_cmd in rm rmdir find; do
     _rb_real="$(command -v "$_rb_cmd")"
     # A builtin or an alias comes back as a bare name, and the link would
@@ -560,6 +569,11 @@ FORCE_STOP=
 # already reached.
 BIN_ON_PATH=
 
+# XDG_CACHE_HOME the installer sees. Empty means $hp/xdg-cache; a scenario sets
+# a relative value (from inside its own home, so nothing resolves outside it)
+# to drive the purge's absolute-path rule.
+CACHE_HOME=
+
 # run <label> <homeprefix> [args...] ; sets rc, captures combined output in $OUT.
 OUT=
 run() {
@@ -574,7 +588,7 @@ run() {
         MINIMAL_BIN="$hp/bin" \
         XDG_DATA_HOME="$hp/xdg-data" \
         XDG_STATE_HOME="$hp/xdg-state" \
-        XDG_CACHE_HOME="$hp/xdg-cache" \
+        XDG_CACHE_HOME="${CACHE_HOME:-$hp/xdg-cache}" \
         XDG_CONFIG_HOME="$hp/xdg-config" \
         MINIMAL_OVERRIDE_INSTALLER_BUCKET="$BUCKET_HOST" \
         STUB_UNAME_S="$PLAT_S" \
@@ -916,13 +930,43 @@ EOF
         "Library/Application Support/minimal"; do
         want_err "darwin: the printed remedy removes $f" test -e "$fake_nsd/$f"
     done
-    for f in Library/LaunchDaemons Library/PrivilegedHelperTools "Library/Application Support"; do
+    for f in Library/LaunchDaemons "Library/Application Support"; do
         want_ok "darwin: the system directory $f stays" test -d "$fake_nsd/$f"
+    done
+    for f in etc/resolver Library/PrivilegedHelperTools; do
+        want_err "darwin: the printed remedy removes the empty directory $f" test -e "$fake_nsd/$f"
     done
     for job in dev.gominimal.zone dev.minimal.local-range; do
         want_ok "darwin: the remedy boots out $job" \
             grep -qx "launchctl bootout system/$job" "$remedy_calls"
     done
+    want_ok "darwin: the remedy asks whether a VM is running" \
+        grep -qx "pgrep -qx minvmd" "$remedy_calls"
+    for addr in 127.0.64.1 127.0.64.128 127.0.64.254; do
+        want_ok "darwin: the remedy removes the lo0 alias $addr" \
+            grep -qx "ifconfig lo0 -alias $addr" "$remedy_calls"
+    done
+    check 254 "$(grep -c '^ifconfig lo0 -alias 127\.0\.64\.' "$remedy_calls")" \
+        "darwin: the remedy removes all 254 lo0 aliases"
+    want_err "darwin: the remedy removes no alias outside 127.0.64.1-254" \
+        grep -qE "^ifconfig lo0 -alias 127\.0\.64\.(0|255)\$" "$remedy_calls"
+    want_ok "darwin: the note says the DNS service runs until the commands run" \
+        grep -q "The DNS service (launchd job dev.gominimal.zone) keeps running until these commands run." "$OUT"
+
+    # A VM is running: the aliases stay and the line says why.
+    : >"$remedy_vm"
+    _vm_line="$(awk '/^      /{sub(/^      /, ""); print; exit}' "$OUT")"
+    : >"$remedy_calls"
+    _vm_err="$( (cd "$root" && HOME="$root" PATH="$remedybin" "$remedy_sh" -c "$_vm_line") 2>&1)"
+    check 0 "$?" "darwin: the remedy runs while a VM is running"
+    rm -f "$remedy_vm"
+    want_err "darwin: the remedy keeps the lo0 aliases while a VM is running" \
+        grep -q "^ifconfig " "$remedy_calls"
+    case "$_vm_err" in
+        *"the loopback IPs boxes use stay on lo0 while a VM is running"*) _vm_said=1 ;;
+        *) _vm_said=0 ;;
+    esac
+    check 1 "$_vm_said" "darwin: the remedy says the aliases stay while a VM is running"
 
     HNS2="$root/hns2"; mkdir -p "$HNS2"
     run ns2_seed "$HNS2"
@@ -1533,6 +1577,32 @@ case_target_validation() {
     want_ok "--version is told the install is counted (R6.1b)" grep -q "no release notices for --version" "$OUT"
     want_ok "--version is told what is sent and the switch (R6.1b)" grep -q "MINIMAL_TELEMETRY=0" "$OUT"
     want_ok "--version is told the channel it sends (R6.1b)" grep -q "(pinned), version, OS, architecture, install method" "$OUT"
+    # `v1` is not a release the card can place, so it gives the range.
+    want_ok "--version with a name the card cannot place gives the range (R6.1b)" \
+        grep -q "min 0.7.4 and later report this install once a day" "$OUT"
+    # A release the card can place is told which of the two it is. The mock
+    # serves the same bytes under two more version names.
+    ln -s v1 "$mock/versions/0.7.3"
+    ln -s v1 "$mock/versions/0.7.4"
+    HVO="$root/hvold"; mkdir -p "$HVO"
+    run versionold "$HVO" --version 0.7.3
+    check 0 "$rc" "--version 0.7.3 installs (R6.1b)"
+    want_ok "a release before 0.7.4 is told it sends nothing (R6.1b)" \
+        grep -q "min 0.7.3 does not check for updates and sends nothing" "$OUT"
+    want_ok "a release before 0.7.4 is told from when installs report (R6.1b)" \
+        grep -q "Releases from 0.7.4 on report an" "$OUT"
+    if grep -q "MINIMAL_TELEMETRY=0" "$OUT"; then
+        bad "a release before 0.7.4 is not told of a switch for a request it never makes (R6.1b)"
+    else
+        ok "a release before 0.7.4 is not told of a switch for a request it never makes (R6.1b)"
+    fi
+    HVN="$root/hvnew"; mkdir -p "$HVN"
+    run versionnew "$HVN" --version 0.7.4
+    check 0 "$rc" "--version 0.7.4 installs (R6.1b)"
+    want_ok "0.7.4 is told it reports, with no range (R6.1b)" \
+        grep -q "min reports this install once a day (no release notices for --version)" "$OUT"
+    want_ok "0.7.4 is told the switch (R6.1b)" grep -q "MINIMAL_TELEMETRY=0" "$OUT"
+    rm "$mock/versions/0.7.3" "$mock/versions/0.7.4"
     HV2="$root/hv2"; mkdir -p "$HV2"
     run versioneq "$HV2" --force-stop --version=v1
     check 0 "$rc" "--version=VER with another flag installs (R2.5)"
@@ -2353,6 +2423,57 @@ case_uninstall() {
     run u5_purge "$HU5" --uninstall --purge
     check 0 "$rc" "uninstall --purge exits 0"
     want_err "purge removes the cache tree (R8.2)" test -e "$HU5/xdg-cache/minimal"
+    want_err "purge removes the data tree (R8.2)" test -e "$HU5/xdg-data/minimal"
+    want_err "purge removes the state tree (R8.2)" test -e "$HU5/xdg-state/minimal"
+
+    # R8.2 on macOS — the runtime's cache is ~/Library/Caches/minimal (the
+    # platform cache dir), not the XDG path, so --purge removes it too, and the
+    # XDG one as before. Another app's cache beside it is never touched.
+    HU5D="$root/hu5_darwin"; mkdir -p "$HU5D"
+    PLAT_S=Darwin; PLAT_M=arm64
+    run u5d_install "$HU5D"
+    check 0 "$rc" "darwin: purge seed install exits 0"
+    mac_stray="$HU5D/Library/Caches/minimal/built/deadbeef"
+    xdg_stray="$HU5D/xdg-cache/minimal/built/deadbeef"
+    other_app="$HU5D/Library/Caches/other-app/keep"
+    mkdir -p "${mac_stray%/*}" "${xdg_stray%/*}" "${other_app%/*}"
+    printf 'artifact\n' >"$mac_stray"
+    printf 'artifact\n' >"$xdg_stray"
+    printf 'theirs\n' >"$other_app"
+    run u5d_dry "$HU5D" --uninstall --purge --dry-run
+    check 0 "$rc" "darwin: uninstall --purge --dry-run exits 0"
+    want_ok "darwin: dry-run names the platform cache tree" \
+        grep -qF "would purge $HU5D/Library/Caches/minimal" "$OUT"
+    want_ok "darwin: dry-run keeps the platform cache tree" test -f "$mac_stray"
+    run u5d_purge "$HU5D" --uninstall --purge
+    check 0 "$rc" "darwin: uninstall --purge exits 0"
+    want_err "darwin: purge removes ~/Library/Caches/minimal (R8.2)" \
+        test -e "$HU5D/Library/Caches/minimal"
+    want_err "darwin: purge removes the XDG cache tree (R8.2)" test -e "$HU5D/xdg-cache/minimal"
+    want_ok "darwin: purge leaves another app's cache" test -f "$other_app"
+    PLAT_S=Linux; PLAT_M=x86_64
+
+    # R8.2 — a relative XDG_CACHE_HOME is not a cache dir: the runtime ignores
+    # it and writes ~/.cache/minimal, so --purge removes that and never the
+    # relative path (which would resolve against the current directory). Runs
+    # from inside the scenario home, so a regression stays inside it.
+    HU5R="$root/hu5_relative"; mkdir -p "$HU5R"
+    run u5r_install "$HU5R"
+    rel_keep="$HU5R/rel-cache/minimal/keep"
+    home_stray="$HU5R/.cache/minimal/built/deadbeef"
+    mkdir -p "${rel_keep%/*}" "${home_stray%/*}"
+    printf 'not ours\n' >"$rel_keep"
+    printf 'artifact\n' >"$home_stray"
+    _u5r_cwd="$(pwd)"
+    cd "$HU5R" || exit 1
+    CACHE_HOME=rel-cache
+    run u5r_purge "$HU5R" --uninstall --purge
+    CACHE_HOME=
+    cd "$_u5r_cwd" || exit 1
+    check 0 "$rc" "relative XDG_CACHE_HOME: uninstall --purge exits 0"
+    want_err "relative XDG_CACHE_HOME: purge removes ~/.cache/minimal (R8.2)" \
+        test -e "$HU5R/.cache/minimal"
+    want_ok "relative XDG_CACHE_HOME: purge leaves the relative path" test -f "$rel_keep"
 
     # R7.3 — a non-regular file now occupying a recorded path is never removed, even
     # with --force (the installer only ever wrote regular files there).

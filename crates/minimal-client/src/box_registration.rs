@@ -307,8 +307,8 @@ pub struct RegisteredWithVmHost {
     /// [`Self::row_addresses`].
     pub addresses: boxes::BoxAddresses,
     /// Whether the registration is a `host_ip` box's (BEP-082): the host
-    /// minted its id and allocated no address, so it has no row to carry,
-    /// to commit or to withdraw.
+    /// minted its id and allocated no address, so it has no row. Its lease
+    /// holds the registration name instead.
     pub host_ip: bool,
     /// The box's own id the reply returned — 32 hex digits on the wire,
     /// the one spelling the row, the attachment and a diagnostic all name
@@ -319,8 +319,9 @@ pub struct RegisteredWithVmHost {
     /// drawing; empty from a daemon that predates them.
     pub task_addresses: Vec<std::net::Ipv4Addr>,
     /// The registration's lease, held until the session is active and
-    /// committed then; `None` from a daemon that predates ids, which
-    /// predates leases too and answered one-shot.
+    /// committed then. A `host_ip` registration's lease holds its name.
+    /// `None` from a daemon that predates ids, which predates leases too
+    /// and answered one-shot.
     pub lease: Option<BoxLease>,
 }
 
@@ -381,7 +382,8 @@ pub async fn register_box_with_vm_host(
             lease: Some(BoxLease { stream }),
         }),
         // A `host_ip` registration's answer (BEP-082): the box's id and no
-        // address, on a connection that holds no lease.
+        // address, on the connection a held registration keeps as the
+        // name's lease.
         minimald_rpc::BoxControlReply::BoxIdMinted { minted_box_id } if host_ip => {
             Ok(RegisteredWithVmHost {
                 addresses: boxes::BoxAddresses {
@@ -391,7 +393,7 @@ pub async fn register_box_with_vm_host(
                 host_ip: true,
                 box_id: Some(minted_box_id),
                 task_addresses: Vec::new(),
-                lease: None,
+                lease: Some(BoxLease { stream }),
             })
         }
         // A daemon that predates ids answers with the bare pair the
@@ -787,7 +789,7 @@ pub fn control_sock_beside(ssh_sock: &Path) -> Option<PathBuf> {
 /// `sock_path`: the box's declaration in, held as a lease, bounded by
 /// [`BOX_CONTROL_TIMEOUT`], with the failure the activation ends with.
 /// `host_ip` registers a `host_ip` box: the host mints its id and hands it
-/// no address, so it asks for no task address and holds no lease.
+/// no address, so it asks for no task address. Its lease holds the name.
 async fn register_box_at(
     sock_path: &Path,
     name: &str,
@@ -829,8 +831,10 @@ async fn register_box_at(
             .and_then(|ingress| ingress.dynamic_allowed_range),
         // The row is held as a lease until the session is active: an
         // activation that dies before then — an interrupt, a crash, a
-        // withdrawal that never lands — leaves no row holding its name.
-        hold: !host_ip,
+        // withdrawal that never lands — leaves no row holding its name. A
+        // `host_ip` registration has no row, and its lease holds its name
+        // the same way.
+        hold: true,
         // The task addresses the box's task runs attach at, filed with the
         // box so the in-VM daemon draws nothing for a task (NET-138).
         task_slots: if host_ip {
@@ -1418,5 +1422,63 @@ mod tests {
                 "{reply:?}"
             );
         }
+    }
+
+    /// A `host_ip` registration asks to be held, and the connection its id
+    /// came back on is the name's lease. A lease dropped uncommitted closes
+    /// the connection with no commit line, the close the daemon withdraws
+    /// the name on.
+    #[tokio::test]
+    async fn a_host_ip_registration_is_held_as_a_lease() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let sock_path = dir.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let id = minimald_rpc::BoxId::from_bytes([5; 16]);
+        let line = serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::BoxIdMinted {
+            minted_box_id: id,
+        })
+        .unwrap();
+        let daemon = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = tokio::io::BufReader::new(stream);
+            let mut request = String::new();
+            stream.read_line(&mut request).await.unwrap();
+            stream
+                .get_mut()
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .unwrap();
+            let mut after = Vec::new();
+            stream.read_to_end(&mut after).await.unwrap();
+            (request, after)
+        });
+        let policy = boxes::BoxPolicy {
+            credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
+            ..boxes::BoxPolicy::default()
+        };
+        let mut registered = register_box_at(&sock_path, "grant", &policy, true)
+            .await
+            .expect("the registration is answered");
+        assert!(registered.host_ip);
+        assert_eq!(registered.box_id, Some(id));
+        let lease = registered
+            .lease
+            .take()
+            .expect("the host_ip registration's connection is its lease");
+        drop(lease);
+        let (request, after) = daemon.await.unwrap();
+        match serde_json_lenient::from_str(request.trim()).unwrap() {
+            minimald_rpc::BoxControlRequest::Register(register) => {
+                assert!(register.host_ip);
+                assert!(register.hold, "a host_ip registration is held");
+            }
+            other => panic!("the client registers the box, got {other:?}"),
+        }
+        assert!(
+            after.is_empty(),
+            "an uncommitted lease closes with no commit line"
+        );
     }
 }

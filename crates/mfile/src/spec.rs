@@ -108,6 +108,13 @@ pub struct BoxSpec {
     /// ends. The daemon only keeps them, so a box that declares exports
     /// can resume from its stored spec.
     pub file_exports: Option<Vec<StoredExport>>,
+    /// The keys of a stored spec that the schema of a spec names, but that
+    /// no field above types, such as `io.exec_enabled` or
+    /// `network.dynamic_ingress`. Each value is kept as it was written,
+    /// by its dotted path, and a section with no typed keys, such as
+    /// `nesting`, is kept whole. A newer client can store such a key, and
+    /// the box still resumes from its stored spec.
+    pub kept_keys: std::collections::BTreeMap<String, StoredExport>,
 }
 
 /// One `[[file_exports]]` item of a stored spec, kept as it was written:
@@ -220,6 +227,11 @@ pub struct SpecNetwork {
     pub mode: boxes::NetworkMode,
     /// The egress and ingress policy the creating command resolved.
     pub policy: boxes::BoxPolicy,
+    /// The entry's `network.vpn_network_names`, in the order it lists
+    /// them, then each name a `--vpn-network-names` flag adds (BCLI-024).
+    /// Serialized as `vpn_network_names`, and left out when empty. The
+    /// daemon keeps the list and does not enforce it (BOX-076).
+    pub vpn_network_names: Vec<String>,
 }
 
 /// What the creating command's flags set on the spec. This is the last
@@ -342,6 +354,9 @@ impl BoxSpec {
             .and_then(|(t, ranking)| ranking.map(|r| (t, r)))
             .and_then(|(t, ranking)| entry_lifetime(t, ranking))
             .unwrap_or(Lifetime::UntilComplete);
+        // BOX-203: the entry's exports, for the command that waits for the
+        // box to copy them when it ends.
+        let file_exports = extra.and_then(|(t, _)| crate::expand::stored_file_exports(t));
         let mut seen = std::collections::BTreeSet::new();
         let packages = packages
             .iter()
@@ -363,9 +378,13 @@ impl BoxSpec {
             network: SpecNetwork {
                 mode: flags.network,
                 policy: flags.policy,
+                vpn_network_names: extra
+                    .map(|(t, _)| entry_vpn_network_names(t))
+                    .unwrap_or_default(),
             },
             lifecycle_hooks: None,
-            file_exports: None,
+            file_exports,
+            kept_keys: std::collections::BTreeMap::new(),
         }
     }
 
@@ -375,6 +394,26 @@ impl BoxSpec {
     pub fn box_name(&self) -> &str {
         self.name.as_deref().unwrap_or(&self.entry)
     }
+}
+
+/// The names an entry's `[network]` table lists in `vpn_network_names`
+/// (BCLI-024), each once, in the order the entry lists them. Empty when the
+/// entry sets none. The expansion refuses a value that is not a list of
+/// strings (see [`check_section`]), and a value that is not a string is
+/// left out here.
+#[must_use]
+pub fn entry_vpn_network_names(extra: &toml::Table) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let listed = extra
+        .get("network")
+        .and_then(|network| network.get("vpn_network_names"))
+        .and_then(toml::Value::as_array);
+    for name in listed.into_iter().flatten().filter_map(toml::Value::as_str) {
+        if !names.iter().any(|kept| kept == name) {
+            names.push(name.to_owned());
+        }
+    }
+    names
 }
 
 /// Whether an entry's own table sets `hooks_on_resume = true` (BOX-028).
@@ -552,6 +591,40 @@ struct SpecDoc {
     /// Absent from a spec that declares no exports.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     file_exports: Option<Vec<StoredExport>>,
+    /// The `[nesting]` section, kept whole. Absent when the spec sets none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nesting: Option<StoredExport>,
+}
+
+/// Declares the fields of a `Doc*` table that keep a schema key as it was
+/// written ([`BoxSpec::kept_keys`]), and the two functions that move them
+/// to and from the kept map, by the dotted path `<section>.<key>`.
+macro_rules! kept_fields {
+    ($doc:ident, $section:literal, [$($key:ident),* $(,)?]) => {
+        impl $doc {
+            /// Moves each kept key of this table into `kept`.
+            fn put_kept(
+                &mut self,
+                kept: &mut std::collections::BTreeMap<String, StoredExport>,
+            ) {
+                $(
+                    if let Some(value) = self.$key.take() {
+                        kept.insert(concat!($section, ".", stringify!($key)).to_owned(), value);
+                    }
+                )*
+            }
+
+            /// Takes each kept key of this table out of `kept`.
+            fn take_kept(
+                &mut self,
+                kept: &mut std::collections::BTreeMap<String, StoredExport>,
+            ) {
+                $(
+                    self.$key = kept.remove(concat!($section, ".", stringify!($key)));
+                )*
+            }
+        }
+    };
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -565,13 +638,38 @@ struct DocBox {
     /// `until_complete`.
     #[serde(default = "until_complete")]
     lifetime: Lifetime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    loadout_mode: Option<StoredExport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    volumes: Option<StoredExport>,
 }
+
+kept_fields!(DocBox, "box", [loadout_mode, volumes]);
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DocIo {
     pty_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exec_enabled: Option<StoredExport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stderr_mimetype: Option<StoredExport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stdin_mimetype: Option<StoredExport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stdout_mimetype: Option<StoredExport>,
 }
+
+kept_fields!(
+    DocIo,
+    "io",
+    [
+        exec_enabled,
+        stderr_mimetype,
+        stdin_mimetype,
+        stdout_mimetype
+    ]
+);
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -581,16 +679,40 @@ struct DocExecution {
     /// Absent from a spec that does not set it, which reads as `false`.
     #[serde(default, skip_serializing_if = "is_false")]
     hooks_on_resume: bool,
-    /// Absent from a spec that sets no timeout.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Absent from a spec that sets no timeout. A read also takes a
+    /// duration string, as the schema of a spec allows.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "stored_timeout"
+    )]
     timeout: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    on_oom: Option<StoredExport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    restart: Option<StoredExport>,
+}
+
+kept_fields!(DocExecution, "execution", [on_oom, restart]);
+
+/// A stored `execution.timeout`: whole seconds, or a duration string that
+/// [`crate::duration::spec_timeout`] reads.
+fn stored_timeout<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    let value = <toml::Value as serde::Deserialize>::deserialize(deserializer)?;
+    crate::duration::spec_timeout(&value).map_err(serde::de::Error::custom)
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DocInstall {
     packages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    raw_packages: Option<StoredExport>,
 }
+
+kept_fields!(DocInstall, "install", [raw_packages]);
 
 /// The `[network]` table. The policy's own keys are `egress`, `ingress`,
 /// and `credentialed_upstream` and `quic443` when it sets them, so it is
@@ -600,12 +722,98 @@ struct DocInstall {
 /// the same v0 exception as on [`SpecNetwork`]: `ingress` keeps the
 /// [`boxes::IngressPolicy`] shape, and `credentialed_upstream` is declared
 /// here. #2410 ends the interim.
+///
+/// The other keys of [`NETWORK_KEYS`] are kept as they were written,
+/// except the flat egress keys. Canonicalisation moves each one to its
+/// nested `egress.*` key before a spec is stored, and a resume reads only
+/// the policy. So a stored flat key is refused, never kept: a kept deny
+/// that no resume applies is a deny the box runs without.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct DocNetwork {
     #[serde(with = "mode_word")]
     mode: boxes::NetworkMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dynamic_ingress: Option<StoredExport>,
+    #[serde(default, skip_serializing, deserialize_with = "refuse_flat_allow_dns")]
+    #[expect(dead_code, reason = "present only to refuse the key on a read")]
+    egress_allow_dns: Option<()>,
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "refuse_flat_allow_subnets"
+    )]
+    #[expect(dead_code, reason = "present only to refuse the key on a read")]
+    egress_allow_subnets: Option<()>,
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "refuse_flat_deny_subnets"
+    )]
+    #[expect(dead_code, reason = "present only to refuse the key on a read")]
+    egress_deny_subnets: Option<()>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "lenient_names"
+    )]
+    vpn_network_names: Vec<String>,
     #[serde(flatten)]
     policy: boxes::BoxPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bep: Option<StoredExport>,
+}
+
+kept_fields!(DocNetwork, "network", [dynamic_ingress, bep,]);
+
+/// Reads a stored spec's `network.vpn_network_names` leniently: the string
+/// items of a list, in order. A hand-edited stored spec can hold another
+/// shape. That value reads as no names, and the box still resumes from its
+/// stored spec.
+fn lenient_names<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <toml::Value as serde::Deserialize>::deserialize(deserializer)?;
+    let names = match value {
+        toml::Value::Array(items) => items
+            .into_iter()
+            .filter_map(|item| match item {
+                toml::Value::String(name) => Some(name),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    Ok(names)
+}
+
+/// Refuses the flat `[network]` egress key `flat` in a stored spec, and
+/// names the nested `egress.*` key that a stored spec carries in its place.
+fn refuse_flat_egress<E: serde::de::Error>(flat: &str) -> E {
+    let nested = crate::network::FLAT_EGRESS_KEYS
+        .iter()
+        .find(|(key, _)| *key == flat)
+        .map_or(flat, |(_, nested)| nested);
+    E::custom(format!(
+        "a stored spec does not carry `network.{flat}`. \
+         Write it as `network.egress.{nested}`."
+    ))
+}
+
+fn refuse_flat_allow_dns<'de, D: serde::Deserializer<'de>>(_: D) -> Result<Option<()>, D::Error> {
+    Err(refuse_flat_egress("egress_allow_dns"))
+}
+
+fn refuse_flat_allow_subnets<'de, D: serde::Deserializer<'de>>(
+    _: D,
+) -> Result<Option<()>, D::Error> {
+    Err(refuse_flat_egress("egress_allow_subnets"))
+}
+
+fn refuse_flat_deny_subnets<'de, D: serde::Deserializer<'de>>(
+    _: D,
+) -> Result<Option<()>, D::Error> {
+    Err(refuse_flat_egress("egress_deny_subnets"))
 }
 
 /// The `mode` key in its spec word, [`boxes::NetworkMode::word`], not the
@@ -637,41 +845,79 @@ mod mode_word {
 
 impl From<BoxSpec> for SpecDoc {
     fn from(spec: BoxSpec) -> Self {
+        let mut kept = spec.kept_keys;
+        let mut box_table = DocBox {
+            box_type: spec.box_type,
+            name: spec.name,
+            lifetime: spec.lifetime,
+            loadout_mode: None,
+            volumes: None,
+        };
+        box_table.take_kept(&mut kept);
+        let mut io = DocIo {
+            pty_enabled: spec.pty_enabled,
+            exec_enabled: None,
+            stderr_mimetype: None,
+            stdin_mimetype: None,
+            stdout_mimetype: None,
+        };
+        io.take_kept(&mut kept);
+        let mut execution = DocExecution {
+            exec: match spec.entrypoint {
+                Entrypoint::Shell => None,
+                Entrypoint::Exec(argv) => Some(argv),
+            },
+            hooks_on_resume: spec.hooks_on_resume,
+            timeout: spec.timeout,
+            on_oom: None,
+            restart: None,
+        };
+        execution.take_kept(&mut kept);
+        let mut install = DocInstall {
+            packages: spec.packages,
+            raw_packages: None,
+        };
+        install.take_kept(&mut kept);
+        let mut network = DocNetwork {
+            mode: spec.network.mode,
+            dynamic_ingress: None,
+            egress_allow_dns: None,
+            egress_allow_subnets: None,
+            egress_deny_subnets: None,
+            vpn_network_names: spec.network.vpn_network_names,
+            policy: spec.network.policy,
+            bep: None,
+        };
+        network.take_kept(&mut kept);
         Self {
             v: spec.v,
             entry: spec.entry,
             hooks_enabled: spec.hooks_enabled,
-            box_table: DocBox {
-                box_type: spec.box_type,
-                name: spec.name,
-                lifetime: spec.lifetime,
-            },
-            io: DocIo {
-                pty_enabled: spec.pty_enabled,
-            },
-            execution: Some(DocExecution {
-                exec: match spec.entrypoint {
-                    Entrypoint::Shell => None,
-                    Entrypoint::Exec(argv) => Some(argv),
-                },
-                hooks_on_resume: spec.hooks_on_resume,
-                timeout: spec.timeout,
-            }),
-            install: DocInstall {
-                packages: spec.packages,
-            },
-            network: DocNetwork {
-                mode: spec.network.mode,
-                policy: spec.network.policy,
-            },
+            box_table,
+            io,
+            execution: Some(execution),
+            install,
+            network,
             lifecycle_hooks: spec.lifecycle_hooks,
             file_exports: spec.file_exports,
+            nesting: kept.remove("nesting"),
         }
     }
 }
 
 impl From<SpecDoc> for BoxSpec {
-    fn from(doc: SpecDoc) -> Self {
+    fn from(mut doc: SpecDoc) -> Self {
+        let mut kept = std::collections::BTreeMap::new();
+        doc.box_table.put_kept(&mut kept);
+        doc.io.put_kept(&mut kept);
+        if let Some(execution) = doc.execution.as_mut() {
+            execution.put_kept(&mut kept);
+        }
+        doc.install.put_kept(&mut kept);
+        doc.network.put_kept(&mut kept);
+        if let Some(nesting) = doc.nesting {
+            kept.insert("nesting".to_owned(), nesting);
+        }
         let hooks_on_resume = doc.execution.as_ref().is_some_and(|e| e.hooks_on_resume);
         let timeout = doc.execution.as_ref().and_then(|e| e.timeout);
         let entrypoint = match doc.execution {
@@ -694,9 +940,11 @@ impl From<SpecDoc> for BoxSpec {
             network: SpecNetwork {
                 mode: doc.network.mode,
                 policy: doc.network.policy,
+                vpn_network_names: doc.network.vpn_network_names,
             },
             lifecycle_hooks: doc.lifecycle_hooks,
             file_exports: doc.file_exports,
+            kept_keys: kept,
         }
     }
 }
@@ -1211,6 +1459,124 @@ mod tests {
         assert!(refused.to_string().contains("file_imports"), "{refused}");
     }
 
+    /// A value that fits `shape`, for a key the stored spec does not set.
+    fn sample(shape: KeyShape) -> toml::Value {
+        match shape {
+            KeyShape::Str => "corp".into(),
+            KeyShape::Bool => false.into(),
+            KeyShape::Int | KeyShape::StrOrInt => 3.into(),
+            KeyShape::StrList | KeyShape::StrOrStrList => vec![toml::Value::from("corp")].into(),
+            KeyShape::Word(words) => words[0].into(),
+            KeyShape::Keys(keys) | KeyShape::Owned(keys) => toml::Value::Table(
+                keys.iter()
+                    .map(|(key, shape)| ((*key).to_owned(), sample(*shape)))
+                    .collect(),
+            ),
+        }
+    }
+
+    // A stored spec that carries every key the schema of a spec names reads
+    // back, so a box whose spec a newer client wrote can resume. A read and
+    // a write keep each key the typed spec does not read.
+    #[test]
+    fn stored_spec_with_every_expansion_key_reads_back() {
+        let spec = BoxSpec::for_session(None, SpecFlags::default());
+        let mut stored = toml::Table::try_from(&spec).unwrap();
+        for (section, shape) in SECTIONS {
+            let KeyShape::Keys(keys) = shape else {
+                continue;
+            };
+            let table = stored
+                .entry((*section).to_owned())
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                .as_table_mut()
+                .unwrap();
+            for (key, shape) in *keys {
+                // A stored spec never carries a flat egress key. The test
+                // below checks that a read refuses one.
+                if *section == "network"
+                    && crate::network::FLAT_EGRESS_KEYS
+                        .iter()
+                        .any(|(flat, _)| flat == key)
+                {
+                    continue;
+                }
+                // A sample does not replace a key that the typed spec
+                // wrote, such as `mode`.
+                table
+                    .entry((*key).to_owned())
+                    .or_insert_with(|| sample(*shape));
+            }
+        }
+        // The typed keys that `for_session` leaves out, in a shape that
+        // the typed spec reads.
+        stored["execution"]["exec"] = vec![toml::Value::from("make")].into();
+        stored["execution"]["timeout"] = 30.into();
+        stored["execution"]["hooks_on_resume"] = true.into();
+        stored["network"]["egress"] = sample(KeyShape::Keys(EGRESS_KEYS));
+        stored["network"]["egress"]["allow_protocols"] = vec![toml::Value::from("tcp")].into();
+        stored["network"]["quic443"] = "block".into();
+        // The typed policy reads `ingress` in its own shape, and a session
+        // spec sets none.
+        stored["network"].as_table_mut().unwrap().remove("ingress");
+
+        let read: BoxSpec = stored.clone().try_into().unwrap();
+        assert_eq!(read.entrypoint, Entrypoint::Exec(vec!["make".to_owned()]));
+        assert_eq!(read.timeout, Some(30));
+        assert_eq!(
+            read.kept_keys.get("io.exec_enabled"),
+            Some(&StoredExport(false.into()))
+        );
+        assert_eq!(read.network.vpn_network_names, ["corp"]);
+        assert!(!read.kept_keys.contains_key("network.vpn_network_names"));
+        assert!(read.kept_keys.contains_key("nesting"));
+
+        let written = toml::Table::try_from(&read).unwrap();
+        assert_eq!(written, stored, "a read and a write keep the stored spec");
+        let again: BoxSpec = written.try_into().unwrap();
+        assert_eq!(again, read);
+
+        // The stored spec also reads back from its text.
+        let text = toml::to_string(&stored).unwrap();
+        assert_eq!(toml::from_str::<BoxSpec>(&text).unwrap(), read);
+
+        // A duration string is a timeout that the schema allows.
+        let mut duration = stored.clone();
+        duration["execution"]["timeout"] = "2m".into();
+        let read: BoxSpec = duration.try_into().unwrap();
+        assert_eq!(read.timeout, Some(120));
+
+        // A flat egress key is refused, and the error names its nested key.
+        for (flat, nested) in crate::network::FLAT_EGRESS_KEYS {
+            let mut legacy = stored.clone();
+            legacy["network"].as_table_mut().unwrap().insert(
+                flat.to_owned(),
+                vec![toml::Value::from("10.0.0.0/8")].into(),
+            );
+            let refused = legacy.try_into::<BoxSpec>().unwrap_err().to_string();
+            assert!(
+                refused.contains(&format!("network.egress.{nested}")),
+                "{flat}: {refused}"
+            );
+        }
+
+        // A key that no schema of a spec names is still refused. The
+        // `[network]` table flattens the policy in, so it does not refuse
+        // a key, as before.
+        for section in ["box", "io", "execution", "install"] {
+            let mut unknown = stored.clone();
+            unknown[section]
+                .as_table_mut()
+                .unwrap()
+                .insert("not_a_key".to_owned(), true.into());
+            let refused = unknown.try_into::<BoxSpec>().unwrap_err();
+            assert!(
+                refused.to_string().contains("not_a_key"),
+                "{section}: {refused}"
+            );
+        }
+    }
+
     // BOX-068: the first spec comes from the `[session]` table or a task,
     // with the flags as the last layer.
     #[test]
@@ -1258,9 +1624,11 @@ mod tests {
                 network: SpecNetwork {
                     mode: boxes::NetworkMode::OwnIp,
                     policy: policy.clone(),
+                    vpn_network_names: Vec::new(),
                 },
                 lifecycle_hooks: None,
                 file_exports: None,
+                kept_keys: std::collections::BTreeMap::new(),
             }
         );
 
@@ -1396,13 +1764,15 @@ mod tests {
             assert_eq!(&toml::from_str::<BoxSpec>(&text).unwrap(), spec, "{text}");
         }
 
-        // An unknown `[execution]` key is refused, as in every other table.
+        // An `[execution]` key that no schema of a spec names is refused,
+        // as in every other table. `restart` is a schema key, so it is kept.
         let mut value: toml::Value = toml::from_str(&toml::to_string(&lint).unwrap()).unwrap();
         value["execution"]
             .as_table_mut()
             .unwrap()
-            .insert("restart".to_string(), true.into());
-        assert!(toml::from_str::<BoxSpec>(&toml::to_string(&value).unwrap()).is_err());
+            .insert("retries".to_string(), true.into());
+        let refused = toml::from_str::<BoxSpec>(&toml::to_string(&value).unwrap()).unwrap_err();
+        assert!(refused.to_string().contains("retries"), "{refused}");
     }
 
     // BOX-028: an entry that sets `hooks_on_resume = true` carries the key
@@ -1539,6 +1909,86 @@ mod tests {
 
     // BCLI-029: a session entry's spec takes its lifetime from the
     // expansion, so `until_stopped` reaches the stored spec, and an entry
+    // BOX-203: a session entry's `[[file_exports]]` items, its own and the
+    // ones `[defaults]` declares, reach the stored spec as written.
+    #[test]
+    fn for_session_entry_stores_file_exports() {
+        let file = r#"
+            [defaults]
+            file_exports = [{ path = "shared.txt" }]
+
+            [sessions.dev]
+            packages = ["git"]
+
+            [[sessions.dev.file_exports]]
+            path = "notes.md"
+
+            [sessions.plain]
+        "#;
+        let dev = expand_in(file, "dev").expect("dev expands");
+        let spec =
+            BoxSpec::for_session_entry("dev", &dev.spec, &dev.report, &[], SpecFlags::default());
+        let paths: Vec<_> = spec
+            .file_exports
+            .as_ref()
+            .expect("the spec stores the exports")
+            .iter()
+            .filter_map(|item| crate::expand::file_export_path(&item.0))
+            .collect();
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        assert!(paths.contains(&"notes.md"), "{paths:?}");
+        assert!(paths.contains(&"shared.txt"), "{paths:?}");
+
+        // The stored bytes carry the list as the top-level `file_exports`.
+        let stored = toml::Table::try_from(&spec).unwrap();
+        assert_eq!(
+            stored["file_exports"].as_array().map(Vec::len),
+            Some(2),
+            "{stored:?}"
+        );
+
+        // An entry with no exports stores no list.
+        let plain = expand_in(file, "plain").expect("plain expands");
+        let mut plain_spec = plain.spec.clone();
+        plain_spec.remove("file_exports");
+        let spec = BoxSpec::for_session_entry(
+            "plain",
+            &plain_spec,
+            &plain.report,
+            &[],
+            SpecFlags::default(),
+        );
+        assert_eq!(spec.file_exports, None);
+    }
+
+    // BOX-203: a task's `[[file_exports]]` items reach its stored spec, and
+    // a task with none stores no list.
+    #[test]
+    fn for_task_stores_file_exports() {
+        let file: crate::File = toml::from_str(
+            r#"
+            [tasks.build]
+            exec = ["make"]
+
+            [[tasks.build.file_exports]]
+            path = "dist/out.txt"
+
+            [tasks.plain]
+            exec = ["true"]
+            "#,
+        )
+        .unwrap();
+        let build = BoxSpec::for_task("build", &file.tasks["build"], SpecFlags::default()).unwrap();
+        let exports = build.file_exports.as_ref().expect("the spec stores them");
+        assert_eq!(exports.len(), 1, "{exports:?}");
+        assert_eq!(
+            crate::expand::file_export_path(&exports[0].0),
+            Some("dist/out.txt")
+        );
+        let plain = BoxSpec::for_task("plain", &file.tasks["plain"], SpecFlags::default()).unwrap();
+        assert_eq!(plain.file_exports, None);
+    }
+
     // that sets none keeps `until_complete`.
     #[test]
     fn box_spec_takes_lifetime_from_expansion() {
@@ -1763,6 +2213,76 @@ mod tests {
             &std::collections::BTreeSet::new(),
         );
         crate::expand::expand(entry, &layers)
+    }
+
+    // BCLI-024: an entry's `network.vpn_network_names` reach the typed spec
+    // and its stored bytes, on a session entry and on a task. A stored spec
+    // reads the list back into the typed field, and an entry that sets none
+    // stores no key.
+    #[test]
+    fn spec_keeps_vpn_network_names() {
+        let file = r#"
+            [sessions.dev.network]
+            vpn_network_names = ["corp", "lab", "corp"]
+
+            [sessions.plain]
+        "#;
+        let dev = expand_in(file, "dev").expect("dev expands");
+        let spec =
+            BoxSpec::for_session_entry("dev", &dev.spec, &dev.report, &[], SpecFlags::default());
+        assert_eq!(spec.network.vpn_network_names, ["corp", "lab"]);
+
+        let stored = toml::Table::try_from(&spec).unwrap();
+        assert_eq!(
+            stored["network"]["vpn_network_names"],
+            toml::Value::from(vec!["corp", "lab"]),
+            "{stored:?}"
+        );
+        let read: BoxSpec = stored.try_into().unwrap();
+        assert_eq!(read, spec, "a stored spec reads the list back");
+        assert!(read.kept_keys.is_empty(), "{:?}", read.kept_keys);
+
+        let plain = expand_in(file, "plain").expect("plain expands");
+        let spec = BoxSpec::for_session_entry(
+            "plain",
+            &plain.spec,
+            &plain.report,
+            &[],
+            SpecFlags::default(),
+        );
+        assert!(spec.network.vpn_network_names.is_empty());
+        let stored = toml::Table::try_from(&spec).unwrap();
+        assert!(
+            stored["network"].get("vpn_network_names").is_none(),
+            "{stored:?}"
+        );
+
+        // A hand-edited stored spec with another shape still reads: the
+        // string items of a list are kept, and any other value is no names.
+        let mut odd = toml::Table::try_from(&spec).unwrap();
+        odd["network"].as_table_mut().unwrap().insert(
+            "vpn_network_names".to_owned(),
+            vec![toml::Value::from("corp"), toml::Value::from(7)].into(),
+        );
+        let read: BoxSpec = odd.clone().try_into().unwrap();
+        assert_eq!(read.network.vpn_network_names, ["corp"]);
+        odd["network"]["vpn_network_names"] = "corp".into();
+        let read: BoxSpec = odd.try_into().unwrap();
+        assert!(read.network.vpn_network_names.is_empty());
+
+        let task_file: crate::File = toml::from_str(
+            r#"
+            [tasks.build]
+            exec = ["make"]
+
+            [tasks.build.network]
+            vpn_network_names = ["corp"]
+            "#,
+        )
+        .unwrap();
+        let build =
+            BoxSpec::for_task("build", &task_file.tasks["build"], SpecFlags::default()).unwrap();
+        assert_eq!(build.network.vpn_network_names, ["corp"]);
     }
 
     // BOX-076: every Box Spec section expands with its keys, and
