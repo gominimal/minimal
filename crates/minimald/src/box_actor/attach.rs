@@ -45,7 +45,9 @@ pub enum AttachError {
     /// the refusal ends with its own exit status
     /// ([`minimald_rpc::ATTACH_ROW_ENDED_EXIT_STATUS`]): the client reads
     /// it, asks the VM host daemon for the row back under the same box id,
-    /// and retries the attach once.
+    /// and retries the attach once. That status goes only on an interactive
+    /// attach's channel. An exec's [`BoxActor::ensure_host`] refusal ends
+    /// its channel with 1, and a forward's channel does not open.
     BoxHostRowEnded,
     /// The attach named a stopped or exited box, and its resume was refused
     /// (BOX-025, BOX-030). The box's state is unchanged. The error's kind

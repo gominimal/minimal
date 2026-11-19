@@ -2825,8 +2825,10 @@ impl OneshotSshRpc for RenameSession {
 /// (NET-138). The client reads it as its cue to ask the VM host daemon for
 /// the row back ([`BoxControlRequest::ResumeBox`]), which reinstates it
 /// from the host's own record of the box's creation under the same box id,
-/// and to retry the attach one time. The status is a signal from the
-/// daemon to the client only: `min` never ends with it.
+/// and to retry the attach one time. Only the interactive attach's channel
+/// carries it: an exec channel ends the same refusal with 1. `min` exits
+/// with 1 for the refusal, except when it could not read the session's
+/// record, so could not check the row, and then it exits with this status.
 pub const ATTACH_ROW_ENDED_EXIT_STATUS: u32 = 253;
 
 /// An RPC to stop a running box and keep its record (BOX-013, BOX-018).

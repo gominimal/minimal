@@ -394,11 +394,17 @@ async fn box_via_ssh_with(
     Err(Handoff::Exit(128 + signo).into())
 }
 
-/// The exit status an attach ends with when the in-VM daemon refused it
-/// because the VM host withdrew the box's row (NET-138). It is the daemon's
-/// signal to this client only: `min` never exits with it for a refusal
-/// ([`attach_retrying_row_ended`]). A box's shell can exit with the same
-/// status by itself, and then `min` exits with it.
+/// The exit status an interactive attach ends with when the in-VM daemon
+/// refused it because the VM host withdrew the box's row (NET-138). The
+/// daemon sends it only on an interactive attach's channel: an exec
+/// channel (`min session exec`, `min session run`, `min box exec`) ends
+/// the same refusal with 1, and a forward's channel does not open. The
+/// interactive attach reads it as a refusal only when the VM host holds no
+/// row of the box's own ([`attach_retrying_row_ended`]), and then `min`
+/// exits with [`ROW_ENDED_REFUSED`]. `min` exits with 253 when the box's
+/// shell exited with it, and also when the session's record could not be
+/// read: no row is then checked, so a refusal cannot be told from the
+/// shell's own status. The dashboard's attach reads it the same way.
 pub(crate) const ROW_ENDED_ATTACH: i32 = 253;
 const _: () = assert!(ROW_ENDED_ATTACH as u32 == minimald_rpc::ATTACH_ROW_ENDED_EXIT_STATUS);
 
