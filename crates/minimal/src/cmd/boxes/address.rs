@@ -136,17 +136,22 @@ impl BoxAddressRefusal {
     }
 
     /// The next step the error object's `hint` names.
-    /// The message of [`Self::OnStoppedVm`] carries the command that starts
-    /// the VM, with the VM's and the box's names in it.
-    pub fn hint(&self) -> &'static str {
+    /// The hint of [`Self::OnStoppedVm`] is the command that starts the VM,
+    /// with the VM's and the box's names in it, as its message gives it.
+    pub fn hint(&self) -> std::borrow::Cow<'static, str> {
+        use std::borrow::Cow;
         match self {
-            Self::Ambiguous { .. } => "Name one box as provider/host/name.",
-            Self::AmbiguousIdStart { .. } => "Give more of the id.",
-            Self::NotFound { .. } => "Run `min box list --all` to see the boxes of every project.",
-            Self::OnStoppedVm { .. } => {
-                "Start the VM that holds the box, then run the command again."
+            Self::Ambiguous { .. } => Cow::Borrowed("Name one box as provider/host/name."),
+            Self::AmbiguousIdStart { .. } => Cow::Borrowed("Give more of the id."),
+            Self::NotFound { .. } => {
+                Cow::Borrowed("Run `min box list --all` to see the boxes of every project.")
             }
-            Self::Unreachable { .. } => "Run the command again when the host answers.",
+            Self::OnStoppedVm { name, vm } => Cow::Owned(format!(
+                "Start it with: min --vm {vm} session attach {name}"
+            )),
+            Self::Unreachable { .. } => {
+                Cow::Borrowed("Run the command again when the host answers.")
+            }
         }
     }
 
