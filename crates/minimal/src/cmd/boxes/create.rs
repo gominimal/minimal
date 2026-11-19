@@ -7168,7 +7168,7 @@ mod tests {
                 "[defaults]",
             ),
             (
-                "[defaults.network.egress]\nallow_dns_hosts = [\"github.com\"]\n",
+                "[defaults.session.network.egress]\nallow_dns_hosts = [\"github.com\"]\n",
                 "[defaults.session]",
             ),
             (
