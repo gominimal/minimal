@@ -934,10 +934,36 @@ impl TpmStore {
     }
 }
 
+/// The most bytes the store reads from an authorization file. The store
+/// writes `AUTH_LEN` bytes; the bound keeps a damaged file from taking the
+/// proxy's memory.
+const AUTH_FILE_MAX: usize = 4 * AUTH_LEN;
+
+/// Whether the proxy's user, `uid`, may use an authorization file whose
+/// owner is `owner` and whose mode is `mode` (BEP-088). The file must
+/// belong to `uid`, and no other user may read or write it.
+fn check_auth_file(path: &Path, owner: u32, mode: u32, uid: u32) -> Result<(), TpmKept> {
+    if owner != uid {
+        return Err(TpmKept::OtherOwner {
+            path: path.to_path_buf(),
+            owner,
+        });
+    }
+    let mode = mode & 0o7777;
+    if mode & 0o077 != 0 {
+        return Err(TpmKept::NotPrivate {
+            path: path.to_path_buf(),
+            mode,
+        });
+    }
+    Ok(())
+}
+
 /// Reads a stored key's authorization file at start (BEP-088, BEP-089).
 /// The file must belong to the proxy's user, and no other user may read or
 /// write it. The check and the read use one open file, so the file that is
-/// read is the file that was checked.
+/// read is the file that was checked. A file longer than `AUTH_FILE_MAX`
+/// is refused after reading one byte past the bound, never the whole file.
 fn read_auth(role: Role, path: &Path) -> Result<Zeroizing<Vec<u8>>, KeyError> {
     use std::io::Read as _;
     use std::os::unix::fs::MetadataExt as _;
@@ -951,36 +977,29 @@ fn read_auth(role: Role, path: &Path) -> Result<Zeroizing<Vec<u8>>, KeyError> {
             },
         )
     };
-    let mut file = fs::File::open(path).map_err(|err| failed(&err))?;
+    let file = fs::File::open(path).map_err(|err| failed(&err))?;
     let meta = file.metadata().map_err(|err| failed(&err))?;
     // SAFETY: `geteuid` takes no argument, reads process state and cannot
     // fail.
     let uid = unsafe { libc::geteuid() };
-    if meta.uid() != uid {
-        return Err(KeyError::TpmKept {
+    check_auth_file(path, meta.uid(), meta.mode(), uid)
+        .map_err(|case| KeyError::TpmKept { role, case })?;
+    // Sized up front for the most the read can return, so the buffer never
+    // grows and leaves the value behind in a smaller one, unzeroed.
+    let mut auth = Zeroizing::new(Vec::with_capacity(AUTH_FILE_MAX + 1));
+    file.take(AUTH_FILE_MAX as u64 + 1)
+        .read_to_end(&mut auth)
+        .map_err(|err| failed(&err))?;
+    if auth.len() > AUTH_FILE_MAX {
+        return Err(KeyError::Store {
             role,
-            case: TpmKept::OtherOwner {
-                path: path.to_path_buf(),
-                owner: meta.uid(),
-            },
+            detail: format!(
+                "did not read {}: it holds more than {AUTH_FILE_MAX} bytes, and an \
+                 authorization value is {AUTH_LEN}",
+                path.display()
+            ),
         });
     }
-    let mode = meta.mode() & 0o7777;
-    if mode & 0o077 != 0 {
-        return Err(KeyError::TpmKept {
-            role,
-            case: TpmKept::NotPrivate {
-                path: path.to_path_buf(),
-                mode,
-            },
-        });
-    }
-    // Sized up front, so the value is not left behind in a smaller buffer
-    // that a growing read gives back unzeroed.
-    let mut auth = Zeroizing::new(Vec::with_capacity(
-        usize::try_from(meta.len()).unwrap_or(AUTH_LEN),
-    ));
-    file.read_to_end(&mut auth).map_err(|err| failed(&err))?;
     Ok(auth)
 }
 
@@ -2102,5 +2121,111 @@ mod tests {
                 },
             })
         );
+    }
+
+    // BEP-088: the owner check runs without root. A file of another user is
+    // refused, whatever its mode, and a file of this user that only it can
+    // use passes.
+    #[test]
+    fn the_auth_file_check_refuses_another_owner_and_modes_others_can_use() {
+        let path = Path::new("/home/u/.minimal/bep/tpm/root.auth");
+        // SAFETY: `geteuid` takes no argument, reads process state and
+        // cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        let other = uid.wrapping_add(1);
+
+        // The controls: this user's file at a private mode, with or without
+        // the file type bits a stat returns.
+        for mode in [0o600, 0o400, 0o100_600, 0o100_400] {
+            assert_eq!(
+                check_auth_file(path, uid, mode, uid),
+                Ok(()),
+                "mode {mode:o}"
+            );
+        }
+
+        for owner in [other, 0, 65534] {
+            if owner == uid {
+                continue;
+            }
+            for mode in [0o600, 0o644] {
+                assert_eq!(
+                    check_auth_file(path, owner, mode, uid),
+                    Err(TpmKept::OtherOwner {
+                        path: path.to_path_buf(),
+                        owner,
+                    }),
+                    "owner {owner}, mode {mode:o}"
+                );
+            }
+        }
+
+        for mode in [0o644, 0o640, 0o604, 0o620, 0o602, 0o610, 0o601, 0o606] {
+            assert_eq!(
+                check_auth_file(path, uid, 0o100_000 | mode, uid),
+                Err(TpmKept::NotPrivate {
+                    path: path.to_path_buf(),
+                    mode,
+                }),
+                "mode {mode:o}"
+            );
+        }
+    }
+
+    // An authorization file longer than the store ever writes is refused at
+    // start without reading it whole, and the key is not replaced. A file
+    // at the bound loads: the control.
+    #[test]
+    fn an_oversized_tpm_auth_file_refuses_start_without_reading_it_whole() {
+        use crate::keys::StartError;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_that_loads_anything(dir.path());
+        let role = Role::Root;
+        write_key_files(&store, role);
+        let auth = store.auth_path(role, Slot::Held);
+
+        fs::write(&auth, vec![7u8; AUTH_FILE_MAX]).expect("write auth file");
+        assert!(matches!(
+            store.find(role).map(|key| key.is_some()),
+            Ok(true)
+        ));
+
+        let refused = || KeyError::Store {
+            role,
+            detail: format!(
+                "did not read {}: it holds more than {AUTH_FILE_MAX} bytes, and an \
+                 authorization value is {AUTH_LEN}",
+                auth.display()
+            ),
+        };
+        fs::write(&auth, vec![7u8; AUTH_FILE_MAX + 1]).expect("write auth file");
+        assert_eq!(
+            store.find(role).map(|key| key.is_some()),
+            Err(refused()),
+            "one byte past the bound"
+        );
+
+        // A sparse file of 8 GiB: a read of the whole file would allocate
+        // 8 GiB, and the refusal comes from reading one byte past the bound.
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&auth)
+            .expect("open auth file");
+        file.set_len(8 << 30).expect("grow auth file");
+        drop(file);
+        assert_eq!(
+            store.find(role).map(|key| key.is_some()),
+            Err(refused()),
+            "8 GiB"
+        );
+        assert_eq!(
+            start_error(&store),
+            StartError::Store(refused()),
+            "through the start"
+        );
+
+        // The refusal changes neither file.
+        assert_eq!(fs::metadata(&auth).expect("stat auth").len(), 8 << 30);
+        assert!(store.key_path(role, Slot::Held).exists());
     }
 }
