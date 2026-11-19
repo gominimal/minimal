@@ -8384,7 +8384,7 @@ async fn every_box_verb_refuses_box_on_stopped_vm() {
     results.push(("box exec", exec.expect_err("exec")));
     let attach = cmd::box_attach_exec_target(hosts(), "beta", FIRST_EXEC_ID).await;
     results.push(("box attach --exec", attach.expect_err("attach")));
-    let rm = cmd::rm_box_on_hosts(hosts(), "beta", false).await;
+    let rm = cmd::rm_box_on_hosts(hosts(), "beta", false, &mut confirmed_rm()).await;
     results.push(("box rm", rm.expect_err("rm")));
     let stop = cmd::stop_box_on_hosts(hosts(), &mut Vec::new(), "beta", false).await;
     results.push(("box stop", stop.expect_err("stop")));
@@ -9941,7 +9941,7 @@ async fn ambiguous_name_across_hosts_exit2_lists_candidates_for_stop_and_rm() {
     let stop = cmd::stop_box_on_hosts(hosts.clone(), &mut out, "web", false)
         .await
         .expect_err("stop refuses the name");
-    let rm = cmd::rm_box_on_hosts(hosts, "web", true)
+    let rm = cmd::rm_box_on_hosts(hosts, "web", true, &mut confirmed_rm())
         .await
         .expect_err("rm refuses the name");
     for err in [stop, rm] {
@@ -9991,7 +9991,7 @@ async fn unqualified_name_with_unreachable_host_exit7_names_host_for_stop_and_rm
     let stop = cmd::stop_box_on_hosts(hosts.clone(), &mut Vec::new(), "web", false)
         .await
         .expect_err("stop refuses the name");
-    let rm = cmd::rm_box_on_hosts(hosts, "web", true)
+    let rm = cmd::rm_box_on_hosts(hosts, "web", true, &mut confirmed_rm())
         .await
         .expect_err("rm refuses the name");
     for err in [stop, rm] {
@@ -10244,6 +10244,176 @@ where
     exit
 }
 
+/// A `min box rm` prompt for a person on a terminal who answers yes.
+fn confirmed_rm() -> RmPrompt<'static> {
+    RmPrompt {
+        no_input: false,
+        stdin_is_terminal: true,
+        ask: Box::new(|_, _| Ok(true)),
+    }
+}
+
+/// A `min box rm` prompt with no person to answer it: `--no-input` off a
+/// terminal. Asking it fails the test.
+fn headless_rm() -> RmPrompt<'static> {
+    RmPrompt {
+        no_input: true,
+        stdin_is_terminal: false,
+        ask: Box::new(|_, question| panic!("a headless min box rm asked: {question}")),
+    }
+}
+
+// BCLI-004: `min box rm` without `--force` asks before it removes a box
+// whose files changed. A clean box is removed. A changed box on a terminal
+// is asked about, and "no" aborts. Off a terminal, a changed box or one
+// whose files cannot be checked is refused with exit 2, naming `--force`.
+// `--force` removes the box without the question.
+#[tokio::test]
+async fn box_rm_without_force_gates_changed_files() {
+    let changed = vec![
+        "1 file with uncommitted changes:".to_owned(),
+        "  notes.txt".to_owned(),
+    ];
+    let dirty = AtRiskState::Dirty(changed.clone());
+    let question = "Remove web? This permanently deletes its files.".to_owned();
+
+    // A clean box: removed, and nobody is asked.
+    rm_gate("web", false, &AtRiskState::Clean, &mut headless_rm()).expect("a clean box is removed");
+
+    // A changed box on a terminal: the changed files and the question,
+    // and "no" aborts.
+    let mut asked = Vec::new();
+    let mut prompt = RmPrompt {
+        no_input: false,
+        stdin_is_terminal: true,
+        ask: Box::new(|lines: &[String], question: &str| {
+            asked.push((lines.to_vec(), question.to_owned()));
+            Ok(false)
+        }),
+    };
+    let err = rm_gate("web", false, &dirty, &mut prompt).expect_err("no aborts the removal");
+    drop(prompt);
+    assert!(err.is::<RmAborted>(), "{err:#}");
+    assert_eq!(asked, vec![(changed.clone(), question.clone())]);
+
+    // A changed box with no person to answer: exit 2, naming `--force`.
+    for (no_input, stdin_is_terminal) in [(true, true), (false, false), (true, false)] {
+        let mut prompt = RmPrompt {
+            no_input,
+            stdin_is_terminal,
+            ask: Box::new(|_, question| panic!("a headless min box rm asked: {question}")),
+        };
+        let err = rm_gate("web", false, &dirty, &mut prompt).expect_err("refused headless");
+        assert_eq!(
+            box_command_ending(&Err(err)),
+            (
+                "web has changed files, so it was not removed. \
+                 Removing it deletes them. \
+                 Run min box rm web --force to remove it anyway."
+                    .to_owned(),
+                2
+            ),
+            "no_input {no_input}, stdin_is_terminal {stdin_is_terminal}"
+        );
+    }
+
+    // A state that cannot be read is gated too: asked on a terminal, with
+    // a line that says so.
+    let mut asked = Vec::new();
+    let mut prompt = RmPrompt {
+        no_input: false,
+        stdin_is_terminal: true,
+        ask: Box::new(|lines: &[String], question: &str| {
+            asked.push((lines.to_vec(), question.to_owned()));
+            Ok(true)
+        }),
+    };
+    rm_gate("web", false, &AtRiskState::Unknowable, &mut prompt).expect("yes removes the box");
+    drop(prompt);
+    assert_eq!(
+        asked,
+        vec![(
+            vec!["The files of web could not be checked for changes.".to_owned()],
+            question.clone()
+        )]
+    );
+
+    // `--force`: removed, and nobody is asked.
+    for state in [AtRiskState::Clean, dirty, AtRiskState::Unknowable] {
+        rm_gate("web", true, &state, &mut headless_rm()).expect("--force removes the box");
+    }
+
+    // Over a harness daemon: the daemon cannot read the files of a stopped
+    // box, so a headless `min box rm` refuses it with exit 2 and the box
+    // stays. `min box rm --force` removes it.
+    let state = tempfile::tempdir().expect("a temp minimal state dir");
+    let global = GlobalArgs {
+        repo_dir: None,
+        minimal_dir: Some(state.path().to_path_buf()),
+        config_dir: None,
+        provider: Some(Provider::LocalMinimald),
+        no_input: true,
+        vm: None,
+    };
+    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
+        .expect("the native daemon's socket path");
+    std::fs::create_dir_all(sock.parent().expect("the socket has a dir"))
+        .expect("the native daemon's state dir");
+    let server = minimald::test_harness::TestServer::new().await;
+    server.listen_on_uds(&sock).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let mut daemon = server.connect().await;
+    let id = minimald::test_harness::create_configured_session(
+        &mut daemon,
+        "web",
+        project.path().to_str().expect("a UTF-8 project path"),
+    )
+    .await
+    .to_string();
+    let listed = async || -> Vec<String> {
+        let mut client = connect_daemon(&global).await.expect("the daemon");
+        list_box_records(&mut client, None)
+            .await
+            .expect("the listing")
+            .into_iter()
+            .map(|entry| entry.box_id.to_string())
+            .collect()
+    };
+
+    stop_box_on_hosts(local_hosts(&global).unwrap(), &mut Vec::new(), "web", false)
+        .await
+        .expect("the box stops");
+    let result = rm_box_on_hosts(
+        local_hosts(&global).unwrap(),
+        "web",
+        false,
+        &mut headless_rm(),
+    )
+    .await
+    .map(drop);
+    assert_eq!(
+        box_command_ending(&result),
+        (
+            "The files of web could not be checked for changes, \
+             so it was not removed. \
+             Run min box rm web --force to remove it anyway."
+                .to_owned(),
+            2
+        )
+    );
+    assert!(listed().await.contains(&id), "the refused box stays");
+
+    rm_box_on_hosts(
+        local_hosts(&global).unwrap(),
+        "web",
+        true,
+        &mut headless_rm(),
+    )
+    .await
+    .expect("--force removes the box");
+    assert!(!listed().await.contains(&id), "the box is removed");
+}
+
 // The first slice end to end (BCLI-001, BCLI-003, BCLI-004, BCLI-051,
 // BCLI-059, BCLI-060): `min box list|show|stop|rm` of one box over a
 // harness daemon that the native host's socket serves. Each step resolves
@@ -10378,7 +10548,7 @@ async fn box_first_slice_list_show_stop_rm_end_to_end() {
     // `--force`, and the box keeps running.
     let rm = async |out: &mut Vec<u8>| {
         let _ = out;
-        rm_box_on_hosts(local_hosts(&global)?, "web", false).await?;
+        rm_box_on_hosts(local_hosts(&global)?, "web", false, &mut confirmed_rm()).await?;
         Ok(())
     };
     let exit = run_box_command(&mut runs, "rm", "min box rm web".into(), &id, rm).await;
@@ -11840,7 +12010,7 @@ async fn attach_ended_from_other_side_notice_exit254() {
         None,
         true,
         async |_: &BoxAttachTarget| {
-            cmd::rm_box_on_hosts(hosts.clone(), "web", true)
+            cmd::rm_box_on_hosts(hosts.clone(), "web", true, &mut confirmed_rm())
                 .await
                 .expect("the removal succeeds");
             Ok(254)
@@ -12211,7 +12381,7 @@ async fn attach_ended_from_other_side_notice_exit254_before_the_record() {
 /// next round of a test attaches to a running box. A harness box resumes
 /// through the same create flow, so this creates it afresh under the name.
 async fn resume_for_attach_test(daemon: &mut minimald::test_harness::TestClient, host: &LocalHost) {
-    cmd::rm_box_on_hosts(vec![host.clone()], "web", true)
+    cmd::rm_box_on_hosts(vec![host.clone()], "web", true, &mut confirmed_rm())
         .await
         .expect("the stopped box is removed");
     let project = tempfile::TempDir::new().unwrap();
@@ -12498,7 +12668,13 @@ async fn box_address_and_json_output_end_to_end() {
     assert_eq!(exit, 0, "{transcript}");
     let rm = async |out: &mut Vec<u8>| {
         let _ = out;
-        rm_box_on_hosts(local_hosts(&global)?, &qualified, false).await?;
+        rm_box_on_hosts(
+            local_hosts(&global)?,
+            &qualified,
+            false,
+            &mut confirmed_rm(),
+        )
+        .await?;
         Ok(())
     };
     let command = format!("min box rm {qualified}");
@@ -13527,9 +13703,14 @@ async fn events_follow_replays_then_tails() {
             .expect("the box stops");
         let tailed = shared.more_than(replayed.len()).await;
         assert_eq!(tailed[..replayed.len()], replayed[..]);
-        rm_box_on_hosts(local_hosts(&global).unwrap(), "web", false)
-            .await
-            .expect("the stopped box is removed");
+        rm_box_on_hosts(
+            local_hosts(&global).unwrap(),
+            "web",
+            false,
+            &mut confirmed_rm(),
+        )
+        .await
+        .expect("the stopped box is removed");
     };
     let (followed, ()) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
         tokio::join!(follow, drive)
@@ -15054,9 +15235,14 @@ async fn type_noun_logs_follow() {
             stop_box_on_hosts(local_hosts(&global).unwrap(), &mut Vec::new(), name, false)
                 .await
                 .expect("the box stops");
-            rm_box_on_hosts(local_hosts(&global).unwrap(), name, false)
-                .await
-                .expect("the stopped box is removed");
+            rm_box_on_hosts(
+                local_hosts(&global).unwrap(),
+                name,
+                false,
+                &mut confirmed_rm(),
+            )
+            .await
+            .expect("the stopped box is removed");
         }
     };
     let (results, ()) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
