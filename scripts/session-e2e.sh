@@ -604,6 +604,7 @@ EBR_SEED_DIR="" # the escapes-and-builds proof's seed; removed on teardown
 EBR_LISTENER_PID="" # its host listener; killed on teardown
 EBR_LISTEN_PORT="" # the port the listener binds, beside the escape-union band
 HRF_SEED_DIR="" # the host_ip rules proof's seed; removed on teardown
+AE_SEED_DIR="" # the attach-end proof's seed; removed on teardown
 EBR_EXPECTED="" # the record the leg in progress expects; printed on failure
 NET080_SEED_DIR="" # seeded by the daemon-fetch proof below; removed on teardown
 # The classifier tree+table the daemon-fetch proof installs when the lane has
@@ -1414,6 +1415,7 @@ teardown() {
   # The escapes-and-builds proof's seed and listener, for the same reasons.
   [ -n "$EBR_SEED_DIR" ] && rm -rf "$EBR_SEED_DIR"
   [ -n "$HRF_SEED_DIR" ] && rm -rf "$HRF_SEED_DIR"
+  [ -n "$AE_SEED_DIR" ] && rm -rf "$AE_SEED_DIR"
   if [ -n "$EBR_LISTENER_PID" ]; then
     kill "$EBR_LISTENER_PID" 2>/dev/null || true
   fi
@@ -2283,8 +2285,18 @@ attach_end_wait() {
 proof_attach_ends_on_stop_and_restart() {
 echo "::group::attach-end proof (min box stop and min box restart end an attach)"
 ae_name="e2e-attach-end"
+# min box restart restarts only a box whose spec sets
+# lifetime = "until_stopped" (BCLI-074). The shared seed's implicit
+# default entry sets none, so this proof seeds its own project with a
+# default session entry that sets it.
+AE_SEED_DIR="$(hook_mktemp /tmp/mnlae.XXXXXX)"
+{
+  hook_seed_preamble
+  printf '\n[sessions.default.box]\nlifetime = "until_stopped"\n'
+} > "$AE_SEED_DIR/minimal.toml"
+mkdir "$AE_SEED_DIR/.git"
 # shellcheck disable=SC2086
-out="$(cd "$PROJECT_DIR" && mnl session start --detach --name "$ae_name" ${E2E_ACTIVATE_ARGS:-} 2>"$WORK/ae-start.err")" || {
+out="$(cd "$AE_SEED_DIR" && mnl session start --detach --name "$ae_name" ${E2E_ACTIVATE_ARGS:-} 2>"$WORK/ae-start.err")" || {
   echo "::error::'min session start --detach --name $ae_name' failed for the attach-end proof"
   echo "--- stderr ---"; cat "$WORK/ae-start.err" 2>/dev/null || true
   fail
@@ -2345,6 +2357,8 @@ fi
 echo "stop while attached: exit 254, one line that names the stop"
 
 mnl box rm --force "$ae_sid" </dev/null >/dev/null 2>&1 || true
+rm -rf "$AE_SEED_DIR"
+AE_SEED_DIR=""
 echo "attach-end proof OK"
 echo "::endgroup::"
 }
