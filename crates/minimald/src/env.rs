@@ -2374,12 +2374,13 @@ impl BoxChannel {
         // BCLI-010 (T62): a relaying helper prints `err:` lines on stderr,
         // and an older one prints only `msg:` lines.
         let note_tag = if relays { "err" } else { "msg" };
-        let (mut ctx, graph, _) = match self.refresh_tagged(stream, note_tag).await {
+        let (ctx, graph, _) = match self.refresh_tagged(stream, note_tag).await {
             Ok(v) => v,
             Err(e) => {
                 return relay_refusal_exit(stream, relays, task_name, refusal_exit_code(&e));
             }
         };
+        let mut ctx = self.task_context(ctx, task_name);
 
         let (mut task, mut graph) = match ctx.task(graph, task_name) {
             Err(e) => {
@@ -2471,8 +2472,15 @@ impl BoxChannel {
             let record = session.record().await.map_err(gone)?;
             let switch = session.net_switch().await.map_err(gone)?;
             let opt_out = session.deny_all_opt_out().await.map_err(gone)?;
-            let network =
-                crate::exec::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, opt_out);
+            // NET-079: a host-address task runs in the leaf of its box, so
+            // its plan follows the verdict of that leaf.
+            let network = crate::exec::task_network_in_box_leaf(
+                &record,
+                &switch,
+                boxes::EGRESS_DEFAULT_PHASE,
+                opt_out,
+                ctx.classifier_leaf(),
+            );
             let mut env = ctx
                 .make_env_with_network(
                     task_name,
@@ -2534,6 +2542,33 @@ impl BoxChannel {
         if let Some(forwarded) = forwarded {
             let _ = spawn_blocking(move || forwarded.finish(FORWARDED_STDIN_CLOSE_WAIT)).await;
         }
+    }
+
+    /// The context an in-box task run uses: `ctx` kept in the classifier
+    /// leaf of this box, when the host placed the box in one (NET-079). The
+    /// task env the context makes then joins that leaf, so the box's egress
+    /// verdict decides the task's connections, the same as for a process the
+    /// box itself starts. Logs the leaf the task runs in.
+    fn task_context(&self, ctx: Context, task_name: &str) -> Context {
+        let ctx = match self.classifier_leaf.clone() {
+            Some(leaf) => ctx.with_classifier_leaf(leaf),
+            None => ctx,
+        };
+        match ctx.classifier_leaf() {
+            Some(leaf) => tracing::info!(
+                box_name = %self.name,
+                task = %task_name,
+                leaf = %leaf.dir().display(),
+                "running an in-box task in the box's classifier leaf",
+            ),
+            None => tracing::info!(
+                box_name = %self.name,
+                task = %task_name,
+                leaf = "none",
+                "running an in-box task with no classifier leaf, because the box has none",
+            ),
+        }
+        ctx
     }
 
     /// Sends the end of a task run: its exit code for a relaying helper,
@@ -6616,6 +6651,57 @@ exit $rc
             rx,
         };
         (state, rootfs, cwd, channel, tx)
+    }
+
+    /// NET-079: an in-box task of a host-address box runs in the classifier
+    /// leaf of its box, and its network follows the verdict of that leaf. A
+    /// box with no leaf runs its task with none, and a task of an own-address
+    /// box takes no host-address leaf.
+    #[test]
+    fn run_task_runs_in_the_box_classifier_leaf() {
+        let (_state, _rootfs, _cwd, mut channel) = setup_channel();
+        let unplaced = channel.ctx.clone();
+        assert_eq!(unplaced.classifier_leaf(), None);
+        assert_eq!(
+            channel
+                .task_context(unplaced.clone(), "t")
+                .classifier_leaf(),
+            None
+        );
+
+        let leaf = ClassifierLeaf::under(
+            Path::new("/sys/fs/cgroup/minimald.slice"),
+            "box-1",
+            sandbox::config::Verdict::Allow,
+        );
+        channel.classifier_leaf = Some(leaf.clone());
+        let ctx = channel.task_context(unplaced, "t");
+        assert_eq!(ctx.classifier_leaf(), Some(&leaf));
+
+        assert_eq!(
+            crate::net::classifier::task_box_leaf(
+                boxes::NetworkMode::HostNet,
+                ctx.classifier_leaf()
+            ),
+            Some((leaf.clone(), sandbox::config::Verdict::Allow))
+        );
+        let deny = ClassifierLeaf::under(
+            Path::new("/sys/fs/cgroup/minimald.slice"),
+            "box-2",
+            sandbox::config::Verdict::Deny,
+        );
+        assert_eq!(
+            crate::net::classifier::task_box_leaf(boxes::NetworkMode::HostNet, Some(&deny)),
+            Some((deny, sandbox::config::Verdict::Deny))
+        );
+        assert_eq!(
+            crate::net::classifier::task_box_leaf(boxes::NetworkMode::OwnIp, Some(&leaf)),
+            None
+        );
+        assert_eq!(
+            crate::net::classifier::task_box_leaf(boxes::NetworkMode::HostNet, None),
+            None
+        );
     }
 
     /// TEL-045 at the channel's own loop: an opted-out helper request

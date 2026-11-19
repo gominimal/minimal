@@ -129,8 +129,16 @@ async fn clean_cache_streams_progress_then_a_terminal_done() {
     let server = TestServer::new().await;
     let mut client = server.connect().await;
 
-    // Two cold entries — nothing has read them, and no session needs them.
+    // Two cold entries — nothing has read them, no session needs them, and
+    // they were written an hour ago. An unread entry is stale only when its
+    // write time is before the cutoff.
     let cache = server.state.daemon_context().await.local_cache();
+    let written = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(60 * 60))
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
     for byte in [1u8, 2] {
         let w = cache
             .write_dir(&common::SpecHash::from_bytes([byte; 32]))
@@ -139,13 +147,14 @@ async fn clean_cache_streams_progress_then_a_terminal_done() {
         w.finalize(EntryMeta {
             inner: MetaInner::Spec(format!("pkg-{byte}")),
             fetched: false,
+            epoch_millis: written,
             ..Default::default()
         })
         .unwrap();
     }
 
-    // `older_than_secs` of 1 rather than the daemon default, so entries
-    // written a moment ago are in scope.
+    // `older_than_secs` of 1 rather than the daemon default, so the entries
+    // are in scope.
     let updates = clean_cache(
         &mut client,
         CleanCacheRequest::default().with_older_than_secs(1),
