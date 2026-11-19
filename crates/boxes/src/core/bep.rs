@@ -544,6 +544,8 @@ pub enum ProxyAbsence {
         path: std::path::PathBuf,
         /// The proxy's log file.
         log: Option<std::path::PathBuf>,
+        /// The last error line in the proxy's log, when the log has one.
+        last_error: Option<String>,
     },
     /// The host gives the box no box id or no address stance, so no proxy
     /// serves it.
@@ -571,7 +573,11 @@ impl fmt::Display for ProxyAbsence {
                  an absolute path.",
                 path.display()
             )?,
-            ProxyAbsence::NotAnswering { path, log } => {
+            ProxyAbsence::NotAnswering {
+                path,
+                log,
+                last_error,
+            } => {
                 write!(
                     f,
                     "`bep`, the Box Egress Proxy, is installed at {}, but it does not \
@@ -581,12 +587,30 @@ impl fmt::Display for ProxyAbsence {
                 if let Some(log) = log {
                     write!(f, " The proxy's log is at {}.", log.display())?;
                 }
+                write_restart_step(f, last_error.as_deref())?;
             }
             ProxyAbsence::NotServed => {
                 write!(f, "no Box Egress Proxy serves boxes on this machine.")?;
             }
         }
         Ok(())
+    }
+}
+
+/// Writes the proxy's last error, when there is one, and the step that
+/// starts the proxy again: `minvmd` starts `bep serve` when it starts.
+/// The mint's own refusal writes the same sentences.
+pub fn write_restart_step(f: &mut fmt::Formatter<'_>, last_error: Option<&str>) -> fmt::Result {
+    match last_error {
+        Some(line) => {
+            let stop = if line.ends_with('.') { "" } else { "." };
+            write!(
+                f,
+                " The proxy's last error is: {line}{stop} Fix that error, then restart \
+                 minvmd, which starts the proxy again."
+            )
+        }
+        None => write!(f, " Restart minvmd, which starts the proxy again."),
     }
 }
 
@@ -1389,6 +1413,47 @@ pub fn check_store_references(
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    // A proxy that does not answer: the text names its log, its last error
+    // line, and the restart step. With no error line, it still names the
+    // restart.
+    #[test]
+    fn not_answering_names_the_proxy_reason_and_restart() {
+        let absence = |last_error: Option<&str>| ProxyAbsence::NotAnswering {
+            path: "/usr/local/bin/bep".into(),
+            log: Some("/state/minimal/providers/local-minvmd0/bep.log".into()),
+            last_error: last_error.map(str::to_owned),
+        };
+        assert_eq!(
+            absence(Some("bep serve: the address is already in use")).to_string(),
+            "`bep`, the Box Egress Proxy, is installed at /usr/local/bin/bep, but it does \
+             not answer, so no proxy serves boxes on this machine. The proxy's log is at \
+             /state/minimal/providers/local-minvmd0/bep.log. The proxy's last error is: \
+             bep serve: the address is already in use. Fix that error, then restart \
+             minvmd, which starts the proxy again."
+        );
+        assert_eq!(
+            absence(None).to_string(),
+            "`bep`, the Box Egress Proxy, is installed at /usr/local/bin/bep, but it does \
+             not answer, so no proxy serves boxes on this machine. The proxy's log is at \
+             /state/minimal/providers/local-minvmd0/bep.log. Restart minvmd, which starts \
+             the proxy again."
+        );
+        let refused = BepRefusal::UnenrolledNode {
+            grants: vec!["GH_TOKEN".to_owned()],
+            stored: false,
+            cause: absence(Some("no key.")),
+            table: None,
+        }
+        .to_string();
+        assert!(
+            refused.contains(
+                "The proxy's last error is: no key. Fix that error, then restart minvmd, \
+                 which starts the proxy again. To create the box without the grant"
+            ),
+            "{refused}"
+        );
+    }
 
     const GITHUB_HOSTS: &[&str] = &[
         "github.com",
