@@ -16051,7 +16051,7 @@ fn conflicting_loadout_var_refused_before_create() {
     };
     let error = crate::session_box_expansion(root, None, true, &selected)
         .expect_err("the loadout conflicts with the entry");
-    let refusal = spec_project_error(&error);
+    let refusal = start_project_error(&error);
     assert_eq!(refusal.exit_code(), Some(3));
     assert_eq!(
         refusal.to_string(),
@@ -18424,7 +18424,11 @@ async fn box_spec_renders_formats_secrets_as_refs() {
         .await
         .expect_err("a grant with a value key is refused");
     assert!(
-        error.downcast_ref::<crate::ProjectFileInvalid>().is_some(),
+        error.downcast_ref::<crate::SpecFileInvalid>().is_some(),
+        "{error:#}"
+    );
+    assert!(
+        !format!("{error:#}").contains("Cannot start the box"),
         "{error:#}"
     );
     assert!(!format!("{error:#}").contains("hunter2"), "{error:#}");
@@ -18718,10 +18722,22 @@ async fn box_spec_entry_loadouts_resolve_as_start() {
     assert_eq!(format!("{error:#}"), format!("{expected:#}"));
 }
 
-/// The project file error that `min box spec` ends with.
-fn spec_project_error(error: &anyhow::Error) -> &mfile::Error {
+/// The project file error that a start ends with. It keeps the start text.
+fn start_project_error(error: &anyhow::Error) -> &mfile::Error {
     &error
         .downcast_ref::<crate::ProjectFileInvalid>()
+        .unwrap_or_else(|| panic!("not a project file error: {error:#}"))
+        .error
+}
+
+/// The project file error that `min box spec` ends with.
+fn spec_project_error(error: &anyhow::Error) -> &mfile::Error {
+    assert!(
+        !format!("{error:#}").contains("Cannot start the box"),
+        "{error:#}"
+    );
+    &error
+        .downcast_ref::<crate::SpecFileInvalid>()
         .unwrap_or_else(|| panic!("not a project file error: {error:#}"))
         .error
 }
@@ -19094,7 +19110,11 @@ async fn box_spec_argument_directory_then_entry_then_box() {
         .await
         .expect_err("a bare name is an entry name first");
     assert!(
-        error.downcast_ref::<crate::ProjectFileInvalid>().is_some(),
+        error.downcast_ref::<crate::SpecFileInvalid>().is_some(),
+        "{error:#}"
+    );
+    assert!(
+        !format!("{error:#}").contains("Cannot start the box"),
         "{error:#}"
     );
     // A full box id cannot name an entry, so the box renders past the
@@ -19111,7 +19131,11 @@ async fn box_spec_argument_directory_then_entry_then_box() {
         .await
         .expect_err("no entry and no box");
     assert!(
-        error.downcast_ref::<crate::ProjectFileInvalid>().is_some(),
+        error.downcast_ref::<crate::SpecFileInvalid>().is_some(),
+        "{error:#}"
+    );
+    assert!(
+        !format!("{error:#}").contains("Cannot start the box"),
         "{error:#}"
     );
 }
@@ -19655,7 +19679,7 @@ fn builtin_build_entry_setting_open_refused_exit3() {
     );
     let error = session_loadout_mode(&utf8(&project), Some("b"), &[])
         .expect_err("a build entry that sets open refuses");
-    let invalid = spec_project_error(&error);
+    let invalid = start_project_error(&error);
     assert!(
         matches!(
             invalid,
