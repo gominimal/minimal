@@ -18991,6 +18991,141 @@ async fn box_spec_path_form_renders_bep_rows() {
     );
 }
 
+// D3598: bare `min box spec` reads the expanded session entry, so a
+// `[defaults.network.bep]` steering mode reaches its steering row, the same
+// value that `min box spec default` shows.
+#[tokio::test]
+async fn box_spec_bare_reads_defaults_network_bep() {
+    let (_project, global) = spec_project(
+        "[defaults.network.bep]\nsteering = \"proxy_env\"\n\n\
+         [sessions.default]\npackages = [\"git\"]\n\n\
+         [sessions.default.secrets.GH_TOKEN]\nsource = \"broker\"\nscopes = [\"github:full\"]\n",
+    );
+    let bare = box_spec_text(&global, &["min", "box", "spec", "--network", "host_ip"])
+        .await
+        .expect("the rows render");
+    assert!(bare.contains("\nsteering  proxy_env\n"), "{bare}");
+    assert!(bare.contains("GH_TOKEN"), "{bare}");
+
+    let entry = box_spec_text(&global, &["min", "box", "spec", "default"])
+        .await
+        .expect("the entry renders");
+    assert!(entry.contains("# steering  proxy_env\n"), "{entry}");
+}
+
+// D3598: bare `min box spec` stays a read-only preview when the start
+// cannot pick one session entry. Two session entries and no `default`
+// render the merged `[defaults]` and `[defaults.session]` rows, not the
+// start's refusal.
+#[tokio::test]
+async fn box_spec_bare_reads_defaults_network_bep_undecided_entry() {
+    let (_project, global) = spec_project(
+        "[defaults.session.network.bep]\nsteering = \"proxy_env\"\n\n\
+         [defaults.session.secrets.GH_TOKEN]\nsource = \"broker\"\nscopes = [\"github:full\"]\n\n\
+         [sessions.one]\npackages = [\"git\"]\n\n\
+         [sessions.two]\npackages = [\"git\"]\n",
+    );
+    let bare = box_spec_text(&global, &["min", "box", "spec", "--network", "host_ip"])
+        .await
+        .expect("the rows render without a picked session entry");
+    assert!(bare.contains("\nsteering  proxy_env\n"), "{bare}");
+}
+
+// D3598: with no single session entry, bare `min box spec` still merges
+// the top-level `[defaults]` under `[defaults.session]`, so a
+// `[defaults.network.bep]` steering mode reaches its row and the command
+// succeeds.
+#[tokio::test]
+async fn box_spec_bare_reads_defaults_network_bep_top_level_undecided_entry() {
+    let (_project, global) = spec_project(
+        "[defaults.network.bep]\nsteering = \"proxy_env\"\n\n\
+         [defaults.session.secrets.GH_TOKEN]\nsource = \"broker\"\nscopes = [\"github:full\"]\n\n\
+         [sessions.one]\npackages = [\"git\"]\n\n\
+         [sessions.two]\npackages = [\"git\"]\n",
+    );
+    let bare = box_spec_text(&global, &["min", "box", "spec", "--network", "host_ip"])
+        .await
+        .expect("the rows render without a picked session entry");
+    assert!(bare.contains("\nsteering  proxy_env\n"), "{bare}");
+    assert!(bare.contains("GH_TOKEN"), "{bare}");
+}
+
+// D3598: with no single session entry, bare `min box spec` expands an
+// entry with an empty body as `min box start` expands a picked entry, type
+// chain included. Its rows match the start projection of an entry with an
+// empty body, and a project type that extends `session` does not reach
+// them.
+#[tokio::test]
+async fn box_spec_bare_reads_defaults_network_bep_matches_start_projection() {
+    let (project, global) = spec_project(
+        "[defaults.network.bep]\nsteering = \"proxy_env\"\n\n\
+         [defaults.session.secrets.GH_TOKEN]\nsource = \"broker\"\nscopes = [\"github:full\"]\n\n\
+         [box_types.dev]\nextends = \"session\"\n\n\
+         [box_types.dev.defaults.network.bep]\nsteering = \"dns\"\n\n\
+         [sessions.one]\n\n\
+         [sessions.two]\n",
+    );
+    let path = camino::Utf8Path::from_path(project.path()).expect("a UTF-8 path");
+    let (start_bep, start_secrets, _, start_quic443) =
+        crate::project_bep_and_grants(path, Some("one")).expect("the start projection");
+    assert_eq!(
+        start_bep.steering,
+        Some(boxes::core::bep::Steering::ProxyEnv)
+    );
+    assert!(start_secrets.contains_key("GH_TOKEN"), "{start_secrets:?}");
+    assert_eq!(start_quic443, None);
+
+    let bare = box_spec_text(&global, &["min", "box", "spec", "--network", "host_ip"])
+        .await
+        .expect("the rows render without a picked session entry");
+    assert!(bare.contains("\nsteering  proxy_env\n"), "{bare}");
+    assert!(bare.contains("GH_TOKEN"), "{bare}");
+}
+
+// D3598: with no single session entry, bare `min box spec` checks the
+// grants it reads from the merged `[defaults]` and `[defaults.session]`
+// tables against the egress of that same entry. A `[defaults.network]`
+// egress that admits the GitHub hosts lets an `own_ip` preview render the
+// broker grant, and the command does not refuse.
+#[tokio::test]
+async fn box_spec_bare_reads_defaults_network_bep_undecided_entry_own_ip_egress() {
+    let (_project, global) = spec_project(
+        "[defaults.network.bep]\nsteering = \"proxy_env\"\n\n\
+         [defaults.network.egress]\nallow_dns_hosts = [\"github.com\", \"api.github.com\", \
+         \"uploads.github.com\", \"codeload.github.com\"]\n\n\
+         [defaults.session.secrets.GH_TOKEN]\nsource = \"broker\"\nscopes = [\"github:full\"]\n\n\
+         [sessions.one]\npackages = [\"git\"]\n\n\
+         [sessions.two]\npackages = [\"git\"]\n",
+    );
+    let bare = box_spec_text(&global, &["min", "box", "spec", "--network", "own_ip"])
+        .await
+        .expect("the rows render, and the egress admits the grant");
+    assert!(bare.contains("GH_TOKEN"), "{bare}");
+}
+
+// D3598: bare `min box spec` falls back to the merged `[defaults]` rows
+// only for several session entries with no `default`. A `default` entry of
+// a project Box Type keeps the start's refusal and prints no proxy rows.
+#[tokio::test]
+async fn box_spec_bare_reads_defaults_network_bep_project_type_refuses() {
+    let (_project, global) = spec_project(
+        "[defaults.network.bep]\nsteering = \"proxy_env\"\n\n\
+         [box_types.mydev]\nextends = \"session\"\n\n\
+         [boxes.default]\ntype = \"mydev\"\n",
+    );
+    let error = box_spec_text(&global, &["min", "box", "spec", "--network", "host_ip"])
+        .await
+        .expect_err("a project Box Type keeps the refusal");
+    assert!(
+        matches!(
+            error.downcast_ref::<crate::SessionEntryUndecided>(),
+            Some(crate::SessionEntryUndecided::TypeUnresolved { name, .. }) if name == "default"
+        ),
+        "{error:#}"
+    );
+    assert!(!format!("{error:#}").contains("steering"), "{error:#}");
+}
+
 // BCLI-021: `min box spec <entry>` with the `[network]` override flags
 // renders the network that `min box start` sends with the same flags:
 // the mode, the egress and the ingress, each flag marked as the source.
