@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use boxes::core::bep::{
-    ActivationRefused, ActivationSpec, BepRefusal, BepSettings, BepTables, BepWarning, HostFacts,
-    Quic443, SecretGrant, SecretGrants, Steering, StoreAction, StoreRules, refusals,
+    ActivationSpec, BepSettings, BepTables, BepWarning, HostFacts,
+    Quic443, SecretGrant, SecretGrants, Steering, StoreAction, StoreRules, check_activation,
     store_references,
 };
 
@@ -42,6 +42,10 @@ pub(crate) struct SpecInputs<'a> {
     /// The box's network mode, from `min box spec --network`, the same
     /// mode `min session activate --network` gives the box it creates.
     pub network: boxes::NetworkMode,
+    /// The box's effective egress, as `min box start` sends it in the
+    /// create request: the project's egress with the egress flags applied.
+    /// `None` when neither declares egress.
+    pub egress: Option<&'a boxes::EgressPolicy>,
     /// Whether this host resolves the box's steered names, the same host
     /// fact the box's creation reads (BEP-017, BEP-081):
     /// `host_resolves_box_names` for this host and [`Self::network`]. On a
@@ -61,22 +65,14 @@ pub(crate) struct SpecInputs<'a> {
 ///
 /// # Errors
 ///
-/// [`ActivationRefused`] (exit 3) when a GitHub grant declares scopes
-/// narrower than `full` and the client configuration does not acknowledge
-/// full breadth (BEP-057), and the writer's error.
+/// [`boxes::core::bep::ActivationRefused`] (exit 3) with every refusal that `min box start`
+/// gives for the same spec, network, egress and host, and the writer's
+/// error.
 pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> anyhow::Result<()> {
-    let credentialed = inputs.secrets.values().any(SecretGrant::is_credentialed);
-    if !credentialed {
-        writeln!(
-            out,
-            "This project declares no broker secret, so its box does not use the proxy."
-        )?;
-        return Ok(());
-    }
-
     // BEP-057: every host is un-enrolled today.
-    // Interim: only BEP-057, BEP-009 (from `--network`) and BEP-017 are
-    // previewed here; the full exit-3 set is gominimal/minimal#2445.
+    // #2445: the preview runs the whole check that the start runs, with the
+    // same network, egress and host facts, so every refusal of the start
+    // is a refusal here, with exit 3.
     // BEP-017: the resolver fact is the one creation reads, so the two
     // agree.
     let host = HostFacts {
@@ -84,28 +80,22 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
         box_zone_resolver: inputs.box_zone_resolver,
         ..HostFacts::LOCAL
     };
-    let egress = None;
     let spec = ActivationSpec {
         network: inputs.network,
-        egress,
+        egress: inputs.egress,
         bep: inputs.bep,
         secrets: inputs.secrets,
         tables: inputs.tables,
     };
-    let narrow: Vec<BepRefusal> = refusals(&spec, host, inputs.github_hosts)
-        .into_iter()
-        .filter(|refusal| {
-            matches!(
-                refusal,
-                BepRefusal::NarrowScopesUnenrolled { .. }
-                    | BepRefusal::BrokerScopeNotGithub { .. }
-                    | BepRefusal::NoNetworkWithGrant { .. }
-                    | BepRefusal::NoResolver { .. }
-            )
-        })
-        .collect();
-    if !narrow.is_empty() {
-        return Err(ActivationRefused { refusals: narrow }.into());
+    check_activation(&spec, host, inputs.github_hosts)?;
+
+    let credentialed = inputs.secrets.values().any(SecretGrant::is_credentialed);
+    if !credentialed {
+        writeln!(
+            out,
+            "This project declares no broker secret, so its box does not use the proxy."
+        )?;
+        return Ok(());
     }
 
     match inputs.root_fingerprint {
@@ -405,7 +395,7 @@ fn project_rows(global: &GlobalArgs, args: &BoxSpecArgs, out: &mut Vec<u8>) -> a
         )
     });
     tracing::debug!(project = %project.display(), "rendering min box spec");
-    let (network, _) = preview_host(crate::daemon_host_kind(global), args);
+    let (network, egress) = project_network(&project, args)?;
     // This path reads `[defaults.session]`, as `min box start` does.
     proxy_rows(
         global,
@@ -413,14 +403,51 @@ fn project_rows(global: &GlobalArgs, args: &BoxSpecArgs, out: &mut Vec<u8>) -> a
         quic443,
         &secrets,
         network,
+        egress.as_ref(),
         BepTables::SESSION,
         None,
         out,
     )
 }
 
+/// The network mode and the effective egress that `min box start` gives
+/// the session box of `project`, with `--network` from `args`. The same
+/// helpers as the start resolve them, so the start and the preview check
+/// the grants against the same facts (#2445).
+///
+/// # Errors
+///
+/// The refusals of the start: ingress off an `own_ip` box, and egress on a
+/// `none` box.
+fn project_network(
+    project: &Path,
+    args: &BoxSpecArgs,
+) -> anyhow::Result<(boxes::NetworkMode, Option<boxes::EgressPolicy>)> {
+    let project = camino::Utf8Path::from_path(project)
+        .ok_or_else(|| anyhow::anyhow!("Project path is not valid UTF-8"))?;
+    let mut activate = crate::ActivateArgs::unflagged();
+    activate.network = args.overrides.network;
+    let (port_mappings, flags) = super::box_verbs::flag_network_overrides(&activate)?;
+    let mut project_egress = super::box_verbs::project_egress(project, None)?;
+    let (network, port_mappings) =
+        super::box_verbs::session_box_network(&activate, &mut project_egress, port_mappings)?;
+    let egress = super::box_verbs::session_effective_egress(
+        project_egress,
+        flags,
+        network.into(),
+        &activate.egress,
+    )?;
+    let policy = super::box_verbs::network_override_policy(&activate, port_mappings, egress.policy);
+    tracing::debug!(
+        network = boxes::NetworkMode::from(network).word(),
+        egress = ?policy.egress,
+        "the preview's network and effective egress, as the start sends them"
+    );
+    Ok((network.into(), policy.egress))
+}
+
 /// Writes the Box Egress Proxy rows for `secrets` (BEP-038) to `out`, for
-/// a box of `network` on this host. `read_rules` holds the client's
+/// a box of `network` with `egress` on this host. `read_rules` holds the client's
 /// `[secret-store-rules]` when the caller already read them, and the rows
 /// then do not read them again. `tables` holds the minimal.toml tables
 /// that a refusal names.
@@ -431,6 +458,7 @@ fn proxy_rows(
     quic443: Option<Quic443>,
     secrets: &SecretGrants,
     network: boxes::NetworkMode,
+    egress: Option<&boxes::EgressPolicy>,
     tables: BepTables<'_>,
     read_rules: Option<&StoreRules>,
     out: &mut dyn std::io::Write,
@@ -460,6 +488,7 @@ fn proxy_rows(
             secrets,
             acknowledged,
             network,
+            egress,
             box_zone_resolver,
             github_hosts: &github_hosts,
             store_rules: &store_rules,
@@ -474,7 +503,10 @@ fn proxy_rows(
 /// steered names: the switch's DNS gate for `own_ip`, and the box's own
 /// steering answerer for `host_ip` (BEP-081). Creation reads the same fact
 /// for the same mode, so `min box spec --network <mode>` refuses what `min
-/// session activate --network <mode>` refuses.
+/// session activate --network <mode>` refuses. The preview itself reads
+/// the network through [`project_network`], which also applies the
+/// project's `network.mode`. The tests keep this form to check the flag.
+#[cfg(test)]
 pub(crate) fn preview_host(
     kind: paths::HostKind,
     args: &BoxSpecArgs,
@@ -907,12 +939,12 @@ fn expand_entry(
     network.insert("mode".to_owned(), mode.word().into());
     sources.insert("network.mode".to_owned(), mode_source);
     let egress_flagged = overrides.egress != crate::EgressArgs::default();
-    match egress {
+    match &egress {
         Some(egress) => {
             let had = network.contains_key("egress");
             network.insert(
                 "egress".to_owned(),
-                toml::Value::try_from(&egress).context("Cannot encode the egress")?,
+                toml::Value::try_from(egress).context("Cannot encode the egress")?,
             );
             let mut source = if had {
                 network_label.clone().unwrap_or_default()
@@ -992,6 +1024,7 @@ fn expand_entry(
             quic443,
             &grants,
             mode,
+            egress.as_ref(),
             tables,
             read_rules.as_ref(),
             &mut rows,
@@ -1314,7 +1347,7 @@ fn write_yaml(value: &serde_json_lenient::Value, indent: usize, out: &mut String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boxes::core::bep::GrantSource;
+    use boxes::core::bep::{ActivationRefused, BepRefusal, GrantSource};
 
     const HOSTS: &[&str] = &[
         "github.com",
@@ -1385,6 +1418,15 @@ mod tests {
         .expect("a store reference parses")
     }
 
+    /// An egress that admits every host of the GitHub set, so a GitHub
+    /// grant passes BEP-008.
+    fn github_egress() -> boxes::EgressPolicy {
+        boxes::EgressPolicy {
+            allow_dns_hosts: Some(HOSTS.iter().map(|host| (*host).to_owned()).collect()),
+            ..boxes::EgressPolicy::default()
+        }
+    }
+
     fn proxy_env() -> BepSettings {
         BepSettings {
             steering: Some(Steering::ProxyEnv),
@@ -1409,6 +1451,7 @@ mod tests {
                 // An own-address box on the VM host, whose switch resolves
                 // box names (BEP-017).
                 network: boxes::NetworkMode::OwnIp,
+                egress: Some(&github_egress()),
                 box_zone_resolver: true,
                 github_hosts: HOSTS,
                 store_rules: &StoreRules::new(),
@@ -1446,6 +1489,7 @@ mod tests {
                     secrets: &secrets,
                     acknowledged: false,
                     network: boxes::NetworkMode::OwnIp,
+                    egress: Some(&github_egress()),
                     box_zone_resolver: false,
                     github_hosts: HOSTS,
                     store_rules: rules,
@@ -1510,6 +1554,7 @@ mod tests {
                 secrets: &secrets,
                 acknowledged: false,
                 network: boxes::NetworkMode::OwnIp,
+                egress: Some(&github_egress()),
                 box_zone_resolver: false,
                 github_hosts: HOSTS,
                 store_rules: &other,
@@ -1539,6 +1584,7 @@ mod tests {
                 secrets: &secrets,
                 acknowledged: false,
                 network: boxes::NetworkMode::OwnIp,
+                egress: Some(&github_egress()),
                 box_zone_resolver: false,
                 github_hosts: HOSTS,
                 store_rules: &other,
@@ -1592,6 +1638,7 @@ mod tests {
                 secrets: &secrets,
                 acknowledged: false,
                 network: boxes::NetworkMode::OwnIp,
+                egress: Some(&github_egress()),
                 box_zone_resolver: false,
                 github_hosts: HOSTS,
                 store_rules: &StoreRules::new(),
@@ -1659,6 +1706,7 @@ mod tests {
                 secrets: &secrets,
                 acknowledged: false,
                 network: boxes::NetworkMode::OwnIp,
+                egress: Some(&github_egress()),
                 box_zone_resolver: false,
                 github_hosts: HOSTS,
                 store_rules: &StoreRules::new(),

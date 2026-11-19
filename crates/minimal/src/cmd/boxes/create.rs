@@ -2157,7 +2157,7 @@ fn network_key_invalid(
 /// # Errors
 ///
 /// The refusal, when `network` is `none` and the box has egress.
-fn session_effective_egress(
+pub(crate) fn session_effective_egress(
     project: ProjectEgress,
     flags: Option<boxes::EgressPolicy>,
     network: boxes::NetworkMode,
@@ -6795,6 +6795,7 @@ mod tests {
                         secrets: &secrets,
                         acknowledged: false,
                         network,
+                        egress: Some(&egress),
                         box_zone_resolver: resolver,
                         github_hosts: &github_hosts,
                         store_rules: &rules,
@@ -6871,6 +6872,7 @@ mod tests {
                             secrets: &secrets,
                             acknowledged: false,
                             network: spec_network,
+                            egress: Some(&egress),
                             box_zone_resolver: spec_resolver,
                             github_hosts: &github_hosts,
                             store_rules: &rules,
@@ -6933,6 +6935,101 @@ mod tests {
                 command: crate::BoxCommand::Spec(args),
             })) => args,
             _ => panic!("expected min box spec for {argv:?}"),
+        }
+    }
+
+    /// The refusal that `min session activate` gives for the project in
+    /// `project`, with the flags `flags`. It runs the start's own steps, in
+    /// the start's order, up to the grant check.
+    fn start_refusal(global: &GlobalArgs, project: &std::path::Path, flags: &[&str]) -> String {
+        let mut argv = vec!["min", "session", "activate"];
+        argv.extend(flags);
+        let mut args = parsed_activate_args(&argv);
+        let path = camino::Utf8Path::from_path(project).expect("utf-8 path");
+        let (bep, secrets, spec_env, _) = project_bep_and_grants(path, None).expect("loads");
+        let (port_mappings, flag_egress) = flag_network_overrides(&args).expect("flags parse");
+        let mut project_egress = project_egress(path, None).expect("egress loads");
+        let (network, port_mappings) =
+            session_box_network(&args, &mut project_egress, port_mappings).expect("network");
+        args.network = Some(network);
+        let egress =
+            session_effective_egress(project_egress, flag_egress, network.into(), &args.egress)
+                .expect("egress");
+        let policy = network_override_policy(&args, port_mappings, egress.policy);
+        let (network, resolver) = creation_host(daemon_host_kind(global), &args);
+        let err = refuse_unhonourable_grants(
+            network,
+            policy.egress.as_ref(),
+            &bep,
+            &secrets,
+            false,
+            resolver,
+            &spec_env,
+        )
+        .expect_err("the start refuses");
+        let refused = err
+            .downcast_ref::<boxes::core::bep::ActivationRefused>()
+            .expect("the start's refusal is the box spec refusal");
+        assert_eq!(refused.exit_code(), 3);
+        refused.to_string()
+    }
+
+    // #2445: `min box spec` refuses a project with a GitHub grant whose
+    // egress does not admit the GitHub hosts (BEP-008), as the start does,
+    // with exit 3 and the same text. Before, the preview checked the grant
+    // with no egress and printed the rows.
+    #[tokio::test]
+    async fn box_spec_preview_refuses_like_start() {
+        let home = tempfile::tempdir().expect("home dir");
+        let grant = "[session.network.bep]\nsteering = \"proxy_env\"\n\
+                     [session.secrets.GH_TOKEN]\nsource = \"broker\"\n\
+                     scopes = [\"github:user-token\"]\n";
+        // An egress that names other hosts only, on the default network,
+        // and no egress on an `own_ip` box.
+        let cases: [(&str, &[&str]); 2] = [
+            (
+                "[defaults.network.egress]\nallow_dns_hosts = [\"example.com\"]\n",
+                &[],
+            ),
+            ("", &["--network", "own_ip"]),
+        ];
+        for (egress, flags) in cases {
+            let project = tempfile::tempdir().expect("project dir");
+            std::fs::write(
+                project.path().join(mfile::MFILE_NAME),
+                format!("{grant}{egress}"),
+            )
+            .expect("write minimal.toml");
+            let global = GlobalArgs {
+                repo_dir: Some(project.path().to_path_buf()),
+                minimal_dir: Some(home.path().join("state")),
+                config_dir: Some(home.path().join("config")),
+                provider: None,
+                no_input: true,
+                vm: None,
+            };
+            let case = format!("{egress:?} {flags:?}");
+
+            let started = start_refusal(&global, project.path(), flags);
+
+            let mut argv = vec!["min", "box", "spec"];
+            argv.extend(flags);
+            let mut out = Vec::new();
+            let err = crate::cmd::box_spec::box_spec_to(
+                &global,
+                parsed_box_spec_args(&argv),
+                false,
+                &mut out,
+            )
+            .await
+            .expect_err("min box spec refuses");
+            let refused = err
+                .downcast_ref::<boxes::core::bep::ActivationRefused>()
+                .unwrap_or_else(|| panic!("{case}: the box spec refusal: {err:#}"));
+            assert_eq!(refused.exit_code(), 3, "{case}");
+            assert_eq!(refused.to_string(), started, "{case}: same refusal text");
+            assert!(started.contains("github.com"), "{case}: {started}");
+            assert!(out.is_empty(), "{case}: no rows print");
         }
     }
 
@@ -7071,7 +7168,7 @@ mod tests {
                 "[defaults]",
             ),
             (
-                "[defaults.session.network.egress]\nallow_dns_hosts = [\"github.com\"]\n",
+                "[defaults.network.egress]\nallow_dns_hosts = [\"github.com\"]\n",
                 "[defaults.session]",
             ),
             (
