@@ -3636,9 +3636,9 @@ mod tests {
             .expect_err("quic443 on a task refuses the run");
         assert_eq!(
             refusal.to_string(),
-            "Cannot run the task: [tasks.build] in minimal.toml sets network.quic443, which a \
-             task box does not apply. Remove network.quic443 from [tasks.build], and run the \
-             task with --quic443 block to set it."
+            "[tasks.build] in minimal.toml sets network.quic443, which is not applied to a \
+             task box. Remove network.quic443 from [tasks.build], and set it with \
+             `min task run --quic443 block build`."
         );
 
         let (_dir, defaults_task) =
@@ -3647,8 +3647,8 @@ mod tests {
             .expect_err("bep in [defaults.task] refuses the run");
         assert_eq!(
             refusal.to_string(),
-            "Cannot run the task: [defaults.task] in minimal.toml sets network.bep, which a \
-             task box does not apply. Remove network.bep from [defaults.task]."
+            "[defaults.task] in minimal.toml sets network.bep, which is not applied to a \
+             task box. Remove network.bep from [defaults.task]."
         );
 
         // The keys a task box applies, flat egress spellings included, and

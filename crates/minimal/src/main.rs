@@ -1837,8 +1837,8 @@ mod tests {
     #[test]
     fn task_network_key_a_task_does_not_apply_exits_3() {
         let e = anyhow::Error::new(minimal::TaskNetworkUnapplied {
-            message: "Cannot run the task: [tasks.build] in minimal.toml sets \
-                      network.quic443, which a task box does not apply."
+            message: "[tasks.build] in minimal.toml sets network.quic443, which is \
+                      not applied to a task box."
                 .to_owned(),
         })
         .context("running the task");

@@ -1558,9 +1558,11 @@ const TASK_NETWORK_KEYS: [&str; 2] = ["mode", "egress"];
 
 /// A `network` key that a task's own layers declare and that a task box
 /// does not apply, such as `quic443` (#3252). The message names the key,
-/// the table and the next step. An invalid project `minimal.toml` refuses
-/// the run the same way, so the run ends with exit 3 (`main.rs`), the
-/// code the architecture gives an invalid project file.
+/// the table and the next step. `min task run` and `min box spec` both
+/// read the task's network through `task_project_egress`, so the text
+/// fits both commands. An invalid project `minimal.toml` refuses the same
+/// way, so the command ends with exit 3 (`main.rs`), the code the
+/// architecture gives an invalid project file.
 #[derive(Debug)]
 pub struct TaskNetworkUnapplied {
     /// The refusal, with the key, the table and the next step.
@@ -1621,15 +1623,17 @@ fn refuse_unapplied_task_network(
     let remedy = if key == "quic443" {
         let stance = value.as_str().unwrap_or("<stance>");
         format!(
-            "Remove network.quic443 from {layer}, and run the task with --quic443 {stance} to set it."
+            "Remove network.quic443 from {layer}, and set it with \
+             `min task run --quic443 {stance} {name}`.",
+            name = entry.name,
         )
     } else {
         format!("Remove network.{key} from {layer}.")
     };
     Err(TaskNetworkUnapplied {
         message: format!(
-            "Cannot run the task: {layer} in {file} sets network.{key}, which a task box \
-             does not apply. {remedy}",
+            "{layer} in {file} sets network.{key}, which is not applied to a task box. \
+             {remedy}",
             file = mfile::MFILE_NAME,
         ),
     }
