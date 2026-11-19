@@ -387,8 +387,8 @@ fn project_rows(global: &GlobalArgs, args: &BoxSpecArgs, out: &mut Vec<u8>) -> a
         .repo_dir
         .clone()
         .unwrap_or_else(|| PathBuf::from("."));
-    match mfile::File::from_dir_recursive(&project) {
-        Ok(_) => {}
+    let file = match mfile::File::from_dir_recursive(&project) {
+        Ok(file) => file,
         Err(mfile::Error::NotFound) => anyhow::bail!(
             "No {} found in {} or its parent directories.",
             mfile::MFILE_NAME,
@@ -397,13 +397,38 @@ fn project_rows(global: &GlobalArgs, args: &BoxSpecArgs, out: &mut Vec<u8>) -> a
         Err(error) => {
             return Err(crate::ProjectFileInvalid { error }.into());
         }
-    }
+    };
     // The rows read the expanded session entry, the same expansion that
     // `min box start` grants from, so `[defaults.network.bep]` and the
     // entry's own tables both reach them.
     let utf8_project = camino::Utf8Path::from_path(&project)
         .ok_or_else(|| anyhow::anyhow!("The project path {} is not UTF-8.", project.display()))?;
-    let (bep, secrets, _, quic443) = crate::project_bep_and_grants(utf8_project, None)?;
+    let (bep, secrets, quic443) = match crate::project_bep_and_grants(utf8_project, None) {
+        Ok((bep, secrets, _, quic443)) => (bep, secrets, quic443),
+        // A project whose start cannot pick one session entry still gets
+        // its preview: the bare form is read-only and never refuses for
+        // the pick. The rows then read the `[defaults.session]` table, as they did
+        // before the expansion.
+        Err(error)
+            if error
+                .downcast_ref::<crate::SessionEntryUndecided>()
+                .is_some() =>
+        {
+            tracing::debug!(
+                project = %project.display(),
+                error = %error,
+                "min box spec: no single session entry, rendering the [defaults.session] table"
+            );
+            let session = file.session.unwrap_or_default();
+            let network = session.network.unwrap_or_default();
+            (
+                network.bep.unwrap_or_default(),
+                session.secrets,
+                network.quic443,
+            )
+        }
+        Err(error) => return Err(error),
+    };
     tracing::debug!(project = %project.display(), "rendering min box spec");
     let (network, _) = preview_host(crate::daemon_host_kind(global), args);
     proxy_rows(

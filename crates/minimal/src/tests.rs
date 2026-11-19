@@ -18278,6 +18278,23 @@ async fn box_spec_bare_reads_defaults_network_bep() {
     assert!(entry.contains("# steering  proxy_env\n"), "{entry}");
 }
 
+// D3598: bare `min box spec` stays a read-only preview when the start
+// cannot pick one session entry. Two session entries and no `default`
+// render the `[defaults.session]` table's rows, not the start's refusal.
+#[tokio::test]
+async fn box_spec_bare_reads_defaults_network_bep_undecided_entry() {
+    let (_project, global) = spec_project(
+        "[defaults.session.network.bep]\nsteering = \"proxy_env\"\n\n\
+         [defaults.session.secrets.GH_TOKEN]\nsource = \"broker\"\nscopes = [\"github:full\"]\n\n\
+         [sessions.one]\npackages = [\"git\"]\n\n\
+         [sessions.two]\npackages = [\"git\"]\n",
+    );
+    let bare = box_spec_text(&global, &["min", "box", "spec", "--network", "own_ip"])
+        .await
+        .expect("the rows render without a picked session entry");
+    assert!(bare.contains("\nsteering  proxy_env\n"), "{bare}");
+}
+
 // BCLI-021: `min box spec <entry>` with the `[network]` override flags
 // renders the network that `min box start` sends with the same flags:
 // the mode, the egress and the ingress, each flag marked as the source.
