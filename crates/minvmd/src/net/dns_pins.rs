@@ -5303,10 +5303,22 @@ pub(crate) mod tests {
         let unmatched = tcp_dns_message(&dns_query_of(&[(qname("example.org."), RecordType::A)]));
         let full = u16::try_from(MAX_TCP_DNS_FLOWS).expect("fits");
         // One clean entry, then refused ones up to the bound.
-        let advance = forwarded(decide_tcp(&mut streams, &table, (48000, SYN, 1000), &[], now));
+        let advance = forwarded(decide_tcp(
+            &mut streams,
+            &table,
+            (48000, SYN, 1000),
+            &[],
+            now,
+        ));
         streams.commit(advance);
         for port in 48001..48000 + full {
-            let advance = forwarded(decide_tcp(&mut streams, &table, (port, SYN, 1000), &[], now));
+            let advance = forwarded(decide_tcp(
+                &mut streams,
+                &table,
+                (port, SYN, 1000),
+                &[],
+                now,
+            ));
             streams.commit(advance);
             assert!(
                 matches!(
@@ -5338,6 +5350,9 @@ pub(crate) mod tests {
             (48001..48000 + full).all(|port| streams.flows.contains_key(&(LEASE, port))),
             "every refused entry stays"
         );
-        assert!(streams.flows.contains_key(&(LEASE, 49000)), "the opening is tracked");
+        assert!(
+            streams.flows.contains_key(&(LEASE, 49000)),
+            "the opening is tracked"
+        );
     }
 }
