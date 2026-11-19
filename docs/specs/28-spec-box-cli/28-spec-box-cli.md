@@ -62,7 +62,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
   tier:     T0
   verify:   cargo nextest run -p minimal rm_running_box_refuses_naming_force
   - IF `min box rm` targets a box that is not running, without `--force`, and the box has changed files or the system cannot read whether it has THEN THE SYSTEM SHALL ask for a confirmation before it removes the box when stdin is a terminal and `--no-input` is absent. Otherwise it SHALL fail with exit 2 naming `--force`, and keep the box. A box with no changed files SHALL be removed without a question.
-    <!-- the gate `min session destroy` ran before BCLI-042 removed that verb -->
+    <!-- the gate `min session destroy` ran before BCLI-042 removed that verb. Interim: `min box rm` refuses a running box first, and `GetWorkspaceDelta` answers `Unavailable` for a box with no live host. So every box that reaches this gate is unchecked. A headless `min box rm` without `--force` always refuses as unchecked, and the clean-box clause and the changed-files refusal are not reached yet. This changes when the daemon answers `GetWorkspaceDelta` for a stopped box (gominimal/inbox#1295). The design's global `-y, --yes` (architecture.md, box-provider-api.md) answers this confirmation off a TTY. The tree has no `--yes` yet, and gominimal/inbox#1296 adds it. -->
     tier:   T0
     verify: cargo nextest run -p minimal box_rm_without_force_gates_changed_files
 

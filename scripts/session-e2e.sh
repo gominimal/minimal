@@ -7142,7 +7142,9 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   # the box is stopped, a headless `min box rm` without --force exits 2,
   # names --force and keeps the box (BCLI-004). The daemon cannot read the
   # files of a stopped box, so the gate refuses it as unchecked, which is
-  # the same refusal a changed box gets.
+  # the same refusal a changed box gets. When gominimal/inbox#1295 lets the
+  # daemon read a stopped box's files, this step asserts the
+  # `has changed files` text.
   sr_sid="$(cd "$TASK_SEED_DIR" && mnl session start --detach --no-input \
     --name e2e-task-sr 2>"$WORK/session-rm-start.err")" || {
     echo "::error::'min session start' for the box rm refusal step failed"

@@ -1012,6 +1012,9 @@ pub(crate) async fn rm_box_on_hosts(
         if running {
             return Err(BoxRunningRefusal::new(target).into());
         }
+        // Until gominimal/inbox#1295, the daemon answers `Unavailable` for a
+        // box with no live host. So `box_delta` gets `Unavailable` here and
+        // `at_risk` is `Unknowable`.
         let at_risk = assess_at_risk(box_delta(&mut client, box_id).await);
         tracing::debug!(
             r#box = target,
