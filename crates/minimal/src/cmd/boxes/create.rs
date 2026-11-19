@@ -2158,7 +2158,7 @@ fn network_key_invalid(
 /// # Errors
 ///
 /// The refusal, when `network` is `none` and the box has egress.
-fn session_effective_egress(
+pub(crate) fn session_effective_egress(
     project: ProjectEgress,
     flags: Option<boxes::EgressPolicy>,
     network: boxes::NetworkMode,
@@ -2579,13 +2579,16 @@ fn proxy_stance(network: boxes::NetworkMode) -> Option<bep::boxes::Stance> {
 }
 
 /// Whether a node-local Box Egress Proxy serves boxes on this host: the
-/// proxy published its identity at `identity`, and its control socket is
-/// at `control`. A missing home directory gives neither path.
+/// proxy published its identity at `identity`, and something answers a
+/// connection on its control socket at `control`. A socket file that a
+/// stopped `bep serve` left behind refuses the connection, so it does not
+/// count. A missing home directory gives neither path.
 pub(crate) fn proxy_present(
     identity: Option<&std::path::Path>,
     control: Option<&std::path::Path>,
 ) -> bool {
-    identity.is_some_and(std::path::Path::exists) && control.is_some_and(std::path::Path::exists)
+    identity.is_some_and(std::path::Path::exists)
+        && control.is_some_and(|control| std::os::unix::net::UnixStream::connect(control).is_ok())
 }
 
 /// Why no node-local proxy serves boxes on this host, or `None` when one
@@ -2608,10 +2611,17 @@ pub(crate) fn proxy_absence(
     }
     let absence = match binary {
         // The text names the log only when the host daemon wrote it.
-        Ok(path) if path.exists() => ProxyAbsence::NotAnswering {
-            path,
-            log: log.filter(|log| log.exists()),
-        },
+        Ok(path) if path.exists() => {
+            let log = log.filter(|log| log.exists());
+            let last_error = log
+                .as_deref()
+                .and_then(|log| crate::mint::last_error_line(log, control));
+            ProxyAbsence::NotAnswering {
+                path,
+                log,
+                last_error,
+            }
+        }
         Ok(path) => ProxyAbsence::NotInstalled { path: Some(path) },
         Err(ProxyLookupError::RelativeEnv(path)) => ProxyAbsence::RelativePath { path },
         Err(ProxyLookupError::NoMinvmd) => ProxyAbsence::NotInstalled { path: None },
@@ -2884,6 +2894,7 @@ fn mint_grants(
     box_id: Option<String>,
     egress: Vec<String>,
     network: boxes::NetworkMode,
+    proxy_log: Option<&std::path::Path>,
 ) -> Result<MintedGrants, anyhow::Error> {
     use crate::mint::{
         ControlClient, GrantBox, HostClientKeyStore, MintError, ProxyRegistration,
@@ -2903,8 +2914,10 @@ fn mint_grants(
         "a GitHub grant"
     };
     // A box with store references only is told about its secrets, not
-    // about a GitHub grant it does not declare.
+    // about a GitHub grant it does not declare. A proxy that does not
+    // answer is named with its log and that log's last error.
     let mint_error = |error: MintError| -> anyhow::Error {
+        let error = error.with_proxy_log(proxy_log);
         if stored {
             StoreOnlyMintError(error).into()
         } else {
@@ -3063,7 +3076,12 @@ fn proxy_egress(
 /// override, which the store mint checks `bep serve` agrees with. No box
 /// exists yet, so a failure only withdraws the row the box's registration
 /// bought (T66). `box_name` is the name that row was registered under. A
-/// box with no `--name` has none on the request (BOX-163).
+/// box with no `--name` has none on the request (BOX-163). `proxy_log` is
+/// the proxy's `bep.log`, which the refusal names when the proxy does not
+/// answer.
+// Each argument is one fact the activation already holds, and a struct
+// for one caller only moves the list.
+#[allow(clippy::too_many_arguments)]
 async fn mint_into_request(
     request: &mut minimald_rpc::CreateSessionRequest,
     box_name: Option<&str>,
@@ -3072,6 +3090,7 @@ async fn mint_into_request(
     store_grants: &[crate::mint::StoreGrant],
     config_dir: Option<std::path::PathBuf>,
     control_sock: Option<std::path::PathBuf>,
+    proxy_log: Option<std::path::PathBuf>,
 ) -> Result<Option<crate::mint::ProxyRegistration>, anyhow::Error> {
     let grants = github_grants.to_vec();
     let stores = store_grants.to_vec();
@@ -3094,6 +3113,7 @@ async fn mint_into_request(
             box_id,
             egress,
             network,
+            proxy_log.as_deref(),
         )
     })
     .await
@@ -4325,6 +4345,7 @@ pub(crate) async fn activate_box(
             &store_grants,
             global.config_dir.clone(),
             control_sock.clone(),
+            proxy_log_path(global.minimal_dir.as_deref()),
         ))
         .await?;
 
@@ -5729,6 +5750,7 @@ mod tests {
             &[],
             None,
             Some(sock_path.clone()),
+            None,
         )
         .await;
         assert!(result.is_err(), "the grant mint fails");
@@ -6863,6 +6885,7 @@ mod tests {
                         secrets: &secrets,
                         acknowledged: false,
                         network,
+                        egress: Some(&egress),
                         box_zone_resolver: resolver,
                         github_hosts: &github_hosts,
                         store_rules: &rules,
@@ -6939,6 +6962,7 @@ mod tests {
                             secrets: &secrets,
                             acknowledged: false,
                             network: spec_network,
+                            egress: Some(&egress),
                             box_zone_resolver: spec_resolver,
                             github_hosts: &github_hosts,
                             store_rules: &rules,
@@ -7004,6 +7028,215 @@ mod tests {
         }
     }
 
+    /// The refusal that `min session activate` gives for the project in
+    /// `project`, with the flags `flags`. It runs the start's own steps, in
+    /// the start's order, up to the grant check.
+    fn start_refusal(global: &GlobalArgs, project: &std::path::Path, flags: &[&str]) -> String {
+        start_refusal_of(global, project, None, flags)
+    }
+
+    /// [`start_refusal`] for the entry `entry` of the project, and with the
+    /// store reference check that follows the grant check.
+    fn start_refusal_of(
+        global: &GlobalArgs,
+        project: &std::path::Path,
+        entry: Option<&str>,
+        flags: &[&str],
+    ) -> String {
+        let mut argv = vec!["min", "session", "activate"];
+        argv.extend(flags);
+        let mut args = parsed_activate_args(&argv);
+        let path = camino::Utf8Path::from_path(project).expect("utf-8 path");
+        let (bep, secrets, spec_env, _) = project_bep_and_grants(path, entry).expect("loads");
+        let (port_mappings, flag_egress) = flag_network_overrides(&args).expect("flags parse");
+        let mut project_egress = project_egress(path, entry).expect("egress loads");
+        let (network, port_mappings) =
+            session_box_network(&args, &mut project_egress, port_mappings).expect("network");
+        args.network = Some(network);
+        let egress =
+            session_effective_egress(project_egress, flag_egress, network.into(), &args.egress)
+                .expect("egress");
+        let policy = network_override_policy(&args, port_mappings, egress.policy);
+        let (network, resolver) = creation_host(daemon_host_kind(global), &args);
+        let err = refuse_unhonourable_grants(
+            network,
+            policy.egress.as_ref(),
+            &bep,
+            &secrets,
+            false,
+            resolver,
+            &spec_env,
+        )
+        .and_then(|_| check_store_grants(global, &secrets, policy.egress.as_ref(), false))
+        .expect_err("the start refuses");
+        let refused = err
+            .downcast_ref::<boxes::core::bep::ActivationRefused>()
+            .expect("the start's refusal is the box spec refusal");
+        assert_eq!(refused.exit_code(), 3);
+        refused.to_string()
+    }
+
+    // #2445: `min box spec` refuses a project with a GitHub grant whose
+    // egress does not admit the GitHub hosts (BEP-008), as the start does,
+    // with exit 3 and the same text. Before, the preview checked the grant
+    // with no egress and printed the rows.
+    #[tokio::test]
+    async fn box_spec_preview_refuses_like_start() {
+        let home = tempfile::tempdir().expect("home dir");
+        let grant = "[session.network.bep]\nsteering = \"proxy_env\"\n\
+                     [session.secrets.GH_TOKEN]\nsource = \"broker\"\n\
+                     scopes = [\"github:user-token\"]\n";
+        // An egress that names other hosts only, on the default network,
+        // and no egress on an `own_ip` box.
+        let cases: [(&str, &[&str]); 2] = [
+            (
+                "[defaults.network.egress]\nallow_dns_hosts = [\"example.com\"]\n",
+                &[],
+            ),
+            ("", &["--network", "own_ip"]),
+        ];
+        for (egress, flags) in cases {
+            let project = tempfile::tempdir().expect("project dir");
+            std::fs::write(
+                project.path().join(mfile::MFILE_NAME),
+                format!("{grant}{egress}"),
+            )
+            .expect("write minimal.toml");
+            let global = GlobalArgs {
+                repo_dir: Some(project.path().to_path_buf()),
+                minimal_dir: Some(home.path().join("state")),
+                config_dir: Some(home.path().join("config")),
+                provider: None,
+                no_input: true,
+                vm: None,
+            };
+            let case = format!("{egress:?} {flags:?}");
+
+            let started = start_refusal(&global, project.path(), flags);
+
+            let mut argv = vec!["min", "box", "spec"];
+            argv.extend(flags);
+            let mut out = Vec::new();
+            let err = crate::cmd::box_spec::box_spec_to(
+                &global,
+                parsed_box_spec_args(&argv),
+                false,
+                &mut out,
+            )
+            .await
+            .expect_err("min box spec refuses");
+            let refused = err
+                .downcast_ref::<boxes::core::bep::ActivationRefused>()
+                .unwrap_or_else(|| panic!("{case}: the box spec refusal: {err:#}"));
+            assert_eq!(refused.exit_code(), 3, "{case}");
+            assert_eq!(refused.to_string(), started, "{case}: same refusal text");
+            assert!(started.contains("github.com"), "{case}: {started}");
+            assert!(out.is_empty(), "{case}: no rows print");
+        }
+    }
+
+    // #2445: `min box spec <entry>` runs the start's whole check for every
+    // entry. An entry with no grant and `steering = "off"` with
+    // `proxy_env` (BEP-010), a store reference with no egress (BEP-036),
+    // and an `allow_dns_hosts` list on a `host_ip` box on a VM host
+    // (BEP-008) each give the start's refusal, with exit 3.
+    #[tokio::test]
+    async fn box_spec_entry_preview_refuses_like_start() {
+        let entry = "[sessions.dev]\npackages = [\"git\"]\n\n";
+        let off = "[defaults.session.network.bep]\nsteering = \"off\"\nproxy_env = true\n";
+        let store = "[defaults.session.network.bep]\nsteering = \"proxy_env\"\n\
+                     [defaults.session.secrets.OPENAI_KEY]\nsource = \"store\"\n\
+                     store = \"keychain\"\nid = \"openai-key\"\n";
+        let host_ip = "[defaults.session.secrets.GH_TOKEN]\nsource = \"broker\"\n\
+                       scopes = [\"github:user-token\"]\n\
+                       [defaults.network.egress]\n\
+                       allow_dns_hosts = [\"example.com\"]\n";
+        let rule = "[secret-store-rules.openai-key]\nupstream = [\"api.openai.com\"]\n\
+                    header = \"Authorization\"\nprefix = \"Bearer \"\n";
+        let cases: [(&str, &[&str], bool, &str); 3] = [
+            (off, &[], false, "proxy_env"),
+            (store, &[], false, "api.openai.com"),
+            (host_ip, &["--network", "host_ip"], true, "github.com"),
+        ];
+        for (body, flags, vm, names) in cases {
+            let home = tempfile::tempdir().expect("home dir");
+            let config = home.path().join("config");
+            std::fs::create_dir_all(config.join("minimal")).expect("config dir");
+            std::fs::write(config.join("minimal/config.toml"), rule).expect("write config.toml");
+            let project = tempfile::tempdir().expect("project dir");
+            std::fs::write(
+                project.path().join(mfile::MFILE_NAME),
+                format!("{entry}{body}"),
+            )
+            .expect("write minimal.toml");
+            let global = GlobalArgs {
+                repo_dir: Some(project.path().to_path_buf()),
+                minimal_dir: Some(home.path().join("state")),
+                config_dir: Some(config),
+                provider: vm.then_some(crate::Provider::LocalMinvmd),
+                no_input: true,
+                vm: None,
+            };
+            let case = format!("{body:?} {flags:?} vm={vm}");
+
+            let started = start_refusal_of(&global, project.path(), Some("dev"), flags);
+
+            let mut argv = vec!["min", "box", "spec", "dev"];
+            argv.extend(flags);
+            let mut out = Vec::new();
+            let err = crate::cmd::box_spec::box_spec_to(
+                &global,
+                parsed_box_spec_args(&argv),
+                false,
+                &mut out,
+            )
+            .await
+            .expect_err("min box spec refuses");
+            let refused = err
+                .downcast_ref::<boxes::core::bep::ActivationRefused>()
+                .unwrap_or_else(|| panic!("{case}: the box spec refusal: {err:#}"));
+            assert_eq!(refused.exit_code(), 3, "{case}");
+            assert_eq!(refused.to_string(), started, "{case}: same refusal text");
+            assert!(started.contains(names), "{case}: {started}");
+            assert!(out.is_empty(), "{case}: no rows print");
+        }
+    }
+
+    // #2445: `min task run` makes no grant check, so `min box spec <entry>`
+    // does not refuse a task entry with no grant that sets `steering =
+    // "off"` with `proxy_env`. The same settings on a session entry are
+    // refused, as the test above shows.
+    #[tokio::test]
+    async fn box_spec_task_entry_preview_accepts_what_task_run_accepts() {
+        let home = tempfile::tempdir().expect("home dir");
+        let project = tempfile::tempdir().expect("project dir");
+        std::fs::write(
+            project.path().join(mfile::MFILE_NAME),
+            "[tasks.build]\necho = 'x'\n\n\
+             [tasks.build.network.bep]\nsteering = \"off\"\nproxy_env = true\n",
+        )
+        .expect("write minimal.toml");
+        let global = GlobalArgs {
+            repo_dir: Some(project.path().to_path_buf()),
+            minimal_dir: Some(home.path().join("state")),
+            config_dir: Some(home.path().join("config")),
+            provider: None,
+            no_input: true,
+            vm: None,
+        };
+        let mut out = Vec::new();
+        crate::cmd::box_spec::box_spec_to(
+            &global,
+            parsed_box_spec_args(&["min", "box", "spec", "build"]),
+            false,
+            &mut out,
+        )
+        .await
+        .expect("min box spec shows the task entry");
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("proxy_env"), "{text}");
+    }
+
     // BEP-032: a box whose only proxy-served secrets are store references
     // is refused in words that name no GitHub grant. A GitHub grant box
     // keeps the GitHub wording.
@@ -7014,6 +7247,8 @@ mod tests {
         let not_running = || MintError::NotRunning {
             path: "/home/me/.minimal/bep/control.sock".into(),
             error: std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+            log: None,
+            last_error: None,
         };
         let store = StoreOnlyMintError(not_running()).to_string();
         assert!(

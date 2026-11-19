@@ -274,8 +274,18 @@ let EnvVars = std.contract.custom (fun label record_value =>
                 'Ok wrapped_value => 'Ok (acc @ [{ include field, value = wrapped_value }]),
                 'Error e =>
                     let why = if std.record.has_field "message" e then ": %{e.message}" else "" in
+                    # The hint is for a value that is not a record. A record
+                    # that fails has the shape right, so it gets no hint. No
+                    # record fails today: each class in need_classes.ncl takes
+                    # `{}`, and that check passes any record here.
+                    let hint =
+                        if std.is_record value then
+                            ""
+                        else
+                            "; a need is written as a record, as in `needs.%{field} = {}`"
+                    in
                     'Error {
-                        message = "failed to validate %{field}%{why}; a need is written as a record, as in `needs.%{field} = {}`",
+                        message = "failed to validate %{field}%{why}%{hint}",
                         blame_location = e.blame_location,
                     }
                 }
