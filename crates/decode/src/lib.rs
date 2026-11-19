@@ -20,16 +20,18 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 mod load;
-pub use load::{LoadOptions, build_decls_in_dir};
+pub use load::{Confinement, LoadOptions, build_decls_in_dir};
 
 mod error;
-pub use error::Error;
+pub use error::{Error, LocalInputWhy};
 
 pub mod attrs;
 pub use attrs::AttrValue;
 pub mod builds;
 use builds::BuildDecl;
 mod decl_tests;
+#[cfg(test)]
+mod field_contract_tests;
 pub use decl_tests::Test;
 mod stacks;
 pub use stacks::{PackageMatcherPredicate, Stack, StackMatcher};
@@ -39,8 +41,14 @@ pub use container::{Container, ExposedPort, ExposedPortProto};
 // Increment for any big change to the format of build specs / stacks, so that hash
 // keys get invalidated.
 //
+// Also increment it when evaluating the same inputs can give a different result, since
+// the layer cache serves a layer by this hash and never evaluates it again.
+//
 // Version 1: Switch from harnesses/ to stacks/.
-const FORMAT_VERSION: u8 = 1;
+// Version 2: BuildSpec's `attrs` and `needs` contracts are applied (inbox#1268).
+// Version 3: Package reads and imports confined to the package and its layer, so a layer
+//            cached before the confinement is evaluated again under it.
+const FORMAT_VERSION: u8 = 3;
 
 /// The start and end bytes where a string was defined.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -625,8 +633,6 @@ mod tests {
                 "builder `build_args`",
                 "a record of strings",
             ),
-            ("attrs = 1", "builder `attrs`", "a record of attributes"),
-            ("needs = 1", "builder `needs`", "a record of attributes"),
             ("tests = 1", "builder `tests`", "a record of tests"),
             ("cmds = 1", "builder `cmds`", "an array of commands"),
             (

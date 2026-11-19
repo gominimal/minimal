@@ -50,6 +50,34 @@ impl std::fmt::Display for HostUnreachable {
 
 impl std::error::Error for HostUnreachable {}
 
+/// The VM host daemon was reached and refused a box row request, with its
+/// reason: for a resume, the reason the box cannot get its addresses back,
+/// such as a VM that cannot reach the DNS service for box names. It
+/// displays as the daemon's reason, word for word, so the person reads the
+/// remedy the daemon names.
+#[derive(Debug)]
+pub struct HostRefusal(String);
+
+impl HostRefusal {
+    /// The daemon's refusal `reason`, as an error.
+    pub fn error(reason: impl Into<String>) -> anyhow::Error {
+        anyhow::Error::new(Self(reason.into()))
+    }
+
+    /// The daemon's reason, word for word.
+    pub fn reason(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for HostRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for HostRefusal {}
+
 /// The VM host daemon refused a registration for want of addresses: its
 /// switch hand-out run, its loopback slice or the machine's zone answerer
 /// has none left ([`minimald_rpc::is_address_capacity_refusal`]). The host
@@ -279,8 +307,8 @@ pub struct RegisteredWithVmHost {
     /// [`Self::row_addresses`].
     pub addresses: boxes::BoxAddresses,
     /// Whether the registration is a `host_ip` box's (BEP-082): the host
-    /// minted its id and allocated no address, so it has no row to carry,
-    /// to commit or to withdraw.
+    /// minted its id and allocated no address, so it has no row. Its lease
+    /// holds the registration name instead.
     pub host_ip: bool,
     /// The box's own id the reply returned — 32 hex digits on the wire,
     /// the one spelling the row, the attachment and a diagnostic all name
@@ -291,8 +319,9 @@ pub struct RegisteredWithVmHost {
     /// drawing; empty from a daemon that predates them.
     pub task_addresses: Vec<std::net::Ipv4Addr>,
     /// The registration's lease, held until the session is active and
-    /// committed then; `None` from a daemon that predates ids, which
-    /// predates leases too and answered one-shot.
+    /// committed then. A `host_ip` registration's lease holds its name.
+    /// `None` from a daemon that predates ids, which predates leases too
+    /// and answered one-shot.
     pub lease: Option<BoxLease>,
 }
 
@@ -353,7 +382,8 @@ pub async fn register_box_with_vm_host(
             lease: Some(BoxLease { stream }),
         }),
         // A `host_ip` registration's answer (BEP-082): the box's id and no
-        // address, on a connection that holds no lease.
+        // address, on the connection a held registration keeps as the
+        // name's lease.
         minimald_rpc::BoxControlReply::BoxIdMinted { minted_box_id } if host_ip => {
             Ok(RegisteredWithVmHost {
                 addresses: boxes::BoxAddresses {
@@ -363,7 +393,7 @@ pub async fn register_box_with_vm_host(
                 host_ip: true,
                 box_id: Some(minted_box_id),
                 task_addresses: Vec::new(),
-                lease: None,
+                lease: Some(BoxLease { stream }),
             })
         }
         // A daemon that predates ids answers with the bare pair the
@@ -562,12 +592,18 @@ pub async fn withdraw_box_row(
 ///
 /// [`HostUnreachable`] when the VM host daemon cannot be reached — the
 /// control socket cannot be connected to or exchanged with: the box's row
-/// cannot be asked back, so the attach or the exec fails closed. A daemon
-/// that answers nothing within [`BOX_CONTROL_TIMEOUT`], and a refusal the
-/// daemon answers, stay warn lines (NET-138): this is a session that already
-/// exists, and the in-VM daemon's own row check before it relaunches the
-/// box's host is the gate that fails closed. Exit 7 stays with the
-/// registration a create makes.
+/// cannot be asked back, so the attach or the exec fails closed.
+/// [`HostRefusal`] when the daemon refuses to give the box an address: the
+/// attach or the exec fails with the daemon's reason, which names the
+/// remedy, for example `min finalize-install --show` when the VM cannot
+/// reach the DNS service for box names. Without it, the attach goes on and
+/// the in-VM daemon refuses the launch with a text that hides the cause.
+/// The daemon's other refusals, and the refusal of a daemon that predates
+/// the resume, stay a warn line, and the attach or the exec goes on. A daemon that
+/// answers nothing within [`BOX_CONTROL_TIMEOUT`] stays a warn line
+/// (NET-138): this is a session that already exists, and the in-VM daemon's
+/// own row check before it relaunches the box's host is the gate that fails
+/// closed. Exit 7 stays with the registration a create makes.
 pub async fn resume_box_row(sock: &Path, record: Option<&boxes::Record>) -> anyhow::Result<()> {
     let Some(control_sock) = control_sock_beside(sock) else {
         return Ok(());
@@ -589,6 +625,11 @@ pub async fn resume_box_row(sock: &Path, record: Option<&boxes::Record>) -> anyh
     .await;
     match resumed {
         Ok(Ok(Ok(_))) => Ok(()),
+        // The daemon's reason is a whole sentence that names the remedy, so
+        // the context adds only the box it is about.
+        Ok(Ok(Err(error))) if error.downcast_ref::<HostRefusal>().is_some() => {
+            Err(error.context(format!("box {name}")))
+        }
         Ok(Ok(Err(error))) => Err(error.context(format!(
             "asking the VM host daemon for box {name}'s host row back failed"
         ))),
@@ -748,7 +789,7 @@ pub fn control_sock_beside(ssh_sock: &Path) -> Option<PathBuf> {
 /// `sock_path`: the box's declaration in, held as a lease, bounded by
 /// [`BOX_CONTROL_TIMEOUT`], with the failure the activation ends with.
 /// `host_ip` registers a `host_ip` box: the host mints its id and hands it
-/// no address, so it asks for no task address and holds no lease.
+/// no address, so it asks for no task address. Its lease holds the name.
 async fn register_box_at(
     sock_path: &Path,
     name: &str,
@@ -790,8 +831,10 @@ async fn register_box_at(
             .and_then(|ingress| ingress.dynamic_allowed_range),
         // The row is held as a lease until the session is active: an
         // activation that dies before then — an interrupt, a crash, a
-        // withdrawal that never lands — leaves no row holding its name.
-        hold: !host_ip,
+        // withdrawal that never lands — leaves no row holding its name. A
+        // `host_ip` registration has no row, and its lease holds its name
+        // the same way.
+        hold: true,
         // The task addresses the box's task runs attach at, filed with the
         // box so the in-VM daemon draws nothing for a task (NET-138).
         task_slots: if host_ip {
@@ -991,6 +1034,96 @@ mod tests {
         assert!(
             error.downcast_ref::<HostUnreachable>().is_some(),
             "{error:#}"
+        );
+    }
+
+    /// minvmd's refusal to give a box an address, as it crosses the wire:
+    /// `allocate_box_address_keeping`'s prefix and minvmd's `NO_ANSWERER`.
+    const NO_ANSWERER: &str = "the running VM cannot reach Minimal's DNS service for box names, \
+                               so this box cannot be given an address; run `min \
+                               finalize-install --show` to check the service's setup, or see \
+                               minvmd.log for the cause (`min dirs` shows where logs are kept)";
+
+    /// Runs `resume_box_row` against a VM host daemon that answers the
+    /// resume with `reply`.
+    async fn resume_answered_with(reply: minimald_rpc::BoxControlReply) -> anyhow::Result<()> {
+        use std::io::{BufRead as _, Write as _};
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_, listener) = silent_vm_host(&dir);
+        let daemon = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let request: minimald_rpc::BoxControlRequest =
+                serde_json_lenient::from_str(line.trim()).unwrap();
+            assert!(
+                matches!(request, minimald_rpc::BoxControlRequest::ResumeBox(_)),
+                "{request:?}"
+            );
+            let mut reply = serde_json_lenient::to_string(&reply).unwrap();
+            reply.push('\n');
+            (&stream).write_all(reply.as_bytes()).unwrap();
+        });
+        let resumed = resume_box_row(
+            &dir.path().join(paths::SSH_SOCK_FILE),
+            Some(&own_ip_record(PAIR)),
+        )
+        .await;
+        daemon.join().unwrap();
+        resumed
+    }
+
+    /// A resume that the VM host daemon refuses because it cannot give the
+    /// box an address fails the attach or the exec with the daemon's
+    /// reason, once, not a warn line. Its other refusals, and the refusal
+    /// of a daemon that cannot parse the resume, stay a warn line.
+    #[tokio::test]
+    async fn resume_refusal_carries_the_vm_host_reason() {
+        let wire = format!("{}{NO_ANSWERER}", crate::attach::NO_ADDRESS_REFUSAL);
+        assert!(wire.starts_with("could not give the box an address: the running VM"));
+        let error = resume_answered_with(minimald_rpc::BoxControlReply::Error { error: wire })
+            .await
+            .expect_err("a refused resume fails the attach");
+        let refusal = error
+            .downcast_ref::<HostRefusal>()
+            .expect("the error is the daemon's refusal");
+        assert_eq!(refusal.reason(), NO_ANSWERER);
+        assert!(error.downcast_ref::<HostUnreachable>().is_none());
+        assert_eq!(format!("{error:#}"), format!("box web: {NO_ANSWERER}"));
+
+        for other in [
+            // minvmd's refusal when it holds no creation for the box.
+            "no box \"web\" is registered on this host to resume",
+            // A minvmd from before the resume cannot parse it.
+            "unknown variant `ResumeBox`, expected one of `RegisterBox`",
+        ] {
+            resume_answered_with(minimald_rpc::BoxControlReply::Error {
+                error: other.to_string(),
+            })
+            .await
+            .unwrap_or_else(|error| panic!("{other}: the attach goes on, not {error:#}"));
+        }
+    }
+
+    /// [`crate::attach::NO_ADDRESS_REFUSAL`] copies the prefix that minvmd
+    /// writes on its no-address refusal. minvmd's source must still write
+    /// that prefix, or a reworded refusal goes back to a warn line and the
+    /// attach goes on without the reason (NET-138).
+    #[test]
+    fn resume_refusal_carries_the_vm_host_reason_prefix_minvmd_writes() {
+        let control =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../minvmd/src/control.rs");
+        let source = std::fs::read_to_string(&control)
+            .unwrap_or_else(|error| panic!("read {}: {error}", control.display()));
+        let written = format!(
+            "error: format!(\"{}{{reason}}\")",
+            crate::attach::NO_ADDRESS_REFUSAL
+        );
+        assert!(
+            source.contains(&written),
+            "{} no longer writes `{written}`: update NO_ADDRESS_REFUSAL to match",
+            control.display()
         );
     }
 
@@ -1289,5 +1422,63 @@ mod tests {
                 "{reply:?}"
             );
         }
+    }
+
+    /// A `host_ip` registration asks to be held, and the connection its id
+    /// came back on is the name's lease. A lease dropped uncommitted closes
+    /// the connection with no commit line, the close the daemon withdraws
+    /// the name on.
+    #[tokio::test]
+    async fn a_host_ip_registration_is_held_as_a_lease() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let sock_path = dir.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let id = minimald_rpc::BoxId::from_bytes([5; 16]);
+        let line = serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::BoxIdMinted {
+            minted_box_id: id,
+        })
+        .unwrap();
+        let daemon = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = tokio::io::BufReader::new(stream);
+            let mut request = String::new();
+            stream.read_line(&mut request).await.unwrap();
+            stream
+                .get_mut()
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .unwrap();
+            let mut after = Vec::new();
+            stream.read_to_end(&mut after).await.unwrap();
+            (request, after)
+        });
+        let policy = boxes::BoxPolicy {
+            credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
+            ..boxes::BoxPolicy::default()
+        };
+        let mut registered = register_box_at(&sock_path, "grant", &policy, true)
+            .await
+            .expect("the registration is answered");
+        assert!(registered.host_ip);
+        assert_eq!(registered.box_id, Some(id));
+        let lease = registered
+            .lease
+            .take()
+            .expect("the host_ip registration's connection is its lease");
+        drop(lease);
+        let (request, after) = daemon.await.unwrap();
+        match serde_json_lenient::from_str(request.trim()).unwrap() {
+            minimald_rpc::BoxControlRequest::Register(register) => {
+                assert!(register.host_ip);
+                assert!(register.hold, "a host_ip registration is held");
+            }
+            other => panic!("the client registers the box, got {other:?}"),
+        }
+        assert!(
+            after.is_empty(),
+            "an uncommitted lease closes with no commit line"
+        );
     }
 }

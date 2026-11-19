@@ -11,9 +11,9 @@
 # in practice nobody reads it, and a semantic change to the guest's control
 # plane lands unreviewed. That is how 6.12.43 -> 6.12.94 shipped a4f0b001782b
 # ("vsock/virtio: reset connection on receiving queue overflow"), which turned a
-# silently-dropped packet into a fatal connection reset and broke every sizeable
-# `min session activate` for three weeks. The commit is public, its subject says exactly
-# what it does, and it sits in net/vmw_vsock/ — the subtree the entire guest
+# silently-dropped packet into a fatal connection reset and broke the project
+# upload of every sizeable session start for three weeks. The commit is public,
+# its subject says exactly what it does, and it sits in net/vmw_vsock/ — the subtree the entire guest
 # control plane rides on. A mechanical diff was all that was needed to catch it,
 # with no VM and no test run. This is that diff.
 #

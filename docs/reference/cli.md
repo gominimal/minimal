@@ -28,13 +28,13 @@ drive it directly with the **`mip`** CLI.
 
 ## Command naming convention {#command-naming-convention}
 
-Commands are spelled **`<noun> <verb>`**: `min session activate`,
-`min session policy`, `min loadout list`, `mip package build`. The noun names
+Commands are spelled **`<noun> <verb>`**: `min box start`,
+`min session start`, `min loadout list`, `mip package build`. The noun names
 the thing being acted on; the verb names the action.
 
 Three rules follow from that:
 
-1. **Every noun accepts its singular and plural form.** `session`/`sessions`,
+1. **Every noun accepts its singular and plural form.** `box`/`boxes`, `session`/`sessions`,
    `loadout`/`loadouts`, `package`/`packages` (which also keeps `pkg`). Both
    spellings are visible in `--help`, so neither is a hidden alias you have to
    know about.
@@ -55,7 +55,6 @@ ergonomic choices, not leftovers — do not "fix" them:
 | Form | Why it stays |
 |------|--------------|
 | `min ls` | The highest-traffic command keeps its bare form, with the `--raw` and `--json` flags that scripts read. It is not an alias of `min session list`, which is `min box list` limited to session boxes. |
-| `min stop` | Acts on the daemon backend rather than any session, and is the daemon-lifecycle command people reach for. |
 | `min init`, `min add`, `min update` | Passthroughs to the `mip` commands of the same name; keeping the spelling identical across the two CLIs beats the hierarchy. |
 
 ## Platform availability

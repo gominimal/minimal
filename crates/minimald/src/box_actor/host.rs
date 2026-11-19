@@ -555,20 +555,25 @@ pub(crate) mod entrypoint_env {
 
 /// Why a task run cannot start the entrypoint of a box that has its own
 /// network address while a shell for its activate hooks runs (T43). The
-/// run prints it after the line that names the task and the box. No
-/// command ends that shell, so the text states the situation and stops.
+/// run prints it after the line that names the task and the box. It
+/// prints only when the VM host daemon does not confirm that the box's
+/// host-side row stands, so a replaced shell would leave the box rowless.
+/// No command changes that answer, so the text states the situation and
+/// stops.
 pub(crate) const ENTRYPOINT_BEHIND_HOOK_SHELL: &str = "The box has its own network address. \
-     The shell that ran the project's activate hooks holds that address, \
-     and that shell does not end.";
+     The task must replace the shell that ran the project's activate hooks. \
+     The box's host did not confirm that the box keeps the address when that shell ends.";
 
 /// The refusal of a task run whose entrypoint cannot start behind a hook
 /// shell, as [`BoxActor::ensure_host`] returns it inside
 /// [`AttachError::SpawnFailed`]. The run finds it by type, not by text,
 /// and answers with [`ENTRYPOINT_BEHIND_HOOK_SHELL`].
 ///
-/// Known gap: this refusal fails closed, so a box with its own network
-/// address and activate hooks cannot run its task. Tracked by
-/// https://github.com/gominimal/minimal/issues/3042.
+/// A box with its own network address and activate hooks runs its task
+/// while the VM host daemon confirms the box's host-side row stands: the
+/// run replaces the hook shell and its launch rejoins that row
+/// (https://github.com/gominimal/minimal/issues/3077). This refusal is
+/// left for a row that the host does not confirm, which fails closed.
 #[derive(Debug)]
 pub(crate) struct EntrypointBehindHookShell;
 
@@ -587,6 +592,43 @@ impl EntrypointBehindHookShell {
             error,
             AttachError::SpawnFailed(e)
                 if e.get_ref().is_some_and(|inner| inner.is::<EntrypointBehindHookShell>())
+        )
+    }
+}
+
+/// Why a restart cannot start the command of a box that has its own
+/// network address and holds a shell for its activate hooks. The restart
+/// prints it after the line that says the box did not start again. A
+/// restart does not ask the VM host daemon whether the box's host-side row
+/// stands, so replacing the shell would end that row. No command changes
+/// that answer, so the text states the situation and stops. Tracked by
+/// https://github.com/gominimal/minimal/issues/3231.
+pub(crate) const RESTART_BEHIND_HOOK_SHELL: &str = "The box has its own network address. \
+     Its command must replace the shell that ran the project's activate hooks. \
+     A restart cannot keep the address when that shell ends, so the command did not start.";
+
+/// The refusal of a restart whose command cannot start behind a hook shell,
+/// as [`BoxActor::restart_launch`] returns it inside
+/// [`AttachError::SpawnFailed`]. The restart finds it by type and prints
+/// [`RESTART_BEHIND_HOOK_SHELL`] without the spawn-failure prefix.
+#[derive(Debug)]
+pub(crate) struct RestartBehindHookShell;
+
+impl std::fmt::Display for RestartBehindHookShell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(RESTART_BEHIND_HOOK_SHELL)
+    }
+}
+
+impl std::error::Error for RestartBehindHookShell {}
+
+impl RestartBehindHookShell {
+    /// Whether `error` is this refusal.
+    pub(crate) fn is(error: &AttachError) -> bool {
+        matches!(
+            error,
+            AttachError::SpawnFailed(e)
+                if e.get_ref().is_some_and(|inner| inner.is::<RestartBehindHookShell>())
         )
     }
 }
@@ -1059,6 +1101,13 @@ impl BoxActor {
                 s.shutdown().await;
             }
             if let Some((host, mut task)) = host {
+                // BCLI-068: a removal tells the host before the kill, so an
+                // attached client is told the box was removed. Only
+                // `destroy_now` cancels `destroying`, right before it calls
+                // this.
+                if !for_shutdown && self.destroying.is_cancelled() {
+                    host.announce_end(box_runtime::BoxEnd::Removal).await;
+                }
                 // Signal the process to die, then stop its runtime loop so the
                 // sandbox files backing its rootfs are released before the
                 // caller removes the session's directory tree. The wait is
@@ -1651,13 +1700,28 @@ impl BoxActor {
             // replaces that shell with its entrypoint here, or the task
             // never runs. Any other caller (an exec, an attach, a resume)
             // keeps the shell: it staged no environment for the entrypoint.
-            // A box that holds a host-side row keeps it, as an attach keeps
-            // it.
+            //
+            // A box that holds a host-side row (NET-138) keeps that row
+            // across the replacement (#3077). The VM host daemon detaches a
+            // row when its host ends and withdraws it only after a grace,
+            // so the launch below rejoins the row while the daemon says it
+            // stands. That is asked before the hook shell ends: a row the
+            // daemon does not confirm keeps the shell, and the run is
+            // refused, so the box is never left rowless.
             let replace =
                 entrypoint_run && self.host_origin == HostOrigin::Hooks && self.starts_argv().await;
-            if replace && !holds_host_row {
+            let rejoins_row = replace && holds_host_row && {
+                let record = self
+                    .record
+                    .record()
+                    .await
+                    .map_err(AttachError::LoadoutFailed)?;
+                self.host_row_stands(&record).await
+            };
+            if replace && (!holds_host_row || rejoins_row) {
                 tracing::info!(
                     box_id = %self.record.id(),
+                    rejoins_row,
                     "replacing the hook-launched shell with the box's entrypoint"
                 );
                 if let BoxInner::Active {
@@ -1668,14 +1732,21 @@ impl BoxActor {
                     let (handle, mut join) = slot.take().expect("matched on Some");
                     Self::kill_and_stop_loop(&handle, &mut join, false).await;
                 }
+                // The launch below takes this and reads the row again once
+                // its host is up, as a relaunch after `host_row_lost` does.
+                // Set after the kill: the slot no longer holds the binding
+                // launch's host, so the next launch is the one that rejoins.
+                self.slot_holds_row = false;
+                self.relaunch_row_confirmed = rejoins_row;
             } else {
                 if replace {
                     // The hook shell never exits (BOX-015), so a run that
                     // relayed it would wait for a task that never starts.
                     tracing::warn!(
                         box_id = %self.record.id(),
-                        "refused the run: replacing the hook-launched shell would end the \
-                         box's host-side row, so the box's entrypoint cannot start"
+                        "refused the run: the VM host daemon did not confirm the box's \
+                         host-side row stands, so replacing the hook-launched shell would \
+                         leave the box rowless"
                     );
                     return Err(AttachError::SpawnFailed(std::io::Error::other(
                         EntrypointBehindHookShell,
@@ -1753,6 +1824,9 @@ impl BoxActor {
         // later attach must not replace it. See [`HostOrigin::Exec`].
         self.host_origin = HostOrigin::Exec;
         self.publish_host();
+        // BOX-040: a new host started the box's entrypoint. An ended box is
+        // refused above, so no resume reaches this launch.
+        self.record_started("exec").await;
         if entrypoint_run {
             self.clear_ends_with_run().await;
         }
@@ -1788,20 +1862,20 @@ impl BoxActor {
         if live_hooks_host {
             let starts_argv = self.starts_argv().await;
             if holds_host_row && starts_argv {
-                // As `ensure_host` refuses it: replacing the hook shell would
-                // end the box's host-side row, and keeping it never starts
-                // the entrypoint (BOX-176, BOX-178).
+                // Replacing the hook shell ends the box's host-side row
+                // here, and keeping it never starts the entrypoint
+                // (BOX-176, BOX-178).
                 // Known gap: a restart of such a box fails closed. Tracked by
-                // https://github.com/gominimal/minimal/issues/3231. It flips
-                // when the hook shell can be replaced without ending the
-                // host-side row (#3042).
+                // https://github.com/gominimal/minimal/issues/3231. A task
+                // run rejoins a standing row in `ensure_host` (#3077); a
+                // restart does not do that yet.
                 tracing::warn!(
                     box_id = %self.record.id(),
                     "restart: refused the start: replacing the hook-launched shell would end \
                      the box's host-side row, so the box's entrypoint cannot start"
                 );
                 return Err(AttachError::SpawnFailed(std::io::Error::other(
-                    EntrypointBehindHookShell,
+                    RestartBehindHookShell,
                 )));
             }
             if !starts_argv {
@@ -1971,6 +2045,13 @@ impl BoxActor {
         // here, so nothing may replace it out from under that client.
         self.host_origin = HostOrigin::Interactive;
         self.publish_host();
+        // BOX-040: a new host started the box's entrypoint. On a resume,
+        // `finish_resume` writes `started` after `resumed`.
+        if self.resume_in_flight {
+            self.resume_attach_minted = true;
+        } else {
+            self.record_started("attach").await;
+        }
         outcome
     }
 
@@ -2398,6 +2479,10 @@ impl BoxActor {
             // unrecorded ending, its processes run now. This stop signals
             // them, and the record keeps how they ended.
             (_, Some((host, task))) => {
+                // BCLI-068: the host knows of the stop before any signal, so
+                // an attached client is told the box was stopped, and sees
+                // no shell-exit prompt.
+                host.announce_end(box_runtime::BoxEnd::Stop).await;
                 let container_pid = probe_host(host.get_attrs())
                     .await
                     .and_then(|attrs| attrs.container_pid);
@@ -2459,6 +2544,9 @@ impl BoxActor {
         }
         self.unrecorded_stop = None;
         let state = boxes::core::record::RecordState::Stopped(ending);
+        // BOX-040: the record left `running`, so the next start writes
+        // `started` again.
+        self.started_recorded = false;
         tracing::info!(
             box_id = %box_id,
             exit_code = state.exit_code(),

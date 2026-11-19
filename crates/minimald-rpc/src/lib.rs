@@ -840,7 +840,10 @@ pub struct RegisterBoxRequest {
     /// connection open: the client writes one `commit` line once its
     /// session is active, and a close or an error before that line
     /// withdraws the row, so an activation that dies between registering
-    /// and committing leaves no row holding its name. A client that omits
+    /// and committing leaves no row holding its name. A `host_ip`
+    /// registration has no row and is held the same way: a close before
+    /// the commit withdraws its registration name, unless a box is already
+    /// admitted under its id. A client that omits
     /// the field, or a daemon that predates it, keeps the one-shot
     /// registration: one line each way, and the row lives until its
     /// creator withdraws it.
@@ -3121,6 +3124,88 @@ impl OneshotSshRpc for GetBoxSpec {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetBoxSpec");
     type Request<'a> = GetBoxSpecRequest;
     type Response = Errorable<GetBoxSpecResponse>;
+}
+
+/// An RPC that a command which waited for a box calls before it copies
+/// the box's declared exports (BOX-198). The daemon grants the command
+/// each export of the box's last end that no other command holds or has
+/// reported, and refuses the rest. The connection the RPC came over holds
+/// each granted export until the command reports it with
+/// [`ReportExport`], or until that connection ends (BOX-202).
+pub struct ClaimExports;
+
+/// The request for a [`ClaimExports`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClaimExportsRequest {
+    /// The box, as a listing reports its id.
+    pub id: SessionId,
+    /// The export paths to claim, as the box's spec declares them.
+    pub paths: Vec<String>,
+}
+
+/// The response for a [`ClaimExports`] RPC. A box that has not ended is
+/// an [`Errorable::Err`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClaimExportsResponse {
+    /// The end the claim is for: the count of `exited` events on the box's
+    /// record, so the box's first end is 1.
+    pub end: u64,
+    /// The paths this command holds now, in request order.
+    pub granted: Vec<String>,
+    /// The paths that another command holds or reported for this end, in
+    /// request order.
+    pub refused: Vec<String>,
+}
+
+impl OneshotSshRpc for ClaimExports {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ClaimExports");
+    type Request<'a> = ClaimExportsRequest;
+    type Response = Errorable<ClaimExportsResponse>;
+}
+
+/// An RPC that reports how one claimed export went (BOX-195). The daemon
+/// appends one `file_exported` event to the box's record, and keeps the
+/// export claimed for the end, so no later command copies it again.
+pub struct ReportExport;
+
+/// One file an export wrote under the project root.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExportedFileReport {
+    /// The file's path, relative to the project root.
+    pub path: String,
+    /// Its size in bytes.
+    pub size: u64,
+    /// Its sha256, in lowercase hex.
+    pub sha256: String,
+}
+
+/// The request for a [`ReportExport`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReportExportRequest {
+    /// The box, as a listing reports its id.
+    pub id: SessionId,
+    /// The end the claim was granted for ([`ClaimExportsResponse::end`]).
+    pub end: u64,
+    /// The export's path, as the spec declares it.
+    pub path: String,
+    /// Whether every file and folder of the export was written.
+    pub copied: bool,
+    /// Each file this command wrote for the export.
+    pub files: Vec<ExportedFileReport>,
+}
+
+/// The response for a [`ReportExport`] RPC. A path that this connection
+/// does not hold is an [`Errorable::Err`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReportExportResponse {
+    /// The `ts` of the `file_exported` event the daemon appended.
+    pub ts: u64,
+}
+
+impl OneshotSshRpc for ReportExport {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ReportExport");
+    type Request<'a> = ReportExportRequest;
+    type Response = Errorable<ReportExportResponse>;
 }
 
 /// An RPC to reap one box: delete its record, its events and its

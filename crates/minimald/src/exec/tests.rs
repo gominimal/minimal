@@ -5640,6 +5640,48 @@ fn only_a_container_failure_is_a_sandbox_failure() {
     );
 }
 
+/// A task whose container a SIGKILL ended reports 137, as a SIGKILLed
+/// command does, so the shutdown notice (`KILLED_STATUS_MIN`) covers it
+/// (gominimal/minimal#3062). Every other end keeps hakoniwa's code: a
+/// command that exits 125 itself, a sandbox failure, a signalled command and
+/// a clean exit.
+#[test]
+fn a_container_sigkill_reports_137() {
+    let status = |code, exit_code: Option<i32>, reason: &str| hakoniwa::ExitStatus {
+        code,
+        reason: reason.to_string(),
+        exit_code,
+        rusage: None,
+        proc_pid_smaps_rollup: None,
+        proc_pid_status: None,
+    };
+    let killed = status(125, None, super::CONTAINER_SIGKILL_REASON);
+    assert_eq!(super::task_exit_code(&killed), 137);
+    assert!(u32::try_from(super::task_exit_code(&killed)).unwrap() >= super::KILLED_STATUS_MIN);
+    assert_eq!(
+        super::task_exit_code(&status(
+            125,
+            Some(125),
+            "process(bash) exited with code 125"
+        )),
+        125,
+        "a command that exits 125 itself keeps it"
+    );
+    assert_eq!(
+        super::task_exit_code(&status(125, None, "mount /home/h810: ENOENT")),
+        125,
+        "a sandbox failure keeps 125"
+    );
+    assert_eq!(
+        super::task_exit_code(&status(143, None, "process(bash) received signal SIGTERM")),
+        143
+    );
+    assert_eq!(
+        super::task_exit_code(&status(0, Some(0), "process(bash) exited with code 0")),
+        0
+    );
+}
+
 /// The notice quotes hakoniwa's reason, which can name a path the box
 /// chose; a control character in it is escaped, so the notice stays one line.
 #[test]

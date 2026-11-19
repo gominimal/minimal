@@ -480,8 +480,10 @@ maybe_remove_finalize_install() {
         # Minimal.app is the app bundle the service's program is installed
         # in, a directory (so the remedy removes it, and only it and the
         # .old a replaced bundle leaves, with -r); the bare minzoned is where
-        # an install from before the bundle put the program.
-        _ns_files="/etc/resolver/min.internal /Library/LaunchDaemons/dev.gominimal.zone.plist /Library/PrivilegedHelperTools/Minimal.app /Library/PrivilegedHelperTools/Minimal.app.old /Library/PrivilegedHelperTools/minzoned /Library/LaunchDaemons/dev.minimal.local-range.plist /Library/PrivilegedHelperTools/dev.minimal.local-range"
+        # an install from before the bundle put the program. The logcap
+        # plist and /private/var/log/minimal are the service's log and the
+        # unit that caps its size; the log directory goes with -r too.
+        _ns_files="/etc/resolver/min.internal /Library/LaunchDaemons/dev.gominimal.zone.plist /Library/PrivilegedHelperTools/Minimal.app /Library/PrivilegedHelperTools/Minimal.app.old /Library/PrivilegedHelperTools/minzoned /Library/LaunchDaemons/dev.minimal.local-range.plist /Library/PrivilegedHelperTools/dev.minimal.local-range /Library/LaunchDaemons/dev.gominimal.zone.logcap.plist /private/var/log/minimal/minzoned.log /private/var/log/minimal"
         _ns_paths="$_ns_files"
         _ns_chan="$_fi_root/Library/Application Support/minimal/run/answerer.sock"
     else
@@ -495,13 +497,17 @@ maybe_remove_finalize_install() {
     _ns_rm_r=
     for _ns_p in $_ns_files; do
         case "$_ns_p" in
-            */Minimal.app|*/Minimal.app.old) _ns_rm_r="$_ns_rm_r $(shq "$_fi_root$_ns_p")" ;;
+            */Minimal.app|*/Minimal.app.old|*/var/log/minimal) _ns_rm_r="$_ns_rm_r $(shq "$_fi_root$_ns_p")" ;;
             *) _ns_rm="$_ns_rm $(shq "$_fi_root$_ns_p")" ;;
         esac
     done
     _ns_rm="$_ns_rm $(shq "$_ns_chan")"
     if [ "$os" = darwin ]; then
-        _ns_undo="sudo launchctl bootout system/dev.gominimal.zone; sudo launchctl bootout system/dev.minimal.local-range; sudo rm -f$_ns_rm; sudo rm -rf$_ns_rm_r; sudo rmdir $(shq "${_ns_chan%/*}") $(shq "$_fi_root/Library/Application Support/minimal") 2>/dev/null || true"
+        # The local range unit added 127.0.64.1-254 to lo0. The aliases go
+        # with it, unless a VM is running: its boxes use them. pgrep -q and
+        # bare names keep the line free of unquoted paths. /etc/resolver and
+        # /Library/PrivilegedHelperTools go only when empty (rmdir).
+        _ns_undo="sudo launchctl bootout system/dev.gominimal.zone; sudo launchctl bootout system/dev.minimal.local-range; sudo launchctl bootout system/dev.gominimal.zone.logcap; sudo rm -f$_ns_rm; sudo rm -rf$_ns_rm_r; if pgrep -qx minvmd; then echo 'note: the loopback IPs boxes use stay on lo0 while a VM is running. Stop every VM, then run this line again.' >&2; else i=1; while [ \$i -le 254 ]; do sudo ifconfig lo0 -alias 127.0.64.\$i 2>/dev/null; i=\$((i + 1)); done; fi; sudo rmdir $(shq "${_ns_chan%/*}") $(shq "$_fi_root/Library/Application Support/minimal") $(shq "$_fi_root/etc/resolver") $(shq "$_fi_root/Library/PrivilegedHelperTools") 2>/dev/null || true"
     else
         _ns_undo="sudo systemctl disable --now minzoned.socket minzoned.service; sudo rm -f$_ns_rm; sudo systemctl daemon-reload; sudo systemctl reset-failed minzoned.socket minzoned.service; [ ! -e $(shq "$_fi_root/sys/class/net/minzone0") ] || { sudo resolvectl revert minzone0; sudo ip link del minzone0; }; sudo rmdir $(shq "${_ns_chan%/*}") $(shq "$_lib_dir") 2>/dev/null || true"
     fi
@@ -509,6 +515,7 @@ maybe_remove_finalize_install() {
     # --undo` removes; the manual remedy, one root command line per item.
     _fi_list=
     _fi_owned=
+    _fi_dns=
     _fi_undo=
     _aa_unowned=
     _qb_found=
@@ -516,6 +523,7 @@ maybe_remove_finalize_install() {
         if [ -e "$_fi_root$_ns_p" ]; then
             _fi_list="the host DNS setup ($_ns_p)"
             _fi_owned=1
+            _fi_dns=1
             _fi_undo="      $_ns_undo"
             break
         fi
@@ -645,6 +653,9 @@ maybe_remove_finalize_install() {
     if [ -n "$_fi_owned" ]; then
         say "  \`min finalize-install --undo\` removes what min finalize-install installed, while min"
         say "  is installed. With min gone, remove everything listed with:"
+        if [ "$os" = darwin ] && [ -n "$_fi_dns" ]; then
+            say "  The DNS service (launchd job dev.gominimal.zone) keeps running until these commands run."
+        fi
     else
         say "  it was installed separately with root; remove it too with:"
     fi
@@ -1683,6 +1694,27 @@ say "  ${dim}record: $(tilde "$prev_record")$rst"
 # is reported and the installer still exits 0: Minimal is installed either
 # way. Every printed command names `min` as this shell can resolve it: bare
 # only once $bindir is on PATH, which on a fresh install it is not yet.
+# answerer_copy_differs — whether this run shipped a `minzoned` whose bytes
+# differ from the root-owned copy `min finalize-install` installed: the
+# DNS service then runs the old program until the step runs again. False
+# when either file is missing or unreadable. The root is overridable for
+# install_test.sh. Sets $_ac_source to what the step's script copies from:
+# the shipped program on Linux, the app bundle around it on macOS.
+answerer_copy_differs() {
+    _ac_root="${MINIMAL_OVERRIDE_FINALIZE_INSTALL_ROOT:-}"
+    if [ "$os" = darwin ]; then
+        _ac_source="$bindir/Minimal.app"
+        _ac_shipped="$_ac_source/Contents/MacOS/minzoned"
+        _ac_installed="$_ac_root/Library/PrivilegedHelperTools/Minimal.app/Contents/MacOS/minzoned"
+    else
+        _ac_shipped="$bindir/minzoned"
+        _ac_source="$_ac_shipped"
+        _ac_installed="$_ac_root/usr/local/lib/minimal/minzoned"
+    fi
+    [ -f "$_ac_shipped" ] && [ -f "$_ac_installed" ] && [ -r "$_ac_installed" ] || return 1
+    [ "$(sha256 "$_ac_shipped")" != "$(sha256 "$_ac_installed" 2>/dev/null)" ]
+}
+
 offer_finalize_install() {
     [ -x "$bindir/min" ] || return 0
     _fi_summary="$tmpdir/finalize-summary"
@@ -1703,6 +1735,13 @@ offer_finalize_install() {
             say "  box names finish once a daemon runs: after your first \`min\`, run \`$_fi_min finalize-install\`."
         fi
         return 0
+    fi
+    # An upgrade that ships a new minzoned leaves the installed DNS service
+    # on the old copy. The replace line prints only when the probe's script
+    # copies this release's minzoned, so the run it names replaces the copy.
+    if answerer_copy_differs && grep -qF "\"$_ac_source" "$_fi_script"; then
+        say "  Minimal's DNS service on this machine runs a different minzoned than this release ships."
+        say "  To replace it, run \`$_fi_min finalize-install\`."
     fi
     _fi_tty="${MINIMAL_OVERRIDE_TTY:-/dev/tty}"
     if (exec <"$_fi_tty") 2>/dev/null; then
