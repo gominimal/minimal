@@ -44,11 +44,10 @@ const FINISH_TIMEOUT: Duration = Duration::from_secs(15);
 /// waits for an installation.
 const INSTALL_POLL: Duration = Duration::from_secs(5);
 
-/// Where a person installs the App and chooses its repositories.
+/// Where a person installs the App and chooses its repositories. The page
+/// also lists the accounts and organizations that already have it, and each
+/// one opens its installation's configure page.
 pub(crate) const INSTALL_URL: &str = "https://github.com/apps/gominimal/installations/new";
-
-/// Where a person changes an installation's repositories.
-const SETTINGS_URL: &str = "https://github.com/settings/installations";
 
 // The sentences the terminal and the browser page share. The page renders a
 // backticked span as a command chip.
@@ -1372,7 +1371,7 @@ impl Page {
                     .map(|i| format!("<strong>{}</strong>", escape(&i.account.login)))
                     .collect();
                 format!(
-                    "<p>{} {}</p>\n<p class=\"muted\"><a href=\"{SETTINGS_URL}\">Change which repositories</a></p>",
+                    "<p>{} {}</p>\n<p class=\"muted\"><a href=\"{INSTALL_URL}\">Change which repositories</a></p>",
                     reach_sentence(&join(&accounts)),
                     prose(CLOSE_TAB)
                 )
@@ -2200,7 +2199,7 @@ mod tests {
         );
         assert!(
             got[0].body.contains(
-                "<p>Your boxes can reach repositories on <strong>octocat</strong> and <strong>acme</strong> through the Minimal GitHub App. You can close this tab.</p>\n<p class=\"muted\"><a href=\"https://github.com/settings/installations\">Change which repositories</a></p>"
+                "<p>Your boxes can reach repositories on <strong>octocat</strong> and <strong>acme</strong> through the Minimal GitHub App. You can close this tab.</p>\n<p class=\"muted\"><a href=\"https://github.com/apps/gominimal/installations/new\">Change which repositories</a></p>"
             ),
             "{}",
             got[0].body
