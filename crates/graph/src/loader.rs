@@ -481,6 +481,7 @@ impl<'lc, SP: SourceProvider, LC: LayerCache> ChainLoader<'lc, SP, LC> {
             from: origin.clone(),
             target: self.for_target.clone(),
             params,
+            confine_to: None,
         };
 
         if let Some(layer) = self
