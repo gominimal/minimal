@@ -5304,6 +5304,9 @@ async fn an_unknown_min_provider_refuses_flagless_commands_only() {
 
 /// A `MIN_PROVIDER` that names no provider leaves a command that reads no
 /// provider running, while a command that talks to a host still refuses.
+/// `finalize-install` refuses too, because the provider picks what it
+/// installs; `finalize-install --undo` does not, and runs here as
+/// `--show --script`, which prints the removal script and runs nothing.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn an_unknown_min_provider_spares_commands_that_need_no_provider() {
@@ -5330,14 +5333,34 @@ async fn an_unknown_min_provider_spares_commands_that_need_no_provider() {
     .await
     .unwrap();
     assert!(offline.status.success(), "{offline:?}");
-    let refused = min(&["ls".as_ref()]).output().await.unwrap();
-    assert!(!refused.status.success());
+    let refusal = "error: MIN_PROVIDER=bogus names no provider. Set MIN_PROVIDER to local or \
+                   local-minvmd, or unset it.";
+    // The refusal comes before the command runs, so `finalize-install`
+    // never reaches its root step here.
+    for args in [&["ls"][..], &["finalize-install"]] {
+        let args: Vec<&std::ffi::OsStr> = args.iter().map(|a| a.as_ref()).collect();
+        let refused = min(&args).output().await.unwrap();
+        assert!(!refused.status.success(), "{args:?}: {refused:?}");
+        assert!(
+            String::from_utf8_lossy(&refused.stderr)
+                .lines()
+                .any(|line| line == refusal),
+            "{args:?}: {refused:?}"
+        );
+    }
+    let undo = min(&[
+        "finalize-install".as_ref(),
+        "--undo".as_ref(),
+        "--show".as_ref(),
+        "--script".as_ref(),
+    ])
+    .output()
+    .await
+    .unwrap();
     assert!(
-        String::from_utf8_lossy(&refused.stderr)
+        !String::from_utf8_lossy(&undo.stderr)
             .lines()
-            .any(|line| line
-                == "error: MIN_PROVIDER=bogus names no provider. Set MIN_PROVIDER to local or \
-         local-minvmd, or unset it."),
-        "{refused:?}"
+            .any(|line| line == refusal),
+        "{undo:?}"
     );
 }

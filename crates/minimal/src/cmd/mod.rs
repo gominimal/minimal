@@ -142,13 +142,19 @@ pub async fn run(mut cli: Cli) -> Result<(), anyhow::Error> {
 /// the host the provider selects (`provider list`, `version`). The rest
 /// run when the default provider does not resolve. `dirs` is among them,
 /// because it is how a user finds the config.toml to repair.
+///
+/// `finalize-install` needs one: the provider picks which host changes
+/// it installs, so a provider that does not resolve would install the
+/// changes for a target the user did not name. `finalize-install --undo`
+/// does not: it removes what an earlier install left on this host,
+/// whichever provider that install was for.
 fn needs_provider(command: Option<&Command>) -> bool {
     !matches!(
         command,
         Some(
             Command::Loadout(_)
                 | Command::Type(_)
-                | Command::FinalizeInstall(_)
+                | Command::FinalizeInstall(FinalizeInstallArgs { undo: true, .. })
                 | Command::Dirs
                 | Command::Doctor
                 | Command::Bug(_)
