@@ -24748,3 +24748,191 @@ fn box_verbs_complete_box_names() {
         }
     }
 }
+
+/// The source of `path` with its test modules cut off: everything from the
+/// first `#[cfg(test)]` that opens a `mod` on the next line.
+fn product_source(path: &std::path::Path) -> String {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let lines: Vec<&str> = text.lines().collect();
+    let end = lines
+        .windows(2)
+        .position(|pair| {
+            pair[0].trim() == "#[cfg(test)]"
+                && pair[1]
+                    .trim_start()
+                    .trim_start_matches("pub(crate) ")
+                    .starts_with("mod ")
+        })
+        .unwrap_or(lines.len());
+    lines[..end].join("\n")
+}
+
+/// The string literal that starts `text` after any whitespace, if one does.
+fn leading_literal(text: &str) -> Option<&str> {
+    let rest = text.trim_start().strip_prefix('"')?;
+    rest.find('"').map(|end| &rest[..end])
+}
+
+/// Whether `text` has the shape of an error code: lower snake case.
+fn is_error_code(text: &str) -> bool {
+    text.starts_with(|c: char| c.is_ascii_lowercase())
+        && text
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Every `code` a failed `-o json` run can put in its `min/v1/error`
+/// object, read from the product source: the literal each
+/// `MachineModeFailure::new` call passes, each `CODE` constant and `code:`
+/// field, and each literal or string constant a `fn code` returns. The
+/// defined errors of a refused box spec live in the `boxes` crate, so its
+/// `bep.rs` is read too.
+fn emitted_error_codes(manifest_dir: &str) -> std::collections::BTreeSet<String> {
+    const NEW_NEEDLE: &str = concat!("MachineModeFailure", "::new(");
+    const FN_CODE_NEEDLE: &str = concat!("fn ", "code(");
+    let manifest = std::path::Path::new(manifest_dir);
+    let mut files = Vec::new();
+    let mut dirs = vec![manifest.join("src")];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).expect("readable source dir") {
+            let path = entry.expect("readable dir entry").path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs")
+                && !path.file_name().is_some_and(|name| name == "tests.rs")
+            {
+                files.push(path);
+            }
+        }
+    }
+    files.push(manifest.join("../boxes/src/core/bep.rs"));
+    let sources: Vec<String> = files.iter().map(|path| product_source(path)).collect();
+
+    // String constants, so a `fn code` that returns one resolves to its value.
+    let mut constants = std::collections::BTreeMap::new();
+    for source in &sources {
+        for line in source.lines() {
+            let Some(rest) = line.trim_start().split("const ").nth(1) else {
+                continue;
+            };
+            let Some((name, value)) = rest.split_once(':') else {
+                continue;
+            };
+            if let Some(literal) = value.split_once('=').and_then(|(_, v)| leading_literal(v)) {
+                constants.insert(name.trim().to_owned(), literal.to_owned());
+            }
+        }
+    }
+
+    let mut codes = std::collections::BTreeSet::new();
+    for source in &sources {
+        for (at, _) in source.match_indices(NEW_NEEDLE) {
+            if let Some(code) = leading_literal(&source[at + NEW_NEEDLE.len()..]) {
+                codes.insert(code.to_owned());
+            }
+        }
+        for line in source.lines() {
+            let line = line.trim_start();
+            let literal = if let Some(rest) = line.strip_prefix("code:") {
+                leading_literal(rest)
+            } else if line.contains("const CODE:") {
+                line.split_once('=').and_then(|(_, v)| leading_literal(v))
+            } else {
+                None
+            };
+            codes.extend(
+                literal
+                    .filter(|code| is_error_code(code))
+                    .map(str::to_owned),
+            );
+        }
+        for (at, _) in source.match_indices(FN_CODE_NEEDLE) {
+            let body = &source[at..];
+            let body = &body[..body.find("\n    }").unwrap_or(body.len())];
+            for (i, piece) in body.split('"').enumerate() {
+                if i % 2 == 1 && is_error_code(piece) {
+                    codes.insert(piece.to_owned());
+                }
+            }
+            for word in body.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                if let Some(value) = constants.get(word).filter(|v| is_error_code(v)) {
+                    codes.insert(value.clone());
+                }
+            }
+        }
+    }
+    codes
+}
+
+/// BCLI-033: the CLI reference lists every `code` of the `min/v1/error`
+/// object, each with its exit code. A code added in the source and not in
+/// the reference fails this test, and so does a row for a code that no
+/// longer exists.
+#[test]
+fn cli_reference_lists_every_error_code() {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let reference = std::fs::read_to_string(
+        std::path::Path::new(manifest).join("../../docs/reference/cli-min.md"),
+    )
+    .expect("the min CLI reference must be readable at docs/reference/cli-min.md");
+    let section = reference
+        .split_once("\n## Errors in JSON output\n")
+        .map(|(_, rest)| rest.split("\n## ").next().unwrap_or(rest))
+        .expect("the reference must have an `Errors in JSON output` section");
+    let mut documented = std::collections::BTreeMap::new();
+    for line in section.lines() {
+        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+        let [_, code, exit, ..] = cells.as_slice() else {
+            continue;
+        };
+        if let Some(code) = code
+            .strip_prefix('`')
+            .and_then(|c| c.strip_suffix('`'))
+            .filter(|c| is_error_code(c))
+        {
+            documented.insert(code.to_owned(), (*exit).to_owned());
+        }
+    }
+    for row in ["schema", "code", "message", "hint"] {
+        assert!(
+            section.contains(&format!("| `{row}` |")),
+            "the reference must describe the `{row}` field"
+        );
+    }
+    for code in ["schema", "code", "message", "hint"] {
+        documented.remove(code);
+    }
+
+    let emitted = emitted_error_codes(manifest);
+    for known in ["not_found", "host_unreachable", "ambiguous", "unspecified"] {
+        assert!(
+            emitted.contains(known),
+            "the source scan must find `{known}`, found {emitted:?}"
+        );
+    }
+    let missing: Vec<&String> = emitted
+        .iter()
+        .filter(|code| !documented.contains_key(*code))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "add a row for each of {missing:?} to `Errors in JSON output` in docs/reference/cli-min.md"
+    );
+    let stale: Vec<&String> = documented
+        .keys()
+        .filter(|code| !emitted.contains(*code))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "docs/reference/cli-min.md lists {stale:?}, which no command gives"
+    );
+    for (code, exit) in &documented {
+        assert!(
+            exit.starts_with(|c: char| c.is_ascii_digit()),
+            "the row for `{code}` must give its exit code, got {exit:?}"
+        );
+    }
+    assert_eq!(documented["ambiguous"], "2");
+    assert_eq!(documented["not_found"], "4");
+    assert_eq!(documented["host_unreachable"], "7");
+}

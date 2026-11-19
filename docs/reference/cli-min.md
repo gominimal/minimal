@@ -39,6 +39,44 @@ These apply to every subcommand.
 | `--provider <PROVIDER>` | | Daemon backend that hosts sessions: `local-minimald` (Linux default, `minimald` natively on the host) or `local-minvmd` (`minimald` inside the `minvmd` microVM). No effect on macOS, where `minvmd` is the only backend |
 | `--no-input` | | Skip interactive prompts that need a terminal (such as the session picker); ambiguous choices error with a list of candidates instead. Implied when stdin/stdout is not a terminal |
 
+## Errors in JSON output
+
+A command that runs with `-o json` or `-o jsonl` and fails writes one JSON
+object on stderr, on one line, in place of the plain-text error. Nothing
+else goes to stderr for that failure. The command still exits non-zero.
+
+```json
+{"schema":"min/v1/error","code":"not_found","message":"no box matches 'web'","hint":"..."}
+```
+
+| Field | Description |
+|-------|-------------|
+| `schema` | Always `min/v1/error` |
+| `code` | The kind of failure, from the table below. Branch on this field in a script |
+| `message` | The same error text that the command prints without `-o` |
+| `hint` | One line that names the next step, or an empty string when there is none |
+
+| `code` | Exit code | When the command gives it |
+|--------|-----------|---------------------------|
+| `ambiguous` | 2 | A box name or id prefix matches more than one box |
+| `not_found` | 4 | No box matches the box name or id, the box is on a VM that is stopped, or `min type show` names no box type. When `min session policy -o json` or `min box show --network -o json` finds no box, the exit code is 1 |
+| `host_unreachable` | 7 | A host that the command must ask does not answer |
+| `insufficient_resources` | 8 | The VM host has no network address left for another box |
+| `github_sign_in_required` | 3 | The box spec needs a GitHub sign-in, and you are not signed in. Run `min auth login` |
+| `gatehouse_unenrolled_node` | 5 | The box spec asks for a grant that this host cannot give, because the host is not enrolled |
+| `audit_self_unsupported_unenrolled` | 1 | `min box audit self` inside a box on a host that is not enrolled. On the host, run `min box audit <box>` |
+| `timeout` | 124 | A box ran past its own timeout, or `min box exec --timeout` ended the command |
+| `wait_timeout` | 124 | `min box wait --timeout` ran out before the box ended |
+| `daemon_unreachable` | 1 | The command did not get an answer from the daemon when it read a box's network policy |
+| `policy_unavailable` | 1 | The command found the box but did not read its network policy |
+| `output_failed` | 1 | The command did not write its JSON output to stdout, for example on a full disk |
+| `unspecified` | 1, or the exit code of the failure | Any other failure. The exit code is the one the command gives without `-o` |
+
+A command line that `min` cannot parse, such as an unknown flag, exits 2
+before the command runs. The error is plain text, not a JSON object. When
+the reader of stdout closes it early, the command exits 141 and writes no
+object.
+
 ## Commands
 
 ### `ls`
