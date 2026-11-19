@@ -1781,6 +1781,14 @@ const TCP_DNS_RETAINED: usize = MAX_TCP_DNS_MESSAGE + 2;
 /// TCP SYN: a connection's opening.
 const TCP_SYN: u8 = 0x02;
 
+/// TCP URG: the segment carries urgent data, which a resolver may take out
+/// of the byte stream and so frame the stream differently from the gate.
+const TCP_URG: u8 = 0x20;
+
+/// IPv4 "more fragments": the frame is the first fragment of a datagram,
+/// and its TCP payload is not the whole segment.
+const IPV4_MORE_FRAGMENTS: u8 = 0x20;
+
 /// One TCP connection from a box to its own resolver, as the host-side gate
 /// reads it: how far the box's byte stream has been decided, the decided
 /// bytes a retransmission is compared with, and the bytes of the message not
@@ -1933,8 +1941,9 @@ impl TcpDnsAdvance {
 /// Frames that carry no data (acknowledgements, the close) pass on a
 /// connection that was not refused. The rest fails closed: data on a
 /// connection whose opening the gate did not see, data past a gap, a
-/// message whose length prefix exceeds [`MAX_TCP_DNS_MESSAGE`], and an
-/// opening past [`MAX_TCP_DNS_FLOWS`] are dropped.
+/// message whose length prefix exceeds [`MAX_TCP_DNS_MESSAGE`], a segment
+/// marked urgent, the first fragment of a segment, and an opening past
+/// [`MAX_TCP_DNS_FLOWS`] are dropped.
 ///
 /// Bytes before the next undecided one were decided and written on, but
 /// the switch queue taking a frame does not prove the resolver kept it, so
@@ -1950,8 +1959,10 @@ impl TcpDnsAdvance {
 ///
 /// * at a close (FIN or RST) from the box whose sequence number is the next
 ///   undecided byte, the close the resolver also reads as the end of the
-///   stream; a close at any other sequence number is dropped and the entry
-///   kept;
+///   stream, when no part of a message is pending; a close at any other
+///   sequence number is dropped and the entry kept, and a close at the
+///   next undecided byte that leaves part of a message pending refuses the
+///   connection;
 /// * on a refused connection, every frame is dropped and draws a reset from
 ///   the box toward the resolver at the gate's next undecided byte
 ///   ([`TcpDnsVerdict::Reset`]). The reset ends the resolver's side when
@@ -2021,6 +2032,17 @@ impl DnsTcpStreams {
                     resets: Vec::new(),
                 }),
             };
+        }
+        // The gate reads only whole segments of a stream it frames as the
+        // resolver does: urgent data and a first fragment are dropped.
+        if pkt.tcp_flags & TCP_URG != 0 {
+            return refused("<urgent data>");
+        }
+        if frame
+            .get(ETH_HDR + 6)
+            .is_some_and(|flags| flags & IPV4_MORE_FRAGMENTS != 0)
+        {
+            return refused("<fragment>");
         }
         let ends = pkt.tcp_flags & (TCP_FIN | TCP_RST) != 0;
         if pkt.tcp_flags & TCP_SYN != 0 {
@@ -2106,7 +2128,9 @@ impl DnsTcpStreams {
         };
         // Forwards the frame. A close ends the entry only when it sits at
         // the next undecided byte (`closes_at_next`); any other close is
-        // dropped and the entry kept.
+        // dropped and the entry kept. A close at the next undecided byte
+        // that leaves part of a message pending refuses the connection
+        // instead (`closed_inside_a_message`).
         let forward = |flow: TcpDnsFlow, closes_at_next: bool| {
             if ends && !closes_at_next {
                 return TcpDnsVerdict::Drop(None);
@@ -2121,8 +2145,13 @@ impl DnsTcpStreams {
                 resets: Vec::new(),
             })
         };
+        let closed_inside_a_message =
+            |closes_at_next: bool, pending: &[u8]| ends && closes_at_next && !pending.is_empty();
         if payload.is_empty() {
             let at_next = pkt.tcp_seq == flow.next_seq;
+            if closed_inside_a_message(at_next, &flow.pending) {
+                return flow.refuse(refusal("<closed inside a message>"), now);
+            }
             return forward(flow.clone(), at_next);
         }
         // How far this segment starts past the next undecided byte, in
@@ -2147,6 +2176,9 @@ impl DnsTcpStreams {
                 .tcp_seq
                 .wrapping_add(u32::try_from(payload.len()).unwrap_or(u32::MAX))
                 == flow.next_seq;
+            if closed_inside_a_message(at_next, &flow.pending) {
+                return flow.refuse(refusal("<closed inside a message>"), now);
+            }
             return forward(flow.clone(), at_next);
         };
         let mut next = flow.clone();
@@ -2164,6 +2196,9 @@ impl DnsTcpStreams {
         }
         // The frame's data ends at the next undecided byte, so its close
         // does too.
+        if closed_inside_a_message(true, &next.pending) {
+            return flow.refuse(refusal("<closed inside a message>"), now);
+        }
         forward(next, true)
     }
 
@@ -5353,6 +5388,237 @@ pub(crate) mod tests {
         assert!(
             streams.flows.contains_key(&(LEASE, 49000)),
             "the opening is tracked"
+        );
+    }
+
+    /// The name a verdict's refusal line carries, for a frame that is
+    /// refused.
+    fn refusal_name(verdict: &super::TcpDnsVerdict) -> Option<&str> {
+        match verdict {
+            super::TcpDnsVerdict::Drop(Some(refusal))
+            | super::TcpDnsVerdict::Reset {
+                refusal: Some(refusal),
+                ..
+            } => Some(refusal.name.as_str()),
+            _ => None,
+        }
+    }
+
+    /// NET-141 over TCP, a close inside a message: a close (FIN or RST) at
+    /// the next undecided byte while part of a message is pending, alone or
+    /// on the frame that brings the partial message, refuses the connection
+    /// and draws the reset. The entry stays, refused, so a later opening on
+    /// the same port and the rest of the message are dropped and draw the
+    /// reset again. A close at the next undecided byte with no part of a
+    /// message pending still ends the entry.
+    #[test]
+    fn a_close_inside_a_message_refuses_the_connection() {
+        use super::{DnsTcpStreams, TcpDnsVerdict};
+
+        const SYN: u8 = 0x02;
+        const PSH_ACK: u8 = 0x18;
+        const FIN_ACK: u8 = 0x11;
+        const RST: u8 = 0x04;
+        const PSH_FIN_ACK: u8 = 0x19;
+        let registry = weather_box();
+        let table = registry.table();
+        let mut streams = DnsTcpStreams::default();
+        let now = Instant::now();
+        let unmatched = tcp_dns_message(&dns_query_of(&[(qname("example.org."), RecordType::A)]));
+        let declared = tcp_dns_message(&dns_query_of(&[(qname("example.com."), RecordType::A)]));
+        let (head, tail) = unmatched.split_at(5);
+        let head_end = 1001 + u32::try_from(head.len()).expect("fits");
+
+        for (port, close) in [(43000, FIN_ACK), (43001, RST)] {
+            let advance = forwarded(decide_tcp(
+                &mut streams,
+                &table,
+                (port, SYN, 1000),
+                &[],
+                now,
+            ));
+            streams.commit(advance);
+            let advance = forwarded(decide_tcp(
+                &mut streams,
+                &table,
+                (port, PSH_ACK, 1001),
+                head,
+                now,
+            ));
+            streams.commit(advance);
+            let verdict = decide_tcp(&mut streams, &table, (port, close, head_end), &[], now);
+            assert_eq!(
+                refusal_name(&verdict),
+                Some("<closed inside a message>"),
+                "a close at the next undecided byte inside a message is refused"
+            );
+            let TcpDnsVerdict::Reset {
+                reset,
+                release: None,
+                ..
+            } = verdict
+            else {
+                panic!("the close draws a reset that releases nothing");
+            };
+            assert_reset_at(&reset, port, head_end);
+            for (flags, seq, payload) in [(SYN, head_end - 1, &[][..]), (PSH_ACK, head_end, tail)] {
+                let TcpDnsVerdict::Reset { reset, .. } =
+                    decide_tcp(&mut streams, &table, (port, flags, seq), payload, now)
+                else {
+                    panic!("a later frame on the refused port draws the reset");
+                };
+                assert_reset_at(&reset, port, head_end);
+            }
+        }
+
+        // The partial message and the close on one frame.
+        let advance = forwarded(decide_tcp(
+            &mut streams,
+            &table,
+            (43002, SYN, 1000),
+            &[],
+            now,
+        ));
+        streams.commit(advance);
+        let verdict = decide_tcp(&mut streams, &table, (43002, PSH_FIN_ACK, 1001), head, now);
+        assert_eq!(
+            refusal_name(&verdict),
+            Some("<closed inside a message>"),
+            "a close on the frame that leaves part of a message pending is refused"
+        );
+        assert!(
+            streams
+                .flows
+                .get(&(LEASE, 43002))
+                .is_some_and(|flow| flow.refused),
+            "the entry stays, refused"
+        );
+
+        // Control: a close after a whole message ends the entry.
+        let advance = forwarded(decide_tcp(
+            &mut streams,
+            &table,
+            (43003, SYN, 1000),
+            &[],
+            now,
+        ));
+        streams.commit(advance);
+        let advance = forwarded(decide_tcp(
+            &mut streams,
+            &table,
+            (43003, PSH_ACK, 1001),
+            &declared,
+            now,
+        ));
+        streams.commit(advance);
+        let close_at = 1001 + u32::try_from(declared.len()).expect("fits");
+        let advance = forwarded(decide_tcp(
+            &mut streams,
+            &table,
+            (43003, FIN_ACK, close_at),
+            &[],
+            now,
+        ));
+        streams.commit(advance);
+        assert!(
+            !streams.flows.contains_key(&(LEASE, 43003)),
+            "a close after a whole message ends the entry"
+        );
+    }
+
+    /// NET-141 over TCP, the size bound: a length prefix of
+    /// [`super::MAX_TCP_DNS_MESSAGE`] is read as a message not yet complete
+    /// and its frame passes; one byte more is refused at the prefix.
+    #[test]
+    fn a_length_prefix_past_the_bound_is_refused() {
+        use super::{DnsTcpStreams, MAX_TCP_DNS_MESSAGE, TcpDnsVerdict};
+
+        const SYN: u8 = 0x02;
+        const PSH_ACK: u8 = 0x18;
+        let registry = weather_box();
+        let table = registry.table();
+        let mut streams = DnsTcpStreams::default();
+        let now = Instant::now();
+        let bound = u16::try_from(MAX_TCP_DNS_MESSAGE).expect("fits");
+        for (port, len) in [(44000, bound), (44001, bound + 1)] {
+            let advance = forwarded(decide_tcp(
+                &mut streams,
+                &table,
+                (port, SYN, 1000),
+                &[],
+                now,
+            ));
+            streams.commit(advance);
+            let mut prefixed = len.to_be_bytes().to_vec();
+            prefixed.extend_from_slice(&[0; 64]);
+            let verdict = decide_tcp(&mut streams, &table, (port, PSH_ACK, 1001), &prefixed, now);
+            if len == bound {
+                assert!(
+                    matches!(verdict, TcpDnsVerdict::Forward(_)),
+                    "a prefix at the bound passes as a message not yet complete"
+                );
+            } else {
+                assert_eq!(
+                    refusal_name(&verdict),
+                    Some("<over the size limit>"),
+                    "a prefix past the bound is refused"
+                );
+            }
+        }
+    }
+
+    /// NET-141 over TCP, whole segments only: on a decided connection a
+    /// segment marked urgent and the first fragment of a segment are
+    /// dropped, and the same bytes in a whole, unmarked segment pass.
+    #[test]
+    fn urgent_data_and_fragments_are_dropped() {
+        use super::{DnsTcpStreams, ETH_HDR, TcpDnsVerdict};
+
+        const SYN: u8 = 0x02;
+        const PSH_ACK: u8 = 0x18;
+        const PSH_ACK_URG: u8 = 0x38;
+        let registry = weather_box();
+        let table = registry.table();
+        let mut streams = DnsTcpStreams::default();
+        let now = Instant::now();
+        let declared = tcp_dns_message(&dns_query_of(&[(qname("example.com."), RecordType::A)]));
+        let advance = forwarded(decide_tcp(
+            &mut streams,
+            &table,
+            (45000, SYN, 1000),
+            &[],
+            now,
+        ));
+        streams.commit(advance);
+
+        let verdict = decide_tcp(
+            &mut streams,
+            &table,
+            (45000, PSH_ACK_URG, 1001),
+            &declared,
+            now,
+        );
+        assert_eq!(refusal_name(&verdict), Some("<urgent data>"));
+
+        let mut fragment = tcp_segment_frame(
+            Ipv4Addr::from(LEASE),
+            45000,
+            SUBNET.dns_server(),
+            53,
+            PSH_ACK,
+            1001,
+            &declared,
+        );
+        fragment[ETH_HDR + 6] |= 0x20;
+        let verdict = streams.decide(&table, &l4_of(&fragment), &fragment, now);
+        assert_eq!(refusal_name(&verdict), Some("<fragment>"));
+
+        assert!(
+            matches!(
+                decide_tcp(&mut streams, &table, (45000, PSH_ACK, 1001), &declared, now),
+                TcpDnsVerdict::Forward(_)
+            ),
+            "the same bytes in a whole, unmarked segment pass"
         );
     }
 }
