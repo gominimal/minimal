@@ -8,7 +8,7 @@ description: "Reference for the min session CLI: create, attach to, and manage s
 `min` is the Minimal session CLI. It talks to the `minimald` daemon (see
 [minimald](./cli-minimald.md)) to create, attach to, and manage sandboxed
 development sessions. Most commands start the daemon automatically when it
-isn't running, with `bug`, `host stop`, and `version` being the exceptions. On
+is not running, with `bug`, `host stop`, and `version` being the exceptions. On
 macOS the daemon starts inside the [`minvmd`](./cli-minvmd.md) microVM host
 daemon. On Linux the provider decides where it starts, as
 [Choosing the provider on Linux](#choosing-the-provider-on-linux) describes.
@@ -57,9 +57,8 @@ A command without `--provider` chooses the provider in this order:
 4. `local`, otherwise.
 
 `--provider` wins over all of them. A host where `/dev/kvm` is there but does
-not open for you stays on `local` until you join the `kvm` group:
-`min finalize-install` offers that step, and it takes effect at your next
-login.
+not open for you stays on `local` until you join the `kvm` group.
+`min finalize-install` offers that step. It takes effect at your next login.
 
 Each provider keeps its own boxes. Boxes you started on the native provider
 before `local-minvmd` became your default stay there: `min --provider local
