@@ -61,6 +61,10 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
   <!-- the refusal itself is BOX-019's -->
   tier:     T0
   verify:   cargo nextest run -p minimal rm_running_box_refuses_naming_force
+  - IF `min box rm` targets a box that is not running, without `--force`, and the box has changed files or the system cannot read whether it has THEN THE SYSTEM SHALL ask for a confirmation before it removes the box when stdin is a terminal and `--no-input` is absent. Otherwise it SHALL fail with exit 2 naming `--force`, and keep the box. A box with no changed files SHALL be removed without a question.
+    <!-- the gate `min session destroy` ran before BCLI-042 removed that verb -->
+    tier:   T0
+    verify: cargo nextest run -p minimal box_rm_without_force_gates_changed_files
 
 - **BCLI-005** IF `min box prune` runs off a TTY without `--yes` or `--dry-run` THEN THE SYSTEM SHALL fail with exit 2 naming `--yes`. A dry run reaps nothing, so it needs no `--yes` (BCLI-006).
   tier:     T0

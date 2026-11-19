@@ -2217,8 +2217,10 @@ if [ "$rc" -ne 2 ] || ! grep -Fq "$stop_sid is stopped. Only a running box can r
   echo "--- stderr ---"; cat "$WORK/box-exec-stopped.err" 2>/dev/null || true
   fail
 fi
-mnl box rm "$stop_sid" </dev/null >"$WORK/box-exec-rm.out" 2>&1 || {
-  echo "::error::'min box rm $stop_sid' failed"
+# --force: without a terminal, min box rm refuses a box whose files it
+# cannot check, and the daemon cannot read the files of a stopped box.
+mnl box rm --force "$stop_sid" </dev/null >"$WORK/box-exec-rm.out" 2>&1 || {
+  echo "::error::'min box rm --force $stop_sid' failed"
   cat "$WORK/box-exec-rm.out" 2>/dev/null || true
   fail
 }
@@ -7003,9 +7005,11 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
       fail
     fi
     for tk_i in $(seq 1 20); do
-      mnl box rm "$tk_name" >/dev/null 2>"$WORK/task-rm.err" && break
+      # --force: off a terminal, the gate for changed files refuses a box
+      # that is not running, because the daemon cannot read its files.
+      mnl box rm --force "$tk_name" </dev/null >/dev/null 2>"$WORK/task-rm.err" && break
       if [ "$tk_i" -eq 20 ]; then
-        echo "::error::'min box rm $tk_name' failed after 'min task run $tk_task'"
+        echo "::error::'min box rm --force $tk_name' failed after 'min task run $tk_task'"
         cat "$WORK/task-rm.err" 2>/dev/null || true
         fail
       fi
@@ -7118,8 +7122,9 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     mnl ls 2>&1 || true
     fail
   fi
-  if ! mnl box rm "$ti_name" >/dev/null 2>"$WORK/task-int-rm.err"; then
-    echo "::error::'min box rm $ti_name' failed after an interrupted run"
+  # --force: off a terminal, the gate for changed files refuses a stopped box.
+  if ! mnl box rm --force "$ti_name" </dev/null >/dev/null 2>"$WORK/task-int-rm.err"; then
+    echo "::error::'min box rm --force $ti_name' failed after an interrupted run"
     cat "$WORK/task-int-rm.err" 2>/dev/null || true
     fail
   fi
@@ -7133,10 +7138,11 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   # headless and names the flag, so a script cannot remove a live box by
   # accident (BCLI-004).
   #
-  # Changed assertion: this step used to write into the box and assert that a
-  # headless remove without --force refused a box with changed files. `min box
-  # rm` has no gate for changed files yet. T63 (gominimal/minimal#3638) adds
-  # that gate and moves this step back to it.
+  # The dirty gate: a file written into the box puts its work at risk. Once
+  # the box is stopped, a headless `min box rm` without --force exits 2,
+  # names --force and keeps the box (BCLI-004). The daemon cannot read the
+  # files of a stopped box, so the gate refuses it as unchecked, which is
+  # the same refusal a changed box gets.
   sr_sid="$(cd "$TASK_SEED_DIR" && mnl session start --detach --no-input \
     --name e2e-task-sr 2>"$WORK/session-rm-start.err")" || {
     echo "::error::'min session start' for the box rm refusal step failed"
@@ -7144,15 +7150,32 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     fail
   }
   sr_sid="$(printf '%s\n' "$sr_sid" | tail -n1 | tr -d '\r')"
-  if mnl box rm "$sr_sid" >/dev/null 2>"$WORK/rm-refuse.err"; then
+  mnl box exec "$sr_sid" -- sh -c 'echo dirty > e2e-dirty-gate' </dev/null >/dev/null 2>"$WORK/dirty-write.err" \
+    || { echo "::error::could not write a file in box $sr_sid"; cat "$WORK/dirty-write.err" 2>/dev/null || true; fail; }
+  if mnl box rm "$sr_sid" </dev/null >/dev/null 2>"$WORK/rm-refuse.err"; then
     echo "::error::headless 'min box rm' of a running box without --force should refuse"
     fail
   fi
   grep -q -- "--force" "$WORK/rm-refuse.err" \
     || { echo "::error::the refusal of 'min box rm' does not name --force"; cat "$WORK/rm-refuse.err" 2>/dev/null || true; fail; }
-  mnl box rm --force "$sr_sid" >/dev/null 2>&1 \
-    || { echo "::error::'min box rm --force $sr_sid' failed"; fail; }
   echo "min box rm refused a running box without --force OK"
+  mnl box stop "$sr_sid" </dev/null >"$WORK/dirty-stop.out" 2>&1 \
+    || { echo "::error::'min box stop $sr_sid' failed"; cat "$WORK/dirty-stop.out" 2>/dev/null || true; fail; }
+  mnl box rm "$sr_sid" </dev/null >/dev/null 2>"$WORK/dirty-refuse.err"
+  rc=$?
+  if [ "$rc" -ne 2 ] || ! grep -q -- "--force" "$WORK/dirty-refuse.err"; then
+    echo "::error::headless 'min box rm $sr_sid' of a stopped box with a changed file exited $rc (expected 2 and a refusal that names --force)"
+    cat "$WORK/dirty-refuse.err" 2>/dev/null || true
+    fail
+  fi
+  listed="$(mnl ls --raw 2>/dev/null || true)"
+  if ! printf '%s\n' "$listed" | grep -Fqx "$sr_sid"; then
+    echo "::error::the dirty gate refused 'min box rm $sr_sid', but the box is not listed any more"
+    fail
+  fi
+  mnl box rm --force "$sr_sid" </dev/null >/dev/null 2>&1 \
+    || { echo "::error::'min box rm --force $sr_sid' failed"; fail; }
+  echo "dirty gate refused headless min box rm of a changed box OK"
 
   # Unknown task: an instant client-side error listing what IS declared.
   if (cd "$TASK_SEED_DIR" && mnl task run no-such-task >/dev/null 2>"$WORK/task-unknown.err"); then
@@ -7412,7 +7435,7 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
       return 0
     fi
     for _ in $(seq 1 20); do
-      mnl box rm "$tn_kept" >/dev/null 2>&1 && return 0
+      mnl box rm --force "$tn_kept" </dev/null >/dev/null 2>&1 && return 0
       sleep 0.5
     done
     echo "::warning::'min box rm $tn_kept' failed after the task-run leg"
@@ -26597,8 +26620,9 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     fi
     # The ended box keeps its record (BOX-038). Remove it, so no later case
     # finds it listed.
-    if ! po_rm_out="$(mnl box rm "$po_task_box" </dev/null 2>&1)"; then
-      echo "::error::min box rm $po_task_box failed for the ended run box"
+    # --force: off a terminal, the gate for changed files refuses an ended box.
+    if ! po_rm_out="$(mnl box rm --force "$po_task_box" </dev/null 2>&1)"; then
+      echo "::error::min box rm --force $po_task_box failed for the ended run box"
       printf '%s\n' "$po_rm_out"
       fail
     fi
