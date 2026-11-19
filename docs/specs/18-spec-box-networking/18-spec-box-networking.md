@@ -489,10 +489,14 @@ box that holds it returns to `running`. These terms follow the decision in
   tier:     T0
   verify:   cargo nextest run -p minimal box_name_resolves_vm_without_flag
   <!-- S7b/AC1; prose 37; event-driven; the parent binds with one VM as with several, so the two refusals below bind whatever number of VMs runs; the statement names today's host-side commands that take a box name, which `box_name_resolves_vm_without_flag` exercises; the box CLI (BCLI) gives them successors, `min box attach`, `min box exec`, `min box show --network` and `min box rm`, and BCLI-042 keeps the old spellings as aliases for a window, so the statement moves to the `min box` forms when BCLI's tasks ship them; `min net expose` runs inside the box and names no box; `min stop` takes no box name -->
-  - IF a command names a box that no VM holds THEN THE SYSTEM SHALL say that no VM holds a box of that name and name the `--vm` flag.
+  - IF a `min session` verb or `min net forward` names a box that no VM holds THEN THE SYSTEM SHALL say that no VM holds a box of that name and name the `--vm` flag.
     tier:   T0
     verify: cargo nextest run -p minimal unknown_box_names_vm_flag
     <!-- S7b; unwanted; the flag is the remedy only for a box on a VM the user knows by name; a box on a stopped VM is answered by the sub-requirement below instead -->
+  - IF a `min box` verb names a box that no local host holds THEN THE SYSTEM SHALL say that no box has that name, name `min box list --all`, and exit 4.
+    tier:   T0
+    verify: cargo nextest run -p minimal box_verb_on_stopped_vm_box_refuses_with_start_hint
+    <!-- S7b; unwanted; the box verbs take `--provider` and `--host`, not `--vm` (design addressing section), so their not-found answer points at the listing instead of a flag; a box on a stopped VM is answered by the sub-requirement below instead -->
   - IF a command names a box on a stopped VM THEN THE SYSTEM SHALL say which stopped VM holds the box and give the command that starts that VM.
     tier:   T0
     verify: cargo nextest run -p minimal box_on_stopped_vm_names_start_command
