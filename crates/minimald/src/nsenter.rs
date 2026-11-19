@@ -705,7 +705,7 @@ fn join_refusal(source: &std::io::Error) -> (String, i32) {
         );
     }
     (
-        format!("{INJECTION_UNPLACED_TEXT} ({source}).\n"),
+        format!("{INJECTION_UNPLACED_TEXT}: {source}.\n"),
         i32::from(INJECTION_UNPLACED_EXIT),
     )
 }
@@ -1855,7 +1855,7 @@ mod tests {
                 line,
                 format!(
                     "Did not run the command: the host could not apply the box's network \
-                     rules to it ({source}).\n"
+                     rules to it: {source}.\n"
                 )
             );
             assert_eq!(line.lines().count(), 1, "{line}");

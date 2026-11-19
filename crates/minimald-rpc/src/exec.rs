@@ -79,8 +79,8 @@ pub const INJECTION_BOX_STOPPED_TEXT: &str = "The box stopped before the command
 pub const INJECTION_UNPLACED_EXIT: u8 = 5;
 
 /// The start of the line an injection prints on its stderr when it ends
-/// with [`INJECTION_UNPLACED_EXIT`]. The line ends with the error the join
-/// met. `min box exec` reads it as a refusal.
+/// with [`INJECTION_UNPLACED_EXIT`]. A colon and the error the join met
+/// follow it. `min box exec` reads it as a refusal.
 pub const INJECTION_UNPLACED_TEXT: &str =
     "Did not run the command: the host could not apply the box's network rules to it";
 

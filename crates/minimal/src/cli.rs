@@ -999,7 +999,7 @@ impl std::fmt::Display for BoxExecRefusal {
             Self::NetworkRulesNotApplied { target, cause } => write!(
                 f,
                 "Did not run the command in {target}: the host could not apply the \
-                 box's network rules to it ({cause}). If it keeps failing, run \
+                 box's network rules to it: {cause}. If it keeps failing, run \
                  `min bug` to collect a diagnostic bundle."
             ),
         }

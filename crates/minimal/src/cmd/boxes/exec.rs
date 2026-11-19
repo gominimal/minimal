@@ -574,14 +574,15 @@ fn reads_as_refusal(chunk: &[u8]) -> bool {
 
 /// The error the join met, from the one line the daemon's injection prints
 /// when the box's network rules could not be applied to the command
-/// (`<INJECTION_UNPLACED_TEXT> (<error>).`), or `None` when `text` is not
-/// that line.
+/// (`<INJECTION_UNPLACED_TEXT>: <error>.`), or `None` when `text` is not
+/// that line. A control character in the error means the line is not the
+/// daemon's, so it stays the command's own stderr.
 fn unplaced_cause(text: &str) -> Option<&str> {
     let cause = text
         .strip_prefix(INJECTION_UNPLACED_TEXT)?
-        .strip_prefix(" (")?
-        .strip_suffix(").\n")?;
-    (!cause.is_empty() && !cause.contains('\n')).then_some(cause)
+        .strip_prefix(": ")?
+        .strip_suffix(".\n")?;
+    (!cause.is_empty() && !cause.chars().any(char::is_control)).then_some(cause)
 }
 
 /// The state word in the daemon's text `box <label> is <state>. Only a

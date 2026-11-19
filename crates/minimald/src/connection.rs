@@ -887,7 +887,7 @@ async fn dial_in_box(
             return Err(russh::ChannelOpenFailure::AdministrativelyProhibited);
         }
     };
-    let mut command = match host_handle
+    let command = match host_handle
         .command_in_session_env(
             "socat",
             [
@@ -910,15 +910,7 @@ async fn dial_in_box(
             return Err(russh::ChannelOpenFailure::ConnectFailed);
         }
     };
-    use std::process::Stdio;
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let child = match tokio::process::Command::from(command)
-        .kill_on_drop(true)
-        .spawn()
-    {
+    let child = match spawn_in_box_dial(command) {
         Ok(child) => child,
         Err(e) => {
             tracing::warn!(
@@ -931,6 +923,20 @@ async fn dial_in_box(
         }
     };
     Ok(ChildStdio::new(child, host, port))
+}
+
+/// Starts the in-box dial `command` with every stdio piped: stdin and
+/// stdout carry the forward, and stderr is the line the watcher logs when
+/// the dial ends at once.
+fn spawn_in_box_dial(mut command: std::process::Command) -> std::io::Result<tokio::process::Child> {
+    use std::process::Stdio;
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    tokio::process::Command::from(command)
+        .kill_on_drop(true)
+        .spawn()
 }
 
 /// The envp the in-box dial layers over the session's own variables.
@@ -1163,16 +1169,13 @@ fn attach_refusal_line(cause: &impl std::fmt::Display) -> String {
 #[cfg(test)]
 mod tests {
     /// A stand-in in-box dial that writes `line` to its stderr and exits
-    /// with `code`, with its stdio piped as `dial_in_box` pipes it.
+    /// with `code`, started the way `dial_in_box` starts its dial. A dial
+    /// started without its stderr piped fails the tests that read `line`
+    /// from the log.
     fn stand_in_dial(line: &str, code: u8) -> tokio::process::Child {
-        use std::process::Stdio;
-        tokio::process::Command::new("/bin/sh")
-            .args(["-c", &format!("echo '{line}' >&2; exit {code}")])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawning a stand-in dial")
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", &format!("echo '{line}' >&2; exit {code}")]);
+        super::spawn_in_box_dial(command).expect("spawning a stand-in dial")
     }
 
     /// Whether `logged` has one warning for the dial to `port` that names

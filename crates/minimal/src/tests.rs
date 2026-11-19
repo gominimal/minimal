@@ -12022,7 +12022,7 @@ async fn box_exec_runs_command_and_exits_with_its_code() {
 async fn box_exec_reports_an_injection_that_never_started_as_a_refusal() {
     use minimald_rpc::exec::{INJECTION_BOX_STOPPED_TEXT, INJECTION_UNPLACED_TEXT};
 
-    let unplaced = format!("{INJECTION_UNPLACED_TEXT} (Permission denied (os error 13)).\n");
+    let unplaced = format!("{INJECTION_UNPLACED_TEXT}: Permission denied (os error 13).\n");
     for (line, code, message) in [
         (
             INJECTION_BOX_STOPPED_TEXT.to_string(),
@@ -12033,7 +12033,7 @@ async fn box_exec_reports_an_injection_that_never_started_as_a_refusal() {
             unplaced.clone(),
             5,
             "Did not run the command in web: the host could not apply the box's network \
-             rules to it (Permission denied (os error 13)). If it keeps failing, run \
+             rules to it: Permission denied (os error 13). If it keeps failing, run \
              `min bug` to collect a diagnostic bundle.",
         ),
     ] {
@@ -12057,6 +12057,20 @@ async fn box_exec_reports_an_injection_that_never_started_as_a_refusal() {
         assert_eq!(run.exit, 1, "{run}");
         assert!(run.error.is_none(), "{run}");
         assert_eq!(run.stderr, line, "{run}");
+    }
+
+    // The same line with a control character in the error is not the
+    // daemon's, even under exit 5: it stays the command's own stderr.
+    for cause in ["\x1b[31mPermission denied", "Permission denied\r"] {
+        let line = format!("{INJECTION_UNPLACED_TEXT}: {cause}.\n");
+        let (run, _) = run_scripted_exec(
+            &box_exec_request("web", &[], &["make"]),
+            vec![answer(b"", line.as_bytes(), 5)],
+        )
+        .await;
+        assert_eq!(run.exit, 5, "{cause:?}\n{run}");
+        assert!(run.error.is_none(), "{cause:?}\n{run}");
+        assert_eq!(run.stderr, line, "{cause:?}\n{run}");
     }
 }
 
