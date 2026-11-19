@@ -30,11 +30,13 @@ pub(crate) struct SpecInputs<'a> {
     /// The SHA-256 fingerprint of the proxy's root certificate, as colon
     /// separated hex pairs, or `None` when the proxy has not published it.
     pub root_fingerprint: Option<&'a str>,
-    /// `[session.network.bep]`.
+    /// The `network.bep` table of the expanded box entry, with
+    /// `[defaults.network.bep]` and the entry's own table merged in.
     pub bep: &'a BepSettings,
-    /// `[session.network] quic443`, `None` when not declared.
+    /// The `network.quic443` of the expanded box entry, `None` when not
+    /// declared.
     pub quic443: Option<Quic443>,
-    /// `[session.secrets]`.
+    /// The `secrets` table of the expanded box entry.
     pub secrets: &'a SecretGrants,
     /// Whether the client configuration sets the full-breadth
     /// acknowledgement.
@@ -385,8 +387,8 @@ fn project_rows(global: &GlobalArgs, args: &BoxSpecArgs, out: &mut Vec<u8>) -> a
         .repo_dir
         .clone()
         .unwrap_or_else(|| PathBuf::from("."));
-    let session = match mfile::File::from_dir_recursive(&project) {
-        Ok(file) => file.session,
+    match mfile::File::from_dir_recursive(&project) {
+        Ok(_) => {}
         Err(mfile::Error::NotFound) => anyhow::bail!(
             "No {} found in {} or its parent directories.",
             mfile::MFILE_NAME,
@@ -395,18 +397,15 @@ fn project_rows(global: &GlobalArgs, args: &BoxSpecArgs, out: &mut Vec<u8>) -> a
         Err(error) => {
             return Err(crate::ProjectFileInvalid { error }.into());
         }
-    };
-    let (bep, quic443, secrets) = session.map_or_else(Default::default, |session| {
-        let network = session.network.unwrap_or_default();
-        (
-            network.bep.unwrap_or_default(),
-            network.quic443,
-            session.secrets,
-        )
-    });
+    }
+    // The rows read the expanded session entry, the same expansion that
+    // `min box start` grants from, so `[defaults.network.bep]` and the
+    // entry's own tables both reach them.
+    let utf8_project = camino::Utf8Path::from_path(&project)
+        .ok_or_else(|| anyhow::anyhow!("The project path {} is not UTF-8.", project.display()))?;
+    let (bep, secrets, _, quic443) = crate::project_bep_and_grants(utf8_project, None)?;
     tracing::debug!(project = %project.display(), "rendering min box spec");
     let (network, _) = preview_host(crate::daemon_host_kind(global), args);
-    // This path reads `[defaults.session]`, as `min box start` does.
     proxy_rows(
         global,
         &bep,

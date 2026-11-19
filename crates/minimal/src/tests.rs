@@ -18211,6 +18211,28 @@ async fn box_spec_path_form_renders_bep_rows() {
     );
 }
 
+// D3598: bare `min box spec` reads the expanded session entry, so a
+// `[defaults.network.bep]` steering mode reaches its steering row, the same
+// value that `min box spec default` shows.
+#[tokio::test]
+async fn box_spec_bare_reads_defaults_network_bep() {
+    let (_project, global) = spec_project(
+        "[defaults.network.bep]\nsteering = \"proxy_env\"\n\n\
+         [sessions.default]\npackages = [\"git\"]\n\n\
+         [sessions.default.secrets.GH_TOKEN]\nsource = \"broker\"\nscopes = [\"github:full\"]\n",
+    );
+    let bare = box_spec_text(&global, &["min", "box", "spec", "--network", "own_ip"])
+        .await
+        .expect("the rows render");
+    assert!(bare.contains("\nsteering  proxy_env\n"), "{bare}");
+    assert!(bare.contains("GH_TOKEN"), "{bare}");
+
+    let entry = box_spec_text(&global, &["min", "box", "spec", "default"])
+        .await
+        .expect("the entry renders");
+    assert!(entry.contains("# steering  proxy_env\n"), "{entry}");
+}
+
 // BCLI-021: `min box spec <entry>` with the `[network]` override flags
 // renders the network that `min box start` sends with the same flags:
 // the mode, the egress and the ingress, each flag marked as the source.
