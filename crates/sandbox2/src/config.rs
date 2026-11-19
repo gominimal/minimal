@@ -2,7 +2,7 @@ use crate::network::{NetPlan, Network};
 use crate::{Error, Sandbox};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
@@ -98,9 +98,26 @@ pub enum SandboxMapped {
     File(PathBuf),
     Dir(PathBuf),
     TempDir(tempfile::TempDir),
-    /// Special case of [`SandboxMapped::File`] where the path is
+    /// Special case of [`SandboxMapped::File`] where the file is
     /// copied-in + permissions applied, rather than hardlinked.
-    FileCopy(PathBuf),
+    FileCopy {
+        /// The file whose bytes and mode are copied. For a package file this is
+        /// the resolved path that was checked, never a link.
+        src: PathBuf,
+        /// The single file name the copy gets in the working directory. For a
+        /// package file this is the declared name, which can differ from the
+        /// name of `src` when the declared path is a link inside the package.
+        name: OsString,
+    },
+}
+
+impl SandboxMapped {
+    /// A [`SandboxMapped::FileCopy`] of `src` under its own file name, or
+    /// `None` if `src` has none (it ends in `..` or is a root).
+    pub fn file_copy(src: PathBuf) -> Option<Self> {
+        let name = src.file_name()?.to_os_string();
+        Some(Self::FileCopy { src, name })
+    }
 }
 
 impl PartialEq for SandboxMapped {
@@ -109,14 +126,16 @@ impl PartialEq for SandboxMapped {
             (Self::File(f1), Self::File(f2)) => f1.eq(f2),
             (Self::Dir(d1), Self::Dir(d2)) => d1.eq(d2),
             (Self::TempDir(d1), Self::TempDir(d2)) => d1.path().eq(d2.path()),
-            (Self::FileCopy(f1), Self::FileCopy(f2)) => f1.eq(f2),
+            (Self::FileCopy { src: s1, name: n1 }, Self::FileCopy { src: s2, name: n2 }) => {
+                s1.eq(s2) && n1.eq(n2)
+            }
             _ => false,
         }
     }
 }
 impl Eq for SandboxMapped {}
 
-// Ordered on (variant tag, path), mirroring the `PartialEq`/`Hash` key above,
+// Ordered on (variant tag, path, copy name), mirroring the `PartialEq`/`Hash` key above,
 // so `BTreeSet<SandboxMapped>` iterates — and the rootfs therefore assembles —
 // in the same order in every process. Assembly is first-writer-wins
 // hardlinking, so an unordered collection let a per-process hash seed decide
@@ -128,12 +147,15 @@ impl PartialOrd for SandboxMapped {
 }
 impl Ord for SandboxMapped {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        fn key(m: &SandboxMapped) -> (u8, &Path) {
+        // The copy name is part of the key: two copies of one file under
+        // different names are different entries, as `PartialEq` says.
+        fn key(m: &SandboxMapped) -> (u8, &Path, &OsStr) {
+            let none = OsStr::new("");
             match m {
-                SandboxMapped::File(p) => (0, p),
-                SandboxMapped::Dir(p) => (1, p),
-                SandboxMapped::TempDir(t) => (2, t.path()),
-                SandboxMapped::FileCopy(p) => (3, p),
+                SandboxMapped::File(p) => (0, p, none),
+                SandboxMapped::Dir(p) => (1, p, none),
+                SandboxMapped::TempDir(t) => (2, t.path(), none),
+                SandboxMapped::FileCopy { src, name } => (3, src, name),
             }
         }
         key(self).cmp(&key(other))
@@ -155,9 +177,10 @@ impl Hash for SandboxMapped {
                 "t".hash(state);
                 p.path().hash(state);
             }
-            Self::FileCopy(p) => {
+            Self::FileCopy { src, name } => {
                 "fc".hash(state);
-                p.hash(state);
+                src.hash(state);
+                name.hash(state);
             }
         }
     }
@@ -1048,6 +1071,43 @@ fn fit_box_name(name: &str, budget: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two copies of one file under different names stage two files, so the
+    /// set that assembles them must keep both: equality, order and hash all
+    /// read the name.
+    #[test]
+    fn copies_of_one_file_under_two_names_are_two_entries() {
+        use std::collections::HashSet;
+        let named = SandboxMapped::FileCopy {
+            src: "/pkg/files/a.patch".into(),
+            name: "link.patch".into(),
+        };
+        let own = SandboxMapped::file_copy("/pkg/files/a.patch".into()).unwrap();
+        assert_eq!(
+            own,
+            SandboxMapped::FileCopy {
+                src: "/pkg/files/a.patch".into(),
+                name: "a.patch".into(),
+            }
+        );
+        assert_ne!(named, own);
+        assert_ne!(named.cmp(&own), std::cmp::Ordering::Equal);
+        let fresh = || SandboxMapped::file_copy("/pkg/files/a.patch".into()).unwrap();
+        let mut set = BTreeSet::new();
+        set.insert(named);
+        set.insert(own);
+        set.insert(fresh());
+        assert_eq!(set.len(), 2);
+        let hashed: HashSet<_> = set.into_iter().collect();
+        assert_eq!(hashed.len(), 2);
+        assert!(hashed.contains(&fresh()));
+    }
+
+    #[test]
+    fn a_path_with_no_file_name_has_no_own_copy() {
+        assert_eq!(SandboxMapped::file_copy("/".into()), None);
+        assert_eq!(SandboxMapped::file_copy("/pkg/..".into()), None);
+    }
 
     #[test]
     fn the_devpts_remount_keeps_the_box_ptmx_open_and_caps_at_box_pty_max() {
