@@ -87,6 +87,12 @@
 //! it is not the in-VM gate's. A row with no `allow_dns_hosts`, the node
 //! row among them, is not decided here.
 //!
+//! Both rows' queries are decided over UDP and over TCP: a TCP connection
+//! to the resolver's port is read as its stream of length-prefixed
+//! messages, each decided by the same rule ([`DnsTcpStreams`]), and the
+//! frame that completes a refused message is dropped with every later frame
+//! of the connection that carries data.
+//!
 //! ## The node plane's own lookups (NET-130, NET-085)
 //!
 //! The node-plane baseline set names the registry and the cache by host
@@ -1558,12 +1564,12 @@ impl DnsPins {
     }
 }
 
-/// One DNS datagram from a row whose names the host-side gate decides
+/// One DNS query from a row whose names the host-side gate decides
 /// that it drops rather than write on to the switch
 /// ([`dns_query_refusal`]): the row it came from and what the warn line
 /// names.
 pub(crate) struct DnsQueryRefusal {
-    /// The row the datagram's source resolved to: deny-all, or one that
+    /// The row the query's source resolved to: deny-all, or one that
     /// declared `allow_dns_hosts`.
     pub(crate) record: Arc<BoxRecord>,
     /// The first question that failed the check, normalized the way names
@@ -1645,24 +1651,43 @@ fn declares(declared: &[String], name: &str) -> bool {
 /// either, so a box with unrestricted egress resolves every name. A
 /// datagram to any other address is not decided here either: the frame
 /// verdict already admitted it, and the in-VM gate does not intercept it.
+/// The same rule decides each message a TCP connection to that resolver
+/// carries ([`DnsTcpStreams`]).
 pub(crate) fn dns_query_refusal(
     table: &BoxTable,
     pkt: &L4Packet,
     datagram: &[u8],
 ) -> Option<DnsQueryRefusal> {
-    if pkt.proto != IPPROTO_UDP || pkt.dst.port() != DNS_PORT {
+    if pkt.proto != IPPROTO_UDP {
         return None;
     }
-    let record = table
+    message_refusal(&decided_row(table, pkt)?, datagram)
+}
+
+/// The row whose queries to `pkt`'s destination the host-side DNS gate
+/// decides ([`dns_query_refusal`]), whatever the transport: a deny-all row,
+/// or one that declared `allow_dns_hosts`, sending to its own resolver's
+/// port. `None` for every other frame.
+fn decided_row(table: &BoxTable, pkt: &L4Packet) -> Option<Arc<BoxRecord>> {
+    if pkt.dst.port() != DNS_PORT {
+        return None;
+    }
+    table
         .by_source(pkt.src.ip().octets())
         .filter(|record| record.is_deny_all() || !record.allow_dns_hosts().is_empty())
-        .filter(|record| pkt.dst.ip().octets() == record.egress().resolver())?;
+        .filter(|record| pkt.dst.ip().octets() == record.egress().resolver())
+}
+
+/// The host-side DNS gate's rule for one DNS message from `record`, over
+/// either transport ([`dns_query_refusal`] says what it passes). `Some` is
+/// the drop and what its warn line names.
+fn message_refusal(record: &Arc<BoxRecord>, message: &[u8]) -> Option<DnsQueryRefusal> {
     let refused = |name: &str, query_type: Option<RecordType>| DnsQueryRefusal {
-        record: Arc::clone(&record),
+        record: Arc::clone(record),
         name: name.to_string(),
         query_type,
     };
-    let Ok(message) = Message::from_vec(datagram) else {
+    let Ok(message) = Message::from_vec(message) else {
         return Some(refused("<unparseable>", None));
     };
     if message.metadata.message_type != MessageType::Query
@@ -1688,6 +1713,249 @@ pub(crate) fn dns_query_refusal(
             !(zone_a || declares(declared, name))
         })
         .map(|(question, name)| refused(&name, Some(question.query_type())))
+}
+
+/// The largest DNS message over TCP the host-side gate reads, the same bound
+/// [`MAX_DATAGRAM`] puts on a datagram. A message whose length prefix claims
+/// more is refused before any of it is buffered past the prefix.
+const MAX_TCP_DNS_MESSAGE: usize = MAX_DATAGRAM;
+
+/// The most TCP connections to a decided row's resolver one relay tracks at
+/// once ([`DnsTcpStreams`]). An opening past it is refused.
+const MAX_TCP_DNS_FLOWS: usize = 64;
+
+/// How long a tracked TCP connection to the resolver may sit idle before a
+/// full table reclaims its entry: the outstanding-query expiry, past which
+/// no answer is owed.
+const TCP_DNS_FLOW_IDLE: Duration = DNS_QUERY_EXPIRY;
+
+/// TCP SYN: a connection's opening.
+const TCP_SYN: u8 = 0x02;
+
+/// One TCP connection from a box to its own resolver, as the host-side gate
+/// reads it: how far the box's byte stream has been decided, and the bytes
+/// of the message not yet complete.
+#[derive(Clone)]
+struct TcpDnsFlow {
+    /// The sequence number of the next byte the gate has not yet decided.
+    next_seq: u32,
+    /// The bytes after the last complete message, length prefix included:
+    /// at most [`MAX_TCP_DNS_MESSAGE`] and its prefix between frames.
+    pending: Vec<u8>,
+    /// Whether a message on this connection was refused: no later byte of
+    /// it is written on.
+    refused: bool,
+    /// The last time a frame of the connection was written on.
+    last_seen: Instant,
+}
+
+/// What [`DnsTcpStreams::decide`] makes of one TCP frame.
+pub(crate) enum TcpDnsVerdict {
+    /// Not a frame the host-side DNS gate decides: forward as the verdict
+    /// decided.
+    Pass,
+    /// Forward the frame, then hand this to [`DnsTcpStreams::commit`] once
+    /// it is written on.
+    Forward(TcpDnsAdvance),
+    /// Drop the frame. A refusal is the line to say; `None` drops it
+    /// without one (data out of order, or on a connection already refused).
+    Drop(Option<DnsQueryRefusal>),
+}
+
+/// The state one forwarded frame moves its connection to, applied only once
+/// the frame is written on, so a frame the switch never received never
+/// counts as decided.
+pub(crate) struct TcpDnsAdvance {
+    key: ([u8; 4], u16),
+    /// The connection's next state; `None` ends its entry.
+    flow: Option<TcpDnsFlow>,
+}
+
+/// The host-side DNS gate's reading of DNS over TCP (NET-141): the decision
+/// [`dns_query_refusal`] makes for a datagram, applied to each 2-byte
+/// length-prefixed message a decided row's TCP connection to its own
+/// resolver carries. One per relay connection, keyed by the box's address
+/// and source port.
+///
+/// The gate reads the box's byte stream in order. A frame whose bytes
+/// complete a message the rule refuses is dropped, and so is every later
+/// frame of that connection that carries data, so the resolver never holds
+/// the whole message. Frames that carry no data (acknowledgements, the
+/// close) pass. The rest fails closed: data on a connection whose opening
+/// the gate did not see, data past a gap, a message whose length prefix
+/// exceeds [`MAX_TCP_DNS_MESSAGE`], and an opening past
+/// [`MAX_TCP_DNS_FLOWS`] are dropped. Bytes before the next undecided one
+/// were already decided and written on, so a retransmission of them passes.
+#[derive(Default)]
+pub(crate) struct DnsTcpStreams {
+    flows: HashMap<([u8; 4], u16), TcpDnsFlow>,
+}
+
+impl DnsTcpStreams {
+    /// Decides one admitted TCP frame from a box (see the type's account).
+    pub(crate) fn decide(
+        &mut self,
+        table: &BoxTable,
+        pkt: &L4Packet,
+        frame: &[u8],
+        now: Instant,
+    ) -> TcpDnsVerdict {
+        if pkt.proto != IPPROTO_TCP {
+            return TcpDnsVerdict::Pass;
+        }
+        let Some(record) = decided_row(table, pkt) else {
+            return TcpDnsVerdict::Pass;
+        };
+        let refused = |name: &str| {
+            TcpDnsVerdict::Drop(Some(DnsQueryRefusal {
+                record: Arc::clone(&record),
+                name: name.to_string(),
+                query_type: None,
+            }))
+        };
+        let key = (pkt.src.ip().octets(), pkt.src.port());
+        let Some(payload) = tcp_payload(frame) else {
+            return refused("<unparseable>");
+        };
+        let ends = pkt.tcp_flags & (TCP_FIN | TCP_RST) != 0;
+        if pkt.tcp_flags & TCP_SYN != 0 {
+            if !payload.is_empty() {
+                return refused("<unparseable>");
+            }
+            // An opening on a tracked connection is a retransmission of the
+            // one already seen, or nothing passes: a new opening would move
+            // where the stream is read from while the resolver still reads
+            // the old connection. An entry idle past its bound is reclaimed.
+            if let Some(flow) = self.flows.get(&key)
+                && now.duration_since(flow.last_seen) < TCP_DNS_FLOW_IDLE
+            {
+                return if flow.next_seq == pkt.tcp_seq.wrapping_add(1) && flow.pending.is_empty() {
+                    TcpDnsVerdict::Forward(TcpDnsAdvance {
+                        key,
+                        flow: Some(flow.clone()),
+                    })
+                } else {
+                    TcpDnsVerdict::Drop(None)
+                };
+            }
+            self.flows.remove(&key);
+            if self.flows.len() >= MAX_TCP_DNS_FLOWS {
+                self.flows
+                    .retain(|_, flow| now.duration_since(flow.last_seen) < TCP_DNS_FLOW_IDLE);
+                if self.flows.len() >= MAX_TCP_DNS_FLOWS {
+                    return refused("<too many open connections>");
+                }
+            }
+            let flow = TcpDnsFlow {
+                next_seq: pkt.tcp_seq.wrapping_add(1),
+                pending: Vec::new(),
+                refused: false,
+                last_seen: now,
+            };
+            return TcpDnsVerdict::Forward(TcpDnsAdvance {
+                key,
+                flow: (!ends).then_some(flow),
+            });
+        }
+        let Some(flow) = self.flows.get_mut(&key) else {
+            // No opening seen: a frame without data passes, data does not.
+            return if payload.is_empty() {
+                TcpDnsVerdict::Forward(TcpDnsAdvance { key, flow: None })
+            } else {
+                TcpDnsVerdict::Drop(None)
+            };
+        };
+        let forward = |flow: TcpDnsFlow| {
+            TcpDnsVerdict::Forward(TcpDnsAdvance {
+                key,
+                flow: (!ends).then_some(TcpDnsFlow {
+                    last_seen: now,
+                    ..flow
+                }),
+            })
+        };
+        if payload.is_empty() {
+            return forward(flow.clone());
+        }
+        if flow.refused {
+            return TcpDnsVerdict::Drop(None);
+        }
+        // How far this segment starts past the next undecided byte, in
+        // sequence space: a positive distance is a gap, and the frame waits
+        // for the box's retransmission of what comes before it.
+        let ahead = pkt.tcp_seq.wrapping_sub(flow.next_seq).cast_signed();
+        if ahead > 0 {
+            return TcpDnsVerdict::Drop(None);
+        }
+        let already = usize::try_from(ahead.unsigned_abs()).unwrap_or(usize::MAX);
+        let Some(fresh) = payload.get(already..).filter(|fresh| !fresh.is_empty()) else {
+            // Every byte was decided and written on before.
+            return forward(flow.clone());
+        };
+        let mut next = flow.clone();
+        next.pending.extend_from_slice(fresh);
+        // `fresh` is at most one frame long, so it fits in a u32.
+        next.next_seq = next
+            .next_seq
+            .wrapping_add(u32::try_from(fresh.len()).unwrap_or(u32::MAX));
+        if let Some(refusal) = complete_messages_refusal(&record, &mut next.pending) {
+            flow.refused = true;
+            flow.pending = Vec::new();
+            return TcpDnsVerdict::Drop(Some(refusal));
+        }
+        forward(next)
+    }
+
+    /// Applies a forwarded frame's advance, once the frame is written on.
+    pub(crate) fn commit(&mut self, advance: TcpDnsAdvance) {
+        match advance.flow {
+            Some(flow) => {
+                self.flows.insert(advance.key, flow);
+            }
+            None => {
+                self.flows.remove(&advance.key);
+            }
+        }
+    }
+}
+
+/// Reads every complete length-prefixed message off the front of `pending`
+/// and decides each by [`message_refusal`], leaving the incomplete rest. A
+/// length prefix past [`MAX_TCP_DNS_MESSAGE`] is refused at once.
+fn complete_messages_refusal(
+    record: &Arc<BoxRecord>,
+    pending: &mut Vec<u8>,
+) -> Option<DnsQueryRefusal> {
+    while let Some(&[high, low]) = pending.get(..2) {
+        let len = usize::from(u16::from_be_bytes([high, low]));
+        if len > MAX_TCP_DNS_MESSAGE {
+            return Some(DnsQueryRefusal {
+                record: Arc::clone(record),
+                name: "<over the size limit>".to_string(),
+                query_type: None,
+            });
+        }
+        let message = pending.get(2..2 + len)?;
+        if let Some(refusal) = message_refusal(record, message) {
+            return Some(refusal);
+        }
+        pending.drain(..2 + len);
+    }
+    None
+}
+
+/// The TCP payload one Ethernet + IPv4 + TCP frame carries, bounded by the
+/// IPv4 total length, or `None` when its headers do not bound one.
+fn tcp_payload(frame: &[u8]) -> Option<&[u8]> {
+    let ip = frame.get(ETH_HDR..)?;
+    let ihl = usize::from(*ip.first()? & 0x0f) * 4;
+    let total = usize::from(u16::from_be_bytes([*ip.get(2)?, *ip.get(3)?]));
+    let tcp = ip.get(ihl..total.min(ip.len()))?;
+    let data_offset = usize::from(*tcp.get(12)? >> 4) * 4;
+    if data_offset < 20 {
+        return None;
+    }
+    tcp.get(data_offset..)
 }
 
 #[cfg(test)]
@@ -1776,7 +2044,21 @@ pub(crate) mod tests {
         dst_port: u16,
         flags: u8,
     ) -> Vec<u8> {
-        let total = 20 + 20;
+        tcp_segment_frame(src, src_port, dst, dst_port, flags, 0, &[])
+    }
+
+    /// An Ethernet II + IPv4 + TCP frame like [`tcp_frame`]'s, at sequence
+    /// number `seq` and carrying `payload`, with an honest total length.
+    pub(crate) fn tcp_segment_frame(
+        src: Ipv4Addr,
+        src_port: u16,
+        dst: Ipv4Addr,
+        dst_port: u16,
+        flags: u8,
+        seq: u32,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let total = 20 + 20 + payload.len();
         let mut f = Vec::with_capacity(ETH_FRAME_PREFIX.len() + total);
         f.extend_from_slice(ETH_FRAME_PREFIX);
         f.push(0x45); // IPv4, IHL 5
@@ -1791,14 +2073,22 @@ pub(crate) mod tests {
         f.extend_from_slice(&dst.octets());
         f.extend_from_slice(&src_port.to_be_bytes());
         f.extend_from_slice(&dst_port.to_be_bytes());
-        f.extend_from_slice(&0u32.to_be_bytes()); // sequence
+        f.extend_from_slice(&seq.to_be_bytes()); // sequence
         f.extend_from_slice(&0u32.to_be_bytes()); // acknowledgement
         f.push(0x50); // data offset: 5 words
-        f.push(flags); // flags — the byte the flow retention reads
+        f.push(flags);
         f.extend_from_slice(&0u16.to_be_bytes()); // window
         f.extend_from_slice(&0u16.to_be_bytes()); // checksum: none
         f.extend_from_slice(&0u16.to_be_bytes()); // urgent pointer
+        f.extend_from_slice(payload);
         f
+    }
+
+    /// `message` as DNS over TCP carries it: its 2-byte length, then itself.
+    pub(crate) fn tcp_dns_message(message: &[u8]) -> Vec<u8> {
+        let mut framed = (message.len() as u16).to_be_bytes().to_vec();
+        framed.extend_from_slice(message);
+        framed
     }
 
     /// A standard DNS query datagram for `name`, carrying the id of the
