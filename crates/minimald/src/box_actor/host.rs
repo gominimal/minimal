@@ -596,6 +596,43 @@ impl EntrypointBehindHookShell {
     }
 }
 
+/// Why a restart cannot start the command of a box that has its own
+/// network address and holds a shell for its activate hooks. The restart
+/// prints it after the line that says the box did not start again. A
+/// restart does not ask the VM host daemon whether the box's host-side row
+/// stands, so replacing the shell would end that row. No command changes
+/// that answer, so the text states the situation and stops. Tracked by
+/// https://github.com/gominimal/minimal/issues/3231.
+pub(crate) const RESTART_BEHIND_HOOK_SHELL: &str = "The box has its own network address. \
+     Its command must replace the shell that ran the project's activate hooks. \
+     A restart cannot keep the address when that shell ends, so the command did not start.";
+
+/// The refusal of a restart whose command cannot start behind a hook shell,
+/// as [`BoxActor::restart_launch`] returns it inside
+/// [`AttachError::SpawnFailed`]. The restart finds it by type and prints
+/// [`RESTART_BEHIND_HOOK_SHELL`] without the spawn-failure prefix.
+#[derive(Debug)]
+pub(crate) struct RestartBehindHookShell;
+
+impl std::fmt::Display for RestartBehindHookShell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(RESTART_BEHIND_HOOK_SHELL)
+    }
+}
+
+impl std::error::Error for RestartBehindHookShell {}
+
+impl RestartBehindHookShell {
+    /// Whether `error` is this refusal.
+    pub(crate) fn is(error: &AttachError) -> bool {
+        matches!(
+            error,
+            AttachError::SpawnFailed(e)
+                if e.get_ref().is_some_and(|inner| inner.is::<RestartBehindHookShell>())
+        )
+    }
+}
+
 /// The actor's end of an [`watch_entrypoint_exit`] watch: it receives how
 /// the watched host's runtime loop ended, once, when it ends with an exit.
 pub(super) type EntrypointWatch = tokio::sync::oneshot::Receiver<box_runtime::HostExit>;
@@ -1835,7 +1872,7 @@ impl BoxActor {
                      the box's host-side row, so the box's entrypoint cannot start"
                 );
                 return Err(AttachError::SpawnFailed(std::io::Error::other(
-                    EntrypointBehindHookShell,
+                    RestartBehindHookShell,
                 )));
             }
             if !starts_argv {

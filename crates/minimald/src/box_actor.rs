@@ -1989,7 +1989,15 @@ impl BoxActor {
             }
             self.restart_launch(session_hnd, conn_username)
                 .await
-                .map_err(|error| error.to_string())
+                .map_err(|error| {
+                    // The restart's own refusal prints bare, without the
+                    // spawn-failure prefix.
+                    if host::RestartBehindHookShell::is(&error) {
+                        host::RESTART_BEHIND_HOOK_SHELL.to_string()
+                    } else {
+                        error.to_string()
+                    }
+                })
         }
         .await;
         if let Err(why) = launched {

@@ -18917,10 +18917,19 @@ async fn restart_argv_box_behind_hook_shell_with_host_row_fails_stopped() {
             let text = error.to_string();
             assert!(
                 text.contains(
-                    "Session `argv-behind-hooks` did not start again. It is stopped now."
+                    "Session `argv-behind-hooks` did not start again. It is stopped now. \
+                     The box has its own network address. \
+                     Its command must replace the shell that ran the project's activate hooks. \
+                     A restart cannot keep the address when that shell ends, \
+                     so the command did not start."
                 ),
                 "{text}"
             );
+            assert!(
+                !text.contains(super::ENTRYPOINT_BEHIND_HOOK_SHELL),
+                "a restart does not print the task-run text: {text}"
+            );
+            assert!(!text.contains("session spawn:"), "{text}");
         }
         other => panic!("the restart did not fail: {other:?}"),
     }
