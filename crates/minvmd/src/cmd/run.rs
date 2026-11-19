@@ -158,7 +158,7 @@ fn run_supervisor(detach: bool, timeout_secs: u64, root: tracing::span::EnteredS
     paths::migrate_legacy_host_dirs(&crate::state::state_base_dir());
 
     // R2.4: fail fast with an actionable error if the hypervisor backend is
-    // unavailable (Linux: /dev/kvm). No-op on macOS. Runs in the foreground
+    // unavailable (Linux: /dev/kvm; macOS: kern.hv_support). Runs in the foreground
     // caller so the user sees the error directly, even under --detach.
     crate::cmd::ensure_hypervisor_accessible()?;
     // Likewise the sun_path limit: libkrun aborts on an over-long UDS path

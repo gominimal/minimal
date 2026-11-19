@@ -890,7 +890,7 @@ up: minimald-build minimal-cli gvproxy && (_smoke "--provider" "local" "--minima
     # `activate` sandbox dies at uid_map EPERM until it's installed.
     just _userns-check || true
     echo "up: host-native minimald at $sock (pid $(cat "$pidf"))"
-    echo "  own-IP demo: min --provider local --minimal-dir {{native-dir}} session activate -n net1 --network own-ip . && min --provider local --minimal-dir {{native-dir}} session attach net1"
+    echo "  own-IP demo: min --provider local --minimal-dir {{native-dir}} session start --detach --name net1 --network own_ip && min --provider local --minimal-dir {{native-dir}} session attach net1"
 
 # Bring the stack up: native Linux + one Linux VM over KVM (stop with `just stop`).
 [linux]

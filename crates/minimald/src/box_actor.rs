@@ -317,6 +317,32 @@ fn stored_spec_runs_until_stopped(stored: Option<&[u8]>) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the last of the box's `started`, `exited` and `resumed` events
+/// is `started` (BOX-040): the record has not left `running` since its last
+/// start was written. An events file that cannot be read answers `false`,
+/// so the start writes its event.
+fn last_start_recorded(object: &boxes::store::DiskBox) -> bool {
+    use boxes::events::BoxEventType;
+
+    match object.read_events_from(0) {
+        Ok(read) => read
+            .events
+            .iter()
+            .rev()
+            .find(|event| {
+                matches!(
+                    event.kind,
+                    BoxEventType::Started | BoxEventType::Exited | BoxEventType::Resumed
+                )
+            })
+            .is_some_and(|event| event.kind == BoxEventType::Started),
+        Err(error) => {
+            tracing::warn!(%error, "could not read the events file to check for a started event");
+            false
+        }
+    }
+}
+
 /// The exit that `watch` already holds, taking the watch: `Some(None)` when
 /// the loop ended with no exit to read, `None` when the loop still runs or
 /// nothing is watched.
@@ -761,9 +787,11 @@ pub struct BoxActor {
 
     /// Whether the last [`Self::host_row_lost`] read found the binding
     /// launch's host gone and the VM host daemon's row still standing, so
-    /// the launch that follows rejoins that row. The next attach or exec
-    /// launch takes it and marks its host as holding the row; a hook launch,
-    /// which reads nothing first, drops it.
+    /// the launch that follows rejoins that row. A task run that replaces a
+    /// hook shell sets it too, when the VM host daemon confirms the row
+    /// stands before the shell ends (#3077). The next attach or exec launch
+    /// takes it and marks its host as holding the row; a hook launch, which
+    /// reads nothing first, drops it.
     relaunch_row_confirmed: bool,
 
     /// The spec stored beside this box's record (BOX-068), as the first
@@ -785,6 +813,24 @@ pub struct BoxActor {
     /// nothing: a launch could run an `until_complete` entrypoint a second
     /// time (BOX-038).
     exit_unsettled: bool,
+
+    /// Set from a [`Self::resume`] that set the record to `running` until
+    /// its [`Self::finish_resume`]. The attach's launch then writes no
+    /// `started` event, because `finish_resume` writes it after `resumed`
+    /// (BOX-040).
+    resume_in_flight: bool,
+
+    /// Set when an attach mints a host while [`Self::resume_in_flight`] is
+    /// set, whether or not the attach to that host then succeeds. The
+    /// [`Self::finish_resume`] that reads it writes `started` (BOX-040).
+    resume_attach_minted: bool,
+
+    /// Set when the box's last start already wrote its `started` event, so
+    /// a host minted while the record stays `running` writes no second one
+    /// (BOX-040). A write of `exited` or `resumed`, and the restart's start,
+    /// clear it. An actor restored from disk starts with it clear, and
+    /// [`Self::record_started`] then reads the events file to decide.
+    started_recorded: bool,
 
     /// When the box runs past its `timeout` (BOX-037): armed by each launch
     /// that starts the entrypoint of an `until_complete` box with a timeout,
@@ -899,6 +945,10 @@ impl BoxActor {
             // No launch yet, so no loop to watch.
             entrypoint_watch: None,
             exit_unsettled: false,
+            resume_in_flight: false,
+            resume_attach_minted: false,
+            // Read from the events file by the first `record_started`.
+            started_recorded: false,
             // Armed by the launch that starts the entrypoint.
             timeout_deadline: None,
             // Forwards are registered as their channels open; a session
@@ -1365,14 +1415,18 @@ impl BoxActor {
         let resumed =
             tracing::Instrument::instrument(self.resume_ended(record, from), span.clone()).await;
         match resumed {
-            Ok(restarted_from_stored_spec) => Ok(Some(PendingResume {
-                from,
-                before,
-                span,
-                restarted_from_stored_spec,
-                minted_host: !had_host
-                    && matches!(self.inner, BoxInner::Active { host: Some(_), .. }),
-            })),
+            Ok(restarted_from_stored_spec) => {
+                self.resume_in_flight = true;
+                self.resume_attach_minted = false;
+                Ok(Some(PendingResume {
+                    from,
+                    before,
+                    span,
+                    restarted_from_stored_spec,
+                    minted_host: !had_host
+                        && matches!(self.inner, BoxInner::Active { host: Some(_), .. }),
+                }))
+            }
             Err(error) => {
                 span.record("outcome", "refused");
                 span.in_scope(
@@ -1403,6 +1457,8 @@ impl BoxActor {
             restarted_from_stored_spec,
             minted_host,
         } = pending;
+        self.resume_in_flight = false;
+        let attach_minted = std::mem::take(&mut self.resume_attach_minted);
         let outcome_span = span.clone();
         let finish = async {
             let has_host = matches!(self.inner, BoxInner::Active { host: Some(_), .. });
@@ -1437,6 +1493,9 @@ impl BoxActor {
                 return;
             }
             span.record("outcome", "resumed");
+            // BOX-040: the resume takes the record into `running` again, so
+            // its start writes `started` after `resumed`.
+            self.started_recorded = false;
             match self.record.object().await {
                 Ok(object) => {
                     if let Err(error) = crate::box_manager::write_box_event(
@@ -1452,6 +1511,14 @@ impl BoxActor {
                 Err(error) => {
                     tracing::warn!(%error, "resume: could not open the box to write the resumed event");
                 }
+            }
+            // BOX-040: the resume started the entrypoint again, so `started`
+            // follows `resumed`. An attach that minted a host and then timed
+            // out stored that host, so its entrypoint started too. A launch
+            // that failed beside a host that was already there started
+            // nothing.
+            if launched.is_ok() || attach_minted {
+                self.record_started("resume").await;
             }
             // BOX-027: the resume runs no hook itself. The attach's launch
             // ran `on_attach`, and logs what its hooks did there.
@@ -1690,9 +1757,11 @@ impl BoxActor {
         let spec = box_runtime::stored_spec(bytes)?;
         // BOX-160 at admission: the spec meets its type's built-in root as
         // a create of it would, under the type the record is filed under.
-        // A record filed with no type has only the spec's own to go by.
+        // A record filed with no type has only the spec's own to go by. The
+        // check reads the spec parsed above, in the shape it was stored in.
         let record_type = record.box_type.as_deref().unwrap_or(spec.box_type.as_str());
-        crate::box_manager::stored_spec_root_refusal(bytes, record_type)?;
+        let spec_value = serde_json_lenient::to_value(&spec).map_err(std::io::Error::other)?;
+        crate::box_manager::stored_spec_root_refusal(&spec_value, record_type)?;
         let mut started = record.clone();
         box_runtime::restart_from_stored_spec(&mut started, &spec);
         // The start's launches start the box from this spec.
@@ -1969,6 +2038,9 @@ impl BoxActor {
             box_runtime::restart_from_stored_spec(&mut started, spec);
         }
         started.set_state(RecordState::Running);
+        // BOX-040: the restart takes the record into `running`, so its start
+        // writes `started`.
+        self.started_recorded = false;
         let registered = started.clone();
         self.record
             .write(started)
@@ -1987,7 +2059,15 @@ impl BoxActor {
             }
             self.restart_launch(session_hnd, conn_username)
                 .await
-                .map_err(|error| error.to_string())
+                .map_err(|error| {
+                    // The restart's own refusal prints bare, without the
+                    // spawn-failure prefix.
+                    if host::RestartBehindHookShell::is(&error) {
+                        host::RESTART_BEHIND_HOOK_SHELL.to_string()
+                    } else {
+                        error.to_string()
+                    }
+                })
         }
         .await;
         if let Err(why) = launched {
@@ -2010,22 +2090,46 @@ impl BoxActor {
 
         // BOX-040, BOX-178: the entrypoint started again. The restart records
         // no event type of its own.
+        self.record_started("restart").await;
+        Ok(())
+    }
+
+    /// Writes the box's `started` event (BOX-040): its entrypoint started
+    /// on a new host, and the record entered `running`. A host minted while
+    /// the record stays `running` writes nothing: the last of the box's
+    /// `started`, `exited` and `resumed` events is already `started`. An
+    /// attach that keeps a hooks host (a host kept for its
+    /// host-side row, or an attach that declares no terminal) releases the
+    /// shell without a `started` event yet. Issue #3604 tracks that gap.
+    /// `op` names the operation that started it in the log.
+    /// A failed write is logged and does not stop the box, which runs.
+    pub(super) async fn record_started(&mut self, op: &'static str) {
+        if self.started_recorded {
+            tracing::debug!(op, "the box's start already wrote its started event");
+            return;
+        }
         match self.record.object().await {
             Ok(object) => {
+                if last_start_recorded(&object) {
+                    // An actor restored from disk, for a record that stayed
+                    // `running` across a daemon restart.
+                    tracing::debug!(op, "the events file already ends this start with started");
+                    self.started_recorded = true;
+                    return;
+                }
+                self.started_recorded = true;
                 if let Err(error) = crate::box_manager::write_box_event(
                     &object,
                     boxes::events::BoxEventType::Started,
                     boxes::events::EventData::new(),
                 ) {
-                    // The box runs: a missing event must not stop it.
-                    tracing::warn!(%error, "restart: could not write the started event");
+                    tracing::warn!(%error, op, "could not write the started event");
                 }
             }
             Err(error) => {
-                tracing::warn!(%error, "restart: could not open the box to write the started event");
+                tracing::warn!(%error, op, "could not open the box to write the started event");
             }
         }
-        Ok(())
     }
 
     /// Runs the box's `on_activate` hooks again for a resume or a restart
@@ -2407,7 +2511,8 @@ impl BoxActor {
     /// Records the `exited` event for `ending` (BOX-040): its `reason`, and
     /// the exit code when the record keeps one. The record already says
     /// `exited`, so a failed write is logged.
-    async fn write_exited_event(&self, ending: boxes::core::record::ExitEnding) {
+    async fn write_exited_event(&mut self, ending: boxes::core::record::ExitEnding) {
+        self.started_recorded = false;
         let state = boxes::core::record::RecordState::Exited(ending);
         let mut data = boxes::events::EventData::new();
         if let Some(reason) = state.reason() {
