@@ -164,8 +164,8 @@ session box takes the entry's `network.ingress`, a list such as
 Each `--ingress` adds one mapping after the entry's mappings.
 Ingress needs an `own_ip` box, so a start refuses `network.ingress` on any
 other mode. The box keeps the
-result: `min box show <box> --network` prints the `[network]` section that
-the box was created with.
+result: `min box show <box> --network` prints the network policy in force
+for the box.
 
 `min box start [ENTRY]` takes the same flags. For a task entry, it takes
 every flag in the table except `--ingress` and `--loadout`. A task entry refuses
@@ -318,7 +318,8 @@ command refuses a name that a running box on the same host holds.
 ### `box show`
 
 ```
-min box show [--network | -o <json|yaml>] <BOX>
+min box show [-o <json|yaml>] <BOX>
+min box show --network [-o json] <BOX>
 ```
 
 Shows one box: its id, name, type, parent, project and state, how it ended,
@@ -329,10 +330,19 @@ a terminal (`tty`), is connected without one (`attached`) or runs on its own
 
 | Flag | Short | Description |
 |------|-------|-------------|
-| `--network` | | Show only the box's `[network]` section, as the box was created with it: its network mode, ingress and egress, with the flags of the command that created it applied |
-| `--output <json\|yaml>` | `-o` | Write the box and its running commands in this format instead of text. Cannot be combined with `--network` |
+| `--network` | | Show the box's effective network policy in place of the box: the ingress and egress rules in force, the ports the box published while it runs, and the VPN networks the box keeps |
+| `--output <json\|yaml>` | `-o` | Write the box and its running commands in this format instead of text. With `--network`, only `json` is available |
 
-`--network` prints the section as TOML.
+`--network` prints the rules the box runs under. A box with no egress rules
+of its own shows the default it gets, such as `deny-all (default)`. The ports
+the box published while it runs follow, under
+`live ingress (published at runtime)`. The VPN networks the box keeps
+follow last, under `vpn networks (not connected yet)`. They are the
+entry's `network.vpn_network_names`, then each `--vpn-network-names`
+value. `minimald` does not connect the box to a VPN yet. With `-o json`,
+`--network` writes one JSON document, `min/v1/session-policy`, in place
+of the text. The document lists the names in `vpn_network_names`. The
+command refuses `-o yaml` with `--network`, with exit code 2.
 
 ### `box spec`
 

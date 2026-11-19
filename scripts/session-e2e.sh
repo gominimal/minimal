@@ -152,7 +152,7 @@
 #                                    publishes (on a VM lane the publish
 #                                    rides the guest report door and is
 #                                    admitted against the host-held
-#                                    grant), both 'min session policy'
+#                                    grant), both 'min box show --network'
 #                                    renderings list the runtime publish
 #                                    beside the declaration, and
 #                                    out-of-range and deny asks are
@@ -2246,8 +2246,8 @@ if old in names:
 fi
 
 # The old name must no longer resolve to a session.
-if mnl session policy "$SESSION_NAME" >/dev/null 2>"$WORK/policy-old.err"; then
-  echo "::error::'min session policy $SESSION_NAME' still resolves after the rename"
+if mnl box show "$SESSION_NAME" --network >/dev/null 2>"$WORK/policy-old.err"; then
+  echo "::error::'min box show $SESSION_NAME --network' still resolves after the rename"
   fail
 fi
 
@@ -2476,11 +2476,11 @@ published_loopback_host() {
 #
 # This case drives the four egress flags the CLI exposes today
 # (`--allow-subnets`, `--allow-dns-hosts`, `--allow-protocols`, `--deny-subnets`)
-# through an own-address box, checks that `min session policy` shows the
+# through an own-address box, checks that `min box show --network` shows the
 # effective rules, proves an allowed connection completes and a disallowed one
 # is dropped silently and logged, and proves the deny-all default in force
 # (NET-074/NET-075): a bare own-address box is told its default on one line at
-# activate, `min session policy` shows `deny-all (default)`, and the box
+# activate, `min box show --network` shows `deny-all (default)`, and the box
 # reaches nothing — not a literal destination an explicitly allowing box
 # reaches in the same run, and not an external name, which fails fast at
 # resolution while host.min.internal still resolves. An explicit deny-all
@@ -2537,7 +2537,7 @@ proof_own_ip_egress_declared_and_enforced() {
   # ---- NET-074/NET-075/NET-076: a bare own-address box has deny-all --------
   # The default is in force: an own-address box with no egress section is
   # told so on one line at activate (and the retired announcement, NET-076,
-  # no longer prints), and `min session policy` names the default it got.
+  # no longer prints), and `min box show --network` names the default it got.
   # This daemon runs without the opt-out, so the default binds. The box is
   # kept for the reach legs below, which need a live control first.
   egress_in_force_note="This box can reach no external address: a --network own_ip box with no egress rules gets the deny-all default"
@@ -2561,15 +2561,15 @@ proof_own_ip_egress_declared_and_enforced() {
   fi
   echo "NET-076 OK: no announcement; activate printed the in-force note once"
 
-  bare_policy="$(mnl session policy "$bare_sid" 2>"$WORK/egress-bare-policy.err")" || {
-    echo "::error::'min session policy' failed for the bare box"
+  bare_policy="$(mnl box show "$bare_sid" --network 2>"$WORK/egress-bare-policy.err")" || {
+    echo "::error::'min box show --network' failed for the bare box"
     cat "$WORK/egress-bare-policy.err" 2>/dev/null || true
     fail
   }
   echo "effective policy of the bare box:"
   printf '%s\n' "$bare_policy" | sed 's/^/  /'
   if ! grep -qF "deny-all (default)" <<<"$bare_policy"; then
-    echo "::error::NET-075: 'min session policy' did not show the deny-all default for a bare own-address box"
+    echo "::error::NET-075: 'min box show --network' did not show the deny-all default for a bare own-address box"
     fail
   fi
   echo "NET-075 OK: the bare box's policy shows deny-all (default)"
@@ -2786,8 +2786,8 @@ proof_own_ip_egress_declared_and_enforced() {
   fi
   echo "own-IP session with four egress fields: $declare_sid"
 
-  policy_out="$(mnl session policy "$declare_sid" 2>"$WORK/egress-policy.err")" || {
-    echo "::error::'min session policy' failed for the declared box"
+  policy_out="$(mnl box show "$declare_sid" --network 2>"$WORK/egress-policy.err")" || {
+    echo "::error::'min box show --network' failed for the declared box"
     cat "$WORK/egress-policy.err" 2>/dev/null || true
     fail
   }
@@ -2797,7 +2797,7 @@ proof_own_ip_egress_declared_and_enforced() {
     || ! grep -q "dns hosts  example.com" <<<"$policy_out" \
     || ! grep -q "protocols  tcp, udp" <<<"$policy_out" \
     || ! grep -q "deny subnets  198.51.100.0/24" <<<"$policy_out"; then
-    echo "::error::'min session policy' did not show all four declared egress fields"
+    echo "::error::'min box show --network' did not show all four declared egress fields"
     echo "--- raw policy output ---"
     printf '%s\n' "$policy_out"
     fail
@@ -3851,8 +3851,8 @@ proof_host_ip_deny_all() {
     # the box's own connect is refused after the daemon's fetch completed
     # on this same host — the reach control that makes the refusal the
     # table's verdict and not the weather's.
-    hida_policy="$(mnl session policy "$hida_sid" 2>"$WORK/hida-policy.err")" || {
-      echo "::error::'min session policy' failed for the host-address box"
+    hida_policy="$(mnl box show "$hida_sid" --network 2>"$WORK/hida-policy.err")" || {
+      echo "::error::'min box show --network' failed for the host-address box"
       cat "$WORK/hida-policy.err" 2>/dev/null || true
       fail
     }
@@ -4073,8 +4073,8 @@ proof_host_ip_deny_all() {
   # without external reach degrades that one beat to a note, and the
   # records above still carry the unenforced fact.
   if [ -n "$hida_un_launch" ]; then
-    hida_un_policy="$(mnl session policy "$hida_un_sid" 2>"$WORK/hida-un-policy.err")" || {
-      echo "::error::'min session policy' failed for the unenforced box"
+    hida_un_policy="$(mnl box show "$hida_un_sid" --network 2>"$WORK/hida-un-policy.err")" || {
+      echo "::error::'min box show --network' failed for the unenforced box"
       cat "$WORK/hida-un-policy.err" 2>/dev/null || true
       fail
     }
@@ -4486,7 +4486,7 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
     || { echo "::error::the refused create does not name the rule it refused over (allow_subnets)"; cat "$WORK/net080-refused-list.err" 2>/dev/null || true; fail; }
   echo "refusal: a declaration that names rules the loaded table cannot enforce per box (deny_subnets 0.0.0.0/0, allow_subnets 10.0.0.0/8) is refused at the create with each rule named — this host decides per box, and its classifier enforces deny-all or nothing on a box's leaf"
 
-  # ---- the box's own egress, before: the declaration as `min session policy`
+  # ---- the box's own egress, before: the declaration as `min box show --network`
   # reads it back — a declared deny-all box reads a bare `deny-all` row, with no `(default)` mark, beside
   # the per-box enforcement the host's fact carries — and one connection the
   # box itself opens, to an address its declaration names no exception for,
@@ -4496,8 +4496,8 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
   # so this half tests the connect and not the box's name resolution — a
   # deny-all box resolves only through the box zone's answerer (NET-079),
   # and a name would fail there for a reason this half is not about.
-  net080_policy_before="$(mnl session policy "$net080_sid" 2>"$WORK/net080-policy-before.err")" || {
-    echo "::error::'min session policy' failed for the host-address box"
+  net080_policy_before="$(mnl box show "$net080_sid" --network 2>"$WORK/net080-policy-before.err")" || {
+    echo "::error::'min box show --network' failed for the host-address box"
     cat "$WORK/net080-policy-before.err" 2>/dev/null || true
     fail
   }
@@ -4586,8 +4586,8 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
   # ---- the box's own egress, after: the requirement's fear is that making
   # the node plane's own traffic survive changed the box's own egress, and
   # these are the two halves that say it did not.
-  net080_policy_after="$(mnl session policy "$net080_sid" 2>"$WORK/net080-policy-after.err")" || {
-    echo "::error::'min session policy' failed after the install"
+  net080_policy_after="$(mnl box show "$net080_sid" --network 2>"$WORK/net080-policy-after.err")" || {
+    echo "::error::'min box show --network' failed after the install"
     cat "$WORK/net080-policy-after.err" 2>/dev/null || true
     fail
   }
@@ -4596,7 +4596,7 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
     diff <(printf '%s\n' "$net080_policy_before") <(printf '%s\n' "$net080_policy_after") || true
     fail
   fi
-  echo "egress unchanged: 'min session policy' reads back the same declaration as before the fetch (deny-all beside per-box enforcement per_box, and the box still in the deny subtree)"
+  echo "egress unchanged: 'min box show --network' reads back the same declaration as before the fetch (deny-all beside per-box enforcement per_box, and the box still in the deny subtree)"
 
   # ---- the box's own connect, after: refused again, now with the daemon's
   # own fetch completed in between as the reach control — the daemon fetched
@@ -6410,8 +6410,8 @@ STUB
       exit 1
     fi
     echo "policy of the stock posture box:"
-    mnl session policy "$np_host_sid" 2>"$np_root/hostip-policy.err" | sed 's/^/  /' || {
-      echo "::error::'min session policy' failed for the stock posture box"
+    mnl box show "$np_host_sid" --network 2>"$np_root/hostip-policy.err" | sed 's/^/  /' || {
+      echo "::error::'min box show --network' failed for the stock posture box"
       cat "$np_root/hostip-policy.err" 2>/dev/null || true
       exit 1
     }
@@ -6456,7 +6456,7 @@ STUB
       exit 1
     fi
     echo "policy of the none box:"
-    mnl session policy "$np_none_sid" 2>/dev/null | sed 's/^/  /' || true
+    mnl box show "$np_none_sid" --network 2>/dev/null | sed 's/^/  /' || true
 
     # The namespace's shape: one interface (lo), no default route.
     posture_probe "$np_none_sid" 'echo ---DEV---; cat /proc/net/dev; echo ---ROUTE---; cat /proc/net/route'
@@ -6713,7 +6713,7 @@ exit' python3 "$ROOT/scripts/e2e-attach-pty.py" - \
         echo "daemon log: (no expose record found — the host answer above is the assertion)"
       fi
       echo "policy of the own-IP box:"
-      mnl session policy "$np_own_sid" 2>/dev/null | sed 's/^/  /' || true
+      mnl box show "$np_own_sid" --network 2>/dev/null | sed 's/^/  /' || true
       posture_outbound "$np_own_sid" "the own-IP posture (switch lane)"
       mnl session destroy --force "$np_own_sid" >/dev/null 2>&1 || true
       mnl stop --force >/dev/null 2>&1 || true
@@ -19581,8 +19581,8 @@ GOA_PROBE_EOF
   # The effective rules, shown: the four-field rendering the egress proof
   # pins has its own case; here it is the declaration's own receipt — the
   # dead CIDR, every one of the eleven hosts, and tcp alone.
-  goa_policy="$(mnl session policy "$goa_t_sid" 2>"$WORK/goa-policy.err")" || {
-    echo "::error::'min session policy' failed for the hostname-only box"
+  goa_policy="$(mnl box show "$goa_t_sid" --network 2>"$WORK/goa-policy.err")" || {
+    echo "::error::'min box show --network' failed for the hostname-only box"
     cat "$WORK/goa-policy.err" 2>/dev/null || true
     fail
   }
@@ -22264,7 +22264,7 @@ PY
 # destination their own probes reach) and the fabric (100.64.0.0/16),
 # which carries the host alias, the node-plane baseline set's one
 # category-pair (NET-130: the alias is the registry and the cache, shown
-# beside the rules by `min session policy`). The arms:
+# beside the rules by `min box show --network`). The arms:
 #
 #   * each box's own probe to the runner's address arrives — the whole chain
 #     working, and the union's declared half live for a box's own address;
@@ -22779,9 +22779,9 @@ ESU_LISTENER_EOF
   # ---- the baseline set beside the effective rules (NET-130) ---------------
   for esu_box in a b; do
     sid_var="esu_sid_$esu_box"
-    if ! esu_policy="$(mnl session policy "${!sid_var}" \
+    if ! esu_policy="$(mnl box show "${!sid_var}" --network \
         2>"$WORK/esu-policy-$esu_box.err")"; then
-      echo "::error::'min session policy' failed for box $esu_box"
+      echo "::error::'min box show --network' failed for box $esu_box"
       cat "$WORK/esu-policy-$esu_box.err" 2>/dev/null || true
       esu_fail
     fi
@@ -23658,8 +23658,8 @@ EBR_LISTENER_EOF
   fi
   echo "box e2e-ebr: $ebr_sid at switch address $ebr_ip, declared deny-all"
   echo "the node's own address (the in-VM daemon's, decided by the baseline set): $ebr_node"
-  if ! ebr_policy="$(mnl session policy "$ebr_sid" 2>"$WORK/ebr-policy.err")"; then
-    echo "::error::'min session policy $ebr_sid' failed"
+  if ! ebr_policy="$(mnl box show "$ebr_sid" --network 2>"$WORK/ebr-policy.err")"; then
+    echo "::error::'min box show $ebr_sid --network' failed"
     cat "$WORK/ebr-policy.err" 2>/dev/null || true
     ebr_fail
   fi
@@ -24057,7 +24057,7 @@ proof_host_ip_rules_follow_the_running_box() {
   HRF_EXPECTED="a box-marked SYN from $hrf_node toward $hrf_dst:443 admitted while $hrf_name runs"
   if ! hrf_probe_until admitted; then
     echo "::error::while $hrf_name runs, a box-marked frame from the node's address toward $hrf_dst:443 was not admitted (last verdict: $hrf_verdict after ${hrf_elapsed} s): the case has no reach for the stop to take away"
-    mnl session policy "$hrf_sid" 2>&1 || true
+    mnl box show "$hrf_sid" --network 2>&1 || true
     hrf_fail
   fi
   hrf_rows="$hrf_rows
@@ -26585,7 +26585,7 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
 # `allow` over one range at the create, asks an in-range port of the box,
 # and holds the three surfaces the ask owns: the reply the box reads
 # (`published port N at ADDR:N`), the publication listed beside the
-# declaration on BOTH of `min session policy`'s renderings (NET-044), and the
+# declaration on BOTH of `min box show --network`'s renderings (NET-044), and the
 # typed refusals everything else gets — a port outside the declared range,
 # and a box whose stance is `deny`.
 #
@@ -26857,7 +26857,7 @@ PY
   echo "deny box: refused with the deny the stance spells — the create's word is the whole decision (NET-043)"
 
   # ---- the publication listed beside the declaration ----------------------
-  # `min session policy` is where a person reads what a box actually
+  # `min box show --network` is where a person reads what a box actually
   # published (NET-044): the text rendering carries the resolved stance and
   # range the create declared, then the live section with one row a publish.
   # The row is asserted by its port, not its address — the address is the
@@ -26871,9 +26871,9 @@ PY
   mnx_policy_legs() { # $1 = sid, $2 = stance, $3 = live|nothing-published
     local sid="$1" stance="$2" mode="$3"
     local policy="" json=""
-    policy="$(mnl session policy "$sid" 2>"$WORK/mnx-policy-$stance.err")" \
-      || { echo "::error::'min session policy' failed for the $stance box"; cat "$WORK/mnx-policy-$stance.err" 2>/dev/null || true; fail; }
-    echo "--- min session policy (text, the $stance box) ---"; printf '%s\n' "$policy" | sed 's/^/  /'
+    policy="$(mnl box show "$sid" --network 2>"$WORK/mnx-policy-$stance.err")" \
+      || { echo "::error::'min box show --network' failed for the $stance box"; cat "$WORK/mnx-policy-$stance.err" 2>/dev/null || true; fail; }
+    echo "--- min box show --network (text, the $stance box) ---"; printf '%s\n' "$policy" | sed 's/^/  /'
     if ! printf '%s\n' "$policy" | grep -qxF "  dynamic ingress  $stance"; then
       echo "::error::the text policy does not show the declared dynamic ingress stance as '$stance' (with no (default) mark)"
       fail
@@ -26902,8 +26902,8 @@ PY
       echo "policy (text): stance deny over ${mnx_lo}–${mnx_hi}, and no live-ingress section — a box that published nothing lists nothing (NET-044, fail-closed)"
     fi
 
-    json="$(mnl session policy "$sid" -o json 2>"$WORK/mnx-json-$stance.err")" \
-      || { echo "::error::'min session policy -o json' failed for the $stance box"; cat "$WORK/mnx-json-$stance.err" 2>/dev/null || true; fail; }
+    json="$(mnl box show "$sid" --network -o json 2>"$WORK/mnx-json-$stance.err")" \
+      || { echo "::error::'min box show --network -o json' failed for the $stance box"; cat "$WORK/mnx-json-$stance.err" 2>/dev/null || true; fail; }
     if ! mnx_json_assert "$mnx_lo" "$mnx_hi" "$mnx_port" "$mode" "$stance" "$json" \
         >"$WORK/mnx-json-check.out" 2>"$WORK/mnx-json-check.err"; then
       echo "::error::the -o json document does not carry the declared stance, its source, the range, and the publication verdict the $stance box owes"
@@ -27313,7 +27313,7 @@ proof_listen_published_port_reaches_peer_and_host() {
   # The listener is the premise this arm reads: the watcher polls the box's
   # listening sockets every 250 ms and publishes what the stance allows, and
   # it records a publication only once the switch said yes — so the live row
-  # in `min session policy` is the observed word for whether the listen
+  # in `min box show --network` is the observed word for whether the listen
   # published. On every lane the stance is allow: the row must appear within
   # sixteen of the watcher's own polls (on a VM lane the publish also has to
   # ride the guest report door and come back admitted by the VM host
@@ -27341,23 +27341,23 @@ proof_listen_published_port_reaches_peer_and_host() {
   echo "listen: socat serves port $lp_listen_port inside the target box — inside the declared range, with no expose anywhere (NET-016's premise)"
   lp_live=""
   for _ in $(seq 1 16); do
-    lp_policy="$(mnl session policy "$lp_sid" 2>/dev/null || true)"
+    lp_policy="$(mnl box show "$lp_sid" --network 2>/dev/null || true)"
     case "$lp_policy" in
       *":$lp_listen_port → :$lp_listen_port"*) lp_live=1; break ;;
     esac
     sleep 0.25
   done
   # An in-range listen under allow is a dynamic ingress request, so NET-044
-  # owes its row in `min session policy`: the watcher's publication is
+  # owes its row in `min box show --network`: the watcher's publication is
   # listed beside the runtime exposes for as long as the listener holds the
   # port. The peer and host legs below prove the publish itself (NET-016) —
   # on a VM lane, through the VM host daemon's admission (T94).
   if [ -z "$lp_live" ]; then
-    echo "::error::the in-range listen on port $lp_listen_port is not listed in min session policy — an allowed dynamic ingress request must show its mapping (NET-044)"
-    echo "--- min session policy ---"; printf '%s\n' "${lp_policy:-<no answer>}"
+    echo "::error::the in-range listen on port $lp_listen_port is not listed in min box show --network — an allowed dynamic ingress request must show its mapping (NET-044)"
+    echo "--- min box show --network ---"; printf '%s\n' "${lp_policy:-<no answer>}"
     fail
   fi
-  echo "listen: the in-range listen on port $lp_listen_port is listed as published in min session policy (NET-044)"
+  echo "listen: the in-range listen on port $lp_listen_port is listed as published in min box show --network (NET-044)"
 
   if [ -n "$lp_live" ] && [ -n "$lp_peer_host" ]; then
   # ---- reach: the peer, polled — the watcher publishes within its own poll
@@ -27514,7 +27514,7 @@ PY
   # reading at all, so only an answer that names the box ends the poll.
   lp_unlisted=""
   for _ in $(seq 1 16); do
-    lp_policy="$(mnl session policy "$lp_sid" 2>/dev/null || true)"
+    lp_policy="$(mnl box show "$lp_sid" --network 2>/dev/null || true)"
     if [ -n "$lp_policy" ]; then
       case "$lp_policy" in
         *":$lp_listen_port → :$lp_listen_port"*) ;;
@@ -27524,8 +27524,8 @@ PY
     sleep 0.25
   done
   if [ -z "$lp_unlisted" ]; then
-    echo "::error::min session policy still lists port $lp_listen_port after its listener closed — the row must go with the publication (NET-044)"
-    echo "--- min session policy ---"; printf '%s\n' "${lp_policy:-<no answer>}"
+    echo "::error::min box show --network still lists port $lp_listen_port after its listener closed — the row must go with the publication (NET-044)"
+    echo "--- min box show --network ---"; printf '%s\n' "${lp_policy:-<no answer>}"
     fail
   fi
   echo "policy, after the close: port $lp_listen_port is no longer listed (NET-044)"
@@ -27740,7 +27740,7 @@ eib_vm_ask_legs() {
     *"dynamic ingress is denied for this box"*) ;;
     *) echo "::error::the answered-no refusal does not say dynamic ingress is denied (got: '$err')"; fail ;;
   esac
-  policy="$(mnl session policy "$no_sid" 2>/dev/null)" || true
+  policy="$(mnl box show "$no_sid" --network 2>/dev/null)" || true
   case "$policy" in
     *"live ingress (published at runtime)"*)
       echo "::error::the answered-no ask box lists a live ingress row on a VM lane — a deny records nothing"
@@ -28245,12 +28245,12 @@ proof_expose_from_inside_box() {
     # The publish listed beside the declaration, read the way a person reads
     # it (NET-044): one live row for the port. The row's trailing text is
     # printed as evidence, not asserted.
-    eib_policy="$(mnl session policy "$eib_allow_sid" 2>"$WORK/eib-vm-allow-policy.err")" \
-      || { echo "::error::'min session policy' failed for the allow box on a VM lane"; cat "$WORK/eib-vm-allow-policy.err" 2>/dev/null || true; fail; }
-    echo "--- min session policy (text, the allow box, VM lane) ---"; printf '%s\n' "$eib_policy" | sed 's/^/  /'
+    eib_policy="$(mnl box show "$eib_allow_sid" --network 2>"$WORK/eib-vm-allow-policy.err")" \
+      || { echo "::error::'min box show --network' failed for the allow box on a VM lane"; cat "$WORK/eib-vm-allow-policy.err" 2>/dev/null || true; fail; }
+    echo "--- min box show --network (text, the allow box, VM lane) ---"; printf '%s\n' "$eib_policy" | sed 's/^/  /'
     eib_policy_row="$(printf '%s\n' "$eib_policy" | grep -F ":$eib_port → :$eib_port" | head -n1)"
     if [ -z "$eib_policy_row" ]; then
-      echo "::error::min session policy lists no live row for :$eib_port on a VM lane — the runtime publish is not listed beside the declaration (NET-044)"
+      echo "::error::min box show --network lists no live row for :$eib_port on a VM lane — the runtime publish is not listed beside the declaration (NET-044)"
       fail
     fi
     echo "policy (text): one live row for :$eib_port (NET-044); observed: $eib_policy_row"
@@ -28302,8 +28302,8 @@ proof_expose_from_inside_box() {
     # in the box's own listing and an empty runtime set in the host-held row.
     # The decision itself still crosses the report door (NET-046), so the host
     # audit holds exactly one expose_decision line for it.
-    eib_policy="$(mnl session policy "$eib_deny_sid" 2>"$WORK/eib-vm-deny-policy.err")" \
-      || { echo "::error::'min session policy' failed for the deny box on a VM lane"; cat "$WORK/eib-vm-deny-policy.err" 2>/dev/null || true; fail; }
+    eib_policy="$(mnl box show "$eib_deny_sid" --network 2>"$WORK/eib-vm-deny-policy.err")" \
+      || { echo "::error::'min box show --network' failed for the deny box on a VM lane"; cat "$WORK/eib-vm-deny-policy.err" 2>/dev/null || true; fail; }
     case "$eib_policy" in
       *"live ingress (published at runtime)"*)
         echo "::error::the deny box lists a live ingress row — a stance that refuses every ask must record nothing (NET-044)"
@@ -28832,12 +28832,12 @@ PY
   # The publish listed beside the declaration, read the way a person reads it
   # (NET-044): one live row for the port, with no pending caveat — the
   # publish admitted the port at the gate.
-  eib_policy="$(mnl session policy "$eib_allow_sid" 2>"$WORK/eib-allow-policy.err")" \
-    || { echo "::error::'min session policy' failed for the allow box"; cat "$WORK/eib-allow-policy.err" 2>/dev/null || true; eib_restore_log; fail; }
-  echo "--- min session policy (text, the allow box) ---"; printf '%s\n' "$eib_policy" | sed 's/^/  /'
+  eib_policy="$(mnl box show "$eib_allow_sid" --network 2>"$WORK/eib-allow-policy.err")" \
+    || { echo "::error::'min box show --network' failed for the allow box"; cat "$WORK/eib-allow-policy.err" 2>/dev/null || true; eib_restore_log; fail; }
+  echo "--- min box show --network (text, the allow box) ---"; printf '%s\n' "$eib_policy" | sed 's/^/  /'
   eib_policy_row="$(printf '%s\n' "$eib_policy" | grep -F ":$eib_port → :$eib_port" | head -n1)"
   case "$eib_policy_row" in
-    "") echo "::error::min session policy lists no live row for :$eib_port — the runtime publish is not listed beside the declaration (NET-044)"
+    "") echo "::error::min box show --network lists no live row for :$eib_port — the runtime publish is not listed beside the declaration (NET-044)"
       eib_restore_log
       fail
       ;;
@@ -29032,9 +29032,9 @@ exit' E2E_PTY_ASK=deny \
     *) echo "::error::the answered-no refusal does not say dynamic ingress is denied for the box (got: '$eib_err')"; eib_restore_log; fail ;;
   esac
   echo "the attached human's deny refused the publish: $eib_err (NET-045)"
-  eib_policy="$(mnl session policy "$eib_no_sid" 2>"$WORK/eib-no-policy.err")" \
-    || { echo "::error::'min session policy' failed for the second ask box"; cat "$WORK/eib-no-policy.err" 2>/dev/null || true; eib_restore_log; fail; }
-  echo "--- min session policy (text, the second ask box) ---"; printf '%s\n' "$eib_policy" | sed 's/^/  /'
+  eib_policy="$(mnl box show "$eib_no_sid" --network 2>"$WORK/eib-no-policy.err")" \
+    || { echo "::error::'min box show --network' failed for the second ask box"; cat "$WORK/eib-no-policy.err" 2>/dev/null || true; eib_restore_log; fail; }
+  echo "--- min box show --network (text, the second ask box) ---"; printf '%s\n' "$eib_policy" | sed 's/^/  /'
   case "$eib_policy" in
     *"live ingress (published at runtime)"*)
       echo "::error::the answered-no ask box lists a live ingress row — a publish the human denied must record nothing (NET-044)"
@@ -31743,10 +31743,10 @@ while True:
 # through `min` alone:
 #
 #   * `min ls` lists every box on every VM. Its ADDRESS cell is the address
-#     the box's own `min net expose` reply names, and `min session policy`
+#     the box's own `min net expose` reply names, and `min box show --network`
 #     lists the same address under live ingress. Its EGRESS cell is the
-#     posture `min session policy` prints, in the same words.
-#   * `min session policy <box>` and `min net forward <box>` find the named
+#     posture `min box show --network` prints, in the same words.
+#   * `min box show <box> --network` and `min net forward <box>` find the named
 #     VM's box from its name alone, with no `--vm`, and the forward relays.
 #   * a name no VM holds is refused with the `--vm` form of the command, and
 #     a box on a stopped VM is refused with the command that starts the VM.
@@ -32055,7 +32055,7 @@ for row in lines:
   fi
   echo "check: ADDRESS for $lt_b is $lt_addr_b, the address its expose reply named"
 
-  # ---- `min session policy`, no --vm: the same address and egress ---------
+  # ---- `min box show --network`, no --vm: the same address and egress ---------
   # The EGRESS cell is the policy's posture in the policy's words, and a
   # `; per-box enforcement <x>` suffix is the policy's own row of that name.
   lt_egress_matches_policy() {
@@ -32075,30 +32075,30 @@ for row in lines:
       case "$posture" in
         "subnets "*) ;;
         *)
-          echo "::error::min ls shows EGRESS 'declared rules' for $box, but the egress block of min session policy opens with '${posture:-<no egress block>}', not a subnets rule row"
+          echo "::error::min ls shows EGRESS 'declared rules' for $box, but the egress block of min box show --network opens with '${posture:-<no egress block>}', not a subnets rule row"
           printf '%s\n' "$policy"
           lt_fail
           ;;
       esac
-      echo "check: EGRESS for $box is 'declared rules', and min session policy lists its rules, first '$posture'"
+      echo "check: EGRESS for $box is 'declared rules', and min box show --network lists its rules, first '$posture'"
     else
       if [ "$posture" != "$words" ]; then
-        echo "::error::min ls shows EGRESS '$words' for $box, but min session policy says '${posture:-<no egress block>}'"
+        echo "::error::min ls shows EGRESS '$words' for $box, but min box show --network says '${posture:-<no egress block>}'"
         printf '%s\n' "$policy"
         lt_fail
       fi
-      echo "check: EGRESS for $box is '$words', the posture min session policy prints"
+      echo "check: EGRESS for $box is '$words', the posture min box show --network prints"
     fi
     if [[ "$cell" == *"; per-box enforcement "* ]]; then
       enforcement="${cell##*; per-box enforcement }"
       lt_want_line "policy for $box names per-box enforcement $enforcement" "per-box enforcement  $enforcement" "$policy"
     fi
   }
-  lt_run policy-a mnl session policy "$lt_a"
-  lt_want_rc ok "min session policy $lt_a"
+  lt_run policy-a mnl box show "$lt_a" --network
+  lt_want_rc ok "min box show $lt_a --network"
   lt_egress_matches_policy "$lt_a" "$lt_egress_a" "$LT_OUT"
-  lt_run policy-b mnl session policy "$lt_b"
-  lt_want_rc ok "min session policy $lt_b, with no --vm, for a box on VM $lt_vm"
+  lt_run policy-b mnl box show "$lt_b" --network
+  lt_want_rc ok "min box show $lt_b --network, with no --vm, for a box on VM $lt_vm"
   lt_egress_matches_policy "$lt_b" "$lt_egress_b" "$LT_OUT"
   lt_want_line "policy for $lt_b lists the exposed port at the ADDRESS min ls shows" "$lt_addr:$lt_port" "$LT_OUT"
 
@@ -32144,12 +32144,12 @@ for row in lines:
   TWO_VM_FWD_PID=""
 
   # ---- a name no VM holds -------------------------------------------------
-  lt_run unknown mnl session policy "$lt_nobody"
-  lt_want_rc refused "min session policy $lt_nobody"
-  lt_want_line "the unknown-box refusal says no running VM has the box" \
-    "no running VM has a box named '$lt_nobody'." "$LT_ERR"
-  lt_want_line "the unknown-box refusal shows the --vm form of the command" \
-    "min --vm <vm> session policy $lt_nobody" "$LT_ERR"
+  lt_run unknown mnl box show "$lt_nobody" --network
+  lt_want_rc refused "min box show $lt_nobody --network"
+  lt_want_line "the unknown-box refusal says no box has the name" \
+    "No box named $lt_nobody." "$LT_ERR"
+  lt_want_line "the unknown-box refusal names the command that lists every box" \
+    "Run \`min box list --all\` to see the boxes of every project." "$LT_ERR"
 
   # ---- the expose refusals inside the box ---------------------------------
   lt_run expose-public lt_mn session exec "$lt_b_sid" "/usr/bin/min net expose --public $lt_port"
@@ -32242,8 +32242,8 @@ $LT_ERR"
     printf '%s\n' "$LT_OUT"
     lt_fail
   fi
-  lt_run policy-stopped mnl session policy "$lt_b"
-  lt_want_rc refused "min session policy $lt_b, with VM $lt_vm stopped"
+  lt_run policy-stopped mnl box show "$lt_b" --network
+  lt_want_rc refused "min box show $lt_b --network, with VM $lt_vm stopped"
   lt_want_line "the stopped-VM refusal names the box and its VM" \
     "box '$lt_b' is on VM '$lt_vm', which is stopped." "$LT_ERR"
   lt_want_line "the stopped-VM refusal gives the command that starts the VM" \
@@ -32623,7 +32623,7 @@ PY
   if [ -z "$opened" ]; then
     echo "::error::the host never opened an echoing connection to $a_addr:$port, the port box $a_name's listener published"
     cat "$conn_out" 2>/dev/null || true
-    mnl session policy "$a_sid" 2>&1 || true
+    mnl box show "$a_sid" --network 2>&1 || true
     fail
   fi
   echo "connection: host -> $a_addr:$port open, echo answered"
@@ -32646,7 +32646,7 @@ PY
       echo "::error::the host connection through port $port stayed open after the port was withdrawn: the withdrawal must close the connections it accepted"
       echo "--- in box: TCP sockets on port $port ---"
       mnl session exec "$a_sid" "grep -i ':$(printf '%04X' "$port") ' /proc/net/tcp" 2>&1 || true
-      mnl session policy "$a_sid" 2>&1 || true
+      mnl box show "$a_sid" --network 2>&1 || true
       fail
       ;;
   esac

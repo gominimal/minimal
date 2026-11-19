@@ -132,7 +132,8 @@ no check, because nothing reports a box's injected environment yet
 traced command ran through `minvmd` to `vm.boot` with `libkrun`, and the
 boot line was byte-identical with telemetry off. That run found a TEL-032
 bug, a task that held the start phase open past READY, which is fixed and
-has a unit test. No repeatable macOS VM lane exists yet (minimal#2037).
+has a unit test. The macOS CI workflow's end-to-end job now boots VMs on
+arm64, and its VM test checks that the start phase is exported at READY.
 
 ### Opt-in and switches (Story 3)
 
@@ -541,6 +542,7 @@ has a unit test. No repeatable macOS VM lane exists yet (minimal#2037).
             crates/minvmd/tests/otel_integration.rs::a_minvmd_root_span_is_a_child_of_the_callers_traceparent;
             crates/minvmd/tests/otel_integration.rs::without_a_traceparent_minvmd_starts_its_own_trace;
             crates/minvmd/tests/otel_integration.rs::a_stop_is_a_vm_stop_span_under_the_minvmd_root;
+            crates/minvmd/tests/otel_integration.rs::a_boot_and_stop_share_one_trace_with_the_guest_daemon;
             crates/minvmd/src/rpc_client.rs::guest_shutdown_opens_before_the_guest_is_dialed
   lab:      715 (boot), 715c (stop)
 - **TEL-033** WHILE telemetry is enabled on the host THE SYSTEM SHALL put on the
@@ -942,9 +944,9 @@ id.
 Platforms. The same code runs on Linux (native `minimald`, and `minvmd` with
 KVM) and on macOS (`minvmd` with the Hypervisor framework, and the daemon as
 the guest's `/init`). The lab proves every requirement above on Linux, on
-four distributions with Cloud Hypervisor guests. macOS has unit tests and
-one manual end-to-end run on arm64 (2026-10-05). It has no repeatable VM
-lane until gominimal/minimal#2037 adds one.
+four distributions with Cloud Hypervisor guests. macOS has unit tests, one
+manual end-to-end run on arm64 (2026-10-05), and the VM tests the macOS CI
+workflow runs on arm64 with `libkrun`.
 
 The bounds below are the whole cost telemetry can add to a process when the
 collector is down, slow or unreachable. Each bound names the constant it
