@@ -8,7 +8,8 @@
 //! `op::materialize`) and the span it was emitted in; [`FillBody`], the
 //! logger's first processor, then gives the record the body
 //! `<target>::<span name> failed: <error>`, or `<target>: <error>` when there
-//! is no span. The rule
+//! is no span or the span is from another target. The span is the one the
+//! event was emitted in even when the export filter hides it. The rule
 //! is structural, so it applies at every level (`err(level = "warn")` makes
 //! the same record at WARN). The `error` attribute is kept as it is; a record
 //! with a message, or with no string `error` attribute, is not touched.
@@ -65,10 +66,29 @@ where
             self.0.on_event(event, ctx);
             return;
         }
-        put(Some((
-            metadata.target(),
-            ctx.event_span(event).map(|s| s.name()),
-        )));
+        // Not `ctx.event_span`: this layer sits behind the export filter, so
+        // `ctx` looks spans up through it, and a span the filter hides (an
+        // `#[instrument(level = "debug", err)]` function's under the default
+        // `info`) gives way to the nearest ancestor it admits, a caller's span.
+        // The subscriber's current span ignores per-layer filters. An explicit
+        // parent can only be looked up through `ctx`; hidden, it names nothing.
+        let span = if event.is_root() {
+            None
+        } else if event.is_contextual() {
+            ctx.current_span().metadata()
+        } else {
+            event
+                .parent()
+                .and_then(|id| ctx.span(id))
+                .map(|s| s.metadata())
+        };
+        // `#[instrument]` gives its span and its `err` event the same target.
+        // A span from another module is a caller's (the function's own span
+        // was never created), so the body names no span rather than that one.
+        let span = span
+            .filter(|s| s.target() == metadata.target())
+            .map(|s| s.name());
+        put(Some((metadata.target(), span)));
         let _reset = Reset;
         self.0.on_event(event, ctx);
     }
@@ -161,21 +181,41 @@ mod tests {
     use opentelemetry::logs::AnyValue;
     use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
     use opentelemetry_sdk::logs::{InMemoryLogExporter, SdkLoggerProvider};
+    use tracing::level_filters::LevelFilter;
+    use tracing_subscriber::layer::Identity;
     use tracing_subscriber::prelude::*;
 
     /// Runs `f` under the export stack as `log_layer` builds it (the wrapper
-    /// in front of the bridge, [`super::FillBody`] first) and returns each
-    /// exported record's body and `error` attribute.
+    /// in front of the bridge behind a per-layer filter, `info` as
+    /// `MINIMAL_OTEL_FILTER` defaults to, and [`super::FillBody`] first) and
+    /// returns each exported record's body and `error` attribute.
     fn exported(f: impl FnOnce()) -> Vec<(Option<String>, Option<String>)> {
+        exported_with(false, f)
+    }
+
+    /// [`exported`], and with `debug_elsewhere` another layer that admits
+    /// every level (a console at `RUST_LOG=debug`), so debug spans exist in
+    /// the registry while the export filter still hides them.
+    fn exported_with(
+        debug_elsewhere: bool,
+        f: impl FnOnce(),
+    ) -> Vec<(Option<String>, Option<String>)> {
         let exporter = InMemoryLogExporter::default();
         let provider = SdkLoggerProvider::builder()
             .with_log_processor(super::FillBody)
             .with_simple_exporter(exporter.clone())
             .build();
-        let subscriber = tracing_subscriber::registry().with(super::BodyFromError(
-            OpenTelemetryTracingBridge::new(&provider),
-        ));
-        tracing::subscriber::with_default(subscriber, f);
+        let export = super::BodyFromError(OpenTelemetryTracingBridge::new(&provider))
+            .with_filter(LevelFilter::INFO);
+        if debug_elsewhere {
+            let subscriber = tracing_subscriber::registry()
+                .with(Identity::new().with_filter(LevelFilter::TRACE))
+                .with(export);
+            tracing::subscriber::with_default(subscriber, f);
+        } else {
+            let subscriber = tracing_subscriber::registry().with(export);
+            tracing::subscriber::with_default(subscriber, f);
+        }
         let text = |v: &AnyValue| match v {
             AnyValue::String(s) => s.as_str().to_owned(),
             other => format!("{other:?}"),
@@ -219,6 +259,90 @@ mod tests {
                 (
                     Some("mlog::otel::body::tests: boom".to_owned()),
                     Some("boom".to_owned())
+                ),
+            ]
+        );
+    }
+
+    #[tracing::instrument(level = "debug", err)]
+    fn loads() -> Result<(), String> {
+        Err("bad graph".to_owned())
+    }
+
+    /// A debug-level instrumented function's `err` event is ERROR, so it is
+    /// exported while its span is hidden by the `info` export filter; the
+    /// body still names that function's span, inside an `info` span of the
+    /// caller or under no span at all.
+    #[test]
+    fn a_span_the_export_filter_hides_is_still_the_one_named() {
+        let got = exported_with(true, || {
+            let _in = tracing::info_span!("materialize").entered();
+            assert!(loads().is_err());
+        });
+        let alone = exported_with(true, || assert!(loads().is_err()));
+        let want = (
+            Some("mlog::otel::body::tests::loads failed: bad graph".to_owned()),
+            Some("bad graph".to_owned()),
+        );
+        assert_eq!((got, alone), (vec![want.clone()], vec![want]));
+    }
+
+    /// Control: an info-level function's span passes the export filter and
+    /// is named, inside a caller's span as well, under the same two-layer stack.
+    #[test]
+    fn a_span_the_export_filter_admits_names_itself() {
+        let got = exported_with(true, || {
+            let _in = tracing::info_span!("materialize").entered();
+            assert!(fails().is_err());
+        });
+        assert_eq!(
+            got,
+            vec![(
+                Some("mlog::otel::body::tests::fails failed: disk full".to_owned()),
+                Some("disk full".to_owned())
+            )]
+        );
+    }
+
+    /// With no layer admitting debug the function's span is never created,
+    /// so the current span is the caller's. One from another module is not
+    /// named as the failing function; the body falls back to `<target>: <error>`.
+    #[test]
+    fn a_callers_span_from_another_module_is_not_named() {
+        let got = exported_with(false, || {
+            let _in = tracing::info_span!(target: "op::materialize", "materialize").entered();
+            assert!(loads().is_err());
+        });
+        assert_eq!(
+            got,
+            vec![(
+                Some("mlog::otel::body::tests: bad graph".to_owned()),
+                Some("bad graph".to_owned())
+            )]
+        );
+    }
+
+    /// Control: an explicit parent is named when the export filter admits
+    /// it, and names nothing (not some other span) when the filter hides it.
+    #[test]
+    fn an_explicit_parent_is_named_only_when_admitted() {
+        let got = exported_with(true, || {
+            let shown = tracing::info_span!("step");
+            let hidden = tracing::debug_span!("load");
+            let _in = tracing::info_span!("outer").entered();
+            tracing::error!(parent: &shown, error = "a");
+            tracing::error!(parent: &hidden, error = "b");
+        });
+        assert_eq!(
+            got,
+            vec![
+                (
+                    Some("mlog::otel::body::tests::step failed: a".to_owned()),
+                    Some("a".to_owned())
+                ),
+                (
+                    Some("mlog::otel::body::tests: b".to_owned()),
+                    Some("b".to_owned())
                 ),
             ]
         );
