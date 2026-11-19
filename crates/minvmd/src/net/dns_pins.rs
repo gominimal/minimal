@@ -1666,19 +1666,25 @@ pub(crate) fn dns_query_refusal(
 }
 
 /// The host-side DNS gate's rule for a UDP frame to a decided row's
-/// resolver whose datagram cannot be read ([`udp_datagram`] yields `None`
-/// though `pkt` parsed): nothing proves what it names, so `Some` is the
-/// drop, as for a datagram that does not parse as a DNS message. `None`
-/// for every frame [`dns_query_refusal`] does not decide.
+/// resolver whose datagram cannot be read ([`udp_datagram`] yields `None`,
+/// whether or not the frame's UDP header is whole): nothing proves what it
+/// names, so `Some` is the drop, as for a datagram that does not parse as a
+/// DNS message. It reads the frame's summary (source, destination, protocol
+/// and destination port), so a UDP header too short for [`parse_ipv4_l4`]
+/// is decided too. `None` for every frame [`dns_query_refusal`] does not
+/// decide.
 pub(crate) fn unreadable_datagram_refusal(
     table: &BoxTable,
-    pkt: &L4Packet,
+    src: [u8; 4],
+    dst: [u8; 4],
+    proto: u8,
+    dst_port: u16,
 ) -> Option<DnsQueryRefusal> {
-    if pkt.proto != IPPROTO_UDP {
+    if proto != IPPROTO_UDP {
         return None;
     }
     Some(DnsQueryRefusal {
-        record: decided_row(table, pkt)?,
+        record: decided_row_at(table, src, dst, dst_port)?,
         name: "<unparseable>".to_string(),
         query_type: None,
     })
@@ -1689,13 +1695,28 @@ pub(crate) fn unreadable_datagram_refusal(
 /// or one that declared `allow_dns_hosts`, sending to its own resolver's
 /// port. `None` for every other frame.
 fn decided_row(table: &BoxTable, pkt: &L4Packet) -> Option<Arc<BoxRecord>> {
-    if pkt.dst.port() != DNS_PORT {
+    decided_row_at(
+        table,
+        pkt.src.ip().octets(),
+        pkt.dst.ip().octets(),
+        pkt.dst.port(),
+    )
+}
+
+/// [`decided_row`] from the frame's addresses and destination port.
+fn decided_row_at(
+    table: &BoxTable,
+    src: [u8; 4],
+    dst: [u8; 4],
+    dst_port: u16,
+) -> Option<Arc<BoxRecord>> {
+    if dst_port != DNS_PORT {
         return None;
     }
     table
-        .by_source(pkt.src.ip().octets())
+        .by_source(src)
         .filter(|record| record.is_deny_all() || !record.allow_dns_hosts().is_empty())
-        .filter(|record| pkt.dst.ip().octets() == record.egress().resolver())
+        .filter(|record| dst == record.egress().resolver())
 }
 
 /// The host-side DNS gate's rule for one DNS message from `record`, over
@@ -1948,10 +1969,10 @@ impl TcpDnsAdvance {
 /// bytes. After the release, data on the same port without a new opening
 /// is untracked and dropped, and a new opening starts a fresh reading.
 ///
-/// A full table makes room for an opening from entries idle past the bound:
-/// a clean one is reclaimed as it is, and one that is refused or holds
-/// part of a message is reclaimed with a reset written on before the
-/// opening. The opening gives them up only once it and every such reset
+/// A full table makes room for an opening by giving up one entry idle past
+/// the bound: a clean one, reclaimed as it is, when there is one;
+/// otherwise one that is refused or holds part of a message, reclaimed
+/// with a reset written on before the opening. The opening gives them up only once it and every such reset
 /// are written on, so an opening the switch never receives leaves the
 /// table as it was.
 #[derive(Default)]
@@ -2032,15 +2053,26 @@ impl DnsTcpStreams {
             let mut reclaimed = Vec::new();
             let mut resets = Vec::new();
             if others >= MAX_TCP_DNS_FLOWS {
-                for (tracked, flow) in &self.flows {
-                    if *tracked != key && flow.idle(now) {
-                        reclaimed.push(*tracked);
-                        if !flow.clean() {
-                            resets.push(flow.reset_frame());
-                        }
+                // Only as many idle entries as admit the opening, clean ones
+                // first, so a reset goes on only when no clean idle entry is
+                // left to give up.
+                let needed = others + 1 - MAX_TCP_DNS_FLOWS;
+                let idle = || {
+                    self.flows
+                        .iter()
+                        .filter(|(tracked, flow)| **tracked != key && flow.idle(now))
+                };
+                for (tracked, flow) in idle()
+                    .filter(|(_, flow)| flow.clean())
+                    .chain(idle().filter(|(_, flow)| !flow.clean()))
+                    .take(needed)
+                {
+                    reclaimed.push(*tracked);
+                    if !flow.clean() {
+                        resets.push(flow.reset_frame());
                     }
                 }
-                if others - reclaimed.len() >= MAX_TCP_DNS_FLOWS {
+                if reclaimed.len() < needed {
                     return refused("<too many open connections>");
                 }
             }
@@ -4826,7 +4858,7 @@ pub(crate) mod tests {
     /// idle bound. Past the bound the reset, once written on, releases the
     /// entry, and data on the port without a new opening is dropped. A full
     /// table of refused entries refuses an opening within the bound; past
-    /// it, the opening reclaims them with a reset for each, and a declared
+    /// it, the opening reclaims one of them with its reset, and a declared
     /// lookup on it passes.
     #[test]
     fn refused_tcp_entry_is_kept_until_its_idle_bound() {
@@ -4940,8 +4972,8 @@ pub(crate) mod tests {
             "an opening over refused entries within their bound is refused"
         );
 
-        // Past the bound the opening reclaims them, a reset for each, and a
-        // declared lookup on it passes.
+        // Past the bound the opening reclaims one of them, with its reset,
+        // and a declared lookup on it passes.
         let advance = forwarded(decide_tcp(
             &mut streams,
             &table,
@@ -4951,8 +4983,8 @@ pub(crate) mod tests {
         ));
         assert_eq!(
             advance.resets().len(),
-            MAX_TCP_DNS_FLOWS,
-            "each refused entry the opening reclaims is reset"
+            1,
+            "the one refused entry the opening reclaims is reset"
         );
         for reset in advance.resets() {
             let parsed = crate::net::forward_revoke::parse_tcp_segment(reset)
@@ -4960,7 +4992,11 @@ pub(crate) mod tests {
             assert_reset_at(reset, parsed.src_port, 5001);
         }
         streams.commit(advance);
-        assert_eq!(streams.flows.len(), 1, "only the new opening is tracked");
+        assert_eq!(
+            streams.flows.len(),
+            MAX_TCP_DNS_FLOWS,
+            "the opening took the one reclaimed entry's place"
+        );
         let advance = forwarded(decide_tcp(
             &mut streams,
             &table,
@@ -4973,7 +5009,7 @@ pub(crate) mod tests {
 
     /// NET-141 over TCP, stalled entries: a full table of entries that each
     /// hold one byte of a message refuses an opening within the idle bound.
-    /// Past the bound the opening reclaims them with a reset for each at its
+    /// Past the bound the opening reclaims one of them with a reset at its
     /// next undecided byte, so a box's stalled connections never hold its
     /// DNS over TCP shut.
     #[test]
@@ -5023,8 +5059,8 @@ pub(crate) mod tests {
         ));
         assert_eq!(
             advance.resets().len(),
-            MAX_TCP_DNS_FLOWS,
-            "each stalled entry the opening reclaims is reset"
+            1,
+            "the one stalled entry the opening reclaims is reset"
         );
         for reset in advance.resets() {
             let parsed = crate::net::forward_revoke::parse_tcp_segment(reset)
@@ -5036,7 +5072,11 @@ pub(crate) mod tests {
             assert_reset_at(reset, parsed.src_port, 1002);
         }
         streams.commit(advance);
-        assert_eq!(streams.flows.len(), 1, "only the new opening is tracked");
+        assert_eq!(
+            streams.flows.len(),
+            MAX_TCP_DNS_FLOWS,
+            "the opening took the one reclaimed entry's place"
+        );
     }
 
     /// NET-141 over TCP, retransmissions: a frame carrying bytes before the
@@ -5236,8 +5276,68 @@ pub(crate) mod tests {
         streams.commit(advance);
         assert_eq!(
             streams.flows.len(),
-            1,
-            "the committed opening reclaimed every idle entry"
+            MAX_TCP_DNS_FLOWS,
+            "the committed opening reclaimed one idle entry"
         );
+        assert!(
+            streams.flows.contains_key(&(LEASE, 44000)),
+            "the committed opening is tracked"
+        );
+    }
+
+    /// NET-141 over TCP, a full table: an opening past the idle bound gives
+    /// up a clean idle entry before a refused one, so a table holding one
+    /// clean idle entry and refused idle ones admits it with no reset, and
+    /// every refused entry stays.
+    #[test]
+    fn a_full_table_reclaims_a_clean_entry_before_a_refused_one() {
+        use super::{DnsTcpStreams, MAX_TCP_DNS_FLOWS, TCP_DNS_FLOW_IDLE, TcpDnsVerdict};
+
+        const SYN: u8 = 0x02;
+        const PSH_ACK: u8 = 0x18;
+        let registry = weather_box();
+        let table = registry.table();
+        let mut streams = DnsTcpStreams::default();
+        let now = Instant::now();
+        let later = now + TCP_DNS_FLOW_IDLE + Duration::from_secs(1);
+        let unmatched = tcp_dns_message(&dns_query_of(&[(qname("example.org."), RecordType::A)]));
+        let full = u16::try_from(MAX_TCP_DNS_FLOWS).expect("fits");
+        // One clean entry, then refused ones up to the bound.
+        let advance = forwarded(decide_tcp(&mut streams, &table, (48000, SYN, 1000), &[], now));
+        streams.commit(advance);
+        for port in 48001..48000 + full {
+            let advance = forwarded(decide_tcp(&mut streams, &table, (port, SYN, 1000), &[], now));
+            streams.commit(advance);
+            assert!(
+                matches!(
+                    decide_tcp(&mut streams, &table, (port, PSH_ACK, 1001), &unmatched, now),
+                    TcpDnsVerdict::Reset { release: None, .. }
+                ),
+                "the unmatched query is refused"
+            );
+        }
+        assert_eq!(streams.flows.len(), MAX_TCP_DNS_FLOWS, "the table is full");
+
+        let advance = forwarded(decide_tcp(
+            &mut streams,
+            &table,
+            (49000, SYN, 1000),
+            &[],
+            later,
+        ));
+        assert!(
+            advance.resets().is_empty(),
+            "the clean idle entry is reclaimed without a reset"
+        );
+        streams.commit(advance);
+        assert!(
+            !streams.flows.contains_key(&(LEASE, 48000)),
+            "the clean entry gave its place to the opening"
+        );
+        assert!(
+            (48001..48000 + full).all(|port| streams.flows.contains_key(&(LEASE, port))),
+            "every refused entry stays"
+        );
+        assert!(streams.flows.contains_key(&(LEASE, 49000)), "the opening is tracked");
     }
 }

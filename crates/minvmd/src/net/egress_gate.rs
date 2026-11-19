@@ -5489,10 +5489,19 @@ async fn relay_frames_to_switch(
             continue;
         }
         // A UDP frame to that resolver whose datagram cannot be read is
-        // dropped the same way: nothing proves what it names.
+        // dropped the same way: nothing proves what it names. It is read
+        // from the frame's summary, so a UDP header too short to parse is
+        // decided too.
         if dns.is_none()
-            && let Some(pkt) = l4.as_ref()
-            && let Some(refusal) = dns_pins::unreadable_datagram_refusal(table, pkt)
+            && let (Some(src), Some(dst), Some(proto)) =
+                (summary.source(), summary.destination(), summary.protocol())
+            && let Some(refusal) = dns_pins::unreadable_datagram_refusal(
+                table,
+                src,
+                dst,
+                proto,
+                summary.destination_port(),
+            )
         {
             limiter.warn_refused_dns_query(&refusal);
             continue;
@@ -5558,36 +5567,39 @@ async fn relay_frames_to_switch(
             }
         }
         // An opening that reclaims entries of connections it must reset
-        // writes those resets on first. A reset the queue has no room for
-        // drops the opening too, so no entry is given up without its reset.
-        if let Some(advance) = dns_tcp_advance.as_ref() {
-            let mut queued = true;
-            for reset in advance.resets() {
+        // writes those resets on first. The queue space for the resets and
+        // the opening is reserved together, without waiting: when it has no
+        // room for all of them, none is written on and no entry is given
+        // up.
+        let mut frame_permit = None;
+        if let Some(advance) = dns_tcp_advance.as_ref()
+            && !advance.resets().is_empty()
+        {
+            let mut permits = match switch.try_reserve_many(advance.resets().len() + 1) {
+                Ok(permits) => permits,
+                Err(mpsc::error::TrySendError::Full(())) => {
+                    limiter.warn_backpressure(
+                        QueueDirection::TowardSwitch,
+                        summary.source(),
+                        Who::of(table, summary.source()),
+                    );
+                    continue;
+                }
+                Err(mpsc::error::TrySendError::Closed(())) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "the relay's switch writer is gone",
+                    ));
+                }
+            };
+            // The resets lead the zip so it never takes a permit past them.
+            for (reset, permit) in advance.resets().iter().zip(permits.by_ref()) {
                 let mut framed = Vec::with_capacity(2 + reset.len());
                 framed.extend_from_slice(&(reset.len() as u16).to_le_bytes());
                 framed.extend_from_slice(reset);
-                match switch.try_send(framed) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        limiter.warn_backpressure(
-                            QueueDirection::TowardSwitch,
-                            summary.source(),
-                            Who::of(table, summary.source()),
-                        );
-                        queued = false;
-                        break;
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::ConnectionAborted,
-                            "the relay's switch writer is gone",
-                        ));
-                    }
-                }
+                permit.send(framed);
             }
-            if !queued {
-                continue;
-            }
+            frame_permit = permits.next();
         }
         // One combined write keeps the length prefix and the frame together
         // even if the switch closes between two writes — and the queue keeps
@@ -5604,7 +5616,14 @@ async fn relay_frames_to_switch(
         let mut framed = Vec::with_capacity(2 + n);
         framed.extend_from_slice(&(n as u16).to_le_bytes());
         framed.extend_from_slice(&frame[..n]);
-        match switch.try_send(framed) {
+        let sent = match frame_permit {
+            Some(permit) => {
+                permit.send(framed);
+                Ok(())
+            }
+            None => switch.try_send(framed),
+        };
+        match sent {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
                 limiter.warn_backpressure(
@@ -21094,6 +21113,18 @@ mod tests {
             expect_frame(&mut h.switch).await,
             marker,
             "the unreadable datagram did not reach the switch; the declared name did"
+        );
+        expect_silence(&mut h.switch).await;
+        // A frame cut inside its UDP header: the destination port is
+        // readable, the header is not whole. It is dropped too.
+        let mut cut = query_from(LEASE, 40006, "example.com.")[..38].to_vec();
+        cut[16..18].copy_from_slice(&24u16.to_be_bytes());
+        send_frame(&mut h.guest, &cut).await;
+        send_frame(&mut h.guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            marker,
+            "the frame cut inside its UDP header did not reach the switch; the declared name did"
         );
         expect_silence(&mut h.switch).await;
         // Nothing was written back toward the guest: the drop is silent.
