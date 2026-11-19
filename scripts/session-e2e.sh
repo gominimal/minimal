@@ -81,7 +81,7 @@
 #   box_exec                         `min box exec`: plain with its exit code,
 #                                    -t on a pty and off one, --detach,
 #                                    --timeout 124, a stopped box refused
-#   attach_ends_on_stop_and_restart  `min box stop` ends an attach with exit
+#   attach_ends_on_stop              `min box stop` ends an attach with exit
 #                                    254 and a line that names the stop, never
 #                                    the shell-exit prompt (#3526). T62
 #                                    (#3635) adds the restart step.
@@ -2281,7 +2281,7 @@ attach_end_wait() {
   fi
 }
 
-proof_attach_ends_on_stop_and_restart() {
+proof_attach_ends_on_stop() {
 # The proof starts a box from the project that this script seeds. A
 # project that E2E_PROJECT_DIR names and that brings its own minimal.toml
 # can declare entries that the start cannot pick, so skip it there.
@@ -33076,7 +33076,7 @@ case "${1:-}" in
     proof_session_exec
     proof_exec_reattach
     proof_box_exec
-    proof_attach_ends_on_stop_and_restart
+    proof_attach_ends_on_stop
     proof_session_rename
     proof_session_outbound_request
     proof_own_ip
@@ -33204,7 +33204,7 @@ case "${1:-}" in
     # rely on the lane's daemon or the host's packet filter as it found them.
     proof_daemon_fetch_under_deny_all_host_address_box
     ;;
-  lifecycle | session_exec | exec_reattach | box_exec | attach_ends_on_stop_and_restart | session_rename | session_outbound_request | own_ip | own_ip_egress_declared_and_enforced | task_run | task_network_inherits_session | hooks \
+  lifecycle | session_exec | exec_reattach | box_exec | attach_ends_on_stop | session_rename | session_outbound_request | own_ip | own_ip_egress_declared_and_enforced | task_run | task_network_inherits_session | hooks \
     | skip_scaffold | tty_relay | sandbox | restart | fresh_install_own_ip_ingress_publishes_loopback \
     | own_ip_box_registers_with_the_vm_host_without_a_provider_flag \
     | vm_host_row_read_tracks_create_and_destroy \
@@ -33285,7 +33285,7 @@ case "${1:-}" in
   *)
     echo "usage: $0 [case]"
     echo "  no argument: every proof, in the whole-lane order"
-    echo "  cases: lifecycle session_exec exec_reattach box_exec attach_ends_on_stop_and_restart session_rename session_outbound_request own_ip own_ip_egress_declared_and_enforced task_run task_network_inherits_session hooks"
+    echo "  cases: lifecycle session_exec exec_reattach box_exec attach_ends_on_stop session_rename session_outbound_request own_ip own_ip_egress_declared_and_enforced task_run task_network_inherits_session hooks"
     echo "         skip_scaffold tty_relay sandbox restart fresh_install_own_ip_ingress_publishes_loopback"
     echo "         own_ip_box_registers_with_the_vm_host_without_a_provider_flag"
     echo "         vm_host_row_read_tracks_create_and_destroy"

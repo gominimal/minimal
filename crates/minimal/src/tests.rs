@@ -865,9 +865,18 @@ const REMOVED_VERB_MARKER: &str = "removed-verb-ok: gominimal/minimal#3589";
 /// page, each as `min ...`. The line is read as words: quotes, backticks
 /// and shell punctuation separate words.
 fn removed_spellings_in_line(line: &str) -> Vec<String> {
-    let spaced: String = line
+    // Each command on the line is read alone, so a flag of one command
+    // never counts for the command before it.
+    line.split([';', '|', '&'])
+        .flat_map(|command| removed_spellings_in_command(line, command))
+        .collect()
+}
+
+/// The removed spellings in one command of `line`.
+fn removed_spellings_in_command(line: &str, command: &str) -> Vec<String> {
+    let spaced: String = command
         .chars()
-        .map(|c| if "`'\"();|&".contains(c) { ' ' } else { c })
+        .map(|c| if "`'\"()".contains(c) { ' ' } else { c })
         .collect();
     let words: Vec<&str> = spaced.split_whitespace().collect();
     let mut found = Vec::new();
@@ -911,7 +920,9 @@ fn removed_spellings_in_line(line: &str) -> Vec<String> {
 
 /// The shell functions in `text` whose body runs `min` or `"$MIN"` with
 /// `"$@"`: the wrappers a script calls `min` by. Each line that runs `min`
-/// with `"$@"` belongs to the nearest function that opens above it.
+/// with `"$@"` belongs to the function that is open at that line. A
+/// function closes at a `}` in the first column, or on its own line when
+/// the whole function is one line.
 fn min_wrappers_in_script(text: &str) -> Vec<(usize, String)> {
     let mut wrappers: Vec<(usize, String)> = Vec::new();
     let mut current: Option<(usize, String)> = None;
@@ -920,14 +931,17 @@ fn min_wrappers_in_script(text: &str) -> Vec<(usize, String)> {
         if trimmed.starts_with('#') {
             continue;
         }
+        let mut one_line_function = false;
         if let Some((name, rest)) = trimmed.split_once("()")
             && !name.is_empty()
             && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
             && rest.trim_start().starts_with('{')
         {
             current = Some((n + 1, name.to_owned()));
+            one_line_function = rest.trim_end().ends_with('}');
         }
         let spaced: String = line
+            .replace("${MIN}", "$MIN")
             .chars()
             .map(|c| if "`'\"();|&{}".contains(c) { ' ' } else { c })
             .collect();
@@ -940,6 +954,9 @@ fn min_wrappers_in_script(text: &str) -> Vec<(usize, String)> {
             if !wrappers.iter().any(|(_, name)| *name == owner.1) {
                 wrappers.push(owner);
             }
+        }
+        if one_line_function || line.starts_with('}') {
+            current = None;
         }
     }
     wrappers
@@ -1021,12 +1038,14 @@ fn scripts_and_cli_reference_use_no_removed_session_verb() {
 fn min_wrappers_in_script_finds_each_form() {
     let script = "mnl() {\n  # min \"$@\" in a comment\n  min ${E2E_MINIMAL_ARGS:-} \"$@\"\n}\n\
                   two() { \"$MIN\" --vm x \"$@\"; }\n\
-                  other() {\n  echo \"$@\"\n}\n";
+                  other() {\n  echo \"$@\"\n}\n\
+                  three() {\n  \"${MIN}\" \"$@\"\n}\n\
+                  min \"$@\"\n";
     let names: Vec<String> = min_wrappers_in_script(script)
         .into_iter()
         .map(|(_, name)| name)
         .collect();
-    assert_eq!(names, ["mnl", "two"]);
+    assert_eq!(names, ["mnl", "two", "three", "<no function>"]);
 }
 
 /// The line reader finds each removed spelling, and passes the verbs that
@@ -1060,6 +1079,7 @@ fn removed_spellings_in_line_reads_each_form() {
             "min task run --path ../proj build",
             vec!["min task run --path"],
         ),
+        ("min task run build; cmd --path x", vec![]),
         ("mnl host stop \"$E2E_HOST\" --force", vec![]),
         ("mnl box stop \"$sid\"", vec![]),
         ("minvmd stop >/dev/null 2>&1", vec![]),
