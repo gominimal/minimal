@@ -108,6 +108,53 @@ pub(crate) fn task_box_spec(
     Some(spec)
 }
 
+/// Puts the `[[file_exports]]` items of the task entry's expansion,
+/// `expanded`, on the task box's `spec` (BOX-203). The expansion holds the
+/// items of `[defaults]` and the task's type too, so the command that waits
+/// for the box copies each of them when the box ends.
+pub(crate) fn take_expanded_exports(spec: &mut mfile::spec::BoxSpec, expanded: &toml::Table) {
+    spec.file_exports = mfile::expand::stored_file_exports(expanded);
+    tracing::debug!(
+        entry = %spec.entry,
+        exports = spec.file_exports.as_ref().map_or(0, Vec::len),
+        "put the expanded task entry's file exports on the box spec"
+    );
+}
+
+/// Puts the stored spec of a task run on `request` (BOX-068). `spec` is
+/// the declared task's spec, `None` for an interactive task. `expanded` is
+/// the task entry's expansion, whose `[[file_exports]]` items the spec takes
+/// (BOX-203). Then each `--vpn-network-names` value, `vpn_network_names`,
+/// goes on the stored spec (BCLI-024). That edits the stored JSON, so it
+/// runs after `put_spec`, and once.
+///
+/// # Errors
+///
+/// Fails when the spec does not encode, or when `vpn_network_names` is not
+/// empty and the task has no spec.
+pub(crate) fn put_task_spec(
+    request: &mut minimald_rpc::CreateSessionRequest,
+    entry: &str,
+    spec: Option<&mut mfile::spec::BoxSpec>,
+    expanded: Option<&toml::Table>,
+    vpn_network_names: &[String],
+) -> Result<(), anyhow::Error> {
+    if let Some(spec) = spec {
+        if let Some(expanded) = expanded {
+            take_expanded_exports(spec, expanded);
+        }
+        crate::put_spec(request, spec)?;
+    } else {
+        // An interactive task sends no spec: the task type denies a
+        // terminal. With no spec to name it, the request carries the
+        // entry's name, cleaned as the daemon cleans a spec's entry.
+        request.config.name = Some(interactive_task_box_name(entry));
+    }
+    // With no spec, a `--vpn-network-names` value has no place to go, so
+    // the helper refuses it rather than drop it.
+    crate::add_vpn_network_names(request, vpn_network_names)
+}
+
 /// The network a run gives task `task`'s box (NET-060), from
 /// [`task_box_network`].
 #[derive(Debug)]
@@ -1557,7 +1604,7 @@ pub(crate) async fn run_entry(
     // channel. The box is marked at create, so a daemon restart before its
     // task starts destroys it rather than resuming it (NET-131). The daemon
     // clears the mark when the task box's entrypoint starts.
-    let spec = task_box_spec(
+    let mut spec = task_box_spec(
         &args.entry,
         &declared,
         crate::spec_flags(&request),
@@ -1572,23 +1619,26 @@ pub(crate) async fn run_entry(
     // `task_box_spec` names the task type, so `min box run` creates a task
     // box too.
     request.config.creating_verb = minimald_rpc::CreatingVerb::Task;
-    // BOX-068: the declared task's spec, with this command's settings. An
-    // interactive task sends none: the task type denies a terminal.
-    if let Some(spec) = &spec {
-        crate::put_spec(&mut request, spec)?;
-    } else {
-        // With no spec to name it, the request carries the entry's name,
-        // cleaned as the daemon cleans a spec's entry.
-        request.config.name = Some(interactive_task_box_name(&args.entry));
-    }
-    // With no spec, a `--vpn-network-names` value has no place to go, so
-    // the helper refuses it rather than drop it.
-    crate::add_vpn_network_names(&mut request, &args.other.vpn_network_names)?;
 
     // Upload per the normal activate rules: tarball sync (the default), the
     // same empty/`$HOME` and non-VCS-root gates, no `--sync` escape hatch.
     let upload_root = crate::resolve_upload_root(&utf8_path)?;
     crate::stamp_project_root(&mut request, &upload_root)?;
+
+    // BOX-068: the task's expanded entry rides on the contribution, and the
+    // daemon composes the project's part of the box from it. One span
+    // covers the expansion and the compose call that sends it.
+    let entry_span = tracing::info_span!("box_entry", box_type = boxes::TASK_BOX_TYPE);
+    let expanded = entry_span.in_scope(|| {
+        crate::task_box_entry(&upload_root, &args.entry, request.config.hooks_enabled)
+    })?;
+    put_task_spec(
+        &mut request,
+        &args.entry,
+        spec.as_mut(),
+        expanded.as_ref().map(|expanded| &expanded.spec),
+        &args.other.vpn_network_names,
+    )?;
 
     // Loadouts and user policy, resolved before the daemon connection so a
     // broken loadout fails loudly client-side, and through the same shared
@@ -1612,15 +1662,7 @@ pub(crate) async fn run_entry(
     let finalize_hook_budget = inputs.hook_budget;
     let mut contribution = inputs.contribution;
     let user_policy = inputs.user_policy;
-    // BOX-068: the task's expanded entry rides on the contribution, and the
-    // daemon composes the project's part of the box from it. One span
-    // covers the expansion and the compose call that sends it.
-    let entry_span = tracing::info_span!("box_entry", box_type = boxes::TASK_BOX_TYPE);
-    contribution.entry = entry_span
-        .in_scope(|| {
-            crate::task_box_entry(&upload_root, &args.entry, request.config.hooks_enabled)
-        })?
-        .map(Box::new);
+    contribution.entry = expanded.map(|expanded| Box::new(expanded.wire));
     // Sent only for a task that declares `inherit_cwd`; any other task
     // starts at the root of the uploaded tree.
     let task_cwd = if declared.inherit_cwd {

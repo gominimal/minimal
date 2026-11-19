@@ -460,6 +460,22 @@ pub fn file_export_paths(spec: &toml::Table) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The `[[file_exports]]` items of an expanded spec or an entry table, as
+/// a stored spec keeps them (BOX-203). `None` when the table has no
+/// `file_exports` list.
+#[must_use]
+pub fn stored_file_exports(spec: &toml::Table) -> Option<Vec<crate::spec::StoredExport>> {
+    spec.get("file_exports")
+        .and_then(toml::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .cloned()
+                .map(crate::spec::StoredExport)
+                .collect()
+        })
+}
+
 /// Whether an export path stays inside the project root and names
 /// something below it: not absolute, no `..` component, and not the root
 /// itself (BOX-189).

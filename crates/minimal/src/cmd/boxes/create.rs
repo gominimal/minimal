@@ -1918,8 +1918,9 @@ pub(crate) fn session_box_expansion(
 }
 
 /// The expanded `[tasks.<task>]` entry of the project at `project`, for the
-/// daemon to compose the task box from (BOX-068). `None` when the project
-/// declares no such entry.
+/// daemon to compose the task box from (BOX-068), with the expanded spec
+/// that the stored spec reads its `[[file_exports]]` from (BOX-203). `None`
+/// when the project declares no such entry.
 ///
 /// # Errors
 ///
@@ -1928,7 +1929,7 @@ pub(crate) fn task_box_entry(
     project: &camino::Utf8Path,
     task: &str,
     hooks_enabled: bool,
-) -> anyhow::Result<Option<boxes::wire::request::WireBoxEntry>> {
+) -> anyhow::Result<Option<BoxEntryExpansion>> {
     let Some(bytes) = project_file_bytes(project)? else {
         return Ok(None);
     };
@@ -1951,7 +1952,7 @@ pub(crate) fn task_box_entry(
         hooks_enabled,
         &SelectedLoadouts::default(),
     )
-    .map(|expanded| Some(expanded.wire))
+    .map(Some)
 }
 
 /// Expands `entry` of the `minimal.toml` in `bytes` over `[defaults]` and
