@@ -261,21 +261,21 @@ impl ProcessBackend for SandboxBackend {
                 code = reason.code,
                 exit_code = ?reason.exit_code,
                 reason = %reason.reason,
-                "hakoniwa container/process exited"
+                "box process exited"
             );
         } else if level == tracing::Level::DEBUG {
             tracing::debug!(
                 code = reason.code,
                 exit_code = ?reason.exit_code,
                 reason = %reason.reason,
-                "session process ended after the daemon killed it"
+                "box process ended after the daemon killed it"
             );
         } else {
             tracing::warn!(
                 code = reason.code,
                 exit_code = ?reason.exit_code,
                 reason = %reason.reason,
-                "session process exited non-zero"
+                "box process exited non-zero"
             );
         }
     }
