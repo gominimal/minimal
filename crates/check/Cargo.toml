@@ -27,5 +27,8 @@ lcache.workspace = true
 op.workspace = true
 ot.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true
