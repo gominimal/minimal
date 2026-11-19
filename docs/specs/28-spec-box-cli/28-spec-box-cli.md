@@ -205,7 +205,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     tier:   T0
     verify: cargo nextest run -p minimal box_spec_entry_override_flags_match_start
 
-- **BCLI-077** WHEN `min box spec <entry>` renders an entry's `vars` and `vars_lenient` THE SYSTEM SHALL render each variable name once, in the table and with the value that BOX-180's merge gives it. Beside each name it SHALL name the layer that set it, as BOX-161 reports.
+- **BCLI-077** WHEN `min box spec <entry>` renders an entry's `env_vars` (BOX-205) THE SYSTEM SHALL render each variable name once, with the value that BOX-180's merge gives it. Beside each name it SHALL name the layer that set it, as BOX-161 reports.
   <!-- event-driven; BOX-180: up to and including the entry, the most specific layer that sets a name wins, and each selected loadout adds the names it sets -->
   tier:     T0
   verify:   cargo nextest run -p minimal box_spec_renders_merged_vars_once_with_layer
@@ -214,14 +214,15 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     tier:   T0
     verify: cargo nextest run -p minimal box_spec_withholds_loadout_set_var_values
 
-- **BCLI-078** IF expanding an entry fails under BOX-172, BOX-174, BOX-181, BOX-182, BOX-183 or BOX-184 THEN THE SYSTEM SHALL fail `min box spec <entry>`, `min box start`, `min box run`, `min session start` and `min task run` with exit 3, and print the error that requirement states. It SHALL create nothing and render nothing.
+- **BCLI-078** IF expanding an entry fails under BOX-172, BOX-174, BOX-181, BOX-182, BOX-183, BOX-206 or BOX-207 THEN THE SYSTEM SHALL fail `min box spec <entry>`, `min box start`, `min box run`, `min session start` and `min task run` with exit 3, and print the error that requirement states. It SHALL create nothing and render nothing.
   <!-- unwanted; spec 29 states each refusal's content, and this requirement binds the commands that print it. What each error tells the person:
        BOX-172: the loadout and the key, that a loadout cannot set `loadout_mode`, and to remove the key from that loadout.
        BOX-174: the key, the value and the layer that set it, and that `sealed` and `open` are the accepted values.
        BOX-181: the type whose constraint holds `loadout_mode`, the key and the layer that set the other value, as BOX-061 names them. The expansion fails before any loadout is read.
        BOX-182: the file and the `ask` rule in the client's `[loadout-file-rules]` that met no terminal. The read is denied.
        BOX-183: the variable and both sources that set it to different resolved values, and the remedy of adding the variable to the `ignore` list of the user policy.
-       BOX-184: the variable and the one layer that sets it twice to different values, in `vars_lenient` or in both `vars` and `vars_lenient` -->
+       BOX-206: the file, the table that sets `vars` or `vars_lenient` as its own key, and the key, and to move the variables to `env_vars`.
+       BOX-207: the variable and the file, and which characters a variable name can hold -->
   tier:     T0
   verify:   cargo nextest run -p minimal expansion_refusals_exit3_on_spec_and_create_verbs
 
@@ -315,9 +316,10 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     tier:   T0
     verify: cargo nextest run -p minimald no_hooks_box_runs_no_hook_on_resume_attach_detach_end
 
-- **BCLI-025** WHEN `min box show <box> --network` runs THE SYSTEM SHALL render the effective `[network]` section from the stored spec.
+- **BCLI-025** WHEN `min box show <box> --network` runs THE SYSTEM SHALL render the box's effective network policy: the ingress and egress rules in force, with the default a box gets where it declares none, and each dynamic ingress mapping the box published while it runs. Under `-o json` it SHALL write the one `min/v1/session-policy` document to stdout in place of the text. IF `-o yaml` comes with `--network` THEN THE SYSTEM SHALL refuse the command with exit 2 and look up no box.
+  <!-- amended by T55: the successor of `min session policy` (BCLI-042), so it renders the policy the gate enforces, not the stored `[network]` TOML section -->
   tier:     T0
-  verify:   cargo nextest run -p minimal box_show_network_renders_effective
+  verify:   cargo nextest run -p minimal box_show_network_renders_effective_policy
 
 ### The command tree, aliases and hosts
 
@@ -671,7 +673,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
 **T31 removes the old session verbs and moves their callers in the same PR.** T31 (gominimal/minimal#2917) removes the spellings BCLI-042 names. In the same PR it moves every requirement, script and doc below that uses one of them, so no caller meets an unknown command. `scripts/session-e2e.sh` is the VM lane's session proof, and BCLI-049's verify line runs it.
 
 - `min session activate`: NET-018, NET-020, NET-035, NET-040, NET-049, NET-051 and NET-122, the last in a sub-bullet's comment. A BOX-001 sub-bullet cites it too. The installer's closing card names `min session activate --attach .` (`docs/specs/07-spec-installer`, R10.4). The lifecycle-hooks spec cites `min session activate --no-hooks` (`docs/specs/11-spec-lifecycle-hooks`), whose new spelling is `min session start --no-hooks` (BCLI-076). Scripts: `scripts/session-e2e.sh`, `scripts/bulk-upload-e2e.sh`, `scripts/stress-session-e2e.sh` and `scripts/kernel-bump-review.sh`.
-- `min session policy`: NET-044, NET-058, NET-061, NET-075, NET-130 (in a sub-bullet's comment), NET-140, NET-146 and a NET-160 sub-bullet's comment, and BEP-085's comment. The draft GWI-003 cites it too. Its successor is `min box show --network` (BCLI-025). Script: `scripts/session-e2e.sh`.
+- `min session policy`: NET-044, NET-058, NET-061, NET-075, NET-130 (in a sub-bullet's comment), NET-140, NET-146 and a NET-160 sub-bullet's comment, and BEP-085's comment. The draft GWI-003 cites it too. Its successor is `min box show <box> --network` (BCLI-025), which renders the same effective policy and the same `-o json` document. T55 moved the steps of `scripts/session-e2e.sh` that read a box's policy to it, and `min session policy` calls the same render until T31 removes it. T60 (gominimal/minimal#3589) moved NET-058 and its two e2e steps to `min box show <box> --network`: the step for a name no VM holds and the step for a box on a stopped VM. T61 (gominimal/minimal#3634) gave the same refusal to the other verbs. Every `min box` verb that takes a box refuses a box on a stopped VM with NET-058's refusal, with exit 4. These verbs are `show`, `spec`, `exec`, `attach`, `rm`, `stop`, `wait`, `events`, `cp`, `rename`, `restart`, `logs` and `prune --parent`. The type-noun forms `min session|task stop`, `rm` and `logs` refuse it the same way. The step for a name no VM holds now checks the box verb's not-found refusal.
 - `min session hooks`: the lifecycle-hooks spec. Its successor is `min box spec <box-id>` (BCLI-022). A caller addresses the box by its id, or by `provider/host/name`, because a bare name reads an entry of the same name first. Script: `scripts/session-e2e.sh`.
 - `min session rename`: no requirement. Script: `scripts/session-e2e.sh`.
 - `min session destroy`: NET-058 and BEP-043. Its successor is `min box rm --force` (BCLI-060), which still stops a live box and fires BEP-043's revoke-on-destroy. Scripts: `scripts/session-e2e.sh`, and `scripts/bulk-upload-e2e.sh`, whose cleanup runs `session destroy --all --force`.

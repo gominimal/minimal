@@ -366,6 +366,30 @@ resolve_prefix() {
     esac
 }
 
+# The data/state/cache directory the runtime itself writes, which --purge
+# removes alongside the resolve_prefix one. Mirrors crates/paths
+# (minimal_data_dir, minimal_state_dir, minimal_cache_dir): an XDG variable
+# counts only when it is an absolute path, as the XDG spec says and the runtime
+# does, and the macOS cache is ~/Library/Caches/minimal whatever XDG_CACHE_HOME
+# says, because the runtime takes it from the platform cache directory.
+runtime_dir() {
+    case "$1" in
+        data)  _rd_xdg="${XDG_DATA_HOME:-}";  _rd_home="$HOME/.local/share" ;;
+        state) _rd_xdg="${XDG_STATE_HOME:-}"; _rd_home="$HOME/.local/state" ;;
+        cache)
+            if [ "$os" = darwin ]; then
+                printf '%s\n' "$HOME/Library/Caches/minimal"
+                return 0
+            fi
+            _rd_xdg="${XDG_CACHE_HOME:-}"; _rd_home="$HOME/.cache" ;;
+        *)     die "unknown runtime dir token: $1" ;;
+    esac
+    case "$_rd_xdg" in
+        /*) printf '%s\n' "$_rd_xdg/minimal" ;;
+        *)  printf '%s\n' "$_rd_home/minimal" ;;
+    esac
+}
+
 # The bin prefix, resolved once. Needed early: the pre-upgrade daemon stop
 # runs the `min` already installed there, before the component loop
 # replaces it.
@@ -503,7 +527,11 @@ maybe_remove_finalize_install() {
     done
     _ns_rm="$_ns_rm $(shq "$_ns_chan")"
     if [ "$os" = darwin ]; then
-        _ns_undo="sudo launchctl bootout system/dev.gominimal.zone; sudo launchctl bootout system/dev.minimal.local-range; sudo launchctl bootout system/dev.gominimal.zone.logcap; sudo rm -f$_ns_rm; sudo rm -rf$_ns_rm_r; sudo rmdir $(shq "${_ns_chan%/*}") $(shq "$_fi_root/Library/Application Support/minimal") 2>/dev/null || true"
+        # The local range unit added 127.0.64.1-254 to lo0. The aliases go
+        # with it, unless a VM is running: its boxes use them. pgrep -q and
+        # bare names keep the line free of unquoted paths. /etc/resolver and
+        # /Library/PrivilegedHelperTools go only when empty (rmdir).
+        _ns_undo="sudo launchctl bootout system/dev.gominimal.zone; sudo launchctl bootout system/dev.minimal.local-range; sudo launchctl bootout system/dev.gominimal.zone.logcap; sudo rm -f$_ns_rm; sudo rm -rf$_ns_rm_r; if pgrep -qx minvmd; then echo 'note: the loopback IPs boxes use stay on lo0 while a VM is running. Stop every VM, then run this line again.' >&2; else i=1; while [ \$i -le 254 ]; do sudo ifconfig lo0 -alias 127.0.64.\$i 2>/dev/null; i=\$((i + 1)); done; fi; sudo rmdir $(shq "${_ns_chan%/*}") $(shq "$_fi_root/Library/Application Support/minimal") $(shq "$_fi_root/etc/resolver") $(shq "$_fi_root/Library/PrivilegedHelperTools") 2>/dev/null || true"
     else
         _ns_undo="sudo systemctl disable --now minzoned.socket minzoned.service; sudo rm -f$_ns_rm; sudo systemctl daemon-reload; sudo systemctl reset-failed minzoned.socket minzoned.service; [ ! -e $(shq "$_fi_root/sys/class/net/minzone0") ] || { sudo resolvectl revert minzone0; sudo ip link del minzone0; }; sudo rmdir $(shq "${_ns_chan%/*}") $(shq "$_lib_dir") 2>/dev/null || true"
     fi
@@ -511,6 +539,7 @@ maybe_remove_finalize_install() {
     # --undo` removes; the manual remedy, one root command line per item.
     _fi_list=
     _fi_owned=
+    _fi_dns=
     _fi_undo=
     _aa_unowned=
     _qb_found=
@@ -518,6 +547,7 @@ maybe_remove_finalize_install() {
         if [ -e "$_fi_root$_ns_p" ]; then
             _fi_list="the host DNS setup ($_ns_p)"
             _fi_owned=1
+            _fi_dns=1
             _fi_undo="      $_ns_undo"
             break
         fi
@@ -647,6 +677,9 @@ maybe_remove_finalize_install() {
     if [ -n "$_fi_owned" ]; then
         say "  \`min finalize-install --undo\` removes what min finalize-install installed, while min"
         say "  is installed. With min gone, remove everything listed with:"
+        if [ "$os" = darwin ] && [ -n "$_fi_dns" ]; then
+            say "  The DNS service (launchd job dev.gominimal.zone) keeps running until these commands run."
+        fi
     else
         say "  it was installed separately with root; remove it too with:"
     fi
@@ -818,16 +851,28 @@ do_uninstall() {
 
     # --purge additionally deletes the minimal-owned trees wholesale (build
     # cache included); they live at fixed .../minimal paths the tool owns. It
-    # never removes files outside those roots.
+    # never removes files outside those roots. Each tree is purged both where
+    # the installer resolves it and where the runtime writes it (runtime_dir):
+    # on macOS the runtime's cache is ~/Library/Caches/minimal, not the
+    # installer's XDG path. Only an absolute .../minimal path is purged, so a
+    # relative XDG value never resolves against the current directory.
     if [ "$uninstall_purge" -eq 1 ]; then
         for p in data state cache; do
-            d="$(resolve_prefix "$p")"
-            [ -d "$d" ] || continue
-            if [ "$dry_run" -eq 1 ]; then
-                say "  would purge $d"
-            else
-                rm -rf "$d"
-            fi
+            _pg_inst="$(resolve_prefix "$p")"
+            _pg_run="$(runtime_dir "$p")"
+            [ "$_pg_run" != "$_pg_inst" ] || _pg_run=
+            for d in "$_pg_inst" "$_pg_run"; do
+                case "$d" in
+                    /*/minimal) ;;
+                    *) continue ;;
+                esac
+                [ -d "$d" ] || continue
+                if [ "$dry_run" -eq 1 ]; then
+                    say "  would purge $d"
+                else
+                    rm -rf "$d"
+                fi
+            done
         done
     fi
 
@@ -1792,15 +1837,44 @@ say "  ${dim}docs.minimal.dev   $sep   discord.com/invite/qgX8sm6X7G$rst"
 # so it lists every field the request sends, as the CLI's own disclosure
 # does, and names the switch. A channel install is told when its channel
 # moves on; a pinned (--version) one is counted but never told, since no
-# channel pointer applies to it.
+# channel pointer applies to it. A pinned release older than 0.7.4 has no
+# check and sends nothing. The card knows the pinned version, so it says
+# which of the two this install is; only for a version it cannot place (a
+# pre-release, a nightly, a name that is not X.Y.Z) does it give the range.
+pinned_reports="unknown"
 if [ "$version_set" -eq 1 ]; then
-    say "  ${dim}min reports this install once a day (no release notices for --version), sending its channel$rst"
-    say "  ${dim}(pinned), version, OS, architecture, install method and a random install id to update.minimal.dev.$rst"
-else
-    say "  ${dim}min checks once a day for a newer $target release, sending its channel, version, OS,$rst"
-    say "  ${dim}architecture, install method and a random install id to update.minimal.dev.$rst"
+    case "${VERSION#v}" in
+        *[!0-9.]*|.*|*.|*..*) ;;
+        *.*.*.*) ;;
+        *.*.*)
+            pin_major="${VERSION#v}"; pin_major="${pin_major%%.*}"
+            pin_rest="${VERSION#v}"; pin_rest="${pin_rest#*.}"
+            pin_minor="${pin_rest%%.*}"; pin_patch="${pin_rest#*.}"
+            if [ "$pin_major" -gt 0 ] \
+                || { [ "$pin_major" -eq 0 ] && [ "$pin_minor" -gt 7 ]; } \
+                || { [ "$pin_major" -eq 0 ] && [ "$pin_minor" -eq 7 ] && [ "$pin_patch" -ge 4 ]; }; then
+                pinned_reports="yes"
+            else
+                pinned_reports="no"
+            fi ;;
+    esac
 fi
-say "  ${dim}Off: MINIMAL_TELEMETRY=0$rst"
+if [ "$version_set" -eq 1 ] && [ "$pinned_reports" = "no" ]; then
+    say "  ${dim}min $VERSION does not check for updates and sends nothing. Releases from 0.7.4 on report an$rst"
+    say "  ${dim}install once a day.$rst"
+else
+    if [ "$version_set" -eq 1 ] && [ "$pinned_reports" = "yes" ]; then
+        say "  ${dim}min reports this install once a day (no release notices for --version), sending the channel$rst"
+        say "  ${dim}(pinned), version, OS, architecture, install method and a random install id to update.minimal.dev.$rst"
+    elif [ "$version_set" -eq 1 ]; then
+        say "  ${dim}min 0.7.4 and later report this install once a day (no release notices for --version), sending the channel$rst"
+        say "  ${dim}(pinned), version, OS, architecture, install method and a random install id to update.minimal.dev.$rst"
+    else
+        say "  ${dim}min checks once a day for a newer $target release, sending its channel, version, OS,$rst"
+        say "  ${dim}architecture, install method and a random install id to update.minimal.dev.$rst"
+    fi
+    say "  ${dim}Off: MINIMAL_TELEMETRY=0$rst"
+fi
 say "  ${dim}docs.minimal.dev/reference/telemetry#update-check$rst"
 say ""
 }

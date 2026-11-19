@@ -485,7 +485,7 @@ pub enum BoxCommand {
     List(BoxListArgs),
     /// Show one box: its id, name, type, parent, project, state, how it
     /// ended, the identity it runs under, and its provider and host.
-    /// `--network` shows the box's network section in its place
+    /// `--network` shows the box's effective network policy in its place
     Show(BoxShowArgs),
     /// Stop a running box and keep it: its record, its events and its
     /// files stay until `min box rm` removes them. `--force` kills every
@@ -767,14 +767,17 @@ pub struct BoxShowArgs {
     /// prints them
     #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: String,
-    /// Show only the box's `[network]` section, as the box was created
-    /// with it: its network mode, ingress and egress, with the flags of
-    /// the command that created it applied
+    /// Show the box's effective network policy in place of the box: the
+    /// ingress and egress rules in force, and the ports the box published
+    /// while it runs. With `-o json`, write it as one JSON document. `-o
+    /// yaml` is not available with this flag
     #[arg(long)]
     pub network: bool,
     /// Write the box and its running commands in this format instead of
-    /// text
-    #[arg(short = 'o', long = "output", value_enum, conflicts_with = "network")]
+    /// text. With `--network`, only `json` is available
+    // BCLI-025: `--network` takes `-o json`, and `cmd_box_show` refuses
+    // `-o yaml` with it as a usage error.
+    #[arg(short = 'o', long = "output", value_enum)]
     pub output: Option<BoxShowOutputFormat>,
 }
 

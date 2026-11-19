@@ -1550,7 +1550,16 @@ where
         let exited_clean = entry.state == "exited" && entry.exit_code == Some(0);
         copied = Some((exited_clean, outcomes));
     }
-    match attach_ending(&target, code, &after) {
+    // BCLI-068: a box that runs again after the host ended the attach, and
+    // whose count of ends rose, was restarted, not taken by another terminal.
+    // Only a 254 reads the count, since only a 254 can name a restart.
+    let ends_after = if code == DAEMON_ENDED_ATTACH {
+        box_end_count(&target).await
+    } else {
+        None
+    };
+    let restarted = attach_restart(code, &after, ends_before, ends_after);
+    match box_attach_ending(&target, code, &after, restarted) {
         Ok(mut ending) => {
             if let Some((exited_clean, outcomes)) = &copied {
                 ending.code = exit_code_after_exports(ending.code, *exited_clean, outcomes);
@@ -1579,8 +1588,10 @@ where
 /// What the attach knew of the box's ends before it started (BOX-204).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EndsBefore {
-    /// The box ran, so any end it reaches is a new end.
-    Running,
+    /// The box ran, so any end it reaches is a new end. The count is how
+    /// many times it had ended, `None` when the host did not give it. A
+    /// restart while the attach runs raises it (BCLI-068).
+    Running(Option<u64>),
     /// The box was stopped or exited, and had ended this many times.
     Ended(u64),
     /// The host did not give the box's state or its count of ends.
@@ -1594,18 +1605,102 @@ async fn ended_box_end_count(target: &BoxAttachTarget) -> EndsBefore {
         tracing::warn!(box_id = %target.box_id, "box ends: the host did not give the box's state");
         return EndsBefore::Unread;
     };
-    if !matches!(entry.state.as_str(), "stopped" | "exited") {
-        return EndsBefore::Running;
+    let running = !matches!(entry.state.as_str(), "stopped" | "exited");
+    let count = box_end_count(target).await;
+    if running {
+        return EndsBefore::Running(count);
     }
-    let Ok(mut client) = box_host_client(&target.host)
+    count.map_or(EndsBefore::Unread, EndsBefore::Ended)
+}
+
+/// How many times the box `target` ended, `None` when its host does not
+/// give the count.
+async fn box_end_count(target: &BoxAttachTarget) -> Option<u64> {
+    let mut client = box_host_client(&target.host)
         .await
         .inspect_err(|e| tracing::warn!(box_id = %target.box_id, "box ends: could not reach the box's host: {e:#}"))
-    else {
-        return EndsBefore::Unread;
-    };
+        .ok()?;
     box_ends(&mut client, target.box_id)
         .await
-        .map_or(EndsBefore::Unread, |ends| EndsBefore::Ended(ends.count))
+        .map(|ends| ends.count)
+}
+
+/// Whether a box that runs after its attach ended was restarted while the
+/// attach ran (BCLI-068).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoxRestart {
+    /// The box's count of ends rose while the attach ran.
+    Restarted,
+    /// The count did not rise, or the box did not run when the attach
+    /// started.
+    NotRestarted,
+    /// The count before or after the attach was not read, so nothing
+    /// says why the attach ended.
+    Unread,
+}
+
+/// Whether a box that the attach knew as `before` was restarted while the
+/// attach ran: its count of ends rose from `before` to `after`. A count
+/// that was not read, before or after, gives [`BoxRestart::Unread`]
+/// (BCLI-068).
+pub(crate) fn ends_show_restart(before: EndsBefore, after: Option<u64>) -> BoxRestart {
+    match (before, after) {
+        (EndsBefore::Running(Some(before)), Some(after)) if after > before => BoxRestart::Restarted,
+        (EndsBefore::Running(Some(_)), Some(_)) | (EndsBefore::Ended(_), _) => {
+            BoxRestart::NotRestarted
+        }
+        (EndsBefore::Running(_), _) | (EndsBefore::Unread, _) => BoxRestart::Unread,
+    }
+}
+
+/// Whether the attach that ended with ssh's `code` was ended by a restart
+/// of its box. Only a 254 against a box that the settled read `after`
+/// lists as running can be a restart. Then the count of ends decides, from
+/// `before` the attach to `ends_after` it, as [`ends_show_restart`] says
+/// (BCLI-068).
+pub(crate) fn attach_restart(
+    code: i32,
+    after: &BoxAfterAttach,
+    before: EndsBefore,
+    ends_after: Option<u64>,
+) -> BoxRestart {
+    let running = matches!(after, BoxAfterAttach::Listed(entry) if entry.state == "running");
+    if code == DAEMON_ENDED_ATTACH && running {
+        ends_show_restart(before, ends_after)
+    } else {
+        BoxRestart::NotRestarted
+    }
+}
+
+/// How an attach that ended with ssh's `code` ends the command, as
+/// [`attach_ending`] says, except for a 254 against a box that runs again.
+/// A box that was `restarted` ends with 254 and a line that names the
+/// restart, not another terminal. A box whose count of ends was not read
+/// ends with 254 and the line for a host that ended the attach, since
+/// nothing says why (BCLI-068).
+pub(crate) fn box_attach_ending(
+    target: &BoxAttachTarget,
+    code: i32,
+    after: &BoxAfterAttach,
+    restarted: BoxRestart,
+) -> Result<AttachEnding, BoxAttachRefusal> {
+    let running = matches!(after, BoxAfterAttach::Listed(entry) if entry.state == "running");
+    if code != DAEMON_ENDED_ATTACH || !running {
+        return attach_ending(target, code, after);
+    }
+    match restarted {
+        BoxRestart::Restarted => {
+            let label = &target.label;
+            Ok(AttachEnding {
+                code: DAEMON_ENDED_ATTACH,
+                notice: Some(format!(
+                    "Detached: {label} was restarted. Run min box attach {label} to attach again."
+                )),
+            })
+        }
+        BoxRestart::NotRestarted => attach_ending(target, code, after),
+        BoxRestart::Unread => attach_ending(target, code, &BoxAfterAttach::Unread),
+    }
 }
 
 /// Whether a box that the attach knew as `before` ended again, when the
@@ -1615,7 +1710,7 @@ async fn ended_box_end_count(target: &BoxAttachTarget) -> EndsBefore {
 /// (BOX-204).
 pub(crate) fn ends_show_new_end(before: EndsBefore, after: Option<u64>) -> bool {
     match before {
-        EndsBefore::Running => true,
+        EndsBefore::Running(_) => true,
         EndsBefore::Ended(before) => after.is_some_and(|after| after > before),
         EndsBefore::Unread => false,
     }
@@ -1624,7 +1719,7 @@ pub(crate) fn ends_show_new_end(before: EndsBefore, after: Option<u64>) -> bool 
 /// Whether the box `target`, which the attach knew as `before`, ended
 /// again since. See [`ends_show_new_end`].
 async fn ended_again(target: &BoxAttachTarget, before: EndsBefore) -> bool {
-    if before == EndsBefore::Running {
+    if let EndsBefore::Running(_) = before {
         return true;
     }
     let mut after = None;

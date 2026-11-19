@@ -278,17 +278,15 @@ pub async fn cmd_session_run(
     .await
 }
 
-/// Print the effective networking rules for a session.
+/// Print the effective networking rules for a session, through the render
+/// `min box show <box> --network` uses.
 pub async fn cmd_session_policy(
     global: &GlobalArgs,
     args: PolicyArgs,
 ) -> Result<(), anyhow::Error> {
     // `-o json` is the machine-readable rendering: one document on stdout,
-    // one error object on stderr when the walk fails. A separate walk with
-    // typed failures (below) rather than a flag threaded through the text
-    // one, because *which* failure it was is part of what a script reads —
-    // the text walk answers with a message only — and because the text
-    // rendering is not touched at all.
+    // one error object on stderr when the walk fails. Its own resolve step,
+    // because *which* failure it was is part of what a script reads.
     if args.output == Some(PolicyOutputFormat::Json) {
         return box_policy_as_json(global, &args.session).await;
     }
@@ -297,111 +295,24 @@ pub async fn cmd_session_policy(
 
     let client = connect_daemon(global).await?;
 
-    // The effective reply carries only the rules, but the ingress block is
-    // suppressed for host-address sessions (see [`format_policy`]), so the
-    // command also resolves the record the policy rides on for its network
-    // mode. The name alone decides which VM is asked (NET-058): a box on
-    // another VM is read from that VM's daemon, with no global flag.
+    // The name alone decides which VM is asked (NET-058): a box on another
+    // VM is read from that VM's daemon, with no global flag.
     let example = format!("session policy {}", args.session);
     let (mut client, record) =
         resolve_box_on_any_vm(global, client, &args.session, &example).await?;
-    // The follow-up lookups go by the resolved id, so a session named by an
-    // id prefix reaches the same session they do.
-    let box_id = record.id.to_string();
-
-    // The daemon resolves the effective egress (NET-074/NET-077), because
-    // the rollout phase and its opt-out are the daemon's own facts; built
-    // here rather than through a `SessionLookup` conversion so the request
-    // types stay the rpc crate's, where the wire contract lives.
-    use minimald_rpc::{GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest};
-    let lookup = match SessionLookup::parse(&box_id) {
-        SessionLookup::Id(id) => GetEffectiveSessionPolicyRequest::Id(id),
-        SessionLookup::Name(n) => GetEffectiveSessionPolicyRequest::Name(n),
-    };
-
-    let resp = client
-        .oneshot_rpc::<GetEffectiveSessionPolicy>(lookup)
-        .await
-        .context("GetEffectiveSessionPolicy RPC failed")?;
-
-    // NET-079's per-box enforcement answers beside the rules, over its own
-    // runtime-facts reply — never as a field on the policy, because the
-    // policy struct is `deny_unknown_fields`: an older `min` would reject the
-    // whole rules reply over a key it has no field for, so the fact rides a
-    // separate reply the way live ingress does. A client that cannot get it
-    // — an older daemon, a session mid-teardown — renders the rules with no
-    // enforcement row, silently: the row is an optional fact beside the
-    // declaration, and the same silence is what a session that is not
-    // host-address already prints.
-    let facts_lookup = match SessionLookup::parse(&box_id) {
-        SessionLookup::Id(id) => minimald_rpc::GetSessionRuntimeFactsRequest::Id(id),
-        SessionLookup::Name(n) => minimald_rpc::GetSessionRuntimeFactsRequest::Name(n),
-    };
-    let facts = match client
-        .oneshot_rpc::<minimald_rpc::GetSessionRuntimeFacts>(facts_lookup)
-        .await
-    {
-        Ok(minimald_rpc::Errorable::Ok(facts)) => Some(facts),
-        Ok(minimald_rpc::Errorable::Err { .. }) | Err(_) => None,
-    };
-    let host_ip_enforcement = facts.as_ref().and_then(|facts| facts.host_ip_enforcement);
-    let shared_port_collisions = facts
-        .as_ref()
-        .map(|facts| facts.shared_port_collisions.clone())
-        .unwrap_or_default();
-    // (NET-044) — the rows that make a `min net expose` visible rather than
-    // only permitted. Fetched through the text walk's own degrade of the
-    // shared fetch: warn on stderr and print no section — the JSON
-    // rendering below degrades differently, saying the unknown in the
-    // document instead.
-    let live = fetch_live_ingress_degrading(&mut client, &box_id).await;
-
-    match resp {
-        minimald_rpc::Errorable::Ok(policy) => {
-            // The fabric the display builds the baseline set from: the
-            // microVM backend's run path builds its registry and the
-            // helper's enumeration from the default plan, so that is the
-            // plan the display can name for it. Keyed on the backend this
-            // command actually talks to — `client_host_kind`, the same
-            // key `resolve_socket_path` turns on — not on `use_minvmd()`,
-            // which is true only under an explicit `--provider
-            // local-minvmd`: on macOS that kind is `Minvmd` without the
-            // flag, minvmd being the only backend there. The native
-            // daemon's own per-daemon switch is a plan the reply does not
-            // carry — and it has no host-side gate the set would describe —
-            // so that arm passes `None` and the block is left out rather
-            // than printed from a plan the session does not attach to.
-            let host_kind = daemon_host_kind(global);
-            let fabric =
-                (host_kind == paths::HostKind::Minvmd).then_some(switch::SwitchSubnet::default());
-            // NET-160: the host exposures row turns on the host kind itself,
-            // not on `fabric`.
-            let native_host = host_kind == paths::HostKind::Minimald;
-            let mut out = std::io::stdout();
-            format_policy_on_host(
-                &mut out,
-                &policy,
-                record.network,
-                host_ip_enforcement,
-                &shared_port_collisions,
-                fabric,
-                native_host,
-            )?;
-            write_live_ingress(&mut out, &live)?;
-            if let Some(facts) = &facts {
-                write_unaudited_listen_ports(
-                    &mut out,
-                    &facts.unaudited_listen_ports,
-                    facts.audit_log.as_deref(),
-                )?;
-            }
-            out.flush().context("Failed to write policy")?;
-            Ok(())
-        }
-        minimald_rpc::Errorable::Err { error } => {
-            bail!("{error}")
-        }
-    }
+    // Keyed on the backend this command actually talks to —
+    // `client_host_kind`, the same key `resolve_socket_path` turns on — not
+    // on `use_minvmd()`, which is true only under an explicit `--provider
+    // local-minvmd`.
+    let mut out = std::io::stdout();
+    write_box_network(
+        &mut out,
+        &mut client,
+        &record,
+        daemon_host_kind(global),
+        false,
+    )
+    .await
 }
 
 /// Register a session as an SSH remote in Zed's `settings.json`.
@@ -936,57 +847,16 @@ pub(crate) fn empty_typed_list(box_type: &str, scoped: bool) -> String {
 /// Resolves the address `address` over `hosts` among the boxes of
 /// `box_type` only, so a type noun never reaches a box of another type.
 /// An address that only a box of another type holds is refused as one
-/// that no box holds. The verb, the box id and the outcome go to the log.
+/// that no box holds. A box on a stopped VM is refused with the command
+/// that starts the VM, as every `min box` verb refuses it (BCLI-002,
+/// NET-058). The verb, the box id and the outcome go to the log.
 pub(crate) async fn resolve_box_of_type(
-    mut hosts: Vec<crate::cmd::list::LocalHost>,
+    hosts: Vec<crate::cmd::list::LocalHost>,
     address: &str,
     box_type: &str,
     verb: &'static str,
 ) -> Result<ResolvedBox, anyhow::Error> {
-    if let BoxAddress::Qualified { provider, host, .. } = parse_box_address(address) {
-        hosts.retain(|h| h.provider == provider && h.host == host);
-    }
-    let mut listings = Vec::with_capacity(hosts.len());
-    for host in hosts {
-        let boxes = read_host_boxes(&host).await.inspect_err(|err| {
-            tracing::info!(verb, outcome = "error", host = %host.host, "{err:#}");
-        })?;
-        let boxes = boxes.map(|records| {
-            records
-                .into_iter()
-                .filter(|entry| entry.box_type.as_deref() == Some(box_type))
-                .collect()
-        });
-        listings.push(HostListing { host, boxes });
-    }
-    match resolve_box_address(address, &listings) {
-        Ok(resolved) => {
-            tracing::info!(
-                verb,
-                box_id = %resolved.box_id,
-                host = %resolved.host.host,
-                outcome = "resolved"
-            );
-            Ok(resolved)
-        }
-        Err(refusal) => {
-            for listing in &listings {
-                if let Err(why) = &listing.boxes {
-                    tracing::info!(verb, host = %listing.host.host, "host did not answer: {why}");
-                }
-            }
-            // The same outcome names `resolve_box_on_hosts` records, so an
-            // unreachable host reads apart from a missing box in the log.
-            let outcome = match &refusal {
-                BoxAddressRefusal::Ambiguous { .. }
-                | BoxAddressRefusal::AmbiguousIdStart { .. } => "ambiguous",
-                BoxAddressRefusal::NotFound { .. } => "not found",
-                BoxAddressRefusal::Unreachable { .. } => "host unreachable",
-            };
-            tracing::info!(verb, address, box_type, outcome, "{refusal}");
-            Err(refusal.into())
-        }
-    }
+    resolve_box_over(hosts, address, Some(box_type), verb).await
 }
 
 /// `min session stop` and `min task stop`: `min box stop`, with the box

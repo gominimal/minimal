@@ -647,8 +647,27 @@ pub struct EnvArgs<'a> {
     /// resolver the sandbox gets, and does any post-spawn wiring; see
     /// [`sandbox::Network`].
     pub network: std::sync::Arc<dyn sandbox::Network>,
+    /// The classifier leaf of the box the environment runs for, if any. A
+    /// task of a host-address box runs in its box's leaf, so the box's
+    /// egress verdict decides the task's connections. `None` runs the
+    /// sandbox as its caller's own traffic.
+    pub classifier_leaf: Option<sandbox::config::ClassifierLeaf>,
     /// The operation tracker to use downstream, if applicable.
     pub ot: Option<OpTracker>,
+}
+
+/// Places the sandbox `config` in `leaf`, the classifier leaf of the box a
+/// task runs for. The sandbox's pre-exec closure joins every invocation to
+/// the leaf, so the task gets its box's egress. No leaf leaves `config` as
+/// it is.
+pub(crate) fn place_in_classifier_leaf(
+    config: sandbox::config::Config,
+    leaf: Option<sandbox::config::ClassifierLeaf>,
+) -> sandbox::config::Config {
+    match leaf {
+        Some(leaf) => config.with_classifier_leaf(leaf),
+        None => config,
+    }
 }
 
 /// Returns a clone of `task` with every action string interpolated against
@@ -1360,6 +1379,7 @@ impl<'a> Env<'a> {
             // own DNS need does not enter into it.
             .with_network(args.network)
             .with_env_vars(pkg_env_vars.into_iter());
+        config = place_in_classifier_leaf(config, args.classifier_leaf);
         if let Some(id) = ctx.daemon_id() {
             config = config.with_daemon_id(id);
         }
@@ -2682,5 +2702,154 @@ mod tests {
             HashSet::from_iter([*chan.graph.by_name("uroot").unwrap()])
         );
         assert!(std::fs::exists(rootfs.path().join("bin")).unwrap());
+    }
+
+    /// A `set_env:` line hands the helper a variable name that began as
+    /// package metadata. Bash evaluates the name of a `declare`d variable
+    /// for array subscripts, so a crafted one — `X[$(touch /tmp/pwned)]` —
+    /// runs the command in the user's live shell. The helper must refuse
+    /// such a name without evaluating it, while still exporting the valid
+    /// names around it. The minimald helper has the same guard with the
+    /// same test; this is mctx's copy.
+    #[cfg(unix)]
+    #[test]
+    fn a_set_env_line_with_a_crafted_name_is_refused_not_evaluated() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempdir().unwrap();
+        let helper = tmp.path().join("min_helper.sh");
+        std::fs::write(&helper, MIN_SCRIPT).unwrap();
+
+        // The payload's marker: the crafted name would `touch` it if bash
+        // evaluated the subscript. It must not exist after the helper runs.
+        let marker = tmp.path().join("pwned");
+
+        // A socat stand-in that answers a request with three `set_env:`
+        // lines — a crafted name, a valid one after it, then `done:`.
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let socat = bin.join("socat");
+        std::fs::write(
+            &socat,
+            format!(
+                "#!/bin/sh\nprintf 'set_env:X[$(touch {})]:/state/gocache\\n'\nprintf 'set_env:GOCACHE:/state/gocache\\n'\nprintf 'done:\\n'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&socat, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                ". '{}'; __min_rpc status; rc=$?; echo \"GOCACHE=$GOCACHE\"; exit $rc",
+                helper.display()
+            ))
+            .env("PATH", &path)
+            .env_remove("GOCACHE")
+            .output();
+        let Ok(out) = out else {
+            eprintln!("no bash to run the min helper with — skipping");
+            return;
+        };
+
+        assert!(!marker.exists(), "the crafted name ran its payload");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("min: refusing to export environment variable with an invalid name"),
+            "the refusal must say so in plain words, got: {stderr}"
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("GOCACHE=/state/gocache"),
+            "a valid name alongside must still export, got: {stdout}"
+        );
+        assert!(
+            !stdout.contains("pwned"),
+            "the crafted name must not join the export summary, got: {stdout}"
+        );
+    }
+
+    /// A valid name can still match a local of `__min_rpc` or of its
+    /// caller, and an assignment by name writes that local, not the shell's
+    /// variable. The helper must write and export the global whatever the
+    /// name. And since `declare` reads a value opening with `(` as an array
+    /// list when the global is an array, such a value is refused, not run.
+    /// The protocol reader's own `line` is one such local: were it the
+    /// global, the next read would overwrite a `set_env:line:` assignment.
+    /// The minimald helper has the same test.
+    #[cfg(unix)]
+    #[test]
+    fn a_set_env_line_writes_the_global_even_when_a_local_shares_its_name() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempdir().unwrap();
+        let helper = tmp.path().join("min_helper.sh");
+        std::fs::write(&helper, MIN_SCRIPT).unwrap();
+
+        // Created only if the parenthesised value were expanded.
+        let marker = tmp.path().join("ran");
+
+        // A socat stand-in that answers with a name the helper also uses
+        // for a local, a parenthesised value for an array global, then
+        // `done:`.
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let socat = bin.join("socat");
+        std::fs::write(
+            &socat,
+            format!(
+                "#!/bin/sh\nprintf 'set_env:varname:/state/varname\\n'\nprintf 'set_env:LIST:($(touch {}))\\n'\nprintf 'set_env:line:/state/line\\n'\nprintf 'done:\\n'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&socat, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "LIST=(one); . '{}'; __min_rpc status; rc=$?; \
+                 echo \"global=$varname exported=$(printenv varname) list=$LIST line=$line exported_line=$(printenv line)\"; exit $rc",
+                helper.display()
+            ))
+            .env("PATH", &path)
+            .env_remove("varname")
+            .env_remove("line")
+            .output();
+        let Ok(out) = out else {
+            eprintln!("no bash to run the min helper with — skipping");
+            return;
+        };
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("global=/state/varname exported=/state/varname"),
+            "a name shared with a local must still set and export the global, got: {stdout}"
+        );
+        assert!(!marker.exists(), "a parenthesised value was expanded");
+        assert!(
+            stdout.contains("list=one"),
+            "a refused value must leave the global as it was, got: {stdout}"
+        );
+        assert!(
+            stdout.contains("line=/state/line exported_line=/state/line"),
+            "the reader's own `line` must not take or overwrite the shell's, got: {stdout}"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("would be read as an array"),
+            "the refusal must say so, got: {stderr}"
+        );
     }
 }
