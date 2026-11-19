@@ -2584,15 +2584,6 @@ impl CreateSessionReply {
     }
 }
 
-impl From<Errorable<CreateSessionResponse>> for CreateSessionReply {
-    fn from(reply: Errorable<CreateSessionResponse>) -> Self {
-        match reply {
-            Errorable::Ok(created) => Self::Ok(created),
-            Errorable::Err { error } => Self::refused(error),
-        }
-    }
-}
-
 /// An RPC to compose a session's loadout, completing its create flow.
 ///
 /// Split from [`CreateSession`] because the composer reads the
