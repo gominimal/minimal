@@ -559,9 +559,10 @@ fn session_defaults_egress(project: &Path) -> anyhow::Result<crate::ProjectEgres
     let Some((_, bytes)) = project_file_bytes(project)? else {
         return Ok(Default::default());
     };
-    let file: toml::Table = toml::from_slice(&bytes).map_err(|error| crate::ProjectFileInvalid {
-        error: mfile::Error::Format(error),
-    })?;
+    let file: toml::Table =
+        toml::from_slice(&bytes).map_err(|error| crate::ProjectFileInvalid {
+            error: mfile::Error::Format(error),
+        })?;
     let entry = mfile::entry::BoxEntry {
         name: mfile::entry::DEFAULT_ENTRY_NAME.to_owned(),
         table: mfile::entry::EntryTable::Sessions,
