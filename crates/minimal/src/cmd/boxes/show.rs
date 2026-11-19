@@ -368,7 +368,7 @@ pub(crate) async fn write_box_network(
 /// order (BCLI-024). Empty when the box stores no spec, its spec lists no
 /// names, or the host cannot give the spec. A failure goes to the log, and
 /// the policy still shows.
-async fn stored_vpn_network_names(
+pub(crate) async fn stored_vpn_network_names(
     client: &mut client::Client,
     id: boxes::SessionId,
 ) -> Vec<String> {

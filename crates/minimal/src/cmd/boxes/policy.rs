@@ -1112,13 +1112,16 @@ pub(crate) async fn box_policy_as_json(
         Ok(resolved) => resolved,
         Err(failure) => return Err(failure.machine_failure().into()),
     };
+    // BCLI-024: the same document as `min box show <box> --network -o json`,
+    // so it lists the VPN networks the box's stored spec keeps.
+    let vpn_network_names = stored_vpn_network_names(&mut client, record.id).await;
     let mut out = std::io::stdout();
     write_box_policy_json(
         &mut out,
         &mut client,
         &record,
         daemon_host_kind(global),
-        &[],
+        &vpn_network_names,
     )
     .await
 }
