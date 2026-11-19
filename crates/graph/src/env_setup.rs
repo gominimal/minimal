@@ -141,6 +141,17 @@ impl SetupForPackages {
                         ));
                     }
 
+                    mfile::File::validate_state_component(&prefix).map_err(|reason| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "package {} declares a state dir prefix {prefix:?} that cannot \
+                                 be used: {reason}",
+                                b.name
+                            ),
+                        )
+                    })?;
+
                     state_dirs.insert(prefix.clone());
 
                     env_vars.insert(
