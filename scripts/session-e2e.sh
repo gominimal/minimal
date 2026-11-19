@@ -19685,25 +19685,28 @@ $(cat "$WORK/goa-$label-1.err" "$WORK/goa-$label-2.err" 2>/dev/null || true)"
   # nowhere, and on a VM host the host-side gate drops the query before the
   # switch too. So curl must exit 6 (could not resolve host), inside
   # 5000 ms, before any connection is tried — never a connect timeout
-  # (exit 28), which would mean the name resolved.
+  # (exit 28), which would mean the name resolved. Timed inside the box, so
+  # the exec's own round trip is not counted; single-quoted so the box's
+  # shell, not this one, expands it.
   goa_x_before="$(goa_log_lines)"
-  goa_x_start="$(now_ms)"
+  # shellcheck disable=SC2016
   mnl session exec "$goa_t_sid" \
-    "curl -sS --max-time 10 -o /dev/null -w 'HTTP:%{http_code}' https://example.org" \
-    >"$WORK/goa-example.out" 2>"$WORK/goa-example.err"
-  goa_x_rc=$?
-  goa_x_elapsed=$(( $(now_ms) - goa_x_start ))
-  goa_x_status="$(cat "$WORK/goa-example.out" 2>/dev/null)"
+    's=$(date +%s%N); curl -sS --max-time 10 -o /dev/null -w "HTTP:%{http_code}" https://example.org; rc=$?; e=$(date +%s%N); echo; echo "rc=$rc ms=$(( (e - s) / 1000000 ))"' \
+    >"$WORK/goa-example.out" 2>"$WORK/goa-example.err" || true
+  goa_x_timing="$(tr -d '\r' < "$WORK/goa-example.out" 2>/dev/null | grep '^rc=' | tail -n1)"
+  goa_x_rc="$(printf '%s' "$goa_x_timing" | sed -n 's/^rc=\([0-9]*\) .*/\1/p')"
+  goa_x_elapsed="$(printf '%s' "$goa_x_timing" | sed -n 's/.* ms=\([0-9]*\)$/\1/p')"
+  goa_x_status="$(tr -d '\r' < "$WORK/goa-example.out" 2>/dev/null | grep -o 'HTTP:[0-9]*' | head -n1)"
   goa_x_err="$(tr '\n' ' ' < "$WORK/goa-example.err" 2>/dev/null)"
   goa_print_net_since "$goa_x_before" ""
-  echo "undeclared-name GET https://example.org -> rc=$goa_x_rc status=${goa_x_status:-<none>} elapsed=${goa_x_elapsed}ms curl: ${goa_x_err:-<none>}"
-  if goa_curl_answered "$goa_x_rc" "${goa_x_status:-}"; then
+  echo "undeclared-name GET https://example.org -> rc=${goa_x_rc:-<none>} status=${goa_x_status:-<none>} elapsed=${goa_x_elapsed:-<none>}ms curl: ${goa_x_err:-<none>}"
+  if goa_curl_answered "${goa_x_rc:-1}" "${goa_x_status:-}"; then
     echo "::error::the hostname-only box answered a GET of example.org — a name the declaration does not name, so any reach it travelled is a grant the gate never made"
     cat "$WORK/goa-example.err" 2>/dev/null || true
     fail
   fi
-  if [ "$goa_x_rc" != 6 ] || [ "$goa_x_elapsed" -ge 5000 ]; then
-    echo "::error::NET-141: the hostname-only box's GET of example.org did not fail fast at resolution (want curl exit 6 inside 5000 ms, got exit $goa_x_rc in ${goa_x_elapsed}ms) — its resolver refuses every name its allow list does not match. The fetches in this same run resolved and reached github.com, so this is the box's own doing, not weather"
+  if [ "$goa_x_rc" != 6 ] || [ -z "$goa_x_elapsed" ] || [ "$goa_x_elapsed" -ge 5000 ]; then
+    echo "::error::NET-141: the hostname-only box's GET of example.org did not fail fast at resolution (want curl exit 6 inside 5000 ms, got exit ${goa_x_rc:-none} in ${goa_x_elapsed:-unknown} ms) — its resolver refuses every name its allow list does not match. The fetches in this same run resolved and reached github.com, so this is the box's own doing, not weather"
     cat "$WORK/goa-example.err" 2>/dev/null || true
     fail
   fi
