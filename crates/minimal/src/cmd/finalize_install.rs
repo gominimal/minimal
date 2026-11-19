@@ -85,11 +85,15 @@ pub(crate) struct Item {
     /// The step's block in the script, while the item is missing.
     #[serde(skip)]
     script: Option<String>,
-    /// Whether the block runs ahead of every other item's block. A step
-    /// that refuses ends the script, so a step that must not wait on
-    /// another one runs first.
+    /// The id of the item whose block this one runs just ahead of, while
+    /// that item is missing too. A step that refuses ends the script, so a
+    /// step that must not wait on another one runs before it.
     #[serde(skip)]
-    script_first: bool,
+    script_before: Option<&'static str>,
+    /// A line the script runs after every block, for a block that records
+    /// its status in place of ending the script.
+    #[serde(skip)]
+    script_end: Option<&'static str>,
 }
 
 impl Item {
@@ -103,7 +107,8 @@ impl Item {
             step: None,
             cause: None,
             script: None,
-            script_first: false,
+            script_before: None,
+            script_end: None,
         }
     }
 
@@ -123,7 +128,8 @@ impl Item {
             step: Some(step),
             cause: None,
             script: Some(script),
-            script_first: false,
+            script_before: None,
+            script_end: None,
         }
     }
 
@@ -137,7 +143,8 @@ impl Item {
             step: None,
             cause: Some(cause),
             script: None,
-            script_first: false,
+            script_before: None,
+            script_end: None,
         }
     }
 
@@ -151,7 +158,8 @@ impl Item {
             step: None,
             cause: Some(cause),
             script: None,
-            script_first: false,
+            script_before: None,
+            script_end: None,
         }
     }
 }
@@ -224,14 +232,26 @@ impl Plan {
             labels.join(", ")
         );
         let mut script = crate::resolver::script_header(&what, crate::resolver::FINALIZE_SHOWN_BY);
-        // A block that runs first goes ahead of the others, so a later
-        // step that refuses does not keep it from running. Two items that
-        // carry the same block run it once.
-        let ordered = missing
-            .iter()
-            .filter(|item| item.script_first)
-            .chain(missing.iter().filter(|item| !item.script_first));
+        // The blocks keep plan order. A block that must run before another
+        // item's block moves to just ahead of it, so that step refusing does
+        // not keep it from running. Two items that carry the same block run
+        // it once.
+        let moved = |item: &Item| {
+            item.script_before
+                .is_some_and(|id| missing.iter().any(|other| other.id == id))
+        };
+        let mut ordered: Vec<&Item> = Vec::new();
+        for item in missing.iter().copied().filter(|item| !moved(item)) {
+            ordered.extend(
+                missing
+                    .iter()
+                    .copied()
+                    .filter(|early| early.script_before == Some(item.id)),
+            );
+            ordered.push(item);
+        }
         let mut blocks: Vec<&str> = Vec::new();
+        let mut ends: Vec<&str> = Vec::new();
         for item in ordered {
             let block = item.script.as_deref().unwrap_or_default();
             if blocks.contains(&block) {
@@ -240,6 +260,17 @@ impl Plan {
             blocks.push(block);
             script.push('\n');
             script.push_str(block);
+            if let Some(end) = item.script_end.filter(|end| !ends.contains(end)) {
+                ends.push(end);
+            }
+        }
+        // A block that recorded its status ends the script with it here,
+        // after the blocks that come later had their turn.
+        if !ends.is_empty() {
+            script.push('\n');
+            for end in ends {
+                script.push_str(end);
+            }
         }
         Some(script)
     }
@@ -1663,7 +1694,8 @@ pub(crate) mod linux {
         match step.script {
             // The wording is the task's diagnostics line (#2607).
             Some(_) => Item {
-                script_first: true,
+                script_before: Some(CLASSIFIER_ID),
+                script_end: Some(QUIC443_HELPER_END),
                 ..Item::missing(
                     QUIC443_HELPER_ID,
                     QUIC443_HELPER_LABEL,
@@ -1696,7 +1728,8 @@ pub(crate) mod linux {
         format!(
             "# The QUIC block helper and its sudoers rule, from the egress classifier's\n\
              # step in its helper-only mode. It runs ahead of the classifier step, so a\n\
-             # classifier step that refuses leaves the helper installed.\n\
+             # classifier step that refuses leaves the helper installed. A helper step\n\
+             # that fails does not stop the steps after it. The script ends with its status.\n\
              mkdir -p {ANSWERER_PROGRAM_DIR}\n\
              cat > {staged} <<\\{CLASSIFIER_SCRIPT_HEREDOC}\n\
              {CLASSIFIER_SCRIPT}\
@@ -1704,10 +1737,15 @@ pub(crate) mod linux {
              chmod 0755 {staged}\n\
              quic443_status=0\n\
              {staged} --user '{operator}' --quic443-helper-only || quic443_status=$?\n\
-             rm -f {staged}\n\
-             [ \"$quic443_status\" -eq 0 ] || exit \"$quic443_status\"\n"
+             rm -f {staged}\n"
         )
     }
+
+    /// The script's last line while the QUIC block helper's block runs: a
+    /// helper step that failed ends the script with its status, after the
+    /// blocks that follow it ran.
+    const QUIC443_HELPER_END: &str = "# The QUIC block helper step's status, recorded above.\n\
+         [ \"$quic443_status\" -eq 0 ] || exit \"$quic443_status\"\n";
 
     /// The classifier item and the QUIC block helper item over this host's
     /// reads, in that order.
@@ -3567,6 +3605,101 @@ mod tests {
         assert!(
             !lib.join("install-host-classifier.sh").exists(),
             "a refused first install leaves no classifier copy"
+        );
+    }
+
+    /// The helper's block runs just ahead of the classifier step, after the
+    /// blocks that come before that step in plan order. A helper step that
+    /// fails does not stop the script: the classifier step still runs, and
+    /// the script ends with the helper step's status.
+    #[test]
+    fn quic443_helper_failure_lets_later_blocks_run() {
+        use crate::resolver::{ANSWERER_PROGRAM_DIR, CLASSIFIER_PROGRAM_PATH, CLASSIFIER_SCRIPT};
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().expect("a temp dir");
+        let lib = root.path().join("lib");
+        let units = root.path().join("units");
+        let var = root.path().join("var");
+        let bin = root.path().join("bin");
+        let marks = root.path().join("marks");
+        for dir in [&lib, &units, &var, &bin, &marks] {
+            std::fs::create_dir_all(dir).expect("a scratch dir");
+        }
+        let systemctl = bin.join("systemctl");
+        std::fs::write(&systemctl, "#!/bin/sh\nexit 0\n").expect("a systemctl stub");
+        std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755))
+            .expect("the stub is executable");
+        let sock = root.path().join("home/alice/ssh.sock");
+        let [classifier, helper] =
+            classifier_and_quic443_helper_missing(sock.to_str().expect("the temp root is UTF-8"));
+        let marked = |id: &'static str| {
+            Item::missing(
+                id,
+                id,
+                format!("{id} is missing"),
+                format!("installs {id}"),
+                format!("# {id}\n: > '{}'\n", marks.join(id).display()),
+            )
+        };
+        let plan = Plan {
+            items: vec![
+                marked("userns-profile"),
+                marked("names"),
+                classifier,
+                helper,
+            ],
+        };
+        let script = plan.script().expect("a script while items are missing");
+        let at = |needle: &str| {
+            script
+                .find(needle)
+                .unwrap_or_else(|| panic!("the script carries {needle:?}: {script}"))
+        };
+        let helper_at = at("--user 'alice' --quic443-helper-only");
+        assert!(
+            at("# userns-profile\n") < helper_at && at("# names\n") < helper_at,
+            "the helper's block runs after the blocks ahead of the classifier step: {script}"
+        );
+        assert!(
+            helper_at
+                < at(&format!(
+                    "\nif {CLASSIFIER_PROGRAM_PATH} --user 'alice'; then\n"
+                )),
+            "the helper's block runs ahead of the classifier step: {script}"
+        );
+
+        // The step stubbed: its helper-only mode fails, and every other
+        // call installs.
+        let stub = format!(
+            "#!/bin/sh\n\
+             for arg in \"$@\"; do\n\
+             \x20 if [ \"$arg\" = --quic443-helper-only ]; then echo 'error: nft is missing.' >&2; exit 3; fi\n\
+             done\n\
+             : > '{}'\n\
+             exit 0\n",
+            marks.join("classifier").display()
+        );
+        let script = script
+            .replace(CLASSIFIER_SCRIPT, &stub)
+            .replace(ANSWERER_PROGRAM_DIR, &lib.display().to_string())
+            .replace("/etc/systemd/system", &units.display().to_string())
+            .replace("/var/lib/minimal", &var.display().to_string());
+        let output = crate::resolver::tests::run_confined(root.path(), &bin, &script);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for id in ["userns-profile", "names", "classifier"] {
+            assert!(
+                marks.join(id).exists(),
+                "the {id} block ran after the helper step failed: {stderr}"
+            );
+        }
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "the script ends with the helper step's status: {stderr}"
+        );
+        assert!(
+            !lib.join("install-host-classifier.sh.quic443").exists(),
+            "the helper's staged copy is removed"
         );
     }
 
