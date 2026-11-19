@@ -1325,10 +1325,11 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
             // proxy is the acceptor, and the token reaches no file and no
             // argv. The stand-in replaces it under its flag, so the two
             // never contend for the path. `bep` keeps its keys in the macOS
-            // Keychain and runs nowhere else, so another host starts
-            // nothing. Best-effort, like a missing gvproxy: a boot without
-            // the proxy still runs boxes, without a credentialed lane.
-            if !stub_enabled && cfg!(target_os = "macos") {
+            // Keychain, or on Linux in the TPM or Secret Service (BEP-088),
+            // so both hosts start it. Best-effort, like a missing gvproxy: a
+            // boot without the proxy, or with one that refuses to start,
+            // still runs boxes, without a credentialed lane.
+            if !stub_enabled {
                 _bep_proxy = start_bep_proxy(&proxy_sock, &token, &boxes);
             }
             // The wire the peer carries: the acceptor's socket, this boot's
@@ -1961,10 +1962,7 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
 
 /// The override for the `bep` binary the supervisor starts. Unset, the
 /// supervisor looks beside its own binary, where `just minvmd-build` puts
-/// it. The installer does not ship `bep` yet: `scripts/dist-build.sh` and
-/// the release workflow build only `minvmd`, so an installed `minvmd`
-/// finds no proxy and boots without a credentialed lane. #2498
-/// (https://github.com/gominimal/minimal/issues/2498) owns that release gap.
+/// it and where the installer puts the released `bep` on macOS and Linux.
 const BEP_BIN_ENV: &str = bep::store::PROXY_BIN_ENV;
 
 /// The file beside the proxy's socket that holds its stdout and stderr.
