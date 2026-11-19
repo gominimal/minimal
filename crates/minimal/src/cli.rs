@@ -1618,7 +1618,7 @@ pub struct GlobalArgs {
     ///
     /// On Linux, `local` runs minimald on the host and `local-minvmd` runs it
     /// inside the minvmd microVM. Without this flag, `min` uses
-    /// `MINIMAL_PROVIDER`, then the `provider` key of config.toml, then
+    /// `MIN_PROVIDER`, then the `provider` key of config.toml, then
     /// `local-minvmd` where /dev/kvm opens for you and `local` where it does
     /// not. No effect on macOS, where minvmd is the only backend. `min
     /// provider list --all` lists the providers on this machine.
@@ -1850,7 +1850,7 @@ pub struct EgressArgs {
 ///
 /// On Linux `local` is the host-native daemon (DM2) and `local-minvmd` runs
 /// `minimald` inside the minvmd microVM (DM1). A command without
-/// `--provider` takes `MINIMAL_PROVIDER`, then the `provider` key of
+/// `--provider` takes `MIN_PROVIDER`, then the `provider` key of
 /// `config.toml`, then `local-minvmd` where `/dev/kvm` opens for reading and
 /// writing and `local` otherwise ([`crate::hosts::resolve_default_provider`]).
 /// On macOS minvmd is the only backend, so the choice has no effect there.

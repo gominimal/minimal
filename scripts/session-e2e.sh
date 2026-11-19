@@ -848,17 +848,17 @@ fi
 # An explicit E2E_MINIMAL_ARGS is kept verbatim. A Linux run without
 # provider args is the native lane and must stay exactly that, so the
 # script names `--provider local` itself: without a flag the CLI would
-# take MINIMAL_PROVIDER, the config's provider key, or the VM provider
+# take MIN_PROVIDER, the config's provider key, or the VM provider
 # wherever /dev/kvm opens (resolve_default_provider in
 # crates/minimal/src/cmd/hosts.rs), and a runner with KVM would move the
-# native lane into a VM. MINIMAL_PROVIDER=local holds the same for a `min`
+# native lane into a VM. MIN_PROVIDER=local holds the same for a `min`
 # call that does not go through E2E_MINIMAL_ARGS; a flag still wins over it.
 if [ -z "${E2E_MINIMAL_ARGS:-}" ]; then
   if [ "$(uname -s)" = Darwin ]; then
     E2E_MINIMAL_ARGS="--provider local-minvmd"
   else
     E2E_MINIMAL_ARGS="--provider local"
-    export MINIMAL_PROVIDER=local
+    export MIN_PROVIDER=local
   fi
 fi
 #
@@ -14040,7 +14040,7 @@ bep_live_gate() {
   local lg_control="$HOME/.minimal/bep/control.sock" lg_status lg_try
   local lg_log="$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log"
   if [ "$(uname -s)" != "Darwin" ]; then
-    not_run "$1" "the live Box Egress Proxy cases run on macOS lanes only"
+    not_run "$1" "the live Box Egress Proxy cases run on macOS lanes only; Linux: https://github.com/gominimal/minimal/issues/3652"
     return 1
   fi
   if [ -z "$E2E_VM" ] || [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then

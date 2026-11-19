@@ -66,7 +66,7 @@ async fn run_min_env(
         }
     }
     // The native test daemon, whatever /dev/kvm allows on this host.
-    command.env("MINIMAL_PROVIDER", "local");
+    command.env("MIN_PROVIDER", "local");
     command.envs(env.iter().copied());
     let t = Instant::now();
     let out = command.output().await.unwrap();

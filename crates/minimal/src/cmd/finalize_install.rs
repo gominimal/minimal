@@ -536,7 +536,7 @@ async fn plan_for_this_host(global: &GlobalArgs, ct_mark_mask: Option<u32>) -> P
 /// configured provider is the Linux VM provider, then the `kvm` group
 /// membership for that provider or the classifier tree for the native one,
 /// in that order. A native provider that the `/dev/kvm` fallback chose
-/// (no `--provider`, `MINIMAL_PROVIDER` or `provider` key) also gets the
+/// (no `--provider`, `MIN_PROVIDER` or `provider` key) also gets the
 /// `kvm` group item when `/dev/kvm` is there but does not open for this
 /// user: joining the group is what makes the VM provider the default
 /// ([`crate::hosts::resolve_default_provider`]). The host line leaves that
@@ -1988,7 +1988,7 @@ pub(crate) mod linux {
 
     /// Whether the native provider's plan offers the `kvm` group item: only
     /// when the `/dev/kvm` fallback chose the native provider (`defaulted`:
-    /// no `--provider`, `MINIMAL_PROVIDER` or `provider` key named it) and
+    /// no `--provider`, `MIN_PROVIDER` or `provider` key named it) and
     /// `/dev/kvm` is there but did not open (`open`) for lack of permission.
     pub(crate) fn offers_native_kvm_item(defaulted: bool, open: &std::io::Result<()>) -> bool {
         defaulted

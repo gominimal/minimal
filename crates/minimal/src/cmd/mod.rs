@@ -57,7 +57,7 @@ pub use session::*;
 pub use types::{BoxTypeNotFound, BoxTypesCause, BoxTypesInvalid};
 
 pub async fn run(mut cli: Cli) -> Result<(), anyhow::Error> {
-    // A command with no `--provider` takes `MINIMAL_PROVIDER`, then the
+    // A command with no `--provider` takes `MIN_PROVIDER`, then the
     // `provider` key of config.toml, then the VM provider where /dev/kvm
     // opens (Linux only). Resolved before the alias, so an old name in
     // either place gets the same hint as the flag.

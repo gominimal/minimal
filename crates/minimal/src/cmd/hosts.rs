@@ -44,7 +44,7 @@ pub fn read_provider_alias(global: &mut GlobalArgs) -> Option<&'static str> {
 
 /// The environment variable that names the provider for a `min` command
 /// with no `--provider`. It wins over the `provider` key of `config.toml`.
-pub const PROVIDER_ENV: &str = "MINIMAL_PROVIDER";
+pub const PROVIDER_ENV: &str = "MIN_PROVIDER";
 
 /// The device the Linux VM provider drives.
 const KVM_DEVICE: &str = "/dev/kvm";
@@ -61,7 +61,7 @@ pub(crate) fn open_kvm_device() -> std::io::Result<()> {
 }
 
 /// Choose the provider for a command that has no `--provider`, on Linux.
-/// `MINIMAL_PROVIDER` decides first, then the `provider` key of the user's
+/// `MIN_PROVIDER` decides first, then the `provider` key of the user's
 /// `config.toml`. With neither, the VM provider is the default where
 /// `/dev/kvm` opens for reading and writing, and the native provider
 /// otherwise, which leaves `provider` unset as before. macOS has one
@@ -69,7 +69,7 @@ pub(crate) fn open_kvm_device() -> std::io::Result<()> {
 ///
 /// # Errors
 ///
-/// A `MINIMAL_PROVIDER` or `provider` value that names no provider, or a
+/// A `MIN_PROVIDER` or `provider` value that names no provider, or a
 /// `config.toml` that is not read or does not parse.
 pub fn resolve_default_provider(global: &mut GlobalArgs) -> anyhow::Result<()> {
     if global.provider.is_some() || !cfg!(target_os = "linux") {
@@ -873,7 +873,7 @@ mod default_provider_tests {
         assert_eq!(absent, None);
     }
 
-    /// `MINIMAL_PROVIDER` wins over the config key, and the config key wins
+    /// `MIN_PROVIDER` wins over the config key, and the config key wins
     /// over the KVM probe. Neither is read past the input that decides.
     #[test]
     fn env_beats_config_and_config_beats_kvm() {
@@ -922,7 +922,7 @@ mod default_provider_tests {
         let env = default_provider_over(Some("vm".into()), no_config, path, denied).unwrap_err();
         assert_eq!(
             env.to_string(),
-            "MINIMAL_PROVIDER=vm names no provider. Set MINIMAL_PROVIDER to local or local-minvmd, \
+            "MIN_PROVIDER=vm names no provider. Set MIN_PROVIDER to local or local-minvmd, \
              or unset it."
         );
         let config =

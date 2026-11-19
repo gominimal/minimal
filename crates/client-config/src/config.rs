@@ -22,7 +22,7 @@ use crate::store_rules::{
 #[non_exhaustive]
 pub struct Config {
     /// `provider`: the box host `min` uses on Linux when a command has no
-    /// `--provider` and `MINIMAL_PROVIDER` is unset, as `--provider` names
+    /// `--provider` and `MIN_PROVIDER` is unset, as `--provider` names
     /// it (`local` or `local-minvmd`). The client checks the value. A top-level
     /// key, so it goes before the first table in the file.
     #[serde(default, skip_serializing_if = "Option::is_none")]

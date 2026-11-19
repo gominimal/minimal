@@ -37,14 +37,14 @@ These apply to every subcommand.
 | `--repo-dir <PATH>` | `-C` | Use the given directory as the repository root, instead of the current working directory |
 | `--minimal-dir <PATH>` | | Override the base directory for minimal's state; the session store, provider instances, and other on-disk state live under `<minimal_dir>/`. Defaults to `$XDG_STATE_HOME/minimal` on Linux (or `$HOME/.local/state/minimal`); macOS also uses `$HOME/.local/state/minimal` |
 | `--config-dir <PATH>` | | Override the user config directory; everything under `<config_dir>/minimal/` (`config.toml`, `loadouts/`, ...) resolves relative to it. Defaults to `$XDG_CONFIG_HOME` on Linux (or `$HOME/.config`); macOS also uses `$HOME/.config` |
-| `--provider <PROVIDER>` | | Daemon backend that hosts sessions: `local` (`minimald` natively on the host) or `local-minvmd` (`minimald` inside the `minvmd` microVM). Without the flag, Linux uses `MINIMAL_PROVIDER`, then the `provider` key of `config.toml`, then `local-minvmd` where `/dev/kvm` opens for you and `local` where it does not. No effect on macOS, where `minvmd` is the only backend |
+| `--provider <PROVIDER>` | | Daemon backend that hosts sessions: `local` (`minimald` natively on the host) or `local-minvmd` (`minimald` inside the `minvmd` microVM). Without the flag, Linux uses `MIN_PROVIDER`, then the `provider` key of `config.toml`, then `local-minvmd` where `/dev/kvm` opens for you and `local` where it does not. No effect on macOS, where `minvmd` is the only backend |
 | `--no-input` | | Skip interactive prompts that need a terminal (such as the session picker); ambiguous choices error with a list of candidates instead. Implied when stdin/stdout is not a terminal |
 
 ### Choosing the provider on Linux
 
 A command without `--provider` chooses the provider in this order:
 
-1. The `MINIMAL_PROVIDER` environment variable, set to `local` or
+1. The `MIN_PROVIDER` environment variable, set to `local` or
    `local-minvmd`.
 2. The `provider` key of your `config.toml` (run `min dirs` to find the
    file). It is a top-level key, so it goes before the first table:
@@ -63,7 +63,7 @@ not open for you stays on `local` until you join the `kvm` group.
 Each provider keeps its own boxes. Boxes you started on the native provider
 before `local-minvmd` became your default stay there: `min --provider local
 ls` lists them. To keep the native provider as your default, set
-`MINIMAL_PROVIDER=local` or put `provider = "local"` in `config.toml`.
+`MIN_PROVIDER=local` or put `provider = "local"` in `config.toml`.
 
 ## Commands
 

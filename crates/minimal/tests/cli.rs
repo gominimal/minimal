@@ -88,7 +88,7 @@ async fn finalize_install_show_json_reaches_a_piped_reader_before_exit() {
     let state = tempfile::TempDir::new().unwrap();
     let config_dir = tempfile::TempDir::new().unwrap();
     let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
-        .env("MINIMAL_PROVIDER", "local")
+        .env("MIN_PROVIDER", "local")
         .args(["--minimal-dir".as_ref(), state.path().as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .args(["--no-input", "finalize-install", "--show", "--json"])
@@ -190,7 +190,7 @@ async fn finalize_install_show_returns_within_its_deadline_on_a_wedged_daemon() 
     });
     let started = std::time::Instant::now();
     let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
-        .env("MINIMAL_PROVIDER", "local")
+        .env("MIN_PROVIDER", "local")
         .args(["--minimal-dir".as_ref(), state.path().as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .args(["--no-input", "finalize-install", "--show", "--json"])
@@ -1332,7 +1332,7 @@ async fn activate_prints_no_session_id_when_composition_fails() {
     // out of the run.
     let config_dir = tempfile::TempDir::new().unwrap();
     let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
-        .env("MINIMAL_PROVIDER", "local")
+        .env("MIN_PROVIDER", "local")
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .arg("--no-input")
@@ -1388,7 +1388,7 @@ async fn refused_activation(verdict: minimald::server::UsernsRestriction) -> Str
         .set_user_namespace_gate(minimald::server::UsernsGate::Fixed(verdict))
         .await;
     let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
-        .env("MINIMAL_PROVIDER", "local")
+        .env("MIN_PROVIDER", "local")
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .arg("--no-input")
@@ -1535,7 +1535,7 @@ async fn refused_task_run(verdict: minimald::server::UsernsRestriction) -> Strin
         .set_user_namespace_gate(minimald::server::UsernsGate::Fixed(verdict))
         .await;
     let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
-        .env("MINIMAL_PROVIDER", "local")
+        .env("MIN_PROVIDER", "local")
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .arg("--no-input")
@@ -1633,7 +1633,7 @@ async fn loadout_list_warning_goes_to_stderr_not_stdout() {
     // out of the run.
     let config_dir = tempfile::TempDir::new().unwrap();
     let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
-        .env("MINIMAL_PROVIDER", "local")
+        .env("MIN_PROVIDER", "local")
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .arg("--no-input")
@@ -3367,7 +3367,7 @@ async fn run_min(args: &GlobalArgs, extra: &[&str]) -> std::process::Output {
         .expect("setup points at a tempdir");
     let config_dir = tempfile::TempDir::new().unwrap();
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"));
-    command.env("MINIMAL_PROVIDER", "local");
+    command.env("MIN_PROVIDER", "local");
     command
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
@@ -4960,7 +4960,7 @@ async fn net_forward_announces_the_bound_local_port() {
         .expect("setup points at a tempdir");
     let config_dir = tempfile::TempDir::new().unwrap();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
-        .env("MINIMAL_PROVIDER", "local")
+        .env("MIN_PROVIDER", "local")
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .arg("--no-input")
@@ -5047,7 +5047,7 @@ async fn task_run_exits_with_held_open_stdin_pipe() {
 
     let config_dir = tempfile::TempDir::new().unwrap();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
-        .env("MINIMAL_PROVIDER", "local")
+        .env("MIN_PROVIDER", "local")
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .arg("--no-input")
@@ -5264,18 +5264,18 @@ async fn activate_exits_8_when_the_vm_host_is_out_of_addresses() {
     );
 }
 
-/// A `MINIMAL_PROVIDER` that names no provider refuses a flagless command
+/// A `MIN_PROVIDER` that names no provider refuses a flagless command
 /// with the step that fixes it, while `--provider` still wins over it and
 /// the shell's completion helper prints nothing and succeeds.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn an_unknown_minimal_provider_refuses_flagless_commands_only() {
+async fn an_unknown_min_provider_refuses_flagless_commands_only() {
     let state = tempfile::TempDir::new().unwrap();
     let config_dir = tempfile::TempDir::new().unwrap();
     let min = |args: &[&str]| {
         let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"));
         command
-            .env("MINIMAL_PROVIDER", "vm")
+            .env("MIN_PROVIDER", "vm")
             .args(["--minimal-dir".as_ref(), state.path().as_os_str()])
             .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
             .arg("--no-input")
@@ -5288,7 +5288,7 @@ async fn an_unknown_minimal_provider_refuses_flagless_commands_only() {
         String::from_utf8_lossy(&refused.stderr)
             .lines()
             .any(|line| line
-                == "error: MINIMAL_PROVIDER=vm names no provider. Set MINIMAL_PROVIDER to local or \
+                == "error: MIN_PROVIDER=vm names no provider. Set MIN_PROVIDER to local or \
          local-minvmd, or unset it."),
         "{refused:?}"
     );
