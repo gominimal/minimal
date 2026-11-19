@@ -834,9 +834,10 @@ const REMOVED_SESSION_VERBS: [&str; 7] = [
 ];
 
 /// The names a script calls `min` by: the binary and the e2e's wrappers.
-const MIN_INVOKERS: [&str; 7] = [
+const MIN_INVOKERS: [&str; 8] = [
     "min",
     "mnl",
+    "bn_warm",
     "mnl2",
     "nasr_mnl2",
     "lt_mn",
@@ -908,6 +909,42 @@ fn removed_spellings_in_line(line: &str) -> Vec<String> {
     found
 }
 
+/// The shell functions in `text` whose body runs `min` or `"$MIN"` with
+/// `"$@"`: the wrappers a script calls `min` by. Each line that runs `min`
+/// with `"$@"` belongs to the nearest function that opens above it.
+fn min_wrappers_in_script(text: &str) -> Vec<(usize, String)> {
+    let mut wrappers: Vec<(usize, String)> = Vec::new();
+    let mut current: Option<(usize, String)> = None;
+    for (n, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some((name, rest)) = trimmed.split_once("()")
+            && !name.is_empty()
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && rest.trim_start().starts_with('{')
+        {
+            current = Some((n + 1, name.to_owned()));
+        }
+        let spaced: String = line
+            .chars()
+            .map(|c| if "`'\"();|&{}".contains(c) { ' ' } else { c })
+            .collect();
+        let words: Vec<&str> = spaced.split_whitespace().collect();
+        let runs_min = words.iter().any(|w| *w == "min" || *w == "$MIN");
+        if runs_min && words.contains(&"$@") {
+            let owner = current
+                .clone()
+                .unwrap_or_else(|| (n + 1, "<no function>".to_owned()));
+            if !wrappers.iter().any(|(_, name)| *name == owner.1) {
+                wrappers.push(owner);
+            }
+        }
+    }
+    wrappers
+}
+
 // BCLI-042: the session e2e, the smaller scripts and every CLI reference
 // page use none of the removed spellings, so no caller meets an unknown
 // command when the parser drops them.
@@ -948,6 +985,18 @@ fn scripts_and_cli_reference_use_no_removed_session_verb() {
     for file in &files {
         let text = std::fs::read_to_string(file)
             .unwrap_or_else(|e| panic!("{} must be readable: {e}", file.display()));
+        // A wrapper that MIN_INVOKERS does not list hides a bare `stop`
+        // from the check below, so every wrapper must be listed.
+        if file.extension().is_some_and(|ext| ext == "sh") {
+            for (n, name) in min_wrappers_in_script(&text) {
+                if !MIN_INVOKERS.contains(&name.as_str()) {
+                    hits.push(format!(
+                        "{}:{n}: the wrapper {name} runs min with \"$@\" and is not in MIN_INVOKERS",
+                        file.display()
+                    ));
+                }
+            }
+        }
         for (n, line) in text.lines().enumerate() {
             for spelling in removed_spellings_in_line(line) {
                 hits.push(format!(
@@ -961,9 +1010,23 @@ fn scripts_and_cli_reference_use_no_removed_session_verb() {
     }
     assert!(
         hits.is_empty(),
-        "these lines use a removed spelling (BCLI-042):\n{}",
+        "these lines use a removed spelling (BCLI-042), or define a wrapper the check does not know:\n{}",
         hits.join("\n")
     );
+}
+
+/// The wrapper finder names each function that runs `min` or `"$MIN"` with
+/// `"$@"`, on one line or several, and skips a function that does not.
+#[test]
+fn min_wrappers_in_script_finds_each_form() {
+    let script = "mnl() {\n  # min \"$@\" in a comment\n  min ${E2E_MINIMAL_ARGS:-} \"$@\"\n}\n\
+                  two() { \"$MIN\" --vm x \"$@\"; }\n\
+                  other() {\n  echo \"$@\"\n}\n";
+    let names: Vec<String> = min_wrappers_in_script(script)
+        .into_iter()
+        .map(|(_, name)| name)
+        .collect();
+    assert_eq!(names, ["mnl", "two"]);
 }
 
 /// The line reader finds each removed spelling, and passes the verbs that
