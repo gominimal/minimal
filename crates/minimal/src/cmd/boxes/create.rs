@@ -1551,10 +1551,11 @@ fn task_egress_from(bytes: &[u8], task: &str) -> anyhow::Result<ProjectEgress> {
     entry_egress(&file, entry)
 }
 
-/// The `[network]` keys a task box takes from `minimal.toml`: the mode and
-/// the egress, in its nested or its flat spelling. Every other key reaches
+/// The `[network]` keys a task box takes from `minimal.toml`: the mode, the
+/// egress in its nested or its flat spelling, and `vpn_network_names`,
+/// which `put_task_spec` keeps on the stored spec. Every other key reaches
 /// a task box only by its run flag.
-const TASK_NETWORK_KEYS: [&str; 2] = ["mode", "egress"];
+const TASK_NETWORK_KEYS: [&str; 3] = ["mode", "egress", "vpn_network_names"];
 
 /// A `network` key that a task's own layers declare and that a task box
 /// does not apply, such as `quic443` (#3252). The message names the key,
@@ -7335,6 +7336,26 @@ mod tests {
              task box. Remove network.bep from [tasks.build]."
         );
         assert!(out.is_empty(), "no rows print");
+    }
+
+    // #3252: a task box applies `network.vpn_network_names`, so
+    // `min task run` and `min box spec` take it from `[tasks.<name>]` and
+    // from `[defaults.task]` without a refusal.
+    #[test]
+    fn task_vpn_network_names_is_not_refused() {
+        for toml in [
+            "[tasks.build]\necho = 'x'\n\n\
+             [tasks.build.network]\nvpn_network_names = [\"corp\"]\n",
+            "[defaults.task.network]\nvpn_network_names = [\"corp\"]\n\n\
+             [tasks.build]\necho = 'x'\n",
+        ] {
+            let project = tempfile::tempdir().expect("project dir");
+            std::fs::write(project.path().join(mfile::MFILE_NAME), toml)
+                .expect("write minimal.toml");
+            let root = camino::Utf8Path::from_path(project.path()).expect("utf-8 project dir");
+            task_project_egress(root, "build")
+                .unwrap_or_else(|err| panic!("{toml}: the task is not refused: {err:#}"));
+        }
     }
 
     // BEP-032: a box whose only proxy-served secrets are store references

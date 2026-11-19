@@ -1020,8 +1020,8 @@ pub struct File {
 /// reported as unknown.
 ///
 /// An entry's `network` table is read by the minimal crate's task reader.
-/// That reader applies the table's `mode` and `egress` to a task box and
-/// refuses the other sub-keys (`quic443`, `bep`, `ingress`, …), which a
+/// That reader applies the table's `mode`, `egress` and
+/// `vpn_network_names` to a task box and refuses the other sub-keys (`quic443`, `bep`, `ingress`, …), which a
 /// task box does not apply. The sub-keys are not checked here: which ones
 /// a box reads differs per box type, and the minimal crate owns that
 /// knowledge. The projection of a `[network]` table onto a given box
