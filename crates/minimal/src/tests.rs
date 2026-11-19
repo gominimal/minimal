@@ -6629,7 +6629,7 @@ mod mint_tests {
             &log,
             "2026-11-19T10:00:00Z  INFO bep::serve: listening\n\
              2026-11-19T10:00:01Z \u{1b}[31mERROR\u{1b}[0m bep::serve: the TPM key was not read\n\
-             2026-11-19T10:00:02Z  INFO bep::serve: stopping\n\n",
+             \n",
         )
         .unwrap();
         let reason = "bep::serve: the TPM key was not read";
@@ -6699,6 +6699,39 @@ mod mint_tests {
         assert_eq!(
             crate::mint::last_error_line(&log).as_deref(),
             Some("bep did not start, because it did not find your home directory.")
+        );
+        // The log keeps earlier runs. An error that a later record follows
+        // did not stop the proxy, and is not quoted.
+        std::fs::write(
+            &log,
+            "2026-11-19T09:00:00Z ERROR bep::serve: an old failure\n\
+             2026-11-19T10:00:00Z  INFO bep::serve: listening\n",
+        )
+        .unwrap();
+        assert_eq!(crate::mint::last_error_line(&log), None);
+        // Lines with no level after a record: the first one is quoted, not
+        // the tail of a backtrace.
+        std::fs::write(
+            &log,
+            "2026-11-19T10:00:00Z  INFO bep::serve: listening\n\
+             bep stopped serving: the listener closed\n\
+             \x20\x20\x200: std::backtrace::Backtrace::create\n",
+        )
+        .unwrap();
+        assert_eq!(
+            crate::mint::last_error_line(&log).as_deref(),
+            Some("bep stopped serving: the listener closed")
+        );
+        // An ERROR record keeps its own text when a wrapped line follows it.
+        std::fs::write(
+            &log,
+            "2026-11-19T10:00:00Z ERROR bep::serve: the TPM key was not read\n\
+             \x20\x20\x20\x20at crates/bep/src/tpm.rs:10\n",
+        )
+        .unwrap();
+        assert_eq!(
+            crate::mint::last_error_line(&log).as_deref(),
+            Some("bep::serve: the TPM key was not read")
         );
         // With no log file, the text names no log and still gives the
         // restart step.

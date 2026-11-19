@@ -90,11 +90,16 @@ const LOG_TAIL_BYTES: u64 = 64 * 1024;
 /// The longest error line a refusal quotes, in characters.
 const ERROR_LINE_CHARS: usize = 300;
 
-/// The last error line in the proxy's log at `log`, or `None` when the
-/// file is not read or has none. A `tracing` record counts when its level
-/// is `ERROR`, and its text after the level is kept. A line that is no
-/// record is what `bep` printed when it stopped, and counts as an error.
-/// Colour codes are removed, and other control characters are escaped.
+/// The error that ends the proxy's log at `log`, or `None` when the file
+/// is not read or does not end in an error. Only the end of the log
+/// counts, because `bep.log` keeps the records of earlier runs. When the
+/// last `tracing` record is an `ERROR`, its text after the level is kept,
+/// and lines with no level after it are taken as part of it. After any
+/// other record, lines with no level are what `bep` printed when it
+/// stopped, and the first of them is kept, so the tail of a backtrace is
+/// not quoted. An `INFO`, `WARN`, `DEBUG` or `TRACE` record with no such
+/// lines after it gives `None`: an error before it did not stop the proxy. Colour codes are removed, and other control
+/// characters are escaped.
 pub(crate) fn last_error_line(log: &Path) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(log).ok()?;
@@ -104,21 +109,7 @@ pub(crate) fn last_error_line(log: &Path) -> Option<String> {
     let mut tail = Vec::new();
     file.read_to_end(&mut tail).ok()?;
     let tail = String::from_utf8_lossy(&tail);
-    let line = tail.lines().rev().find_map(|line| {
-        let line = strip_ansi(line);
-        let words: Vec<&str> = line.split_whitespace().take(3).collect();
-        if words.is_empty() {
-            return None;
-        }
-        const LEVELS: [&str; 5] = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"];
-        match words.iter().find(|word| LEVELS.contains(word)) {
-            Some(&"ERROR") => line
-                .split_once("ERROR")
-                .map(|(_, rest)| rest.trim().to_owned()),
-            Some(_) => None,
-            None => Some(line.trim().to_owned()),
-        }
-    })?;
+    let line = final_error(&tail)?;
     let line: String = line
         .chars()
         .flat_map(|c| {
@@ -131,6 +122,31 @@ pub(crate) fn last_error_line(log: &Path) -> Option<String> {
         .take(ERROR_LINE_CHARS)
         .collect();
     (!line.is_empty()).then_some(line)
+}
+
+/// The error that ends `tail`, a run of log lines, as [`last_error_line`]
+/// describes it, before its characters are escaped.
+fn final_error(tail: &str) -> Option<String> {
+    const LEVELS: [&str; 5] = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"];
+    // The first line with no level after the last record, seen so far.
+    let mut printed: Option<String> = None;
+    for line in tail.lines().rev() {
+        let line = strip_ansi(line);
+        let words: Vec<&str> = line.split_whitespace().take(3).collect();
+        if words.is_empty() {
+            continue;
+        }
+        match words.iter().find(|word| LEVELS.contains(word)) {
+            Some(&"ERROR") => {
+                return line
+                    .split_once("ERROR")
+                    .map(|(_, rest)| rest.trim().to_owned());
+            }
+            Some(_) => return printed,
+            None => printed = Some(line.trim().to_owned()),
+        }
+    }
+    printed
 }
 
 /// `line` with its ANSI colour sequences (`ESC [ ... letter`) removed.
