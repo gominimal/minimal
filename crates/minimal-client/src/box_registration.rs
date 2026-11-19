@@ -1436,11 +1436,10 @@ mod tests {
         let sock_path = dir.path().join("control.sock");
         let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
         let id = minimald_rpc::BoxId::from_bytes([5; 16]);
-        let line =
-            serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::BoxIdMinted {
-                minted_box_id: id,
-            })
-            .unwrap();
+        let line = serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::BoxIdMinted {
+            minted_box_id: id,
+        })
+        .unwrap();
         let daemon = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut stream = tokio::io::BufReader::new(stream);
@@ -1477,6 +1476,9 @@ mod tests {
             }
             other => panic!("the client registers the box, got {other:?}"),
         }
-        assert!(after.is_empty(), "an uncommitted lease closes with no commit line");
+        assert!(
+            after.is_empty(),
+            "an uncommitted lease closes with no commit line"
+        );
     }
 }
