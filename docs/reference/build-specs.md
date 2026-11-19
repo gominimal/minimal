@@ -134,7 +134,7 @@ Where the package comes from decides what its build box can reach:
 
 | Package | Reach |
 |---|---|
-| From an `[upstream]` or a sideload, at the pin `minimal.toml` held when `min` created the box | The hosts of its declared sources and the hosts they redirect to, for the fetch alone. With `needs.dns` or `needs.internet`, on the package or in its dependencies, the internet. |
+| From an `[upstream]` or a sideload, at the pin `minimal.toml` held when `min` created the box | The hosts of its declared sources and the public internet hosts they redirect to, for the fetch alone. With `needs.dns` or `needs.internet`, on the package or in its dependencies, the internet. |
 | Written in the project, patched, or changed inside the box | The box's own rules. A box that admits nothing refuses a build that needs the network. |
 
 `min` reads the pins when it creates the box. The same reach applies to a

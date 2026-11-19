@@ -285,11 +285,21 @@ const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 /// host, and each host those sources redirect to now. This is the one place
 /// that decides what a redirect widens. It reads response heads only. A hop it
 /// cannot reach adds nothing: the fetch then fails and names that host.
+///
+/// A redirect is followed only to an `http` or `https` URL whose host is on
+/// the public internet. A hop to any other scheme, or to a loopback, private,
+/// link-local or other non-public address, by literal or by the addresses its
+/// name resolves to, ends that source's walk and adds nothing. The probe of a
+/// hop connects to the addresses checked, never to a later answer for its name.
 pub async fn source_hosts(sources: &[String]) -> std::collections::BTreeSet<String> {
-    let probe = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(PROBE_TIMEOUT)
-        .build();
+    source_hosts_admitting(sources, is_public_address).await
+}
+
+/// [`source_hosts`], following a redirect only to addresses `admits` admits.
+async fn source_hosts_admitting(
+    sources: &[String],
+    admits: fn(std::net::IpAddr) -> bool,
+) -> std::collections::BTreeSet<String> {
     let mut hosts = std::collections::BTreeSet::new();
     let started = std::time::Instant::now();
     for source in sources {
@@ -297,7 +307,9 @@ pub async fn source_hosts(sources: &[String]) -> std::collections::BTreeSet<Stri
             continue;
         };
         hosts.extend(at.host_str().map(str::to_ascii_lowercase));
-        let Ok(probe) = &probe else { continue };
+        let Ok(mut probe) = probe_client(None) else {
+            continue;
+        };
         for _ in 0..MAX_REDIRECTS {
             if started.elapsed() >= PROBE_BUDGET {
                 break;
@@ -314,11 +326,113 @@ pub async fn source_hosts(sources: &[String]) -> std::collections::BTreeSet<Stri
             // Dropping the response closes the connection, so no body is read.
             drop(response);
             let Some(next) = next else { break };
+            let Some(pinned) = redirect_addresses(&next, admits).await else {
+                break;
+            };
+            let Ok(next_probe) = probe_client(pinned.as_ref()) else {
+                break;
+            };
             hosts.extend(next.host_str().map(str::to_ascii_lowercase));
+            probe = next_probe;
             at = next;
         }
     }
     hosts
+}
+
+/// A name and the addresses a probe connects to for it.
+type PinnedName = (String, Vec<std::net::SocketAddr>);
+
+/// The client that probes one hop. It follows no redirect. With `pinned`, it
+/// connects to those addresses for the hop's name and to no others.
+fn probe_client(pinned: Option<&PinnedName>) -> reqwest::Result<reqwest::Client> {
+    let builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(PROBE_TIMEOUT);
+    match pinned {
+        Some((name, addresses)) => builder.resolve_to_addrs(name, addresses),
+        None => builder,
+    }
+    .build()
+}
+
+/// Whether a redirect to `url` is followed, and where its probe connects.
+/// `None` ends the walk. `Some(None)` is a literal address `admits` admits,
+/// which needs no name. `Some(Some(_))` is a name that resolves, every
+/// address of which `admits` admits, pinned to those addresses. Only an
+/// `http` or `https` URL is followed.
+async fn redirect_addresses(
+    url: &reqwest::Url,
+    admits: fn(std::net::IpAddr) -> bool,
+) -> Option<Option<PinnedName>> {
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    let port = url.port_or_known_default()?;
+    match url.host()? {
+        url::Host::Ipv4(ip) => admits(ip.into()).then_some(None),
+        url::Host::Ipv6(ip) => admits(ip.into()).then_some(None),
+        url::Host::Domain(name) => {
+            let resolved: Vec<std::net::SocketAddr> =
+                tokio::time::timeout(PROBE_TIMEOUT, tokio::net::lookup_host((name, port)))
+                    .await
+                    .ok()?
+                    .ok()?
+                    .collect();
+            (!resolved.is_empty() && resolved.iter().all(|addr| admits(addr.ip())))
+                .then(|| Some((name.to_string(), resolved)))
+        }
+    }
+}
+
+/// Whether `ip` is an address on the public internet: not loopback,
+/// private, link-local, shared, multicast, documentation, reserved or
+/// unspecified.
+fn is_public_address(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => is_public_v4(v4),
+        std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_public_v4(v4);
+            }
+            let segments = v6.segments();
+            !(v6.is_unspecified()
+                || v6.is_loopback()
+                || v6.is_multicast()
+                // Unique local, fc00::/7.
+                || (segments[0] & 0xfe00) == 0xfc00
+                // Link-local, fe80::/10.
+                || (segments[0] & 0xffc0) == 0xfe80
+                // Documentation, 2001:db8::/32.
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+                // IPv4 translation, 64:ff9b::/96 and 64:ff9b:1::/48.
+                || segments[0] == 0x0064
+                // The IPv4-compatible form, ::/96.
+                || segments[..6].iter().all(|segment| *segment == 0))
+        }
+    }
+}
+
+/// [`is_public_address`] for an IPv4 address.
+fn is_public_v4(ip: std::net::Ipv4Addr) -> bool {
+    let [a, b, c, _] = ip.octets();
+    !(ip.is_unspecified()
+        || ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || ip.is_documentation()
+        // This network, 0.0.0.0/8.
+        || a == 0
+        // Shared address space, 100.64.0.0/10.
+        || (a == 100 && (b & 0xc0) == 64)
+        // IETF protocol assignments, 192.0.0.0/24.
+        || (a == 192 && b == 0 && c == 0)
+        // Benchmarking, 198.18.0.0/15.
+        || (a == 198 && (b & 0xfe) == 18)
+        // Reserved, 240.0.0.0/4.
+        || a >= 240)
 }
 
 /// How long a build box's fetch waits between two reads of a body.
@@ -581,17 +695,21 @@ mod connect_tests {
         );
     }
 
-    /// NET-167: a source's hosts are its own and each host it redirects to.
-    /// The source is at a literal address and redirects to a name, so the
-    /// two hosts differ on one listener.
-    #[tokio::test]
-    async fn source_redirect_hosts_join_the_build_box_egress() {
+    /// A listener on loopback that answers each of `locations` in turn: a
+    /// redirect to it, or for an empty one a 200. Returns its port and the
+    /// count of connections it took.
+    async fn redirecting_server(
+        locations: Vec<String>,
+    ) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let taken = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = taken.clone();
         tokio::spawn(async move {
-            for location in [format!("http://localhost:{port}/two"), String::new()] {
+            for location in locations {
                 let (mut stream, _) = listener.accept().await.unwrap();
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let mut request = [0u8; 1024];
                 let _ = stream.read(&mut request).await.unwrap();
                 let response = if location.is_empty() {
@@ -605,11 +723,82 @@ mod connect_tests {
                 stream.write_all(response.as_bytes()).await.unwrap();
             }
         });
-        let hosts = source_hosts(&[format!("http://127.0.0.1:{port}/one")]).await;
+        (port, taken)
+    }
+
+    /// NET-167: a source's hosts are its own and each host it redirects to.
+    /// The source is at a literal address and redirects to a name, so the
+    /// two hosts differ on one listener. The listener is on loopback, so this
+    /// walk admits every address.
+    #[tokio::test]
+    async fn source_redirect_hosts_join_the_build_box_egress() {
+        let (port, taken) = redirecting_server(vec![String::new()]).await;
+        let (first, _) = redirecting_server(vec![format!("http://localhost:{port}/two")]).await;
+        let hosts =
+            source_hosts_admitting(&[format!("http://127.0.0.1:{first}/one")], |_| true).await;
         assert_eq!(
             hosts.into_iter().collect::<Vec<_>>(),
             ["127.0.0.1", "localhost"]
         );
+        assert_eq!(taken.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// NET-167: a redirect is followed only to an `http` or `https` URL on
+    /// the public internet. A hop to a loopback literal, to a name that
+    /// resolves to loopback, or to another scheme adds no host, and its
+    /// address is never probed. The declared source stays.
+    #[tokio::test]
+    async fn a_redirect_off_the_public_internet_adds_no_host() {
+        for target in ["http://127.0.0.2:{port}/two", "http://localhost:{port}/two"] {
+            let (port, taken) = redirecting_server(vec![String::new()]).await;
+            let location = target.replace("{port}", &port.to_string());
+            let (first, _) = redirecting_server(vec![location.clone()]).await;
+            let hosts = source_hosts(&[format!("http://127.0.0.1:{first}/one")]).await;
+            assert_eq!(
+                hosts.into_iter().collect::<Vec<_>>(),
+                ["127.0.0.1"],
+                "{location}"
+            );
+            assert_eq!(
+                taken.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{location} was probed"
+            );
+        }
+        let (first, _) = redirecting_server(vec!["file:///etc/passwd".to_string()]).await;
+        let hosts =
+            source_hosts_admitting(&[format!("http://127.0.0.1:{first}/one")], |_| true).await;
+        assert_eq!(hosts.into_iter().collect::<Vec<_>>(), ["127.0.0.1"]);
+    }
+
+    /// The addresses a redirect may reach: public ones, and none of the
+    /// loopback, private, link-local, shared or reserved ranges, in either
+    /// family.
+    #[test]
+    fn only_a_public_address_is_public() {
+        for public in ["93.184.215.14", "8.8.8.8", "2606:2800:21f:cb07::1"] {
+            assert!(is_public_address(public.parse().unwrap()), "{public}");
+        }
+        for internal in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "240.0.0.1",
+            "::1",
+            "::",
+            "fd00::1",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+            "::ffff:169.254.169.254",
+            "64:ff9b::a9fe:a9fe",
+        ] {
+            assert!(!is_public_address(internal.parse().unwrap()), "{internal}");
+        }
     }
 
     /// A build box's fetch that could not connect names the host the same way.
