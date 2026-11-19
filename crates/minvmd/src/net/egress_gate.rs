@@ -21226,6 +21226,116 @@ mod tests {
         .await;
     }
 
+    /// NET-141 over TCP, failing closed at a connection's close: a close
+    /// (FIN) at a sequence number other than the next undecided byte is
+    /// dropped and the connection's entry kept, so an opening on the same
+    /// port that follows is dropped and the half that completes an
+    /// unmatched query never reaches the switch. A refused connection's
+    /// close passes but never ends its entry: an opening on the same port
+    /// after it is dropped, and so is its data.
+    #[tokio::test]
+    async fn allow_list_row_tcp_close_never_restarts_the_stream() {
+        use hickory_proto::rr::RecordType;
+
+        use crate::net::dns_pins::tests::{
+            dns_query_of, qname, tcp_dns_message, tcp_segment_frame,
+        };
+
+        const SYN: u8 = 0x02;
+        const PSH_ACK: u8 = 0x18;
+        const FIN_ACK: u8 = 0x11;
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(
+            BoxRegistration::new("weather", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: Some(vec![boxes::IpProto::Tcp, boxes::IpProto::Udp]),
+                    allow_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+                    allow_dns_hosts: Some(vec!["example.com".to_string()]),
+                    deny_subnets: None,
+                }),
+        );
+        let mut h = gate_over(registry).await;
+        let resolver = SUBNET.dns_server();
+        let segment = |port: u16, flags: u8, seq: u32, payload: &[u8]| {
+            tcp_segment_frame(
+                Ipv4Addr::from(LEASE),
+                port,
+                resolver,
+                53,
+                flags,
+                seq,
+                payload,
+            )
+        };
+        let query = |name: &str| tcp_dns_message(&dns_query_of(&[(qname(name), RecordType::A)]));
+        let declared = query("example.com.");
+        let unmatched = query("example.org.");
+        let len = |bytes: &[u8]| u32::try_from(bytes.len()).expect("a query fits in u32");
+        // The marker every drop below is proved against: a declared query on
+        // a connection of its own, opened here.
+        passes(
+            &mut h,
+            &segment(41900, SYN, 900, &[]),
+            "the marker's opening",
+        )
+        .await;
+        let mut marker_seq = 901;
+        let mut marker = async |h: &mut super::test_support::GateHarness| {
+            passes(
+                h,
+                &segment(41900, PSH_ACK, marker_seq, &declared),
+                "the declared marker query",
+            )
+            .await;
+            marker_seq += len(&declared);
+            expect_silence(&mut h.switch).await;
+        };
+
+        // An unmatched query's first half passes. A close at the wrong
+        // sequence number, an opening on the same port, and the completing
+        // half (at the new opening's sequence number and at the old one)
+        // are all dropped.
+        let (head, tail) = unmatched.split_at(5);
+        passes(&mut h, &segment(41010, SYN, 6000, &[]), "the opening").await;
+        passes(
+            &mut h,
+            &segment(41010, PSH_ACK, 6001, head),
+            "the unmatched query's first half",
+        )
+        .await;
+        send_frame(
+            &mut h.guest,
+            &segment(41010, FIN_ACK, 6001 + len(head) + 7, &[]),
+        )
+        .await;
+        send_frame(&mut h.guest, &segment(41010, SYN, 7000, &[])).await;
+        send_frame(&mut h.guest, &segment(41010, PSH_ACK, 7001, tail)).await;
+        send_frame(
+            &mut h.guest,
+            &segment(41010, PSH_ACK, 6001 + len(head), tail),
+        )
+        .await;
+        marker(&mut h).await;
+
+        // A refused connection's close passes, and its entry stays: an
+        // opening on the same port and data after it are dropped.
+        passes(&mut h, &segment(41011, SYN, 8000, &[]), "the opening").await;
+        send_frame(&mut h.guest, &segment(41011, PSH_ACK, 8001, &unmatched)).await;
+        marker(&mut h).await;
+        passes(
+            &mut h,
+            &segment(41011, FIN_ACK, 8001, &[]),
+            "the refused connection's close",
+        )
+        .await;
+        send_frame(&mut h.guest, &segment(41011, SYN, 9000, &[])).await;
+        send_frame(&mut h.guest, &segment(41011, PSH_ACK, 9001, &declared)).await;
+        send_frame(&mut h.guest, &segment(41011, PSH_ACK, 9001, &unmatched)).await;
+        marker(&mut h).await;
+        // Nothing was written back toward the guest: the drops are silent.
+        expect_silence(&mut h.guest).await;
+    }
+
     /// A relay whose guest side never reads must keep draining its switch
     /// side: the reader and the writer of a direction are split by a bounded
     /// queue, so a stalled far end is a dropped frame said once per

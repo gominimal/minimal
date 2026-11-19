@@ -1749,6 +1749,18 @@ struct TcpDnsFlow {
     last_seen: Instant,
 }
 
+impl TcpDnsFlow {
+    /// Whether the idle bound may reclaim this entry at `now`: it sat idle
+    /// past [`TCP_DNS_FLOW_IDLE`], holds no part of a message, and was not
+    /// refused. A refused entry, or one holding part of a message, is kept
+    /// so a later opening cannot restart where its stream is read from.
+    fn reclaimable(&self, now: Instant) -> bool {
+        !self.refused
+            && self.pending.is_empty()
+            && now.duration_since(self.last_seen) >= TCP_DNS_FLOW_IDLE
+    }
+}
+
 /// What [`DnsTcpStreams::decide`] makes of one TCP frame.
 pub(crate) enum TcpDnsVerdict {
     /// Not a frame the host-side DNS gate decides: forward as the verdict
@@ -1786,6 +1798,14 @@ pub(crate) struct TcpDnsAdvance {
 /// exceeds [`MAX_TCP_DNS_MESSAGE`], and an opening past
 /// [`MAX_TCP_DNS_FLOWS`] are dropped. Bytes before the next undecided one
 /// were already decided and written on, so a retransmission of them passes.
+///
+/// A connection's entry ends only at a close (FIN or RST) whose sequence
+/// number is the next undecided byte, the close the resolver also reads as
+/// the end of the stream; a close at any other sequence number is dropped
+/// and the entry kept. A refused connection's entry is never ended, and
+/// neither it nor an entry holding part of a message is reclaimed by the
+/// idle bound, so no later opening on the same port restarts where its
+/// stream is read from.
 #[derive(Default)]
 pub(crate) struct DnsTcpStreams {
     flows: HashMap<([u8; 4], u16), TcpDnsFlow>,
@@ -1825,23 +1845,26 @@ impl DnsTcpStreams {
             // An opening on a tracked connection is a retransmission of the
             // one already seen, or nothing passes: a new opening would move
             // where the stream is read from while the resolver still reads
-            // the old connection. An entry idle past its bound is reclaimed.
-            if let Some(flow) = self.flows.get(&key)
-                && now.duration_since(flow.last_seen) < TCP_DNS_FLOW_IDLE
-            {
-                return if flow.next_seq == pkt.tcp_seq.wrapping_add(1) && flow.pending.is_empty() {
-                    TcpDnsVerdict::Forward(TcpDnsAdvance {
-                        key,
-                        flow: Some(flow.clone()),
-                    })
-                } else {
-                    TcpDnsVerdict::Drop(None)
-                };
+            // the old connection. Only a clean entry idle past its bound is
+            // reclaimed.
+            if let Some(flow) = self.flows.get(&key) {
+                if !flow.reclaimable(now) {
+                    return if flow.next_seq == pkt.tcp_seq.wrapping_add(1)
+                        && flow.pending.is_empty()
+                        && !flow.refused
+                    {
+                        TcpDnsVerdict::Forward(TcpDnsAdvance {
+                            key,
+                            flow: Some(flow.clone()),
+                        })
+                    } else {
+                        TcpDnsVerdict::Drop(None)
+                    };
+                }
+                self.flows.remove(&key);
             }
-            self.flows.remove(&key);
             if self.flows.len() >= MAX_TCP_DNS_FLOWS {
-                self.flows
-                    .retain(|_, flow| now.duration_since(flow.last_seen) < TCP_DNS_FLOW_IDLE);
+                self.flows.retain(|_, flow| !flow.reclaimable(now));
                 if self.flows.len() >= MAX_TCP_DNS_FLOWS {
                     return refused("<too many open connections>");
                 }
@@ -1865,7 +1888,13 @@ impl DnsTcpStreams {
                 TcpDnsVerdict::Drop(None)
             };
         };
-        let forward = |flow: TcpDnsFlow| {
+        // Forwards the frame. A close ends the entry only when it sits at
+        // the next undecided byte (`closes_at_next`); any other close is
+        // dropped and the entry kept.
+        let forward = |flow: TcpDnsFlow, closes_at_next: bool| {
+            if ends && !closes_at_next {
+                return TcpDnsVerdict::Drop(None);
+            }
             TcpDnsVerdict::Forward(TcpDnsAdvance {
                 key,
                 flow: (!ends).then_some(TcpDnsFlow {
@@ -1874,11 +1903,21 @@ impl DnsTcpStreams {
                 }),
             })
         };
-        if payload.is_empty() {
-            return forward(flow.clone());
-        }
         if flow.refused {
-            return TcpDnsVerdict::Drop(None);
+            // A refused connection writes on no data, and its entry is never
+            // ended: a frame without data passes and keeps it.
+            return if payload.is_empty() {
+                TcpDnsVerdict::Forward(TcpDnsAdvance {
+                    key,
+                    flow: Some(flow.clone()),
+                })
+            } else {
+                TcpDnsVerdict::Drop(None)
+            };
+        }
+        if payload.is_empty() {
+            let at_next = pkt.tcp_seq == flow.next_seq;
+            return forward(flow.clone(), at_next);
         }
         // How far this segment starts past the next undecided byte, in
         // sequence space: a positive distance is a gap, and the frame waits
@@ -1890,7 +1929,11 @@ impl DnsTcpStreams {
         let already = usize::try_from(ahead.unsigned_abs()).unwrap_or(usize::MAX);
         let Some(fresh) = payload.get(already..).filter(|fresh| !fresh.is_empty()) else {
             // Every byte was decided and written on before.
-            return forward(flow.clone());
+            let at_next = pkt
+                .tcp_seq
+                .wrapping_add(u32::try_from(payload.len()).unwrap_or(u32::MAX))
+                == flow.next_seq;
+            return forward(flow.clone(), at_next);
         };
         let mut next = flow.clone();
         next.pending.extend_from_slice(fresh);
@@ -1903,7 +1946,9 @@ impl DnsTcpStreams {
             flow.pending = Vec::new();
             return TcpDnsVerdict::Drop(Some(refusal));
         }
-        forward(next)
+        // The frame's data ends at the next undecided byte, so its close
+        // does too.
+        forward(next, true)
     }
 
     /// Applies a forwarded frame's advance, once the frame is written on.
@@ -4379,5 +4424,81 @@ pub(crate) mod tests {
     /// would parse it — the identity the flow retention reads.
     fn l4_of(frame: &[u8]) -> super::L4Packet {
         super::parse_ipv4_l4(frame).expect("the test's frame parses as the relay parses it")
+    }
+
+    /// NET-141 over TCP, the idle bound: an opening on a port whose entry
+    /// sat idle past [`super::TCP_DNS_FLOW_IDLE`] is dropped while that
+    /// entry holds part of a message or was refused, so the stream is never
+    /// read again from a new start; a clean idle entry is reclaimed and the
+    /// opening passes.
+    #[test]
+    fn tcp_entry_idle_past_its_bound_is_reclaimed_only_when_clean() {
+        use super::{DnsTcpStreams, TCP_DNS_FLOW_IDLE, TcpDnsVerdict};
+
+        const SYN: u8 = 0x02;
+        const PSH_ACK: u8 = 0x18;
+        let registry = BoxRegistry::new(SUBNET);
+        deny_all_box(&registry, "sealed", LEASE);
+        let table = registry.table();
+        let mut streams = DnsTcpStreams::default();
+        let start = Instant::now();
+        let later = start + TCP_DNS_FLOW_IDLE + Duration::from_secs(1);
+        let mut decide = |port: u16, flags: u8, seq: u32, payload: &[u8], now: Instant| {
+            let frame = tcp_segment_frame(
+                Ipv4Addr::from(LEASE),
+                port,
+                SUBNET.dns_server(),
+                53,
+                flags,
+                seq,
+                payload,
+            );
+            match streams.decide(&table, &l4_of(&frame), &frame, now) {
+                TcpDnsVerdict::Forward(advance) => {
+                    streams.commit(advance);
+                    true
+                }
+                TcpDnsVerdict::Pass => panic!("a decided row's frame to its resolver is decided"),
+                TcpDnsVerdict::Drop(_) => false,
+            }
+        };
+        let unmatched = tcp_dns_message(&dns_query_of(&[(qname("example.org."), RecordType::A)]));
+        let zone = tcp_dns_message(&dns_query_of(&[(
+            qname("web.min.internal."),
+            RecordType::A,
+        )]));
+
+        // An entry holding the first half of a message.
+        assert!(decide(42000, SYN, 1000, &[], start), "the opening passes");
+        assert!(
+            decide(42000, PSH_ACK, 1001, &unmatched[..5], start),
+            "the first half passes"
+        );
+        assert!(
+            !decide(42000, SYN, 5000, &[], later),
+            "an opening over an idle entry holding part of a message is dropped"
+        );
+
+        // A refused entry.
+        assert!(decide(42001, SYN, 2000, &[], start), "the opening passes");
+        assert!(
+            !decide(42001, PSH_ACK, 2001, &unmatched, start),
+            "the unmatched query is dropped"
+        );
+        assert!(
+            !decide(42001, SYN, 6000, &[], later),
+            "an opening over an idle refused entry is dropped"
+        );
+
+        // A clean entry: every message complete and passed.
+        assert!(decide(42002, SYN, 3000, &[], start), "the opening passes");
+        assert!(
+            decide(42002, PSH_ACK, 3001, &zone, start),
+            "the zone lookup passes"
+        );
+        assert!(
+            decide(42002, SYN, 7000, &[], later),
+            "an opening over an idle clean entry passes"
+        );
     }
 }
