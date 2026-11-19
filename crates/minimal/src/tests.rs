@@ -265,7 +265,7 @@ fn every_daemon_connection_is_classified() {
             // so a skewed host still answers which boxes it holds.
             "cmd/boxes/address.rs::connect_box_host = gated",
             "cmd/boxes/address.rs::probe_other_host = ungated",
-            "cmd/boxes/address.rs::read_host_boxes = ungated",
+            "cmd/boxes/address.rs::read_host = ungated",
             // A read-only look at a box after `min box attach` ended, to say
             // why the host ended it. The attach itself went through the
             // address resolution above, and the read builds nothing.
