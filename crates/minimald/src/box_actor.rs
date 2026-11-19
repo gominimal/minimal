@@ -2616,7 +2616,12 @@ impl BoxActor {
                 let _ = r.send(self.rename(new_name).await);
             }
             BoxMessage::RegisterBoxAgain(request, r) => {
-                let _ = r.send(self.register_box_again(request).await);
+                // A request whose caller gave up before the actor reached it
+                // is not served: its client dropped the registration.
+                if !r.is_closed() {
+                    let answer = self.register_box_again(request, || r.is_closed()).await;
+                    let _ = r.send(answer);
+                }
             }
             #[cfg(test)]
             BoxMessage::Park(d, entered) => {

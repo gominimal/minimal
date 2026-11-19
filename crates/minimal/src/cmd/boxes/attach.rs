@@ -313,17 +313,23 @@ async fn box_via_ssh_with(
             // The VM host withdrew the box's row: register the box again
             // and retry the attach, one time (NET-138).
             if !registered_again
-                && register_again_after_row_ended(sock, code, record.as_ref()).await?
+                && let Some(again) =
+                    register_again_after_row_ended(sock, code, record.as_ref()).await?
             {
                 registered_again = true;
+                // The record read back, or else the old one with the new
+                // registration's addresses and box id, so the retried
+                // attach and its cleanup name the new row.
                 record = match attached_box_record(sock, id).await {
-                    Ok(read) => read,
+                    Ok(Some(read)) => Some(read),
+                    Ok(None) => Some(again),
                     Err(error) => {
                         tracing::warn!(
                             "could not read the session's record after its new \
-                             registration ({error:#})"
+                             registration ({error:#}); the attach goes on with the \
+                             new registration's addresses"
                         );
-                        record
+                        Some(again)
                     }
                 };
                 ssh =
@@ -340,7 +346,7 @@ async fn box_via_ssh_with(
             // replaced did: `min` has nothing of its own left to say after
             // an attach, and the unwind guard has already run. `run` exits
             // once the command's `cmd` span has ended and been flushed.
-            return Err(Handoff::Exit(code).into());
+            return Err(Handoff::Exit(attach_exit_status(code)).into());
         }
     }
 
@@ -398,15 +404,27 @@ async fn box_via_ssh_with(
 }
 
 /// The exit status an attach ends with when the in-VM daemon refused it
-/// because the VM host withdrew the box's row (NET-138).
+/// because the VM host withdrew the box's row (NET-138). It is the daemon's
+/// signal to this client only: `min` never exits with it
+/// ([`attach_exit_status`]).
 pub(crate) const ROW_ENDED_ATTACH: i32 = 253;
 const _: () = assert!(ROW_ENDED_ATTACH as u32 == minimald_rpc::ATTACH_ROW_ENDED_EXIT_STATUS);
 
+/// The status `min` exits with after an interactive attach that ended with
+/// `code`. The daemon's row-ended status ([`ROW_ENDED_ATTACH`]) is not in
+/// `min`'s exit table: an attach that ends with it was refused and no retry
+/// attached the box, so `min` exits 1, the status of any other refused
+/// attach. Every other status is ssh's own.
+pub(crate) fn attach_exit_status(code: i32) -> i32 {
+    if code == ROW_ENDED_ATTACH { 1 } else { code }
+}
+
 /// Whether an interactive attach that ended with `code` retries: the code
-/// says the VM host withdrew the box's row, and the box was registered
-/// again ([`minimal_client::box_registration::register_box_again`]) from
-/// the session's `record`, which the in-VM daemon then stored. A record
-/// that could not be read registers nothing, and the code stands.
+/// says the VM host withdrew the box's row, and the VM host registered the
+/// box again ([`minimal_client::box_registration::register_box_again`])
+/// for the session's `record`, which the in-VM daemon then stored. Returns
+/// the record with the new registration's addresses and box id. A record
+/// that could not be read registers nothing.
 ///
 /// # Errors
 ///
@@ -416,12 +434,12 @@ pub(crate) async fn register_again_after_row_ended(
     sock: &std::path::Path,
     code: i32,
     record: Option<&boxes::Record>,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Option<boxes::Record>> {
     if code != ROW_ENDED_ATTACH {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(record) = record else {
-        return Ok(false);
+        return Ok(None);
     };
     minimal_client::box_registration::register_box_again(sock, record)
         .await

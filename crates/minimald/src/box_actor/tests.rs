@@ -4848,12 +4848,8 @@ async fn a_box_holding_a_host_row_refuses_remint_after_its_host_loop_ends() {
         "the refusal must name the host-row cause; got: {refusal:?}"
     );
     assert!(
-        refusal.contains("`min box attach <box>` to register the box again"),
-        "the refusal must name the attach that registers the box again; got: {refusal:?}"
-    );
-    assert!(
-        !refusal.contains("min session destroy") && !refusal.contains("min session activate"),
-        "the refusal no longer sends the person to destroy the box; got: {refusal:?}"
+        !refusal.contains("min "),
+        "the client retries on this refusal, so it names no command; got: {refusal:?}"
     );
     assert_eq!(
         super::launch_publish_seam::observed(id).len(),
@@ -4865,9 +4861,11 @@ async fn a_box_holding_a_host_row_refuses_remint_after_its_host_loop_ends() {
 /// The creator's new registration of a box whose host-side row ended is a
 /// new attachment (NET-138). While the box's first host holds its row, the
 /// daemon refuses the new facts and changes nothing. Once the shell exits
-/// and the row is gone, the daemon stores the new addresses and box id,
-/// clears the row binding, and the next attach launches a new host that
-/// binds the new row.
+/// and the row is gone, a request its caller stopped waiting for is not
+/// stored. One the caller waits for is: the daemon stores the new addresses
+/// and box id, clears the row binding, moves the box's published address
+/// and name to the new loopback address, and the next attach launches a
+/// new host that binds the new row.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_box_registered_again_after_its_row_ended_attaches_under_the_new_row() {
@@ -4926,6 +4924,33 @@ async fn a_box_registered_again_after_its_row_ended_attaches_under_the_new_row()
     keep_exit(&mut channel).await;
     assert_attach_refused_rowless(&mut client, id).await;
 
+    // A caller that stops waiting while the actor is busy: the request is
+    // not stored once the actor reaches it.
+    let handle = server
+        .state
+        .sessions_manager()
+        .await
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves");
+    handle.park_for(Duration::from_millis(500)).await;
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            handle.register_box_again(again.clone())
+        )
+        .await
+        .is_err(),
+        "the parked actor does not answer in time"
+    );
+    let record = record_of(&server, id).await;
+    assert_eq!(
+        record.box_addresses.map(|a| a.switch_address),
+        Some(std::net::Ipv4Addr::new(100, 64, 128, 23)),
+        "a request its caller stopped waiting for is not stored"
+    );
+
     assert_eq!(
         client.call::<RegisterBoxAgain>(&again).await,
         minimald_rpc::Errorable::Ok(RegisterBoxAgainResponse::Registered),
@@ -4938,6 +4963,23 @@ async fn a_box_registered_again_after_its_row_ended_attaches_under_the_new_row()
     assert!(
         !record.host_row_bound,
         "no launch has bound the new row yet"
+    );
+    assert_eq!(
+        server
+            .state
+            .sessions_manager()
+            .await
+            .hostnames()
+            .read()
+            .expect("registry lock")
+            .published_own_address(id),
+        Some(again.box_addresses.loopback_address),
+        "the box's published address moves to the new loopback address"
+    );
+    assert_eq!(
+        zone_answer_for(&server, "web.min.internal").await,
+        Some(("web".to_string(), again.box_addresses.loopback_address)),
+        "the box's name answers at the new loopback address"
     );
 
     let mut channel = client.open_shell(id).await;

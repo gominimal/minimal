@@ -648,55 +648,87 @@ pub async fn resume_box_row(sock: &Path, record: Option<&boxes::Record>) -> anyh
     }
 }
 
+/// The in-VM daemon gives up on a [`minimald_rpc::RegisterBoxAgain`]
+/// request before this client stops waiting for it, so a request whose
+/// lease this client drops is never stored afterwards.
+const _: () = assert!(
+    minimald_rpc::REGISTER_BOX_AGAIN_SERVE_BOUND.as_millis() < BOX_CONTROL_TIMEOUT.as_millis()
+);
+
 /// Registers the session's box with the VM host daemon again, after an
 /// attach ended because that daemon withdrew the box's row (NET-138,
 /// [`minimald_rpc::ATTACH_ROW_ENDED_EXIT_STATUS`]), and hands the new
 /// registration to the in-VM daemon behind `ssh_sock`
-/// ([`minimald_rpc::RegisterBoxAgain`]). Returns whether the in-VM daemon
-/// stored it, so the caller retries the attach.
+/// ([`minimald_rpc::RegisterBoxAgain`]). Returns the session's record with
+/// the new registration's addresses and box id, once the in-VM daemon
+/// stored them, so the caller retries the attach under them.
 ///
-/// The registration is the one an activation makes, with the record's
-/// name, network and policy ([`register_box_beside`], the same exchange
-/// [`register_box_for_activation`] makes), and it is a new creation with a
-/// new box id. Its lease is committed only once the in-VM daemon stored
-/// the new facts. Otherwise the lease drops, and the VM host daemon
-/// withdraws the new row on the close.
+/// The request carries the proof only: the box's name, the pair and the
+/// box id the old registration handed back. The VM host daemon registers
+/// the new row from its own record of the box's creation
+/// ([`minimald_rpc::BoxControlRequest::RegisterBoxAgain`]), so no rule
+/// read from the in-VM daemon reaches the row. The new registration is
+/// held as a lease, committed only once the in-VM daemon stored the new
+/// facts. Otherwise the lease drops, and the VM host daemon withdraws the
+/// new row on the close and keeps the old creation.
 ///
-/// `Ok(false)`, with nothing registered, for a record with no name or no
+/// `Ok(None)`, with nothing registered, for a record with no name or no
 /// box row, for a host that is not VM-backed, and when the old row did not
-/// end: a live row holds the name, or the in-VM daemon answers
-/// [`minimald_rpc::RegisterBoxAgainResponse::RowStands`]. That is the
-/// case of a shell that exited with the row-ended status by itself.
+/// end: the VM host daemon says it stands, or the in-VM daemon answers
+/// [`minimald_rpc::RegisterBoxAgainResponse::RowStands`] or
+/// [`minimald_rpc::RegisterBoxAgainResponse::HostRunning`]. A row that
+/// stands is the case of a shell that exited with the row-ended status by
+/// itself.
 ///
 /// # Errors
 ///
-/// The registration's own failure, as an activation reports it, and an
-/// in-VM daemon that cannot be asked or refuses the new facts.
-pub async fn register_box_again(ssh_sock: &Path, record: &boxes::Record) -> anyhow::Result<bool> {
-    let (Some(name), Some(_)) = (record.name.as_deref(), record.box_addresses) else {
-        return Ok(false);
+/// The VM host daemon cannot be reached ([`HostUnreachable`]) or refuses
+/// to register the box again, and an in-VM daemon that cannot be asked or
+/// refuses the new facts.
+pub async fn register_box_again(
+    ssh_sock: &Path,
+    record: &boxes::Record,
+) -> anyhow::Result<Option<boxes::Record>> {
+    let (Some(name), Some(old)) = (record.name.as_deref(), record.box_addresses) else {
+        return Ok(None);
     };
-    let registered = match register_box_beside(ssh_sock, record.network, name, &record.policy).await
+    let Some(control_sock) = vm_host_control_sock(ssh_sock) else {
+        return Ok(None);
+    };
+    let request = minimald_rpc::RegisterBoxAgainHostRequest {
+        name: name.to_string(),
+        switch_address: old.switch_address,
+        loopback_address: old.loopback_address,
+        box_id: record.box_id,
+    };
+    let registered = match tokio::time::timeout(
+        BOX_CONTROL_TIMEOUT,
+        register_box_again_with_vm_host(&control_sock, request),
+    )
+    .await
     {
-        Ok(Some(registered)) => registered,
-        Ok(None) => return Ok(false),
-        Err(error) if error.downcast_ref::<NameAlreadyHeld>().is_some() => {
+        Ok(Ok(Some(registered))) => registered,
+        Ok(Ok(None)) => {
             tracing::info!(
                 box = %name,
-                error = %format!("{error:#}"),
-                "a live row holds the box's name, so its row did not end; \
+                "the VM host says the box's row stands, so its row did not end; \
                  the box is not registered again"
             );
-            return Ok(false);
+            return Ok(None);
         }
-        Err(error) => return Err(error),
-    };
-    let Some(box_addresses) = registered.row_addresses() else {
-        return Ok(false);
+        Ok(Err(error)) => {
+            return Err(error.context("registering the box again with the VM host daemon failed"));
+        }
+        Err(_) => {
+            return Err(HostUnreachable::error(format!(
+                "the VM host daemon did not answer the box's new registration in \
+                 {BOX_CONTROL_TIMEOUT:?}"
+            )));
+        }
     };
     let request = minimald_rpc::RegisterBoxAgainRequest {
         id: record.id,
-        box_addresses,
+        box_addresses: registered.addresses,
         task_addresses: registered.task_addresses.clone(),
         box_id: registered.box_id,
     };
@@ -723,23 +755,69 @@ pub async fn register_box_again(ssh_sock: &Path, record: &boxes::Record) -> anyh
             }
             tracing::info!(
                 box = %name,
-                switch_address = %box_addresses.switch_address,
+                switch_address = %registered.addresses.switch_address,
                 box_id = %registered.box_id.map(|id| id.to_string()).unwrap_or_default(),
                 "registered the box again after its host row ended"
             );
-            Ok(true)
+            let mut again = record.clone();
+            again.box_addresses = Some(registered.addresses);
+            again.task_addresses = registered.task_addresses;
+            again.box_id = registered.box_id;
+            again.host_row_bound = false;
+            Ok(Some(again))
         }
-        minimald_rpc::Errorable::Ok(minimald_rpc::RegisterBoxAgainResponse::RowStands) => {
+        minimald_rpc::Errorable::Ok(
+            answer @ (minimald_rpc::RegisterBoxAgainResponse::RowStands
+            | minimald_rpc::RegisterBoxAgainResponse::HostRunning),
+        ) => {
             tracing::info!(
                 box = %name,
-                "the box's daemon says its host row did not end; the new registration \
-                 is dropped"
+                answer = ?answer,
+                "the box's daemon did not take the new registration; it is dropped"
             );
-            Ok(false)
+            Ok(None)
         }
         minimald_rpc::Errorable::Err { error } => Err(anyhow::anyhow!(
             "the box's daemon refused the box's new registration: {error}"
         )),
+    }
+}
+
+/// Asks the VM host daemon on `sock_path` to register a box again from its
+/// own record of the box's creation (NET-138). `Ok(None)` when the daemon
+/// says the box's row stands. Every registration this verb answers is held
+/// as a lease, so a reply that carries none is refused here and nothing is
+/// registered.
+async fn register_box_again_with_vm_host(
+    sock_path: &Path,
+    request: minimald_rpc::RegisterBoxAgainHostRequest,
+) -> anyhow::Result<Option<RegisteredWithVmHost>> {
+    let (reply, stream) = control_exchange_with_vm_host(
+        sock_path,
+        minimald_rpc::BoxControlRequest::RegisterBoxAgain(request),
+    )
+    .await?;
+    match reply {
+        minimald_rpc::BoxControlReply::Registered(web) => Ok(Some(RegisteredWithVmHost {
+            addresses: boxes::BoxAddresses {
+                switch_address: web.switch_address,
+                loopback_address: web.loopback_address,
+            },
+            host_ip: false,
+            box_id: Some(web.box_id),
+            task_addresses: web.task_addresses,
+            lease: Some(BoxLease { stream }),
+        })),
+        minimald_rpc::BoxControlReply::RowStanding {
+            row_standing: true, ..
+        } => Ok(None),
+        minimald_rpc::BoxControlReply::Error { error } => Err(HostRefusal::error(format!(
+            "the VM host daemon refused to register the box again: {error}"
+        ))),
+        other => anyhow::bail!(
+            "the VM host daemon answered the box's new registration with {other:?}; \
+             the box was not registered again"
+        ),
     }
 }
 
@@ -1516,9 +1594,10 @@ mod tests {
     }
 
     /// A stand-in VM host daemon at `local-minvmd0/control.sock` under
-    /// `dir`. It answers one registration with `reply`, then reads the
-    /// lease connection to its close and returns what the client wrote on
-    /// it. The ssh socket beside it is returned too, and nothing serves it.
+    /// `dir`. It answers one request to register the box again with
+    /// `reply`, then reads the lease connection to its close and returns
+    /// what the client wrote on it. The ssh socket beside it is returned
+    /// too, and nothing serves it.
     fn stand_in_vm_host(
         dir: &tempfile::TempDir,
         reply: minimald_rpc::BoxControlReply,
@@ -1537,9 +1616,17 @@ mod tests {
             stream.read_line(&mut request).await.unwrap();
             let request: minimald_rpc::BoxControlRequest =
                 serde_json_lenient::from_str(request.trim()).unwrap();
-            assert!(
-                matches!(&request, minimald_rpc::BoxControlRequest::Register(r) if r.name == "web"),
-                "the client registers the box under its record's name: {request:?}"
+            assert_eq!(
+                request,
+                minimald_rpc::BoxControlRequest::RegisterBoxAgain(
+                    minimald_rpc::RegisterBoxAgainHostRequest {
+                        name: "web".to_string(),
+                        switch_address: PAIR.switch_address,
+                        loopback_address: PAIR.loopback_address,
+                        box_id: None,
+                    }
+                ),
+                "the client sends the record's name and pair as proof, and no rule"
             );
             stream
                 .get_mut()
@@ -1563,31 +1650,38 @@ mod tests {
         let ssh_sock = native.join(paths::SSH_SOCK_FILE);
         let mut rowless = own_ip_record(PAIR);
         rowless.box_addresses = None;
-        assert!(!register_box_again(&ssh_sock, &rowless).await.unwrap());
         assert!(
-            !register_box_again(&ssh_sock, &own_ip_record(PAIR))
+            register_box_again(&ssh_sock, &rowless)
                 .await
-                .unwrap(),
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            register_box_again(&ssh_sock, &own_ip_record(PAIR))
+                .await
+                .unwrap()
+                .is_none(),
             "a native host has no VM host daemon to register with"
         );
     }
 
-    /// A live row that holds the box's name is a row that did not end: the
-    /// box is not registered again, and the attach's status stands. This is
-    /// a shell that exited with the row-ended status by itself.
+    /// A row the VM host says stands is a row that did not end: the box is
+    /// not registered again. This is a shell that exited with the row-ended
+    /// status by itself.
     #[tokio::test]
     async fn register_box_again_keeps_a_row_that_did_not_end() {
         let dir = tempfile::TempDir::new().unwrap();
         let (ssh_sock, host) = stand_in_vm_host(
             &dir,
-            minimald_rpc::BoxControlReply::Error {
-                error: "a box named web already exists".to_string(),
+            minimald_rpc::BoxControlReply::RowStanding {
+                switch_address: PAIR.switch_address,
+                row_standing: true,
             },
         );
         let again = register_box_again(&ssh_sock, &own_ip_record(PAIR))
             .await
-            .expect("a held name is not an error here");
-        assert!(!again, "nothing is registered again");
+            .expect("a standing row is not an error here");
+        assert!(again.is_none(), "nothing is registered again");
         host.await.unwrap();
     }
 
@@ -1619,5 +1713,28 @@ mod tests {
             !written.contains(minimald_rpc::REGISTRATION_COMMIT_LINE),
             "the lease closes uncommitted: {written:?}"
         );
+    }
+
+    /// A VM host daemon that answers with a registration it holds no lease
+    /// for registers nothing here: every registration this verb makes is
+    /// held, so the client cannot leave a row it never withdraws.
+    #[tokio::test]
+    async fn register_box_again_refuses_a_registration_without_a_lease() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (ssh_sock, host) = stand_in_vm_host(
+            &dir,
+            minimald_rpc::BoxControlReply::Addresses(boxes::BoxAddresses {
+                switch_address: std::net::Ipv4Addr::new(100, 64, 0, 3),
+                loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 1),
+            }),
+        );
+        let error = register_box_again(&ssh_sock, &own_ip_record(PAIR))
+            .await
+            .expect_err("a reply with no lease is refused");
+        assert!(
+            format!("{error:#}").contains("was not registered again"),
+            "{error:#}"
+        );
+        host.await.unwrap();
     }
 }

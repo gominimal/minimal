@@ -936,6 +936,31 @@ fn serve_connection(
                         answerer,
                         order,
                         register.clone(),
+                        None,
+                        slot,
+                    );
+                }
+                None => refuse_past_cap(
+                    &mut stream,
+                    "registration lease",
+                    door.name(),
+                    gauges.lease_cap(),
+                    &LEASE_CAP_WARNED,
+                ),
+            }
+        }
+        // A creator's request to register its box again (NET-138) is a held
+        // registration made from the host's own record of the box's
+        // creation, so it takes a lease slot as a registration does.
+        (BoxControlRequest::RegisterBoxAgain(again), ControlDoor::Host) => {
+            match gauges.leases.try_acquire(gauges.lease_cap()) {
+                Some(slot) => {
+                    return serve_registration_again(
+                        stream,
+                        boxes,
+                        answerer,
+                        order,
+                        again.clone(),
                         slot,
                     );
                 }
@@ -1841,13 +1866,15 @@ fn resume_reply(
 /// registration holds nothing: its reply is written here and the
 /// connection closes. A thread that cannot be spawned withdraws the row it
 /// would have held and answers the reason, so no row outlives a lease that
-/// never started.
+/// never started. `retire` is a creation the commit ends: the old creation
+/// of a box registered again ([`serve_registration_again`]).
 fn serve_held_registration(
     mut stream: UnixStream,
     boxes: &BoxRegistry,
     answerer: &AnswererStatus,
     order: &Arc<ApplyOrder>,
     request: RegisterBoxRequest,
+    retire: Option<WithdrawBoxRequest>,
     slot: crate::box_registry::GaugeGuard,
 ) -> std::io::Result<()> {
     let name = request.name.clone();
@@ -1892,6 +1919,7 @@ fn serve_held_registration(
                 &thread_answerer,
                 &thread_order,
                 thread_withdrawal,
+                retire,
                 &reply,
             );
         });
@@ -1916,13 +1944,15 @@ fn serve_held_registration(
 /// client's withdrawal takes ([`withdraw_box`]). The commit is explicit,
 /// never read from a clean close, so a client that closes just after its
 /// session went active cannot withdraw a live box's row before the row's
-/// first attachment.
+/// first attachment. The commit also ends the creation `retire` names, in
+/// the same apply order: the old creation of a box registered again.
 fn hold_registration_lease(
     mut stream: UnixStream,
     boxes: &BoxRegistry,
     answerer: &AnswererStatus,
     order: &Arc<ApplyOrder>,
     withdrawal: WithdrawBoxRequest,
+    retire: Option<WithdrawBoxRequest>,
     reply: &BoxControlReply,
 ) {
     // The lease lasts as long as the activation takes, so the request
@@ -1952,6 +1982,16 @@ fn hold_registration_lease(
                         "committed the box's registration lease; the row stays until its \
                          creator withdraws it"
                     );
+                    if let Some(retire) = retire {
+                        let switch_address = retire.switch_address;
+                        let (retired, _) = order.apply(|| withdraw_box(boxes, answerer, retire));
+                        tracing::info!(
+                            box = %withdrawal.name,
+                            old_switch_address = %switch_address,
+                            retired = matches!(retired, BoxControlReply::Addresses(_)),
+                            "the box was registered again; its old creation ends"
+                        );
+                    }
                     return;
                 }
                 Ok(Some(_)) => "its client sent a line that is not the commit".to_string(),
@@ -1967,6 +2007,75 @@ fn hold_registration_lease(
         "the box's registration lease ended uncommitted; withdrawing its row"
     );
     order.apply(|| withdraw_box(boxes, answerer, withdrawal));
+}
+
+/// Serve a creator's request to register its box again (NET-138,
+/// [`minimald_rpc::RegisterBoxAgainHostRequest`]): find and prove the box's
+/// creation as a resume does, and register a new row from the declaration
+/// that creation was registered from ([`BoxRegistry::registration_again`]),
+/// held as a lease ([`serve_held_registration`]) whose commit retires the
+/// old creation. Nothing in the request but the proof reaches the row: the
+/// rules are the host's own record of the box, never the guest's. A row
+/// that stands is answered with [`BoxControlReply::RowStanding`] and
+/// nothing is registered. A creation the request does not prove is
+/// answered with the refusal, as a resume's is.
+fn serve_registration_again(
+    mut stream: UnixStream,
+    boxes: &BoxRegistry,
+    answerer: &AnswererStatus,
+    order: &Arc<ApplyOrder>,
+    request: minimald_rpc::RegisterBoxAgainHostRequest,
+    slot: crate::box_registry::GaugeGuard,
+) -> std::io::Result<()> {
+    let again = match boxes.registration_again(
+        &request.name,
+        request.switch_address,
+        request.loopback_address,
+        request.box_id.map(minimald_rpc::BoxId::to_bytes),
+    ) {
+        Ok(Some(again)) => again,
+        Ok(None) => {
+            tracing::info!(
+                box = %request.name,
+                switch_address = %request.switch_address,
+                "the box's row stands; it is not registered again"
+            );
+            return write_reply(
+                &mut stream,
+                &BoxControlReply::RowStanding {
+                    switch_address: request.switch_address,
+                    row_standing: true,
+                },
+            );
+        }
+        Err(error) => {
+            tracing::info!(box = %request.name, error = %error, "box registration again refused");
+            return write_reply(
+                &mut stream,
+                &BoxControlReply::Error {
+                    error: error.to_string(),
+                },
+            );
+        }
+    };
+    let retire = WithdrawBoxRequest {
+        name: again.name.clone(),
+        switch_address: again.switch_address,
+        loopback_address: again.loopback_address,
+        box_id: Some(minimald_rpc::BoxId::from_bytes(again.box_id)),
+    };
+    let register = RegisterBoxRequest {
+        name: again.spec.name,
+        ingress_ports: again.spec.ingress_ports,
+        egress: again.spec.egress,
+        credentialed_upstream: again.spec.credentialed_upstream,
+        dynamic_ingress: again.spec.dynamic_ingress,
+        dynamic_allowed_range: again.spec.dynamic_allowed_range,
+        hold: true,
+        task_slots: again.task_slots,
+        host_ip: false,
+    };
+    serve_held_registration(stream, boxes, answerer, order, register, Some(retire), slot)
 }
 
 /// Refuse a verb that arrived on a door that does not serve it (NET-138):
@@ -2024,6 +2133,7 @@ fn request_verb(request: &BoxControlRequest) -> &'static str {
         BoxControlRequest::RecordAskAnswer(_) => "record_ask_answer",
         BoxControlRequest::SubscribeAsks(_) => "subscribe_asks",
         BoxControlRequest::ResumeBox(_) => "resume_box",
+        BoxControlRequest::RegisterBoxAgain(_) => "register_box_again",
         BoxControlRequest::RowStanding(_) => "row_standing",
         BoxControlRequest::ProxyListening => "proxy_listening",
         BoxControlRequest::ProxyPorts => "proxy_ports",
@@ -8957,6 +9067,135 @@ mod tests {
             host.releases_of("web").is_empty(),
             "a committed lease releases nothing"
         );
+    }
+
+    /// Ask the host to register `web` again (NET-138) with the proof its
+    /// registration handed back: the lease connection, kept open, and the
+    /// reply read off it.
+    fn register_again_holding(
+        sock_path: &Path,
+        web: &RegisteredBox,
+    ) -> (TestStream, BoxControlReply) {
+        let mut stream = TestStream::connect(sock_path).expect("the door accepts");
+        let request =
+            BoxControlRequest::RegisterBoxAgain(minimald_rpc::RegisterBoxAgainHostRequest {
+                name: "web".to_string(),
+                switch_address: web.switch_address,
+                loopback_address: web.loopback_address,
+                box_id: Some(web.box_id),
+            });
+        let mut line = serde_json_lenient::to_string(&request).expect("the request serializes");
+        line.push('\n');
+        stream
+            .write_all(line.as_bytes())
+            .expect("the request is written");
+        let mut reply = String::new();
+        BufReader::new(stream.try_clone().expect("the lease clones"))
+            .read_line(&mut reply)
+            .expect("the reply is read");
+        let reply = serde_json_lenient::from_str(reply.trim()).expect("the reply parses");
+        (stream, reply)
+    }
+
+    /// NET-138: a creator registers its box again from the host's own
+    /// record of the box's creation, never from rules it sends. While the
+    /// row stands nothing is registered. Once the row is withdrawn, the new
+    /// row has a new box id and the rules the box was created with. A lease
+    /// closed before its commit withdraws the new row and keeps the old
+    /// creation, which still resumes. The commit keeps the new row and ends
+    /// the old creation.
+    #[test]
+    fn a_box_registered_again_takes_its_rules_from_its_creation() {
+        let host = SlowAllocation::start();
+        let web = handed(
+            register(
+                &host.sock_path,
+                &RegisterBoxRequest {
+                    dynamic_ingress: Some(boxes::DynamicIngress::Allow),
+                    dynamic_allowed_range: Some((8000, 8100)),
+                    ..box_request("web")
+                },
+            )
+            .expect("the registration is answered"),
+        );
+
+        let (_lease, standing) = register_again_holding(&host.sock_path, &web);
+        assert_eq!(
+            standing,
+            BoxControlReply::RowStanding {
+                switch_address: web.switch_address,
+                row_standing: true,
+            },
+            "a row that stands is not registered again"
+        );
+        leases_settled(&host);
+
+        let dormant = || {
+            assert!(
+                host.boxes.withdraw(web.switch_address).is_some(),
+                "the row is withdrawn, its creation dormant"
+            );
+        };
+        dormant();
+        let (lease, reply) = register_again_holding(&host.sock_path, &web);
+        let again = handed(reply);
+        assert_ne!(again.box_id, web.box_id, "a new registration has a new id");
+        let row = host.boxes.row_by_name("web").expect("the new row stands");
+        assert_eq!(row.box_id(), again.box_id.to_bytes());
+        assert_eq!(
+            row.dynamic_ingress(),
+            boxes::DynamicIngress::Allow,
+            "the new row holds the rules the box was created with"
+        );
+        drop(lease);
+        leases_settled(&host);
+        assert!(
+            host.boxes.row_by_name("web").is_none(),
+            "a lease closed before its commit withdraws the new row"
+        );
+        let resumed = handed(
+            control(
+                &host.sock_path,
+                &BoxControlRequest::ResumeBox(minimald_rpc::ResumeBoxRequest {
+                    name: "web".to_string(),
+                    switch_address: web.switch_address,
+                    loopback_address: web.loopback_address,
+                    box_id: Some(web.box_id),
+                }),
+            )
+            .expect("the resume is answered"),
+        );
+        assert_eq!(resumed.box_id, web.box_id, "the old creation is kept");
+
+        dormant();
+        let (mut lease, reply) = register_again_holding(&host.sock_path, &web);
+        let again = handed(reply);
+        lease
+            .write_all(format!("{}\n", minimald_rpc::REGISTRATION_COMMIT_LINE).as_bytes())
+            .expect("the commit is written");
+        drop(lease);
+        leases_settled(&host);
+        assert_eq!(
+            host.boxes
+                .row_by_name("web")
+                .expect("a committed lease keeps the new row")
+                .box_id(),
+            again.box_id.to_bytes(),
+        );
+        match control(
+            &host.sock_path,
+            &BoxControlRequest::ResumeBox(minimald_rpc::ResumeBoxRequest {
+                name: "web".to_string(),
+                switch_address: web.switch_address,
+                loopback_address: web.loopback_address,
+                box_id: Some(web.box_id),
+            }),
+        )
+        .expect("the resume is answered")
+        {
+            BoxControlReply::Error { .. } => {}
+            other => panic!("the commit ended the old creation, got {other:?}"),
+        }
     }
 
     /// Past the lease cap a held registration is refused naming the cap,

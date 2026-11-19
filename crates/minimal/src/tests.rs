@@ -23381,10 +23381,12 @@ fn box_verbs_complete_box_names() {
 }
 
 /// NET-138: an attach that the in-VM daemon refuses because the VM host
-/// withdrew the box's row ends with its own status, and the client
-/// registers the box again from its record and hands the new registration
-/// to the daemon. The next attach is not refused for the released
-/// addresses: the daemon took the new registration as a new attachment.
+/// withdrew the box's row ends with its own status, and the client asks
+/// the VM host to register the box again, presenting only the record's
+/// name, pair and box id, and hands the new registration to the daemon.
+/// The next attach is not refused for the released addresses: the daemon
+/// took the new registration as a new attachment. `min` never exits with
+/// the row-ended status.
 ///
 /// The box's shell exit is stood in for by its record: a launch bound the
 /// row, and the daemon restarted with no host in the box's slot. No VM
@@ -23457,19 +23459,22 @@ async fn attach_after_row_withdrawn_registers_again() {
     let mut daemon = server.connect().await;
 
     /// The text an attach wrote before its channel closed, and its status.
+    /// An attach that does not close within the bound fails the test.
     async fn attach_once(
         daemon: &mut minimald::test_harness::TestClient,
         id: boxes::SessionId,
     ) -> (String, Option<u32>) {
         let mut channel = daemon.open_shell(id).await;
         let (mut out, mut status) = (Vec::new(), None);
-        while let Ok(Some(msg)) =
-            tokio::time::timeout(std::time::Duration::from_secs(60), channel.wait()).await
-        {
+        loop {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(60), channel.wait())
+                .await
+                .expect("the attach's channel closes within the bound");
             match msg {
-                russh::ChannelMsg::Data { data } => out.extend_from_slice(&data),
-                russh::ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
-                _ => {}
+                None => break,
+                Some(russh::ChannelMsg::Data { data }) => out.extend_from_slice(&data),
+                Some(russh::ChannelMsg::ExitStatus { exit_status }) => status = Some(exit_status),
+                Some(_) => {}
             }
         }
         (String::from_utf8_lossy(&out).into_owned(), status)
@@ -23495,10 +23500,19 @@ async fn attach_after_row_withdrawn_registers_again() {
         stream.read_line(&mut line).await.unwrap();
         let request: minimald_rpc::BoxControlRequest =
             serde_json_lenient::from_str(line.trim()).unwrap();
-        let minimald_rpc::BoxControlRequest::Register(register) = request else {
-            panic!("the client registers the box again, got {request:?}");
+        // The request type carries the proof alone, so no rule can ride it.
+        let minimald_rpc::BoxControlRequest::RegisterBoxAgain(again) = request else {
+            panic!("the client asks the VM host to register the box again, got {request:?}");
         };
-        assert_eq!(register.name, "web", "under the record's name");
+        assert_eq!(
+            (
+                again.name.as_str(),
+                again.switch_address,
+                again.loopback_address
+            ),
+            ("web", OLD.switch_address, OLD.loopback_address),
+            "the client presents the record's name and pair"
+        );
         let reply = serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::Registered(
             minimald_rpc::RegisteredBox {
                 switch_address: NEW.switch_address,
@@ -23524,8 +23538,13 @@ async fn attach_after_row_withdrawn_registers_again() {
         .expect("the box's record");
     let retry = register_again_after_row_ended(&sock, code, Some(&record))
         .await
-        .expect("the box is registered again");
-    assert!(retry, "the attach retries after the new registration");
+        .expect("the box is registered again")
+        .expect("the attach retries after the new registration");
+    assert_eq!(
+        (retry.box_addresses, retry.box_id),
+        (Some(NEW), Some(new_box_id)),
+        "the retry carries the new registration's addresses and id"
+    );
     let lease = host.await.unwrap();
     assert!(
         lease.contains(minimald_rpc::REGISTRATION_COMMIT_LINE),
@@ -23547,12 +23566,21 @@ async fn attach_after_row_withdrawn_registers_again() {
         !retried.contains("network addresses"),
         "the retried attach goes past the row check: {retried:?}"
     );
-    assert_ne!(status, Some(minimald_rpc::ATTACH_ROW_ENDED_EXIT_STATUS));
+    let status = status.expect("the retried attach ends with an exit status");
+    assert_ne!(status, minimald_rpc::ATTACH_ROW_ENDED_EXIT_STATUS);
 
     // Any other status registers nothing.
     assert!(
-        !register_again_after_row_ended(&sock, 0, Some(&record))
+        register_again_after_row_ended(&sock, 0, Some(&record))
             .await
             .unwrap()
+            .is_none()
     );
+
+    // `min` never exits with the row-ended status: an attach that ends
+    // with it and was not attached again exits 1. Every other status is
+    // ssh's own.
+    assert_eq!(attach_exit_status(code), 1);
+    assert_eq!(attach_exit_status(0), 0);
+    assert_eq!(attach_exit_status(130), 130);
 }

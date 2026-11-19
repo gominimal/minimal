@@ -121,11 +121,9 @@ impl fmt::Display for AttachError {
             AttachError::SessionBusy => {
                 write!(f, "the session is busy; run the attach again in a moment")
             }
-            AttachError::BoxHostRowEnded => write!(
-                f,
-                "the VM host released this box's network addresses. Run \
-                 `min box attach <box>` to register the box again and attach to it."
-            ),
+            AttachError::BoxHostRowEnded => {
+                write!(f, "the VM host released this box's network addresses")
+            }
             AttachError::ResumeRefused(e, _) => write!(f, "{e}"),
         }
     }
