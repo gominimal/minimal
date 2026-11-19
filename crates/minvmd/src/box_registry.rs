@@ -3220,6 +3220,12 @@ pub struct BoxRegistry {
     /// driven without waiting it out.
     #[cfg(test)]
     clock_skew: Arc<Mutex<Duration>>,
+    /// The instant the tests stopped this registry's clock at
+    /// ([`Self::freeze_clock`]), shared by every clone: [`Self::now`] reads
+    /// it in place of the real clock, so only [`Self::advance_clock`] moves
+    /// it.
+    #[cfg(test)]
+    clock_frozen_at: Arc<Mutex<Option<Instant>>>,
     /// The next published loopback address the tests' single-node
     /// allocation hands out, shared the same way. The daemon's addresses
     /// are the answerer's ([`Self::register_client_box_at`]).
@@ -3723,6 +3729,8 @@ impl Clone for BoxRegistry {
             #[cfg(test)]
             clock_skew: Arc::clone(&self.clock_skew),
             #[cfg(test)]
+            clock_frozen_at: Arc::clone(&self.clock_frozen_at),
+            #[cfg(test)]
             next_loopback_addr: Arc::clone(&self.next_loopback_addr),
             loopback_slice: self.loopback_slice,
             attachments: self.attachments.clone(),
@@ -3767,6 +3775,8 @@ impl BoxRegistry {
             switch_book: Arc::new(Mutex::new(SwitchAddressBook::new(subnet))),
             #[cfg(test)]
             clock_skew: Arc::new(Mutex::new(Duration::ZERO)),
+            #[cfg(test)]
+            clock_frozen_at: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             next_loopback_addr: Arc::new(AtomicU32::new(
                 loopback_slice.map_or(0, |slice| box_loopback_run(slice).0),
@@ -4371,7 +4381,8 @@ impl BoxRegistry {
     }
 
     /// The instant the hand-out book draws and returns at: the real clock,
-    /// moved by [`Self::advance_clock`] in tests.
+    /// moved by [`Self::advance_clock`] and stopped by
+    /// [`Self::freeze_clock`] in tests.
     fn now(&self) -> Instant {
         #[cfg(test)]
         {
@@ -4379,7 +4390,12 @@ impl BoxRegistry {
                 .clock_skew
                 .lock()
                 .expect("the test clock's lock is held only across a read or an add");
-            Instant::now()
+            let frozen_at = *self
+                .clock_frozen_at
+                .lock()
+                .expect("the test clock's lock is held only across a read or a set");
+            frozen_at
+                .unwrap_or_else(Instant::now)
                 .checked_add(skew)
                 .expect("a test moves the clock by minutes, never past the clock's range")
         }
@@ -4398,6 +4414,19 @@ impl BoxRegistry {
             .lock()
             .expect("the test clock's lock is held only across a read or an add");
         *skew = skew.saturating_add(by);
+    }
+
+    /// Stops this registry's clock, and every clone's, at the real clock's
+    /// instant now: from then on only [`Self::advance_clock`] moves it, so a
+    /// test drives a grace's boundary without the real clock running past
+    /// it.
+    #[cfg(test)]
+    pub(crate) fn freeze_clock(&self) {
+        let mut frozen_at = self
+            .clock_frozen_at
+            .lock()
+            .expect("the test clock's lock is held only across a read or a set");
+        frozen_at.get_or_insert_with(Instant::now);
     }
 
     fn switch_book(&self) -> MutexGuard<'_, SwitchAddressBook> {
@@ -11263,6 +11292,9 @@ mod tests {
                 claim.generation(),
             )
         };
+        // The clock moves only when the test moves it, so the two resumes
+        // fall on either side of the grace's end however the test is run.
+        registry.freeze_clock();
         relay_carried_and_ended(&registry, &[&web]);
         wait_until(|| web.is_detached(), "the row detaches at its relay's end");
         registry.advance_clock(DETACH_GRACE.saturating_sub(Duration::from_secs(1)));

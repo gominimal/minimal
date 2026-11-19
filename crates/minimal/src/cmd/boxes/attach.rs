@@ -401,7 +401,8 @@ async fn box_via_ssh_with(
 /// the same refusal with 1, and a forward's channel does not open. The
 /// interactive attach reads it as a refusal only when the VM host holds no
 /// row of the box's own ([`attach_retrying_row_ended`]), and then `min`
-/// exits with [`ROW_ENDED_REFUSED`]. `min` exits with 253 when the box's
+/// exits with [`ROW_ENDED_REFUSED`], or with 2 when another box holds the
+/// box's name ([`RowNotBack::NameHeld`]). `min` exits with 253 when the box's
 /// shell exited with it, and also when the session's record could not be
 /// read: no row is then checked, so a refusal cannot be told from the
 /// shell's own status. The dashboard's attach reads it the same way.

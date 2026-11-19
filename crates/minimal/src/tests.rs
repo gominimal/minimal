@@ -23913,7 +23913,6 @@ async fn attach_after_row_withdrawn_registers_again() {
     let mut request = minimald::test_harness::create_session_req("web", "/uwu");
     request.config.network = boxes::NetworkMode::OwnIp;
     request.config.box_addresses = Some(PAIR);
-    request.config.box_id = Some(box_id);
     let id = daemon.call::<CreateSession>(&request).await.unwrap().id;
     minimald::test_harness::unwrap_ready(
         daemon
@@ -23936,11 +23935,15 @@ async fn attach_after_row_withdrawn_registers_again() {
     }
     drop(daemon);
 
-    // A launch bound the row, and the daemon restarted.
+    // A launch bound the row under the id the VM host minted, and the
+    // daemon restarted. The daemon takes a box id only from the VM host
+    // daemon at creation, and this test has none then, so the record is
+    // seeded with it.
     let record_path = box_state_dir(&state_path, id).join("record.json");
     let mut record: serde_json_lenient::Value =
         serde_json_lenient::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
     record["host_row_bound"] = serde_json_lenient::Value::Bool(true);
+    record["box_id"] = serde_json_lenient::Value::String(box_id.simple().to_string());
     std::fs::write(&record_path, serde_json_lenient::to_vec(&record).unwrap()).unwrap();
     let server = minimald::test_harness::TestServer::new_in(server.into_state_dir()).await;
 
@@ -23951,12 +23954,16 @@ async fn attach_after_row_withdrawn_registers_again() {
     let sock = host_dir.join(paths::SSH_SOCK_FILE);
     server.listen_on_uds(&sock).await;
 
-    // The record the attach reads first, and the box id it holds.
+    // The record the attach reads first holds the box id it was created with.
     let record = attached_box_record(&sock, id)
         .await
         .unwrap()
         .expect("the box's record");
-    let held_id = record.box_id;
+    assert_eq!(
+        record.box_id,
+        Some(box_id),
+        "the record holds the box's own id"
+    );
 
     // The stand-in VM host reads no row for the box, as the in-VM daemon
     // read it, and answers every resume with the box's own row. It counts
@@ -23995,7 +24002,7 @@ async fn attach_after_row_withdrawn_registers_again() {
                                 name: "web".to_string(),
                                 switch_address: PAIR.switch_address,
                                 loopback_address: PAIR.loopback_address,
-                                box_id: held_id,
+                                box_id: Some(box_id),
                             },
                             "the client resumes the box's own creation, under its own id"
                         );
@@ -24003,7 +24010,7 @@ async fn attach_after_row_withdrawn_registers_again() {
                         minimald_rpc::BoxControlReply::Registered(minimald_rpc::RegisteredBox {
                             switch_address: PAIR.switch_address,
                             loopback_address: PAIR.loopback_address,
-                            box_id: held_id.unwrap_or(box_id),
+                            box_id,
                             task_addresses: Vec::new(),
                         })
                     }
@@ -24088,7 +24095,7 @@ async fn attach_after_row_withdrawn_registers_again() {
         .expect("the box's record");
     assert_eq!(
         (after.box_addresses, after.box_id),
-        (Some(PAIR), held_id),
+        (Some(PAIR), Some(box_id)),
         "the box keeps its addresses and its id"
     );
 }

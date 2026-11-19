@@ -785,17 +785,25 @@ pub async fn box_row_withdrawn(
     else {
         return Ok(false);
     };
+    let box_name = name.clone();
     let read = tokio::time::timeout(
         BOX_CONTROL_TIMEOUT,
         tokio::task::spawn_blocking(move || {
-            crate::attach::box_row_stands_at(&control_sock, &name, addresses, box_id)
+            crate::attach::box_row_stands_at(&control_sock, &box_name, addresses, box_id)
         }),
     )
     .await;
     match read {
         Ok(Ok(stands)) => Ok(stands? == Some(false)),
         Ok(Err(join)) => Err(anyhow::Error::new(join).context("the box row read did not run")),
-        Err(_) => Ok(false),
+        Err(_) => {
+            tracing::warn!(
+                box = %name,
+                "the VM host daemon did not answer the row read in {BOX_CONTROL_TIMEOUT:?}; \
+                 the attach's exit status passes through unchecked"
+            );
+            Ok(false)
+        }
     }
 }
 
@@ -1117,6 +1125,35 @@ mod tests {
         .await
         .expect("a native host registers nothing");
         assert!(registered.is_none());
+    }
+
+    /// Accepts one connection on `listener` for a stand-in VM host daemon,
+    /// and fails the test when none arrives within ten seconds, so a client
+    /// that never connects fails the test instead of stalling it. The
+    /// connection's reads are bounded the same way.
+    fn accept_within_bound(
+        listener: &std::os::unix::net::UnixListener,
+    ) -> std::os::unix::net::UnixStream {
+        const BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + BOUND;
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream.set_read_timeout(Some(BOUND)).unwrap();
+                    return stream;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the client did not connect within {BOUND:?}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept: {error}"),
+            }
+        }
     }
 
     /// A control socket that never answers.
@@ -1587,7 +1624,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let (_, listener) = silent_vm_host(&dir);
         let daemon = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
+            let stream = accept_within_bound(&listener);
             let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
@@ -1711,7 +1748,7 @@ mod tests {
             let dir = tempfile::TempDir::new().unwrap();
             let (_, listener) = silent_vm_host(&dir);
             let daemon = std::thread::spawn(move || {
-                let (stream, _) = listener.accept().unwrap();
+                let stream = accept_within_bound(&listener);
                 let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
