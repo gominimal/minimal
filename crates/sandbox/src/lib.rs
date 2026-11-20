@@ -850,6 +850,58 @@ pub mod classifier {
         file.write_all(format!("{pid}\n").as_bytes())
     }
 
+    /// Moves a sandbox's supervisor, `pid`, into `leaf` and confirms it
+    /// there: the one function every launch in a box's leaf — a box's own
+    /// launch, a package build, a task — places its supervisor with.
+    ///
+    /// The supervisor is the one process of a sandbox that never runs the
+    /// pre-exec closure that joins the leaf: hakoniwa forks it inside
+    /// `spawn()`, in the cgroup of whoever spawned it. So the spawner writes
+    /// it in, from its own namespaces, and then reads the leaf's
+    /// `cgroup.procs` back, which must list it. Both name pids in the
+    /// spawner's PID namespace, where `pid` is the one the spawn returned.
+    ///
+    /// A supervisor that already exited is no process of the run left
+    /// outside the leaf, so a failure for a supervisor that is a zombie is
+    /// `Ok`: a run that is not held at a start gate can end before the move.
+    /// `pid` must be the caller's own unreaped child, so that it still names
+    /// the supervisor. Any other `Err` means the supervisor is not in the
+    /// leaf.
+    pub fn place_supervisor(leaf: &config::ClassifierLeaf, pid: u32) -> std::io::Result<()> {
+        let placed = place_pid(&leaf.procs(), pid)
+            .and_then(|()| std::fs::read_to_string(leaf.procs()))
+            .and_then(|members| leaf_lists_pid(&members, pid));
+        match placed {
+            Err(_) if has_exited(pid) => Ok(()),
+            placed => placed,
+        }
+    }
+
+    /// `Ok` when `members`, the text of a leaf's `cgroup.procs`, lists `pid`:
+    /// one pid per line, as the kernel writes it.
+    pub fn leaf_lists_pid(members: &str, pid: u32) -> std::io::Result<()> {
+        let pid_text = pid.to_string();
+        if members.lines().any(|line| line.trim() == pid_text) {
+            return Ok(());
+        }
+        Err(std::io::Error::other(format!(
+            "the cgroup does not list process {pid} after the move"
+        )))
+    }
+
+    /// Whether `pid` is a process that exited and waits to be reaped: its
+    /// `/proc/<pid>/stat` state is `Z` or `X`. The state follows the last
+    /// `)`, because the command name before it can hold any character.
+    fn has_exited(pid: u32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                let (_, after) = stat.rsplit_once(')')?;
+                after.split_whitespace().next().map(str::to_owned)
+            })
+            .is_some_and(|state| state == "Z" || state == "X")
+    }
+
     /// What a refused join of a box's leaf most likely means, for the line
     /// the box's launch fails with: `None` for an error that is not a
     /// refusal. The kernel moves a process into a cgroup only for a writer
@@ -2730,7 +2782,16 @@ impl<C: Channel> Sandbox<C> {
             // One launch per invocation: hakoniwa unshares per `spawn()`, so
             // each invocation has its own netns and needs its own plan.
             let planned = self.plan_launch().await?;
-            let container = self.new_container(planned.plan())?;
+            let mut container = self.new_container(planned.plan())?;
+            // A run in a box's classifier leaf holds its program at a start
+            // gate until its supervisor is in the leaf too, so the supervisor
+            // is alive for the move and the program never runs beside a
+            // supervisor outside the leaf.
+            let leaf = self.config.classifier_leaf.clone();
+            let gate = match &leaf {
+                Some(_) => Some(self.hold_start(&mut container)?),
+                None => None,
+            };
 
             let mut cmd = self.command(&container, &exec.executable, &exec.args, &exec.envs)?;
             let stdin_slot = apply_run_options(&mut cmd, current_dir.as_deref(), &mut stdin);
@@ -2740,6 +2801,39 @@ impl<C: Channel> Sandbox<C> {
 
             let mut child = forker::on_fork_thread(move || cmd.spawn())
                 .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
+
+            // NET-079: every process of a run in a box's leaf is in the leaf.
+            // The program joined it in its pre-exec closure; the supervisor
+            // never runs that closure, so it is moved here. A supervisor
+            // that is not in the leaf after the move fails the run: kill and
+            // reap it (a `hakoniwa::Child` does not terminate on drop).
+            if let Some(leaf) = &leaf {
+                let supervisor = child.id();
+                if let Err(e) = classifier::place_supervisor(leaf, supervisor) {
+                    tracing::error!(
+                        leaf = %leaf.dir().display(),
+                        supervisor,
+                        error = %e,
+                        "placing the run's supervisor in its classifier leaf failed; \
+                         the run is stopped",
+                    );
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(Error::IO(
+                        "moving the sandbox's supervisor process into its cgroup",
+                        leaf.procs(),
+                        e,
+                    ));
+                }
+                tracing::debug!(
+                    leaf = %leaf.dir().display(),
+                    supervisor,
+                    "placed the run's supervisor in its classifier leaf",
+                );
+            }
+            if let Some(gate) = gate {
+                gate.release();
+            }
 
             // Step 3: wire this invocation's netns. Torn down explicitly once
             // the invocation completes (both arms).
@@ -8609,6 +8703,157 @@ int main(int argc, char **argv) {
             format!("magic {CGROUP2_SUPER_MAGIC}"),
             "a box with no classifier leaf gets no classifier tree at all: the \
              placement is an opt-in per box, not a change to every sandbox"
+        );
+    }
+
+    /// NET-079, the placement half of a run in a box's leaf, over a stand-in
+    /// leaf: the supervisor is written into the leaf's `cgroup.procs` and
+    /// read back from it. A leaf with no `cgroup.procs` is not a cgroup, and
+    /// a leaf that does not list the pid after the write has not taken it:
+    /// both are an `Err` that fails the run.
+    #[test]
+    fn a_run_in_a_classifier_leaf_places_its_supervisor_over_a_stand_in() {
+        let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+        let supervisor = std::process::id();
+
+        let leaf_dir = tree.path().join("placed");
+        std::fs::create_dir(&leaf_dir).expect("creating the stand-in leaf");
+        model_cgroup_files(&leaf_dir);
+        let leaf = config::ClassifierLeaf::new(leaf_dir.clone());
+        classifier::place_supervisor(&leaf, supervisor).expect("a leaf that takes the pid");
+        assert_eq!(
+            std::fs::read_to_string(leaf.procs()).expect("reading the leaf's procs"),
+            format!("{supervisor}\n"),
+            "the supervisor is written into the leaf"
+        );
+
+        let gone = config::ClassifierLeaf::new(tree.path().join("not-a-cgroup"));
+        std::fs::create_dir(gone.dir()).expect("creating a leaf with no cgroup.procs");
+        let err = classifier::place_supervisor(&gone, supervisor)
+            .expect_err("a leaf with no cgroup.procs is not a cgroup");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+        assert!(
+            !gone.procs().exists(),
+            "the placement never creates the cgroup.procs it found missing"
+        );
+
+        let deaf_dir = tree.path().join("deaf");
+        std::fs::create_dir(&deaf_dir).expect("creating a leaf that keeps nothing");
+        std::os::unix::fs::symlink("/dev/null", deaf_dir.join("cgroup.procs"))
+            .expect("a cgroup.procs whose writes vanish");
+        let err = classifier::place_supervisor(&config::ClassifierLeaf::new(deaf_dir), supervisor)
+            .expect_err("a leaf that does not list the supervisor did not take it");
+        assert!(
+            err.to_string()
+                .contains(&format!("does not list process {supervisor}")),
+            "{err}"
+        );
+    }
+
+    /// NET-079 against the kernel's own bookkeeping: while a run in a box's
+    /// leaf is alive, the leaf's `cgroup.procs` lists the run's supervisor —
+    /// the child of this process that `spawn()` forked — beside the program.
+    ///
+    /// Gated, with the reason printed, as `host_address_box_placed_in_leaf`
+    /// is: the tree installed, writable by this account, and a child of this
+    /// process able to migrate into a leaf of it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_in_a_classifier_leaf_places_its_supervisor_in_the_real_tree() {
+        const SKIP: &str =
+            "skipping a_run_in_a_classifier_leaf_places_its_supervisor_in_the_real_tree";
+        if let Some(reason) = user_namespaces_restriction() {
+            eprintln!(
+                "{SKIP}: this host denies the unprivileged user namespace \
+                       every sandbox starts by unsharing: {reason}"
+            );
+            return;
+        }
+        let root = Path::new(classifier::TREE_ROOT);
+        let deny = root.join(classifier::BOXES_DIR).join(config::DENY_DIR);
+        if !deny.is_dir() {
+            eprintln!(
+                "{SKIP}: {} is absent — this host has no classifier tree to place a run in",
+                deny.display()
+            );
+            return;
+        }
+        if nix::unistd::access(&deny, nix::unistd::AccessFlags::W_OK).is_err() {
+            eprintln!("{SKIP}: {} is not writable by this account", deny.display());
+            return;
+        }
+        if let Err(e) = classifier::probe_child_placement(root, config::Verdict::Deny) {
+            eprintln!("{SKIP}: this process cannot place a child in the tree: {e}");
+            return;
+        }
+
+        let box_id = format!("run-supervisor-{}", std::process::id());
+        let leaf = classifier::create_box_leaf(root, &box_id, config::Verdict::Deny)
+            .expect("creating the run's leaf in the real tree");
+
+        let base_dir = box_base_dir(&box_id);
+        let build = tempfile::tempdir_in(&base_dir).expect("a temp dir for the probe");
+        let probe = compile_cgroup_probe(build.path());
+        let source = build.path().join("rootfs-src");
+        probe_rootfs(&source, &probe);
+        let sandbox_home = tempfile::tempdir_in(&base_dir).expect("a temp dir for the sandbox");
+        let mut sandbox = Config::new(&box_id)
+            .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
+            .with_dns(false)
+            .with_classifier_leaf(config::ClassifierLeaf::new(leaf.clone()))
+            .build(sandbox_home.path().join("sandbox"), ())
+            .await
+            .expect("building the sandbox");
+        let release_name = format!("run-release-{}", std::process::id());
+        let release = sandbox.base_dir.join("run").join(&release_name);
+
+        let run = sandbox.run_with_cancel(
+            vec![Invocation {
+                executable: "/usr/bin/probe".to_string(),
+                args: vec![format!("HOLD:/run/{release_name}")],
+                envs: Default::default(),
+            }],
+            None::<tokio::io::Sink>,
+            None::<tokio::io::Sink>,
+            tokio_util::sync::CancellationToken::new(),
+        );
+        // Read the leaf while the probe holds the run in it, then release.
+        let watch = async {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            let members = loop {
+                let members =
+                    std::fs::read_to_string(leaf.join("cgroup.procs")).unwrap_or_default();
+                let parents: Vec<u32> = members
+                    .lines()
+                    .filter_map(|pid| {
+                        let status =
+                            std::fs::read_to_string(format!("/proc/{}/status", pid.trim())).ok()?;
+                        status
+                            .lines()
+                            .find_map(|line| line.strip_prefix("PPid:"))
+                            .and_then(|ppid| ppid.trim().parse().ok())
+                    })
+                    .collect();
+                if parents.contains(&std::process::id()) || std::time::Instant::now() >= deadline {
+                    break (members, parents);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            };
+            std::fs::write(&release, "").expect("releasing the probe");
+            members
+        };
+        let (ran, (members, parents)) = tokio::join!(run, watch);
+        let _ = classifier::remove_box_leaf(&leaf);
+
+        ran.expect("the run in the leaf passes");
+        assert!(
+            parents.contains(&std::process::id()),
+            "the leaf lists the run's supervisor, a child of this process, while \
+             the run is alive: members {members:?}, their parents {parents:?}"
+        );
+        assert!(
+            members.lines().count() >= 2,
+            "the leaf holds the program beside its supervisor: {members:?}"
         );
     }
 
