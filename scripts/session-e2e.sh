@@ -14183,17 +14183,17 @@ bep_linux_key_store() {
     if [ -z "$ks_err" ] && { [ "$ks_rc" = 0 ] || [ "$ks_rc" = 1 ]; }; then
       return 0
     fi
-    echo "no key store for the Box Egress Proxy: no TPM at /dev/tpmrm0 that this user can use with tpm2-tools, and Secret Service did not answer secret-tool (exit $ks_rc${ks_err:+: ${ks_err%%$'\n'*}}). Set E2E_BEP_KEY_STORE=1 on a lane that provides one"
+    echo "no key store for the Box Egress Proxy: no TPM at /dev/tpmrm0 that this user can use with tpm2-tools, and Secret Service did not answer secret-tool (exit $ks_rc${ks_err:+: ${ks_err%%$'\n'*}}). Set E2E_BEP_KEY_STORE=1 on a lane that provides one; https://github.com/gominimal/minimal/issues/3652"
     return 1
   fi
-  echo "no key store for the Box Egress Proxy: no TPM at /dev/tpmrm0 that this user can use with tpm2-tools, and no secret-tool for Secret Service. Set E2E_BEP_KEY_STORE=1 on a lane that provides one"
+  echo "no key store for the Box Egress Proxy: no TPM at /dev/tpmrm0 that this user can use with tpm2-tools, and no secret-tool for Secret Service. Set E2E_BEP_KEY_STORE=1 on a lane that provides one; https://github.com/gominimal/minimal/issues/3652"
   return 1
 }
 # `min secret` stores values in the macOS Keychain only. Records case $1 as
 # NOT RUN and returns 1 on any other host.
 bep_native_store_gate() {
   [ "$(uname -s)" = Darwin ] && return 0
-  not_run "$1" "'min secret' stores secrets only in the macOS Keychain, and this host is $(uname -s)"
+  not_run "$1" "'min secret' stores secrets only in the macOS Keychain, and this host is $(uname -s); Linux: https://github.com/gominimal/minimal/issues/3695"
   return 1
 }
 bep_live_gate() {
@@ -16429,7 +16429,7 @@ print(rcode, an, addr)' "$dq_b64"
   # `min secret` stores values in the macOS Keychain only, so on Linux the
   # leg is NOT RUN and the fail_closed leg checks the git box alone.
   if [ "$(uname -s)" != Darwin ]; then
-    bz_not_run store "'min secret' stores secrets only in the macOS Keychain, and this host is $(uname -s)"
+    bz_not_run store "'min secret' stores secrets only in the macOS Keychain, and this host is $(uname -s); Linux: https://github.com/gominimal/minimal/issues/3695"
   else
     bz_id="e2e-dns-store-$(date +%s)-$$"
     bz_value="mne2e$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
@@ -19093,10 +19093,6 @@ proof_bep_ahm_relayed_response_has_no_alt_svc() {
 
 proof_bep_ahm_missing_proxy_refused() {
   local mp_case=bep_ahm_missing_proxy_refused mp_home mp_bin mp_rc=0 mp_err mp_want mp_next
-  if [ "$(uname -s)" != "Darwin" ]; then
-    not_run "$mp_case" "the Box Egress Proxy runs on macOS only"
-    return 0
-  fi
   if [ -z "$E2E_VM" ] || [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
     not_run "$mp_case" "no MINVMD_GVPROXY_BIN: the VM host daemon starts the Box Egress Proxy beside gvproxy, and this target has none"
     return 0
