@@ -123,10 +123,13 @@ pub(crate) fn take_expanded_exports(spec: &mut mfile::spec::BoxSpec, expanded: &
 
 /// Puts the stored spec of a task run on `request` (BOX-068). `spec` is
 /// the declared task's spec, `None` for an interactive task. `expanded` is
-/// the task entry's expansion, whose `[[file_exports]]` items and
-/// `network.vpn_network_names` the spec takes (BOX-203, BCLI-024). Then each `--vpn-network-names` value, `vpn_network_names`,
-/// goes on the stored spec (BCLI-024). That edits the stored JSON, so it
-/// runs after `put_spec`, and once.
+/// the task entry's expansion, whose `[[file_exports]]` items,
+/// `network.vpn_network_names` and `[secrets]` the spec takes (BOX-203,
+/// BCLI-024, BOX-071). The client digest is the projection of that spec, so
+/// it binds the task's secret grants, and the daemon reads the same
+/// `[secrets]` (#3650). Then each `--vpn-network-names` value,
+/// `vpn_network_names`, goes on the stored spec (BCLI-024). That edits the
+/// stored JSON, so it runs after `put_expanded_spec`, and once.
 ///
 /// # Errors
 ///
@@ -145,8 +148,10 @@ pub(crate) fn put_task_spec(
             // The expansion holds the names `[defaults]` and the task's
             // type declare too. A flag value adds to them below.
             spec.network.vpn_network_names = mfile::spec::entry_vpn_network_names(expanded);
+            crate::put_expanded_spec(request, spec, expanded)?;
+        } else {
+            crate::put_spec(request, spec)?;
         }
-        crate::put_spec(request, spec)?;
     } else {
         // An interactive task sends no spec: the task type denies a
         // terminal. With no spec to name it, the request carries the
@@ -156,6 +161,69 @@ pub(crate) fn put_task_spec(
     // With no spec, a `--vpn-network-names` value has no place to go, so
     // the helper refuses it rather than drop it.
     crate::add_vpn_network_names(request, vpn_network_names)
+}
+
+/// Refuses a run whose sent `spec` carries a `source = "broker"` secret
+/// where no node-local proxy serves boxes (BOX-081, #3650). `absence` says
+/// why no proxy serves boxes, or gives `None` when one does. It is read
+/// only for a spec with a brokered secret.
+///
+/// The refusal is the daemon's for the same spec: it names each brokered
+/// secret, in name order, and exits 5 (`gatehouse_unenrolled_node`).
+///
+/// Interim until #3679: `min task run` sends no proxy root certificate, so
+/// the daemon refuses a brokered task secret on every host, also on a host
+/// with a proxy. A session box can use the same secret. #3679 tracks the
+/// task path.
+///
+/// # Errors
+///
+/// [`boxes::core::bep::ActivationRefused`] for a brokered secret with no
+/// proxy.
+pub(crate) fn refuse_unserved_broker_secrets(
+    spec: Option<&serde_json_lenient::Value>,
+    absence: impl FnOnce() -> Option<boxes::core::bep::ProxyAbsence>,
+) -> Result<(), boxes::core::bep::ActivationRefused> {
+    let Some(secrets) = spec
+        .and_then(|spec| spec.get("secrets"))
+        .and_then(serde_json_lenient::Value::as_object)
+    else {
+        return Ok(());
+    };
+    let brokered: std::collections::BTreeMap<&String, &serde_json_lenient::Value> = secrets
+        .iter()
+        .filter(|(_, grant)| grant.get("source").and_then(|s| s.as_str()) == Some("broker"))
+        .collect();
+    if brokered.is_empty() {
+        return Ok(());
+    }
+    let Some(cause) = absence() else {
+        return Ok(());
+    };
+    // The text says "secret" in place of "GitHub grant" when any of them
+    // asks for no `github:` scope.
+    let not_github = brokered.values().any(|grant| {
+        !grant
+            .get("scopes")
+            .and_then(|s| s.as_array())
+            .is_some_and(|scopes| {
+                scopes
+                    .iter()
+                    .filter_map(|scope| scope.as_str())
+                    .any(|scope| scope.starts_with("github:"))
+            })
+    });
+    let names: Vec<String> = brokered.keys().map(|name| (*name).clone()).collect();
+    tracing::info!(
+        secrets = ?names,
+        code = boxes::core::bep::GATEHOUSE_UNENROLLED_NODE,
+        "refused a task run: the spec carries a brokered secret and no proxy serves boxes"
+    );
+    // The secrets can come from the task's table or from a default, so
+    // the refusal names no table.
+    Err(boxes::core::bep::unenrolled_node(
+        names, not_github, cause, None,
+    ))
 }
 
 /// The network a run gives task `task`'s box (NET-060), from
@@ -1633,7 +1701,12 @@ pub(crate) async fn run_entry(
     // covers the expansion and the compose call that sends it.
     let entry_span = tracing::info_span!("box_entry", box_type = boxes::TASK_BOX_TYPE);
     let expanded = entry_span.in_scope(|| {
-        crate::task_box_entry(&upload_root, &args.entry, request.config.hooks_enabled)
+        crate::task_box_entry(
+            &upload_root,
+            &args.entry,
+            request.config.hooks_enabled,
+            Some(global),
+        )
     })?;
     put_task_spec(
         &mut request,
@@ -1642,6 +1715,12 @@ pub(crate) async fn run_entry(
         expanded.as_ref().map(|expanded| &expanded.spec),
         &args.other.vpn_network_names,
     )?;
+    // BOX-081, #3650: the run sends no proxy root certificate. So where no
+    // proxy serves boxes, the daemon refuses each brokered secret of the
+    // spec. The run refuses it here first, with exit 5, before a box exists.
+    // Interim until #3679: with no root certificate, the daemon refuses a
+    // brokered task secret also where a proxy serves boxes.
+    refuse_unserved_broker_secrets(request.spec.as_ref(), || crate::host_proxy_absence(global))?;
 
     // Loadouts and user policy, resolved before the daemon connection so a
     // broken loadout fails loudly client-side, and through the same shared

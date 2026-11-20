@@ -432,6 +432,9 @@ fn every_create_session_asserts_the_daemon_build() {
             "cmd/boxes/create.rs::activation_puts_the_spec_on_the_create_request = asserts nothing",
             // A unit test's request, never sent: it checks the project root.
             "cmd/boxes/create.rs::create_from_a_subdirectory_sends_the_project_root = asserts nothing",
+            // A unit test's request, never sent: it checks that the client
+            // digest of a spec with secrets equals the daemon's.
+            "cmd/boxes/create.rs::create_stores_a_client_digest_equal_to_the_daemon_digest = asserts nothing",
             // A unit test's request, never sent: it checks the creation key
             // a fresh-instance grant box registers under (BEP-082).
             "cmd/boxes/create.rs::fresh_instance_grant_box_registers_under_a_creation_key = asserts nothing",
@@ -495,6 +498,9 @@ fn every_create_session_asserts_the_daemon_build() {
             // A unit test's request, never sent: it checks the run path's
             // `--no-hooks` on the stored spec.
             "tests.rs::start_no_hooks_stores_no_hooks = asserts nothing",
+            // A unit test's request, never sent: it checks the task's
+            // secrets on the spec a run sends.
+            "tests.rs::task_spec_carries_expanded_secrets = asserts nothing",
             // A unit test's request, never sent: it checks that
             // `--vpn-network-names` is refused when the request has no spec.
             "tests.rs::vpn_network_names_without_a_spec_is_refused = asserts nothing",
@@ -2921,6 +2927,7 @@ fn create_verbs_name_flag_overrides_box_name() {
             root,
             options.entry.as_deref(),
             options.box_name.as_deref(),
+            None,
         )
         .unwrap();
         assert_eq!(created_box_name(&request).as_deref(), Some("api"));
@@ -2983,7 +2990,7 @@ fn create_verbs_name_flag_overrides_box_name() {
         boxes::BoxPolicy::default(),
     );
     request.config.name = minimal_client::box_name::request_name(None);
-    stamp_session_spec_as(&mut request, root, options.entry.as_deref(), None).unwrap();
+    stamp_session_spec_as(&mut request, root, options.entry.as_deref(), None, None).unwrap();
     assert_eq!(created_box_name(&request).as_deref(), Some("dev"));
 
     // A task entry's box takes a generated name, so `--name` is refused
@@ -3183,7 +3190,13 @@ async fn start_typed_session_entry_stores_its_own_body() {
     // it.
     let (_state, mut global, server) = show_network_daemon().await;
     global.repo_dir = Some(project.path().to_path_buf());
-    let (request, _) = &specs[0];
+    // dev grants the GitHub secret DEV_TOKEN, so the daemon creates the box
+    // only when a Box Egress Proxy serves it. The activation hands the
+    // proxy's root certificate with the grant, as on a host with a proxy.
+    let mut request = specs[0].0.clone();
+    request.config.root_certificate =
+        Some("-----BEGIN CERTIFICATE-----\nUk9PVA==\n-----END CERTIFICATE-----\n".to_owned());
+    let request = &request;
     let id = create_box_from(&server, request).await;
     let id_text = id.to_string();
     let stored = box_spec_text(&global, &["min", "box", "spec", &id_text, "-o", "json"])
@@ -17203,7 +17216,7 @@ echo = "ok"
         (session.name.as_str(), session.box_type.as_str()),
         ("default", "session")
     );
-    let task = crate::task_box_entry(root, "check", true)
+    let task = crate::task_box_entry(root, "check", true, None)
         .expect("the task entry expands")
         .expect("the project declares the task")
         .wire;
@@ -17265,7 +17278,7 @@ echo = "ok"
     assert_eq!(entry.name, "default");
     let (legacy_vars, _) = start_from_entry(&mut daemon, "legacy", legacy.path(), entry).await;
     assert_eq!(legacy_vars, ["EDITOR=vi"]);
-    let legacy_task = crate::task_box_entry(legacy_root, "check", true)
+    let legacy_task = crate::task_box_entry(legacy_root, "check", true, None)
         .expect("the legacy project's task entry expands")
         .expect("the legacy project declares the task")
         .wire;
@@ -17376,7 +17389,7 @@ fn planned_session_request_checked(
     );
     request.config.name = minimal_client::box_name::request_name(None);
     request.config.hooks_enabled = !args.no_hooks;
-    stamp_session_spec_as(&mut request, root, options.entry.as_deref(), None).unwrap();
+    stamp_session_spec_as(&mut request, root, options.entry.as_deref(), None, None).unwrap();
     add_vpn_network_names(&mut request, &options.vpn_network_names).unwrap();
     // Each create in a test is a fresh instance, so no name is held.
     request_fresh_instance(&mut request);
@@ -21781,6 +21794,7 @@ async fn start_attach_resume_end_to_end() {
             root,
             options.entry.as_deref(),
             options.box_name.as_deref(),
+            None,
         )
         .expect("the spec is stamped");
         let mut daemon = alpha.server.connect().await;
@@ -24387,7 +24401,7 @@ fn run_spec(project: &std::path::Path, argv: &[&str]) -> serde_json_lenient::Val
         &run.args,
     )
     .expect("a non-interactive task has a spec");
-    let expanded = crate::task_box_entry(root, &run.entry, true)
+    let expanded = crate::task_box_entry(root, &run.entry, true, None)
         .expect("the task entry expands")
         .expect("the project declares the task");
     task::put_task_spec(
@@ -24399,6 +24413,118 @@ fn run_spec(project: &std::path::Path, argv: &[&str]) -> serde_json_lenient::Val
     )
     .expect("the spec encodes");
     request.spec.expect("the run stores a spec")
+}
+
+/// A task with one brokered secret, as #3650 reports it.
+const BROKER_TASK_FILE: &str = "[tasks.ci]\nexec = [\"true\"]\n\n\
+    [tasks.ci.secrets.GH_TOKEN]\nsource = \"broker\"\nscopes = [\"github:contents:read\"]\n";
+
+// #3650, BOX-071: the spec of `min task run ci` carries the task's
+// expanded `[secrets]`, and its client digest equals the daemon's digest of
+// the sent spec.
+#[test]
+fn task_spec_carries_expanded_secrets() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    std::fs::write(project.path().join(mfile::MFILE_NAME), BROKER_TASK_FILE).unwrap();
+    let root = camino::Utf8Path::from_path(project.path()).unwrap();
+    let run = parsed_run(&["min", "task", "run", "ci"]);
+    let mut request = minimald_rpc::CreateSessionRequest::new(
+        String::new(),
+        paths::HostAbsPath::try_new(root.to_owned()).unwrap(),
+        boxes::NetworkMode::HostNet,
+        boxes::BoxPolicy::default(),
+    );
+    request.config.creating_verb = minimald_rpc::CreatingVerb::Task;
+    let declared = task::declared_task(root, &run.entry).expect("the task is declared");
+    let mut spec = task::task_box_spec(
+        &run.entry,
+        &declared,
+        crate::spec_flags(&request),
+        &run.args,
+    )
+    .expect("a non-interactive task has a spec");
+    let expanded = crate::task_box_entry(root, &run.entry, true, None)
+        .expect("the task entry expands")
+        .expect("the project declares the task");
+    task::put_task_spec(
+        &mut request,
+        &run.entry,
+        Some(&mut spec),
+        Some(&expanded.spec),
+        &[],
+    )
+    .expect("the spec encodes");
+
+    let wire = request.spec.as_ref().expect("the run stores a spec");
+    assert_eq!(wire["secrets"]["GH_TOKEN"]["source"], "broker", "{wire}");
+    assert_eq!(
+        wire["secrets"]["GH_TOKEN"]["scopes"],
+        serde_json_lenient::json!(["github:contents:read"]),
+        "{wire}"
+    );
+    let daemon =
+        mfile::projection::spec_digest(wire, boxes::TASK_BOX_TYPE).expect("the sent spec projects");
+    assert_eq!(
+        request.config.client_projection_digest(),
+        Some(daemon.as_str())
+    );
+    let read: mfile::spec::BoxSpec =
+        serde_json_lenient::from_value(wire.clone()).expect("the daemon reads the sent spec");
+    assert!(read.kept_keys.contains_key("secrets"), "{read:?}");
+}
+
+// #3650, BOX-081: `min task run ci` of a task with a brokered secret, on a
+// host that is not enrolled and has no proxy, fails with exit 5, and no
+// box exists after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_run_broker_secret_unenrolled_exits_5() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join(mfile::MFILE_NAME), BROKER_TASK_FILE).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let sock = state.path().join("providers/local-minimald0/ssh.sock");
+    std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+    let server = minimald::test_harness::TestServer::new().await;
+    server.listen_on_uds(&sock).await;
+    let global = GlobalArgs {
+        repo_dir: Some(project.path().to_path_buf()),
+        minimal_dir: Some(state.path().to_path_buf()),
+        config_dir: Some(config.path().to_path_buf()),
+        no_input: true,
+        ..Default::default()
+    };
+
+    let err = task::cmd_task_run(
+        &global,
+        TaskRunArgs {
+            task: "ci".into(),
+            path: None,
+            network: None,
+            egress: EgressArgs::default(),
+            other: crate::BoxOverrideArgs::default(),
+            detach: true,
+            args: vec![],
+        },
+    )
+    .await
+    .expect_err("a brokered secret on an un-enrolled host is refused");
+    let refused = err
+        .downcast_ref::<boxes::core::bep::ActivationRefused>()
+        .unwrap_or_else(|| panic!("the refusal is an activation refusal: {err:#}"));
+    assert_eq!(refused.exit_code(), 5, "{err:#}");
+    assert_eq!(
+        refused.refusals[0].code(),
+        Some(boxes::core::bep::GATEHOUSE_UNENROLLED_NODE),
+        "{err:#}"
+    );
+    assert!(err.to_string().contains("GH_TOKEN"), "{err:#}");
+
+    let listed = server
+        .connect()
+        .await
+        .call::<minimald_rpc::ListSessions>(&())
+        .await;
+    assert!(listed.sessions.is_empty(), "the refused run created no box");
 }
 
 // BOX-203, BCLI-024: `min task run --vpn-network-names corp build` stores a
@@ -24691,7 +24817,7 @@ async fn box_start_detach_then_wait_copies_declared_file_exports() {
         boxes::NetworkMode::HostNet,
         boxes::BoxPolicy::default(),
     );
-    crate::stamp_session_spec_as(&mut request, root, Some("dev"), None)
+    crate::stamp_session_spec_as(&mut request, root, Some("dev"), None, None)
         .expect("the start stores a spec");
     let spec = request.spec.expect("the start stores a spec");
     assert_eq!(
