@@ -946,6 +946,89 @@ do_uninstall() {
 # this inside the component loop).
 sessions_live_msg='daemon has active sessions'
 
+# A `min` from this release on has no bare `min stop`: `min host stop <host>`
+# stops each running box on that host, then its daemon. It refuses nothing, so
+# min_stop makes its own running-box check before a graceful stop, and refuses
+# with $sessions_live_msg as bare `min stop` did. A listing that fails proves
+# nothing, so it refuses too, with $boxes_unknown_msg. A box list fails on a
+# version skew, which is the post-swap case, so a failed listing never ends a
+# box without consent. A listing that could not reach a host exits 0 but
+# leaves that host's boxes out, so it counts as a failed listing. A failed
+# `min host list` names no host to stop, so min_stop refuses with
+# $hosts_unknown_msg, with or without --force. An older `min`, without
+# `min host stop`, still gets bare `min stop`.
+boxes_unknown_msg='daemon did not list its boxes'
+hosts_unknown_msg='min host list failed'
+# What `min box list` prints on stderr for a host it could not reach.
+host_unreached_msg='its boxes are not listed'
+
+# Succeeds when the `min` on disk has `min host stop`.
+min_has_host_stop() {
+    "$bindir/min" host stop --help >/dev/null 2>&1 </dev/null
+}
+
+# The local hosts that are not stopped, one name per line. A row of `min host
+# list` is `HOST PROVIDER STATE`. The header and the notes after the rows do
+# not name a provider, and the box `min` runs in (local-box) is never stopped.
+# Fails when `min host list` fails.
+live_hosts() {
+    _hl="$("$bindir/min" host list 2>/dev/null </dev/null)" || return 1
+    printf '%s\n' "$_hl" \
+        | awk 'NR > 1 && $2 ~ /^local(-minvmd)?$/ && $3 != "stopped" { print $1 }'
+}
+
+# min_stop [--force]: stop the daemons the `min` on disk talks to. Its output
+# and exit status are those of the stop, as bare `min stop` gave them.
+min_stop() {
+    if ! min_has_host_stop; then
+        "$bindir/min" stop "$@" </dev/null
+        return
+    fi
+    if ! _hosts="$(live_hosts)"; then
+        echo "$hosts_unknown_msg" >&2
+        return 1
+    fi
+    [ -n "$_hosts" ] || return 0
+    if [ "${1:-}" != --force ]; then
+        # stderr rides with the JSON, so a host the listing did not reach
+        # shows up beside the rows.
+        if ! _boxes="$("$bindir/min" box list --all -o json 2>&1 </dev/null)"; then
+            echo "$boxes_unknown_msg" >&2
+            return 1
+        fi
+        case "$_boxes" in
+            *"$host_unreached_msg"*)
+                echo "$boxes_unknown_msg" >&2
+                return 1
+                ;;
+        esac
+        if printf '%s\n' "$_boxes" | grep -qE '"state": *"running"'; then
+            echo "$sessions_live_msg" >&2
+            return 1
+        fi
+    fi
+    _rc=0
+    for _h in $_hosts; do
+        "$bindir/min" host stop "$@" "$_h" </dev/null || _rc=1
+    done
+    return "$_rc"
+}
+
+# The stop command to name in advice, with --force when $1 is --force. A
+# `min` with `min host stop` names the host when one host runs.
+stop_command() {
+    if min_has_host_stop; then
+        _sh="$(live_hosts)" || _sh=
+        case "$_sh" in
+            ""|*"
+"*) _sh='<host>' ;;
+        esac
+        printf 'min host stop%s %s' "${1:+ $1}" "$_sh"
+    else
+        printf '%s stop%s' "$_stale_min" "${1:+ $1}"
+    fi
+}
+
 # Ask, on the CONTROLLING TERMINAL, whether to end the live sessions. Under
 # `curl … | sh` stdin is the script pipe, so reading the answer from it would
 # consume the script; /dev/tty is the only sound source (overridable so the
@@ -955,12 +1038,22 @@ sessions_live_msg='daemon has active sessions'
 # upgrade must not proceed. The argument names the calling stop: `pre` (the
 # default) may tell the user to rerun with --force-stop, which works before
 # the swaps; `post` runs after them, where a rerun replaces nothing and could
-# never reach this stop, so it must not suggest one.
+# never reach this stop, so it must not suggest one. The second argument is
+# what the refused stop printed.
 confirm_force_stop() {
     _tty="${MINIMAL_OVERRIDE_TTY:-/dev/tty}"
+    _ends='them'
     say ""
-    say "warning: the running daemon has active sessions:"
-    "$bindir/min" ls >&2 </dev/null || true
+    case "${2:-}" in
+        *"$boxes_unknown_msg"*)
+            say "warning: the running daemon did not list its boxes, so this run cannot tell if a box runs."
+            _ends='every box that runs'
+            ;;
+        *)
+            say "warning: the running daemon has active sessions:"
+            "$bindir/min" ls >&2 </dev/null || true
+            ;;
+    esac
     say ""
     if ! (exec <"$_tty") 2>/dev/null; then
         if [ "${1:-pre}" = post ]; then
@@ -971,7 +1064,7 @@ confirm_force_stop() {
         fi
         return 1
     fi
-    printf 'Stopping the daemon ends them. Continue? [y/N] ' >&2
+    printf 'Stopping the daemon ends %s. Continue? [y/N] ' "$_ends" >&2
     _ans=
     read -r _ans <"$_tty" || _ans=
     case "$_ans" in
@@ -1003,20 +1096,40 @@ stop_running_daemon() {
 
     if [ "$force_stop" -eq 0 ]; then
         # Stopped gracefully (or there was nothing to stop): done, no --force.
-        if _stop_out="$("$bindir/min" stop 2>&1 </dev/null)"; then
+        if _stop_out="$(min_stop 2>&1)"; then
             return 0
         fi
         case "$_stop_out" in
-            *"$sessions_live_msg"*)
+            *"$sessions_live_msg"*|*"$boxes_unknown_msg"*)
                 pre_swap_sessions="$("$bindir/min" ls --raw 2>/dev/null </dev/null)" \
                     || pre_swap_sessions=
-                confirm_force_stop || return 1
+                confirm_force_stop pre "$_stop_out" || return 1
                 daemon_stop_consent=1
+                ;;
+            *"$hosts_unknown_msg"*)
+                hosts_unknown_refusal
+                return 1
                 ;;
         esac
         # Any other failure falls through to the force stop, silent as before.
     fi
-    "$bindir/min" stop --force >/dev/null 2>&1 </dev/null || true
+    if ! _stop_out="$(min_stop --force 2>&1)"; then
+        case "$_stop_out" in
+            *"$hosts_unknown_msg"*)
+                hosts_unknown_refusal
+                return 1
+                ;;
+        esac
+    fi
+    return 0
+}
+
+# Why the pre-swap stop refuses when `min host list` fails: with no host
+# list, this run cannot find the daemon to stop.
+hosts_unknown_refusal() {
+    say ""
+    say "warning: 'min host list' failed, so this run cannot find the daemon to stop."
+    say "run '$bindir/min host list' to see why."
 }
 
 # Dispatch uninstall before any target/manifest work. resolve_prefix and
@@ -1170,17 +1283,22 @@ stop_stale_daemon_now() {
     [ -n "$_cv" ] && [ -n "$_sv" ] && [ "$_cv" != "$_sv" ] || return 0
     say "stopping a daemon still running from build $_sv"
     if [ "$force_stop" -eq 0 ] && { [ "$daemon_stop_consent" -eq 0 ] || ! sessions_seen_pre_swap; }; then
-        if _stop_out="$("$bindir/min" stop 2>&1 </dev/null)"; then
+        if _stop_out="$(min_stop 2>&1)"; then
             return 0
         fi
         case "$_stop_out" in
-            *"$sessions_live_msg"*)
-                if confirm_force_stop post; then
+            *"$sessions_live_msg"*|*"$boxes_unknown_msg"*)
+                if confirm_force_stop post "$_stop_out"; then
                     force_stop_stale "$_sv"
                     return 0
                 fi
-                say "the daemon has active sessions, so it is still running build $_sv."
-                say "run '$_stale_min stop' after those sessions end, or '$_stale_min stop --force' to end them now."
+                case "$_stop_out" in
+                    *"$boxes_unknown_msg"*)
+                        say "the daemon did not list its boxes, so it is still running build $_sv." ;;
+                    *)
+                        say "the daemon has active sessions, so it is still running build $_sv." ;;
+                esac
+                say "run '$(stop_command)' after those sessions end, or '$(stop_command --force)' to end them now."
                 return 0
                 ;;
         esac
@@ -1204,8 +1322,8 @@ sessions_seen_pre_swap() {
 # stop is reported rather than left looking like success: a daemon of the old
 # build may still be serving, and the user is told how to stop it.
 force_stop_stale() {
-    "$bindir/min" stop --force >/dev/null 2>&1 </dev/null && return 0
-    say "the daemon on build $1 may still be running; run '$_stale_min stop --force'"
+    min_stop --force >/dev/null 2>&1 && return 0
+    say "the daemon on build $1 may still be running; run '$(stop_command --force)'"
 }
 
 # Set once the pre-swap stop has run and the first executable is about to be

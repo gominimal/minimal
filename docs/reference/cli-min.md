@@ -104,7 +104,6 @@ else goes to stderr for that failure. The command still exits non-zero.
 | `audit_self_unsupported_unenrolled` | 1 | `min box audit self` inside a box on a host that is not enrolled. On the host, run `min box audit <box>` |
 | `timeout` | 124 | A box ran past its own timeout, or `min box exec --timeout` ended the command |
 | `wait_timeout` | 124 | `min box wait --timeout` ran out before the box ended |
-| `daemon_unreachable` | 1 | The command did not get an answer from the daemon when it read a box's network policy |
 | `policy_unavailable` | 1 | The command found the box but did not read its network policy |
 | `output_failed` | 1 | The command did not write its JSON output to stdout, for example on a full disk |
 | `unspecified` | 1, or the exit code of the failure | Any other failure. The exit code is the one the command gives without `-o` |
