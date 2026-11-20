@@ -865,7 +865,7 @@ up-nodocker: artifacts gvproxy initramfs-nodocker minvmd-build minimal-cli && (_
 
 # Bring the stack up: host-native minimald, no VM (`just up-kvm` for the VM stack).
 [linux]
-up: minimald-build minimal-cli gvproxy && (_smoke "--minimal-dir" native-dir)
+up: minimald-build minimal-cli gvproxy && (_smoke "--provider" "local" "--minimal-dir" native-dir)
     #!/usr/bin/env sh
     set -eu
     sock="{{native-dir}}/providers/local-minimald0/ssh.sock"
@@ -890,7 +890,7 @@ up: minimald-build minimal-cli gvproxy && (_smoke "--minimal-dir" native-dir)
     # `activate` sandbox dies at uid_map EPERM until it's installed.
     just _userns-check || true
     echo "up: host-native minimald at $sock (pid $(cat "$pidf"))"
-    echo "  own-IP demo: min --minimal-dir {{native-dir}} session start --detach --name net1 --network own_ip && min --minimal-dir {{native-dir}} session attach net1"
+    echo "  own-IP demo: min --provider local --minimal-dir {{native-dir}} session start --detach --name net1 --network own_ip && min --provider local --minimal-dir {{native-dir}} session attach net1"
 
 # Bring the stack up: native Linux + one Linux VM over KVM (stop with `just stop`).
 [linux]

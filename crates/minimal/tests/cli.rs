@@ -88,6 +88,7 @@ async fn finalize_install_show_json_reaches_a_piped_reader_before_exit() {
     let state = tempfile::TempDir::new().unwrap();
     let config_dir = tempfile::TempDir::new().unwrap();
     let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .env("MIN_PROVIDER", "local")
         .args(["--minimal-dir".as_ref(), state.path().as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .args(["--no-input", "finalize-install", "--show", "--json"])
@@ -189,6 +190,7 @@ async fn finalize_install_show_returns_within_its_deadline_on_a_wedged_daemon() 
     });
     let started = std::time::Instant::now();
     let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .env("MIN_PROVIDER", "local")
         .args(["--minimal-dir".as_ref(), state.path().as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .args(["--no-input", "finalize-install", "--show", "--json"])
@@ -1330,6 +1332,7 @@ async fn activate_prints_no_session_id_when_composition_fails() {
     // out of the run.
     let config_dir = tempfile::TempDir::new().unwrap();
     let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .env("MIN_PROVIDER", "local")
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .arg("--no-input")
@@ -1385,6 +1388,7 @@ async fn refused_activation(verdict: minimald::server::UsernsRestriction) -> Str
         .set_user_namespace_gate(minimald::server::UsernsGate::Fixed(verdict))
         .await;
     let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .env("MIN_PROVIDER", "local")
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .arg("--no-input")
@@ -1531,6 +1535,7 @@ async fn refused_task_run(verdict: minimald::server::UsernsRestriction) -> Strin
         .set_user_namespace_gate(minimald::server::UsernsGate::Fixed(verdict))
         .await;
     let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .env("MIN_PROVIDER", "local")
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .arg("--no-input")
@@ -1628,6 +1633,7 @@ async fn loadout_list_warning_goes_to_stderr_not_stdout() {
     // out of the run.
     let config_dir = tempfile::TempDir::new().unwrap();
     let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .env("MIN_PROVIDER", "local")
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .arg("--no-input")
@@ -3361,6 +3367,7 @@ async fn run_min(args: &GlobalArgs, extra: &[&str]) -> std::process::Output {
         .expect("setup points at a tempdir");
     let config_dir = tempfile::TempDir::new().unwrap();
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"));
+    command.env("MIN_PROVIDER", "local");
     command
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
@@ -4953,6 +4960,7 @@ async fn net_forward_announces_the_bound_local_port() {
         .expect("setup points at a tempdir");
     let config_dir = tempfile::TempDir::new().unwrap();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .env("MIN_PROVIDER", "local")
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .arg("--no-input")
@@ -5039,6 +5047,7 @@ async fn task_run_exits_with_held_open_stdin_pipe() {
 
     let config_dir = tempfile::TempDir::new().unwrap();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .env("MIN_PROVIDER", "local")
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .arg("--no-input")
@@ -5252,5 +5261,148 @@ async fn activate_exits_8_when_the_vm_host_is_out_of_addresses() {
     assert!(
         stderr.contains("address plan is exhausted"),
         "the error carries the daemon's reason: {stderr}"
+    );
+}
+
+/// A `MIN_PROVIDER` that names no provider refuses a flagless command
+/// with the step that fixes it, while `--provider` still wins over it and
+/// the shell's completion helper prints nothing and succeeds.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_unknown_min_provider_refuses_flagless_commands_only() {
+    let state = tempfile::TempDir::new().unwrap();
+    let config_dir = tempfile::TempDir::new().unwrap();
+    let min = |args: &[&str]| {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"));
+        command
+            .env("MIN_PROVIDER", "vm")
+            .args(["--minimal-dir".as_ref(), state.path().as_os_str()])
+            .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+            .arg("--no-input")
+            .args(args);
+        command
+    };
+    let refused = min(&["ls"]).output().await.unwrap();
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .lines()
+            .any(|line| line
+                == "error: MIN_PROVIDER=vm names no provider. Set MIN_PROVIDER to local or \
+         local-minvmd, or unset it."),
+        "{refused:?}"
+    );
+    let completion = min(&["complete-session-str"]).output().await.unwrap();
+    assert!(completion.status.success(), "{completion:?}");
+    assert!(completion.stdout.is_empty(), "{completion:?}");
+    let flagged = min(&["--provider", "local", "version"])
+        .output()
+        .await
+        .unwrap();
+    assert!(flagged.status.success(), "{flagged:?}");
+}
+
+/// The `provider` key of the `config.toml` that `min` finds on its own
+/// config path decides a flagless command's provider, ahead of the
+/// `/dev/kvm` probe: `provider = "local"` keeps it native on a host where
+/// `/dev/kvm` opens, and `provider = "local-minvmd"` picks the VM where it
+/// does not. `min dirs` prints the socket of the provider it resolved.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_config_provider_key_decides_a_flagless_command() {
+    let home = tempfile::TempDir::new().unwrap();
+    let config = home.path().join("xdg-config/minimal/config.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let dirs = || async {
+        let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+            .env_remove("MIN_PROVIDER")
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join("xdg-config"))
+            .env("XDG_STATE_HOME", home.path().join("xdg-state"))
+            .args(["--no-input", "dirs"])
+            .output()
+            .await
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    std::fs::write(&config, "provider = \"local\"\n").unwrap();
+    let native = dirs().await;
+    assert!(
+        native.contains("providers/local-minimald0/ssh.sock"),
+        "provider = \"local\" keeps the native provider: {native}"
+    );
+    std::fs::write(&config, "provider = \"local-minvmd\"\n").unwrap();
+    let vm = dirs().await;
+    assert!(
+        vm.contains("providers/local-minvmd0/ssh.sock"),
+        "provider = \"local-minvmd\" picks the VM provider: {vm}"
+    );
+}
+
+/// A `MIN_PROVIDER` that names no provider leaves a command that reads no
+/// provider running, while a command that talks to a host still refuses.
+/// `finalize-install` refuses too, because the provider picks what it
+/// installs; `finalize-install --undo` does not, and runs here as
+/// `--show --script`, which prints the removal script and runs nothing.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_unknown_min_provider_spares_commands_that_need_no_provider() {
+    let state = tempfile::TempDir::new().unwrap();
+    let config_dir = tempfile::TempDir::new().unwrap();
+    let loadouts_dir = tempfile::TempDir::new().unwrap();
+    let min = |args: &[&std::ffi::OsStr]| {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"));
+        command
+            .env("MIN_PROVIDER", "bogus")
+            .args(["--minimal-dir".as_ref(), state.path().as_os_str()])
+            .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+            .arg("--no-input")
+            .args(args);
+        command
+    };
+    let offline = min(&[
+        "loadout".as_ref(),
+        "list".as_ref(),
+        "--dir".as_ref(),
+        loadouts_dir.path().as_os_str(),
+    ])
+    .output()
+    .await
+    .unwrap();
+    assert!(offline.status.success(), "{offline:?}");
+    let refusal = "error: MIN_PROVIDER=bogus names no provider. Set MIN_PROVIDER to local or \
+                   local-minvmd, or unset it.";
+    // The refusal comes before the command runs, so `finalize-install`
+    // never reaches its root step here.
+    for args in [
+        &["ls"][..],
+        &["finalize-install"],
+        &["finalize-install", "--show"],
+    ] {
+        let args: Vec<&std::ffi::OsStr> = args.iter().map(|a| a.as_ref()).collect();
+        let refused = min(&args).output().await.unwrap();
+        assert!(!refused.status.success(), "{args:?}: {refused:?}");
+        assert!(
+            String::from_utf8_lossy(&refused.stderr)
+                .lines()
+                .any(|line| line == refusal),
+            "{args:?}: {refused:?}"
+        );
+    }
+    let undo = min(&[
+        "finalize-install".as_ref(),
+        "--undo".as_ref(),
+        "--show".as_ref(),
+        "--script".as_ref(),
+    ])
+    .output()
+    .await
+    .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&undo.stderr)
+            .lines()
+            .any(|line| line == refusal),
+        "{undo:?}"
     );
 }

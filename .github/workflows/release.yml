@@ -264,6 +264,7 @@ jobs:
                   mv minimald minimald-linux-amd64
                   mv minvmd minvmd-linux-amd64
                   mv minzoned minzoned-linux-amd64
+                  mv bep bep-linux-amd64
             - name: Re-check minzoned links on the renamed artifact
               # dist-build.sh gated the binary it built; re-run the same gate
               # on the exact file that uploads, so the shipped bytes are the
@@ -292,6 +293,14 @@ jobs:
               with:
                   name: minimald-linux-amd64
                   path: target/x86_64-unknown-linux-musl/release/minimald-linux-amd64
+                  retention-days: 7
+            - name: Upload binary (bep)
+              # The Box Egress Proxy minvmd starts from beside its own binary;
+              # stage-release.sh installs it at bin/bep next to bin/minvmd.
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+              with:
+                  name: bep-linux-amd64
+                  path: target/x86_64-unknown-linux-musl/release/bep-linux-amd64
                   retention-days: 7
             - name: Verify minvmd is static and links libkrun
               # Both halves matter and neither is implied by a successful build:
@@ -401,6 +410,7 @@ jobs:
                   mv minimald minimald-linux-arm64
                   mv minvmd minvmd-linux-arm64
                   mv minzoned minzoned-linux-arm64
+                  mv bep bep-linux-arm64
             - name: Re-check minzoned links on the renamed artifact
               # See the amd64 job: the gate runs again on the file that uploads.
               run: scripts/check-zoned-links.sh target/aarch64-unknown-linux-musl/release/minzoned-linux-arm64
@@ -427,6 +437,14 @@ jobs:
               with:
                   name: minimald-linux-arm64
                   path: target/aarch64-unknown-linux-musl/release/minimald-linux-arm64
+                  retention-days: 7
+            - name: Upload binary (bep)
+              # The Box Egress Proxy minvmd starts from beside its own binary;
+              # stage-release.sh installs it at bin/bep next to bin/minvmd.
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+              with:
+                  name: bep-linux-arm64
+                  path: target/aarch64-unknown-linux-musl/release/bep-linux-arm64
                   retention-days: 7
             - name: Verify minvmd is static and links libkrun
               # See the amd64 job: a stub minvmd builds and links cleanly too, so

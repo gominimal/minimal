@@ -535,7 +535,12 @@ async fn plan_for_this_host(global: &GlobalArgs, ct_mark_mask: Option<u32>) -> P
 /// scoping both readers share: the user-namespace profile unless the
 /// configured provider is the Linux VM provider, then the `kvm` group
 /// membership for that provider or the classifier tree for the native one,
-/// in that order. [`plan_for_this_host`] slots the names item in among them
+/// in that order. A native provider that the `/dev/kvm` fallback chose
+/// (no `--provider`, `MIN_PROVIDER` or `provider` key) also gets the
+/// `kvm` group item when `/dev/kvm` is there but does not open for this
+/// user: joining the group is what makes the VM provider the default
+/// ([`crate::hosts::resolve_default_provider`]). The host line leaves that
+/// item out ([`host_install_for_this_host`]). [`plan_for_this_host`] slots the names item in among them
 /// and the host line ([`host_install_for_this_host`]) reads them whole, so
 /// the two read the same items by construction. Every item is Linux-only,
 /// so a macOS host reads none.
@@ -546,14 +551,18 @@ fn other_items_for_this_host(global: &GlobalArgs, ct_mark_mask: Option<u32>) -> 
         if !global.use_minvmd() {
             items.extend(linux::userns_item_on_this_host());
         }
+        let kvm = crate::hosts::open_kvm_device();
         if global.use_minvmd() {
             // Formerly BEP-047 (gominimal/inbox#1184): the vm-users item is
             // not offered until minvmd starts the VM and gvproxy through
             // `sudo -n` (T66, #2566). Its drop-in names subcommands minvmd
             // does not have at this head.
-            items.push(linux::kvm_item_on_this_host());
+            items.push(linux::kvm_item_on_this_host(kvm));
         } else {
             items.extend(linux::classifier_items_on_this_host(global, ct_mark_mask));
+            if linux::offers_native_kvm_item(global.provider.is_none(), &kvm) {
+                items.push(linux::native_kvm_item(linux::kvm_item_on_this_host(kvm)));
+            }
         }
     }
     #[cfg(not(target_os = "linux"))]
@@ -569,8 +578,12 @@ fn other_items_for_this_host(global: &GlobalArgs, ct_mark_mask: Option<u32>) -> 
 /// holds). Every item is Linux-only, so a macOS host reads `false`.
 pub(crate) fn host_install_for_this_host(global: &GlobalArgs) -> crate::resolver::HostInstall {
     crate::resolver::HostInstall {
+        // A native host's `kvm` item is an offer, not unfinished setup: the
+        // native provider runs without it, so it never turns the host line
+        // into a note on a healthy start.
         other_items_unfinished: other_items_for_this_host(global, None)
             .iter()
+            .filter(|item| global.use_minvmd() || item.id != KVM_ID)
             .any(|item| item.state != ItemState::Done),
         ..crate::resolver::HostInstall::default()
     }
@@ -811,8 +824,8 @@ pub(crate) mod linux {
     /// the block echoes it in one.
     pub(crate) const DAEMON_RUNNING_NOTE: &str = "note: a Minimal daemon is running. If a box \
          you start next still says this machine cannot enforce its egress yet, restart the daemon. Run \
-         min host stop local0, which stops each running box and then the daemon. Then run min ls, \
-         which starts the daemon again.";
+         min host stop local0 --provider local, which stops each running box and then the daemon. \
+         Then run min ls --provider local, which starts the daemon again.";
 
     /// [`DAEMON_RUNNING_NOTE`] for the daemon of `minimal_dir`, the
     /// `--minimal-dir` this run was given: both commands carry the flag, so
@@ -832,10 +845,13 @@ pub(crate) mod linux {
                     .unwrap_or_else(|_| dir.to_string());
                 DAEMON_RUNNING_NOTE
                     .replace(
-                        "min host stop local0,",
-                        &format!("min host stop local0 --minimal-dir {dir},"),
+                        "min host stop local0 --provider local,",
+                        &format!("min host stop local0 --provider local --minimal-dir {dir},"),
                     )
-                    .replace("min ls,", &format!("min ls --minimal-dir {dir},"))
+                    .replace(
+                        "min ls --provider local,",
+                        &format!("min ls --provider local --minimal-dir {dir},"),
+                    )
             }
         }
     }
@@ -1881,7 +1897,8 @@ pub(crate) mod linux {
             socket,
         )
     }
-    /// The KVM item over the result of opening `/dev/kvm` for reading:
+    /// The KVM item over the result of opening `/dev/kvm` for reading and
+    /// writing:
     /// done when it opens; missing — the step adds `operator` to the `kvm`
     /// group — on `EACCES`, unless `already_member` says the group database
     /// lists the operator already, when only a new login is missing and
@@ -1972,12 +1989,44 @@ pub(crate) mod linux {
             })
     }
 
-    /// [`kvm_item_over`] this host's reads.
-    pub(crate) fn kvm_item_on_this_host() -> Item {
-        let open = std::fs::OpenOptions::new()
-            .read(true)
-            .open("/dev/kvm")
-            .map(|_| ());
+    /// Whether the native provider's plan offers the `kvm` group item: only
+    /// when the `/dev/kvm` fallback chose the native provider (`defaulted`:
+    /// no `--provider`, `MIN_PROVIDER` or `provider` key named it) and
+    /// `/dev/kvm` is there but did not open (`open`) for lack of permission.
+    pub(crate) fn offers_native_kvm_item(defaulted: bool, open: &std::io::Result<()>) -> bool {
+        defaulted
+            && open
+                .as_ref()
+                .is_err_and(|err| err.kind() == std::io::ErrorKind::PermissionDenied)
+    }
+
+    /// The `kvm` item as the native provider's plan offers it: a missing
+    /// step says what joining the group changes for a host that runs no VM.
+    pub(crate) fn native_kvm_item(mut item: Item) -> Item {
+        if item.state == ItemState::Missing {
+            item.today = Some(NATIVE_KVM_TODAY.to_string());
+            item.step = item.step.map(|step| format!("{step}. {NATIVE_KVM_STEP}"));
+        }
+        item
+    }
+
+    /// What a native host loses while the operator is outside the `kvm`
+    /// group, as the native provider's `kvm` item says it.
+    pub(crate) const NATIVE_KVM_TODAY: &str = "min uses the native provider, not the VM \
+        provider, because /dev/kvm does not open for you";
+
+    /// What joining the `kvm` group changes on a host the native provider
+    /// serves by default, after the step's own text: the VM provider becomes
+    /// the default ([`crate::hosts::resolve_default_provider`]), and the
+    /// native boxes stay where they are.
+    pub(crate) const NATIVE_KVM_STEP: &str = "From then on min uses the VM provider by \
+        default. Boxes you started on the native provider stay reachable with --provider \
+        local, as in min --provider local ls";
+
+    /// [`kvm_item_over`] this host's reads, with `open` the result of
+    /// opening `/dev/kvm` for reading and writing
+    /// ([`crate::hosts::open_kvm_device`]).
+    pub(crate) fn kvm_item_on_this_host(open: std::io::Result<()>) -> Item {
         let operator = crate::resolver::operator_name();
         let group = std::fs::read_to_string("/etc/group").unwrap_or_default();
         kvm_item_over(open, &operator, in_kvm_group(&group, &operator))
@@ -4012,19 +4061,25 @@ mod tests {
         assert_eq!(daemon_running_note(None), DAEMON_RUNNING_NOTE);
         let dir = "/home/alice/m";
         let note = daemon_running_note(Some(dir));
-        assert!(note.contains("Run min host stop local0 --minimal-dir /home/alice/m, which"));
-        assert!(note.contains("Then run min ls --minimal-dir /home/alice/m, which starts"));
+        assert!(note.contains(
+            "Run min host stop local0 --provider local --minimal-dir /home/alice/m, which"
+        ));
+        assert!(note.contains(
+            "Then run min ls --provider local --minimal-dir /home/alice/m, which starts"
+        ));
         assert!(!note.contains('\''));
         // A relative directory prints absolute, as the daemon resolves it.
         let cwd = std::env::current_dir().expect("a working directory");
         let abs = cwd.join("m").display().to_string();
         let relative = daemon_running_note(Some("m"));
         assert!(
-            relative.contains(&format!("min host stop local0 --minimal-dir {abs},")),
+            relative.contains(&format!(
+                "min host stop local0 --provider local --minimal-dir {abs},"
+            )),
             "{relative}"
         );
         assert!(
-            relative.contains(&format!("min ls --minimal-dir {abs},")),
+            relative.contains(&format!("min ls --provider local --minimal-dir {abs},")),
             "{relative}"
         );
         let facts = ClassifierFacts {
@@ -4422,13 +4477,64 @@ mod tests {
         );
         // The note names the one command that stops the running boxes and then the daemon,
         // and the block can echo it whole.
-        assert!(DAEMON_RUNNING_NOTE.contains("restart the daemon. Run min host stop local0,"));
+        assert!(
+            DAEMON_RUNNING_NOTE
+                .contains("restart the daemon. Run min host stop local0 --provider local,")
+        );
         assert!(DAEMON_RUNNING_NOTE.contains("stops each running box and then the daemon."));
         // Not every command starts the daemon: `min host stop` on a stopped host does not.
-        assert!(DAEMON_RUNNING_NOTE.contains("Then run min ls, which starts the daemon again."));
+        assert!(
+            DAEMON_RUNNING_NOTE
+                .contains("Then run min ls --provider local, which starts the daemon again.")
+        );
         assert!(!DAEMON_RUNNING_NOTE.contains("--force"));
         assert!(!DAEMON_RUNNING_NOTE.contains("sessions survive"));
         assert!(!DAEMON_RUNNING_NOTE.contains('\''));
+    }
+
+    /// The plan offers the `kvm` group item to the VM provider, and to the
+    /// native one when `/dev/kvm` is there but does not open.
+    #[test]
+    fn kvm_item_is_offered_where_kvm_is_there_but_closed() {
+        use linux::{kvm_item_over, native_kvm_item, offers_native_kvm_item};
+        use std::io::{Error, ErrorKind};
+        let denied = || Err(Error::from(ErrorKind::PermissionDenied));
+        assert!(
+            !offers_native_kvm_item(true, &Ok(())),
+            "a usable /dev/kvm needs no step"
+        );
+        assert!(
+            !offers_native_kvm_item(true, &Err(Error::from(ErrorKind::NotFound))),
+            "a host with no /dev/kvm has nothing to join"
+        );
+        assert!(
+            offers_native_kvm_item(true, &denied()),
+            "a /dev/kvm this user cannot open gets the kvm group step"
+        );
+        assert!(
+            !offers_native_kvm_item(false, &denied()),
+            "a native provider the user named gets no kvm step"
+        );
+        let item = native_kvm_item(kvm_item_over(denied(), "alice", false));
+        assert_eq!(item.state, ItemState::Missing);
+        assert_eq!(
+            item.today.as_deref(),
+            Some(
+                "min uses the native provider, not the VM provider, because /dev/kvm does not \
+                 open for you"
+            )
+        );
+        assert_eq!(
+            item.step.as_deref(),
+            Some(
+                "adds alice to the kvm group (it takes effect at your next login). From then on \
+                 min uses the VM provider by default. Boxes you started on the native provider \
+                 stay reachable with --provider local, as in min --provider local ls"
+            )
+        );
+        let done = native_kvm_item(kvm_item_over(Ok(()), "alice", false));
+        assert_eq!(done.today, None);
+        assert_eq!(done.step, None);
     }
 
     /// The KVM item's table: done when the device opens, a group step on

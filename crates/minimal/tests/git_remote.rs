@@ -70,6 +70,7 @@ async fn git_push_through_min_binary_lands_commit_in_workspace() {
             "PATH",
             format!("{}:{inherited_path}", helpers.path().display()),
         )
+        .env("MIN_PROVIDER", "local")
         .env("XDG_STATE_HOME", state_home.path())
         .args(["push", &format!("min://{session_id}"), "main"])
         .output()
@@ -105,6 +106,7 @@ async fn push_refs(
     let out = tokio::process::Command::new("git")
         .current_dir(src)
         .env("PATH", format!("{}:{inherited_path}", helpers.display()))
+        .env("MIN_PROVIDER", "local")
         .env("XDG_STATE_HOME", state_home)
         .arg("push")
         .arg(url)
