@@ -172,9 +172,12 @@ min session list [--all] [-o json]
 
 Lists the session boxes of the current project, in any state. It is
 `min box list` limited to session boxes, with the same columns and the same
-flags. `--all` lists the session boxes of every project. `-o json` writes the
-boxes as one JSON array. It does not take `--raw` or `--json`. Use `min ls`
-for those.
+flags. It does not take `--raw` or `--json`. Use `min ls` for those.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--all` | | List the session boxes of every project |
+| `--output json` | `-o` | Write the boxes as one JSON array, and nothing else |
 
 ### `dash`
 
@@ -344,6 +347,313 @@ refuses the attach. The reason stays on screen. One example is a session
 that still receives its workspace upload. Another is an `own_ip` box that
 cannot get its address back. The reason then names the command that checks
 the setup, such as `min finalize-install --show`.
+
+### `session logs`
+
+```
+min session logs [-f|--follow] [--raw] <BOX>
+```
+
+Shows what a session box's terminal printed, from its start. It is
+`min box logs` for a session box. `BOX` is the box's id, the start of its id,
+or its name, as `min session list` prints them.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--follow` | `-f` | Show the output so far, then keep showing new output, until the box is removed or the command is interrupted |
+| `--raw` | | Write the output byte for byte, with its terminal control codes. Without `--raw`, the command removes those codes when stdout is not a terminal |
+
+### `session stop`
+
+```
+min session stop [--force | --exec <EXEC_ID>] <BOX>
+```
+
+Stops a running session box and keeps it. It is `min box stop` for a session
+box, with the same flags.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--force` | | Kill every process in the box at once, with no grace period |
+| `--exec <EXEC_ID>` | | Stop only one command, by the exec id that `min box exec` printed for it. The box keeps running. Cannot be combined with `--force` |
+
+### `session rm`
+
+```
+min session rm [--force] <BOX>
+```
+
+Removes a stopped or exited session box. It is `min box rm` for a session
+box. The command refuses a running box unless you give `--force`.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--force` | | Stop a running box at once, then remove it |
+
+### `task run`
+
+```
+min task run [OPTIONS] <TASK> [ARGS]...
+```
+
+Runs a task that the project's `minimal.toml` declares, in a box of its own
+named `<TASK>-<n>`. The command exits with the task's exit code. The task
+runs without a terminal. A piped or redirected stdin goes to the task. The
+task's stdout is the command's stdout, and the command prints its own lines
+on stderr. `ARGS` go to the task's declared `args`. Put the command's flags
+before the first task argument. A task argument with the name of a flag goes
+after `--`.
+
+When the task ends, the box stays with its exit code. `min box show
+<TASK>-<n>` shows it, and `min box rm <TASK>-<n>` removes it. Ctrl-C stops
+the box as `min box stop` does, and the command exits 130. For a task
+declared with `interactive = true`, Ctrl-C removes the box.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--detach` | | Start the box, print its id and return. The task gets no input |
+| `--network <none\|host_ip\|own_ip>` | | The network mode of the task box. Without the flag, the box takes the task's `network.mode`, else `host_ip` |
+
+The command also takes these flags of
+[`session start`](#session-start): `--allow-subnets`, `--allow-dns-hosts`,
+`--allow-protocols`, `--deny-subnets`, `--deny-all-egress`,
+`--dynamic-ingress`, `--dynamic-range`, `--credentialed-upstream`,
+`--quic443`, `--vpn-network-names`, `--no-loadouts` and `--no-hooks`. To run
+a task of another project, give `--repo-dir <DIR>` (short `-C`).
+
+### `task list`
+
+```
+min task list [--all] [-o json]
+```
+
+Lists the task boxes of the current project, in any state. It is
+`min box list` for task boxes, with the same columns and flags. A task that
+ended shows its exit code, such as `exited (exit 3)`, until `min box prune`
+removes it.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--all` | | List the task boxes of every project |
+| `--output json` | `-o` | Write the boxes as one JSON array, and nothing else |
+
+### `task logs`
+
+```
+min task logs [-f|--follow] [--raw] <BOX>
+```
+
+Shows what a task printed, from its start. It is `min box logs` for a task
+box.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--follow` | `-f` | Show the output so far, then keep showing new output, until the box is removed or the command is interrupted |
+| `--raw` | | Write the output byte for byte, with its terminal control codes. Without `--raw`, the command removes those codes from the output of a box with a terminal when stdout is not a terminal |
+
+### `task stop`
+
+```
+min task stop [--force | --exec <EXEC_ID>] <BOX>
+```
+
+Stops a running task box and keeps it. It is `min box stop` for a task box,
+with the same flags.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--force` | | Kill every process in the box at once, with no grace period |
+| `--exec <EXEC_ID>` | | Stop only one command, by the exec id that `min box exec` printed for it. Cannot be combined with `--force` |
+
+### `task rm`
+
+```
+min task rm [--force] <BOX>
+```
+
+Removes a stopped or exited task box. It is `min box rm` for a task box. The
+command refuses a running box unless you give `--force`.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--force` | | Stop a running box at once, then remove it |
+
+### `box list`
+
+```
+min box list [--all] [-o json]
+```
+
+Lists the boxes of the current project, in any state. Each row shows the
+box's id, name, type, parent, project and state, how a stopped or exited box
+ended, and the provider and host the box runs on.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--all` | | List the boxes of every project |
+| `--output json` | `-o` | Write the boxes as one JSON array, one object for each box, and nothing else |
+
+### `box start`
+
+```
+min box start [OPTIONS] [ENTRY]
+```
+
+Creates a box from an entry of the project's `minimal.toml`. A box with a
+terminal attaches this terminal to it, unless you give `--detach`. Any other
+box starts with no input, and the command prints its id and returns. Without
+`ENTRY`, the command starts the entry named `default`, of any type, else the
+project's only entry.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--name <NAME>` | | Name the box. With `--new`, the box is named `<NAME>-<n>` |
+| `--new` | | Create another box from the entry, named `<name>-<n>`, even when a running box holds the entry's name |
+| `--detach` | | Create the box, print its id and return. This terminal is not attached to the box |
+
+The command takes the override flags of
+[`session start`](#session-start), from `--network` to `--no-hooks`. A task
+entry refuses `--ingress` and `--loadout` with exit code 2.
+
+### `box run`
+
+```
+min box run [OPTIONS] <ENTRY> [ARGS]...
+```
+
+Creates a box from an entry of the project, runs it without a terminal, and
+exits with the box's exit code. The command's stdin, stdout and stderr are
+the box's. The box is always a new box, named `<ENTRY>-<n>`. `ARGS` go to the
+entry's declared `args`. Put the command's flags before the first argument.
+An argument with the name of a flag goes after `--`.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--detach` | | Start the box, print its id and return. The box gets no input |
+| `--path <PATH>` | | The project directory. Without the flag, the directory that `--repo-dir` (short `-C`) gives, else the current directory |
+| `--network <none\|host_ip\|own_ip>` | | The network mode of the box. Without the flag, the box takes the entry's `network.mode`, else `host_ip` |
+
+The command also takes the flags of `min task run` that
+[`session start`](#session-start) lists: `--allow-subnets`,
+`--allow-dns-hosts`, `--allow-protocols`, `--deny-subnets`,
+`--deny-all-egress`, `--dynamic-ingress`, `--dynamic-range`,
+`--credentialed-upstream`, `--quic443`, `--vpn-network-names`,
+`--no-loadouts` and `--no-hooks`.
+
+### `box attach`
+
+```
+min box attach [BOX]
+min box attach --exec <EXEC_ID> <BOX>
+```
+
+Attaches this terminal to a box's terminal. `BOX` is the box's id, the start
+of its id, its name, or `provider/host/name`, as `min box list` prints them.
+Without `BOX`, the command attaches to this project's running box that has a
+terminal, else to its only stopped or exited one, which starts again.
+`min session attach` is the same command for session boxes.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--exec <EXEC_ID>` | | Attach to a command that `min box exec -t` started in the box, by the exec id it printed. Needs `BOX` |
+
+### `box resume`
+
+```
+min box resume <BOX>
+```
+
+Starts a stopped or exited box that has a terminal again, from the spec it
+was created with, and attaches this terminal to it. The command refuses a box
+that is not stopped or exited. Attach to a running box with
+`min box attach`.
+
+### `box restart`
+
+```
+min box restart <BOX>
+```
+
+Stops a box that runs until it is stopped, if it runs, and starts it again
+from the settings it was created with. The box keeps its id, its name and its
+files. A box that runs to completion cannot restart. Run its entry again with
+`min box run`.
+
+### `box stop`
+
+```
+min box stop [--force | --exec <EXEC_ID>] <BOX>
+```
+
+Stops a running box and keeps it. Its record, its events and its files stay
+until `min box rm` removes them.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--force` | | Kill every process in the box at once, with no grace period |
+| `--exec <EXEC_ID>` | | Stop only one command, by the exec id that `min box exec` printed for it. The box and its other commands keep running. Cannot be combined with `--force` |
+
+### `box logs`
+
+```
+min box logs [-f|--follow] [--raw] <BOX>
+min box logs --exec <EXEC_ID> <BOX>
+```
+
+Shows what a box printed, from its start. A stopped or exited box keeps its
+output until `min box rm` removes it.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--follow` | `-f` | Show the output so far, then keep showing new output, until the box is removed or the command is interrupted |
+| `--raw` | | Write the output byte for byte, with its terminal control codes. Without `--raw`, the command removes those codes from the output of a box with a terminal when stdout is not a terminal |
+| `--exec <EXEC_ID>` | | Show what one command printed, by the exec id that `min box exec` printed for it. The command can be running or ended. Cannot be combined with `--follow` or `--raw` |
+
+### `box events`
+
+```
+min box events [-f|--follow] [-o jsonl] <BOX>
+min box events --parent <BOX> [-f|--follow] [-o jsonl]
+```
+
+Shows the events that the daemon recorded for a box, oldest first: its
+creation, each start and stop, and each exec and its exit. A stopped or
+exited box keeps its events until `min box rm` removes it.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--parent <BOX>` | | Show the events of every child box of this box together, in time order. Each event names its box |
+| `--output jsonl` | `-o` | Write each event as one JSON object on its own line |
+| `--follow` | `-f` | Show the events so far, then keep showing new events, until the box is removed or the command is interrupted |
+
+### `box cp`
+
+```
+min box cp <BOX:PATH> <LOCAL>
+```
+
+Copies a file out of a box to this machine. `BOX` is the box's id, the start
+of its id, or its name. A relative `PATH` is in the box's home directory, and
+`/workbench/<PATH>` is in the box's copy of the project. When `LOCAL` is a
+directory that exists, the file goes into it under its own name. A stopped or
+exited box keeps its files, so a copy from it works too.
+
+### `box prune`
+
+```
+min box prune [--older-than <AGE>] [--parent <BOX>] [-y|--yes] [--dry-run]
+```
+
+Removes every stopped or exited box: its record, its events and its files.
+The command never removes a running box. Off a terminal, the command needs
+`--yes`.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--older-than <AGE>` | | Remove only the boxes that stopped or exited at least this long ago: a whole number of days, hours, minutes or seconds, such as `7d`, `12h`, `30m` or `90s` |
+| `--parent <BOX>` | | Remove only the child boxes of this box |
+| `--yes` | `-y` | Remove the boxes and do not ask first |
+| `--dry-run` | | List the boxes that the command removes and the disk each one holds, and remove nothing |
 
 ### `box exec`
 
