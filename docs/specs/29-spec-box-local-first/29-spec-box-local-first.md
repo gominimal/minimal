@@ -218,9 +218,14 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimald restart_runs_only_resume_hooks
 
-- **BOX-178** WHEN a box is restarted THE SYSTEM SHALL record the `exited` event BOX-013 states if the restart stops running processes, an `exec_exited` event as BOX-152 states for each exec that stop ends, then the `started` event BOX-040 states when the entrypoint starts again, and no event type of the restart's own.
+- **BOX-178** WHEN a box is restarted THE SYSTEM SHALL record the `exited` event BOX-013 states, with BOX-208's `stopped_by`, if the restart stops running processes, an `exec_exited` event as BOX-152 states for each exec that stop ends, then the `started` event BOX-040 states when the entrypoint starts again, and no event type of the restart's own.
   tier:     T0
   verify:   cargo nextest run -p minimald restart_records_exited_then_started_only
+
+- **BOX-208** WHEN a restart stops a box's running processes THE SYSTEM SHALL write `stopped_by = "restart"` in the data of the `exited` event that stop records, beside `reason = "stopped"`, and a stop that is not a restart's SHALL write no `stopped_by`.
+  tier:     T0
+  verify:   cargo nextest run -p minimald restart_records_restart_reason_before_start
+  <!-- gominimal/minimal#3661 (BCLI T62): a client whose attach ended reads the box `stopped`, and this key lets it name the restart before the restart's start runs; `reason` stays `stopped`, as BOX-011 gives it for every stopped record; gominimal/inbox#1297 -->
 
 - **BOX-037** IF a box whose spec sets `lifetime = "until_complete"` runs past its declared `timeout` THEN THE SYSTEM SHALL send SIGTERM to every process in the box as BOX-013 defines them, running execs included, wait, then send SIGKILL to those still running, and end the box with `exited.reason = "timeout"`.
   tier:     T0

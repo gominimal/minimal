@@ -2032,7 +2032,7 @@ impl BoxActor {
         // its `exited` event and each exec's `exec_exited` event.
         if was_running {
             self.timeout_deadline = None;
-            let stopped = self.stop_box(false, grace).await;
+            let stopped = self.stop_box_for_restart(grace).await;
             // NET-128 fail-closed, as a stop: the processes are dead whether
             // or not the record write succeeded.
             self.mark_name_stopped().await;

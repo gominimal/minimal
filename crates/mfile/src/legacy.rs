@@ -218,6 +218,26 @@ pub fn canonicalize(doc: &mut toml::Table, release: &str) -> Result<Vec<LegacyTa
         found.push(LegacyTable::Params);
     }
     admit(&found, release, None)?;
+    // BOX-206: a legacy `[session]` that still sets `vars` or
+    // `vars_lenient` is refused under its own name, before it moves.
+    if let Some(toml::Value::Table(old)) = doc.get("session")
+        && let Some(key) = crate::expand::RETIRED_VAR_KEYS
+            .iter()
+            .find(|k| old.contains_key(**k))
+    {
+        tracing::debug!(
+            rule = "BOX-206",
+            key = *key,
+            table = "[session]",
+            file = crate::MFILE_NAME,
+            "a legacy [session] table sets a retired variable key"
+        );
+        return Err(Error::RetiredVarKey {
+            key: (*key).to_owned(),
+            table: Some("`[session]`".to_owned()),
+            file: crate::MFILE_NAME.to_owned(),
+        });
+    }
 
     if session && let Some(toml::Value::Table(old)) = doc.remove("session") {
         let defaults = doc
@@ -372,7 +392,7 @@ mod tests {
     }
 
     // BOX-049: the per-entry keys are accepted written flat, and `packages`,
-    // `patches`, `vars` and `lifecycle_hooks` keep their meaning, whether a
+    // `patches`, `env_vars` and `lifecycle_hooks` keep their meaning, whether a
     // file writes them in an entry, in `[defaults.session]`, or in the
     // legacy `[session]`.
     #[test]
@@ -386,7 +406,7 @@ mod tests {
             machine = { cpus = 4, memory = "8GiB" }
             packages = ["git"]
             patches = { "/etc/motd" = { inline = "hi" } }
-            vars = { EDITOR = "hx" }
+            env_vars = { EDITOR = "hx" }
             lifecycle_hooks = [{ on_activate = { type = "inline", value = "true" } }]
             "#,
             "dev",
@@ -398,7 +418,7 @@ mod tests {
         assert_eq!(spec["machine"]["cpus"].as_integer(), Some(4));
         assert_eq!(spec["packages"].as_array().map(Vec::len), Some(1));
         assert_eq!(spec["patches"]["/etc/motd"]["inline"].as_str(), Some("hi"));
-        assert_eq!(spec["vars"]["EDITOR"].as_str(), Some("hx"));
+        assert_eq!(spec["env_vars"]["EDITOR"].as_str(), Some("hx"));
         assert_eq!(
             spec["lifecycle_hooks"][0]["on_activate"]["value"].as_str(),
             Some("true")
@@ -408,7 +428,7 @@ mod tests {
         // `[defaults.session]`: both load to one session contribution.
         let body = r#"
             packages = ["git", "ripgrep"]
-            vars = { EDITOR = "hx" }
+            env_vars = { EDITOR = "hx" }
             lifecycle_hooks = [{ on_activate = { type = "inline", value = "true" } }]
             patches = [{ dest = ".psqlrc", source = "config/psqlrc" }]
         "#;
@@ -432,7 +452,7 @@ mod tests {
         let src = r#"
             [session]
             packages = ["git"]
-            vars = { EDITOR = "hx" }
+            env_vars = { EDITOR = "hx" }
 
             [sessions.dev]
             packages = ["helix"]
@@ -447,7 +467,7 @@ mod tests {
                 .filter_map(toml::Value::as_str)
                 .collect();
             assert_eq!(packages, ["git", "helix"]);
-            assert_eq!(spec["vars"]["EDITOR"].as_str(), Some("hx"));
+            assert_eq!(spec["env_vars"]["EDITOR"].as_str(), Some("hx"));
         }
 
         let mut d = doc(src);
@@ -474,7 +494,7 @@ mod tests {
         // Where a file carries both spellings, lists union and the new
         // spelling's other values win.
         let (file, _) = settled(
-            "[session]\npackages = [\"git\"]\nvars = { A = \"1\" }\n\
+            "[session]\npackages = [\"git\"]\nenv_vars = { A = \"1\" }\n\
              [defaults.session]\npackages = [\"helix\"]\n",
             IN_GRACE,
         )

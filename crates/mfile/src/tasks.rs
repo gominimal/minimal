@@ -29,7 +29,10 @@ pub struct Task {
     /// unresolvable `inherit`, so hash order would let the same
     /// declaration name a different variable in its error from run to
     /// run. Var names are `Ord`, so ordering by them costs nothing.
-    #[serde(default, alias = "env_vars")]
+    ///
+    /// Read from `env_vars` only (BOX-205). A `vars` key stays in
+    /// [`Task::extra`], where the expansion refuses it (BOX-206).
+    #[serde(default, rename = "env_vars")]
     pub vars: BTreeMap<String, EnvVarValue>,
     /// Files/directories to be patched into the sandbox this task executes in.
     #[serde(default, alias = "patches")]

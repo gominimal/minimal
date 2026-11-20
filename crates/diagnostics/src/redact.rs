@@ -29,7 +29,9 @@ const SENSITIVE_KEY_PARTS: &[&str] = &[
 
 /// Table/object names whose *entire* contents are environment-variable style
 /// user data and must be masked regardless of key names.
-const ENV_TABLE_NAMES: &[&str] = &["vars", "vars_lenient", "env", "environment"];
+/// `env_vars` is the one table a project or loadout file sets variables in
+/// (BOX-205). `vars` and `vars_lenient` stay for files that still use them.
+const ENV_TABLE_NAMES: &[&str] = &["env_vars", "vars", "vars_lenient", "env", "environment"];
 
 /// Returns true when a key looks like it names secret material.
 ///
@@ -1155,6 +1157,7 @@ mod tests {
             "name": "dev",
             "api_token": "abc123",
             "vars": { "EDITOR": "vim", "HOME": "/home/u" },
+            "env_vars": { "DATABASE_URL": "postgres://u:p@h/db" },
             "nested": { "list": [ { "password": "hunter2", "port": 80 } ] },
         });
         redact_json(&mut v);
@@ -1162,6 +1165,7 @@ mod tests {
         assert_eq!(v["api_token"], "<redacted:len=6>");
         assert_eq!(v["vars"]["EDITOR"], "<redacted:len=3>");
         assert_eq!(v["vars"]["HOME"], "<redacted:len=7>");
+        assert_eq!(v["env_vars"]["DATABASE_URL"], "<redacted:len=19>");
         assert_eq!(v["nested"]["list"][0]["password"], "<redacted:len=7>");
         assert_eq!(v["nested"]["list"][0]["port"], 80);
     }

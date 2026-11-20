@@ -89,7 +89,7 @@ use = "shell"
 # through.
 packages = ["mermaid-ascii", "go"]
 
-[defaults.session.vars]
+[defaults.session.env_vars]
 # Hardcoded literal — auto-approves at the gate because
 # `carries_user_data` is false (no env lookup happened, so nothing
 # from the host is crossing into the sandbox). The user's policy
