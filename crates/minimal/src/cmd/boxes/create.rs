@@ -7609,8 +7609,9 @@ mod tests {
 
     // #2445: `min box spec <entry>` runs the start's whole check for every
     // entry. An entry with no grant and `steering = "off"` with
-    // `proxy_env` (BEP-010), a store reference with no egress (BEP-036),
-    // and an `allow_dns_hosts` list on a `host_ip` box on a VM host
+    // `proxy_env` (BEP-010), a store reference with no egress on an
+    // `own_ip` box (BEP-036), and an `allow_dns_hosts` list on a `host_ip`
+    // box on a VM host
     // (BEP-008) each give the start's refusal, with exit 3.
     #[tokio::test]
     async fn box_spec_entry_preview_refuses_like_start() {
@@ -7627,7 +7628,7 @@ mod tests {
                     header = \"Authorization\"\nprefix = \"Bearer \"\n";
         let cases: [(&str, &[&str], bool, &str); 3] = [
             (off, &[], false, "proxy_env"),
-            (store, &[], false, "api.openai.com"),
+            (store, &["--network", "own_ip"], false, "api.openai.com"),
             (host_ip, &["--network", "host_ip"], true, "github.com"),
         ];
         for (body, flags, vm, names) in cases {
