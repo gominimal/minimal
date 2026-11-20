@@ -1552,7 +1552,7 @@ fn task_egress_from(bytes: &[u8], task: &str) -> anyhow::Result<ProjectEgress> {
 
 /// The egress of `entry` in the parsed `file`: its `[defaults]`,
 /// `[defaults.<type>]` and entry layers, read as [`project_egress`] says.
-fn entry_egress(
+pub(crate) fn entry_egress(
     file: &toml::Table,
     entry: mfile::entry::BoxEntry,
 ) -> anyhow::Result<ProjectEgress> {
@@ -1959,7 +1959,7 @@ pub(crate) fn task_box_entry(
 /// `[secret-store-rules]`, read only for an entry with a store reference,
 /// so its `[secrets]` are the ones a create sends (BOX-071). `min box spec`
 /// expands with the same rules ([`expand_with_store_rules`]).
-fn box_entry(
+pub(crate) fn box_entry(
     project: &camino::Utf8Path,
     bytes: &[u8],
     entry: mfile::entry::BoxEntry,
