@@ -11931,9 +11931,25 @@ async fn attach_ended_from_other_side_notice_exit254() {
 /// count that rose is a restart. A count that did not rise is another
 /// terminal. A count that the host did not give names no cause, so the
 /// line names the host that ended the attach.
+///
+/// The command can read the box between the restart's stop and its start.
+/// It reads `stopped` then, and the restart's stop wrote the `restart`
+/// ending reason on its `exited` event. A new end that names the restart is
+/// a restart. Any other read of a stopped box is a stop.
 #[test]
 fn attach_ended_by_restart_names_restart_exit254() {
-    use cmd::{BoxRestart, EndsBefore, attach_restart, box_attach_ending, ends_show_restart};
+    use cmd::{
+        BoxRestart, EndsAfter, EndsBefore, attach_restart, box_attach_ending, ends_of,
+        ends_show_restart, stop_shows_restart,
+    };
+    let count = |count: u64| EndsAfter {
+        count,
+        last_by_restart: false,
+    };
+    let by_restart = |count: u64| EndsAfter {
+        count,
+        last_by_restart: true,
+    };
 
     assert_eq!(
         ends_show_restart(EndsBefore::Running(Some(1)), Some(2)),
@@ -11967,7 +11983,7 @@ fn attach_ended_by_restart_names_restart_exit254() {
             &target,
             254,
             &running,
-            attach_restart(254, &running, before, after),
+            attach_restart(254, &running, before, after.map(count)),
         )
         .expect("an ending")
     };
@@ -12013,7 +12029,7 @@ fn attach_ended_by_restart_names_restart_exit254() {
     // that runs.
     let mut stopped = ending_entry("stopped");
     stopped.reason = Some("stopped".to_owned());
-    let rose = (EndsBefore::Running(Some(0)), Some(1));
+    let rose = (EndsBefore::Running(Some(0)), Some(count(1)));
     for (code, after) in [
         (0, running.clone()),
         (255, running.clone()),
@@ -12033,25 +12049,118 @@ fn attach_ended_by_restart_names_restart_exit254() {
         BoxRestart::Restarted
     );
     assert_eq!(
-        attach_restart(254, &running, EndsBefore::Running(Some(1)), Some(1)),
+        attach_restart(254, &running, EndsBefore::Running(Some(1)), Some(count(1))),
         BoxRestart::NotRestarted
     );
     assert_eq!(
         attach_restart(254, &running, EndsBefore::Running(Some(1)), None),
         BoxRestart::Unread
     );
+
+    // A box that reads `stopped`: only a new end that names the restart is
+    // a restart.
+    let stopped_after = BoxAfterAttach::Listed(stopped.clone());
     assert_eq!(
-        box_attach_ending(
-            &target,
-            254,
-            &BoxAfterAttach::Listed(stopped),
-            BoxRestart::Restarted
+        stop_shows_restart(EndsBefore::Running(Some(0)), Some(by_restart(1))),
+        BoxRestart::Restarted
+    );
+    for (before, after, why) in [
+        (EndsBefore::Running(Some(0)), Some(count(1)), "a plain stop"),
+        (
+            EndsBefore::Running(Some(1)),
+            Some(by_restart(1)),
+            "an end from before the attach",
         ),
+        (
+            EndsBefore::Running(None),
+            Some(by_restart(1)),
+            "a count before that was not read",
+        ),
+        (
+            EndsBefore::Running(Some(0)),
+            None,
+            "ends after that were not read",
+        ),
+        (
+            EndsBefore::Ended(0),
+            Some(by_restart(1)),
+            "a box that did not run",
+        ),
+    ] {
+        assert_eq!(
+            stop_shows_restart(before, after),
+            BoxRestart::NotRestarted,
+            "{why}"
+        );
+        assert_eq!(
+            box_attach_ending(
+                &target,
+                254,
+                &stopped_after,
+                attach_restart(254, &stopped_after, before, after)
+            ),
+            Ok(AttachEnding {
+                code: 254,
+                notice: Some("Detached: web was stopped.".to_owned())
+            }),
+            "{why} is a stop"
+        );
+    }
+    let restarted = attach_restart(
+        254,
+        &stopped_after,
+        EndsBefore::Running(Some(0)),
+        Some(by_restart(1)),
+    );
+    assert_eq!(restarted, BoxRestart::Restarted);
+    assert_eq!(
+        box_attach_ending(&target, 254, &stopped_after, restarted),
+        Ok(AttachEnding {
+            code: 254,
+            notice: Some(
+                "Detached: web was restarted. Run min box attach web to attach again.".to_owned()
+            )
+        }),
+        "a stopped box whose new end names the restart"
+    );
+    assert_eq!(
+        attach_restart(
+            0,
+            &stopped_after,
+            EndsBefore::Running(Some(0)),
+            Some(by_restart(1))
+        ),
+        BoxRestart::NotRestarted,
+        "only a 254 names a restart"
+    );
+    assert_eq!(
+        box_attach_ending(&target, 254, &stopped_after, BoxRestart::Unread),
         Ok(AttachEnding {
             code: 254,
             notice: Some("Detached: web was stopped.".to_owned())
-        })
+        }),
+        "a stopped record still proves a stop"
     );
+
+    // The ends come from the `exited` events, and the last one decides.
+    let exited = |data: &[(&str, &str)]| boxes::events::BoxEvent {
+        box_id: boxes::SessionId::nil(),
+        parent: None,
+        ts: 0,
+        kind: boxes::events::BoxEventType::Exited,
+        data: data
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).into()))
+            .collect(),
+    };
+    let restart_stop = exited(&[("reason", "stopped"), ("stopped_by", "restart")]);
+    let plain_stop = exited(&[("reason", "stopped")]);
+    assert_eq!(ends_of(&[]), count(0));
+    assert_eq!(
+        ends_of(&[plain_stop.clone(), restart_stop.clone()]),
+        by_restart(2)
+    );
+    assert_eq!(ends_of(&[restart_stop, plain_stop]), count(2));
     for restarted in [BoxRestart::Restarted, BoxRestart::Unread] {
         assert_eq!(
             box_attach_ending(&target, 0, &running, restarted),
@@ -12071,8 +12180,10 @@ fn attach_ended_by_restart_names_restart_exit254() {
 /// start half itself: it writes back the record of the running box.
 ///
 /// A restart stops the box and then starts it. When the command reads the
-/// box between the two, it reads `stopped` and prints the line for a stop.
-/// The second case pins that, with the box left stopped.
+/// box between the two, it reads `stopped`. The restart's stop wrote the
+/// `restart` ending reason on its `exited` event, so the command still
+/// prints the line for a restart. The second case pins that, with the box
+/// left stopped.
 #[tokio::test]
 async fn attach_ended_by_restart_names_restart_exit254_through_the_host() {
     let (alpha, state) = exec_attach_host("alpha.local-minvmd0").await;
@@ -12093,7 +12204,10 @@ async fn attach_ended_by_restart_names_restart_exit254_through_the_host() {
             true,
             "Detached: web was restarted. Run min box attach web to attach again.",
         ),
-        (false, "Detached: web was stopped."),
+        (
+            false,
+            "Detached: web was restarted. Run min box attach web to attach again.",
+        ),
     ] {
         let (attached_tx, attached_rx) = tokio::sync::oneshot::channel::<()>();
         let (restarted_tx, restarted_rx) = tokio::sync::oneshot::channel::<()>();
