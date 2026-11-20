@@ -398,6 +398,13 @@ fn is_public_address(ip: std::net::IpAddr) -> bool {
                 return is_public_v4(v4);
             }
             let segments = v6.segments();
+            // 6to4, 2002::/16, carries an IPv4 address in its next 32 bits.
+            if segments[0] == 0x2002 {
+                let [hi, lo] = [segments[1], segments[2]];
+                return is_public_v4(std::net::Ipv4Addr::from(
+                    (u32::from(hi) << 16) | u32::from(lo),
+                ));
+            }
             !(v6.is_unspecified()
                 || v6.is_loopback()
                 || v6.is_multicast()
@@ -405,14 +412,37 @@ fn is_public_address(ip: std::net::IpAddr) -> bool {
                 || (segments[0] & 0xfe00) == 0xfc00
                 // Link-local, fe80::/10.
                 || (segments[0] & 0xffc0) == 0xfe80
-                // Documentation, 2001:db8::/32.
+                // Documentation, 2001:db8::/32 and 3fff::/20.
                 || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+                || (segments[0] == 0x3fff && (segments[1] & 0xf000) == 0)
                 // IPv4 translation, 64:ff9b::/96 and 64:ff9b:1::/48.
                 || segments[0] == 0x0064
+                // Discard only, 100::/64.
+                || segments[..4] == [0x0100, 0, 0, 0]
+                // Segment routing SIDs, 5f00::/16.
+                || segments[0] == 0x5f00
+                // IETF protocol assignments, 2001::/23, but for the ranges in
+                // it the registry marks globally reachable.
+                || (segments[0] == 0x2001 && segments[1] < 0x0200 && !is_global_in_2001_23(v6))
                 // The IPv4-compatible form, ::/96.
                 || segments[..6].iter().all(|segment| *segment == 0))
         }
     }
+}
+
+/// Whether `ip`, in 2001::/23, is in a range the IANA IPv6 special-purpose
+/// registry marks globally reachable: the PCP, TURN and DNS-SD anycast
+/// addresses 2001:1::1, 2001:1::2 and 2001:1::3, AMT 2001:3::/32, AS112
+/// 2001:4:112::/48, ORCHIDv2 2001:20::/28 and DET 2001:30::/28.
+fn is_global_in_2001_23(ip: std::net::Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    matches!(
+        u128::from(ip),
+        0x2001_0001_0000_0000_0000_0000_0000_0001..=0x2001_0001_0000_0000_0000_0000_0000_0003
+    ) || segments[1] == 0x0003
+        || segments[..3] == [0x2001, 0x0004, 0x0112]
+        || (segments[1] & 0xfff0) == 0x0020
+        || (segments[1] & 0xfff0) == 0x0030
 }
 
 /// [`is_public_address`] for an IPv4 address.
@@ -793,7 +823,24 @@ mod connect_tests {
     /// family.
     #[test]
     fn only_a_public_address_is_public() {
-        for public in ["93.184.215.14", "8.8.8.8", "2606:2800:21f:cb07::1"] {
+        for public in [
+            "93.184.215.14",
+            "8.8.8.8",
+            "2606:2800:21f:cb07::1",
+            "2001:4860:4860::8888",
+            "2a00:1450:4001:80b::200e",
+            // 6to4 of a public IPv4 address.
+            "2002:808:808::1",
+            // The ranges in 2001::/23 the registry marks globally reachable.
+            "2001:1::1",
+            "2001:1::3",
+            "2001:3::1",
+            "2001:4:112::1",
+            "2001:20::1",
+            "2001:3f::1",
+            // Just outside 3fff::/20.
+            "3fff:1000::1",
+        ] {
             assert!(is_public_address(public.parse().unwrap()), "{public}");
         }
         for internal in [
@@ -806,13 +853,47 @@ mod connect_tests {
             "0.0.0.0",
             "255.255.255.255",
             "240.0.0.1",
+            "192.0.0.8",
+            "198.18.0.1",
+            "198.19.255.255",
+            "192.0.2.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
             "::1",
             "::",
-            "fd00::1",
-            "fe80::1",
             "::ffff:127.0.0.1",
             "::ffff:169.254.169.254",
+            "::ffff:10.0.0.1",
             "64:ff9b::a9fe:a9fe",
+            "64:ff9b::808:808",
+            "64:ff9b:1::1",
+            // Discard only, 100::/64.
+            "100::1",
+            // 2001::/23 outside its globally reachable ranges: Teredo,
+            // benchmarking, the rest of 2001:1::/32 and the unassigned rest.
+            "2001::1",
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+            "2001:1::4",
+            "2001:2::1",
+            "2001:2:0:ffff::1",
+            "2001:4::1",
+            "2001:10::1",
+            "2001:1ff::1",
+            "2001:db8::1",
+            // 6to4 of a non-public IPv4 address.
+            "2002:7f00:1::1",
+            "2002:a9fe:a9fe::1",
+            "2002:c0a8:101::1",
+            "3fff::1",
+            "3fff:fff::1",
+            "5f00::1",
+            "fc00::1",
+            "fd00::1",
+            "fe80::1",
+            "febf::1",
+            "ff02::1",
+            "ff0e::1",
         ] {
             assert!(!is_public_address(internal.parse().unwrap()), "{internal}");
         }
