@@ -16621,6 +16621,56 @@ fn loadout_file_with_retired_key_refused_exit3() {
     }
 }
 
+/// BOX-206, BOX-207: `min box spec <entry>` refuses a selected loadout file
+/// that sets `vars` or `vars_lenient`, or an `env_vars` name such as
+/// `my.var`, with exit 3 and the text the start prints.
+#[tokio::test]
+async fn box_spec_loadout_file_with_retired_key_refused_exit3() {
+    let (_project, global) = spec_project("[sessions.default]\n");
+    let dir = global.config_dir.clone().unwrap().join("minimal/loadouts");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("ed.toml");
+    let argv = ["min", "box", "spec", "default", "--loadout", "ed"];
+
+    for key in ["vars", "vars_lenient"] {
+        std::fs::write(&file, format!("[{key}]\nEDITOR = \"vi\"\n")).unwrap();
+        let error = box_spec_text(&global, &argv)
+            .await
+            .expect_err("the loadout sets a retired key");
+        let refusal = spec_project_error(&error);
+        assert_eq!(refusal.exit_code(), Some(3));
+        assert_eq!(
+            refusal.to_string(),
+            format!(
+                "the loadout file {} sets `{key}` at its top level. This key is no longer \
+                 read. Move its variables to an `[env_vars]` table in that file.",
+                file.display()
+            )
+        );
+    }
+
+    std::fs::write(&file, "[env_vars]\n\"my.var\" = \"1\"\n").unwrap();
+    let error = box_spec_text(&global, &argv)
+        .await
+        .expect_err("the loadout sets my.var");
+    let refusal = spec_project_error(&error);
+    assert_eq!(refusal.exit_code(), Some(3));
+    assert_eq!(
+        refusal.to_string(),
+        format!(
+            "the loadout file {} sets the variable `my.var` in `env_vars`. A variable \
+             name can hold only ASCII letters, digits and `_`, and cannot start with a \
+             digit. Rename the variable.",
+            file.display()
+        )
+    );
+
+    std::fs::write(&file, "[env_vars]\nEDITOR = \"vi\"\n").unwrap();
+    box_spec_text(&global, &argv)
+        .await
+        .expect("a loadout with env_vars renders");
+}
+
 /// BOX-068 with BOX-048 and BOX-050: one `minimal.toml` declares a session
 /// and a task entry that share `[defaults]`. The client expands each entry
 /// and sends it, and the daemon composes and starts each box from its own
