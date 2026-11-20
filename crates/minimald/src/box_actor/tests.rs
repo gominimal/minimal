@@ -4109,6 +4109,90 @@ async fn activation_refused_when_declared_port_is_held_by_a_host_program() {
     );
 }
 
+/// NET-121, NET-144: on a VM-backed host the host binds a declared forward
+/// toward the box's switch address. A box that declares ingress and that the
+/// host handed no switch address fails its finalize with the reason, before
+/// any forward is asked of the host, and the activate cleanup leaves no
+/// record. The daemon's switch is turned into the VM host's after the
+/// create, so the create runs the way a native one does.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn activation_refused_when_vm_host_hands_no_switch_address() {
+    use minimald_rpc::{
+        DestroySession, DestroySessionRequest, Errorable, FinalizeSession, FinalizeSessionRequest,
+        ListSessions,
+    };
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_own_ip_session(&mut client, "unhanded").await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves");
+    let switch = handle.net_switch().await.expect("the box's actor lives");
+    {
+        let mut switch = switch.lock().await;
+        let native = std::mem::replace(
+            &mut *switch,
+            crate::net::SwitchClient::new("/nonexistent/gvproxy", "/nonexistent"),
+        );
+        *switch = native.with_transport(crate::net::SwitchTransport::HostShuttle {
+            cid: crate::net::VSOCK_HOST_CID,
+            port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
+        });
+    }
+    let reply = client
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: true,
+        })
+        .await;
+    match reply {
+        Errorable::Err { error } => {
+            assert!(
+                error.contains(
+                    "box unhanded declares ingress ports, but its VM did not assign it a \
+                     network address. No port can be forwarded to it. The box did not start."
+                ),
+                "the refusal states the reason, got: {error}"
+            );
+        }
+        Errorable::Ok(ok) => panic!("finalize must fail with no switch address, got {ok:?}"),
+    }
+    match client
+        .call::<DestroySession>(&DestroySessionRequest {
+            id,
+            only_if_unfinalized: true,
+        })
+        .await
+    {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("the activate cleanup's destroy failed: {error}"),
+    }
+    let listed = client.call::<ListSessions>(&()).await;
+    assert!(
+        listed.sessions.iter().all(|entry| entry.id != id),
+        "a refused activation leaves no record: {:?}",
+        listed.sessions
+    );
+    let logged = capture.contents();
+    assert!(
+        logged.lines().any(|line| line.contains("no switch address")
+            && line.contains(&format!("session={id}"))),
+        "one warn line names the session and the reason, got: {logged}"
+    );
+    // The refusal comes before any forward request: a bind would have gone
+    // to the VM host over vsock and failed with its own error, or refused
+    // the port as held.
+    assert!(
+        !logged.contains("host-port-in-use"),
+        "no forward bind ran, got: {logged}"
+    );
+}
+
 /// NET-144: at the shared `127.0.0.1` fallback a declared port that another
 /// box already holds fails the second box's activation, naming the box that
 /// holds it, where before the second box yielded the port. The first box

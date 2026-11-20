@@ -36,6 +36,22 @@ fn warn_port_refusal(
     );
 }
 
+/// The refusal of an activation on a VM-backed host that handed a box with
+/// declared ingress no switch address (NET-121, NET-144). The host binds a
+/// declared forward toward the box's switch address, so with none no
+/// declared port can reach the box. The client's activate cleanup destroys
+/// the box, so the message says the box did not start.
+#[cfg(target_os = "linux")]
+pub(crate) fn no_switch_address_error(box_name: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::AddrNotAvailable,
+        format!(
+            "box {box_name} declares ingress ports, but its VM did not assign it a \
+             network address. No port can be forwarded to it. The box did not start."
+        ),
+    )
+}
+
 /// The egress *section* the gate compiles for a session: the materialized
 /// form of [`boxes::effective_egress`]'s answer — `None` for the
 /// allow-all default, the deny-all section for an absent declaration under the
@@ -897,9 +913,22 @@ impl BoxActor {
                                 }
                             }
                             // A VM-backed box the host handed no switch
-                            // address has no forward to bind yet. Its
-                            // first attach binds the forwards.
-                            (true, None) => {}
+                            // address has no target for a forward. The
+                            // host binds a declared forward toward the
+                            // box's switch address, so without one the
+                            // name would publish with every declared port
+                            // dead. The finalize fails before the `Active`
+                            // write, and binds nothing (NET-121, NET-144).
+                            (true, None) => {
+                                tracing::warn!(
+                                    session = %record.id,
+                                    name = %own_name,
+                                    %published,
+                                    "refused activation: the box declares ingress on a \
+                                     VM-backed host that handed it no switch address"
+                                );
+                                return Err(no_switch_address_error(&own_name));
+                            }
                             (false, _) => {
                                 let yielded: Vec<u16> =
                                     yielded_ports.iter().map(|c| c.port).collect();
