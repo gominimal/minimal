@@ -25348,7 +25348,6 @@ fn cli_reference_lists_every_error_code() {
         ("audit_self_unsupported_unenrolled", "1"),
         ("timeout", "124"),
         ("wait_timeout", "124"),
-        ("daemon_unreachable", "1"),
         ("policy_unavailable", "1"),
         ("output_failed", "1"),
         ("unspecified", "1, or the exit code of the failure"),

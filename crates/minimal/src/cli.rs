@@ -305,7 +305,7 @@ pub struct MachineModeFailure {
     /// The failure's kind: a name a script branches on — the
     /// architecture's codes, `not_found` for a missing thing (with the
     /// kind of thing that was missing in the message and the hint),
-    /// `daemon_unreachable`, `policy_unavailable` — never a single
+    /// `policy_unavailable` — never a single
     /// command's own spelling.
     code: &'static str,
     message: String,
