@@ -27576,12 +27576,28 @@ proof_listen_published_port_reaches_peer_and_host() {
   # ---- the audit: the allow decision has its decisions.log line (NET-046) --
   # The watcher appends one record per listen it publishes, to the audit log
   # of the daemon that runs the box. On a VM lane that daemon is the guest's,
-  # whose state directory this host does not read — the same split the
-  # expose case's guest-audit legs carry — so the leg is counted NOT RUN
-  # there and asserted everywhere else.
+  # whose state directory this host does not read. The publish crossed to the
+  # VM host daemon's admission, though, and that admission writes its own
+  # copy to the owner-only host audit (audit/box-admissions.log, T84): the
+  # box, the port, and the source the report carried — a listen's is
+  # 'listen'. So on a VM lane the leg asserts that host-held line instead.
   if [ -n "${E2E_VM:-}" ]; then
-    not_run listen_published_port_reaches_peer_and_host \
-      "VM lane: the listen's decision record is in the guest daemon's audit file, which this host does not read (NET-046)"
+    local lp_vm_audit="$XDG_STATE_HOME/minimal/providers/local-minvmd0/audit/box-admissions.log"
+    local lp_vm_line=""
+    for _ in $(seq 1 20); do
+      lp_vm_line="$(grep -F "\"box\":\"$lp_target_name\"" "$lp_vm_audit" 2>/dev/null \
+        | grep -E "\"port\":${lp_listen_port}[,}]" \
+        | grep -F '"source":"listen"' | tail -n1)"
+      [ -n "$lp_vm_line" ] && break
+      sleep 0.25
+    done
+    if [ -z "$lp_vm_line" ]; then
+      echo "::error::the VM host daemon's host audit carries no admission line for box $lp_target_name port $lp_listen_port with source listen — the listen's publish was never audited on the host (T84, NET-046)"
+      grep -F "\"box\":\"$lp_target_name\"" "$lp_vm_audit" 2>/dev/null | sed 's/^/  /' \
+        || echo "(no host audit line for $lp_target_name in $lp_vm_audit)"
+      fail
+    fi
+    echo "host audit: $lp_vm_line (the listen's admission in the owner-only host audit, T84, NET-046)"
   elif python3 - "$lp_target_name" "$lp_listen_port" \
       "$XDG_STATE_HOME/minimal/audit/decisions.log" <<'PY'
 import json
