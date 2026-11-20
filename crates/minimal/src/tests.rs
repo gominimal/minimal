@@ -20171,7 +20171,26 @@ fn concept_and_reference_docs_use_no_removed_session_verb() {
     for page in PAGES {
         let text = std::fs::read_to_string(root.join(page))
             .unwrap_or_else(|e| panic!("{page} must be readable: {e}"));
-        for (n, line) in text.lines().enumerate() {
+        // BCLI-044: the one migration note in docs/concepts/sessions.md (the
+        // `## ` section that names `local-minimald`) names the old spellings
+        // on purpose. Every other line of every page must not.
+        let lines: Vec<&str> = text.lines().collect();
+        let mut in_note = vec![false; lines.len()];
+        let mut start = 0;
+        while start < lines.len() {
+            let end = (start + 1..lines.len())
+                .find(|&i| lines[i].starts_with("## "))
+                .unwrap_or(lines.len());
+            let is_note = *page == "docs/concepts/sessions.md"
+                && lines[start].starts_with("## ")
+                && names_local_minimald_alias(&lines[start..end].join("\n"));
+            in_note[start..end].fill(is_note);
+            start = end;
+        }
+        for (n, line) in lines.iter().enumerate() {
+            if in_note[n] {
+                continue;
+            }
             let mut hits: Vec<String> = REMOVED_SESSION_VERBS
                 .iter()
                 .map(|verb| format!("min session {verb}"))
