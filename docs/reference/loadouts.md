@@ -101,7 +101,7 @@ patches = [
     { dest = ".config/zellij/layouts/", source = "~/dotfiles/zellij/layouts/**/*.kdl" },
 ]
 
-[vars]
+[env_vars]
 EDITOR    = "hx"
 VISUAL    = "hx"
 
@@ -165,16 +165,16 @@ refusal also names the upstream repo and the short `locked_commit`. A package
 that is newer than that commit is unknown until the pin moves. Run
 `min update` to move the pin, then activate again.
 
-### `[vars]` - Environment variables {#vars}
+### `[env_vars]` - Environment variables {#env_vars}
 
 _Optional_
 
-Variables set in the session environment. Names must be POSIX-shaped
-(`[A-Z_][A-Z0-9_]*`); for other names, see
-[`[[vars_lenient]]`](#vars_lenient). Each value takes one of three forms:
+Variables set in the session environment. `[env_vars]` is the one table
+that sets them. A name holds only ASCII letters, digits and `_`, and does
+not start with a digit. Each value takes one of three forms:
 
 ```toml
-[vars]
+[env_vars]
 EDITOR = "hx"                                # literal value
 PAGER   = { inherit = true, default = "less" }  # inherit, with fallback
 MUXER = { inherit = true }               # inherit from the host env
@@ -200,26 +200,24 @@ MUXER = { inherit = true }               # inherit from the host env
 
 The warn-and-drop rule is a loadout relaxation, not a property of the
 spelling. The same `{ inherit = true }` in a project's
-[`[session.vars]`](./minimal-dot-toml.md#session) is **required**: an unset
+[`[defaults.session.env_vars]`](./minimal-dot-toml.md#session) is **required**: an unset
 host variable there fails activation instead of being dropped. A project is
 declaring what every contributor needs, where a loadout is declaring what one
 developer would like. See
 [Where `{ inherit = true }` differs](./minimal-dot-toml.md#inherit-divergence)
 for the rule on every surface that accepts the form.
 
-### `[[vars_lenient]]` - Environment variables with non-POSIX names {#vars_lenient}
+#### Retired keys {#retired-var-keys}
 
-_Optional_
+Older loadouts set variables in a `[vars]` table, and names that were not
+POSIX-shaped in a `[[vars_lenient]]` table. Both keys are retired. A
+loadout that sets either one fails the start, and `min box spec <entry>`,
+with exit code 3. The error names the file, the table and the key. Move
+the variables to `[env_vars]`.
 
-An explicit opt-in for the rare variable whose name is not POSIX-shaped.
-Anything the Linux kernel accepts is allowed (no `=`, no NUL). Values use
-the same three forms as `[vars]`.
-
-```toml
-[[vars_lenient]]
-name  = "weird-thing"
-value = "x"
-```
+A name in `[env_vars]` that is empty, holds any other character, or
+starts with a digit fails in the same way, with exit code 3. The error
+names the variable and the file.
 
 ### `patches` - Files copied from the host into the session {#patches}
 
@@ -242,7 +240,7 @@ so list entries only make sense with per-entry dests or glob entries):
 
 - A leading `~` expands to the host home directory. `$NAME` / `${NAME}`
   references (including `$HOME`) resolve against the session's
-  already-resolved variables (declared in `[vars]`); referencing an
+  already-resolved variables (declared in `[env_vars]`); referencing an
   undefined name is an error. `$$` is a literal `$`.
 - `$LOADOUT_ROOT` expands to the loadout's own directory, for files you
   ship beside the loadout itself — see
@@ -678,13 +676,13 @@ edge: bash's refresh is a `DEBUG` trap, and a `~/.bashrc` that installs a
 working.
 
 Interactive setup can also travel through the environment, i.e. through
-`[vars]`, which is where the prompt and the banner live:
+`[env_vars]`, which is where the prompt and the banner live:
 
 - **Prompt**: the session launcher seeds a baseline environment
   (a stock `PS1`, plus the [orientation banner](#orientation-banner)
   vars below) before merging in the composed vars, and a composed var
   overwrites a baseline entry with the same name. Setting `PS1` in
-  `[vars]` therefore replaces the stock prompt. This baseline is
+  `[env_vars]` therefore replaces the stock prompt. This baseline is
   a layer *beneath* composition, not a contributor: the no-override
   conflict rule above arbitrates between contributors and does not apply
   to the launcher's defaults.
@@ -693,7 +691,7 @@ Interactive setup can also travel through the environment, i.e. through
   can ship as a payload var plus a trigger that clears its own payload:
 
   ```toml
-  [vars]
+  [env_vars]
   PROMPT_COMMAND = 'if [ -n "${MINIMAL_MOTD:-}" ]; then eval "$MINIMAL_MOTD"; unset MINIMAL_MOTD; fi; if [ -r "${MINIMAL_ATTACH_ENV:-}" ]; then . "$MINIMAL_ATTACH_ENV"; fi'
   MINIMAL_MOTD   = '''
   [ -t 1 ] && printf '%s\n' '' '  Welcome to the dev session.' ''
@@ -711,12 +709,12 @@ Interactive setup can also travel through the environment, i.e. through
 
 ### `SHELL` - Which shell an attach starts {#session-shell}
 
-Set `SHELL` in `[vars]` to be dropped into that shell instead of bash:
+Set `SHELL` in `[env_vars]` to be dropped into that shell instead of bash:
 
 ```toml
 packages = ["fish"]
 
-[vars]
+[env_vars]
 SHELL = "/usr/bin/fish"
 ```
 
@@ -742,7 +740,7 @@ which five shells there are to choose from. Nothing fails either way.
 This is the loadout's `SHELL`, not the `$SHELL` of the terminal you ran
 `min` from: a session is a declared environment, and the shell it hands
 you is part of the declaration. A project sets it the same way through its
-[`[session.vars]`](./minimal-dot-toml.md#session).
+[`[defaults.session.env_vars]`](./minimal-dot-toml.md#session).
 
 Four things worth knowing:
 
@@ -759,7 +757,7 @@ Four things worth knowing:
   is written in bash's syntax, so zsh is given the same prompt in zsh's
   syntax instead of printing `\u@\h` at you; fish and nushell build
   their prompts from their own config and ignore `PS1` entirely. A `PS1`
-  you set in `[vars]` always wins, in whatever syntax you wrote it.
+  you set in `[env_vars]` always wins, in whatever syntax you wrote it.
 - **The banner does not follow.** The orientation banner rides
   `PROMPT_COMMAND`, which is bash's; a fish or nushell session simply
   doesn't print it. `TERM` refresh *does* work in all five — that is what
@@ -776,7 +774,7 @@ brings the sandbox up the same way an attach does.
 **Nothing is required of a loadout or a project for this to work.** The
 daemon publishes the current terminal's facts on every attach, and installs
 the hook that re-reads them into every session rootfs, for every shell it
-supports. This is deliberately not carried by a `[vars]` entry: an
+supports. This is deliberately not carried by a `[env_vars]` entry: an
 environment variable is composed, so a loadout could replace it — and the
 MOTD recipe above unsets `PROMPT_COMMAND` outright — which would leave the
 session's `TERM` depending on whether an author knew to preserve it.

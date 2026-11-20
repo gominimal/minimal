@@ -324,7 +324,9 @@ pub(crate) async fn box_ends(client: &mut client::Client, id: boxes::SessionId) 
 /// root, is the one the box's record names, and returns its exit code as
 /// [`wait_exit`] gives it. With `timeout`, the wait stops when the
 /// box still runs after it, with a [`BoxTimedOut`], and leaves the box
-/// running. The record is read again every `poll`.
+/// running. The record is read again every `poll`. `min box wait` itself
+/// calls [`box_wait_all_on_hosts`], for the record its `-o json` writes.
+#[cfg(test)]
 pub(crate) async fn box_wait_on_hosts(
     hosts: Vec<crate::cmd::list::LocalHost>,
     target: &str,
@@ -347,6 +349,73 @@ pub(crate) struct BoxWaited {
     /// The code of its end after its exports, as [`box_wait_on_hosts`]
     /// gives it.
     pub ended: Result<i32, BoxTimedOut>,
+    /// The box's record as the wait last read it, after it ended.
+    pub record: minimald_rpc::BoxListingEntry,
+}
+
+/// The `schema` of the object `min box wait -o json` writes (BCLI-033).
+pub(crate) const WAIT_SCHEMA: &str = "min/v1/wait";
+
+/// The object `min box wait -o json` writes when the box ends: how each
+/// box it waited on ended (BCLI-013).
+#[derive(Debug, serde::Serialize)]
+struct WaitObject<'a> {
+    schema: &'static str,
+    boxes: Vec<WaitedBoxObject<'a>>,
+}
+
+/// How one box ended, in the `min/v1/wait` object. `state`, `reason`,
+/// `exit_code` and `signal` are what the box's record keeps. `code` is the
+/// exit code of the wait for this box.
+#[derive(Debug, serde::Serialize)]
+struct WaitedBoxObject<'a> {
+    box_id: String,
+    name: Option<&'a str>,
+    state: &'a str,
+    reason: Option<&'a str>,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    code: i32,
+}
+
+/// The exit code of the wait for one box: its code, or 124 for a box that
+/// its own timeout ended.
+fn waited_code(ended: &Result<i32, BoxTimedOut>) -> i32 {
+    match ended {
+        Ok(code) => *code,
+        Err(_) => i32::from(BoxTimedOut::EXIT_CODE),
+    }
+}
+
+/// Writes how the boxes in `waited` ended on `out`, in `format`. A text
+/// run writes nothing, and the exit code says how the box ended. A `json`
+/// run writes one `min/v1/wait` object on one line (BCLI-013, BCLI-033).
+pub(crate) fn write_wait_output(
+    out: &mut impl std::io::Write,
+    format: Option<BoxWaitOutputFormat>,
+    waited: &[BoxWaited],
+) -> std::io::Result<()> {
+    let Some(BoxWaitOutputFormat::Json) = format else {
+        return Ok(());
+    };
+    let object = WaitObject {
+        schema: WAIT_SCHEMA,
+        boxes: waited
+            .iter()
+            .map(|one| WaitedBoxObject {
+                box_id: one.box_id.to_string(),
+                name: one.record.name.as_deref(),
+                state: &one.record.state,
+                reason: one.record.reason.as_deref(),
+                exit_code: one.record.exit_code,
+                signal: one.record.signal,
+                code: waited_code(&one.ended),
+            })
+            .collect(),
+    };
+    serde_json_lenient::to_writer(&mut *out, &object)?;
+    writeln!(out)?;
+    out.flush()
 }
 
 /// Waits until every box `targets` names on `hosts` ended, then copies the
@@ -432,6 +501,7 @@ pub(crate) async fn box_wait_all_on_hosts(
         waited.push(BoxWaited {
             box_id: one.id,
             ended,
+            record: shown.record,
         });
     }
     Ok(waited)
@@ -501,7 +571,17 @@ pub async fn cmd_box_wait(global: &GlobalArgs, args: BoxWaitArgs) -> Result<(), 
                 .and_then(|cwd| box_list_scope(cwd.as_ref()))
                 .inspect_err(|e| tracing::info!("box wait: no project root here: {e:#}"))
                 .ok();
-            box_wait_on_hosts(hosts, &args.target, here.as_ref(), timeout, POLL_INTERVAL).await?
+            let target = [args.target.clone()];
+            let waited =
+                box_wait_all_on_hosts(hosts, &target, here.as_ref(), timeout, POLL_INTERVAL)
+                    .await?;
+            // BCLI-013: under `-o json`, how the box ended goes on stdout
+            // before the command exits with its code.
+            write_wait_output(&mut std::io::stdout().lock(), args.output, &waited)
+                .context(OutputWriteError)?;
+            let one = waited.into_iter().next().expect("one box for one target");
+            tracing::debug!(verb = "box wait", box_id = %one.box_id, "the wait ended");
+            one.ended?
         }
     };
     if code == 0 {

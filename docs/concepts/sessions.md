@@ -110,7 +110,7 @@ $ min session attach my-session
 Attach opens an interactive shell inside the session, with your tools on `PATH`
 and the session's workspace (your project files, uploaded at start) as your
 working directory. That shell is bash unless a loadout asks for another one it
-has installed — set `SHELL` in `[vars]` to be dropped into zsh, fish, nushell,
+has installed — set `SHELL` in `[env_vars]` to be dropped into zsh, fish, nushell,
 or POSIX `sh` instead ([reference](../reference/loadouts.md#session-shell)).
 Exiting the shell detaches: the session keeps running in the
 background, and `min session attach` rejoins it later. Changes you make inside stay in

@@ -642,7 +642,9 @@ async fn create_session(
     // The refusal's own text, so a failed attempt names its cause (a create
     // minvmd gave no id is refused with a reply, BOX-002).
     match resp {
-        minimald_rpc::Errorable::Ok(created) => Ok(created.id),
-        minimald_rpc::Errorable::Err { error } => Err(format!("CreateSession refused: {error}")),
+        minimald_rpc::CreateSessionReply::Ok(created) => Ok(created.id),
+        minimald_rpc::CreateSessionReply::Err { error, .. } => {
+            Err(format!("CreateSession refused: {error}"))
+        }
     }
 }

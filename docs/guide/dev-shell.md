@@ -65,10 +65,10 @@ A relative `source` resolves against the project directory, so `source = "config
 
 ### Set environment variables
 
-The session starts with a clean environment. By default, host environment variables do not pass through. Set variables explicitly, or inherit them from the host, under `[defaults.session.vars]`:
+The session starts with a clean environment. By default, host environment variables do not pass through. Set variables explicitly, or inherit them from the host, under `[defaults.session.env_vars]`:
 
 ```toml
-[defaults.session.vars]
+[defaults.session.env_vars]
 EDITOR = "nano"
 AWS_PROFILE = { inherit = true }
 ```
@@ -81,7 +81,7 @@ Inheriting this way is mandatory, not opportunistic. If `AWS_PROFILE` is not set
 error: Composition gating failed: could not resolve pending var `AWS_PROFILE`: environment variable not found
 ```
 
-Since the project commits `minimal.toml`, that applies to everyone on the project. Write `{ inherit = true, default = "..." }` instead when the variable is truly optional. A loadout's `[vars]` takes the opposite view of the same spelling and only warns. See [Where `{ inherit = true }` differs](../reference/minimal-dot-toml.md#inherit-divergence).
+Since the project commits `minimal.toml`, that applies to everyone on the project. Write `{ inherit = true, default = "..." }` instead when the variable is truly optional. A loadout sets its variables in its own `[env_vars]` table. It takes the opposite view of the same spelling and only warns. See [Where `{ inherit = true }` differs](../reference/minimal-dot-toml.md#inherit-divergence).
 
 ### Run setup on activation
 

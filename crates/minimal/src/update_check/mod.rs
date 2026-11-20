@@ -178,7 +178,6 @@ pub fn leaves_the_notice_visible(command: &Option<crate::cli::Command>) -> bool 
         command,
         Some(
             Command::Ls(_)
-                | Command::Stop(_)
                 | Command::Loadout(_)
                 | Command::Net(_)
                 | Command::Dirs

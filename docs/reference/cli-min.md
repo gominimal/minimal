@@ -8,9 +8,10 @@ description: "Reference for the min session CLI: create, attach to, and manage s
 `min` is the Minimal session CLI. It talks to the `minimald` daemon (see
 [minimald](./cli-minimald.md)) to create, attach to, and manage sandboxed
 development sessions. Most commands start the daemon automatically when it
-isn't running, with `bug`, `host stop`, and `version` being the exceptions. The 
-daemon starts natively on Linux (and under `--provider local-minvmd`) or 
-inside the [`minvmd`](./cli-minvmd.md) microVM host daemon on macOS. 
+is not running, with `bug`, `host stop`, and `version` being the exceptions. On
+macOS the daemon starts inside the [`minvmd`](./cli-minvmd.md) microVM host
+daemon. On Linux the provider decides where it starts, as
+[Choosing the provider on Linux](#choosing-the-provider-on-linux) describes.
 Running bare `min` with no subcommand routes you into a session when stdin
 and stdout are both a terminal: it follows the smart-resolution rules of
 `min session attach` with no argument (cwd match → attach, only session →
@@ -36,8 +37,81 @@ These apply to every subcommand.
 | `--repo-dir <PATH>` | `-C` | Use the given directory as the repository root, instead of the current working directory |
 | `--minimal-dir <PATH>` | | Override the base directory for minimal's state; the session store, provider instances, and other on-disk state live under `<minimal_dir>/`. Defaults to `$XDG_STATE_HOME/minimal` on Linux (or `$HOME/.local/state/minimal`); macOS also uses `$HOME/.local/state/minimal` |
 | `--config-dir <PATH>` | | Override the user config directory; everything under `<config_dir>/minimal/` (`config.toml`, `loadouts/`, ...) resolves relative to it. Defaults to `$XDG_CONFIG_HOME` on Linux (or `$HOME/.config`); macOS also uses `$HOME/.config` |
-| `--provider <PROVIDER>` | | Daemon backend that hosts sessions: `local-minimald` (Linux default, `minimald` natively on the host) or `local-minvmd` (`minimald` inside the `minvmd` microVM). No effect on macOS, where `minvmd` is the only backend |
+| `--provider <PROVIDER>` | | Daemon backend that hosts sessions: `local` (`minimald` natively on the host) or `local-minvmd` (`minimald` inside the `minvmd` microVM). Without the flag, Linux uses `MIN_PROVIDER`, then the `provider` key of `config.toml`, then `local-minvmd` where `/dev/kvm` opens for you and `local` where it does not. No effect on macOS, where `minvmd` is the only backend |
 | `--no-input` | | Skip interactive prompts that need a terminal (such as the session picker); ambiguous choices error with a list of candidates instead. Implied when stdin/stdout is not a terminal |
+
+### Choosing the provider on Linux
+
+A command without `--provider` chooses the provider in this order:
+
+1. The `MIN_PROVIDER` environment variable, set to `local` or
+   `local-minvmd`.
+2. The `provider` key of your `config.toml` (run `min dirs` to find the
+   file). It is a top-level key, so it goes before the first table:
+
+   ```toml
+   provider = "local"
+   ```
+
+3. `local-minvmd`, when `/dev/kvm` opens for reading and writing for you
+   and answers the KVM API version request.
+4. `local`, otherwise.
+
+`--provider` wins over all of them. A host where `/dev/kvm` is there but does
+not open for you stays on `local` until you join the `kvm` group.
+`min finalize-install` offers that step. It takes effect at your next login.
+
+Each provider keeps its own boxes. Boxes you started on the native provider
+before `local-minvmd` became your default stay there: `min --provider local
+ls` lists them. To keep the native provider as your default, set
+`MIN_PROVIDER=local` or put `provider = "local"` in `config.toml`.
+
+A command can reach `local-minvmd` only because `/dev/kvm` opens. If the
+native provider then still has boxes or a running daemon, the command prints
+a note on stderr after it ends. The note names both ways back above, and it
+stops once `--provider`, `MIN_PROVIDER` or the `provider` key names the
+provider.
+
+A VM that fails to start under this default gives an error with one more
+line. That line says `min` used the VM because `/dev/kvm` opens, and that
+`MIN_PROVIDER=local` keeps the native provider.
+
+## Errors in JSON output
+
+A command that runs with `-o json` or `-o jsonl` and fails writes one JSON
+object on stderr, on one line, in place of the plain-text error. Nothing
+else goes to stderr for that failure. The command still exits non-zero.
+
+```json
+{"schema":"min/v1/error","code":"not_found","message":"no box matches 'web'","hint":"..."}
+```
+
+| Field | Description |
+|-------|-------------|
+| `schema` | Always `min/v1/error` |
+| `code` | The kind of failure, from the table below. Branch on this field in a script |
+| `message` | The same error text that the command prints without `-o` |
+| `hint` | One line that names the next step, or an empty string when there is none |
+
+| `code` | Exit code | When the command gives it |
+|--------|-----------|---------------------------|
+| `ambiguous` | 2 | A box name or id prefix matches more than one box |
+| `not_found` | 4 | No box matches the box name or id, the box is on a VM that is stopped, or `min type show` names no box type. When `min box show --network -o json` finds no box, the exit code is 1 |
+| `host_unreachable` | 7 | A host that the command must ask does not answer |
+| `insufficient_resources` | 8 | The VM host has no network address left for another box |
+| `github_sign_in_required` | 3 | The box spec needs a GitHub sign-in, and you are not signed in. Run `min auth login` |
+| `gatehouse_unenrolled_node` | 5 | The box spec asks for a grant that this host cannot give, because the host is not enrolled |
+| `audit_self_unsupported_unenrolled` | 1 | `min box audit self` inside a box on a host that is not enrolled. On the host, run `min box audit <box>` |
+| `timeout` | 124 | A box ran past its own timeout, or `min box exec --timeout` ended the command |
+| `wait_timeout` | 124 | `min box wait --timeout` ran out before the box ended |
+| `policy_unavailable` | 1 | The command found the box but did not read its network policy |
+| `output_failed` | 1 | The command did not write its JSON output to stdout, for example on a full disk |
+| `unspecified` | 1, or the exit code of the failure | Any other failure. The exit code is the one the command gives without `-o` |
+
+A command line that `min` cannot parse, such as an unknown flag, exits 2
+before the command runs. The error is plain text, not a JSON object. When
+the reader of stdout closes it early, the command exits 141 and writes no
+object.
 
 ## Commands
 
@@ -344,6 +418,41 @@ value. `minimald` does not connect the box to a VPN yet. With `-o json`,
 of the text. The document lists the names in `vpn_network_names`. The
 command refuses `-o yaml` with `--network`, with exit code 2.
 
+### `box wait`
+
+```
+min box wait [--timeout <DURATION>] [-o json] <BOX>
+min box wait --exec <EXEC_ID> [--timeout <DURATION>] <BOX>
+```
+
+Waits until the box ends, and exits with the box's exit code. A box that a
+signal stopped gives 128 plus the signal, such as 143 for SIGTERM. A box
+that ran past its own timeout gives 124. When the box ends, the command
+copies the files the box declares as exports into the project. If it skips
+an export of a box that exited with 0, it exits with 125.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--timeout <DURATION>` | | Stop waiting after this long: a number of seconds, or a number followed by `s`, `m` or `h`. The box keeps running, and the command exits with code 124 |
+| `--exec <EXEC_ID>` | | Wait for one command, by the exec id that `min box exec` printed for it, and exit with that command's exit code |
+| `--output json` | `-o` | When the box ends, write how it ended as one JSON object on stdout. Not available with `--exec` |
+
+With `-o json`, the command writes one `min/v1/wait` object on one line when
+the box ends. Its `boxes` array has one entry for the box, with these fields:
+
+| Field | Value |
+|-------|-------|
+| `box_id` | The box's id |
+| `name` | The box's name, or `null` |
+| `state` | `exited` or `stopped` |
+| `reason` | How the box ended, as its record keeps it, such as `exit`, `stopped` or `timeout` |
+| `exit_code` | The exit code the box's record keeps, or `null` |
+| `signal` | The signal that ended the box, or `null` |
+| `code` | The exit code of `min box wait` for this box |
+
+A wait that `--timeout` ends before the box ends writes no object. Under
+`-o json`, a failure is one `min/v1/error` object on stderr.
+
 ### `box spec`
 
 ```
@@ -543,8 +652,8 @@ The script holds only what this host is missing from:
   the service it starts places the daemon in its leaf. An un-enrolled
   host does not need a source identity for it. The classifier translates
   nothing until an association adds the reserved addresses
-- membership of the `kvm` group, only when the configured provider is the
-  Linux VM provider
+- membership of the `kvm` group, for the Linux VM provider. A command that
+  does not name a provider also gets it where `/dev/kvm` does not open for you
 
 On macOS the step installs the box-name service's program in an app bundle,
 `/Library/PrivilegedHelperTools/Minimal.app`, that root owns. The service and
@@ -565,7 +674,7 @@ the `kvm` group ends with
 `KVM group membership starts at your next login: log out and back in, or restart the daemon from a new login.`
 When both apply, both lines print, the login line last. When the step that
 enforces deny-all egress installs while a daemon is running, on a host with
-systemd, the script also prints `note: a Minimal daemon is running. If a box you start next still says this machine cannot enforce its egress yet, restart the daemon. Run min host stop local0, which stops each running box and then the daemon. Then run min ls, which starts the daemon again.`
+systemd, the script also prints `note: a Minimal daemon is running. If a box you start next still says this machine cannot enforce its egress yet, restart the daemon. Run min host stop local0 --provider local, which stops each running box and then the daemon. Then run min ls --provider local, which starts the daemon again.`
 When `min finalize-install` runs with `--minimal-dir`, both commands in the
 note carry the same `--minimal-dir`, made absolute.
 A daemon of this release reads the machine again once the step places it, so

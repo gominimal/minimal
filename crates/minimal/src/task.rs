@@ -10,11 +10,11 @@
 //! status is on the wire (NET-131), whether or not this client is still
 //! here.
 //!
-//! Deliberately composed from the same client/RPC primitives `cmd_activate`
+//! Deliberately composed from the same client/RPC primitives `activate_box`
 //! uses (`BoxConfig`, `CreateSession`, the upload gates,
 //! `ConfigureLoadout`, the gating hooks, `FinalizeSession`) rather than
 //! refactored out of it: a few duplicated lines of glue keep
-//! `cmd_activate`'s diff at zero.
+//! `activate_box`'s diff at zero.
 
 use std::io::Read as _;
 
@@ -123,10 +123,13 @@ pub(crate) fn take_expanded_exports(spec: &mut mfile::spec::BoxSpec, expanded: &
 
 /// Puts the stored spec of a task run on `request` (BOX-068). `spec` is
 /// the declared task's spec, `None` for an interactive task. `expanded` is
-/// the task entry's expansion, whose `[[file_exports]]` items and
-/// `network.vpn_network_names` the spec takes (BOX-203, BCLI-024). Then each `--vpn-network-names` value, `vpn_network_names`,
-/// goes on the stored spec (BCLI-024). That edits the stored JSON, so it
-/// runs after `put_spec`, and once.
+/// the task entry's expansion, whose `[[file_exports]]` items,
+/// `network.vpn_network_names` and `[secrets]` the spec takes (BOX-203,
+/// BCLI-024, BOX-071). The client digest is the projection of that spec, so
+/// it binds the task's secret grants, and the daemon reads the same
+/// `[secrets]` (#3650). Then each `--vpn-network-names` value,
+/// `vpn_network_names`, goes on the stored spec (BCLI-024). That edits the
+/// stored JSON, so it runs after `put_expanded_spec`, and once.
 ///
 /// # Errors
 ///
@@ -145,8 +148,10 @@ pub(crate) fn put_task_spec(
             // The expansion holds the names `[defaults]` and the task's
             // type declare too. A flag value adds to them below.
             spec.network.vpn_network_names = mfile::spec::entry_vpn_network_names(expanded);
+            crate::put_expanded_spec(request, spec, expanded)?;
+        } else {
+            crate::put_spec(request, spec)?;
         }
-        crate::put_spec(request, spec)?;
     } else {
         // An interactive task sends no spec: the task type denies a
         // terminal. With no spec to name it, the request carries the
@@ -156,6 +161,69 @@ pub(crate) fn put_task_spec(
     // With no spec, a `--vpn-network-names` value has no place to go, so
     // the helper refuses it rather than drop it.
     crate::add_vpn_network_names(request, vpn_network_names)
+}
+
+/// Refuses a run whose sent `spec` carries a `source = "broker"` secret
+/// where no node-local proxy serves boxes (BOX-081, #3650). `absence` says
+/// why no proxy serves boxes, or gives `None` when one does. It is read
+/// only for a spec with a brokered secret.
+///
+/// The refusal is the daemon's for the same spec: it names each brokered
+/// secret, in name order, and exits 5 (`gatehouse_unenrolled_node`).
+///
+/// Interim until #3679: `min task run` sends no proxy root certificate, so
+/// the daemon refuses a brokered task secret on every host, also on a host
+/// with a proxy. A session box can use the same secret. #3679 tracks the
+/// task path.
+///
+/// # Errors
+///
+/// [`boxes::core::bep::ActivationRefused`] for a brokered secret with no
+/// proxy.
+pub(crate) fn refuse_unserved_broker_secrets(
+    spec: Option<&serde_json_lenient::Value>,
+    absence: impl FnOnce() -> Option<boxes::core::bep::ProxyAbsence>,
+) -> Result<(), boxes::core::bep::ActivationRefused> {
+    let Some(secrets) = spec
+        .and_then(|spec| spec.get("secrets"))
+        .and_then(serde_json_lenient::Value::as_object)
+    else {
+        return Ok(());
+    };
+    let brokered: std::collections::BTreeMap<&String, &serde_json_lenient::Value> = secrets
+        .iter()
+        .filter(|(_, grant)| grant.get("source").and_then(|s| s.as_str()) == Some("broker"))
+        .collect();
+    if brokered.is_empty() {
+        return Ok(());
+    }
+    let Some(cause) = absence() else {
+        return Ok(());
+    };
+    // The text says "secret" in place of "GitHub grant" when any of them
+    // asks for no `github:` scope.
+    let not_github = brokered.values().any(|grant| {
+        !grant
+            .get("scopes")
+            .and_then(|s| s.as_array())
+            .is_some_and(|scopes| {
+                scopes
+                    .iter()
+                    .filter_map(|scope| scope.as_str())
+                    .any(|scope| scope.starts_with("github:"))
+            })
+    });
+    let names: Vec<String> = brokered.keys().map(|name| (*name).clone()).collect();
+    tracing::info!(
+        secrets = ?names,
+        code = boxes::core::bep::GATEHOUSE_UNENROLLED_NODE,
+        "refused a task run: the spec carries a brokered secret and no proxy serves boxes"
+    );
+    // The secrets can come from the task's table or from a default, so
+    // the refusal names no table.
+    Err(boxes::core::bep::unenrolled_node(
+        names, not_github, cause, None,
+    ))
 }
 
 /// The network a run gives task `task`'s box (NET-060), from
@@ -411,13 +479,46 @@ pub(crate) fn misplaced_run_flag<'a>(typed: &[String], args: &'a [String]) -> Op
         .map(String::as_str)
 }
 
+/// The first task argument that is `--path`, alone or as `--path=<value>`,
+/// before any `--` ([`misplaced_run_flag`] reads `typed` and `args` the
+/// same way). `min task run` takes no `--path` (BCLI-042), but clap reads
+/// every token after the task's name as a task argument, so
+/// `min task run build --path sub/dir` parses. The run refuses it, as the
+/// parser refuses `--path` before the task's name.
+pub(crate) fn removed_task_path_flag<'a>(typed: &[String], args: &'a [String]) -> Option<&'a str> {
+    let before_args = typed
+        .len()
+        .checked_sub(args.len())
+        .filter(|&start| typed[start..] == *args)
+        .map(|start| &typed[..start]);
+    if before_args.is_some_and(|before| before.iter().any(|token| token == "--")) {
+        return None;
+    }
+    args.iter()
+        .take_while(|arg| *arg != "--")
+        .find(|arg| *arg == "--path" || arg.starts_with("--path="))
+        .map(String::as_str)
+}
+
+/// Which flag a [`RunFlagMisplaced`] refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MisplacedFlag {
+    /// One of the run's own network flags ([`misplaced_run_flag`]).
+    Network,
+    /// `--path`, which `min task run` does not take
+    /// ([`removed_task_path_flag`]).
+    RemovedPath,
+}
+
 /// The refusal of a run with one of its own network flags among the
-/// task's arguments ([`misplaced_run_flag`]): a usage error, which
+/// task's arguments ([`misplaced_run_flag`]), or of `min task run` with
+/// `--path` among them ([`removed_task_path_flag`]): a usage error, which
 /// `main.rs` ends with [`Self::EXIT_CODE`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunFlagMisplaced {
     entry: String,
     flag: String,
+    kind: MisplacedFlag,
 }
 
 impl RunFlagMisplaced {
@@ -434,26 +535,45 @@ impl RunFlagMisplaced {
                 .split_once('=')
                 .map_or(arg, |(name, _)| name)
                 .to_string(),
+            kind: MisplacedFlag::Network,
+        }
+    }
+
+    /// The refusal of `min task run <entry>` with `arg`, `--path` alone or
+    /// as `--path=<value>`, among its arguments (BCLI-042).
+    #[must_use]
+    pub fn removed_path(entry: &str, arg: &str) -> Self {
+        Self {
+            kind: MisplacedFlag::RemovedPath,
+            ..Self::new(entry, arg)
         }
     }
 }
 
 impl std::fmt::Display for RunFlagMisplaced {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self { entry, flag } = self;
-        write!(
-            f,
-            "Cannot run {entry}: {flag} comes after the task's first argument, so it would \
-             reach the task as an argument and not set the box's network. Put {flag} before \
-             {entry} to set the box's network, or put -- between {entry} and its arguments to \
-             pass it to the task."
-        )
+        let Self { entry, flag, kind } = self;
+        match kind {
+            MisplacedFlag::Network => write!(
+                f,
+                "Cannot run {entry}: {flag} comes after the task's first argument, so it would \
+                 reach the task as an argument and not set the box's network. Put {flag} before \
+                 {entry} to set the box's network, or put -- between {entry} and its arguments \
+                 to pass it to the task."
+            ),
+            MisplacedFlag::RemovedPath => write!(
+                f,
+                "Cannot run {entry}: min task run has no {flag} flag. Run \
+                 min -C <dir> task run {entry} to run the task in the project at <dir>, or put \
+                 -- between {entry} and its arguments to pass {flag} to the task."
+            ),
+        }
     }
 }
 
 impl std::error::Error for RunFlagMisplaced {}
 
-/// Writes what a run prints once its box exists, as `min session activate`
+/// Writes what a run prints once its box exists, as `min session start`
 /// prints it: the classifier advisory the create reply carries (NET-079),
 /// the deny-all default note for an `own_ip` box with no egress rules on a
 /// daemon that has not opted out (NET-074, NET-077), and the masked form
@@ -602,7 +722,9 @@ impl From<TaskRunArgs> for RunEntry {
         Self {
             verb: RunVerb::Task,
             entry: args.task,
-            path: args.path,
+            // BCLI-042: `min task run` takes no `--path`. `-C` names the
+            // project.
+            path: None,
             detach: args.detach,
             network: args.network,
             egress: args.egress,
@@ -920,9 +1042,6 @@ fn resolve_task_env(
 /// [`RefuseAndRecord`] anywhere else. Returns the resolved set and the
 /// policy as the prompt left it, which the interactive lane has already
 /// saved.
-///
-/// Shared by `min task run` and `min session run` (inbox#778), so the two
-/// verbs pass one gate and print one refusal.
 pub(crate) fn gate_task_env(
     global: &GlobalArgs,
     declared: &mfile::Task,
@@ -993,111 +1112,6 @@ pub(crate) fn gate_task_env(
         }
         Ok((task_env?, after))
     }
-}
-
-/// The `env_vars` of `task` for a `min session run` against a session built
-/// from the project at `project_path`, gated and resolved here as
-/// `min task run` does them ([`gate_task_env`]) (inbox#778).
-///
-/// The declaration is read from the project on this host, the only copy the
-/// client can read. The daemon runs the task from the session's own copy,
-/// taken at activation, so the two can differ. The daemon is told the
-/// client resolved the task, and it then refuses an `inherit` this set does
-/// not answer rather than reading its own environment for it. A project
-/// with no `minimal.toml` here, or one that does not declare `task` (a task
-/// a stack provides), yields an empty set for the same reason: the run goes
-/// on, and only an `inherit` stops it. A `minimal.toml` that is there but
-/// does not load is refused here, as `declared_task` refuses it, so the
-/// daemon's refusal never stands in for the real cause.
-pub(crate) fn session_run_task_env(
-    global: &GlobalArgs,
-    project_path: &camino::Utf8Path,
-    task: &str,
-    env: impl Fn(&str) -> Result<String, std::env::VarError>,
-) -> Result<minimald_rpc::taskenv::TaskEnv, anyhow::Error> {
-    // The daemon trims the name it is sent, so the lookup does too.
-    let task = task.trim();
-    let file = match mfile::File::from_dir_recursive(project_path.as_std_path()) {
-        Ok(file) => file,
-        Err(mfile::Error::NotFound) => {
-            tracing::debug!(
-                project = %project_path,
-                "no minimal.toml for the session's project on this host"
-            );
-            return Ok(minimald_rpc::taskenv::TaskEnv::default());
-        }
-        Err(e) => bail!(
-            "found a broken {name} in the session's project at {project_path} \
-             while resolving tasks: {e}",
-            name = mfile::MFILE_NAME,
-        ),
-    };
-    let Some(declared) = file.task(task) else {
-        return Ok(minimald_rpc::taskenv::TaskEnv::default());
-    };
-    let policy_path = crate::config::user_policy_path(global);
-    let user_policy = crate::config::read_user_policy(global)?;
-    let source = boxes::core::source::Source::Project {
-        path: paths::HostPath::try_new(project_path.to_path_buf())
-            .context("Invalid project path")?,
-    };
-    let (task_env, _) = gate_task_env(
-        global,
-        &declared,
-        task,
-        &source,
-        user_policy,
-        &policy_path,
-        env,
-    )?;
-    ensure_carried_by_ssh(task, &task_env)?;
-    Ok(task_env)
-}
-
-/// Refuses a resolved variable the ssh transport of `min session run`
-/// cannot carry: ssh forwards a variable from its own environment, which
-/// holds no name with `=` or a NUL, and no value with a NUL. `min task run`
-/// sends its variables over the daemon's own channel and has no such limit,
-/// but it runs the task in a new box, so the refusal says so.
-fn ensure_carried_by_ssh(
-    task: &str,
-    task_env: &minimald_rpc::taskenv::TaskEnv,
-) -> Result<(), anyhow::Error> {
-    for (name, value) in &task_env.set {
-        let shown = printable_name(name);
-        let why = if name.is_empty() {
-            "One of its variables has an empty name".to_string()
-        } else if name.contains('=') {
-            format!("Its variable `{shown}` has `=` in its name")
-        } else if name.contains('\0') {
-            format!("Its variable `{shown}` has a NUL in its name")
-        } else if value.contains('\0') {
-            format!("Its variable `{shown}` has a NUL in its value")
-        } else {
-            continue;
-        };
-        bail!(
-            "refused to run task '{task}' with `min session run`. {why}, and \
-             `min session run` passes variables to the session in ssh's environment, \
-             which cannot hold it. `min task run {task}` can carry it, and runs the task \
-             in a new box instead of in the session."
-        );
-    }
-    Ok(())
-}
-
-/// `name` as the person wrote it, with control characters escaped so the
-/// refusal stays one readable line: no Debug quotes around it.
-fn printable_name(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c.is_control() {
-                c.escape_default().to_string()
-            } else {
-                c.to_string()
-            }
-        })
-        .collect()
 }
 
 /// The non-interactive lane's hook: records what the policy could not
@@ -1339,9 +1353,8 @@ fn arm_task_run_interrupt(
                              `min box stop {box_name}` to stop it."
                         ),
                         InterruptEnds::Destroy => eprintln!(
-                            "DestroySession timed out after {bound:?}; the session may \
-                             still be present (run `min session destroy {box_name}` to clean \
-                             up manually)"
+                            "Box {box_name} was not removed within {bound:?}. Run \
+                             `min box rm --force {box_name}` to remove it."
                         ),
                     }
                 }
@@ -1508,7 +1521,15 @@ pub(crate) async fn run_entry(
     if let Some(arg) = misplaced_run_flag(&typed, &args.args) {
         return Err(RunFlagMisplaced::new(&args.entry, arg).into());
     }
-    // Same project-path resolution as `cmd_activate`: explicit path, then
+    // BCLI-042: `min task run` takes no `--path`. One typed after the task's
+    // name parses as a task argument, so the run refuses it here, before any
+    // box exists.
+    if args.verb == RunVerb::Task
+        && let Some(arg) = removed_task_path_flag(&typed, &args.args)
+    {
+        return Err(RunFlagMisplaced::removed_path(&args.entry, arg).into());
+    }
+    // Same project-path resolution as `activate_box`: explicit path, then
     // `-C`/`--repo-dir`, then the cwd.
     let effective_path = match (&args.path, &global.repo_dir) {
         (Some(p), _) => std::path::PathBuf::from(p),
@@ -1633,7 +1654,12 @@ pub(crate) async fn run_entry(
     // covers the expansion and the compose call that sends it.
     let entry_span = tracing::info_span!("box_entry", box_type = boxes::TASK_BOX_TYPE);
     let expanded = entry_span.in_scope(|| {
-        crate::task_box_entry(&upload_root, &args.entry, request.config.hooks_enabled)
+        crate::task_box_entry(
+            &upload_root,
+            &args.entry,
+            request.config.hooks_enabled,
+            Some(global),
+        )
     })?;
     put_task_spec(
         &mut request,
@@ -1642,6 +1668,12 @@ pub(crate) async fn run_entry(
         expanded.as_ref().map(|expanded| &expanded.spec),
         &args.other.vpn_network_names,
     )?;
+    // BOX-081, #3650: the run sends no proxy root certificate. So where no
+    // proxy serves boxes, the daemon refuses each brokered secret of the
+    // spec. The run refuses it here first, with exit 5, before a box exists.
+    // Interim until #3679: with no root certificate, the daemon refuses a
+    // brokered task secret also where a proxy serves boxes.
+    refuse_unserved_broker_secrets(request.spec.as_ref(), || crate::host_proxy_absence(global))?;
 
     // Loadouts and user policy, resolved before the daemon connection so a
     // broken loadout fails loudly client-side, and through the same shared
@@ -1674,7 +1706,7 @@ pub(crate) async fn run_entry(
         String::new()
     };
 
-    // Not `connect_daemon`: like `min session activate`, this creates a session
+    // Not `connect_daemon`: like `min session start`, this creates a session
     // and the version gate rides on that `CreateSession` rather than on a
     // `GetVersion` ahead of it.
     let mut client = crate::connect_daemon_unchecked(global).await?;
@@ -1691,15 +1723,20 @@ pub(crate) async fn run_entry(
         .await
         .map_err(|error| crate::session_rpc_failed(crate::SessionRpc::CreateSession, error))?;
     let created = match resp {
-        minimald_rpc::Errorable::Ok(r) => r,
-        minimald_rpc::Errorable::Err { error } => return Err(crate::create_refusal(error)),
+        minimald_rpc::CreateSessionReply::Ok(r) => r,
+        minimald_rpc::CreateSessionReply::Err {
+            error,
+            code,
+            exit_code,
+            hint,
+        } => return Err(crate::create_refusal(error, code, exit_code, hint)),
     };
     // A daemon too old to know the field ignored it and echoes no version;
     // that silence is the skew. Caught here, before the upload and the
     // finalize, with the record still unfinalized and reapable.
     minimal_client::ensure_version_reported(created.daemon_version.as_deref())?;
     let id = created.id;
-    // What `min session activate` prints once its box exists: the
+    // What `min session start` prints once its box exists: the
     // advisory for egress this host cannot enforce on a `host_ip` box, the
     // deny-all default note, and how a subnet flag is read. Best-effort: a
     // stderr that cannot take them must not fail a box that exists.
@@ -1785,7 +1822,7 @@ pub(crate) async fn run_entry(
         }
     };
 
-    // Pending gating: the same two lanes as `cmd_activate` — the
+    // Pending gating: the same two lanes as `activate_box` — the
     // interactive prompt on a real terminal, the collect-and-abort
     // `NoPromptHook` anywhere else (there is no `--no-prompt` flag here;
     // a non-TTY implies it).
@@ -2340,7 +2377,6 @@ mod tests {
         else {
             panic!("the argv is a task run");
         };
-        assert_eq!(run.path, None);
         assert_eq!(run.args, ["--path", "prod"]);
         // A run with no arguments adds no separator.
         let spec = task_box_spec(
@@ -3080,7 +3116,6 @@ mod tests {
         };
         let args = TaskRunArgs {
             task: "deploy".into(),
-            path: None,
             network: None,
             egress: crate::EgressArgs::default(),
             other: crate::BoxOverrideArgs::default(),
@@ -3130,7 +3165,6 @@ mod tests {
         };
         let args = TaskRunArgs {
             task: "build".into(),
-            path: None,
             network: None,
             egress: crate::EgressArgs::default(),
             other: crate::BoxOverrideArgs::default(),
@@ -3151,184 +3185,6 @@ mod tests {
             msg.contains("policy does not allow"),
             "names the gate: {msg}"
         );
-    }
-
-    /// A project on disk declaring `toml`, and a config dir whose
-    /// `user_policy.toml` holds `policy`, isolated from the developer's own.
-    fn session_run_fixture(
-        toml: &str,
-        policy: &str,
-    ) -> (tempfile::TempDir, tempfile::TempDir, GlobalArgs) {
-        let project = tempfile::tempdir().unwrap();
-        std::fs::write(project.path().join(mfile::MFILE_NAME), toml).unwrap();
-        let config = tempfile::tempdir().unwrap();
-        let minimal_dir = config.path().join("minimal");
-        std::fs::create_dir_all(&minimal_dir).unwrap();
-        std::fs::write(minimal_dir.join("user_policy.toml"), policy).unwrap();
-        let global = GlobalArgs {
-            config_dir: Some(config.path().to_path_buf()),
-            no_input: true,
-            ..Default::default()
-        };
-        (project, config, global)
-    }
-
-    fn utf8(dir: &tempfile::TempDir) -> &camino::Utf8Path {
-        camino::Utf8Path::from_path(dir.path()).unwrap()
-    }
-
-    const SESSION_RUN_TOML: &str = "[tasks.t778]\nexec = 'true'\n\
-        env_vars.X778 = { inherit = true }\nenv_vars.LIT778 = 'lit'\n";
-
-    /// inbox#778: `min session run` resolves the task's `inherit` against
-    /// this shell, as `min task run` does, and carries literals too, so the
-    /// daemon never reads its own environment for the task.
-    #[test]
-    fn session_run_resolves_an_allowed_inherit_from_this_shell() {
-        let (project, _config, global) =
-            session_run_fixture(SESSION_RUN_TOML, "[vars]\nallow = [\"X778\", \"LIT778\"]\n");
-
-        let out = session_run_task_env(&global, utf8(&project), "t778", |k| match k {
-            "X778" => Ok("x-from-shell".to_string()),
-            _ => Err(std::env::VarError::NotPresent),
-        })
-        .expect("an allowed, set inherit resolves");
-
-        assert_eq!(
-            out.set.get("X778").map(String::as_str),
-            Some("x-from-shell")
-        );
-        assert_eq!(out.set.get("LIT778").map(String::as_str), Some("lit"));
-        assert!(out.drop.is_empty());
-    }
-
-    /// inbox#778: the policy gate `min task run` passes applies to
-    /// `min session run` too. With no terminal, a name the policy does not
-    /// allow refuses the run naming the policy file, and nothing is read
-    /// out of the shell.
-    #[test]
-    fn session_run_refuses_a_name_the_policy_does_not_allow() {
-        let (project, config, global) =
-            session_run_fixture(SESSION_RUN_TOML, "[vars]\nallow = [\"LIT778\"]\n");
-
-        let err = session_run_task_env(&global, utf8(&project), "t778", |_| {
-            panic!("no value may be read before the policy allows it")
-        })
-        .expect_err("an unallowed name must refuse the run");
-
-        let msg = err.to_string();
-        assert!(msg.contains("task 't778'"), "names the task: {msg}");
-        assert!(
-            msg.contains("policy does not allow"),
-            "names the gate: {msg}"
-        );
-        assert!(msg.contains("X778"), "names the variable: {msg}");
-        let policy = config.path().join("minimal").join("user_policy.toml");
-        assert!(
-            msg.contains(&policy.display().to_string()),
-            "names the policy file: {msg}"
-        );
-    }
-
-    /// The daemon trims the task name it is sent, so the lookup does too:
-    /// a padded name still passes the gate rather than skipping it.
-    #[test]
-    fn session_run_gates_a_padded_task_name() {
-        let (project, _config, global) = session_run_fixture(SESSION_RUN_TOML, "[vars]\n");
-        let err = session_run_task_env(&global, utf8(&project), " t778 ", |_| {
-            panic!("nothing is read")
-        })
-        .expect_err("the padded name is the same task");
-        assert!(err.to_string().contains("policy does not allow"), "{err}");
-    }
-
-    /// A task the project on this host does not declare (one a stack
-    /// provides, or one added to the session's copy only), and a project
-    /// with no `minimal.toml` here, resolve to an empty set. The run goes
-    /// on, and the daemon, told the client resolved it, refuses any
-    /// `inherit` the task has rather than reading its own environment.
-    #[test]
-    fn session_run_resolves_nothing_for_a_task_this_host_does_not_declare() {
-        let (project, _config, global) = session_run_fixture(SESSION_RUN_TOML, "[vars]\n");
-        let out = session_run_task_env(&global, utf8(&project), "other", |_| {
-            panic!("nothing is read")
-        })
-        .unwrap();
-        assert!(out.is_empty(), "{out:?}");
-
-        let empty = tempfile::tempdir().unwrap();
-        let out =
-            session_run_task_env(&global, utf8(&empty), "t778", |_| panic!("nothing is read"))
-                .unwrap();
-        assert!(out.is_empty(), "{out:?}");
-    }
-
-    /// A `minimal.toml` for the session's project that is there but does
-    /// not parse is refused on the client, naming the file and its error,
-    /// as `min task run` refuses it. Read as "no file", it would surface
-    /// only as the daemon's refusal of an unanswered `inherit`.
-    #[test]
-    fn session_run_refuses_a_broken_minimal_toml() {
-        let (project, _config, global) = session_run_fixture("[tasks.t778\n", "[vars]\n");
-        let err = session_run_task_env(&global, utf8(&project), "t778", |_| {
-            panic!("nothing is read")
-        })
-        .expect_err("a file that does not parse must refuse the run");
-        let msg = err.to_string();
-        assert!(
-            msg.starts_with(&format!(
-                "found a broken {} in the session's project at {}",
-                mfile::MFILE_NAME,
-                utf8(&project),
-            )),
-            "names the file: {msg}"
-        );
-        assert!(
-            msg.contains("while resolving tasks: "),
-            "carries the cause: {msg}"
-        );
-    }
-
-    /// A name or value ssh cannot carry is refused in short sentences: what
-    /// was refused, why, and that `min task run` carries it, in a new box.
-    /// The name reads as written, without Debug quotes.
-    #[test]
-    fn session_run_refuses_a_var_ssh_cannot_carry() {
-        let mut env = minimald_rpc::taskenv::TaskEnv::default();
-        env.set.insert("OK".to_string(), "v".to_string());
-        ensure_carried_by_ssh("t", &env).expect("a plain name is carried");
-        env.set.insert("A=B".to_string(), "v".to_string());
-        let msg = ensure_carried_by_ssh("t", &env)
-            .expect_err("`=` cannot be carried")
-            .to_string();
-        assert_eq!(
-            msg,
-            "refused to run task 't' with `min session run`. Its variable `A=B` has `=` in \
-             its name, and `min session run` passes variables to the session in ssh's \
-             environment, which cannot hold it. `min task run t` can carry it, and runs \
-             the task in a new box instead of in the session."
-        );
-
-        let mut env = minimald_rpc::taskenv::TaskEnv::default();
-        env.set.insert("NUL".to_string(), "a\0b".to_string());
-        let msg = ensure_carried_by_ssh("t", &env)
-            .expect_err("a NUL cannot be carried")
-            .to_string();
-        assert!(
-            msg.contains("Its variable `NUL` has a NUL in its value,"),
-            "{msg}"
-        );
-
-        let mut env = minimald_rpc::taskenv::TaskEnv::default();
-        env.set.insert("N\0L".to_string(), "v".to_string());
-        let msg = ensure_carried_by_ssh("t", &env)
-            .expect_err("a NUL in a name cannot be carried")
-            .to_string();
-        assert!(
-            msg.contains(r"Its variable `N\u{0}L` has a NUL in its name,"),
-            "{msg}"
-        );
-        assert!(!msg.contains('\0'), "the NUL is escaped: {msg:?}");
     }
 
     /// `cmd_task_run` resolves a task's `env_vars` against the invoking
@@ -3366,7 +3222,6 @@ mod tests {
         };
         let args = TaskRunArgs {
             task: "build".into(),
-            path: None,
             network: None,
             egress: crate::EgressArgs::default(),
             other: crate::BoxOverrideArgs::default(),
@@ -3620,6 +3475,52 @@ mod tests {
                 .is_some(),
             "{refusal:?}"
         );
+    }
+
+    /// #3252: a `network` key that a task box does not apply, declared in
+    /// the task's own table or `[defaults.task]`, refuses the run and names
+    /// the key, the table and the next step. A key in `[defaults]` does not
+    /// refuse a task, and the task box drops it: the known gap of #3671.
+    #[test]
+    fn task_box_network_refuses_a_network_key_a_task_does_not_apply() {
+        let (_dir, project) = project_with(
+            "[tasks.build]\nexec = 'true'\n\n\
+             [tasks.build.network]\nmode = \"own_ip\"\nquic443 = \"block\"\n",
+        );
+        let refusal = box_network(&project, "build", None, &crate::EgressArgs::default())
+            .expect_err("quic443 on a task refuses the run");
+        assert_eq!(
+            refusal.to_string(),
+            "[tasks.build] in minimal.toml sets network.quic443, which is not applied to a \
+             task box. Remove network.quic443 from [tasks.build], and set it with \
+             `min task run --quic443 block build`."
+        );
+
+        let (_dir, defaults_task) =
+            project_with("[defaults.task.network]\nbep = { }\n\n[tasks.build]\nexec = 'true'\n");
+        let refusal = box_network(&defaults_task, "build", None, &crate::EgressArgs::default())
+            .expect_err("bep in [defaults.task] refuses the run");
+        assert_eq!(
+            refusal.to_string(),
+            "[defaults.task] in minimal.toml sets network.bep, which is not applied to a \
+             task box. Remove network.bep from [defaults.task]."
+        );
+
+        // The keys a task box applies, flat egress spellings included, run.
+        // The `lint` task runs with `[defaults.network] quic443 = "block"`
+        // dropped. That is the known gap of #3671, not a key correctly
+        // left out.
+        let (_dir, applied) = project_with(
+            "[defaults.network]\nquic443 = \"block\"\n\n\
+             [tasks.build]\nexec = 'true'\n\n\
+             [tasks.build.network]\nmode = \"own_ip\"\n\
+             egress_allow_dns = [\"build.example\"]\n\n\
+             [tasks.lint]\nexec = 'true'\n",
+        );
+        box_network(&applied, "build", None, &crate::EgressArgs::default())
+            .expect("mode and egress are applied");
+        box_network(&applied, "lint", None, &crate::EgressArgs::default())
+            .expect("a [defaults] key does not refuse a task");
     }
 
     /// arch#166: a list egress flag adds to the file's list, the file's
