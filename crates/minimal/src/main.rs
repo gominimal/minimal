@@ -270,7 +270,8 @@ fn answer_failure(
 /// refusal carries (`minimal::StartEntryRefusal`: 4 when the start does not
 /// find the entry, 2 when it cannot pick or start it), 2 when a start needs a terminal
 /// it does not have (`minimal::StartNeedsTerminal`) or asks for a held name
-/// (`minimal::StartNameHeld`), 124 when an exec ran past its own timeout
+/// (`minimal::StartNameHeld`), 2 when an attach cannot get its row back
+/// because another box holds the name (`minimal::RowNotBack`), 124 when an exec ran past its own timeout
 /// (`minimal::BoxExecTimedOut`) or a box ran past its own timeout or a
 /// `min box wait --timeout` ran out (`minimal::BoxTimedOut`), and 1, the unspecified error,
 /// for everything else — a refusal the host answered included. Both
@@ -355,6 +356,11 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     if e.downcast_ref::<minimal::StartNameHeld>().is_some() {
         return minimal::StartNameHeld::EXIT_CODE;
     }
+    // NET-138: an attach whose row did not come back; 2 when another box
+    // holds the name, 1 otherwise.
+    if let Some(refusal) = e.downcast_ref::<minimal::RowNotBack>() {
+        return refusal.exit_code();
+    }
     // BOX-163: a create under a name a running box holds.
     if e.downcast_ref::<minimald_rpc::HeldNameRefusal>().is_some() {
         return minimald_rpc::HeldNameRefusal::EXIT_CODE;
@@ -372,6 +378,11 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     // exits 3, as the start does.
     if e.downcast_ref::<minimal::SpecFileInvalid>().is_some() {
         return minimal::SpecFileInvalid::EXIT_CODE;
+    }
+    // A `network` key a task box does not apply is the project file
+    // refusing the command the same way, so it ends with exit 3 too.
+    if e.downcast_ref::<minimal::TaskNetworkUnapplied>().is_some() {
+        return minimal::TaskNetworkUnapplied::EXIT_CODE;
     }
     // BCLI-019, BCLI-020: `min type` of a project whose box types do not
     // load exits 3, and `min type show` of a name that is no type exits 4.
@@ -1518,6 +1529,21 @@ mod tests {
         assert_eq!(failure_exit_code(&err), 2, "{err:#}");
     }
 
+    /// An attach whose row did not come back ends with 2 when another box
+    /// holds its name, and with 1 otherwise (NET-138).
+    #[test]
+    fn row_not_back_exit_codes() {
+        let held = anyhow::Error::new(minimal::RowNotBack::NameHeld {
+            name: "web".to_string(),
+            held: "Web".to_string(),
+        });
+        assert_eq!(failure_exit_code(&held), 2, "{held:#}");
+        let not_back = anyhow::Error::new(minimal::RowNotBack::NotBack {
+            name: "web".to_string(),
+        });
+        assert_eq!(failure_exit_code(&not_back), 1, "{not_back:#}");
+    }
+
     /// BCLI-053: an exec that its own timeout ended ends the run with 124
     /// in both output modes, and a machine-mode run answers it with the
     /// `timeout` object. The exec refusals end with 2 and 5.
@@ -1876,6 +1902,26 @@ mod tests {
             error: mfile::Error::HarnessTable(None),
         };
         let e = anyhow::Error::new(invalid).context("activating the session");
+        assert_eq!(failure_exit_code(&e), 3);
+    }
+
+    /// #3252: a task's `minimal.toml` that sets a `network` key a task box
+    /// does not apply refuses the run with exit 3, the code an invalid
+    /// project file ends with, through the context the run adds over it.
+    /// `task`'s test of the same name proves the refusal names the key, the
+    /// table and the next step.
+    #[test]
+    fn task_network_key_a_task_does_not_apply_exits_3() {
+        let e = anyhow::Error::new(minimal::TaskNetworkUnapplied {
+            message: "[tasks.build] in minimal.toml sets network.quic443, which is \
+                      not applied to a task box."
+                .to_owned(),
+        })
+        .context("running the task");
+        assert_eq!(
+            failure_exit_code(&e),
+            minimal::TaskNetworkUnapplied::EXIT_CODE
+        );
         assert_eq!(failure_exit_code(&e), 3);
     }
 
