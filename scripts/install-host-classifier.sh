@@ -1636,9 +1636,10 @@ EOF_RANGES
 # name the rule carries, or says that the names match no program this step
 # knows. The names are a convention each program keeps, so the line says
 # the match is by name. A rule no name matches, whose packet-mark match
-# (ct_mark_conflicts_in) touches a range in WELL_KNOWN_MARK_RANGES, is said
-# to match that range instead. With "unowned" as $1 it prints only the
-# whole-mark rules that neither a name nor a range ties to a program.
+# (ct_mark_conflicts_in) has a mask inside a range in
+# WELL_KNOWN_MARK_RANGES, is said to match that range instead. With
+# "unowned" as $1 it prints only the whole-mark rules that neither a name
+# nor a range ties to a program.
 ct_mark_rule_owners() {
     RANGES="$WELL_KNOWN_MARK_RANGES" awk -v unowned="${1:-}" '
         function bit(v, x) { return int(v / x) % 2 == 1 }
@@ -1651,14 +1652,19 @@ ct_mark_rule_owners() {
             }
             return v
         }
-        # The well-known range the mask m shares a bit with, as
-        # "<component> <range>", or "" for none.
-        function range_of(m,  r, f, v, x) {
+        # The well-known range that holds every bit of the mask m, as
+        # "<component> <range>", or "" for none. A mask with a bit outside
+        # the range, or no bit at all, matches marks the range does not
+        # account for, so it names no range.
+        function range_of(m,  r, f, v, x, inside) {
+            if (m <= 0) return ""
             for (r = 1; r <= nranges; r++) {
                 if (split(ranges[r], f, " ") != 2) continue
                 v = hex(substr(f[2], 3))
+                inside = 1
                 for (x = 1; x < 4294967296; x *= 2)
-                    if (bit(v, x) && bit(m, x)) return f[1] " " f[2]
+                    if (bit(m, x) && !bit(v, x)) { inside = 0; break }
+                if (inside) return f[1] " " f[2]
             }
             return ""
         }
