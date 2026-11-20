@@ -263,7 +263,9 @@ fn answer_failure(
 /// more than one host, 4 when the address names no box, 7 when a host did
 /// not answer the lookup), the code a `min box exec` refusal carries
 /// (`minimal::BoxExecRefusal`: 2 for `-t` without a terminal or a box that
-/// is not running, 5 when its spec turns exec off), the code an `--exec
+/// is not running or stopped before the command started, 5 when its spec
+/// turns exec off or its network rules could not be applied to the
+/// command), the code an `--exec
 /// <id>` refusal of `min box stop`, `logs` or `wait` carries
 /// (`minimal::BoxExecIdRefusal`: 2 for text that is not an exec id, 4 for an
 /// exec the box does not have), the code a start
@@ -1597,7 +1599,25 @@ mod tests {
                 },
                 5,
             ),
-            (minimal::BoxExecRefusal::SpecUnreadable { target }, 5),
+            (
+                minimal::BoxExecRefusal::SpecUnreadable {
+                    target: target.clone(),
+                },
+                5,
+            ),
+            (
+                minimal::BoxExecRefusal::StoppedBeforeStart {
+                    target: target.clone(),
+                },
+                2,
+            ),
+            (
+                minimal::BoxExecRefusal::NetworkRulesNotApplied {
+                    target,
+                    cause: "Permission denied (os error 13)".to_string(),
+                },
+                5,
+            ),
         ] {
             assert_eq!(failure_exit_code(&anyhow::Error::new(refusal)), code);
         }

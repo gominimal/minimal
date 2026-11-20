@@ -13241,6 +13241,85 @@ async fn box_exec_runs_command_and_exits_with_its_code() {
     }
 }
 
+// NET-079: an exec whose injection could not join the box's classifier leaf
+// never ran its command. The daemon's one line and exit code become the
+// CLI's own refusal: exit 2 when the box stopped before the command
+// started, exit 5 when the box's network rules could not be applied to it,
+// with the error the host met and `min bug` as the next step. The same line
+// under another exit code is the command's own stderr.
+#[tokio::test]
+async fn box_exec_reports_an_injection_that_never_started_as_a_refusal() {
+    use minimald_rpc::exec::{INJECTION_BOX_STOPPED_TEXT, INJECTION_UNPLACED_TEXT};
+
+    let unplaced = format!("{INJECTION_UNPLACED_TEXT}: Permission denied (os error 13).\n");
+    for (line, code, message) in [
+        (
+            INJECTION_BOX_STOPPED_TEXT.to_string(),
+            2,
+            "web stopped before the command started.",
+        ),
+        (
+            unplaced.clone(),
+            5,
+            "Did not run the command in web: the host could not apply the box's network \
+             rules to it: Permission denied (os error 13). If it keeps failing, run \
+             `min bug` to collect a diagnostic bundle.",
+        ),
+    ] {
+        let (run, _) = run_scripted_exec(
+            &box_exec_request("web", &[], &["make"]),
+            vec![answer(b"", line.as_bytes(), code)],
+        )
+        .await;
+        assert_eq!(u32::from(run.exit), code, "{run}");
+        assert_eq!(run.message().as_deref(), Some(message), "{run}");
+        assert_eq!(run.stdout, "", "{run}");
+        assert_eq!(run.stderr, "", "no other words\n{run}");
+
+        // One stderr write can arrive as two messages: the line split across
+        // them is still the refusal.
+        let (head, tail) = line.as_bytes().split_at(line.len() / 2);
+        let mut split = answer(b"", head, code);
+        split.msgs.insert(
+            1,
+            russh::ChannelMsg::ExtendedData {
+                data: tail.to_vec().into(),
+                ext: 1,
+            },
+        );
+        let (run, _) =
+            run_scripted_exec(&box_exec_request("web", &[], &["make"]), vec![split]).await;
+        assert_eq!(u32::from(run.exit), code, "split\n{run}");
+        assert_eq!(run.message().as_deref(), Some(message), "split\n{run}");
+        assert_eq!(run.stderr, "", "split: no other words\n{run}");
+    }
+
+    for line in [INJECTION_BOX_STOPPED_TEXT, unplaced.as_str()] {
+        let (run, _) = run_scripted_exec(
+            &box_exec_request("web", &[], &["make"]),
+            vec![answer(b"", line.as_bytes(), 1)],
+        )
+        .await;
+        assert_eq!(run.exit, 1, "{run}");
+        assert!(run.error.is_none(), "{run}");
+        assert_eq!(run.stderr, line, "{run}");
+    }
+
+    // The same line with a control character in the error is not the
+    // daemon's, even under exit 5: it stays the command's own stderr.
+    for cause in ["\x1b[31mPermission denied", "Permission denied\r"] {
+        let line = format!("{INJECTION_UNPLACED_TEXT}: {cause}.\n");
+        let (run, _) = run_scripted_exec(
+            &box_exec_request("web", &[], &["make"]),
+            vec![answer(b"", line.as_bytes(), 5)],
+        )
+        .await;
+        assert_eq!(run.exit, 5, "{cause:?}\n{run}");
+        assert!(run.error.is_none(), "{cause:?}\n{run}");
+        assert_eq!(run.stderr, line, "{cause:?}\n{run}");
+    }
+}
+
 // BCLI-053: `min box exec -t` with a stdin that is not a terminal is refused
 // with exit 2 before the box resolves. The refusal says why and what to do,
 // and no exec starts in the box.
