@@ -3185,7 +3185,13 @@ async fn start_typed_session_entry_stores_its_own_body() {
     // it.
     let (_state, mut global, server) = show_network_daemon().await;
     global.repo_dir = Some(project.path().to_path_buf());
-    let (request, _) = &specs[0];
+    // dev grants the GitHub secret DEV_TOKEN, so the daemon creates the box
+    // only when a Box Egress Proxy serves it. The activation hands the
+    // proxy's root certificate with the grant, as on a host with a proxy.
+    let mut request = specs[0].0.clone();
+    request.config.root_certificate =
+        Some("-----BEGIN CERTIFICATE-----\nUk9PVA==\n-----END CERTIFICATE-----\n".to_owned());
+    let request = &request;
     let id = create_box_from(&server, request).await;
     let id_text = id.to_string();
     let stored = box_spec_text(&global, &["min", "box", "spec", &id_text, "-o", "json"])
