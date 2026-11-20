@@ -259,6 +259,10 @@ fn every_daemon_connection_is_classified() {
             // the same ride-along shape `resolve_session_version_gated` uses.
             "attach.rs::box_record_on = gated",
             "cmd/admin.rs::cmd_version = ungated",
+            // Not a daemon connection: `min box audit` reads the audit
+            // records from the Box Egress Proxy over its control socket. The
+            // proxy is not the daemon, and the read builds nothing.
+            "cmd/box_audit.rs::open = ungated",
             // A box address reaches every local host, split as `min box
             // list` splits it: the selected host is the one this process
             // ensured, so it keeps the gate. The others are probed ungated,
@@ -372,6 +376,9 @@ fn every_daemon_connection_is_classified() {
             "tests.rs::an_identity_with_no_root_validity_mints_nothing = ungated",
             "tests.rs::attach_fall_through_hands_off_the_owning_vm = gated",
             "tests.rs::attach_refuses_a_box_name_two_vms_know = gated",
+            // Test-only: the audit read test serves its own proxy control
+            // socket, so no daemon is involved.
+            "tests.rs::box_audit_reads_over_the_proxy_socket = ungated",
             "tests.rs::exec_fall_through_hands_off_the_owning_vm = gated",
             "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy = ungated",
             "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy = ungated",
