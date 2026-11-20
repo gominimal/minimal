@@ -2029,6 +2029,15 @@ pub(crate) fn task_box_entry(
     .map(Some)
 }
 
+/// Whether `name` is a secret grant's variable name: `[A-Z_][A-Z0-9_]*`.
+fn is_secret_variable_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_uppercase() || first == '_')
+        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
 /// The wire's `env_vars` from the expanded spec's `env_vars` (BOX-205),
 /// whole and by name. `None` when the spec sets no `env_vars`. The
 /// expansion already refused a name that is not POSIX-shaped (BOX-207), so
@@ -2813,11 +2822,10 @@ pub(crate) fn check_github_grants(
     }
     // BEP-007: each grant's name becomes a variable in the box's
     // environment, so a name that is not one is refused before anything
-    // is created.
-    if let Some(grant) = grants
-        .iter()
-        .find(|grant| boxes::core::primitives::StrictVarName::try_new(grant.as_str()).is_err())
-    {
+    // is created. A secret name keeps the capital-letter rule: the
+    // lower-case names that `env_vars` accepts (BOX-207) do not cover
+    // `[secrets]`, which gominimal/arch#185 decides.
+    if let Some(grant) = grants.iter().find(|grant| !is_secret_variable_name(grant)) {
         return Err(GrantNotDelivered::InvalidName {
             grant: grant.clone(),
         }

@@ -1366,7 +1366,9 @@ mod tests {
 
     #[test]
     fn strict_rejects_non_posix_shapes() {
-        for n in ["", "1FOO", "1foo", "FOO-BAR", "FOO BAR", "FOO=BAR", "foo.bar"] {
+        for n in [
+            "", "1FOO", "1foo", "FOO-BAR", "FOO BAR", "FOO=BAR", "foo.bar",
+        ] {
             assert!(StrictVarName::try_new(n).is_err(), "accepted: {n}");
         }
     }

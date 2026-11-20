@@ -527,7 +527,10 @@ mod tests {
         assert_eq!(wire_entry["env_vars"]["EDITOR"], "vi");
         assert!(wire_entry["env_vars"].get("http_proxy").is_some());
         assert!(wire_entry.get("vars").is_none(), "got: {wire_entry}");
-        assert!(wire_entry.get("vars_lenient").is_none(), "got: {wire_entry}");
+        assert!(
+            wire_entry.get("vars_lenient").is_none(),
+            "got: {wire_entry}"
+        );
         assert_eq!(round_trip(&c), c);
     }
 }
