@@ -286,7 +286,7 @@ The stop is **graceful first**. A `min` from a release with `min host stop`
 has no bare `min stop` (BCLI-042). `min host stop <host>` ends each running box
 on its host and asks nothing, so the installer makes its own running-box check
 first: `<bin>/min box list --all -o json`. A box in state `running` refuses the
-graceful stop. A listing that fails refuses it too. So does a listing that could
+graceful stop. A listing that fails refuses it too. So does a listing that did
 not reach a host: `min box list` then exits 0 but leaves that host's boxes out.
 A listing that is not complete proves nothing, and this refusal says that the
 daemon did not list its boxes. When no box runs, the installer runs
@@ -452,7 +452,7 @@ both hash columns in place of digests.
   non-zero, names the escape hatch and stops nothing. `--force-stop` runs
   `host stop --force local0` and asks nothing. A host that is already stopped
   is not stopped again.
-- **Test** (R5.5): a box listing that fails, and one that exits 0 but could not
+- **Test** (R5.5): a box listing that fails, and one that exits 0 but did not
   reach a host, both make the installer say that the daemon did not list its
   boxes. With no terminal, the upgrade exits non-zero, stops nothing and
   installs nothing.
