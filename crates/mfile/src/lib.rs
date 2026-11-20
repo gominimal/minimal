@@ -6479,29 +6479,26 @@ bash = \"true\"
         }
     }
 
-    /// The keys named `vars` or `vars_lenient` in a schema sketch, read
-    /// from its table headers and the dotted keys before each `=`.
-    fn retired_var_keys_in_sketch(body: &str) -> Vec<String> {
-        let mut found = Vec::new();
-        for line in body.lines() {
-            let line = line.split('#').next().unwrap_or("").trim();
-            let key = if line.starts_with('[') {
-                line.trim_matches(|c| c == '[' || c == ']')
-            } else if let Some((key, _)) = line.split_once('=') {
-                key
-            } else {
-                continue;
+    /// A schema sketch made into toml: each `<placeholder>` becomes its
+    /// bare name and each `, ...` list tail goes away. Anything else that
+    /// does not parse stays an error.
+    fn fill_sketch_placeholders(body: &str) -> String {
+        let mut filled = String::new();
+        let mut rest = body.replace(", ...", "");
+        while let Some(open) = rest.find('<') {
+            let Some(len) = rest[open..].find('>') else {
+                break;
             };
-            let segments: Vec<&str> = key.split('.').map(str::trim).collect();
-            let named = segments
-                .iter()
-                .take_while(|segment| **segment != "env_vars")
-                .any(|segment| *segment == "vars" || *segment == "vars_lenient");
-            if named {
-                found.push(key.trim().to_owned());
+            let name = &rest[open + 1..open + len];
+            if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == ' ') {
+                break;
             }
+            filled.push_str(&rest[..open]);
+            filled.push_str(&name.replace(' ', "_"));
+            rest = rest[open + len + 1..].to_owned();
         }
-        found
+        filled.push_str(&rest);
+        filled
     }
 
     // BOX-205, BOX-206: the reference pages set variables in `env_vars`
@@ -6513,19 +6510,13 @@ bash = \"true\"
             let examples = reference_doc_toml_examples(page);
             assert!(!examples.is_empty(), "{page}: no toml examples");
             for (line, body) in examples {
+                // A schema sketch with `<placeholder>` values is not toml
+                // until its placeholders are filled in. It must parse then.
+                let value = toml::from_str::<toml::Value>(&body)
+                    .or_else(|_| toml::from_str(&fill_sketch_placeholders(&body)))
+                    .unwrap_or_else(|e| panic!("{page}:{line}: the example does not parse: {e}"));
                 let mut found = Vec::new();
-                match toml::from_str::<toml::Value>(&body) {
-                    Ok(value) => retired_var_keys(&value, "", &mut found),
-                    // A schema sketch with `<placeholder>` values is not
-                    // toml. Read its keys line by line instead.
-                    Err(e) => {
-                        assert!(
-                            body.contains('<'),
-                            "{page}:{line}: the example does not parse: {e}"
-                        );
-                        found = retired_var_keys_in_sketch(&body);
-                    }
-                }
+                retired_var_keys(&value, "", &mut found);
                 assert!(
                     found.is_empty(),
                     "{page}:{line}: the example sets {found:?}, not env_vars"
