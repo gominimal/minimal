@@ -1108,14 +1108,15 @@ async fn create_rejects_bad_dynamic_range() {
         (&["--dynamic-range", "8000-8443"][..], "--dynamic-ingress"),
     ] {
         let mut argv = vec![
-            "session",
-            "activate",
+            "-C",
             project_path,
+            "session",
+            "start",
+            "--detach",
             "--name",
             "bad-range",
             "--network",
             "own_ip",
-            "--no-input",
         ];
         argv.extend(extra.iter().copied());
         let out = run_min(&args, &argv).await;
@@ -1336,10 +1337,9 @@ async fn activate_prints_no_session_id_when_composition_fails() {
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .arg("--no-input")
-        .args(["session", "activate"])
-        .arg(&project_canon)
-        .args(["--name", "composition-failure", "--sync", "tarball"])
-        .arg("--no-prompt")
+        .args(["-C".as_ref(), project_canon.as_os_str()])
+        .args(["session", "start", "--detach"])
+        .args(["--name", "composition-failure"])
         .output()
         .await
         .expect("the min binary should be invocable");
@@ -1392,10 +1392,9 @@ async fn refused_activation(verdict: minimald::server::UsernsRestriction) -> Str
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .arg("--no-input")
-        .args(["session", "activate"])
-        .arg(&project_canon)
-        .args(["--name", "refused-sandbox", "--sync", "tarball"])
-        .arg("--no-prompt")
+        .args(["-C".as_ref(), project_canon.as_os_str()])
+        .args(["session", "start", "--detach"])
+        .args(["--name", "refused-sandbox"])
         .output()
         .await
         .expect("the min binary should be invocable");
@@ -1539,8 +1538,8 @@ async fn refused_task_run(verdict: minimald::server::UsernsRestriction) -> Strin
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .arg("--no-input")
+        .args(["-C".as_ref(), project_canon.as_os_str()])
         .args(["task", "run", "e2e-echo"])
-        .args(["--path".as_ref(), project_canon.as_os_str()])
         .output()
         .await
         .expect("the min binary should be invocable");
@@ -3193,14 +3192,13 @@ async fn deny_all_in_force_note_printed() {
     .unwrap();
     let activate = |name: &'static str, extra: &'static [&'static str]| {
         let mut argv = vec![
-            "session",
-            "activate",
+            "-C",
             project.path().to_str().unwrap(),
+            "session",
+            "start",
+            "--detach",
             "--name",
             name,
-            "--sync",
-            "tarball",
-            "--no-prompt",
         ];
         argv.extend_from_slice(extra);
         argv
@@ -3479,14 +3477,13 @@ async fn listener_failure_reported_with_remedy() {
     let activate_stderr = run_min_stderr(
         &args,
         &[
-            "session",
-            "activate",
+            "-C",
             project.path().to_str().unwrap(),
+            "session",
+            "start",
+            "--detach",
             "--name",
             "remedy-report",
-            "--sync",
-            "tarball",
-            "--no-prompt",
         ],
     )
     .await;
@@ -3754,14 +3751,13 @@ async fn activate_and_ls_report_native_surface() {
     let activate_stderr = run_min_stderr(
         &args,
         &[
-            "session",
-            "activate",
+            "-C",
             project.path().to_str().unwrap(),
+            "session",
+            "start",
+            "--detach",
             "--name",
             "native-surface",
-            "--sync",
-            "tarball",
-            "--no-prompt",
         ],
     )
     .await;
@@ -5166,9 +5162,9 @@ async fn activate_own_ip_on_vm_host<G>(
         .args(["--minimal-dir".as_ref(), state.path().as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .args(["--provider", "local-minvmd", "--no-input"])
-        .args(["session", "activate"])
-        .arg(project.path())
-        .args(["--name", "web", "--network", "own_ip", "--no-prompt"])
+        .args(["-C".as_ref(), project.path().as_os_str()])
+        .args(["session", "start", "--detach"])
+        .args(["--name", "web", "--network", "own_ip"])
         .output()
         .await
         .expect("the min binary should be invocable")
