@@ -112,18 +112,22 @@ impl std::error::Error for NetworkFlagRefusal {}
 
 /// Refuses a `network.ingress` from `minimal.toml` on a box that is not
 /// `own_ip`, as [`refuse_ingress_off_own_ip`] refuses `--ingress`. `layer`
-/// is the table that declares the entry's `network` (#3238).
+/// is the table that sets the entry's `network.ingress` (#3238), and
+/// `mode_layer` the table that sets its `network.mode`, when one does. The
+/// two can differ, because `network` merges by key (gominimal/arch#188).
 fn refuse_file_ingress_off_own_ip(
     network: crate::cli::CliNetworkMode,
     network_flagged: bool,
     has_ingress: bool,
     layer: Option<&str>,
+    mode_layer: Option<&str>,
 ) -> Result<(), anyhow::Error> {
     if network == crate::cli::CliNetworkMode::OwnIp || !has_ingress {
         return Ok(());
     }
     let mode = boxes::NetworkMode::from(network).word();
     let layer = layer.unwrap_or("[network]");
+    let mode_layer = mode_layer.unwrap_or(layer);
     let file = mfile::MFILE_NAME;
     if network_flagged {
         anyhow::bail!(
@@ -134,7 +138,7 @@ fn refuse_file_ingress_off_own_ip(
     }
     anyhow::bail!(
         "{layer} in {file} sets network.ingress, but the box is {mode}, so it cannot publish \
-         ports. Set network.mode = \"own_ip\" in {layer}, or run the command again with \
+         ports. Set network.mode = \"own_ip\" in {mode_layer}, or run the command again with \
          --network own_ip."
     )
 }
@@ -173,13 +177,14 @@ pub(crate) fn session_box_network(
         network,
         network_flagged,
         !file_mappings.is_empty(),
-        project.layer.as_deref(),
+        project.ingress_layer.as_deref(),
+        project.mode_layer.as_deref(),
     )?;
     tracing::debug!(
         network = boxes::NetworkMode::from(network).word(),
         file_mappings = file_mappings.len(),
         flag_mappings = flag_mappings.len(),
-        layer = ?project.layer,
+        layer = ?project.ingress_layer,
         "the session box takes the entry's network.ingress and the --ingress mappings"
     );
     Ok((network, union_ingress(file_mappings, flag_mappings)))
@@ -1332,12 +1337,19 @@ pub(crate) struct ProjectEgress {
     /// layer sets the key. A session box takes them, and each `--ingress`
     /// adds one mapping after them (#3238).
     pub(crate) ingress: Option<Vec<boxes::PortMapping>>,
-    /// The table whose `network` the expanded entry holds, as the file
-    /// names it: `[defaults]`, `[defaults.<type>]` or the entry's own, such
-    /// as `[tasks.build]`. A later layer replaces the whole `network` table
-    /// of an earlier one, so one table holds all of it. `None` when no
+    /// The table that set the expanded entry's `network.egress`, as the
+    /// file names it: `[defaults]`, `[defaults.<type>]` or the entry's own,
+    /// such as `[tasks.build]`. The `network` table merges by key, so each
+    /// key can come from its own layer (gominimal/arch#188). With no
+    /// egress, the last table that declares `network`. `None` when no
     /// layer declares `network`.
     pub(crate) layer: Option<String>,
+    /// The table that set the expanded entry's `network.mode`, named as
+    /// [`ProjectEgress::layer`] names a table. `None` when no layer sets it.
+    pub(crate) mode_layer: Option<String>,
+    /// The table that set the expanded entry's `network.ingress`, named as
+    /// [`ProjectEgress::layer`] names a table. `None` when no layer sets it.
+    pub(crate) ingress_layer: Option<String>,
 }
 
 /// The loadout mode of the session box a start creates, from the project
@@ -1665,9 +1677,9 @@ pub(crate) fn entry_egress(
         body: network_of(&entry.body),
         ..entry
     };
-    // The merge replaces a table whole, so the last layer that declares
-    // `network` holds the expanded entry's `network` table.
-    let layer = if !entry.body.is_empty() {
+    // The last layer that declares `network`, for a key whose layer the
+    // report does not name.
+    let last_layer = if !entry.body.is_empty() {
         format!("[{}.{}]", entry.table.key(), entry.name)
     } else if !layers.defaults_type.is_empty() {
         format!(
@@ -1685,6 +1697,27 @@ pub(crate) fn entry_egress(
     // start with exit 3, as every invalid `minimal.toml` does.
     let hints = mfile::network::canonicalize(&mut expansion.spec)
         .map_err(|error| network_key_invalid(&expansion.spec, error))?;
+    // The merge keeps each key below `network` from the layer that set it
+    // (gominimal/arch#188), so each key names its own table.
+    let layer_of = |key: &str| {
+        expansion
+            .report
+            .network
+            .get(key)
+            .and_then(|origin| network_layer_words(origin, &entry))
+    };
+    // A flat `egress_*` key, which `canonicalize` folded into `egress`,
+    // sets egress too. The merge keeps only one layer of them.
+    let layer = std::iter::once("egress")
+        .chain(
+            mfile::network::FLAT_EGRESS_KEYS
+                .iter()
+                .map(|(flat, _)| *flat),
+        )
+        .find_map(layer_of)
+        .unwrap_or_else(|| last_layer.clone());
+    let mode_layer = layer_of("mode");
+    let ingress_layer = layer_of("ingress");
     let network = expansion.spec.get("network");
     // `canonicalize` has rewritten a legacy spelling and refused a value
     // that is not a mode, so the word is a current one.
@@ -1708,6 +1741,8 @@ pub(crate) fn entry_egress(
             mode,
             ingress,
             layer: Some(layer),
+            mode_layer,
+            ingress_layer,
         });
     };
     let mut egress: boxes::EgressPolicy =
@@ -1725,7 +1760,27 @@ pub(crate) fn entry_egress(
         mode,
         ingress,
         layer: Some(layer),
+        mode_layer,
+        ingress_layer,
     })
+}
+
+/// The minimal.toml table of `origin`, a layer that [`entry_egress`]
+/// reads. `None` for a layer that the read does not hold.
+fn network_layer_words(
+    origin: &mfile::expand::Origin,
+    entry: &mfile::entry::BoxEntry,
+) -> Option<String> {
+    use mfile::expand::Layer;
+    match origin.layer {
+        Layer::Entry => Some(format!("[{}.{}]", entry.table.key(), entry.name)),
+        Layer::DefaultsType => Some(format!(
+            "[defaults.{}]",
+            entry.box_type.as_deref().unwrap_or_default()
+        )),
+        Layer::Defaults => Some("[defaults]".to_owned()),
+        _ => None,
+    }
 }
 
 /// One `network.ingress` item of a `minimal.toml`, as `box.toml` writes it:

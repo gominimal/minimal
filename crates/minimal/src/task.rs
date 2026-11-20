@@ -271,7 +271,7 @@ fn task_box_network(
     );
     let (mode, mode_layer) = match (network, project_egress.mode) {
         (Some(flag), _) => (flag.into(), None),
-        (None, Some(mode)) => (mode, project_egress.layer.clone()),
+        (None, Some(mode)) => (mode, project_egress.mode_layer.clone()),
         (None, None) => (
             crate::parse_network_mode(crate::NETWORK_DEFAULT)
                 .map_err(anyhow::Error::msg)?
