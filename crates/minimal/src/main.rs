@@ -726,6 +726,11 @@ fn machine_output_mode(cli: &minimal::Cli) -> bool {
         Some(minimal::Command::Box(minimal::BoxArgs {
             command: minimal::BoxCommand::Show(args),
         })) => args.output.is_some(),
+        // BCLI-013, BCLI-033: a `min box wait -o json` failure, a
+        // `wait_timeout` among them, is one `min/v1/error` object.
+        Some(minimal::Command::Box(minimal::BoxArgs {
+            command: minimal::BoxCommand::Wait(args),
+        })) => args.output.is_some(),
         // BCLI-019, BCLI-020: `min type list|show -o json|yaml|toml`.
         Some(minimal::Command::Type(minimal::TypeArgs {
             command: minimal::TypeCommand::List(minimal::TypeListArgs { output }),
