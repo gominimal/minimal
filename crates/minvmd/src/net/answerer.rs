@@ -162,6 +162,25 @@ pub fn hook_port_from_raw(raw: Option<&str>) -> Result<u16, String> {
     }
 }
 
+/// [`hook_port_from_raw`] for the variable as the environment holds it. A
+/// value that is not Unicode is an error like any other value that is not a
+/// port: only an absent variable selects [`DEFAULT_ANSWERER_PORT`].
+///
+/// # Errors
+///
+/// Returns the message to fail the start with when `raw` is not a port.
+pub fn hook_port_from_os(raw: Option<&std::ffi::OsStr>) -> Result<u16, String> {
+    match raw {
+        None => hook_port_from_raw(None),
+        Some(raw) => match raw.to_str() {
+            Some(text) => hook_port_from_raw(Some(text)),
+            None => Err(format!(
+                "environment variable {ANSWERER_PORT_ENV} carries {raw:?}, which is not a port"
+            )),
+        },
+    }
+}
+
 /// Resolves the answerer's hook port from this process's environment and
 /// records it as the one every reader in this process uses
 /// ([`hook_port`]). The supervisor calls it once, before anything reads
@@ -174,7 +193,7 @@ pub fn hook_port_from_raw(raw: Option<&str>) -> Result<u16, String> {
 /// something that is not a port, or when this process already resolved a
 /// different port.
 pub fn configure_hook_port() -> Result<u16, String> {
-    let port = hook_port_from_raw(std::env::var(ANSWERER_PORT_ENV).ok().as_deref())?;
+    let port = hook_port_from_os(std::env::var_os(ANSWERER_PORT_ENV).as_deref())?;
     let recorded = *HOOK_PORT.get_or_init(|| port);
     if recorded != port {
         return Err(format!(
@@ -6764,6 +6783,25 @@ mod tests {
             zero.contains("0 is not a port to pin") && zero.contains("7656"),
             "the refusal of 0 says why and names the default, got: {zero}"
         );
+    }
+
+    /// A value that is not Unicode is refused like any other value that is
+    /// not a port, with the variable named. It never falls back to the
+    /// default: only an absent variable does.
+    #[cfg(unix)]
+    #[test]
+    fn hook_port_refuses_a_value_that_is_not_unicode() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let raw = OsStr::from_bytes(b"76\xff56");
+        let err = hook_port_from_os(Some(raw)).expect_err("a value that is not Unicode is refused");
+        assert!(
+            err.contains(ANSWERER_PORT_ENV) && err.contains("which is not a port"),
+            "the refusal names the variable, got: {err}"
+        );
+        assert_eq!(hook_port_from_os(None), Ok(DEFAULT_ANSWERER_PORT));
+        assert_eq!(hook_port_from_os(Some(OsStr::new("17656"))), Ok(17656));
     }
 
     /// Two answerers on different pinned hook ports both bind and both
