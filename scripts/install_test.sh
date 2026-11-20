@@ -120,6 +120,11 @@ printf '%s %s\n' "${MIN_PROVIDER:-unset}" "${1:-}" >>"$HOME/min.provider"
 # nothing.
 _pre_provider=0
 grep -q '^# mock min (pre-provider)' "$0" && _pre_provider=1
+# The "host-stop" label stands for a `min` with `min host stop` and no bare
+# `min stop`. Its host local0 runs while $HOME/host.running exists. A local-box
+# host, the box `min` runs in, always runs, and the installer never stops it.
+_host_stop=0
+grep -q '^# mock min (host-stop)' "$0" && _host_stop=1
 _on_vm=0
 if [ "$_pre_provider" -eq 0 ]; then
     case "${MIN_PROVIDER:-}" in
@@ -208,8 +213,51 @@ case "${1:-}" in
             printf 'session-alpha  running\n'
         fi
         ;;
+    host)
+        if [ "$_host_stop" -eq 0 ]; then
+            echo "error: unrecognized subcommand 'host'" >&2
+            exit 2
+        fi
+        case "${2:-}" in
+            list)
+                printf 'HOST             PROVIDER       STATE\n'
+                if [ -f "$HOME/host.running" ]; then
+                    printf 'local0           local          running\n'
+                else
+                    printf 'local0           local          stopped\n'
+                fi
+                printf 'box0             local-box      running\n'
+                printf 'note: a stand-in note line after the rows\n'
+                ;;
+            stop)
+                [ "${3:-}" = --help ] && exit 0
+                printf '%s\n' "$*" >>"$HOME/stop.calls"
+                # `min host stop` stops every running box, then the daemon.
+                rm -f "$HOME/host.running" "$HOME/daemon.running" \
+                    "$HOME/sessions.live" "$HOME/sessions.ids"
+                ;;
+            *) echo "mock min: no such host verb: ${2:-}" >&2; exit 2 ;;
+        esac
+        ;;
+    box)
+        # `box list --all -o json`: session-alpha runs while sessions are
+        # live. $HOME/boxlist.fail: the listing fails.
+        if [ -f "$HOME/boxlist.fail" ]; then
+            echo "error: the daemon runs another build" >&2
+            exit 1
+        fi
+        if [ -f "$HOME/sessions.live" ]; then
+            printf '[\n  {\n    "id": "session-alpha",\n    "state": "running"\n  }\n]\n'
+        else
+            printf '[\n  {\n    "id": "session-beta",\n    "state": "stopped"\n  }\n]\n'
+        fi
+        ;;
     stop)
         printf '%s\n' "$*" >>"$HOME/stop.calls"
+        if [ "$_host_stop" -eq 1 ]; then
+            echo "error: unrecognized subcommand 'stop'" >&2
+            exit 2
+        fi
         if [ -f "$HOME/sessions.live" ] && [ "${2:-}" != "--force" ]; then
             echo "daemon has active sessions; pass --force to shut down anyway" >&2
             exit 1
@@ -2119,6 +2167,93 @@ stop" "$(cat "$HL12/stop.calls")" \
     check 0 "$rc" "an upgrade that leaves the native daemon running exits 0 (R5.5)"
     want_ok "the advice names the native provider (R5.5)" \
         grep -qF "run 'min --provider local stop' after those sessions end, or 'min --provider local stop --force' to end them now." "$OUT"
+
+    # A `min` with `min host stop` has no bare `min stop`. The installer stops
+    # each local host that runs with `min host stop <host>`, after its own
+    # check for running boxes, since `min host stop` refuses nothing.
+    stage_host_stop_upgrade() {
+        run "$2_seed" "$1"
+        check 0 "$rc" "$2: seed install exits 0"
+        printf 'stale\n' >"$1/bin/minimald"
+        write_min_stub "$1/bin/min" host-stop
+        : >"$1/host.running"
+        rm -f "$1/stop.calls"
+    }
+
+    # No box runs: one graceful `min host stop local0`, no question, and the
+    # host of the box `min` runs in is left alone.
+    HS1="$root/hs1"; mkdir -p "$HS1"
+    stage_host_stop_upgrade "$HS1" hoststop
+    run hoststop "$HS1"
+    check 0 "$rc" "an upgrade with min host stop exits 0 (BCLI-042)"
+    check "host stop local0" "$(cat "$HS1/stop.calls")" \
+        "the upgrade stops the host by name, gracefully (BCLI-042)"
+    want_err "no question when no box runs (BCLI-042)" grep -q "Continue?" "$OUT"
+    check "$h_minimald" "$(hash_file "$HS1/bin/minimald")" "the upgrade completes (BCLI-042)"
+
+    # A running box: the installer's own check refuses the graceful stop,
+    # lists the sessions and asks. A yes forces the host stop.
+    HS2="$root/hs2"; mkdir -p "$HS2"
+    stage_host_stop_upgrade "$HS2" hoststopyes
+    : >"$HS2/sessions.live"
+    printf 'y\n' >"$root/tty-yes-hs2"
+    TTY_FILE="$root/tty-yes-hs2"
+    run hoststopyes "$HS2"
+    TTY_FILE=
+    check 0 "$rc" "a confirmed upgrade with min host stop exits 0 (BCLI-042)"
+    want_ok "the running sessions are listed (BCLI-042)" grep -q "session-alpha" "$OUT"
+    want_ok "the user is asked before a running box ends (BCLI-042)" grep -q "Continue?" "$OUT"
+    check "host stop --force local0" "$(cat "$HS2/stop.calls")" \
+        "no host is stopped before the yes, then the forced host stop (BCLI-042)"
+
+    # A running box and no terminal: abort, name the escape hatch, stop nothing.
+    HS3="$root/hs3"; mkdir -p "$HS3"
+    stage_host_stop_upgrade "$HS3" hoststopnotty
+    : >"$HS3/sessions.live"
+    run hoststopnotty "$HS3"
+    check 1 "$rc" "an unconfirmable upgrade with min host stop aborts (BCLI-042)"
+    want_ok "the abort names the escape hatch (BCLI-042)" grep -q -- "--force-stop" "$OUT"
+    want_err "no host is stopped without consent (BCLI-042)" test -e "$HS3/stop.calls"
+    check "stale" "$(cat "$HS3/bin/minimald")" "nothing is installed without consent (BCLI-042)"
+
+    # A box listing that fails proves nothing: the installer asks, and says
+    # why, instead of a stop that can end a running box.
+    HS4="$root/hs4"; mkdir -p "$HS4"
+    stage_host_stop_upgrade "$HS4" hoststopunlisted
+    : >"$HS4/boxlist.fail"
+    run hoststopunlisted "$HS4"
+    check 1 "$rc" "an upgrade whose boxes are not listed aborts without a terminal (BCLI-042)"
+    want_ok "the warning says the boxes were not listed (BCLI-042)" \
+        grep -q "did not list its boxes" "$OUT"
+    want_err "no host is stopped when the boxes are not listed (BCLI-042)" \
+        test -e "$HS4/stop.calls"
+
+    # --force-stop: the forced host stop at once, with no check and no question.
+    HS5="$root/hs5"; mkdir -p "$HS5"
+    stage_host_stop_upgrade "$HS5" hoststopforce
+    : >"$HS5/sessions.live"
+    run hoststopforce "$HS5" --force-stop
+    check 0 "$rc" "--force-stop with min host stop exits 0 (BCLI-042)"
+    want_err "--force-stop asks nothing (BCLI-042)" grep -q "Continue?" "$OUT"
+    check "host stop --force local0" "$(cat "$HS5/stop.calls")" \
+        "--force-stop forces the host stop (BCLI-042)"
+
+    # A stopped host: nothing to stop, and no stop runs.
+    HS6="$root/hs6"; mkdir -p "$HS6"
+    stage_host_stop_upgrade "$HS6" hoststopidle
+    rm -f "$HS6/host.running"
+    run hoststopidle "$HS6"
+    check 0 "$rc" "an upgrade with every host stopped exits 0 (BCLI-042)"
+    want_err "a stopped host is not stopped again (BCLI-042)" test -e "$HS6/stop.calls"
+
+    # An older `min`, without `min host stop`, gets bare `min stop`.
+    HS7="$root/hs7"; mkdir -p "$HS7"
+    stage_host_stop_upgrade "$HS7" hoststopfallback
+    write_min_stub "$HS7/bin/min" "previous release"
+    run hoststopfallback "$HS7"
+    check 0 "$rc" "an upgrade with an older min exits 0 (BCLI-042)"
+    check "stop" "$(cat "$HS7/stop.calls")" \
+        "an older min falls back to bare min stop (BCLI-042)"
 }
 
 case_shell_integration() {
