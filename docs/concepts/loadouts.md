@@ -1,5 +1,5 @@
 ---
-description: Loadouts are per-developer, session-level bundles of packages, vars, file patches, and lifecycle hooks that layer your personal environment on top of a project's shared config.
+description: Loadouts are per-developer, session-level bundles of packages, environment variables, file patches, and lifecycle hooks that layer your personal environment on top of a project's shared config.
 ---
 
 # Loadouts
@@ -94,20 +94,25 @@ packages = ["helix", "zellij"]
 Packages compose as a set across all contributors, so listing something the
 project already provides is harmless: duplicates are deduplicated.
 
-### Vars
+### Environment variables
 
-Environment variables set in the session. A value can be a literal, or it can
-inherit from the host environment of the `min` process, optionally with a
-fallback:
+The `[env_vars]` table sets environment variables in the session. A value can
+be a literal, or it can inherit from the host environment of the `min`
+process, optionally with a fallback:
 
 ```toml
-[vars]
+[env_vars]
 EDITOR = "hx"
 VISUAL = "hx"
 ```
 
-Vars are the main lever for interactive setup: your prompt (`PS1`) and a
-one-time banner travel through `[vars]`, and they reach every shell. An rc
+A name holds only ASCII letters, digits and `_`, and does not start with a
+digit. A loadout that still sets the old `[vars]` or `[[vars_lenient]]` table
+fails the start with exit 3. Move its variables to `[env_vars]`.
+
+Environment variables are the main lever for interactive setup: your prompt
+(`PS1`) and a one-time banner travel through `[env_vars]`, and they reach every
+shell. An rc
 file is the other lever — the shell started by `min session attach` sources
 the startup file you [patched](#file-patches) into the session home, bash's
 `.bashrc` included (plain `sh` is the one exception: its startup file is the
@@ -180,7 +185,7 @@ patches = [
     { dest = ".config/zellij/",           source = "~/dotfiles/zellij/**/*.kdl" },
 ]
 
-[vars]
+[env_vars]
 EDITOR = "hx"
 
 [[lifecycle_hooks]]
@@ -206,7 +211,7 @@ immediately rather than producing a silently-empty session. When loadouts are
 applied, the CLI prints `Applying loadouts: <names>` to stderr.
 
 Applying a loadout is also the moment its contents are captured: files are
-read once, inherited vars are resolved against your current host environment,
+read once, inherited variables are resolved against your current host environment,
 and the composed result is what the session runs with. Editing a loadout file
 does not retroactively change sessions that already exist, so remove the
 box with `min box rm --force <box>` and start a new one to pick up an edit.
@@ -270,7 +275,7 @@ loadouts directory other than the default.
 ## Where to go next
 
 - The [loadout reference](../reference/loadouts.md) has the full TOML schema
-  for every field (`description`, `packages`, `[vars]`, `patches`,
+  for every field (`description`, `packages`, `[env_vars]`, `patches`,
   `[[lifecycle_hooks]]`, and the rest), the client config keys, and the exact
   composition and conflict rules.
 - [Sessions](./sessions.md) explains the session model that loadouts layer

@@ -182,10 +182,29 @@ the host working directory, the `/state`-backed `XDG_*` directories and
 
 ### `env_vars` - Environment variables to set {#env_vars}
 
-_Optional. `env_vars` is an alias of the canonical `vars` key; both parse_
+_Optional_
 
 `env_vars` sets environment variables in the tasks' runtime environment. Variables
 set here take precedence over any inherited from the stack.
+
+`env_vars` is the only key that sets a task's variables. A task that sets
+`vars` or `vars_lenient` fails with exit code 3, and the error names
+the file, the table and the key. Move the variables to `env_vars`. A name
+holds only ASCII letters, digits and `_`, and does not start with a digit.
+
+A task's `env_vars` merges by name with the `env_vars` of
+[`[defaults]` and `[defaults.task]`](./minimal-dot-toml.md#defaults). The task
+gets every name that those tables set, and its own value wins for a name that
+both set:
+
+```toml
+[defaults.task.env_vars]
+RUST_LOG = "info"
+CC = "clang"
+
+[tasks.my_task]
+env_vars.CC = "gcc"   # my_task gets CC = "gcc" and RUST_LOG = "info"
+```
 
 ```toml
 [tasks.my_task]
@@ -203,7 +222,7 @@ env_vars.TOKEN = { inherit = true }
 
 The parent process is the shell you run `min task run` in: the value is read
 on the client, at the moment you invoke the task, and carried to the session —
-the same way `[session.vars]` resolves at activation. So exporting the variable
+the same way `[defaults.session.env_vars]` resolves at activation. So exporting the variable
 in your shell is enough, and the daemon's own environment is never consulted.
 
 A variable declared `inherit` but not set in that shell is an error, reported
@@ -242,7 +261,7 @@ inherited or literal — is checked against the `[vars]` section of your
   name, and can record the answer as a rule; anywhere else the run stops and
   prints the rules to add.
 
-This is the same gate `[session.vars]` from the same file has always passed
+This is the same gate `[defaults.session.env_vars]` from the same file has always passed
 through, with the same precedence — `deny`, then `ignore`, then `allow` — and
 `allow` is required for the same reason: a project you have not read should
 not be able to name a variable and receive its value.
