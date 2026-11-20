@@ -295,8 +295,8 @@ impl fmt::Display for RestartError {
 /// gives, with the next step.
 fn unsatisfiable_why(error: &std::io::Error, name: &str) -> String {
     format!(
-        "{error} Destroy it with `min session destroy {name}`, then start a new one with \
-         `min session activate`."
+        "{error} Remove it with `min box rm --force {name}`, then start a new one with \
+         `min session start`."
     )
 }
 
@@ -2153,9 +2153,9 @@ impl BoxActor {
                 "resume: hooks_on_resume is set, and the box has no composition to read its hooks from"
             );
             return Err(format!(
-                "The daemon cannot read its hook settings. Destroy it with \
-                 `min session destroy {name}`, then start a new one with \
-                 `min session activate`."
+                "The daemon cannot read its hook settings. Remove it with \
+                 `min box rm --force {name}`, then start a new one with \
+                 `min session start`."
             ));
         }
         if !self.has_hooks_for(event) {

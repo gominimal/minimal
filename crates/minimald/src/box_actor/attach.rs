@@ -281,14 +281,14 @@ impl BoxActor {
                 // requires. `finalize`'s per-op guard will refuse
                 // any later attempt against this Materializing
                 // record, so the operator has to destroy it and
-                // re-activate through `min session activate`, which drives
+                // re-activate through `min session start`, which drives
                 // the full flow.
                 return Err(AttachError::LoadoutFailed(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "this session's configuration includes patches that only \
-                     `min session activate` can apply; destroy it with \
-                     `min session destroy <session>`, then run \
-                     `min session activate` again",
+                     `min session start` can apply; remove it with \
+                     `min box rm --force <box>`, then run \
+                     `min session start` again",
                 )));
             }
             // No patches: finalize inline so the shortcut still

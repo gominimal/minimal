@@ -3142,7 +3142,10 @@ async fn create_session_refuses_a_version_skew_before_allocating_anything() {
         error.contains("0.0.0-not-this-build") && error.contains(OWN_VERSION),
         "the refusal must name both builds, got: {error}"
     );
-    assert!(error.contains("min stop"), "missing the recovery: {error}");
+    assert!(
+        error.contains("min host stop <host>"),
+        "missing the recovery: {error}"
+    );
     assert!(
         error.contains(minimald_rpc::SKEW_OVERRIDE_VAR),
         "missing the override: {error}"
