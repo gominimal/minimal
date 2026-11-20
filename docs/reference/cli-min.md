@@ -76,6 +76,44 @@ A VM that fails to start under this default gives an error with one more
 line. That line says `min` used the VM because `/dev/kvm` opens, and that
 `MIN_PROVIDER=local` keeps the native provider.
 
+## Errors in JSON output
+
+A command that runs with `-o json` or `-o jsonl` and fails writes one JSON
+object on stderr, on one line, in place of the plain-text error. Nothing
+else goes to stderr for that failure. The command still exits non-zero.
+
+```json
+{"schema":"min/v1/error","code":"not_found","message":"no box matches 'web'","hint":"..."}
+```
+
+| Field | Description |
+|-------|-------------|
+| `schema` | Always `min/v1/error` |
+| `code` | The kind of failure, from the table below. Branch on this field in a script |
+| `message` | The same error text that the command prints without `-o` |
+| `hint` | One line that names the next step, or an empty string when there is none |
+
+| `code` | Exit code | When the command gives it |
+|--------|-----------|---------------------------|
+| `ambiguous` | 2 | A box name or id prefix matches more than one box |
+| `not_found` | 4 | No box matches the box name or id, the box is on a VM that is stopped, or `min type show` names no box type. When `min box show --network -o json` finds no box, the exit code is 1 |
+| `host_unreachable` | 7 | A host that the command must ask does not answer |
+| `insufficient_resources` | 8 | The VM host has no network address left for another box |
+| `github_sign_in_required` | 3 | The box spec needs a GitHub sign-in, and you are not signed in. Run `min auth login` |
+| `gatehouse_unenrolled_node` | 5 | The box spec asks for a grant that this host cannot give, because the host is not enrolled |
+| `audit_self_unsupported_unenrolled` | 1 | `min box audit self` inside a box on a host that is not enrolled. On the host, run `min box audit <box>` |
+| `timeout` | 124 | A box ran past its own timeout, or `min box exec --timeout` ended the command |
+| `wait_timeout` | 124 | `min box wait --timeout` ran out before the box ended |
+| `daemon_unreachable` | 1 | The command did not get an answer from the daemon when it read a box's network policy |
+| `policy_unavailable` | 1 | The command found the box but did not read its network policy |
+| `output_failed` | 1 | The command did not write its JSON output to stdout, for example on a full disk |
+| `unspecified` | 1, or the exit code of the failure | Any other failure. The exit code is the one the command gives without `-o` |
+
+A command line that `min` cannot parse, such as an unknown flag, exits 2
+before the command runs. The error is plain text, not a JSON object. When
+the reader of stdout closes it early, the command exits 141 and writes no
+object.
+
 ## Commands
 
 ### `ls`
@@ -380,6 +418,41 @@ value. `minimald` does not connect the box to a VPN yet. With `-o json`,
 `--network` writes one JSON document, `min/v1/session-policy`, in place
 of the text. The document lists the names in `vpn_network_names`. The
 command refuses `-o yaml` with `--network`, with exit code 2.
+
+### `box wait`
+
+```
+min box wait [--timeout <DURATION>] [-o json] <BOX>
+min box wait --exec <EXEC_ID> [--timeout <DURATION>] <BOX>
+```
+
+Waits until the box ends, and exits with the box's exit code. A box that a
+signal stopped gives 128 plus the signal, such as 143 for SIGTERM. A box
+that ran past its own timeout gives 124. When the box ends, the command
+copies the files the box declares as exports into the project. If it skips
+an export of a box that exited with 0, it exits with 125.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--timeout <DURATION>` | | Stop waiting after this long: a number of seconds, or a number followed by `s`, `m` or `h`. The box keeps running, and the command exits with code 124 |
+| `--exec <EXEC_ID>` | | Wait for one command, by the exec id that `min box exec` printed for it, and exit with that command's exit code |
+| `--output json` | `-o` | When the box ends, write how it ended as one JSON object on stdout. Not available with `--exec` |
+
+With `-o json`, the command writes one `min/v1/wait` object on one line when
+the box ends. Its `boxes` array has one entry for the box, with these fields:
+
+| Field | Value |
+|-------|-------|
+| `box_id` | The box's id |
+| `name` | The box's name, or `null` |
+| `state` | `exited` or `stopped` |
+| `reason` | How the box ended, as its record keeps it, such as `exit`, `stopped` or `timeout` |
+| `exit_code` | The exit code the box's record keeps, or `null` |
+| `signal` | The signal that ended the box, or `null` |
+| `code` | The exit code of `min box wait` for this box |
+
+A wait that `--timeout` ends before the box ends writes no object. Under
+`-o json`, a failure is one `min/v1/error` object on stderr.
 
 ### `box spec`
 

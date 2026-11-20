@@ -188,23 +188,29 @@ fn needs_provider(command: Option<&Command>) -> bool {
 /// than the helpers that ssh, the shell's completion and the spinner run.
 /// Their stderr is not a command the person typed.
 fn shows_native_boxes_notice(command: Option<&Command>) -> bool {
-    // The spinner run and the answerer aid exist in debug builds only, so
-    // their variants cannot sit in the pattern below: a release build has
-    // no such names.
-    #[cfg(debug_assertions)]
-    {
-        if matches!(
-            command,
-            Some(Command::Spin(_) | Command::DebugAnswererCommand)
-        ) {
-            return false;
-        }
-    }
     needs_provider(command)
         && !matches!(
             command,
             Some(Command::Proxy(_) | Command::CompleteSessionStr(_))
         )
+        && !is_debug_helper(command)
+}
+
+/// Whether `command` is one of the helpers only a debug build has: the
+/// spinner demo and the answerer-command probe. A release build has neither
+/// variant, so the match is compiled only where they exist.
+#[cfg(debug_assertions)]
+fn is_debug_helper(command: Option<&Command>) -> bool {
+    matches!(
+        command,
+        Some(Command::Spin(_) | Command::DebugAnswererCommand)
+    )
+}
+
+/// A release build has no debug helper to match.
+#[cfg(not(debug_assertions))]
+fn is_debug_helper(_command: Option<&Command>) -> bool {
+    false
 }
 
 /// The verb a run dispatches, as the user typed it (`box show`,

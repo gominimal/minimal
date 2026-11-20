@@ -2486,7 +2486,7 @@ mod tests {
                     "
                     stack = {{ use = \"fake-stack\", build_packages = [] }}
                     tasks = {{ something = {{ exec = \"./something\" }} }}
-                    session = {{ packages = [], vars = {{ ANSWER = \"42\" }} }}
+                    session = {{ packages = [], env_vars = {{ ANSWER = \"42\" }} }}
 
                     [upstream]
                     dir = \"{}\"
@@ -2582,7 +2582,7 @@ mod tests {
         let session = &doc["defaults"]["session"];
         assert!(session.is_inline_table(), "session lost inline form");
         assert_eq!(str_list(&session["packages"]), ["uroot"]);
-        assert_eq!(session["vars"]["ANSWER"].as_str(), Some("42"));
+        assert_eq!(session["env_vars"]["ANSWER"].as_str(), Some("42"));
 
         // The surviving settings must still parse into the config.
         let session = ctx.minimal_file().session.clone().unwrap_or_default();
@@ -2613,7 +2613,7 @@ mod tests {
                     [session]
                     packages = [\"uroot\"]
 
-                    [session.vars]
+                    [session.env_vars]
                     ANSWER = \"42\"
 
                     [defaults.session]
@@ -2655,7 +2655,7 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert_eq!(packages, ["uroot", "extra-runtime-pkg"], "{text}");
-        assert_eq!(session["vars"]["ANSWER"].as_str(), Some("42"), "{text}");
+        assert_eq!(session["env_vars"]["ANSWER"].as_str(), Some("42"), "{text}");
 
         // The written file carries no legacy table, so a read prints no hint.
         let mut raw: toml::Table = toml::from_str(&text).unwrap();
