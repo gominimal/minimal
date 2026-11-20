@@ -290,6 +290,52 @@ pub(super) async fn attach_or_reap<P: Reapable>(
     }
 }
 
+/// NET-079: moves a task invocation's supervisor into the leaf of its box,
+/// or kills and reaps the process and fails the task with the cause. The
+/// program joined the leaf in its own pre-exec closure; the supervisor
+/// never runs that closure, so the daemon moves it after the spawn with the
+/// same function a box launch and a package build use. `leaf` is `None` for
+/// a box with no leaf, which places nothing.
+pub(super) fn place_supervisor_or_reap<P: Reapable>(
+    leaf: Option<&sandbox::config::ClassifierLeaf>,
+    supervisor: u32,
+    child: &mut P,
+) -> io::Result<()> {
+    let Some(leaf) = leaf else {
+        return Ok(());
+    };
+    match sandbox::classifier::place_supervisor(leaf, supervisor) {
+        Ok(()) => {
+            tracing::debug!(
+                leaf = %leaf.dir().display(),
+                supervisor,
+                "placed the task's supervisor in its box's classifier leaf",
+            );
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!(
+                leaf = %leaf.dir().display(),
+                supervisor,
+                error = %e,
+                "placing the task's supervisor in its box's classifier leaf failed; \
+                 the task is stopped",
+            );
+            child.kill_and_reap();
+            let cause = match e.kind() {
+                io::ErrorKind::NotFound => "The cgroup no longer exists.".to_string(),
+                io::ErrorKind::PermissionDenied => "The kernel refused the move.".to_string(),
+                _ => format!("The move failed: {e}."),
+            };
+            Err(io::Error::other(format!(
+                "the task did not start: Minimal could not move the task's supervisor \
+                 process into the cgroup that decides the box's network access. {cause} \
+                 If it keeps failing, run `min bug` to collect a diagnostic bundle."
+            )))
+        }
+    }
+}
+
 /// Parse a task run's argv against the task's declared `args` schema.
 ///
 /// Returns `None` when the task declares no args (nothing to bind), and
@@ -543,6 +589,9 @@ pub(super) async fn task_producer(
             Ok(dir) => (dir, None),
             Err(notice) => (None, Some(notice)),
         };
+        // The leaf the task's sandbox joins: `env` is built from `ctx`, so
+        // its invocations run in the same leaf.
+        let leaf = ctx.classifier_leaf().cloned();
         let mut env = ctx
             .make_env_with_network(
                 &exec.task,
@@ -600,6 +649,8 @@ pub(super) async fn task_producer(
                 // (inbox#710).
                 let mut child = sandbox::forker::on_fork_thread(move || cmd.spawn())
                     .map_err(|e| io::Error::other(format!("command launch failed: {}", e)))?;
+                let supervisor = child.id();
+                place_supervisor_or_reap(leaf.as_ref(), supervisor, &mut child)?;
                 let spawned = sandbox::Spawned::from_child(&mut child);
                 let guard = attach_or_reap(planned, spawned, &mut child).await?;
                 let mut process = HakoniwaProcess::new(child, guard);
