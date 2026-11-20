@@ -7045,9 +7045,9 @@ mod tests {
         }
     }
 
-    /// BEP-036: a host_ip box with no egress section admits every name, so
+    /// BEP-036: a `host_ip` box with no egress section admits every name, so
     /// the creation accepts a rule's upstream there, as the GitHub check
-    /// does. An own_ip box with no egress section still refuses it.
+    /// does. An `own_ip` box with no egress section still refuses it.
     #[test]
     fn store_grant_on_host_ip_box_with_no_egress_is_accepted() {
         let mut rules = store_rule(None);

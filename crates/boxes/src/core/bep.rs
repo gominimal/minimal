@@ -3103,7 +3103,7 @@ mod tests {
         assert!(PROJECT_STORE_RULES_IGNORED.contains("config.toml"));
     }
 
-    /// BEP-036: with no egress section, a host_ip box admits every
+    /// BEP-036: with no egress section, a `host_ip` box admits every
     /// registered upstream host, as the GitHub check does (BEP-008). A box
     /// in any other mode admits none of them. The sign-in item is refused
     /// in every mode.
