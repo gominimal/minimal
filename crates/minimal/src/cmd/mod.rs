@@ -704,35 +704,11 @@ impl From<SessionLookup> for minimald_rpc::GetSessionPolicyRequest {
     }
 }
 
-impl From<SessionLookup> for minimald_rpc::GetSessionHooksRequest {
-    fn from(l: SessionLookup) -> Self {
-        match l {
-            SessionLookup::Id(id) => Self::Id(id),
-            SessionLookup::Name(n) => Self::Name(n),
-        }
-    }
-}
-
-/// Resolve a session by UUID, unique id prefix, or session name, returning
-/// its record.
+/// Resolve a session by UUID, unique id prefix, or session name, for the
+/// paths that must refuse a version-skewed daemon: the lookup, with the
+/// build it reports asserted before the record is used for anything.
 ///
-/// Used by commands that need the full record before proceeding (destroy,
-/// rename). If the string parses as a UUID, the session
-/// is looked up by ID; otherwise by name, then by unique id prefix (see
-/// [`get_session_record`]). Bails if no session matches.
-pub(crate) async fn resolve_session(
-    client: &mut client::Client,
-    session: &str,
-) -> Result<boxes::Record, anyhow::Error> {
-    let resp = get_session_record(client, session).await?;
-    named_record(resp.record, session)
-}
-
-/// [`resolve_session`] for the paths that must refuse a version-skewed daemon:
-/// the same lookup, with the build it reports asserted before the record is
-/// used for anything.
-///
-/// The lookup is the first RPC `min session attach`, `min session exec`, and
+/// The lookup is the first RPC `min session attach` and
 /// `min session setup-zed` make, so the gate rides on
 /// its reply rather than on a `GetVersion` sent ahead of it — an activation
 /// must not pay a round trip for a check the calls it already makes can carry
@@ -747,7 +723,7 @@ pub(crate) async fn resolve_session_version_gated(
     named_record(resp.record, session)
 }
 
-/// The `GetSessionRecord` round trip both resolvers share.
+/// The `GetSessionRecord` round trip the resolvers share.
 ///
 /// A name lookup that finds no record falls back to matching `session` as an
 /// id prefix (see [`match_id_prefix`]), so the short id `min ls` prints
@@ -1002,41 +978,6 @@ pub(crate) async fn ensure_selected_holds_box_alone(
 fn several_vms(global: &GlobalArgs) -> bool {
     client::enumerate_vm_sockets(global.minimal_dir.as_deref(), global.use_minvmd())
         .is_ok_and(|vms| vms.len() > 1)
-}
-
-/// Resolve `name` to its record and a client connected to the VM that owns
-/// it, for the commands that act on a named box over the daemon's RPCs
-/// rather than an ssh hand-off: `min session policy` and `min session
-/// destroy` (NET-058). The selected VM's `client` is asked first. A hit
-/// there is refused when another VM also holds the name
-/// ([`ensure_selected_holds_box_alone`]). When its daemon does not know the
-/// name, [`resolve_box_on_another_vm`] finds the
-/// owning VM, and the client returned is connected to that VM's socket.
-/// `example` is the command the user ran, for the not-found refusal.
-pub(crate) async fn resolve_box_on_any_vm(
-    global: &GlobalArgs,
-    mut client: client::Client,
-    name: &str,
-    example: &str,
-) -> Result<(client::Client, boxes::Record), anyhow::Error> {
-    match resolve_session(&mut client, name).await {
-        Ok(record) => {
-            ensure_selected_holds_box_alone(global, name, &record).await?;
-            Ok((client, record))
-        }
-        Err(selected) => {
-            let resolved = resolve_box_on_another_vm(global, name, example, selected).await?;
-            let mut client = client::Client::connect(&resolved.sock)
-                .await
-                .with_context(|| {
-                    format!("Failed to connect to the daemon of VM {}", resolved.vm)
-                })?;
-            // Gated as `connect_daemon` gates the selected VM: a destroy is
-            // a mutation, and this is the connection it runs over.
-            ensure_version_match(&mut client).await?;
-            Ok((client, resolved.record))
-        }
-    }
 }
 
 /// `ListSessions` with the daemon's build asserted off the same reply, for the

@@ -305,7 +305,6 @@ fn every_daemon_connection_is_classified() {
             "cmd/boxes/list.rs::list_other_host = ungated",
             "cmd/boxes/list.rs::list_selected_host = gated",
             "cmd/boxes/vm_host.rs::box_record_by = ungated",
-            "cmd/boxes/vm_host.rs::destroyable_box_on_vm_host = ungated",
             // `min host list|show` probes each local host for its state and
             // daemon version. It only reads, and it must show a skewed
             // daemon's version, so it must work when the pair is skewed.
@@ -324,10 +323,6 @@ fn every_daemon_connection_is_classified() {
             "cmd/list.rs::list_selected_vm = gated",
             "cmd/mod.rs::arm_activation_interrupt = ungated",
             "cmd/mod.rs::connect_daemon_unchecked = ungated",
-            // `min session policy` and `min session destroy` on a box another
-            // VM owns: the connection to that VM, gated as `connect_daemon`
-            // gates the selected one.
-            "cmd/mod.rs::resolve_box_on_any_vm = gated",
             "cmd/net.rs::cmd_net_forward = gated",
             // `min net forward` on a box another VM holds: the session poll's
             // connection to that VM, gated before the loop (NET-058).
@@ -337,8 +332,6 @@ fn every_daemon_connection_is_classified() {
             // the rule is already saved before the ask, so a skew can
             // half-build nothing here, the same as the mint path's sites.
             "cmd/secret.rs::recertify = ungated",
-            "cmd/session.rs::cmd_exec = gated",
-            "cmd/session.rs::cmd_session_run = gated",
             "cmd/session.rs::cmd_session_setup_zed = gated",
             // The dashboard's activation is the same multi-step mutation as
             // `cmd_session`'s, so it carries the same gate on its own create.
@@ -840,8 +833,10 @@ const REMOVED_SESSION_VERBS: [&str; 7] = [
 // BCLI-042: the removed `min session` verbs, bare `min stop` and `min task
 // run --path` fail as the parser fails for any unknown command or flag.
 // The exit is 2, and nothing runs, because the parse gives no command.
-#[test]
-fn removed_session_verbs_are_unknown_commands() {
+// A `--path` after the task's name parses as a task argument, so the run
+// refuses it with exit 2 before it creates a box.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removed_session_verbs_fail_as_unknown_commands() {
     use clap::CommandFactory as _;
     use clap::Parser as _;
     use clap::error::ErrorKind;
@@ -917,6 +912,67 @@ fn removed_session_verbs_are_unknown_commands() {
             .get_arguments()
             .all(|arg| arg.get_long() != Some("path")),
         "no `min task run --path`"
+    );
+
+    // `--path` after the task's name reaches the run as a task argument.
+    // The run refuses it with exit 2, and the daemon has no box after it.
+    let project = tempfile::tempdir().expect("a temp project dir");
+    std::fs::write(
+        project.path().join(mfile::MFILE_NAME),
+        b"[tasks.build]\necho = 'x'\n",
+    )
+    .expect("the project's minimal.toml");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let sock = state.path().join("providers/local-minimald0/ssh.sock");
+    std::fs::create_dir_all(sock.parent().expect("the socket has a dir"))
+        .expect("the daemon's state dir");
+    let server = minimald::test_harness::TestServer::new().await;
+    server.listen_on_uds(&sock).await;
+    let global = GlobalArgs {
+        repo_dir: Some(project.path().to_path_buf()),
+        minimal_dir: Some(state.path().to_path_buf()),
+        no_input: true,
+        ..Default::default()
+    };
+    for (argv, flag) in [
+        (
+            &["min", "task", "run", "build", "--path", "sub/dir"][..],
+            "--path",
+        ),
+        (&["min", "task", "run", "build", "--path=sub/dir"], "--path"),
+    ] {
+        let cli = Cli::try_parse_from(argv).unwrap_or_else(|err| panic!("{argv:?}: {err}"));
+        let Some(Command::Task(TaskArgs {
+            command: TaskCommand::Run(run),
+        })) = cli.command
+        else {
+            panic!("{argv:?} parses as a task run");
+        };
+        let err = task::cmd_task_run(&global, run)
+            .await
+            .expect_err("a task run with --path is refused");
+        let refusal = err
+            .downcast_ref::<task::RunFlagMisplaced>()
+            .unwrap_or_else(|| panic!("{argv:?}: {err:#}"));
+        assert_eq!(task::RunFlagMisplaced::EXIT_CODE, 2);
+        assert_eq!(
+            refusal.to_string(),
+            format!(
+                "Cannot run build: min task run has no {flag} flag. Run min -C <dir> task run \
+                 build to run the task in the project at <dir>, or put -- between build and \
+                 its arguments to pass {flag} to the task."
+            ),
+            "{argv:?}"
+        );
+    }
+    let listed = server
+        .connect()
+        .await
+        .call::<minimald_rpc::ListSessions>(&())
+        .await;
+    assert!(
+        listed.sessions.is_empty(),
+        "the refused runs created no box"
     );
 }
 
@@ -4195,7 +4251,7 @@ fn both_creators_share_the_composition_failure_message() {
 
 /// A daemon refusal is printed in the daemon's own words. The RPC's name
 /// is the wire's vocabulary, not the person's, so no creator, verdict
-/// submitter, finalizer or renamer may prefix the daemon's error with
+/// submitter or finalizer may prefix the daemon's error with
 /// it. Asserted over the function bodies, the way the composition
 /// message is, because the prefix had crept into five sites across three
 /// files before anyone noticed it on a terminal.
@@ -4204,7 +4260,6 @@ fn daemon_refusals_print_without_rpc_names() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for (file, func) in [
         ("src/cmd/boxes/create.rs", "activate_box"),
-        ("src/cmd/session.rs", "cmd_rename"),
         ("src/task.rs", "run_entry"),
         ("src/cmd/mod.rs", "submit_verdict_and_wait"),
         ("src/cmd/mod.rs", "upload_and_finalize"),
@@ -4214,7 +4269,6 @@ fn daemon_refusals_print_without_rpc_names() {
             function_body(&text, func).unwrap_or_else(|| panic!("{file} no longer defines {func}"));
         for bare in [
             "CreateSession failed",
-            "RenameSession failed",
             "SubmitVerdict failed",
             "SubmitVerdict faulted",
             "FinalizeSession failed",
@@ -4326,294 +4380,6 @@ fn project_lifecycle_hook_count_detects_declared_hooks() {
     assert_eq!(project_lifecycle_hook_count(root), 0);
 }
 
-/// On a VM target the daemon is the guest's pid-1, so an accepted shutdown
-/// takes the SSH transport down with it and the reply can be lost on the
-/// way out. `stop` gates on the observable goal, not on the transport: a
-/// daemon that reached the stopped state is a stop that worked.
-#[tokio::test]
-async fn stop_succeeds_when_a_lost_reply_still_stopped_the_daemon() {
-    stop_outcome(
-        Err(anyhow::anyhow!("EOF while parsing a value")
-            .context("decode response for shutdown")
-            .context("Shutdown RPC failed")),
-        async || Ok(()),
-        async || true,
-    )
-    .await
-    .expect("a daemon that reached the stopped state is a successful stop");
-}
-
-/// The other half of that judgement: a failed RPC over a daemon that is
-/// still there is a real failure, and the RPC's own error — context and all
-/// — is what the user needs.
-#[tokio::test]
-async fn stop_reports_the_rpc_error_when_the_daemon_is_still_running() {
-    let err = stop_outcome(
-        Err(anyhow::anyhow!("connection reset").context("Shutdown RPC failed")),
-        async || Ok(()),
-        async || false,
-    )
-    .await
-    .unwrap_err();
-
-    let chain = format!("{err:#}");
-    assert!(
-        chain.contains("Shutdown RPC failed") && chain.contains("connection reset"),
-        "expected the original RPC error chain, got: {chain}"
-    );
-}
-
-/// A refusal is an answer, not a lost reply: it keeps its own message and
-/// its non-zero exit, and observes nothing — the daemon it names is staying
-/// up on purpose.
-#[tokio::test]
-async fn stop_with_live_sessions_bails_without_waiting() {
-    let observed = std::cell::Cell::new(false);
-    let err = stop_outcome(
-        Ok(minimald_rpc::ShutdownResponse::SessionsLive),
-        async || {
-            observed.set(true);
-            Ok(())
-        },
-        async || {
-            observed.set(true);
-            true
-        },
-    )
-    .await
-    .unwrap_err();
-
-    assert_eq!(
-        err.to_string(),
-        "daemon has active sessions; pass --force to shut down anyway"
-    );
-    assert!(
-        !observed.get(),
-        "a refused shutdown has nothing to wait for"
-    );
-}
-
-/// An acknowledged shutdown still has to finish, and its wait is the whole
-/// judgement: a daemon that never reaches a stopped state fails with the
-/// wait's own error, and the extra liveness probe — which exists only to
-/// judge a *failed* RPC — never races a teardown the daemon acknowledged.
-#[tokio::test]
-async fn stop_fails_when_an_accepted_shutdown_never_completes() {
-    stop_outcome(
-        Ok(minimald_rpc::ShutdownResponse::ShuttingDown),
-        async || Ok(()),
-        async || false,
-    )
-    .await
-    .expect("an acknowledged shutdown that completes is a successful stop");
-
-    let probed = std::cell::Cell::new(false);
-    let err = stop_outcome(
-        Ok(minimald_rpc::ShutdownResponse::ShuttingDown),
-        async || Err(anyhow::anyhow!("the VM is still shutting down after 20s")),
-        async || {
-            probed.set(true);
-            true
-        },
-    )
-    .await
-    .unwrap_err();
-    assert!(
-        err.to_string().contains("still shutting down"),
-        "expected the wait's error, got: {err}"
-    );
-    assert!(
-        !probed.get(),
-        "an accepted shutdown is judged by its wait alone"
-    );
-}
-
-/// The recovery's actual observation, not a stand-in for it: the real
-/// probe `cmd_stop` hands `stop_outcome`, run against a state dir no daemon
-/// ever ran in. Nothing is listening and no lifecycle is active, which is
-/// exactly the post-shutdown reading a lost reply has to be judged on, so
-/// it must confirm the stop.
-#[tokio::test]
-async fn the_real_probe_confirms_a_daemon_that_is_not_there() {
-    let dir = tempfile::tempdir().unwrap();
-    assert!(
-        daemon_confirmed_stopped(true, Some(dir.path().to_path_buf())).await,
-        "a state dir with no live daemon is a confirmed stop"
-    );
-}
-
-/// The already-down fast path: against a state dir no daemon ever ran in,
-/// `stop` reports the goal state and exits 0 without connecting or
-/// spawning anything.
-#[tokio::test]
-async fn stop_is_a_no_op_when_the_daemon_is_already_down() {
-    let dir = tempfile::tempdir().unwrap();
-    let global = GlobalArgs {
-        repo_dir: None,
-        minimal_dir: Some(dir.path().to_path_buf()),
-        config_dir: None,
-        provider: None,
-        no_input: true,
-        vm: None,
-    };
-
-    cmd_stop(&global, StopArgs { force: false })
-        .await
-        .expect("an already-stopped daemon is the goal state, not an error");
-}
-
-/// The wedged-VM recovery: with a VM backend whose state says Running under a
-/// live alive-lock but no bridge socket to answer, `min stop --force` must
-/// stop the VM from the host — signal the VMM the state names, write
-/// `Stopped` — and exit 0, rather than failing on the refused connect and
-/// leaving the only recovery a hand-killed VMM.
-#[tokio::test]
-async fn stop_force_stops_a_wedged_vm_from_the_host() {
-    let dir = tempfile::tempdir().unwrap();
-    let host_dir = client::resolve_host_dir(Some(dir.path()), true).expect("resolve provider dir");
-    let state_dir = minvmd::state::StateDir::new(host_dir).expect("open state dir");
-    // The alive lock is held the way a real VM holds it: by the VMM process,
-    // through the inherited fd, so it is released when that process dies and
-    // not before.
-    let lock = state_dir
-        .try_acquire_alive_lock()
-        .unwrap()
-        .expect("acquire alive lock");
-    let mut vmm_cmd = std::process::Command::new("sleep");
-    vmm_cmd.arg("30");
-    lock.inherit_into(&mut vmm_cmd);
-    let mut vmm = vmm_cmd.spawn().expect("spawn sleep");
-    drop(lock);
-    state_dir
-        .write_state(&minvmd::state::State {
-            lifecycle: minvmd::lifecycle::Lifecycle::Running,
-            vmm_pid: Some(vmm.id()),
-            started_at: None,
-            ..minvmd::state::State::stopped()
-        })
-        .unwrap();
-    assert!(
-        state_dir.daemon_alive().unwrap(),
-        "the stand-in VMM must hold the alive lock"
-    );
-
-    let global = GlobalArgs {
-        repo_dir: None,
-        minimal_dir: Some(dir.path().to_path_buf()),
-        config_dir: None,
-        provider: Some(Provider::LocalMinvmd),
-        no_input: true,
-        vm: None,
-    };
-    cmd_stop(&global, StopArgs { force: true })
-        .await
-        .expect("a wedged VM stopped from the host is the goal state");
-
-    assert_eq!(
-        state_dir.read_state().unwrap().lifecycle,
-        minvmd::lifecycle::Lifecycle::Stopped
-    );
-    assert!(
-        !state_dir.daemon_alive().unwrap(),
-        "the stop must not return while the alive lock is held: a `min start` would refuse"
-    );
-    // SIGTERM'd by the host-side stop; reaped here so the test leaves no stray.
-    let status = vmm.wait().unwrap();
-    assert!(
-        status.code().is_none(),
-        "expected a signalled VMM child, got {status:?}"
-    );
-}
-
-/// A VM that is still booting has no VMM pid to signal, so `min stop --force`
-/// must not report a host-side stop it did not make: it refuses with the
-/// retry, and leaves the boot's `Starting` state for the supervisor to finish.
-#[tokio::test]
-async fn stop_force_refuses_a_booting_vm() {
-    let dir = tempfile::tempdir().unwrap();
-    let host_dir = client::resolve_host_dir(Some(dir.path()), true).expect("resolve provider dir");
-    let state_dir = minvmd::state::StateDir::new(host_dir).expect("open state dir");
-    state_dir
-        .write_state(&minvmd::state::State {
-            lifecycle: minvmd::lifecycle::Lifecycle::Starting,
-            vmm_pid: None,
-            started_at: None,
-            ..minvmd::state::State::stopped()
-        })
-        .unwrap();
-    let _lock = state_dir
-        .try_acquire_alive_lock()
-        .unwrap()
-        .expect("acquire alive lock");
-
-    let global = GlobalArgs {
-        repo_dir: None,
-        minimal_dir: Some(dir.path().to_path_buf()),
-        config_dir: None,
-        provider: Some(Provider::LocalMinvmd),
-        no_input: true,
-        vm: None,
-    };
-    let err = cmd_stop(&global, StopArgs { force: true })
-        .await
-        .expect_err("a booting VM was not stopped from the host");
-
-    let chain = format!("{err:#}");
-    assert!(
-        chain.contains("still booting") && chain.contains("`min stop`"),
-        "expected the retry hint, got: {chain}"
-    );
-    assert_eq!(
-        state_dir.read_state().unwrap().lifecycle,
-        minvmd::lifecycle::Lifecycle::Starting
-    );
-}
-
-/// Without `--force`, a VM that is still booting is not told to use `--force`,
-/// which refuses a booting VM: the hint names the retry, and the failure stays
-/// the typed host-unreachable one.
-#[tokio::test]
-async fn stop_without_force_on_a_booting_vm_names_the_retry() {
-    let dir = tempfile::tempdir().unwrap();
-    let host_dir = client::resolve_host_dir(Some(dir.path()), true).expect("resolve provider dir");
-    let state_dir = minvmd::state::StateDir::new(host_dir).expect("open state dir");
-    state_dir
-        .write_state(&minvmd::state::State {
-            lifecycle: minvmd::lifecycle::Lifecycle::Starting,
-            vmm_pid: None,
-            started_at: None,
-            ..minvmd::state::State::stopped()
-        })
-        .unwrap();
-    let _lock = state_dir
-        .try_acquire_alive_lock()
-        .unwrap()
-        .expect("acquire alive lock");
-
-    let global = GlobalArgs {
-        repo_dir: None,
-        minimal_dir: Some(dir.path().to_path_buf()),
-        config_dir: None,
-        provider: Some(Provider::LocalMinvmd),
-        no_input: true,
-        vm: None,
-    };
-    let err = cmd_stop(&global, StopArgs { force: false })
-        .await
-        .expect_err("a booting VM that does not answer keeps failing");
-
-    let chain = format!("{err:#}");
-    assert!(
-        chain.contains("still booting") && !chain.contains("--force"),
-        "expected the retry hint and no --force, got: {chain}"
-    );
-    assert!(
-        err.downcast_ref::<client::box_registration::HostUnreachable>()
-            .is_some(),
-        "the refusal must carry the type `main` maps to exit 7, got: {chain}"
-    );
-}
-
 /// The wait a host-side stop ends on is the alive lock, not the lifecycle
 /// file: it fails while a minvmd still holds the lock, even over a `Stopped`
 /// state, and passes once the lock is released.
@@ -4639,52 +4405,6 @@ fn host_stop_waits_for_the_alive_lock_not_the_lifecycle() {
     drop(lock);
     wait_for_alive_lock_released(&state_dir, std::time::Duration::from_millis(300))
         .expect("a released alive lock is a finished stop");
-}
-
-/// Without `--force` the wedged VM keeps its non-zero exit — force-stopping a
-/// VM that may still be draining is not the default behaviour — but the error
-/// names the recovery instead of a bare connect failure, and is the typed
-/// host-unreachable failure the binary exits 7 on.
-#[tokio::test]
-async fn stop_without_force_on_a_wedged_vm_names_the_recovery() {
-    let dir = tempfile::tempdir().unwrap();
-    let host_dir = client::resolve_host_dir(Some(dir.path()), true).expect("resolve provider dir");
-    let state_dir = minvmd::state::StateDir::new(host_dir).expect("open state dir");
-    state_dir
-        .write_state(&minvmd::state::State {
-            lifecycle: minvmd::lifecycle::Lifecycle::Running,
-            vmm_pid: Some(std::process::id()),
-            started_at: None,
-            ..minvmd::state::State::stopped()
-        })
-        .unwrap();
-    let _lock = state_dir
-        .try_acquire_alive_lock()
-        .unwrap()
-        .expect("acquire alive lock");
-
-    let global = GlobalArgs {
-        repo_dir: None,
-        minimal_dir: Some(dir.path().to_path_buf()),
-        config_dir: None,
-        provider: Some(Provider::LocalMinvmd),
-        no_input: true,
-        vm: None,
-    };
-    let err = cmd_stop(&global, StopArgs { force: false })
-        .await
-        .expect_err("a wedged VM without --force must keep failing");
-
-    let chain = format!("{err:#}");
-    assert!(
-        chain.contains("the VM is not answering") && chain.contains("--force"),
-        "expected the recovery hint, got: {chain}"
-    );
-    assert!(
-        err.downcast_ref::<client::box_registration::HostUnreachable>()
-            .is_some(),
-        "the refusal must carry the type `main` maps to exit 7, got: {chain}"
-    );
 }
 
 /// A `min proxy` bridge must not outlive the daemon socket: when the daemon
@@ -8056,50 +7776,15 @@ async fn selected_client(state: &std::path::Path) -> (client::Client, std::path:
     (client, selected)
 }
 
-/// NET-058 for the commands that act on a named box over the daemon's RPCs:
-/// `min session policy` and `min session destroy` find a box on another VM
-/// by its name alone, and the client they get back is that VM's.
-#[tokio::test]
-async fn box_name_resolves_vm_without_flag_for_policy_and_destroy() {
-    let (state, default_vm, alpha) = two_vms().await;
-    create_box_on(&default_vm, "api").await;
-    let beta = create_box_on(&alpha, "beta").await;
-    let global = vm_globals(state.path(), None);
-
-    for example in ["session policy beta", "session destroy beta"] {
-        let (client, _) = selected_client(state.path()).await;
-        let (mut owner, record) = cmd::resolve_box_on_any_vm(&global, client, "beta", example)
-            .await
-            .expect("a name alpha owns resolves without --vm");
-        assert_eq!(record.id, beta, "{example}: alpha's record");
-        let again = cmd::resolve_session(&mut owner, "beta")
-            .await
-            .expect("the client returned is connected to alpha");
-        assert_eq!(again.id, beta, "{example}: the follow-up RPCs reach alpha");
-    }
-}
-
 /// NET-058: a box name no running VM holds, on a host with two VMs, is
 /// refused with the flag that names a box on another VM, shown on the
-/// command the user ran. With `--vm`, the selected VM's own miss stands.
+/// command the user ran.
 #[tokio::test]
 async fn unknown_box_names_vm_flag() {
     let (state, _default_vm, _alpha) = two_vms().await;
     let global = vm_globals(state.path(), None);
 
-    let (client, _) = selected_client(state.path()).await;
-    let err = cmd::resolve_box_on_any_vm(&global, client, "beta", "session policy beta")
-        .await
-        .map(|(_, record)| record)
-        .expect_err("no VM holds 'beta'");
-    assert_eq!(
-        format!("error: {err:#}"),
-        "error: no running VM has a box named 'beta'. A box on another VM is named with --vm, \
-         for example: min --vm <vm> session policy beta",
-        "the refusal as main prints it"
-    );
-
-    // The hand-off verbs say the same, on their own command.
+    // The hand-off verbs name the flag, on their own command.
     let (mut client, sock) = selected_client(state.path()).await;
     let err = cmd::resolve_named_box_version_gated(
         &global,
@@ -8116,15 +7801,6 @@ async fn unknown_box_names_vm_flag() {
         "no running VM has a box named 'beta'. A box on another VM is named with --vm, \
          for example: min --vm <vm> net forward beta 8080:3000"
     );
-
-    // An explicit --vm is the operator's choice: the selected VM's miss.
-    let pinned = vm_globals(state.path(), Some(paths::DEFAULT_VM_NAME.to_string()));
-    let (client, _) = selected_client(state.path()).await;
-    let err = cmd::resolve_box_on_any_vm(&pinned, client, "beta", "session policy beta")
-        .await
-        .map(|(_, record)| record)
-        .expect_err("no VM holds 'beta'");
-    assert_eq!(err.to_string(), "No session found matching 'beta'");
 }
 
 /// NET-152: a box only a stopped VM holds is named with that VM and the
@@ -8153,35 +7829,6 @@ async fn box_on_stopped_vm_names_start_command() {
         .await
         .expect_err("attach refuses a box on a stopped VM");
     assert_eq!(err.to_string(), expected);
-
-    // And the RPC verbs, with the policy's machine reading still a miss.
-    let (client, _) = selected_client(state.path()).await;
-    let err = cmd::resolve_box_on_any_vm(&global, client, "beta", "session policy beta")
-        .await
-        .map(|(_, record)| record)
-        .expect_err("policy refuses a box on a stopped VM");
-    assert_eq!(err.to_string(), expected);
-    assert!(err.downcast_ref::<cmd::BoxNotFound>().is_some());
-
-    // A name two stopped VMs hold is ambiguous, and typed so the policy's
-    // machine reading reports a miss, not an unreachable daemon.
-    stopped_vm_with_boxes(state.path(), "delta", &[("dup", boxes::SessionId::mint())]);
-    stopped_vm_with_boxes(
-        state.path(),
-        "epsilon",
-        &[("dup", boxes::SessionId::mint())],
-    );
-    let (client, _) = selected_client(state.path()).await;
-    let err = cmd::resolve_box_on_any_vm(&global, client, "dup", "session policy dup")
-        .await
-        .map(|(_, record)| record)
-        .expect_err("a name two stopped VMs hold is ambiguous");
-    assert_eq!(
-        err.to_string(),
-        "box name 'dup' exists on more than one stopped VM (delta, epsilon); \
-         name the one you mean with --vm"
-    );
-    assert!(err.downcast_ref::<cmd::AmbiguousBoxName>().is_some());
 
     // A name a running VM owns and a stopped VM's records hold is ambiguous,
     // though the running box is active: the error lists both VMs, marks the
@@ -8223,27 +7870,6 @@ async fn box_on_stopped_vm_names_start_command() {
     );
     assert!(err.downcast_ref::<cmd::AmbiguousBoxName>().is_some());
 
-    // The selected VM is the only holder: it resolves there.
-    create_box_on(&default_vm, "solo").await;
-    let (client, _) = selected_client(state.path()).await;
-    let (_, record) = cmd::resolve_box_on_any_vm(&global, client, "solo", "session policy solo")
-        .await
-        .expect("the selected VM's own box resolves");
-    assert_eq!(record.name.as_deref(), Some("solo"));
-
-    // A hit on the selected VM is ambiguous when a stopped VM also holds the
-    // name.
-    let (client, _) = selected_client(state.path()).await;
-    let err = cmd::resolve_box_on_any_vm(&global, client, "api", "session policy api")
-        .await
-        .map(|(_, record)| record)
-        .expect_err("the selected VM and a stopped VM both hold 'api'");
-    assert_eq!(
-        err.to_string(),
-        "box name 'api' exists on more than one VM (default, gamma (stopped)); \
-         name the one you mean with --vm"
-    );
-
     // A name wins over an id prefix across VMs, as on one daemon: a running
     // box named 'cafe' resolves though a stopped VM holds a box whose id
     // starts with 'cafe'.
@@ -8265,9 +7891,8 @@ async fn box_on_stopped_vm_names_start_command() {
 }
 
 /// NET-058: a name the selected VM holds is ambiguous when a second running
-/// VM holds it too. `min session destroy` and `min session attach` refuse it,
-/// name both VMs and `--vm`, and do not act on the selected VM's box. With
-/// `--vm`, the selected VM's box resolves.
+/// VM holds it too. `min session attach` refuses it, names both VMs and
+/// `--vm`, and does not act on the selected VM's box.
 #[tokio::test]
 async fn box_name_resolves_vm_without_flag_refuses_a_name_two_vms_hold() {
     let (state, default_vm, alpha) = two_vms().await;
@@ -8276,14 +7901,6 @@ async fn box_name_resolves_vm_without_flag_refuses_a_name_two_vms_hold() {
     let global = vm_globals(state.path(), None);
     let expected = "box name 'shared' exists on more than one VM (default, alpha); \
                     name the one you mean with --vm";
-
-    let (client, _) = selected_client(state.path()).await;
-    let err = cmd::resolve_box_on_any_vm(&global, client, "shared", "session destroy shared")
-        .await
-        .map(|(_, record)| record)
-        .expect_err("destroy refuses a name two VMs hold");
-    assert_eq!(err.to_string(), expected);
-    assert!(err.downcast_ref::<cmd::AmbiguousBoxName>().is_some());
 
     let (mut client, sock) = selected_client(state.path()).await;
     let err = resolve_attach_target_version_gated(&global, &mut client, sock, "shared")
@@ -8294,18 +7911,9 @@ async fn box_name_resolves_vm_without_flag_refuses_a_name_two_vms_hold() {
 
     // The selected VM's box is still there: nothing acted on it.
     let (mut client, _) = selected_client(state.path()).await;
-    let record = cmd::resolve_session(&mut client, "shared")
+    let record = cmd::resolve_session_version_gated(&mut client, "shared")
         .await
         .expect("the selected VM still holds 'shared'");
-    assert_eq!(record.id, shared);
-
-    // With --vm, the operator chose: the selected VM's box resolves.
-    let pinned = vm_globals(state.path(), Some(paths::DEFAULT_VM_NAME.to_string()));
-    let (client, _) = selected_client(state.path()).await;
-    let (_, record) =
-        cmd::resolve_box_on_any_vm(&pinned, client, "shared", "session destroy shared")
-            .await
-            .expect("--vm picks the selected VM's box");
     assert_eq!(record.id, shared);
 }
 

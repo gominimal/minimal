@@ -1,6 +1,6 @@
 //! `clap` argument definitions for the `min` CLI.
 
-use clap::{ArgGroup, Args, Subcommand, ValueEnum};
+use clap::{Args, Subcommand, ValueEnum};
 // Re-exported so the crate-root glob (`pub use cli::*`) keeps `Parser` in scope
 // for tests that call `Cli::try_parse_from`, exactly as the old single-module
 // layout did.
@@ -286,62 +286,6 @@ pub struct SetupZedArgs {
     /// Print the connection entry as JSON instead of editing any file
     #[arg(long)]
     pub print: bool,
-}
-
-/// Args for `min session hooks`.
-#[derive(Debug, Args)]
-pub struct HooksArgs {
-    /// Session identifier (UUID, unique id prefix, or session name)
-    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
-    pub session: String,
-    /// Emit the raw JSON the daemon returned instead of a table
-    #[arg(long)]
-    pub json: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct ExecArgs {
-    /// Session identifier (UUID, unique id prefix, or session name).
-    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
-    pub session: String,
-    /// Command to execute in the session context
-    ///
-    /// A single argument is a shell command, run by the session's shell with
-    /// its pipes, globs and `$VAR` intact: `min session exec s 'echo $PWD'`.
-    /// Several arguments are an argv, quoted so the session sees exactly the
-    /// words you typed: `min session exec s sh -c 'echo A B'`.
-    #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
-    pub command: Vec<String>,
-}
-
-#[derive(Debug, Args)]
-pub struct SessionRunArgs {
-    /// Session identifier (UUID, unique id prefix, or session name).
-    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
-    pub session: String,
-    /// Name of a task declared in the session project's minimal.toml
-    pub task: String,
-}
-
-#[derive(Debug, Args)]
-pub struct PolicyArgs {
-    /// Session identifier (UUID, unique id prefix, or session name)
-    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
-    pub session: String,
-    /// Write one JSON document instead of text (the default)
-    #[arg(short = 'o', long = "output", value_enum)]
-    pub output: Option<PolicyOutputFormat>,
-}
-
-/// The rendering `min session policy` writes. One value today — `json`, the
-/// machine-readable shape — beside the text default; an `output` enum rather
-/// than a bare `--json` flag so a second format lands beside the first
-/// instead of accreting flags.
-#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
-pub enum PolicyOutputFormat {
-    /// One JSON document, `min/v1/session-policy`, with each live mapping's
-    /// `pending` state carried
-    Json,
 }
 
 /// The typed failure a machine-output run fails its walk into: the
@@ -2214,20 +2158,6 @@ pub struct LsArgs {
 }
 
 #[derive(Debug, Args)]
-#[command(group(ArgGroup::new("target").args(["session", "all"]).required(true).multiple(false)))]
-pub struct DestroyArgs {
-    /// Session identifier (UUID, unique id prefix, or session name)
-    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
-    pub session: Option<String>,
-    /// Destroy all sessions
-    #[arg(long)]
-    pub all: bool,
-    /// Skip the destroy confirmation, and treat a session that is already destroyed as success
-    #[arg(long, short)]
-    pub force: bool,
-}
-
-#[derive(Debug, Args)]
 pub struct NetArgs {
     #[command(subcommand)]
     pub command: NetCommand,
@@ -2279,24 +2209,6 @@ pub struct FinalizeInstallArgs {
         conflicts_with = "undo"
     )]
     pub ct_mark_mask: Option<u32>,
-}
-
-#[derive(Debug, Args)]
-pub struct StopArgs {
-    /// Force shutdown even if a session is mid-create or still holds a host handle (even a dead one).
-    /// On a VM backend whose in-guest daemon does not answer, stops the VM from the host;
-    /// data not yet flushed inside the VM can then be lost
-    #[arg(long, short, default_value_t = false)]
-    pub force: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct RenameArgs {
-    /// Session identifier (UUID, unique id prefix, or session name)
-    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
-    pub session: String,
-    /// New name for the session
-    pub new_name: String,
 }
 
 #[derive(Debug, Args)]
