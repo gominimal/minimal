@@ -7104,16 +7104,18 @@ mod tests {
         }
     }
 
-    /// The `min session activate` arguments for `argv`, from the real clap
-    /// parse.
+    /// The activation arguments for `argv`, from the real clap parse of
+    /// [`ActivateArgs`]. `argv` starts `min session activate`, the spelling
+    /// these flags had before BCLI-042 removed the verb.
     fn parsed_activate_args(argv: &[&str]) -> ActivateArgs {
-        use clap::Parser as _;
-        match crate::Cli::try_parse_from(argv).expect("parses").command {
-            Some(crate::Command::Session(crate::SessionArgs {
-                command: crate::SessionCommand::Activate(args),
-            })) => args,
-            _ => panic!("expected min session activate for {argv:?}"),
+        #[derive(clap::Parser)]
+        struct Activate {
+            #[command(flatten)]
+            args: ActivateArgs,
         }
+        use clap::Parser as _;
+        assert_eq!(argv.get(..3), Some(&["min", "session", "activate"][..]));
+        Activate::try_parse_from(&argv[2..]).expect("parses").args
     }
 
     /// The `min box spec` arguments for `argv`, from the real clap parse.

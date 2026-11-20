@@ -602,7 +602,9 @@ impl From<TaskRunArgs> for RunEntry {
         Self {
             verb: RunVerb::Task,
             entry: args.task,
-            path: args.path,
+            // BCLI-042: `min task run` takes no `--path`. `-C` names the
+            // project.
+            path: None,
             detach: args.detach,
             network: args.network,
             egress: args.egress,
@@ -2340,7 +2342,6 @@ mod tests {
         else {
             panic!("the argv is a task run");
         };
-        assert_eq!(run.path, None);
         assert_eq!(run.args, ["--path", "prod"]);
         // A run with no arguments adds no separator.
         let spec = task_box_spec(
@@ -3080,7 +3081,6 @@ mod tests {
         };
         let args = TaskRunArgs {
             task: "deploy".into(),
-            path: None,
             network: None,
             egress: crate::EgressArgs::default(),
             other: crate::BoxOverrideArgs::default(),
@@ -3130,7 +3130,6 @@ mod tests {
         };
         let args = TaskRunArgs {
             task: "build".into(),
-            path: None,
             network: None,
             egress: crate::EgressArgs::default(),
             other: crate::BoxOverrideArgs::default(),
@@ -3366,7 +3365,6 @@ mod tests {
         };
         let args = TaskRunArgs {
             task: "build".into(),
-            path: None,
             network: None,
             egress: crate::EgressArgs::default(),
             other: crate::BoxOverrideArgs::default(),

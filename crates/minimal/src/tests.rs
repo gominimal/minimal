@@ -837,6 +837,173 @@ const REMOVED_SESSION_VERBS: [&str; 7] = [
     "activate", "destroy", "exec", "rename", "policy", "hooks", "run",
 ];
 
+// BCLI-042: the removed `min session` verbs, bare `min stop` and `min task
+// run --path` fail as the parser fails for any unknown command or flag.
+// The exit is 2, and nothing runs, because the parse gives no command.
+#[test]
+fn removed_session_verbs_are_unknown_commands() {
+    use clap::CommandFactory as _;
+    use clap::Parser as _;
+    use clap::error::ErrorKind;
+
+    let refused = |argv: &[&str], kind: ErrorKind| -> String {
+        let err = Cli::try_parse_from(argv)
+            .map(|_| ())
+            .expect_err("a removed spelling does not parse");
+        assert_eq!(err.kind(), kind, "{argv:?}: {err}");
+        assert_eq!(err.exit_code(), 2, "{argv:?}: {err}");
+        err.to_string()
+    };
+
+    // The parser's own refusal for a word it does not know, for comparison.
+    let unknown = refused(&["min", "session", "bogus"], ErrorKind::InvalidSubcommand);
+    assert!(unknown.contains("unrecognized subcommand 'bogus'"), "{unknown}");
+
+    for noun in ["session", "sessions"] {
+        for verb in REMOVED_SESSION_VERBS {
+            for argv in [vec!["min", noun, verb], vec!["min", noun, verb, "web"]] {
+                let rendered = refused(&argv, ErrorKind::InvalidSubcommand);
+                assert!(
+                    rendered.contains(&format!("unrecognized subcommand '{verb}'")),
+                    "{argv:?}: {rendered}"
+                );
+            }
+        }
+    }
+
+    for argv in [
+        &["min", "stop"][..],
+        &["min", "stop", "--force"],
+        &["min", "-C", "/tmp", "stop"],
+    ] {
+        let rendered = refused(argv, ErrorKind::InvalidSubcommand);
+        assert!(
+            rendered.contains("unrecognized subcommand 'stop'"),
+            "{argv:?}: {rendered}"
+        );
+    }
+
+    for argv in [
+        &["min", "task", "run", "--path", "sub/dir", "build"][..],
+        &["min", "task", "run", "--path=sub/dir", "build"],
+    ] {
+        let rendered = refused(argv, ErrorKind::UnknownArgument);
+        assert!(
+            rendered.contains("unexpected argument '--path"),
+            "{argv:?}: {rendered}"
+        );
+    }
+
+    // The command model has none of them, hidden or not, so neither help
+    // nor completions offer them.
+    let cli = Cli::command();
+    assert!(cli.find_subcommand("stop").is_none(), "no bare `min stop`");
+    let session = cli.find_subcommand("session").expect("`min session` stays");
+    for verb in REMOVED_SESSION_VERBS {
+        assert!(
+            session.find_subcommand(verb).is_none(),
+            "no `min session {verb}`"
+        );
+    }
+    let task_run = cli
+        .find_subcommand("task")
+        .and_then(|task| task.find_subcommand("run"))
+        .expect("`min task run` stays");
+    assert!(
+        task_run.get_arguments().all(|arg| arg.get_long() != Some("path")),
+        "no `min task run --path`"
+    );
+}
+
+// BCLI-042, BCLI-030, BCLI-032: `min session list` and `min session attach`
+// stay when the old verbs go. Each parses to its verb, the list shows the
+// session box, and the attach reaches it.
+#[tokio::test]
+async fn kept_session_list_and_attach_still_work() {
+    use clap::Parser as _;
+
+    for argv in [
+        &["min", "session", "list"][..],
+        &["min", "session", "ls"],
+        &["min", "sessions", "list"],
+    ] {
+        let cli = Cli::try_parse_from(argv).unwrap_or_else(|err| panic!("{argv:?}: {err}"));
+        assert!(
+            matches!(
+                cli.command,
+                Some(Command::Session(SessionArgs {
+                    command: SessionCommand::List(_),
+                }))
+            ),
+            "{argv:?} is the session list"
+        );
+    }
+    for (argv, named) in [
+        (&["min", "session", "attach", "web"][..], Some("web")),
+        (&["min", "session", "attach"], None),
+    ] {
+        let cli = Cli::try_parse_from(argv).unwrap_or_else(|err| panic!("{argv:?}: {err}"));
+        match cli.command {
+            Some(Command::Session(SessionArgs {
+                command: SessionCommand::Attach(args),
+            })) => assert_eq!(args.session.as_deref(), named, "{argv:?}"),
+            _ => panic!("{argv:?} is the session attach"),
+        }
+    }
+
+    // `min session list` lists the session box, through the in-process
+    // daemon.
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let project_path = project.path().to_str().expect("a UTF-8 project path");
+    let mut daemon = server.connect().await;
+    let web =
+        minimald::test_harness::create_configured_session(&mut daemon, "web", project_path).await;
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let hosts = local_hosts(&global).expect("the local hosts");
+    typed_list_on_hosts(boxes::SESSION_BOX_TYPE, hosts, None, &mut out, &mut err)
+        .await
+        .expect("the session list");
+    assert!(err.is_empty(), "nothing on stderr");
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.lines()
+            .skip(1)
+            .any(|row| row.starts_with(&web.to_string())),
+        "the session box is listed:\n{text}"
+    );
+
+    // `min session attach <box>` reaches the session box.
+    let (alpha, _state) = exec_attach_host("alpha.local-minvmd0").await;
+    let dev = alpha.create("dev", None).await;
+    let hosts = [alpha.host.clone()];
+    let attached = attached_by(AttachVerb::SessionAttach, &hosts, Some("dev"), None)
+        .await
+        .unwrap_or_else(|err| panic!("the session attach: {err:#}"));
+    assert_eq!(attached.box_id, dev);
+}
+
+/// The clap command of [`ActivateArgs`], built, so its flags and help are
+/// what a parse sees. A bare `min` still takes these flags' defaults after
+/// BCLI-042 removed `min session activate`.
+fn activate_command() -> clap::Command {
+    use clap::Args as _;
+    let mut command = ActivateArgs::augment_args(clap::Command::new("activate"));
+    command.build();
+    command
+}
+
+/// [`ActivateArgs`] parsed from `argv`. `argv` starts `min session
+/// activate`, the spelling these flags had before BCLI-042.
+fn parse_activate_args(argv: &[&str]) -> Result<ActivateArgs, clap::Error> {
+    use clap::FromArgMatches as _;
+    assert_eq!(argv.get(..3), Some(&["min", "session", "activate"][..]));
+    let matches = activate_command().try_get_matches_from(&argv[2..])?;
+    ActivateArgs::from_arg_matches(&matches)
+}
+
 /// The names a script calls `min` by: the binary and the e2e's wrappers.
 const MIN_INVOKERS: [&str; 8] = [
     "min",
@@ -1652,30 +1819,6 @@ fn repo_and_minimal_dir_are_accepted_after_the_subcommand() {
     assert_eq!(cli.global_args.minimal_dir.as_deref(), Some(p("/tmp/y")));
 }
 
-/// `session destroy` must present `[SESSION]` and `--all` as mutually
-/// exclusive alternatives, one required. Regression for #1038: the error
-/// path used to hide `--all` and demand a session outright, yielding a
-/// usage line that could never parse.
-#[test]
-fn destroy_models_session_and_all_as_required_alternatives() {
-    use clap::Parser as _;
-    let parse = |args: &[&str]| Cli::try_parse_from(args);
-
-    // Exactly one of a session or --all is required; both together conflict.
-    assert!(parse(&["min", "session", "destroy", "web"]).is_ok());
-    assert!(parse(&["min", "session", "destroy", "--all"]).is_ok());
-    assert!(parse(&["min", "session", "destroy"]).is_err());
-    assert!(parse(&["min", "session", "destroy", "--all", "web"]).is_err());
-
-    // --force skips the confirm on either target: --all, or — since the
-    // single-session confirm landed — a bare session too.
-    assert!(parse(&["min", "session", "destroy", "--all", "--force"]).is_ok());
-    assert!(parse(&["min", "session", "destroy", "web", "--force"]).is_ok());
-    assert!(parse(&["min", "session", "destroy", "web", "-f"]).is_ok());
-    // ... but never stands in for the required target.
-    assert!(parse(&["min", "session", "destroy", "-f"]).is_err());
-}
-
 /// The single-session destroy gate is dirty-only: `--force` and a
 /// proven-clean session proceed promptless in every mode (including
 /// headless); dirty and unknowable states prompt interactively and
@@ -1792,26 +1935,6 @@ fn assess_at_risk_classifies_clean_dirty_and_unknowable() {
     );
 }
 
-/// `min session run <session> <task>` names both the session to run in and
-/// the task to run, in that order — the session-scoped counterpart to
-/// `min task run <task>`, which composes a session of its own.
-#[test]
-fn session_run_takes_a_session_then_a_task() {
-    let cli = Cli::try_parse_from(["min", "session", "run", "web", "build"]).unwrap();
-    let Some(Command::Session(SessionArgs {
-        command: SessionCommand::Run(a),
-    })) = cli.command
-    else {
-        panic!("expected a session run command");
-    };
-    assert_eq!(a.session, "web");
-    assert_eq!(a.task, "build");
-
-    // Both operands are required: a lone session names no task.
-    assert!(Cli::try_parse_from(["min", "session", "run", "web"]).is_err());
-    assert!(Cli::try_parse_from(["min", "session", "run"]).is_err());
-}
-
 /// The task reaches the daemon as a named form, so a task whose name
 /// collides with a program on the session's `PATH` is still a task —
 /// nothing is inferred from the text (gominimal/inbox#558). `min session
@@ -1837,9 +1960,9 @@ fn session_run_encodes_a_task_form_not_a_command() {
     );
 }
 
-/// `min task run <task>` parses its `--path` option before or after the
-/// task name, every positional after the task name is a task argument,
-/// never a project path, and it has no `--keep` flag.
+/// `min task run <task>` parses its task name, every positional after the
+/// task name is a task argument, never a project path, and it has no
+/// `--keep` flag.
 #[test]
 fn task_run_parses_task_and_path() {
     use clap::Parser as _;
@@ -1854,12 +1977,7 @@ fn task_run_parses_task_and_path() {
 
     let a = run_args(&["min", "task", "run", "build"]);
     assert_eq!(a.task, "build");
-    assert!(a.path.is_none());
     assert!(a.args.is_empty());
-
-    let a = run_args(&["min", "task", "run", "build", "--path", "sub/dir"]);
-    assert_eq!(a.task, "build");
-    assert_eq!(a.path.as_deref(), Some("sub/dir"));
 
     // `min task run` has no `--keep`: every box keeps its record.
     assert!(Cli::try_parse_from(["min", "task", "run", "--keep", "build"]).is_err());
@@ -1867,24 +1985,16 @@ fn task_run_parses_task_and_path() {
     // A positional after the task name is a task argument, not a path.
     let a = run_args(&["min", "task", "run", "greet", "Alice"]);
     assert_eq!(a.task, "greet");
-    assert!(a.path.is_none());
     assert_eq!(a.args, ["Alice"]);
-
-    // `--path` may precede the task name.
-    let a = run_args(&["min", "task", "run", "--path", "sub/dir", "build"]);
-    assert_eq!(a.task, "build");
-    assert_eq!(a.path.as_deref(), Some("sub/dir"));
 
     // A declared task arg is a `--<name>` flag; it passes through as-is.
     let a = run_args(&["min", "task", "run", "greet", "--name", "Alice"]);
     assert_eq!(a.task, "greet");
     assert_eq!(a.args, ["--name", "Alice"]);
 
-    // A task arg whose name collides with a `min task run` option (`path`)
-    // goes after `--`, which ends `min`'s own options.
+    // `--` ends `min`'s own options: what follows is the task's.
     let a = run_args(&["min", "task", "run", "deploy", "--", "--path", "prod"]);
     assert_eq!(a.task, "deploy");
-    assert!(a.path.is_none());
     assert_eq!(a.args, ["--path", "prod"]);
 
     // The task name is required.
@@ -2345,7 +2455,6 @@ async fn run_pty_entry_exit2_hints_start_new() {
             &global,
             TaskRunArgs {
                 task: "default".into(),
-                path: None,
                 network: None,
                 egress: EgressArgs::default(),
                 other: crate::BoxOverrideArgs::default(),
@@ -2423,7 +2532,6 @@ fn run_and_start_new_request_fresh_instance() {
     };
     let task_run = task::RunEntry::from(TaskRunArgs {
         task: "build".into(),
-        path: None,
         network: Some(CliNetworkMode::OwnIp),
         egress: egress.clone(),
         other: crate::BoxOverrideArgs::default(),
@@ -4665,11 +4773,7 @@ fn task_run_help_describes_the_task_box_network() {
         }
     }
 
-    let activate = cmd
-        .find_subcommand_mut("session")
-        .expect("`session` stays a subcommand")
-        .find_subcommand_mut("activate")
-        .expect("`session activate` stays a subcommand");
+    let activate = activate_command();
     let network = activate
         .get_arguments()
         .find(|a| a.get_id() == "network")
@@ -4680,19 +4784,12 @@ fn task_run_help_describes_the_task_box_network() {
     );
 }
 
-/// `--network` and `--ingress` are visible in `min session activate --help`
-/// (NET-035), with the `--network` value advertising the current
+/// `--network` and `--ingress` are visible in the help of the activation
+/// flags (NET-035), with the `--network` value advertising the current
 /// `none|host_ip|own_ip` spellings.
 #[test]
 fn activate_help_shows_network_flags() {
-    use clap::CommandFactory as _;
-
-    let mut cmd = Cli::command();
-    let activate = cmd
-        .find_subcommand_mut("session")
-        .expect("`session` stays a subcommand")
-        .find_subcommand_mut("activate")
-        .expect("`session activate` stays a subcommand");
+    let mut activate = activate_command();
     let help = activate.render_help().to_string();
     assert!(
         help.contains("--network <none|host_ip|own_ip>"),
@@ -4754,16 +4851,7 @@ fn capture_stderr<T>(f: impl FnOnce() -> T) -> (String, T) {
 /// the default print nothing, and anything else is refused.
 #[test]
 fn legacy_network_spellings_parse_with_hint() {
-    use clap::Parser as _;
-
-    let activate_args = |args: &[&str]| -> ActivateArgs {
-        match Cli::try_parse_from(args).unwrap().command {
-            Some(Command::Session(SessionArgs {
-                command: SessionCommand::Activate(a),
-            })) => a,
-            _ => panic!("expected an activate command for {args:?}"),
-        }
-    };
+    let activate_args = |args: &[&str]| -> ActivateArgs { parse_activate_args(args).unwrap() };
 
     for (legacy, current, mode) in [
         ("no-net", "none", CliNetworkMode::NoNet),
@@ -4815,7 +4903,7 @@ fn legacy_network_spellings_parse_with_hint() {
         "the default network mode must print nothing to stderr: {stderr:?}"
     );
 
-    let err = Cli::try_parse_from(["min", "session", "activate", "--network", "bogus"])
+    let err = parse_activate_args(&["min", "session", "activate", "--network", "bogus"])
         .map(|_| ())
         .unwrap_err()
         .to_string();
@@ -4852,7 +4940,7 @@ fn deny_all_egress_refuses_the_allow_flags() {
     use clap::Parser as _;
 
     for verb in [
-        &["session", "activate"][..],
+        &["session", "start"][..],
         &["task", "run"],
         &["box", "run"],
     ] {
@@ -4893,20 +4981,23 @@ fn deny_all_egress_refuses_the_allow_flags() {
 
     // The flag on its own parses, and it carries one meaning wherever the
     // egress flags appear: a boolean declaration with no value to validate.
-    let args = Cli::try_parse_from(["min", "session", "activate", "--deny-all-egress"])
+    let args = Cli::try_parse_from(["min", "session", "start", "--deny-all-egress"])
         .expect("--deny-all-egress alone must parse");
     match args.command {
         Some(Command::Session(SessionArgs {
-            command: SessionCommand::Activate(a),
-        })) => assert!(a.egress.deny_all_egress, "the flag must land on the args"),
-        _ => panic!("expected an activate command"),
+            command: SessionCommand::Start(a),
+        })) => assert!(
+            a.overrides.egress.deny_all_egress,
+            "the flag must land on the args"
+        ),
+        _ => panic!("expected a session start command"),
     }
 
     // The proxy lane is not a rule (NET-134): the two combine.
     Cli::try_parse_from([
         "min",
         "session",
-        "activate",
+        "start",
         "--deny-all-egress",
         "--credentialed-upstream",
     ])
@@ -4919,17 +5010,8 @@ fn deny_all_egress_refuses_the_allow_flags() {
 /// the range's parser in the launch check's own words.
 #[test]
 fn dynamic_ingress_flags_parse() {
-    use clap::Parser as _;
-
     let activate = |argv: &[&str]| -> ActivateArgs {
-        let args = Cli::try_parse_from(argv)
-            .unwrap_or_else(|error| panic!("{argv:?} must parse: {error}"));
-        match args.command {
-            Some(Command::Session(SessionArgs {
-                command: SessionCommand::Activate(a),
-            })) => a,
-            _ => panic!("expected an activate command"),
-        }
+        parse_activate_args(argv).unwrap_or_else(|error| panic!("{argv:?} must parse: {error}"))
     };
 
     let a = activate(&[
@@ -4948,8 +5030,7 @@ fn dynamic_ingress_flags_parse() {
     assert_eq!(a.dynamic_ingress, Some(boxes::DynamicIngress::Ask));
     assert_eq!(a.dynamic_range, None, "a mode alone carries no range");
 
-    let Err(err) =
-        Cli::try_parse_from(["min", "session", "activate", "--dynamic-ingress", "maybe"])
+    let Err(err) = parse_activate_args(&["min", "session", "activate", "--dynamic-ingress", "maybe"])
     else {
         panic!("an unknown dynamic ingress mode must not parse");
     };
@@ -4959,7 +5040,7 @@ fn dynamic_ingress_flags_parse() {
         "the refusal must name the mode, got: {rendered}"
     );
 
-    let Err(err) = Cli::try_parse_from([
+    let Err(err) = parse_activate_args(&[
         "min",
         "session",
         "activate",
@@ -17267,6 +17348,16 @@ fn start_loadout_flag_selects_loadouts_layer() {
 }
 
 /// The long flags that the `min` verb at `path` takes, as `--<long>`.
+/// The long flags of [`ActivateArgs`], the flags the removed `min session
+/// activate` took (BCLI-042).
+fn activate_long_flags() -> std::collections::BTreeSet<String> {
+    activate_command()
+        .get_arguments()
+        .filter_map(clap::Arg::get_long)
+        .map(|long| format!("--{long}"))
+        .collect()
+}
+
 fn verb_long_flags(path: &[&str]) -> std::collections::BTreeSet<String> {
     use clap::CommandFactory as _;
     let mut command = Cli::command();
@@ -17300,7 +17391,7 @@ fn parsed_run(argv: &[&str]) -> task::RunEntry {
 // activate` takes, and a start stores the values those flags give.
 #[tokio::test]
 async fn start_and_run_take_every_network_key_flag() {
-    let activate = verb_long_flags(&["session", "activate"]);
+    let activate = activate_long_flags();
     // The flags of activate that do not override a key of the box.
     let not_overrides = ["--name", "--sync", "--no-prompt", "--attach", "--help"];
     // The run path takes no `--ingress` (#3163) and no `--loadout` (#3237).

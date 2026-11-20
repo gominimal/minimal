@@ -201,24 +201,16 @@ fn shows_native_boxes_notice(command: Option<&Command>) -> bool {
 }
 
 /// The verb a run dispatches, as the user typed it (`box show`,
-/// `session policy`), for the root span's `verb` field.
+/// `session list`), for the root span's `verb` field.
 fn command_verb(command: Option<&Command>) -> &'static str {
     match command {
         None => "min",
         Some(Command::Ls(_)) => "ls",
-        Some(Command::Stop(_)) => "stop",
         Some(Command::Session(SessionArgs { command })) => match command {
             SessionCommand::List(_) => "session list",
-            SessionCommand::Activate(_) => "session activate",
             SessionCommand::Start(_) => "session start",
             SessionCommand::Attach(_) => "session attach",
-            SessionCommand::Exec(_) => "session exec",
-            SessionCommand::Run(_) => "session run",
-            SessionCommand::Destroy(_) => "session destroy",
-            SessionCommand::Rename(_) => "session rename",
-            SessionCommand::Policy(_) => "session policy",
             SessionCommand::SetupZed(_) => "session setup-zed",
-            SessionCommand::Hooks(_) => "session hooks",
             SessionCommand::Logs(_) => "session logs",
             SessionCommand::Stop(_) => "session stop",
             SessionCommand::Rm(_) => "session rm",
@@ -485,22 +477,14 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         // `cmd_bare`.
         None => cmd_bare(&cli.global_args).await,
         Some(Command::Ls(args)) => cmd_ls(&cli.global_args, args).await,
-        Some(Command::Stop(args)) => cmd_stop(&cli.global_args, args).await,
         Some(Command::Session(SessionArgs { command })) => match command {
             SessionCommand::List(args) => {
                 let session = boxes::SESSION_BOX_TYPE;
                 cmd_typed_box_list(&cli.global_args, args, session, "session list").await
             }
-            SessionCommand::Activate(args) => cmd_activate(&cli.global_args, args).await,
             SessionCommand::Start(args) => cmd_session_start(&cli.global_args, args).await,
             SessionCommand::Attach(args) => cmd_attach(&cli.global_args, args).await,
-            SessionCommand::Exec(args) => cmd_exec(&cli.global_args, args).await,
-            SessionCommand::Run(args) => cmd_session_run(&cli.global_args, args).await,
-            SessionCommand::Destroy(args) => cmd_destroy(&cli.global_args, args).await,
-            SessionCommand::Rename(args) => cmd_rename(&cli.global_args, args).await,
-            SessionCommand::Policy(args) => cmd_session_policy(&cli.global_args, args).await,
             SessionCommand::SetupZed(args) => cmd_session_setup_zed(&cli.global_args, args).await,
-            SessionCommand::Hooks(args) => cmd_session_hooks(&cli.global_args, args).await,
             SessionCommand::Logs(args) => {
                 let session = Some(boxes::SESSION_BOX_TYPE);
                 cmd_box_logs(&cli.global_args, args, session, "session logs").await

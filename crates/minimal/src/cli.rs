@@ -72,12 +72,7 @@ pub enum Command {
     // (BCLI-030) and takes the `min box list` flags. Not an oversight — do
     // not remove it.
     Ls(LsArgs),
-    /// Shut down the minimald daemon
-    //
-    // Stays top-level: it acts on the daemon backend, not on any session, and
-    // it is the daemon-lifecycle command people reach for. Documented as a
-    // deliberate exception in docs/reference/cli.md.
-    Stop(StopArgs),
+    // BCLI-042: no bare `min stop`. `min host stop` takes its place.
     /// Session management subcommands
     #[command(visible_alias = "sessions")]
     Session(SessionArgs),
@@ -163,8 +158,8 @@ pub enum Command {
     /// standard library is embedded in the `min` binary and is only refreshed
     /// or verified locally — its commit is not re-pinned. This leaves
     /// `minimal.toml` modified in your working tree (a diff to commit),
-    /// and the next `min session activate` materializes the new closure, which
-    /// can take several minutes on the first activate.
+    /// and the next `min session start` materializes the new closure, which
+    /// can take several minutes on the first start.
     ///
     /// This does not update the `min` binary itself; reinstall it with the
     /// installer to do that.
@@ -181,7 +176,7 @@ pub enum Command {
     /// Demo the client's activity spinner (development aid).
     ///
     /// Draws the same build-hold-fade spinner used by the file-upload
-    /// phases of `min session activate` so you can eyeball timing and layout
+    /// phases of `min session start` so you can eyeball timing and layout
     /// without triggering a real upload. Stops after `--seconds` or
     /// on Ctrl-C, whichever comes first. Debug builds only.
     #[cfg(debug_assertions)]
@@ -235,8 +230,8 @@ pub enum SessionCommand {
     /// project
     #[command(visible_alias = "ls")]
     List(BoxListArgs),
-    /// Activate (create) a new session
-    Activate(ActivateArgs),
+    // BCLI-042: no `activate`, `destroy`, `exec`, `rename`, `policy`,
+    // `hooks` or `run` here. They fail as unknown commands.
     /// Create a box from a session entry of the project and attach this
     /// terminal to it. `--detach` creates the box, prints its id and returns
     Start(SessionStartArgs),
@@ -244,21 +239,6 @@ pub enum SessionCommand {
     /// attach to this project's running session box that has a terminal,
     /// else to its only stopped or exited one, which starts again
     Attach(AttachArgs),
-    /// Execute a command in an existing session
-    Exec(ExecArgs),
-    /// Run a declared task in an existing session
-    ///
-    /// The task runs in the named session's context, serviced by the daemon —
-    /// the counterpart to `min task run <task>`, which composes a task session
-    /// of its own instead of reusing one you already have.
-    Run(SessionRunArgs),
-    /// Destroy (terminate) a session
-    Destroy(DestroyArgs),
-    /// Rename an existing session
-    Rename(RenameArgs),
-    /// Print the effective networking policy for a session, as text or as
-    /// one JSON document (`-o json`)
-    Policy(PolicyArgs),
     /// Register a session as an SSH remote in Zed's settings
     ///
     /// Upserts an entry into the `ssh_connections` array of Zed's
@@ -280,9 +260,6 @@ pub enum SessionCommand {
     #[command(name = "setup-zed", verbatim_doc_comment)]
     #[command(hide = true)]
     SetupZed(SetupZedArgs),
-    /// List the lifecycle hooks composed into a session, and where each
-    /// was declared
-    Hooks(HooksArgs),
     /// Show what a session's terminal printed, from its start. `-f` keeps
     /// showing new output until the session is removed or the command is
     /// interrupted
@@ -1253,7 +1230,7 @@ pub enum TaskCommand {
     /// Run a declared task in a task box
     ///
     /// Creates a box for the project (named `<task>-<n>`), uploads the
-    /// project like `min session activate`, runs the task inside it, and
+    /// project like `min session start`, runs the task inside it, and
     /// exits with the task's exit code.
     ///
     /// The task runs without a terminal. A piped or redirected stdin goes to
@@ -1314,12 +1291,7 @@ pub enum TaskCommand {
 pub struct TaskRunArgs {
     /// Name of a task declared in the project's minimal.toml
     pub task: String,
-    /// Project path. Defaults to the directory set by `-C`/`--repo-dir`,
-    /// or the current working directory when neither is given. A named
-    /// option rather than a positional so that every positional after the
-    /// task name is a task argument, never a project path.
-    #[arg(long)]
-    pub path: Option<String>,
+    // BCLI-042: no `--path`. The global `-C <dir>` names the project.
     // The same values and parser as `min session activate --network`, with
     // help worded for a task box. With no flag, the box takes the task's
     // `network.mode` from minimal.toml, else `NETWORK_DEFAULT`.
@@ -1808,8 +1780,8 @@ pub struct EgressArgs {
     /// `--network own_ip` and `--network host_ip`, and only `own_ip`
     /// enforces these rules: a `host_ip` box is refused at creation or, on
     /// a host that cannot filter it, runs with the rules unenforced.
-    /// `--network none` rejects every egress flag. `min session policy`
-    /// shows the rules a box ended up with.
+    /// `--network none` rejects every egress flag. `min box show <box>
+    /// --network` shows the rules a box ended up with.
     #[arg(long = "allow-subnets", value_name = "CIDR")]
     pub allow_subnets: Vec<String>,
     /// Allow outbound traffic to this DNS hostname, e.g. `github.com`.
