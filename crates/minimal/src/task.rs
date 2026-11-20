@@ -505,7 +505,7 @@ impl std::fmt::Display for RunFlagMisplaced {
 
 impl std::error::Error for RunFlagMisplaced {}
 
-/// Writes what a run prints once its box exists, as `min session activate`
+/// Writes what a run prints once its box exists, as `min session start`
 /// prints it: the classifier advisory the create reply carries (NET-079),
 /// the deny-all default note for an `own_ip` box with no egress rules on a
 /// daemon that has not opted out (NET-074, NET-077), and the masked form
@@ -974,9 +974,6 @@ fn resolve_task_env(
 /// [`RefuseAndRecord`] anywhere else. Returns the resolved set and the
 /// policy as the prompt left it, which the interactive lane has already
 /// saved.
-///
-/// Shared by `min task run` and `min session run` (inbox#778), so the two
-/// verbs pass one gate and print one refusal.
 pub(crate) fn gate_task_env(
     global: &GlobalArgs,
     declared: &mfile::Task,
@@ -1630,7 +1627,7 @@ pub(crate) async fn run_entry(
         String::new()
     };
 
-    // Not `connect_daemon`: like `min session activate`, this creates a session
+    // Not `connect_daemon`: like `min session start`, this creates a session
     // and the version gate rides on that `CreateSession` rather than on a
     // `GetVersion` ahead of it.
     let mut client = crate::connect_daemon_unchecked(global).await?;
@@ -1660,7 +1657,7 @@ pub(crate) async fn run_entry(
     // finalize, with the record still unfinalized and reapable.
     minimal_client::ensure_version_reported(created.daemon_version.as_deref())?;
     let id = created.id;
-    // What `min session activate` prints once its box exists: the
+    // What `min session start` prints once its box exists: the
     // advisory for egress this host cannot enforce on a `host_ip` box, the
     // deny-all default note, and how a subnet flag is read. Best-effort: a
     // stderr that cannot take them must not fail a box that exists.
