@@ -3038,7 +3038,7 @@ async fn create_reply_carries_user_namespace_verdict() {
                  unprivileged user namespaces), so no box can start here yet.\n\
                  Finish the install to allow it for Minimal only: min finalize-install   (see \
                  what it changes first: min finalize-install --show). The profile takes \
-                 effect when the daemon next starts: run min stop, then your command \
+                 effect when the daemon next starts: run min host stop <host>, then your command \
                  again.\n\
                  A daemon built from source is not covered: attach the profile to this \
                  binary instead, from a checkout: sudo scripts/install-apparmor-profile.sh \

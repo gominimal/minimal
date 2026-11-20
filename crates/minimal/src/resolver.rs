@@ -4120,8 +4120,8 @@ const MACOS_UNDO_WHAT: &str = "Remove what `min finalize-install` installed on t
 /// left behind too. Echoed inside single quotes, so it holds none.
 #[cfg(any(test, target_os = "macos"))]
 const MACOS_UNDO_VM_RUNNING_NOTE: &str = "note: the loopback IPs boxes use stay on lo0 while a \
-     VM is running; stop every VM (run min stop, and end any minvmd process still running), \
-     then run min finalize-install --undo again";
+     VM is running; stop every VM (run min host stop <host> for each host that min host \
+     list shows as running, and end any minvmd process still running), then run min finalize-install --undo again";
 
 /// The lead-in sentence of the removal script on Linux.
 #[cfg(any(test, not(target_os = "macos")))]

@@ -281,11 +281,6 @@ fn every_daemon_connection_is_classified() {
             // with the Box Egress Proxy over its control socket. The proxy is
             // not the daemon, and the daemon's build is not in question here.
             "cmd/boxes/create.rs::mint_grants = ungated",
-            // Not a product path: the destroy-race test's own connection to
-            // the harness daemon. The destroy it drives sends no gated RPC —
-            // the race's loser just reports what the daemon said — so the
-            // harness connection carries no gate to record.
-            "cmd/boxes/lifecycle.rs::a_destroy_of_an_already_destroyed_session_reports_it = ungated",
             // `min box prune` probes each host it did not select and checks
             // its build before the prune, so a daemon outside the supported
             // window removes nothing.
@@ -305,7 +300,6 @@ fn every_daemon_connection_is_classified() {
             "cmd/boxes/list.rs::list_other_host = ungated",
             "cmd/boxes/list.rs::list_selected_host = gated",
             "cmd/boxes/vm_host.rs::box_record_by = ungated",
-            "cmd/boxes/vm_host.rs::destroyable_box_on_vm_host = ungated",
             // `min host list|show` probes each local host for its state and
             // daemon version. It only reads, and it must show a skewed
             // daemon's version, so it must work when the pair is skewed.
@@ -324,10 +318,6 @@ fn every_daemon_connection_is_classified() {
             "cmd/list.rs::list_selected_vm = gated",
             "cmd/mod.rs::arm_activation_interrupt = ungated",
             "cmd/mod.rs::connect_daemon_unchecked = ungated",
-            // `min session policy` and `min session destroy` on a box another
-            // VM owns: the connection to that VM, gated as `connect_daemon`
-            // gates the selected one.
-            "cmd/mod.rs::resolve_box_on_any_vm = gated",
             "cmd/net.rs::cmd_net_forward = gated",
             // `min net forward` on a box another VM holds: the session poll's
             // connection to that VM, gated before the loop (NET-058).
@@ -337,8 +327,6 @@ fn every_daemon_connection_is_classified() {
             // the rule is already saved before the ask, so a skew can
             // half-build nothing here, the same as the mint path's sites.
             "cmd/secret.rs::recertify = ungated",
-            "cmd/session.rs::cmd_exec = gated",
-            "cmd/session.rs::cmd_session_run = gated",
             "cmd/session.rs::cmd_session_setup_zed = gated",
             // The dashboard's activation is the same multi-step mutation as
             // `cmd_session`'s, so it carries the same gate on its own create.
@@ -843,6 +831,241 @@ const REMOVED_SESSION_VERBS: [&str; 7] = [
     "activate", "destroy", "exec", "rename", "policy", "hooks", "run",
 ];
 
+// BCLI-042: the removed `min session` verbs, bare `min stop` and `min task
+// run --path` fail as the parser fails for any unknown command or flag.
+// The exit is 2, and nothing runs, because the parse gives no command.
+// A `--path` after the task's name parses as a task argument, so the run
+// refuses it with exit 2 before it creates a box.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removed_session_verbs_fail_as_unknown_commands() {
+    use clap::CommandFactory as _;
+    use clap::Parser as _;
+    use clap::error::ErrorKind;
+
+    let refused = |argv: &[&str], kind: ErrorKind| -> String {
+        let err = Cli::try_parse_from(argv)
+            .map(|_| ())
+            .expect_err("a removed spelling does not parse");
+        assert_eq!(err.kind(), kind, "{argv:?}: {err}");
+        assert_eq!(err.exit_code(), 2, "{argv:?}: {err}");
+        err.to_string()
+    };
+
+    // The parser's own refusal for a word it does not know, for comparison.
+    let unknown = refused(&["min", "session", "bogus"], ErrorKind::InvalidSubcommand);
+    assert!(
+        unknown.contains("unrecognized subcommand 'bogus'"),
+        "{unknown}"
+    );
+
+    for noun in ["session", "sessions"] {
+        for verb in REMOVED_SESSION_VERBS {
+            for argv in [vec!["min", noun, verb], vec!["min", noun, verb, "web"]] {
+                let rendered = refused(&argv, ErrorKind::InvalidSubcommand);
+                assert!(
+                    rendered.contains(&format!("unrecognized subcommand '{verb}'")),
+                    "{argv:?}: {rendered}"
+                );
+            }
+        }
+    }
+
+    for argv in [
+        &["min", "stop"][..],
+        &["min", "stop", "--force"],
+        &["min", "-C", "/tmp", "stop"],
+    ] {
+        let rendered = refused(argv, ErrorKind::InvalidSubcommand);
+        assert!(
+            rendered.contains("unrecognized subcommand 'stop'"),
+            "{argv:?}: {rendered}"
+        );
+    }
+
+    for argv in [
+        &["min", "task", "run", "--path", "sub/dir", "build"][..],
+        &["min", "task", "run", "--path=sub/dir", "build"],
+    ] {
+        let rendered = refused(argv, ErrorKind::UnknownArgument);
+        assert!(
+            rendered.contains("unexpected argument '--path"),
+            "{argv:?}: {rendered}"
+        );
+    }
+
+    // The command model has none of them, hidden or not, so neither help
+    // nor completions offer them.
+    let cli = Cli::command();
+    assert!(cli.find_subcommand("stop").is_none(), "no bare `min stop`");
+    let session = cli.find_subcommand("session").expect("`min session` stays");
+    for verb in REMOVED_SESSION_VERBS {
+        assert!(
+            session.find_subcommand(verb).is_none(),
+            "no `min session {verb}`"
+        );
+    }
+    let task_run = cli
+        .find_subcommand("task")
+        .and_then(|task| task.find_subcommand("run"))
+        .expect("`min task run` stays");
+    assert!(
+        task_run
+            .get_arguments()
+            .all(|arg| arg.get_long() != Some("path")),
+        "no `min task run --path`"
+    );
+
+    // `--path` after the task's name reaches the run as a task argument.
+    // The run refuses it with exit 2, and the daemon has no box after it.
+    let project = tempfile::tempdir().expect("a temp project dir");
+    std::fs::write(
+        project.path().join(mfile::MFILE_NAME),
+        b"[tasks.build]\necho = 'x'\n",
+    )
+    .expect("the project's minimal.toml");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let sock = state.path().join("providers/local-minimald0/ssh.sock");
+    std::fs::create_dir_all(sock.parent().expect("the socket has a dir"))
+        .expect("the daemon's state dir");
+    let server = minimald::test_harness::TestServer::new().await;
+    server.listen_on_uds(&sock).await;
+    let global = GlobalArgs {
+        repo_dir: Some(project.path().to_path_buf()),
+        minimal_dir: Some(state.path().to_path_buf()),
+        no_input: true,
+        ..Default::default()
+    };
+    for (argv, flag) in [
+        (
+            &["min", "task", "run", "build", "--path", "sub/dir"][..],
+            "--path",
+        ),
+        (&["min", "task", "run", "build", "--path=sub/dir"], "--path"),
+    ] {
+        let cli = Cli::try_parse_from(argv).unwrap_or_else(|err| panic!("{argv:?}: {err}"));
+        let Some(Command::Task(TaskArgs {
+            command: TaskCommand::Run(run),
+        })) = cli.command
+        else {
+            panic!("{argv:?} parses as a task run");
+        };
+        let err = task::cmd_task_run(&global, run)
+            .await
+            .expect_err("a task run with --path is refused");
+        let refusal = err
+            .downcast_ref::<task::RunFlagMisplaced>()
+            .unwrap_or_else(|| panic!("{argv:?}: {err:#}"));
+        assert_eq!(task::RunFlagMisplaced::EXIT_CODE, 2);
+        assert_eq!(
+            refusal.to_string(),
+            format!(
+                "Cannot run build: min task run has no {flag} flag. Run min -C <dir> task run \
+                 build to run the task in the project at <dir>, or put -- between build and \
+                 its arguments to pass {flag} to the task."
+            ),
+            "{argv:?}"
+        );
+    }
+    let listed = server
+        .connect()
+        .await
+        .call::<minimald_rpc::ListSessions>(&())
+        .await;
+    assert!(
+        listed.sessions.is_empty(),
+        "the refused runs created no box"
+    );
+}
+
+// BCLI-042, BCLI-030, BCLI-032: `min session list` and `min session attach`
+// stay when the old verbs go. Each parses to its verb, the list shows the
+// session box, and the attach reaches it.
+#[tokio::test]
+async fn kept_session_list_and_attach_still_work() {
+    use clap::Parser as _;
+
+    for argv in [
+        &["min", "session", "list"][..],
+        &["min", "session", "ls"],
+        &["min", "sessions", "list"],
+    ] {
+        let cli = Cli::try_parse_from(argv).unwrap_or_else(|err| panic!("{argv:?}: {err}"));
+        assert!(
+            matches!(
+                cli.command,
+                Some(Command::Session(SessionArgs {
+                    command: SessionCommand::List(_),
+                }))
+            ),
+            "{argv:?} is the session list"
+        );
+    }
+    for (argv, named) in [
+        (&["min", "session", "attach", "web"][..], Some("web")),
+        (&["min", "session", "attach"], None),
+    ] {
+        let cli = Cli::try_parse_from(argv).unwrap_or_else(|err| panic!("{argv:?}: {err}"));
+        match cli.command {
+            Some(Command::Session(SessionArgs {
+                command: SessionCommand::Attach(args),
+            })) => assert_eq!(args.session.as_deref(), named, "{argv:?}"),
+            _ => panic!("{argv:?} is the session attach"),
+        }
+    }
+
+    // `min session list` lists the session box, through the in-process
+    // daemon.
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let project_path = project.path().to_str().expect("a UTF-8 project path");
+    let mut daemon = server.connect().await;
+    let web =
+        minimald::test_harness::create_configured_session(&mut daemon, "web", project_path).await;
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let hosts = local_hosts(&global).expect("the local hosts");
+    typed_list_on_hosts(boxes::SESSION_BOX_TYPE, hosts, None, &mut out, &mut err)
+        .await
+        .expect("the session list");
+    assert!(err.is_empty(), "nothing on stderr");
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.lines()
+            .skip(1)
+            .any(|row| row.starts_with(&web.to_string())),
+        "the session box is listed:\n{text}"
+    );
+
+    // `min session attach <box>` reaches the session box.
+    let (alpha, _state) = exec_attach_host("alpha.local-minvmd0").await;
+    let dev = alpha.create("dev", None).await;
+    let hosts = [alpha.host.clone()];
+    let attached = attached_by(AttachVerb::SessionAttach, &hosts, Some("dev"), None)
+        .await
+        .unwrap_or_else(|err| panic!("the session attach: {err:#}"));
+    assert_eq!(attached.box_id, dev);
+}
+
+/// The clap command of [`ActivateArgs`], built, so its flags and help are
+/// what a parse sees. A bare `min` still takes these flags' defaults after
+/// BCLI-042 removed `min session activate`.
+fn activate_command() -> clap::Command {
+    use clap::Args as _;
+    let mut command = ActivateArgs::augment_args(clap::Command::new("activate"));
+    command.build();
+    command
+}
+
+/// [`ActivateArgs`] parsed from `argv`. `argv` starts `min session
+/// activate`, the spelling these flags had before BCLI-042.
+fn parse_activate_args(argv: &[&str]) -> Result<ActivateArgs, clap::Error> {
+    use clap::FromArgMatches as _;
+    assert_eq!(argv.get(..3), Some(&["min", "session", "activate"][..]));
+    let matches = activate_command().try_get_matches_from(&argv[2..])?;
+    ActivateArgs::from_arg_matches(&matches)
+}
+
 /// The names a script calls `min` by: the binary and the e2e's wrappers.
 const MIN_INVOKERS: [&str; 8] = [
     "min",
@@ -1120,7 +1343,7 @@ fn twin_entry(
 }
 
 /// One cwd-matching session: the report names it with its status, and the
-/// `Next:` attach line carries its real name — every line verbatim.
+/// `Next:` lines suggest `min task run` — every line verbatim.
 #[test]
 fn bare_status_renders_a_cwd_session_verbatim() {
     let entries = vec![twin_entry(
@@ -1136,7 +1359,7 @@ fn bare_status_renders_a_cwd_session_verbatim() {
              \x20 sessions: 1 (web, running)\n\
              \x20 blueprint: minimal.toml present\n\
              Next:\n\
-             \x20 min session run web <task>\n\
+             \x20 min task run <task>\n\
              \x20 min ls --json\n"
     );
 }
@@ -1152,7 +1375,7 @@ fn bare_status_renders_the_empty_state_verbatim() {
              \x20 sessions: none\n\
              \x20 blueprint: none (min init to create one)\n\
              Next:\n\
-             \x20 min session activate --attach .\n\
+             \x20 min session start\n\
              \x20 min ls --json\n"
     );
 }
@@ -1183,19 +1406,19 @@ fn bare_status_counts_elsewhere_sessions() {
         "elsewhere count: {out}"
     );
     assert!(
-        out.contains("  min session activate --attach .\n"),
-        "no cwd session must suggest activate: {out}"
+        out.contains("  min session start\n"),
+        "no cwd session must suggest start: {out}"
     );
     assert!(
-        !out.contains("min session run"),
+        !out.contains("min task run"),
         "must not suggest running in a session elsewhere: {out}"
     );
 }
 
 /// More than two cwd matches: the count is the full total, the listing
 /// stops at two and counts the rest, sessions elsewhere are counted too,
-/// and an unnamed session shows its short id — which is also what the run
-/// suggestion substitutes for the first match.
+/// and an unnamed session shows its short id. The run suggestion is
+/// `min task run <task>`.
 #[test]
 fn bare_status_lists_at_most_two_cwd_sessions() {
     let entries = vec![
@@ -1238,8 +1461,8 @@ fn bare_status_lists_at_most_two_cwd_sessions() {
         "third session must not be listed: {out}"
     );
     assert!(
-        out.contains("  min session run 019f5d0f <task>\n"),
-        "run suggestion uses the first match's handle: {out}"
+        out.contains("  min task run <task>\n"),
+        "a cwd session must suggest task run: {out}"
     );
 }
 
@@ -1663,30 +1886,6 @@ fn repo_and_minimal_dir_are_accepted_after_the_subcommand() {
     assert_eq!(cli.global_args.minimal_dir.as_deref(), Some(p("/tmp/y")));
 }
 
-/// `session destroy` must present `[SESSION]` and `--all` as mutually
-/// exclusive alternatives, one required. Regression for #1038: the error
-/// path used to hide `--all` and demand a session outright, yielding a
-/// usage line that could never parse.
-#[test]
-fn destroy_models_session_and_all_as_required_alternatives() {
-    use clap::Parser as _;
-    let parse = |args: &[&str]| Cli::try_parse_from(args);
-
-    // Exactly one of a session or --all is required; both together conflict.
-    assert!(parse(&["min", "session", "destroy", "web"]).is_ok());
-    assert!(parse(&["min", "session", "destroy", "--all"]).is_ok());
-    assert!(parse(&["min", "session", "destroy"]).is_err());
-    assert!(parse(&["min", "session", "destroy", "--all", "web"]).is_err());
-
-    // --force skips the confirm on either target: --all, or — since the
-    // single-session confirm landed — a bare session too.
-    assert!(parse(&["min", "session", "destroy", "--all", "--force"]).is_ok());
-    assert!(parse(&["min", "session", "destroy", "web", "--force"]).is_ok());
-    assert!(parse(&["min", "session", "destroy", "web", "-f"]).is_ok());
-    // ... but never stands in for the required target.
-    assert!(parse(&["min", "session", "destroy", "-f"]).is_err());
-}
-
 /// The single-session destroy gate is dirty-only: `--force` and a
 /// proven-clean session proceed promptless in every mode (including
 /// headless); dirty and unknowable states prompt interactively and
@@ -1803,26 +2002,6 @@ fn assess_at_risk_classifies_clean_dirty_and_unknowable() {
     );
 }
 
-/// `min session run <session> <task>` names both the session to run in and
-/// the task to run, in that order — the session-scoped counterpart to
-/// `min task run <task>`, which composes a session of its own.
-#[test]
-fn session_run_takes_a_session_then_a_task() {
-    let cli = Cli::try_parse_from(["min", "session", "run", "web", "build"]).unwrap();
-    let Some(Command::Session(SessionArgs {
-        command: SessionCommand::Run(a),
-    })) = cli.command
-    else {
-        panic!("expected a session run command");
-    };
-    assert_eq!(a.session, "web");
-    assert_eq!(a.task, "build");
-
-    // Both operands are required: a lone session names no task.
-    assert!(Cli::try_parse_from(["min", "session", "run", "web"]).is_err());
-    assert!(Cli::try_parse_from(["min", "session", "run"]).is_err());
-}
-
 /// The task reaches the daemon as a named form, so a task whose name
 /// collides with a program on the session's `PATH` is still a task —
 /// nothing is inferred from the text (gominimal/inbox#558). `min session
@@ -1848,9 +2027,9 @@ fn session_run_encodes_a_task_form_not_a_command() {
     );
 }
 
-/// `min task run <task>` parses its `--path` option before or after the
-/// task name, every positional after the task name is a task argument,
-/// never a project path, and it has no `--keep` flag.
+/// `min task run <task>` parses its task name, every positional after the
+/// task name is a task argument, never a project path, and it has no
+/// `--keep` flag.
 #[test]
 fn task_run_parses_task_and_path() {
     use clap::Parser as _;
@@ -1865,12 +2044,7 @@ fn task_run_parses_task_and_path() {
 
     let a = run_args(&["min", "task", "run", "build"]);
     assert_eq!(a.task, "build");
-    assert!(a.path.is_none());
     assert!(a.args.is_empty());
-
-    let a = run_args(&["min", "task", "run", "build", "--path", "sub/dir"]);
-    assert_eq!(a.task, "build");
-    assert_eq!(a.path.as_deref(), Some("sub/dir"));
 
     // `min task run` has no `--keep`: every box keeps its record.
     assert!(Cli::try_parse_from(["min", "task", "run", "--keep", "build"]).is_err());
@@ -1878,24 +2052,16 @@ fn task_run_parses_task_and_path() {
     // A positional after the task name is a task argument, not a path.
     let a = run_args(&["min", "task", "run", "greet", "Alice"]);
     assert_eq!(a.task, "greet");
-    assert!(a.path.is_none());
     assert_eq!(a.args, ["Alice"]);
-
-    // `--path` may precede the task name.
-    let a = run_args(&["min", "task", "run", "--path", "sub/dir", "build"]);
-    assert_eq!(a.task, "build");
-    assert_eq!(a.path.as_deref(), Some("sub/dir"));
 
     // A declared task arg is a `--<name>` flag; it passes through as-is.
     let a = run_args(&["min", "task", "run", "greet", "--name", "Alice"]);
     assert_eq!(a.task, "greet");
     assert_eq!(a.args, ["--name", "Alice"]);
 
-    // A task arg whose name collides with a `min task run` option (`path`)
-    // goes after `--`, which ends `min`'s own options.
+    // `--` ends `min`'s own options: what follows is the task's.
     let a = run_args(&["min", "task", "run", "deploy", "--", "--path", "prod"]);
     assert_eq!(a.task, "deploy");
-    assert!(a.path.is_none());
     assert_eq!(a.args, ["--path", "prod"]);
 
     // The task name is required.
@@ -2356,7 +2522,6 @@ async fn run_pty_entry_exit2_hints_start_new() {
             &global,
             TaskRunArgs {
                 task: "default".into(),
-                path: None,
                 network: None,
                 egress: EgressArgs::default(),
                 other: crate::BoxOverrideArgs::default(),
@@ -2434,7 +2599,6 @@ fn run_and_start_new_request_fresh_instance() {
     };
     let task_run = task::RunEntry::from(TaskRunArgs {
         task: "build".into(),
-        path: None,
         network: Some(CliNetworkMode::OwnIp),
         egress: egress.clone(),
         other: crate::BoxOverrideArgs::default(),
@@ -4095,7 +4259,7 @@ fn both_creators_share_the_composition_failure_message() {
 
 /// A daemon refusal is printed in the daemon's own words. The RPC's name
 /// is the wire's vocabulary, not the person's, so no creator, verdict
-/// submitter, finalizer or renamer may prefix the daemon's error with
+/// submitter or finalizer may prefix the daemon's error with
 /// it. Asserted over the function bodies, the way the composition
 /// message is, because the prefix had crept into five sites across three
 /// files before anyone noticed it on a terminal.
@@ -4104,7 +4268,6 @@ fn daemon_refusals_print_without_rpc_names() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for (file, func) in [
         ("src/cmd/boxes/create.rs", "activate_box"),
-        ("src/cmd/session.rs", "cmd_rename"),
         ("src/task.rs", "run_entry"),
         ("src/cmd/mod.rs", "submit_verdict_and_wait"),
         ("src/cmd/mod.rs", "upload_and_finalize"),
@@ -4114,7 +4277,6 @@ fn daemon_refusals_print_without_rpc_names() {
             function_body(&text, func).unwrap_or_else(|| panic!("{file} no longer defines {func}"));
         for bare in [
             "CreateSession failed",
-            "RenameSession failed",
             "SubmitVerdict failed",
             "SubmitVerdict faulted",
             "FinalizeSession failed",
@@ -4226,294 +4388,6 @@ fn project_lifecycle_hook_count_detects_declared_hooks() {
     assert_eq!(project_lifecycle_hook_count(root), 0);
 }
 
-/// On a VM target the daemon is the guest's pid-1, so an accepted shutdown
-/// takes the SSH transport down with it and the reply can be lost on the
-/// way out. `stop` gates on the observable goal, not on the transport: a
-/// daemon that reached the stopped state is a stop that worked.
-#[tokio::test]
-async fn stop_succeeds_when_a_lost_reply_still_stopped_the_daemon() {
-    stop_outcome(
-        Err(anyhow::anyhow!("EOF while parsing a value")
-            .context("decode response for shutdown")
-            .context("Shutdown RPC failed")),
-        async || Ok(()),
-        async || true,
-    )
-    .await
-    .expect("a daemon that reached the stopped state is a successful stop");
-}
-
-/// The other half of that judgement: a failed RPC over a daemon that is
-/// still there is a real failure, and the RPC's own error — context and all
-/// — is what the user needs.
-#[tokio::test]
-async fn stop_reports_the_rpc_error_when_the_daemon_is_still_running() {
-    let err = stop_outcome(
-        Err(anyhow::anyhow!("connection reset").context("Shutdown RPC failed")),
-        async || Ok(()),
-        async || false,
-    )
-    .await
-    .unwrap_err();
-
-    let chain = format!("{err:#}");
-    assert!(
-        chain.contains("Shutdown RPC failed") && chain.contains("connection reset"),
-        "expected the original RPC error chain, got: {chain}"
-    );
-}
-
-/// A refusal is an answer, not a lost reply: it keeps its own message and
-/// its non-zero exit, and observes nothing — the daemon it names is staying
-/// up on purpose.
-#[tokio::test]
-async fn stop_with_live_sessions_bails_without_waiting() {
-    let observed = std::cell::Cell::new(false);
-    let err = stop_outcome(
-        Ok(minimald_rpc::ShutdownResponse::SessionsLive),
-        async || {
-            observed.set(true);
-            Ok(())
-        },
-        async || {
-            observed.set(true);
-            true
-        },
-    )
-    .await
-    .unwrap_err();
-
-    assert_eq!(
-        err.to_string(),
-        "daemon has active sessions; pass --force to shut down anyway"
-    );
-    assert!(
-        !observed.get(),
-        "a refused shutdown has nothing to wait for"
-    );
-}
-
-/// An acknowledged shutdown still has to finish, and its wait is the whole
-/// judgement: a daemon that never reaches a stopped state fails with the
-/// wait's own error, and the extra liveness probe — which exists only to
-/// judge a *failed* RPC — never races a teardown the daemon acknowledged.
-#[tokio::test]
-async fn stop_fails_when_an_accepted_shutdown_never_completes() {
-    stop_outcome(
-        Ok(minimald_rpc::ShutdownResponse::ShuttingDown),
-        async || Ok(()),
-        async || false,
-    )
-    .await
-    .expect("an acknowledged shutdown that completes is a successful stop");
-
-    let probed = std::cell::Cell::new(false);
-    let err = stop_outcome(
-        Ok(minimald_rpc::ShutdownResponse::ShuttingDown),
-        async || Err(anyhow::anyhow!("the VM is still shutting down after 20s")),
-        async || {
-            probed.set(true);
-            true
-        },
-    )
-    .await
-    .unwrap_err();
-    assert!(
-        err.to_string().contains("still shutting down"),
-        "expected the wait's error, got: {err}"
-    );
-    assert!(
-        !probed.get(),
-        "an accepted shutdown is judged by its wait alone"
-    );
-}
-
-/// The recovery's actual observation, not a stand-in for it: the real
-/// probe `cmd_stop` hands `stop_outcome`, run against a state dir no daemon
-/// ever ran in. Nothing is listening and no lifecycle is active, which is
-/// exactly the post-shutdown reading a lost reply has to be judged on, so
-/// it must confirm the stop.
-#[tokio::test]
-async fn the_real_probe_confirms_a_daemon_that_is_not_there() {
-    let dir = tempfile::tempdir().unwrap();
-    assert!(
-        daemon_confirmed_stopped(true, Some(dir.path().to_path_buf())).await,
-        "a state dir with no live daemon is a confirmed stop"
-    );
-}
-
-/// The already-down fast path: against a state dir no daemon ever ran in,
-/// `stop` reports the goal state and exits 0 without connecting or
-/// spawning anything.
-#[tokio::test]
-async fn stop_is_a_no_op_when_the_daemon_is_already_down() {
-    let dir = tempfile::tempdir().unwrap();
-    let global = GlobalArgs {
-        repo_dir: None,
-        minimal_dir: Some(dir.path().to_path_buf()),
-        config_dir: None,
-        provider: None,
-        no_input: true,
-        vm: None,
-    };
-
-    cmd_stop(&global, StopArgs { force: false })
-        .await
-        .expect("an already-stopped daemon is the goal state, not an error");
-}
-
-/// The wedged-VM recovery: with a VM backend whose state says Running under a
-/// live alive-lock but no bridge socket to answer, `min stop --force` must
-/// stop the VM from the host — signal the VMM the state names, write
-/// `Stopped` — and exit 0, rather than failing on the refused connect and
-/// leaving the only recovery a hand-killed VMM.
-#[tokio::test]
-async fn stop_force_stops_a_wedged_vm_from_the_host() {
-    let dir = tempfile::tempdir().unwrap();
-    let host_dir = client::resolve_host_dir(Some(dir.path()), true).expect("resolve provider dir");
-    let state_dir = minvmd::state::StateDir::new(host_dir).expect("open state dir");
-    // The alive lock is held the way a real VM holds it: by the VMM process,
-    // through the inherited fd, so it is released when that process dies and
-    // not before.
-    let lock = state_dir
-        .try_acquire_alive_lock()
-        .unwrap()
-        .expect("acquire alive lock");
-    let mut vmm_cmd = std::process::Command::new("sleep");
-    vmm_cmd.arg("30");
-    lock.inherit_into(&mut vmm_cmd);
-    let mut vmm = vmm_cmd.spawn().expect("spawn sleep");
-    drop(lock);
-    state_dir
-        .write_state(&minvmd::state::State {
-            lifecycle: minvmd::lifecycle::Lifecycle::Running,
-            vmm_pid: Some(vmm.id()),
-            started_at: None,
-            ..minvmd::state::State::stopped()
-        })
-        .unwrap();
-    assert!(
-        state_dir.daemon_alive().unwrap(),
-        "the stand-in VMM must hold the alive lock"
-    );
-
-    let global = GlobalArgs {
-        repo_dir: None,
-        minimal_dir: Some(dir.path().to_path_buf()),
-        config_dir: None,
-        provider: Some(Provider::LocalMinvmd),
-        no_input: true,
-        vm: None,
-    };
-    cmd_stop(&global, StopArgs { force: true })
-        .await
-        .expect("a wedged VM stopped from the host is the goal state");
-
-    assert_eq!(
-        state_dir.read_state().unwrap().lifecycle,
-        minvmd::lifecycle::Lifecycle::Stopped
-    );
-    assert!(
-        !state_dir.daemon_alive().unwrap(),
-        "the stop must not return while the alive lock is held: a `min start` would refuse"
-    );
-    // SIGTERM'd by the host-side stop; reaped here so the test leaves no stray.
-    let status = vmm.wait().unwrap();
-    assert!(
-        status.code().is_none(),
-        "expected a signalled VMM child, got {status:?}"
-    );
-}
-
-/// A VM that is still booting has no VMM pid to signal, so `min stop --force`
-/// must not report a host-side stop it did not make: it refuses with the
-/// retry, and leaves the boot's `Starting` state for the supervisor to finish.
-#[tokio::test]
-async fn stop_force_refuses_a_booting_vm() {
-    let dir = tempfile::tempdir().unwrap();
-    let host_dir = client::resolve_host_dir(Some(dir.path()), true).expect("resolve provider dir");
-    let state_dir = minvmd::state::StateDir::new(host_dir).expect("open state dir");
-    state_dir
-        .write_state(&minvmd::state::State {
-            lifecycle: minvmd::lifecycle::Lifecycle::Starting,
-            vmm_pid: None,
-            started_at: None,
-            ..minvmd::state::State::stopped()
-        })
-        .unwrap();
-    let _lock = state_dir
-        .try_acquire_alive_lock()
-        .unwrap()
-        .expect("acquire alive lock");
-
-    let global = GlobalArgs {
-        repo_dir: None,
-        minimal_dir: Some(dir.path().to_path_buf()),
-        config_dir: None,
-        provider: Some(Provider::LocalMinvmd),
-        no_input: true,
-        vm: None,
-    };
-    let err = cmd_stop(&global, StopArgs { force: true })
-        .await
-        .expect_err("a booting VM was not stopped from the host");
-
-    let chain = format!("{err:#}");
-    assert!(
-        chain.contains("still booting") && chain.contains("`min stop`"),
-        "expected the retry hint, got: {chain}"
-    );
-    assert_eq!(
-        state_dir.read_state().unwrap().lifecycle,
-        minvmd::lifecycle::Lifecycle::Starting
-    );
-}
-
-/// Without `--force`, a VM that is still booting is not told to use `--force`,
-/// which refuses a booting VM: the hint names the retry, and the failure stays
-/// the typed host-unreachable one.
-#[tokio::test]
-async fn stop_without_force_on_a_booting_vm_names_the_retry() {
-    let dir = tempfile::tempdir().unwrap();
-    let host_dir = client::resolve_host_dir(Some(dir.path()), true).expect("resolve provider dir");
-    let state_dir = minvmd::state::StateDir::new(host_dir).expect("open state dir");
-    state_dir
-        .write_state(&minvmd::state::State {
-            lifecycle: minvmd::lifecycle::Lifecycle::Starting,
-            vmm_pid: None,
-            started_at: None,
-            ..minvmd::state::State::stopped()
-        })
-        .unwrap();
-    let _lock = state_dir
-        .try_acquire_alive_lock()
-        .unwrap()
-        .expect("acquire alive lock");
-
-    let global = GlobalArgs {
-        repo_dir: None,
-        minimal_dir: Some(dir.path().to_path_buf()),
-        config_dir: None,
-        provider: Some(Provider::LocalMinvmd),
-        no_input: true,
-        vm: None,
-    };
-    let err = cmd_stop(&global, StopArgs { force: false })
-        .await
-        .expect_err("a booting VM that does not answer keeps failing");
-
-    let chain = format!("{err:#}");
-    assert!(
-        chain.contains("still booting") && !chain.contains("--force"),
-        "expected the retry hint and no --force, got: {chain}"
-    );
-    assert!(
-        err.downcast_ref::<client::box_registration::HostUnreachable>()
-            .is_some(),
-        "the refusal must carry the type `main` maps to exit 7, got: {chain}"
-    );
-}
-
 /// The wait a host-side stop ends on is the alive lock, not the lifecycle
 /// file: it fails while a minvmd still holds the lock, even over a `Stopped`
 /// state, and passes once the lock is released.
@@ -4539,52 +4413,6 @@ fn host_stop_waits_for_the_alive_lock_not_the_lifecycle() {
     drop(lock);
     wait_for_alive_lock_released(&state_dir, std::time::Duration::from_millis(300))
         .expect("a released alive lock is a finished stop");
-}
-
-/// Without `--force` the wedged VM keeps its non-zero exit — force-stopping a
-/// VM that may still be draining is not the default behaviour — but the error
-/// names the recovery instead of a bare connect failure, and is the typed
-/// host-unreachable failure the binary exits 7 on.
-#[tokio::test]
-async fn stop_without_force_on_a_wedged_vm_names_the_recovery() {
-    let dir = tempfile::tempdir().unwrap();
-    let host_dir = client::resolve_host_dir(Some(dir.path()), true).expect("resolve provider dir");
-    let state_dir = minvmd::state::StateDir::new(host_dir).expect("open state dir");
-    state_dir
-        .write_state(&minvmd::state::State {
-            lifecycle: minvmd::lifecycle::Lifecycle::Running,
-            vmm_pid: Some(std::process::id()),
-            started_at: None,
-            ..minvmd::state::State::stopped()
-        })
-        .unwrap();
-    let _lock = state_dir
-        .try_acquire_alive_lock()
-        .unwrap()
-        .expect("acquire alive lock");
-
-    let global = GlobalArgs {
-        repo_dir: None,
-        minimal_dir: Some(dir.path().to_path_buf()),
-        config_dir: None,
-        provider: Some(Provider::LocalMinvmd),
-        no_input: true,
-        vm: None,
-    };
-    let err = cmd_stop(&global, StopArgs { force: false })
-        .await
-        .expect_err("a wedged VM without --force must keep failing");
-
-    let chain = format!("{err:#}");
-    assert!(
-        chain.contains("the VM is not answering") && chain.contains("--force"),
-        "expected the recovery hint, got: {chain}"
-    );
-    assert!(
-        err.downcast_ref::<client::box_registration::HostUnreachable>()
-            .is_some(),
-        "the refusal must carry the type `main` maps to exit 7, got: {chain}"
-    );
 }
 
 /// A `min proxy` bridge must not outlive the daemon socket: when the daemon
@@ -4687,11 +4515,7 @@ fn task_run_help_describes_the_task_box_network() {
         }
     }
 
-    let activate = cmd
-        .find_subcommand_mut("session")
-        .expect("`session` stays a subcommand")
-        .find_subcommand_mut("activate")
-        .expect("`session activate` stays a subcommand");
+    let activate = activate_command();
     let network = activate
         .get_arguments()
         .find(|a| a.get_id() == "network")
@@ -4702,20 +4526,20 @@ fn task_run_help_describes_the_task_box_network() {
     );
 }
 
-/// `--network` and `--ingress` are visible in `min session activate --help`
+/// `--network` and `--ingress` are visible in `min session start --help`
 /// (NET-035), with the `--network` value advertising the current
 /// `none|host_ip|own_ip` spellings.
 #[test]
 fn activate_help_shows_network_flags() {
     use clap::CommandFactory as _;
-
-    let mut cmd = Cli::command();
-    let activate = cmd
-        .find_subcommand_mut("session")
-        .expect("`session` stays a subcommand")
-        .find_subcommand_mut("activate")
-        .expect("`session activate` stays a subcommand");
-    let help = activate.render_help().to_string();
+    let mut cli = Cli::command();
+    cli.build();
+    let mut start = cli
+        .find_subcommand("session")
+        .and_then(|session| session.find_subcommand("start"))
+        .expect("`min session start` exists")
+        .clone();
+    let help = start.render_help().to_string();
     assert!(
         help.contains("--network <none|host_ip|own_ip>"),
         "--help must advertise the network modes and their spellings: {help}"
@@ -4776,16 +4600,7 @@ fn capture_stderr<T>(f: impl FnOnce() -> T) -> (String, T) {
 /// the default print nothing, and anything else is refused.
 #[test]
 fn legacy_network_spellings_parse_with_hint() {
-    use clap::Parser as _;
-
-    let activate_args = |args: &[&str]| -> ActivateArgs {
-        match Cli::try_parse_from(args).unwrap().command {
-            Some(Command::Session(SessionArgs {
-                command: SessionCommand::Activate(a),
-            })) => a,
-            _ => panic!("expected an activate command for {args:?}"),
-        }
-    };
+    let activate_args = |args: &[&str]| -> ActivateArgs { parse_activate_args(args).unwrap() };
 
     for (legacy, current, mode) in [
         ("no-net", "none", CliNetworkMode::NoNet),
@@ -4837,7 +4652,7 @@ fn legacy_network_spellings_parse_with_hint() {
         "the default network mode must print nothing to stderr: {stderr:?}"
     );
 
-    let err = Cli::try_parse_from(["min", "session", "activate", "--network", "bogus"])
+    let err = parse_activate_args(&["min", "session", "activate", "--network", "bogus"])
         .map(|_| ())
         .unwrap_err()
         .to_string();
@@ -4873,11 +4688,7 @@ fn network_parser_round_trips_every_mode_word() {
 fn deny_all_egress_refuses_the_allow_flags() {
     use clap::Parser as _;
 
-    for verb in [
-        &["session", "activate"][..],
-        &["task", "run"],
-        &["box", "run"],
-    ] {
+    for verb in [&["session", "start"][..], &["task", "run"], &["box", "run"]] {
         let line = |rest: &[&'static str]| {
             ["min"]
                 .iter()
@@ -4915,20 +4726,23 @@ fn deny_all_egress_refuses_the_allow_flags() {
 
     // The flag on its own parses, and it carries one meaning wherever the
     // egress flags appear: a boolean declaration with no value to validate.
-    let args = Cli::try_parse_from(["min", "session", "activate", "--deny-all-egress"])
+    let args = Cli::try_parse_from(["min", "session", "start", "--deny-all-egress"])
         .expect("--deny-all-egress alone must parse");
     match args.command {
         Some(Command::Session(SessionArgs {
-            command: SessionCommand::Activate(a),
-        })) => assert!(a.egress.deny_all_egress, "the flag must land on the args"),
-        _ => panic!("expected an activate command"),
+            command: SessionCommand::Start(a),
+        })) => assert!(
+            a.overrides.egress.deny_all_egress,
+            "the flag must land on the args"
+        ),
+        _ => panic!("expected a session start command"),
     }
 
     // The proxy lane is not a rule (NET-134): the two combine.
     Cli::try_parse_from([
         "min",
         "session",
-        "activate",
+        "start",
         "--deny-all-egress",
         "--credentialed-upstream",
     ])
@@ -4941,17 +4755,8 @@ fn deny_all_egress_refuses_the_allow_flags() {
 /// the range's parser in the launch check's own words.
 #[test]
 fn dynamic_ingress_flags_parse() {
-    use clap::Parser as _;
-
     let activate = |argv: &[&str]| -> ActivateArgs {
-        let args = Cli::try_parse_from(argv)
-            .unwrap_or_else(|error| panic!("{argv:?} must parse: {error}"));
-        match args.command {
-            Some(Command::Session(SessionArgs {
-                command: SessionCommand::Activate(a),
-            })) => a,
-            _ => panic!("expected an activate command"),
-        }
+        parse_activate_args(argv).unwrap_or_else(|error| panic!("{argv:?} must parse: {error}"))
     };
 
     let a = activate(&[
@@ -4971,7 +4776,7 @@ fn dynamic_ingress_flags_parse() {
     assert_eq!(a.dynamic_range, None, "a mode alone carries no range");
 
     let Err(err) =
-        Cli::try_parse_from(["min", "session", "activate", "--dynamic-ingress", "maybe"])
+        parse_activate_args(&["min", "session", "activate", "--dynamic-ingress", "maybe"])
     else {
         panic!("an unknown dynamic ingress mode must not parse");
     };
@@ -4981,7 +4786,7 @@ fn dynamic_ingress_flags_parse() {
         "the refusal must name the mode, got: {rendered}"
     );
 
-    let Err(err) = Cli::try_parse_from([
+    let Err(err) = parse_activate_args(&[
         "min",
         "session",
         "activate",
@@ -8080,50 +7885,15 @@ async fn selected_client(state: &std::path::Path) -> (client::Client, std::path:
     (client, selected)
 }
 
-/// NET-058 for the commands that act on a named box over the daemon's RPCs:
-/// `min session policy` and `min session destroy` find a box on another VM
-/// by its name alone, and the client they get back is that VM's.
-#[tokio::test]
-async fn box_name_resolves_vm_without_flag_for_policy_and_destroy() {
-    let (state, default_vm, alpha) = two_vms().await;
-    create_box_on(&default_vm, "api").await;
-    let beta = create_box_on(&alpha, "beta").await;
-    let global = vm_globals(state.path(), None);
-
-    for example in ["session policy beta", "session destroy beta"] {
-        let (client, _) = selected_client(state.path()).await;
-        let (mut owner, record) = cmd::resolve_box_on_any_vm(&global, client, "beta", example)
-            .await
-            .expect("a name alpha owns resolves without --vm");
-        assert_eq!(record.id, beta, "{example}: alpha's record");
-        let again = cmd::resolve_session(&mut owner, "beta")
-            .await
-            .expect("the client returned is connected to alpha");
-        assert_eq!(again.id, beta, "{example}: the follow-up RPCs reach alpha");
-    }
-}
-
 /// NET-058: a box name no running VM holds, on a host with two VMs, is
 /// refused with the flag that names a box on another VM, shown on the
-/// command the user ran. With `--vm`, the selected VM's own miss stands.
+/// command the user ran.
 #[tokio::test]
 async fn unknown_box_names_vm_flag() {
     let (state, _default_vm, _alpha) = two_vms().await;
     let global = vm_globals(state.path(), None);
 
-    let (client, _) = selected_client(state.path()).await;
-    let err = cmd::resolve_box_on_any_vm(&global, client, "beta", "session policy beta")
-        .await
-        .map(|(_, record)| record)
-        .expect_err("no VM holds 'beta'");
-    assert_eq!(
-        format!("error: {err:#}"),
-        "error: no running VM has a box named 'beta'. A box on another VM is named with --vm, \
-         for example: min --vm <vm> session policy beta",
-        "the refusal as main prints it"
-    );
-
-    // The hand-off verbs say the same, on their own command.
+    // The hand-off verbs name the flag, on their own command.
     let (mut client, sock) = selected_client(state.path()).await;
     let err = cmd::resolve_named_box_version_gated(
         &global,
@@ -8140,15 +7910,6 @@ async fn unknown_box_names_vm_flag() {
         "no running VM has a box named 'beta'. A box on another VM is named with --vm, \
          for example: min --vm <vm> net forward beta 8080:3000"
     );
-
-    // An explicit --vm is the operator's choice: the selected VM's miss.
-    let pinned = vm_globals(state.path(), Some(paths::DEFAULT_VM_NAME.to_string()));
-    let (client, _) = selected_client(state.path()).await;
-    let err = cmd::resolve_box_on_any_vm(&pinned, client, "beta", "session policy beta")
-        .await
-        .map(|(_, record)| record)
-        .expect_err("no VM holds 'beta'");
-    assert_eq!(err.to_string(), "No session found matching 'beta'");
 }
 
 /// NET-152: a box only a stopped VM holds is named with that VM and the
@@ -8177,35 +7938,6 @@ async fn box_on_stopped_vm_names_start_command() {
         .await
         .expect_err("attach refuses a box on a stopped VM");
     assert_eq!(err.to_string(), expected);
-
-    // And the RPC verbs, with the policy's machine reading still a miss.
-    let (client, _) = selected_client(state.path()).await;
-    let err = cmd::resolve_box_on_any_vm(&global, client, "beta", "session policy beta")
-        .await
-        .map(|(_, record)| record)
-        .expect_err("policy refuses a box on a stopped VM");
-    assert_eq!(err.to_string(), expected);
-    assert!(err.downcast_ref::<cmd::BoxNotFound>().is_some());
-
-    // A name two stopped VMs hold is ambiguous, and typed so the policy's
-    // machine reading reports a miss, not an unreachable daemon.
-    stopped_vm_with_boxes(state.path(), "delta", &[("dup", boxes::SessionId::mint())]);
-    stopped_vm_with_boxes(
-        state.path(),
-        "epsilon",
-        &[("dup", boxes::SessionId::mint())],
-    );
-    let (client, _) = selected_client(state.path()).await;
-    let err = cmd::resolve_box_on_any_vm(&global, client, "dup", "session policy dup")
-        .await
-        .map(|(_, record)| record)
-        .expect_err("a name two stopped VMs hold is ambiguous");
-    assert_eq!(
-        err.to_string(),
-        "box name 'dup' exists on more than one stopped VM (delta, epsilon); \
-         name the one you mean with --vm"
-    );
-    assert!(err.downcast_ref::<cmd::AmbiguousBoxName>().is_some());
 
     // A name a running VM owns and a stopped VM's records hold is ambiguous,
     // though the running box is active: the error lists both VMs, marks the
@@ -8247,27 +7979,6 @@ async fn box_on_stopped_vm_names_start_command() {
     );
     assert!(err.downcast_ref::<cmd::AmbiguousBoxName>().is_some());
 
-    // The selected VM is the only holder: it resolves there.
-    create_box_on(&default_vm, "solo").await;
-    let (client, _) = selected_client(state.path()).await;
-    let (_, record) = cmd::resolve_box_on_any_vm(&global, client, "solo", "session policy solo")
-        .await
-        .expect("the selected VM's own box resolves");
-    assert_eq!(record.name.as_deref(), Some("solo"));
-
-    // A hit on the selected VM is ambiguous when a stopped VM also holds the
-    // name.
-    let (client, _) = selected_client(state.path()).await;
-    let err = cmd::resolve_box_on_any_vm(&global, client, "api", "session policy api")
-        .await
-        .map(|(_, record)| record)
-        .expect_err("the selected VM and a stopped VM both hold 'api'");
-    assert_eq!(
-        err.to_string(),
-        "box name 'api' exists on more than one VM (default, gamma (stopped)); \
-         name the one you mean with --vm"
-    );
-
     // A name wins over an id prefix across VMs, as on one daemon: a running
     // box named 'cafe' resolves though a stopped VM holds a box whose id
     // starts with 'cafe'.
@@ -8289,9 +8000,8 @@ async fn box_on_stopped_vm_names_start_command() {
 }
 
 /// NET-058: a name the selected VM holds is ambiguous when a second running
-/// VM holds it too. `min session destroy` and `min session attach` refuse it,
-/// name both VMs and `--vm`, and do not act on the selected VM's box. With
-/// `--vm`, the selected VM's box resolves.
+/// VM holds it too. `min session attach` refuses it, names both VMs and
+/// `--vm`, and does not act on the selected VM's box.
 #[tokio::test]
 async fn box_name_resolves_vm_without_flag_refuses_a_name_two_vms_hold() {
     let (state, default_vm, alpha) = two_vms().await;
@@ -8300,14 +8010,6 @@ async fn box_name_resolves_vm_without_flag_refuses_a_name_two_vms_hold() {
     let global = vm_globals(state.path(), None);
     let expected = "box name 'shared' exists on more than one VM (default, alpha); \
                     name the one you mean with --vm";
-
-    let (client, _) = selected_client(state.path()).await;
-    let err = cmd::resolve_box_on_any_vm(&global, client, "shared", "session destroy shared")
-        .await
-        .map(|(_, record)| record)
-        .expect_err("destroy refuses a name two VMs hold");
-    assert_eq!(err.to_string(), expected);
-    assert!(err.downcast_ref::<cmd::AmbiguousBoxName>().is_some());
 
     let (mut client, sock) = selected_client(state.path()).await;
     let err = resolve_attach_target_version_gated(&global, &mut client, sock, "shared")
@@ -8318,18 +8020,9 @@ async fn box_name_resolves_vm_without_flag_refuses_a_name_two_vms_hold() {
 
     // The selected VM's box is still there: nothing acted on it.
     let (mut client, _) = selected_client(state.path()).await;
-    let record = cmd::resolve_session(&mut client, "shared")
+    let record = cmd::resolve_session_version_gated(&mut client, "shared")
         .await
         .expect("the selected VM still holds 'shared'");
-    assert_eq!(record.id, shared);
-
-    // With --vm, the operator chose: the selected VM's box resolves.
-    let pinned = vm_globals(state.path(), Some(paths::DEFAULT_VM_NAME.to_string()));
-    let (client, _) = selected_client(state.path()).await;
-    let (_, record) =
-        cmd::resolve_box_on_any_vm(&pinned, client, "shared", "session destroy shared")
-            .await
-            .expect("--vm picks the selected VM's box");
     assert_eq!(record.id, shared);
 }
 
@@ -17712,6 +17405,16 @@ fn start_loadout_flag_selects_loadouts_layer() {
 }
 
 /// The long flags that the `min` verb at `path` takes, as `--<long>`.
+/// The long flags of [`ActivateArgs`], the flags the removed `min session
+/// activate` took (BCLI-042).
+fn activate_long_flags() -> std::collections::BTreeSet<String> {
+    activate_command()
+        .get_arguments()
+        .filter_map(clap::Arg::get_long)
+        .map(|long| format!("--{long}"))
+        .collect()
+}
+
 fn verb_long_flags(path: &[&str]) -> std::collections::BTreeSet<String> {
     use clap::CommandFactory as _;
     let mut command = Cli::command();
@@ -17745,7 +17448,7 @@ fn parsed_run(argv: &[&str]) -> task::RunEntry {
 // activate` takes, and a start stores the values those flags give.
 #[tokio::test]
 async fn start_and_run_take_every_network_key_flag() {
-    let activate = verb_long_flags(&["session", "activate"]);
+    let activate = activate_long_flags();
     // The flags of activate that do not override a key of the box.
     let not_overrides = ["--name", "--sync", "--no-prompt", "--attach", "--help"];
     // The run path takes no `--ingress` (#3163) and no `--loadout` (#3237).
@@ -24592,7 +24295,6 @@ async fn task_run_broker_secret_unenrolled_exits_5() {
         &global,
         TaskRunArgs {
             task: "ci".into(),
-            path: None,
             network: None,
             egress: EgressArgs::default(),
             other: crate::BoxOverrideArgs::default(),
@@ -25944,7 +25646,6 @@ fn cli_reference_lists_every_error_code() {
         ("audit_self_unsupported_unenrolled", "1"),
         ("timeout", "124"),
         ("wait_timeout", "124"),
-        ("daemon_unreachable", "1"),
         ("policy_unavailable", "1"),
         ("output_failed", "1"),
         ("unspecified", "1, or the exit code of the failure"),
