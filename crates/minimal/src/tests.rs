@@ -1343,7 +1343,7 @@ fn twin_entry(
 }
 
 /// One cwd-matching session: the report names it with its status, and the
-/// `Next:` attach line carries its real name — every line verbatim.
+/// `Next:` lines suggest `min task run` — every line verbatim.
 #[test]
 fn bare_status_renders_a_cwd_session_verbatim() {
     let entries = vec![twin_entry(
@@ -1359,7 +1359,7 @@ fn bare_status_renders_a_cwd_session_verbatim() {
              \x20 sessions: 1 (web, running)\n\
              \x20 blueprint: minimal.toml present\n\
              Next:\n\
-             \x20 min session run web <task>\n\
+             \x20 min task run <task>\n\
              \x20 min ls --json\n"
     );
 }
@@ -1375,7 +1375,7 @@ fn bare_status_renders_the_empty_state_verbatim() {
              \x20 sessions: none\n\
              \x20 blueprint: none (min init to create one)\n\
              Next:\n\
-             \x20 min session activate --attach .\n\
+             \x20 min session start\n\
              \x20 min ls --json\n"
     );
 }
@@ -1406,19 +1406,19 @@ fn bare_status_counts_elsewhere_sessions() {
         "elsewhere count: {out}"
     );
     assert!(
-        out.contains("  min session activate --attach .\n"),
-        "no cwd session must suggest activate: {out}"
+        out.contains("  min session start\n"),
+        "no cwd session must suggest start: {out}"
     );
     assert!(
-        !out.contains("min session run"),
+        !out.contains("min task run"),
         "must not suggest running in a session elsewhere: {out}"
     );
 }
 
 /// More than two cwd matches: the count is the full total, the listing
 /// stops at two and counts the rest, sessions elsewhere are counted too,
-/// and an unnamed session shows its short id — which is also what the run
-/// suggestion substitutes for the first match.
+/// and an unnamed session shows its short id. The run suggestion is
+/// `min task run <task>`.
 #[test]
 fn bare_status_lists_at_most_two_cwd_sessions() {
     let entries = vec![
@@ -1461,8 +1461,8 @@ fn bare_status_lists_at_most_two_cwd_sessions() {
         "third session must not be listed: {out}"
     );
     assert!(
-        out.contains("  min session run 019f5d0f <task>\n"),
-        "run suggestion uses the first match's handle: {out}"
+        out.contains("  min task run <task>\n"),
+        "a cwd session must suggest task run: {out}"
     );
 }
 
