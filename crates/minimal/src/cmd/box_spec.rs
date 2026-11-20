@@ -1060,6 +1060,13 @@ fn expand_entry(
         })
         .into());
     }
+    // BOX-206, BOX-207: a loadout that sets `vars` or `vars_lenient`, or a
+    // variable name that is not POSIX-shaped, fails the start, so it fails
+    // the spec the same way.
+    for loadout in &active.loadouts {
+        let layer = crate::loadout_layer(loadout, None)?;
+        mfile::expand::check_loadout_vars(&layer).map_err(invalid)?;
+    }
     let loadouts = Some(
         active
             .loadouts
