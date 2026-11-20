@@ -82,16 +82,16 @@ pub struct CleanReport {
     pub dirs: usize,
 }
 
-/// Deletes cache entries whose last recorded read is older than `older_than` —
-/// and entries never read at all once their most recent write is that old —
-/// then removes the leftover execution directories under `sweep` whose owner
-/// is gone.
+/// Deletes cache entries whose last recorded read and last write are both
+/// older than `older_than`, then removes the leftover execution directories
+/// under `sweep` whose owner is gone. An entry with no recorded read and no
+/// readable write time is deleted too.
 ///
 /// Entries in `keep` are never deleted, whatever their age, and directories
 /// stamped with `daemon_id` are never swept.
 pub struct CleanCache {
-    /// Only delete entries last read at least this long ago; an entry nothing
-    /// has read yet is judged by when it was written.
+    /// Only delete entries last read and last written at least this long
+    /// ago. An entry with neither time is deleted.
     pub older_than: Duration,
     /// Entries to keep regardless of age.
     pub keep: HashSet<SpecHash>,
@@ -439,8 +439,12 @@ mod tests {
                 ),
             ],
         );
+        // Written ages ago, read an hour ago: survives on the recent read.
+        backdate_entry(&cache, &recent, Duration::from_secs(30 * 24 * 60 * 60));
         // Written and last read ages ago: reclaimable on both times.
         backdate_entry(&cache, &old, Duration::from_secs(30 * 24 * 60 * 60));
+        // Written and last read ages ago, like `old`, but listed in `keep`.
+        backdate_entry(&cache, &kept, Duration::from_secs(30 * 24 * 60 * 60));
         // Written ages ago, never read: still reclaimable by its write time.
         backdate_entry(&cache, &never_read, Duration::from_secs(30 * 24 * 60 * 60));
 
@@ -461,9 +465,11 @@ mod tests {
                 dirs: 0
             }
         );
-        // `fresh` was written moments ago and nothing has read it yet: it
-        // survives until the cutoff passes on its write time. `rebuilt`
-        // survives on its fresh write time, newer than its old read.
+        // `recent` was written ages ago and survives on its read an hour ago.
+        // `kept` is as old as `old` and survives on `keep` alone. `fresh` was
+        // written moments ago and nothing has read it yet: it survives until
+        // the cutoff passes on its write time. `rebuilt` survives on its
+        // fresh write time, newer than its old read.
         let mut left: Vec<SpecHash> = cache.iter_entries().collect();
         left.sort();
         let mut want = vec![recent, kept, fresh, rebuilt];
