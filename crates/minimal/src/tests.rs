@@ -4513,13 +4513,20 @@ fn task_run_help_describes_the_task_box_network() {
     );
 }
 
-/// `--network` and `--ingress` are visible in the help of the activation
-/// flags (NET-035), with the `--network` value advertising the current
+/// `--network` and `--ingress` are visible in `min session start --help`
+/// (NET-035), with the `--network` value advertising the current
 /// `none|host_ip|own_ip` spellings.
 #[test]
 fn activate_help_shows_network_flags() {
-    let mut activate = activate_command();
-    let help = activate.render_help().to_string();
+    use clap::CommandFactory as _;
+    let mut cli = Cli::command();
+    cli.build();
+    let mut start = cli
+        .find_subcommand("session")
+        .and_then(|session| session.find_subcommand("start"))
+        .expect("`min session start` exists")
+        .clone();
+    let help = start.render_help().to_string();
     assert!(
         help.contains("--network <none|host_ip|own_ip>"),
         "--help must advertise the network modes and their spellings: {help}"
