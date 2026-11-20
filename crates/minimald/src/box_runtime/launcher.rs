@@ -900,6 +900,7 @@ impl Drop for SpawnedProcessGuard {
         let Some(mut process) = self.process.take() else {
             return;
         };
+        kill_abandoned_box(process.id());
         // `kill` and `wait` are independent: a process that already
         // exited fails the kill with `ESRCH` but still needs reaping.
         if let Err(e) = process.kill() {
@@ -908,6 +909,30 @@ impl Drop for SpawnedProcessGuard {
         if let Err(e) = process.wait() {
             tracing::warn!(error = %e, "reaping sandbox process after an abandoned launch");
         }
+    }
+}
+
+/// SIGKILLs every process of the box whose container supervisor is
+/// `supervisor`, while the supervisor is still alive and unreaped, so the
+/// box's processes can still be found from it ([`BoxProcesses`]).
+///
+/// Killing the supervisor alone does not end the box. hakoniwa forks the
+/// program inside the supervisor and reports the spawn as done right after
+/// that fork, before the program arms its own `PR_SET_PDEATHSIG`. A program
+/// that has not armed it yet outlives a killed supervisor. It then reaches
+/// its start gate after the launch dropped the gate, finds no gate, and
+/// execs. An abandoned launch must not run its program, so the guard kills
+/// the box's processes first, while the start gate still holds the program
+/// and the supervisor still names them. The program is the init of the
+/// box's PID namespace, so its death ends every process in that namespace.
+pub(super) fn kill_abandoned_box(supervisor: u32) {
+    let killed = BoxProcesses::of_container(supervisor).signal(libc::SIGKILL);
+    if killed > 0 {
+        tracing::debug!(
+            container_pid = supervisor,
+            killed,
+            "killed the processes of an abandoned launch's box"
+        );
     }
 }
 
@@ -1903,9 +1928,12 @@ impl BoxLauncher for SandboxLauncher {
         // process. The program placed itself already, in the pre-exec closure
         // it ran inside the box, before it unshared the cgroup namespace onto
         // the leaf; the supervisor is the one process that never ran that
-        // closure. Never fatal: a supervisor the host could not place runs in
-        // the daemon's leaf, at the cost of being classified as the daemon
-        // rather than its box.
+        // closure. Fatal, like the program's own join and an injected exec's:
+        // every process of a host-address box stays in the cgroup its verdict
+        // is decided on, so a supervisor the host could not place, or did not
+        // find in the leaf after the write, fails the launch. The `Err` drops
+        // `process` first, which kills the box's processes and reaps its
+        // supervisor before the gate drops ([`kill_abandoned_box`]).
         if let Some(leaf) = leaf_guard.as_ref().and_then(BoxLeafGuard::get) {
             let supervisor = process.get_mut().id();
             match place_box_processes(leaf, supervisor) {
@@ -1916,12 +1944,17 @@ impl BoxLauncher for SandboxLauncher {
                     "placed the session's box in its classifier leaf: the \
                      supervisor here, the program in its own pre-exec closure",
                 ),
-                Err(e) => tracing::warn!(
-                    session = %session_label,
-                    leaf = %leaf.dir().display(),
-                    error = %e,
-                    "placing the session's supervisor in its classifier leaf",
-                ),
+                Err(e) => {
+                    tracing::error!(
+                        session = %session_label,
+                        leaf = %leaf.dir().display(),
+                        supervisor,
+                        error = %e,
+                        "placing the session's supervisor in its classifier leaf \
+                         failed; the launch is refused",
+                    );
+                    return Err(supervisor_placement_refusal(&e));
+                }
             }
         }
 

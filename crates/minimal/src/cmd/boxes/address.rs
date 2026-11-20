@@ -491,27 +491,30 @@ pub(crate) async fn resolve_box_on_local_hosts(
     verb: &'static str,
 ) -> Result<ResolvedBox, anyhow::Error> {
     let hosts = crate::cmd::list::local_hosts(global)?;
-    let vms = client::enumerate_vm_sockets(global.minimal_dir.as_deref(), global.use_minvmd())?;
-    resolve_box_over(hosts, &vms, address, verb).await
+    resolve_box_on_hosts(hosts, address, verb).await
 }
 
-/// [`resolve_box_on_local_hosts`] over the local `hosts` it read, with no
-/// read of a stopped VM's box records.
+/// [`resolve_box_on_local_hosts`] over the local `hosts` it read. A VM host
+/// that is not running lists the boxes its VM keeps on disk, and a box
+/// resolved there is refused as on a stopped VM (BCLI-002, NET-058).
 pub(crate) async fn resolve_box_on_hosts(
     hosts: Vec<crate::cmd::list::LocalHost>,
     address: &str,
     verb: &'static str,
 ) -> Result<ResolvedBox, anyhow::Error> {
-    resolve_box_over(hosts, &[], address, verb).await
+    resolve_box_over(hosts, address, None, verb).await
 }
 
-/// Resolves `address` over `hosts`. A host that is not running, and that
-/// serves one of `vms`, lists the boxes its VM keeps on disk (NET-152), and
-/// a box resolved there is refused as on a stopped VM (NET-058).
-async fn resolve_box_over(
+/// Resolves `address` over `hosts`. With `box_type`, a running host's
+/// records of every other type are dropped first, so a type noun never
+/// reaches a box of another type. A host that is not running, and that a
+/// VM serves, lists the boxes its VM keeps on disk (NET-152). Those records
+/// carry no type, so every type noun sees them. A box resolved there is
+/// refused as on a stopped VM (NET-058).
+pub(crate) async fn resolve_box_over(
     mut hosts: Vec<crate::cmd::list::LocalHost>,
-    vms: &[client::VmSocket],
     address: &str,
+    box_type: Option<&str>,
     verb: &'static str,
 ) -> Result<ResolvedBox, anyhow::Error> {
     if let BoxAddress::Qualified { provider, host, .. } = parse_box_address(address) {
@@ -525,11 +528,17 @@ async fn resolve_box_over(
             tracing::info!(verb, outcome = "error", host = %host.host, "{err:#}");
         })?;
         let boxes = match read {
-            HostRead::Answered(boxes) => boxes,
-            HostRead::NotRunning => match vms.iter().find(|vm| vm.sock == host.sock) {
+            HostRead::Answered(boxes) => boxes.map(|records| match box_type {
+                Some(box_type) => records
+                    .into_iter()
+                    .filter(|entry| entry.box_type.as_deref() == Some(box_type))
+                    .collect(),
+                None => records,
+            }),
+            HostRead::NotRunning => match stopped_vm_of(&host) {
                 Some(vm) => {
                     stopped.push((host.host.clone(), vm.vm.clone()));
-                    Ok(stopped_vm_entries(vm))
+                    Ok(stopped_vm_entries(&vm))
                 }
                 None => Ok(Vec::new()),
             },
@@ -570,10 +579,30 @@ async fn resolve_box_over(
                     tracing::info!(verb, host = %listing.host.host, "host did not answer: {why}");
                 }
             }
-            tracing::info!(verb, address, outcome = refusal.outcome(), "{refusal}");
+            tracing::info!(verb, address, box_type = ?box_type, outcome = refusal.outcome(), "{refusal}");
             Err(refusal.into())
         }
     }
+}
+
+/// The VM that serves `host`, when a VM does: its name and its socket. The
+/// default VM's socket sits in the host dir under `providers`. A named VM's
+/// socket sits one level deeper, in a dir that carries the VM's name.
+fn stopped_vm_of(host: &crate::cmd::list::LocalHost) -> Option<client::VmSocket> {
+    if host.provider != crate::cmd::list::LOCAL_MINVMD_PROVIDER {
+        return None;
+    }
+    let dir = host.sock.parent()?;
+    let parent = dir.parent().and_then(std::path::Path::file_name)?;
+    let vm = if parent == "providers" {
+        paths::DEFAULT_VM_NAME.to_owned()
+    } else {
+        dir.file_name()?.to_str()?.to_owned()
+    };
+    Some(client::VmSocket {
+        vm,
+        sock: host.sock.clone(),
+    })
 }
 
 /// Every box record one host keeps. The selected host is reached with the

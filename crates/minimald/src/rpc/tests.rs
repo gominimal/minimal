@@ -130,7 +130,16 @@ async fn clean_cache_streams_progress_then_a_terminal_done() {
     let mut client = server.connect().await;
 
     // Two cold entries — nothing has read them, and no session needs them.
+    // Their metadata says they were written an hour ago. Their directories'
+    // mtimes, which a clean judges them by, are a minute before the cutoff
+    // the request sets, so they are in scope.
     let cache = server.state.daemon_context().await.local_cache();
+    let written = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(60 * 60))
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
     for byte in [1u8, 2] {
         let w = cache
             .write_dir(&common::SpecHash::from_bytes([byte; 32]))
@@ -139,13 +148,21 @@ async fn clean_cache_streams_progress_then_a_terminal_done() {
         w.finalize(EntryMeta {
             inner: MetaInner::Spec(format!("pkg-{byte}")),
             fetched: false,
+            epoch_millis: written,
             ..Default::default()
         })
         .unwrap();
+        let cold = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(60))
+            .unwrap();
+        std::fs::File::open(cache.entry_path(&common::SpecHash::from_bytes([byte; 32])))
+            .unwrap()
+            .set_modified(cold)
+            .unwrap();
     }
 
-    // `older_than_secs` of 1 rather than the daemon default, so entries
-    // written a moment ago are in scope.
+    // `older_than_secs` of 1 rather than the daemon default, so the entries
+    // are in scope.
     let updates = clean_cache(
         &mut client,
         CleanCacheRequest::default().with_older_than_secs(1),

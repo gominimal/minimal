@@ -1201,10 +1201,12 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                         // read, with the box id beside it (#1116): a Delete
                         // at the shell-exit prompt leaves no record to read
                         // them from after.
+                        let record = match box_name {
+                            Some(_) => rpc::record_of(p, key.id).await,
+                            None => None,
+                        };
                         let box_row = match box_name {
-                            Some(_) => {
-                                rpc::prepare_attach(&sock, rpc::record_of(p, key.id).await).await
-                            }
+                            Some(_) => rpc::prepare_attach(&sock, record.clone()).await,
                             None => Ok(None),
                         };
                         // A VM host that cannot be reached fails the attach
@@ -1216,7 +1218,7 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                                 continue;
                             }
                         };
-                        attach_and_resume(
+                        let code = attach_and_resume(
                             &mut terminal,
                             &sock,
                             key.id,
@@ -1224,6 +1226,21 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                             opts.config_dir.as_deref(),
                             &mut model,
                         );
+                        // The in-VM daemon refused the attach because the VM
+                        // host released the box's row (NET-138), read as the
+                        // interactive attach reads it: only when the host
+                        // holds no row of the box's own. Otherwise 253 is
+                        // the shell's own status.
+                        if code == Some(crate::ROW_ENDED_ATTACH)
+                            && minimal_client::box_registration::box_row_withdrawn(
+                                &sock,
+                                record.as_ref(),
+                            )
+                            .await
+                            .unwrap_or(false)
+                        {
+                            model.status = Some(ROW_ENDED_DASH_STATUS.to_string());
+                        }
                         // The attach may have ended in the shell-exit
                         // prompt's Delete: withdraw the box's row, or
                         // release a `host_ip` box's hold, through the CLI's
@@ -1542,6 +1559,8 @@ async fn exec_effect(
 /// on the VM host daemon and answers them the way `min session attach`
 /// does (NET-045); the dash's list view never subscribes, so only an attach
 /// counts as an attached client.
+///
+/// Returns the status the attach ended with, or `None` when it did not run.
 fn attach_and_resume(
     terminal: &mut TerminalGuard,
     sock: &std::path::Path,
@@ -1549,12 +1568,12 @@ fn attach_and_resume(
     box_name: Option<&str>,
     config_dir: Option<&std::path::Path>,
     model: &mut Model,
-) {
+) -> Option<i32> {
     let session_keys = match minimal_client::attach::resolve_session_keys(config_dir) {
         Ok(keys) => Some(keys),
         Err(e) => {
             model.status = Some(format!("error: {e:#}"));
-            return;
+            return None;
         }
     };
     let result = minimal_client::attach::attach_command(sock, id, None, session_keys.as_ref())
@@ -1575,10 +1594,20 @@ fn attach_and_resume(
                 Some(0) => "detached".to_string(),
                 _ => format!("attach ended: {status}"),
             });
+            status.code()
         }
-        Err(e) => model.status = Some(format!("error: attach failed: {e:#}")),
+        Err(e) => {
+            model.status = Some(format!("error: attach failed: {e:#}"));
+            None
+        }
     }
 }
+
+/// The dashboard's status line after the in-VM daemon refused an attach
+/// because the VM host released the box's row (NET-138). The dashboard asks
+/// for the row back before every attach, so attaching again asks for it.
+const ROW_ENDED_DASH_STATUS: &str = "error: the VM host released this box's network addresses. \
+     Attach again to ask for them back";
 
 /// The terminal the dash hands over for an attach and takes back after.
 trait SuspendableTerminal {

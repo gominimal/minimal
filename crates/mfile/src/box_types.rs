@@ -35,6 +35,17 @@ pub const BOX_TYPES_TABLE: &str = "box_types";
 /// nothing from it.
 pub const TYPE_KEYS: [&str; 4] = ["extends", "defaults", "constraints", "description"];
 
+/// [`TYPE_KEYS`] as the refusal of an unknown key names them, in their
+/// order: "`extends`, `defaults`, `constraints` and `description`".
+fn type_keys_in_words() -> String {
+    let named: Vec<String> = TYPE_KEYS.iter().map(|k| format!("`{k}`")).collect();
+    match named.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+        None => String::new(),
+    }
+}
+
 /// The built-in Box Types. Each one is its own built-in root.
 pub const BUILTIN_BOX_TYPES: [&str; 6] = [
     "session",
@@ -217,9 +228,9 @@ impl fmt::Display for BoxTypeError {
             BoxTypeError::UnknownKey { name, key } => write!(
                 f,
                 "`[{BOX_TYPES_TABLE}.{name}]` in minimal.toml sets `{key}`, \
-                 which is not a key of a box type. A box type takes `extends`, \
-                 `defaults`, `constraints` and `description`. \
-                 Remove the key or correct its name."
+                 which is not a key of a box type. A box type takes {}. \
+                 Remove the key or correct its name.",
+                type_keys_in_words()
             ),
             BoxTypeError::MissingExtends(name) => write!(
                 f,
@@ -975,6 +986,26 @@ mod tests {
             "`description` in `[box_types.ci]` is not a string."
         );
         assert_eq!(err.exit_code(), 3);
+    }
+
+    /// The refusal of an unknown key names every key of [`TYPE_KEYS`], so a
+    /// key added there is named in the message too, and names no other.
+    #[test]
+    fn unknown_key_message_names_every_type_key() {
+        let msg = BoxTypeError::UnknownKey {
+            name: "ci".to_owned(),
+            key: "zzz".to_owned(),
+        }
+        .to_string();
+        for key in TYPE_KEYS {
+            assert!(msg.contains(&format!("`{key}`")), "{key} missing: {msg}");
+        }
+        let takes = msg
+            .split("A box type takes ")
+            .nth(1)
+            .and_then(|rest| rest.split(". ").next())
+            .expect("the message lists the keys");
+        assert_eq!(takes.matches('`').count(), 2 * TYPE_KEYS.len(), "{msg}");
     }
 
     /// A type graph with one defect, and the type the error must name.

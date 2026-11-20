@@ -366,6 +366,30 @@ resolve_prefix() {
     esac
 }
 
+# The data/state/cache directory the runtime itself writes, which --purge
+# removes alongside the resolve_prefix one. Mirrors crates/paths
+# (minimal_data_dir, minimal_state_dir, minimal_cache_dir): an XDG variable
+# counts only when it is an absolute path, as the XDG spec says and the runtime
+# does, and the macOS cache is ~/Library/Caches/minimal whatever XDG_CACHE_HOME
+# says, because the runtime takes it from the platform cache directory.
+runtime_dir() {
+    case "$1" in
+        data)  _rd_xdg="${XDG_DATA_HOME:-}";  _rd_home="$HOME/.local/share" ;;
+        state) _rd_xdg="${XDG_STATE_HOME:-}"; _rd_home="$HOME/.local/state" ;;
+        cache)
+            if [ "$os" = darwin ]; then
+                printf '%s\n' "$HOME/Library/Caches/minimal"
+                return 0
+            fi
+            _rd_xdg="${XDG_CACHE_HOME:-}"; _rd_home="$HOME/.cache" ;;
+        *)     die "unknown runtime dir token: $1" ;;
+    esac
+    case "$_rd_xdg" in
+        /*) printf '%s\n' "$_rd_xdg/minimal" ;;
+        *)  printf '%s\n' "$_rd_home/minimal" ;;
+    esac
+}
+
 # The bin prefix, resolved once. Needed early: the pre-upgrade daemon stop
 # runs the `min` already installed there, before the component loop
 # replaces it.
@@ -827,16 +851,28 @@ do_uninstall() {
 
     # --purge additionally deletes the minimal-owned trees wholesale (build
     # cache included); they live at fixed .../minimal paths the tool owns. It
-    # never removes files outside those roots.
+    # never removes files outside those roots. Each tree is purged both where
+    # the installer resolves it and where the runtime writes it (runtime_dir):
+    # on macOS the runtime's cache is ~/Library/Caches/minimal, not the
+    # installer's XDG path. Only an absolute .../minimal path is purged, so a
+    # relative XDG value never resolves against the current directory.
     if [ "$uninstall_purge" -eq 1 ]; then
         for p in data state cache; do
-            d="$(resolve_prefix "$p")"
-            [ -d "$d" ] || continue
-            if [ "$dry_run" -eq 1 ]; then
-                say "  would purge $d"
-            else
-                rm -rf "$d"
-            fi
+            _pg_inst="$(resolve_prefix "$p")"
+            _pg_run="$(runtime_dir "$p")"
+            [ "$_pg_run" != "$_pg_inst" ] || _pg_run=
+            for d in "$_pg_inst" "$_pg_run"; do
+                case "$d" in
+                    /*/minimal) ;;
+                    *) continue ;;
+                esac
+                [ -d "$d" ] || continue
+                if [ "$dry_run" -eq 1 ]; then
+                    say "  would purge $d"
+                else
+                    rm -rf "$d"
+                fi
+            done
         done
     fi
 
@@ -958,6 +994,12 @@ stop_running_daemon() {
     daemon_stop_tried=1
     [ "$force_stop" -eq 0 ] || daemon_stop_consent=1
     [ -x "$bindir/min" ] || return 0
+    # A `min` that reads MIN_PROVIDER refuses a value that names no provider.
+    # One that does not predates it, and ran the native daemon on Linux.
+    if [ "$os" = linux ] && ! MIN_PROVIDER=min-installer-probe "$bindir/min" version </dev/null 2>&1 \
+        | grep -qF 'MIN_PROVIDER=min-installer-probe names no provider'; then
+        stale_provider=local
+    fi
 
     if [ "$force_stop" -eq 0 ]; then
         # Stopped gracefully (or there was nothing to stop): done, no --force.
@@ -1100,11 +1142,28 @@ installed=0 skipped=0
 # on the terminal, as the pre-swap stop does. Declined, or with no terminal to
 # ask on, it leaves the daemon running and says how to stop it: the swaps are
 # done, so the install itself still succeeds.
+#
+# The new `min` must reach the daemon the old one ran. On Linux a `min` from
+# before MIN_PROVIDER always ran the native daemon, and a new `min` with no
+# flag runs the VM where /dev/kvm opens. So when the pre-swap stop found such
+# an old `min` (stale_provider=local), this stop runs with MIN_PROVIDER=local,
+# in a subshell so nothing after it inherits the variable, and its advice names
+# `--provider local`.
 stale_stop_tried=0
+stale_provider=
 stop_stale_daemon() {
     [ "$stale_stop_tried" -eq 0 ] || return 0
     stale_stop_tried=1
     [ -x "$bindir/min" ] || return 0
+    if [ -n "$stale_provider" ]; then
+        (MIN_PROVIDER="$stale_provider"; export MIN_PROVIDER; stop_stale_daemon_now)
+    else
+        stop_stale_daemon_now
+    fi
+}
+
+stop_stale_daemon_now() {
+    _stale_min="min${stale_provider:+ --provider $stale_provider}"
     _vout="$("$bindir/min" version 2>&1 </dev/null)" || _vout=
     _cv="$(printf '%s\n' "$_vout" | sed -n 's/^Client: minimal //p')"
     _sv="$(printf '%s\n' "$_vout" | sed -n 's/^Server: minimald //p')"
@@ -1121,7 +1180,7 @@ stop_stale_daemon() {
                     return 0
                 fi
                 say "the daemon has active sessions, so it is still running build $_sv."
-                say "run 'min stop' after those sessions end, or 'min stop --force' to end them now."
+                say "run '$_stale_min stop' after those sessions end, or '$_stale_min stop --force' to end them now."
                 return 0
                 ;;
         esac
@@ -1146,7 +1205,7 @@ sessions_seen_pre_swap() {
 # build may still be serving, and the user is told how to stop it.
 force_stop_stale() {
     "$bindir/min" stop --force >/dev/null 2>&1 </dev/null && return 0
-    say "the daemon on build $1 may still be running; run 'min stop --force'"
+    say "the daemon on build $1 may still be running; run '$_stale_min stop --force'"
 }
 
 # Set once the pre-swap stop has run and the first executable is about to be
@@ -1801,15 +1860,44 @@ say "  ${dim}docs.minimal.dev   $sep   discord.com/invite/qgX8sm6X7G$rst"
 # so it lists every field the request sends, as the CLI's own disclosure
 # does, and names the switch. A channel install is told when its channel
 # moves on; a pinned (--version) one is counted but never told, since no
-# channel pointer applies to it.
+# channel pointer applies to it. A pinned release older than 0.7.4 has no
+# check and sends nothing. The card knows the pinned version, so it says
+# which of the two this install is; only for a version it cannot place (a
+# pre-release, a nightly, a name that is not X.Y.Z) does it give the range.
+pinned_reports="unknown"
 if [ "$version_set" -eq 1 ]; then
-    say "  ${dim}min reports this install once a day (no release notices for --version), sending its channel$rst"
-    say "  ${dim}(pinned), version, OS, architecture, install method and a random install id to update.minimal.dev.$rst"
-else
-    say "  ${dim}min checks once a day for a newer $target release, sending its channel, version, OS,$rst"
-    say "  ${dim}architecture, install method and a random install id to update.minimal.dev.$rst"
+    case "${VERSION#v}" in
+        *[!0-9.]*|.*|*.|*..*) ;;
+        *.*.*.*) ;;
+        *.*.*)
+            pin_major="${VERSION#v}"; pin_major="${pin_major%%.*}"
+            pin_rest="${VERSION#v}"; pin_rest="${pin_rest#*.}"
+            pin_minor="${pin_rest%%.*}"; pin_patch="${pin_rest#*.}"
+            if [ "$pin_major" -gt 0 ] \
+                || { [ "$pin_major" -eq 0 ] && [ "$pin_minor" -gt 7 ]; } \
+                || { [ "$pin_major" -eq 0 ] && [ "$pin_minor" -eq 7 ] && [ "$pin_patch" -ge 4 ]; }; then
+                pinned_reports="yes"
+            else
+                pinned_reports="no"
+            fi ;;
+    esac
 fi
-say "  ${dim}Off: MINIMAL_TELEMETRY=0$rst"
+if [ "$version_set" -eq 1 ] && [ "$pinned_reports" = "no" ]; then
+    say "  ${dim}min $VERSION does not check for updates and sends nothing. Releases from 0.7.4 on report an$rst"
+    say "  ${dim}install once a day.$rst"
+else
+    if [ "$version_set" -eq 1 ] && [ "$pinned_reports" = "yes" ]; then
+        say "  ${dim}min reports this install once a day (no release notices for --version), sending the channel$rst"
+        say "  ${dim}(pinned), version, OS, architecture, install method and a random install id to update.minimal.dev.$rst"
+    elif [ "$version_set" -eq 1 ]; then
+        say "  ${dim}min 0.7.4 and later report this install once a day (no release notices for --version), sending the channel$rst"
+        say "  ${dim}(pinned), version, OS, architecture, install method and a random install id to update.minimal.dev.$rst"
+    else
+        say "  ${dim}min checks once a day for a newer $target release, sending its channel, version, OS,$rst"
+        say "  ${dim}architecture, install method and a random install id to update.minimal.dev.$rst"
+    fi
+    say "  ${dim}Off: MINIMAL_TELEMETRY=0$rst"
+fi
 say "  ${dim}docs.minimal.dev/reference/telemetry#update-check$rst"
 say ""
 }

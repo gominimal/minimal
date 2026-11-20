@@ -4844,20 +4844,12 @@ async fn a_box_holding_a_host_row_refuses_remint_after_its_host_loop_ends() {
         "the refusal must be surfaced as an attach error; got: {refusal:?}"
     );
     assert!(
-        refusal.contains("the VM host daemon released this session's network addresses"),
+        refusal.contains("the VM host released this box's network addresses"),
         "the refusal must name the host-row cause; got: {refusal:?}"
     );
     assert!(
-        refusal.contains("min session activate"),
-        "the refusal must name the step that registers a box again; got: {refusal:?}"
-    );
-    assert!(
-        refusal.contains("min session destroy <session>"),
-        "the refusal must name the session argument the destroy step takes; got: {refusal:?}"
-    );
-    assert!(
-        refusal.contains("run the same command again"),
-        "the refusal must name the re-run that resumes the row; got: {refusal:?}"
+        refusal.contains("Run the same command again to ask for them back"),
+        "the refusal names the re-run that asks for the row back; got: {refusal:?}"
     );
     assert_eq!(
         super::launch_publish_seam::observed(id).len(),
@@ -4873,7 +4865,7 @@ async fn assert_attach_refused_rowless(client: &mut TestClient, id: SessionId) {
     let refusal = collect_to_close(&mut channel).await;
     assert!(
         refusal.contains("Cannot attach to the box:")
-            && refusal.contains("the VM host daemon released this session's network addresses"),
+            && refusal.contains("the VM host released this box's network addresses"),
         "the attach must be refused for the ended host-side row; got: {refusal:?}"
     );
 }
@@ -16487,7 +16479,10 @@ async fn resume_refuses_stored_spec_its_root_excludes_keeps_state() {
         &mut client,
         id,
         RecordState::Stopped(ending),
-        &["`box.type` to `no-such-root`", "names no built-in type"],
+        &[
+            "`box.type` to `no-such-root`",
+            "do not name the built-in type that `no-such-root` extends",
+        ],
         3,
     )
     .await;
@@ -18421,11 +18416,28 @@ async fn restart_box_in(server: &TestServer, id: SessionId) -> Result<bool, supe
 }
 
 /// The refusal a restart of `id` answers. Panics when it was not refused.
+///
+/// A refused restart of an ended box ends the actor it started, and the
+/// manager evicts that actor a moment later. A restart sent in between
+/// reaches the ending actor and is answered "The session ended before its
+/// restart finished." So this waits for the eviction before it returns, as
+/// [`stop_through_daemon`] does after a stop.
 async fn restart_refusal(server: &TestServer, id: SessionId) -> minimald_rpc::RestartRefusal {
-    match restart_box_in(server, id).await {
+    let manager = server.state.sessions_manager().await;
+    let before = manager.running_count().await;
+    let refusal = match restart_box_in(server, id).await {
         Err(super::RestartError::Refused(refusal)) => refusal,
         other => panic!("the restart was not refused: {other:?}"),
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while manager.running_count().await > before {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the actor a refused restart started was not evicted"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    refusal
 }
 
 /// The types of the events of `id`, in the order they were written.
@@ -18585,6 +18597,94 @@ async fn restart_refuses_box_not_until_stopped_keeps_state() {
     assert_eq!(refusal.kind, RestartRefusalKind::Lifetime);
     assert_eq!(
         read_record(&server, bare).await.state().unwrap(),
+        RecordState::Running
+    );
+}
+
+/// BOX-160, BOX-176: a restart meets the admission check a create of its
+/// stored spec meets, as a resume does. An until_stopped box whose stored
+/// spec its root excludes is refused with exit 3, and the record stays as
+/// it was, byte for byte. A project type that does not name the built-in
+/// type it extends is refused as the create refuses it. The control: the
+/// spec the create accepted restarts once it is stored again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_refuses_stored_spec_its_root_excludes_keeps_state() {
+    use boxes::core::record::RecordState;
+    use minimald_rpc::RestartRefusalKind;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_session_with_spec(
+        &mut client,
+        Some("restart-root"),
+        "/uwu",
+        Some(until_stopped_spec(true)),
+    )
+    .await;
+    let ending = stop_through_daemon(&server, id).await;
+    let record_path = record_dir(&server, id).await.join("record.json");
+    let spec_of_type = |box_type: &str| {
+        let mut spec = until_stopped_spec(true);
+        spec["box"]["type"] = box_type.into();
+        spec
+    };
+
+    // The `task` root allows no terminal.
+    rewrite_spec(&server, id, &spec_of_type(boxes::TASK_BOX_TYPE)).await;
+    let before = std::fs::read(&record_path).unwrap();
+    let refusal = restart_refusal(&server, id).await;
+    assert_eq!(
+        (refusal.kind, refusal.exit_code),
+        (RestartRefusalKind::Spec, 3),
+        "{refusal}"
+    );
+    for words in [
+        "It stays stopped.",
+        "`io.pty_enabled` to `true`",
+        "the built-in type `task` allows only `false`",
+        "min session destroy restart-root",
+    ] {
+        assert!(
+            refusal.message.contains(words),
+            "{words:?} not in {refusal}"
+        );
+    }
+    assert_eq!(std::fs::read(&record_path).unwrap(), before);
+
+    // A project type whose spec does not name the built-in type it extends.
+    rewrite_spec(&server, id, &spec_of_type("ci")).await;
+    let refusal = restart_refusal(&server, id).await;
+    assert_eq!(
+        (refusal.kind, refusal.exit_code),
+        (RestartRefusalKind::Spec, 3),
+        "{refusal}"
+    );
+    for words in [
+        "It stays stopped.",
+        "`box.type` to `ci`, but they do not name",
+        "the built-in type that `ci` extends",
+    ] {
+        assert!(
+            refusal.message.contains(words),
+            "{words:?} not in {refusal}"
+        );
+    }
+    assert_eq!(std::fs::read(&record_path).unwrap(), before);
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        RecordState::Stopped(ending)
+    );
+
+    // The control: the box as the create filed it restarts.
+    rewrite_spec(&server, id, &until_stopped_spec(true)).await;
+    assert!(
+        !restart_box_in(&server, id)
+            .await
+            .expect("a stored spec the create accepted restarts"),
+        "the box was stopped"
+    );
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
         RecordState::Running
     );
 }

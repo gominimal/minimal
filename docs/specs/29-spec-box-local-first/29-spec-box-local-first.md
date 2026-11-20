@@ -282,12 +282,12 @@ After this ships, a developer on a stock install with no identity plane runs ses
     tier:   T0
     verify: cargo nextest run -p mfile entry_name_invalid_exit3_names_entry
 
-- **BOX-048** THE SYSTEM SHALL merge `[defaults]` into every entry and `[defaults.<type>]` into entries of that type, unioning lists and replacing scalars and tables with the more specific layer's, except `vars` and `vars_lenient`, which BOX-180 merges by name.
+- **BOX-048** THE SYSTEM SHALL merge `[defaults]` into every entry and `[defaults.<type>]` into entries of that type, unioning lists and replacing scalars and tables with the more specific layer's, except `env_vars`, which BOX-180 merges by name.
   tier:     T1
   verify:   cargo nextest run -p mfile defaults_merge_lists_union_scalars_replace
-  property: For every pair of layers, merging unions list values in layer order, merges `vars` and `vars_lenient` by name with the more specific layer's value for a name both set, and replaces other scalars and tables with the more specific layer's.
+  property: For every pair of layers, merging unions list values in layer order, merges `env_vars` by name with the more specific layer's value for a name both set, and replaces other scalars and tables with the more specific layer's.
 
-- **BOX-049** THE SYSTEM SHALL accept per-entry keys written flat (`timeout`, `pty_enabled`, and the `[machine]` and `on_oom` keys as the resources spec (gominimal/inbox#698; BRES) defines them) and keep the meaning of `packages`, `patches`, `vars` and `lifecycle_hooks`.
+- **BOX-049** THE SYSTEM SHALL accept per-entry keys written flat (`timeout`, `pty_enabled`, and the `[machine]` and `on_oom` keys as the resources spec (gominimal/inbox#698; BRES) defines them) and keep the meaning of `packages`, `patches`, `env_vars` and `lifecycle_hooks`.
   tier:     T0
   verify:   cargo nextest run -p mfile flat_per_entry_keys_and_legacy_keys_keep_meaning
 
@@ -352,7 +352,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
     tier:   T0
     verify: cargo nextest run -p mfile other_builtin_type_entry_refused_exit3_other_entries_usable
 
-- **BOX-064** THE SYSTEM SHALL expand an entry in the order `[upstream]`, type defaults, `[defaults]`, `[defaults.<type>]`, entry, selected loadouts, then command-line overrides where BCLI provides them, unioning lists in that order and replacing scalars and tables wholesale, except `vars` and `vars_lenient`, which BOX-180 merges by name, and except that the command-line override layer merges as the sub-bullets below state.
+- **BOX-064** THE SYSTEM SHALL expand an entry in the order `[upstream]`, type defaults, `[defaults]`, `[defaults.<type>]`, entry, selected loadouts, then command-line overrides where BCLI provides them, unioning lists in that order and replacing scalars and tables wholesale, except `env_vars`, which BOX-180 merges by name, and except that the command-line override layer merges as the sub-bullets below state.
   tier:     T1
   verify:   cargo nextest run -p mfile expansion_order_and_merge_rules
   property: For every set of layers, expansion equals the fold of the merge rule over the layers before the command-line overrides in the stated order, followed by the command-line override rules below.
@@ -372,27 +372,39 @@ After this ships, a developer on a stock install with no identity plane runs ses
     tier:   T0
     verify: cargo nextest run -p mfile command_line_no_hooks_empties_lifecycle_hooks
 
-- **BOX-180** THE SYSTEM SHALL merge the `vars` and `vars_lenient` of BOX-064's layers by variable name, keyed across both tables, so that each name keeps the value, and the table, of the most specific layer up to and including the entry that sets it, and each selected loadout adds the names it sets.
+- **BOX-180** THE SYSTEM SHALL merge the `env_vars` of BOX-064's layers by variable name, so that each name keeps the value of the most specific layer up to and including the entry that sets it, and each selected loadout adds the names it sets.
   tier:   T0
-  verify: cargo nextest run -p mfile vars_merge_by_name_across_layers
-  <!-- decided 2026-11-09: a wholesale replace would let a loadout's `vars`, such as the built-in default loadout's, erase an open entry's own; a loadout that sets a name to the same value adds nothing (docs/reference/loadouts.md, "Composition, conflicts, and policy") -->
+  verify: cargo nextest run -p mfile env_vars_merge_by_name_across_layers
+  <!-- decided 2026-11-09: a wholesale replace would let a loadout's `env_vars`, such as the built-in default loadout's, erase an open entry's own; a loadout that sets a name to the same value adds nothing (docs/reference/loadouts.md, "Composition, conflicts, and policy") -->
 
 - **BOX-183** IF a loadout that BOX-167 applies sets a variable name to a resolved value other than the one that the layers up to and including the entry, or another loadout that BOX-167 applies, resolve it to THEN THE SYSTEM SHALL fail the expansion with exit 3, so that the creation and `min box spec <entry>` both refuse it. The error SHALL name the variable and both sources, and name the remedy of adding the variable to the `ignore` list of the user policy.
   tier:   T0
   verify: cargo nextest run -p mfile conflicting_loadout_var_refused_exit3
   <!-- decided 2026-11-09: keeps the documented rule, with no override precedence between loadouts and the project (docs/reference/loadouts.md); a different value is a hard conflict, not a silent override; a sealed box applies no loadout (BOX-166), so it has no conflict to check; the check compares resolved values, so a literal and an `inherit` that resolve to one value are one variable, and a loadout's `inherit` that finds no value on the host is dropped with a warning, so it contributes nothing to compare (docs/reference/loadouts.md) -->
 
-- **BOX-184** IF one layer sets a variable name twice, in `vars_lenient` or in both `vars` and `vars_lenient`, to different values THEN THE SYSTEM SHALL fail the expansion with exit 3, so that the creation and `min box spec <entry>` both refuse it. The error SHALL name the variable and the layer.
+<!-- BOX-184 retired 2026-11-19 (owner ruling 2026-11-16, gominimal/arch#177, gominimal/minimal#3469): one `env_vars` table cannot set a key twice, so one layer cannot set a variable name twice. The ID is not reused. -->
+
+- **BOX-205** THE SYSTEM SHALL read the environment variables of each BOX-064 layer that `minimal.toml` or a loadout file supplies from one table named `env_vars`.
   tier:   T0
-  verify: cargo nextest run -p mfile duplicate_var_in_one_layer_refused_exit3
-  <!-- one layer has no more specific layer to settle the name, so BOX-180's rule picks nothing; the same name set twice to the same value is one variable -->
+  verify: cargo nextest run -p mfile env_vars_read_from_every_layer
+  <!-- owner ruling 2026-11-16 (gominimal/arch#177): one table under one name at every layer, the task entry's included, replacing `vars`, `vars_lenient` and the task-only `env_vars` -->
+
+- **BOX-206** IF a layer that a `minimal.toml` table or a loadout file supplies sets `vars` or `vars_lenient` as one of its own keys, not as a variable name inside its `env_vars`, THEN THE SYSTEM SHALL fail the expansion with exit 3, so that the creation and `min box spec <entry>` both refuse it. The error SHALL name the file, the table that sets the key, and the key, and SHALL tell the person to move the variables to `env_vars`.
+  tier:   T0
+  verify: cargo nextest run -p mfile retired_var_keys_refused_exit3
+  <!-- owner ruling 2026-11-16: no compatibility shim, so a file that still uses a retired key learns the new key at once rather than losing its variables -->
+
+- **BOX-207** IF an `env_vars` table sets a variable whose name is empty, holds a character other than an ASCII letter, a digit or `_`, or starts with a digit, THEN THE SYSTEM SHALL fail the expansion with exit 3, so that the creation and `min box spec <entry>` both refuse it. The error SHALL name the variable and the file, and say which characters a name can hold.
+  tier:   T0
+  verify: cargo nextest run -p mfile non_posix_env_var_name_refused_exit3
+  <!-- decided 2026-11-19: `[[vars_lenient]]` was the opt-in for other names and no shipped loadout or example uses it; a per-variable opt-in can be added later without breaking a project, while accepting every name now could not be narrowed later -->
 
 - **BOX-166** WHERE the `loadout_mode` that BOX-064's layers up to and including the entry set is `sealed` THE SYSTEM SHALL apply no loadout at BOX-064's selected-loadouts layer.
   tier:     T0
   verify:   cargo nextest run -p mfile sealed_spec_applies_no_loadout
   <!-- architecture expansion order step 6, "selected loadouts (subject to loadout_mode)"; optional-feature on the setting; the gate reads the mode before the loadouts layer, so a loadout cannot open the gate that admits it; a loadout a flag names fails under BOX-173 before this layer; gominimal/minimal#3068 -->
 
-- **BOX-167** WHERE the `loadout_mode` that BOX-064's layers up to and including the entry set is `open` THE SYSTEM SHALL apply each selected loadout's packages, config-file patches, `vars`, `vars_lenient` and lifecycle hooks at BOX-064's selected-loadouts layer, with its config-file patches read under the client's `[loadout-file-rules]`.
+- **BOX-167** WHERE the `loadout_mode` that BOX-064's layers up to and including the entry set is `open` THE SYSTEM SHALL apply each selected loadout's packages, config-file patches, `env_vars` and lifecycle hooks at BOX-064's selected-loadouts layer, with its config-file patches read under the client's `[loadout-file-rules]`.
   tier:     T0
   verify:   cargo nextest run -p mfile open_spec_applies_whole_loadout
 
@@ -827,7 +839,9 @@ Moved to the sibling spec `docs/specs/28-spec-box-cli` (BCLI) when the grammar w
 
 **A project layer can open a sealed type.** Decided on 2026-11-09: the gate reads `loadout_mode` from every layer up to and including the entry, and a cloned `minimal.toml` supplies some of those layers. So a project can set `loadout_mode = "open"` on a task entry, and the user's loadouts then apply to a task that runs the project's code. This spec accepts that, as the architecture does: its shipped-types table makes `sealed` the `task` type's default and a constraint only for `build` and `container-build`, and "a type's defaults sit below the project's on purpose". A session is `open` by default and already runs the project's code with those loadouts, so it adds no new exposure. Design principle 8 lets a type that extends `task` set `open`. The cause, gominimal/minimal#3068, was about reproducibility, and a project that opens its own task gives up its own reproducibility. The alternative let only the client config or a flag open a sealed box. It was rejected because it contradicts design principle 8 and needs an architecture change first. So the project controls the mode. The client still controls which loadouts it offers, `--no-loadouts` (BCLI), and the file reads `[loadout-file-rules]` allows, which a project file cannot supply. The gate runs in the client's expansion. The daemon's admission (BOX-160) checks the root's constraints, not the gate, and the projection carries `loadout_mode` (BOX-071).
 
-**`vars` merge by name.** Decided on 2026-11-09: BOX-180 merges `vars` and `vars_lenient` by name, and every other table is still replaced whole. With a wholesale replace, an open entry that sets `vars` and a loadout that sets `vars` would lose the entry's variables, and the built-in default loadout sets `vars`. Up to the entry, the more specific layer wins on a name, as BOX-048 says for any value. A loadout adds names. A loadout that sets a name to a different value fails the expansion (BOX-183), which keeps the documented rule of docs/reference/loadouts.md: there is no override precedence between loadouts and the project. The alternative let a later layer win, so a loadout would override the entry silently. It was rejected because it changes shipped behaviour. A person who wants a loadout's value removes the project's declaration of that variable, and any lower layer's declaration that would then apply. The policy's `ignore` list drops every contributor of the variable, the loadout's included, so it resolves a conflict without keeping either value.
+**`env_vars` merge by name.** Decided on 2026-11-09: BOX-180 merges the variables by name, and every other table is still replaced whole. With a wholesale replace, an open entry that sets variables and a loadout that sets variables would lose the entry's variables, and the built-in default loadout sets variables. Up to the entry, the more specific layer wins on a name, as BOX-048 says for any value. A loadout adds names. A loadout that sets a name to a different value fails the expansion (BOX-183), which keeps the documented rule of docs/reference/loadouts.md: there is no override precedence between loadouts and the project. The alternative let a later layer win, so a loadout would override the entry silently. It was rejected because it changes shipped behaviour. A person who wants a loadout's value removes the project's declaration of that variable, and any lower layer's declaration that would then apply. The policy's `ignore` list drops every contributor of the variable, the loadout's included, so it resolves a conflict without keeping either value.
+
+**One variable table.** Owner ruling 2026-11-16 (gominimal/arch#177, gominimal/minimal#3469): every layer names its variables in one `env_vars` table, which BOX-205 reads, and `vars`, `vars_lenient` and the task-only `env_vars` become that one table. Before, a task's `env_vars` was replaced whole while `vars` merged by name, so a task and a session read the same layers differently. With one table that BOX-180 merges, they read them the same way. A file that still sets `vars` or `vars_lenient` fails with exit 3 and names the new key (BOX-206). No shim reads the old keys, because a shim would let two names mean one table for as long as it stayed. With one table, BOX-184's check of a name set twice in one layer has nothing to check, so it is retired. `[[vars_lenient]]` was the opt-in for a name that is not POSIX-shaped. Decided on 2026-11-19: `env_vars` takes POSIX names only (BOX-207), because no shipped loadout or example uses another name, and a shell cannot read one. A per-variable opt-in can be added later without breaking a project. Accepting every name now could not be narrowed later without breaking one. The rule covers `env_vars` and a loadout's variables only. `[secrets]` and the trust variables also reach the box environment, and gominimal/arch#185 decides how they meet a variable of the same name.
 
 **Unenforced sections are accepted and warned of, never silently dropped.** Decided on 2026-10-05: BOX-076 keeps accepting the whole `box.toml` schema, and the daemon warns once at creation for each section this spec does not enforce, naming it, with each section's owner listed under Non-goals; a project's `[secret-store-rules]` is left out with BEP-037's warning. Decided on 2026-10-06: a project's `[package-file-rules]` and `[loadout-file-rules]` get the same treatment, because both authorize reads of the client's filesystem outside the project subtree, and carrying a cloned file's `allow` rules into the stored spec would hand the follow-up that enforces them a spec that says to honour them. The alternative, refusing those sections until an owner enforces them, was rejected because epic story S9 accepts keys whether or not this host enforces them yet, and the architecture's own example uses them.
 
