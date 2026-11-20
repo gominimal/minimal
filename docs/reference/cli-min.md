@@ -8,9 +8,10 @@ description: "Reference for the min session CLI: create, attach to, and manage s
 `min` is the Minimal session CLI. It talks to the `minimald` daemon (see
 [minimald](./cli-minimald.md)) to create, attach to, and manage sandboxed
 development sessions. Most commands start the daemon automatically when it
-isn't running, with `bug`, `host stop`, and `version` being the exceptions. The 
-daemon starts natively on Linux (and under `--provider local-minvmd`) or 
-inside the [`minvmd`](./cli-minvmd.md) microVM host daemon on macOS. 
+is not running, with `bug`, `host stop`, and `version` being the exceptions. On
+macOS the daemon starts inside the [`minvmd`](./cli-minvmd.md) microVM host
+daemon. On Linux the provider decides where it starts, as
+[Choosing the provider on Linux](#choosing-the-provider-on-linux) describes.
 Running bare `min` with no subcommand routes you into a session when stdin
 and stdout are both a terminal: it follows the smart-resolution rules of
 `min session attach` with no argument (cwd match → attach, only session →
@@ -36,8 +37,44 @@ These apply to every subcommand.
 | `--repo-dir <PATH>` | `-C` | Use the given directory as the repository root, instead of the current working directory |
 | `--minimal-dir <PATH>` | | Override the base directory for minimal's state; the session store, provider instances, and other on-disk state live under `<minimal_dir>/`. Defaults to `$XDG_STATE_HOME/minimal` on Linux (or `$HOME/.local/state/minimal`); macOS also uses `$HOME/.local/state/minimal` |
 | `--config-dir <PATH>` | | Override the user config directory; everything under `<config_dir>/minimal/` (`config.toml`, `loadouts/`, ...) resolves relative to it. Defaults to `$XDG_CONFIG_HOME` on Linux (or `$HOME/.config`); macOS also uses `$HOME/.config` |
-| `--provider <PROVIDER>` | | Daemon backend that hosts sessions: `local-minimald` (Linux default, `minimald` natively on the host) or `local-minvmd` (`minimald` inside the `minvmd` microVM). No effect on macOS, where `minvmd` is the only backend |
+| `--provider <PROVIDER>` | | Daemon backend that hosts sessions: `local` (`minimald` natively on the host) or `local-minvmd` (`minimald` inside the `minvmd` microVM). Without the flag, Linux uses `MIN_PROVIDER`, then the `provider` key of `config.toml`, then `local-minvmd` where `/dev/kvm` opens for you and `local` where it does not. No effect on macOS, where `minvmd` is the only backend |
 | `--no-input` | | Skip interactive prompts that need a terminal (such as the session picker); ambiguous choices error with a list of candidates instead. Implied when stdin/stdout is not a terminal |
+
+### Choosing the provider on Linux
+
+A command without `--provider` chooses the provider in this order:
+
+1. The `MIN_PROVIDER` environment variable, set to `local` or
+   `local-minvmd`.
+2. The `provider` key of your `config.toml` (run `min dirs` to find the
+   file). It is a top-level key, so it goes before the first table:
+
+   ```toml
+   provider = "local"
+   ```
+
+3. `local-minvmd`, when `/dev/kvm` opens for reading and writing for you
+   and answers the KVM API version request.
+4. `local`, otherwise.
+
+`--provider` wins over all of them. A host where `/dev/kvm` is there but does
+not open for you stays on `local` until you join the `kvm` group.
+`min finalize-install` offers that step. It takes effect at your next login.
+
+Each provider keeps its own boxes. Boxes you started on the native provider
+before `local-minvmd` became your default stay there: `min --provider local
+ls` lists them. To keep the native provider as your default, set
+`MIN_PROVIDER=local` or put `provider = "local"` in `config.toml`.
+
+A command can reach `local-minvmd` only because `/dev/kvm` opens. If the
+native provider then still has boxes or a running daemon, the command prints
+a note on stderr after it ends. The note names both ways back above, and it
+stops once `--provider`, `MIN_PROVIDER` or the `provider` key names the
+provider.
+
+A VM that fails to start under this default gives an error with one more
+line. That line says `min` used the VM because `/dev/kvm` opens, and that
+`MIN_PROVIDER=local` keeps the native provider.
 
 ## Commands
 
@@ -578,8 +615,8 @@ The script holds only what this host is missing from:
   the service it starts places the daemon in its leaf. An un-enrolled
   host does not need a source identity for it. The classifier translates
   nothing until an association adds the reserved addresses
-- membership of the `kvm` group, only when the configured provider is the
-  Linux VM provider
+- membership of the `kvm` group, for the Linux VM provider. A command that
+  does not name a provider also gets it where `/dev/kvm` does not open for you
 
 On macOS the step installs the box-name service's program in an app bundle,
 `/Library/PrivilegedHelperTools/Minimal.app`, that root owns. The service and
@@ -600,7 +637,7 @@ the `kvm` group ends with
 `KVM group membership starts at your next login: log out and back in, or restart the daemon from a new login.`
 When both apply, both lines print, the login line last. When the step that
 enforces deny-all egress installs while a daemon is running, on a host with
-systemd, the script also prints `note: a Minimal daemon is running. If a box you start next still says this machine cannot enforce its egress yet, restart the daemon. Run min host stop local0, which stops each running box and then the daemon. Then run min ls, which starts the daemon again.`
+systemd, the script also prints `note: a Minimal daemon is running. If a box you start next still says this machine cannot enforce its egress yet, restart the daemon. Run min host stop local0 --provider local, which stops each running box and then the daemon. Then run min ls --provider local, which starts the daemon again.`
 When `min finalize-install` runs with `--minimal-dir`, both commands in the
 note carry the same `--minimal-dir`, made absolute.
 A daemon of this release reads the machine again once the step places it, so

@@ -650,6 +650,190 @@ pub async fn resume_box_row(sock: &Path, record: Option<&boxes::Record>) -> anyh
     }
 }
 
+/// What asking the VM host daemon for a box's row back gave, after the
+/// in-VM daemon refused an attach because the row was withdrawn (NET-138,
+/// [`minimald_rpc::ATTACH_ROW_ENDED_EXIT_STATUS`]):
+/// [`resume_box_row_after_row_ended`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowEndedResume {
+    /// There is no row to ask back: the host is not VM-backed, or the
+    /// session's record names no box row.
+    NothingToResume,
+    /// The VM host daemon answered with the box's row, which it reinstated
+    /// from its own record of the box's creation under the same box id, or
+    /// which stands. The attach can run again.
+    Back,
+    /// A running box holds the box's name now, in the spelling `held`:
+    /// the box's creation gave up its name while it had no row
+    /// (BOX-004), and the host does not put two running boxes under one
+    /// name.
+    NameHeld {
+        /// The name in the spelling the running box holds it.
+        held: String,
+    },
+    /// The row did not come back for another reason, as a log clause.
+    NotBack(String),
+}
+
+/// The words minvmd's refusal starts and ends with when a running box holds
+/// the name the request asked for (`AllocationError::NameAlreadyHeld` in
+/// `crates/minvmd/src/box_registry.rs`); the held name is between them.
+/// This copies minvmd's literal, because minvmd's text is not in a crate
+/// that this one shares. A test reads minvmd's source and fails when the
+/// two drift apart.
+pub const NAME_HELD_REFUSAL: (&str, &str) = ("a box named ", " already exists");
+
+/// How long the resume after a row-ended attach may take
+/// ([`resume_box_row_after_row_ended`]). A row that was just withdrawn
+/// can still have its revocation in flight, and the VM host daemon waits
+/// up to 5 s for it before it reinstates the row (`REVOCATION_WAIT` in
+/// `crates/minvmd/src/box_registry.rs`). This bound is twice that wait, so
+/// the client does not give up on a row the host is bringing back. A test
+/// reads minvmd's source and fails when the wait grows past half of it.
+pub const ROW_ENDED_RESUME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Asks the VM host daemon beside `sock` for the session's box row back
+/// once more, after the in-VM daemon refused an interactive attach because
+/// the row was withdrawn (NET-138). The resume before the attach can find
+/// the row standing near the end of its detach grace, and the host can
+/// withdraw it before the in-VM daemon reads it. This resume then finds the
+/// box's creation dormant and reinstates its row from the host's own record
+/// of that creation, under the same box id and at the same addresses, so
+/// the record the client holds stays right, and no second creation is made
+/// that would hold addresses of its own. Bounded by
+/// [`ROW_ENDED_RESUME_TIMEOUT`].
+///
+/// # Errors
+///
+/// [`HostUnreachable`] when the VM host daemon cannot be reached, and
+/// [`HostRefusal`] when it refuses to give the box an address, as for the
+/// resume before an attach ([`resume_box_row`]).
+pub async fn resume_box_row_after_row_ended(
+    sock: &Path,
+    record: Option<&boxes::Record>,
+) -> anyhow::Result<RowEndedResume> {
+    let Some(control_sock) = control_sock_beside(sock) else {
+        return Ok(RowEndedResume::NothingToResume);
+    };
+    let Some((name, addresses, box_id)) = record
+        .and_then(|record| Some((record.name.clone()?, record.box_addresses?, record.box_id)))
+    else {
+        return Ok(RowEndedResume::NothingToResume);
+    };
+    let box_name = name.clone();
+    let answer = tokio::time::timeout(
+        ROW_ENDED_RESUME_TIMEOUT,
+        tokio::task::spawn_blocking(move || {
+            // One second past the caller's own deadline, so that deadline
+            // is the one that answers.
+            crate::attach::resume_box_row_answer(
+                &control_sock,
+                &box_name,
+                addresses,
+                box_id,
+                ROW_ENDED_RESUME_TIMEOUT + std::time::Duration::from_secs(1),
+            )
+        }),
+    )
+    .await;
+    let answer = match answer {
+        Ok(Ok(Ok(answer))) => answer,
+        Ok(Ok(Err(error))) if error.downcast_ref::<HostRefusal>().is_some() => {
+            return Err(error.context(format!("box {name}")));
+        }
+        Ok(Ok(Err(error))) => return Err(error),
+        Ok(Err(join)) => {
+            return Err(anyhow::Error::new(join).context("the box row resume did not run"));
+        }
+        Err(_) => {
+            return Ok(RowEndedResume::NotBack(format!(
+                "the VM host daemon did not answer the resume in {ROW_ENDED_RESUME_TIMEOUT:?}"
+            )));
+        }
+    };
+    Ok(match answer {
+        Ok(()) => {
+            tracing::info!(
+                box = %name,
+                "the box's host row is back after its attach found it withdrawn"
+            );
+            RowEndedResume::Back
+        }
+        Err(crate::attach::RowNotResumed::Refused(error)) => {
+            let (lead, tail) = NAME_HELD_REFUSAL;
+            match error
+                .strip_prefix(lead)
+                .and_then(|rest| rest.strip_suffix(tail))
+            {
+                Some(held) => RowEndedResume::NameHeld {
+                    held: held.to_string(),
+                },
+                None => RowEndedResume::NotBack(format!("the daemon refused it: {error}")),
+            }
+        }
+        Err(crate::attach::RowNotResumed::Failed(failure)) => RowEndedResume::NotBack(failure),
+    })
+}
+
+/// Whether the session's box row is gone from the VM host daemon beside
+/// `sock`, read after an interactive attach ended with
+/// [`minimald_rpc::ATTACH_ROW_ENDED_EXIT_STATUS`] (NET-138). The in-VM
+/// daemon refuses an attach with that status only once the host holds no
+/// row for the box, and a box's shell can exit with the same status by
+/// itself while its row stands. So `true` only when the host holds no row
+/// of this box's own ([`crate::attach::box_row_stands_at`]). `false` for a
+/// host that is not VM-backed, a record that names no box row, a row that
+/// stands, and an answer that says neither, which the caller reads as the
+/// shell's own status. Bounded by [`BOX_CONTROL_TIMEOUT`]; a read that
+/// does not finish in time, or that cannot reach the VM host daemon, is
+/// `false` too.
+///
+/// # Errors
+///
+/// When the blocking row read cannot run.
+pub async fn box_row_withdrawn(
+    sock: &Path,
+    record: Option<&boxes::Record>,
+) -> anyhow::Result<bool> {
+    let Some(control_sock) = control_sock_beside(sock).filter(|control| control.exists()) else {
+        return Ok(false);
+    };
+    let Some((name, addresses, box_id)) = record
+        .and_then(|record| Some((record.name.clone()?, record.box_addresses?, record.box_id)))
+    else {
+        return Ok(false);
+    };
+    let box_name = name.clone();
+    let read = tokio::time::timeout(
+        BOX_CONTROL_TIMEOUT,
+        tokio::task::spawn_blocking(move || {
+            crate::attach::box_row_stands_at(&control_sock, &box_name, addresses, box_id)
+        }),
+    )
+    .await;
+    match read {
+        Ok(Ok(Ok(stands))) => Ok(stands == Some(false)),
+        Ok(Ok(Err(error))) => {
+            tracing::warn!(
+                box = %name,
+                error = %format!("{error:#}"),
+                "the row read did not reach the VM host daemon; \
+                 the attach's exit status passes through unchecked"
+            );
+            Ok(false)
+        }
+        Ok(Err(join)) => Err(anyhow::Error::new(join).context("the box row read did not run")),
+        Err(_) => {
+            tracing::warn!(
+                box = %name,
+                "the VM host daemon did not answer the row read in {BOX_CONTROL_TIMEOUT:?}; \
+                 the attach's exit status passes through unchecked"
+            );
+            Ok(false)
+        }
+    }
+}
+
 /// Registers this activation's box with the VM host daemon, when the daemon
 /// this invocation talks to is minvmd-backed (T66), returning what it handed
 /// back — `Ok(None)` when there is nothing to register.
@@ -968,6 +1152,35 @@ mod tests {
         .await
         .expect("a native host registers nothing");
         assert!(registered.is_none());
+    }
+
+    /// Accepts one connection on `listener` for a stand-in VM host daemon,
+    /// and fails the test when none arrives within ten seconds, so a client
+    /// that never connects fails the test instead of stalling it. The
+    /// connection's reads are bounded the same way.
+    fn accept_within_bound(
+        listener: &std::os::unix::net::UnixListener,
+    ) -> std::os::unix::net::UnixStream {
+        const BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + BOUND;
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream.set_read_timeout(Some(BOUND)).unwrap();
+                    return stream;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the client did not connect within {BOUND:?}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept: {error}"),
+            }
+        }
     }
 
     /// A control socket that never answers.
@@ -1422,6 +1635,305 @@ mod tests {
                 "{reply:?}"
             );
         }
+    }
+
+    /// Runs [`resume_box_row_after_row_ended`] for a record created as
+    /// `box_id` against a VM host daemon that answers with `reply`, and
+    /// returns what it gave with the one request the daemon read.
+    async fn resume_after_row_ended_answered_with(
+        box_id: Option<minimald_rpc::BoxId>,
+        reply: minimald_rpc::BoxControlReply,
+    ) -> (
+        anyhow::Result<RowEndedResume>,
+        minimald_rpc::BoxControlRequest,
+    ) {
+        resume_after_row_ended_answered_after(box_id, reply, std::time::Duration::ZERO).await
+    }
+
+    /// [`resume_after_row_ended_answered_with`], with the VM host daemon
+    /// answering `delay` after it read the request.
+    async fn resume_after_row_ended_answered_after(
+        box_id: Option<minimald_rpc::BoxId>,
+        reply: minimald_rpc::BoxControlReply,
+        delay: std::time::Duration,
+    ) -> (
+        anyhow::Result<RowEndedResume>,
+        minimald_rpc::BoxControlRequest,
+    ) {
+        use std::io::{BufRead as _, Read as _, Write as _};
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_, listener) = silent_vm_host(&dir);
+        let daemon = std::thread::spawn(move || {
+            let stream = accept_within_bound(&listener);
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let request: minimald_rpc::BoxControlRequest =
+                serde_json_lenient::from_str(line.trim()).unwrap();
+            std::thread::sleep(delay);
+            let mut reply = serde_json_lenient::to_string(&reply).unwrap();
+            reply.push('\n');
+            (&stream).write_all(reply.as_bytes()).unwrap();
+            let mut rest = String::new();
+            let _ = reader.read_to_string(&mut rest);
+            assert!(rest.is_empty(), "one request only, got {rest:?} after it");
+            request
+        });
+        let mut record = own_ip_record(PAIR);
+        record.box_id = box_id;
+        let resumed =
+            resume_box_row_after_row_ended(&dir.path().join(paths::SSH_SOCK_FILE), Some(&record))
+                .await;
+        (resumed, daemon.join().unwrap())
+    }
+
+    /// NET-138: after an attach found the box's row withdrawn, the client
+    /// asks for the row back with a resume, presenting the record's name,
+    /// pair and box id, and nothing else. A row the host answers at that
+    /// pair is back under the same box id, so the record stays right and
+    /// no new creation holds addresses of its own.
+    #[tokio::test]
+    async fn resume_after_row_ended_asks_for_the_same_box_back() {
+        let box_id = minimald_rpc::BoxId::from_bytes([5; 16]);
+        let (resumed, request) = resume_after_row_ended_answered_with(
+            Some(box_id),
+            minimald_rpc::BoxControlReply::Registered(minimald_rpc::RegisteredBox {
+                switch_address: PAIR.switch_address,
+                loopback_address: PAIR.loopback_address,
+                box_id,
+                task_addresses: Vec::new(),
+            }),
+        )
+        .await;
+        assert_eq!(resumed.unwrap(), RowEndedResume::Back);
+        assert_eq!(
+            request,
+            minimald_rpc::BoxControlRequest::ResumeBox(minimald_rpc::ResumeBoxRequest {
+                name: "web".to_string(),
+                switch_address: PAIR.switch_address,
+                loopback_address: PAIR.loopback_address,
+                box_id: Some(box_id),
+            }),
+            "the client resumes the box's own creation; it registers nothing new"
+        );
+    }
+
+    /// The VM host daemon can wait for a withdrawn row's revocation before
+    /// it reinstates the row, so the resume after a row-ended attach waits
+    /// past [`BOX_CONTROL_TIMEOUT`] for its answer: a row the host brings
+    /// back late is back, not a row that did not come back.
+    #[tokio::test]
+    async fn resume_after_row_ended_waits_for_a_late_answer() {
+        let box_id = minimald_rpc::BoxId::from_bytes([5; 16]);
+        let (resumed, _) = resume_after_row_ended_answered_after(
+            Some(box_id),
+            minimald_rpc::BoxControlReply::Registered(minimald_rpc::RegisteredBox {
+                switch_address: PAIR.switch_address,
+                loopback_address: PAIR.loopback_address,
+                box_id,
+                task_addresses: Vec::new(),
+            }),
+            BOX_CONTROL_TIMEOUT + std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(resumed.unwrap(), RowEndedResume::Back);
+    }
+
+    /// [`ROW_ENDED_RESUME_TIMEOUT`] outlasts the revocation wait minvmd
+    /// runs before it reinstates a withdrawn row, with room for the
+    /// exchange around it. minvmd's source must still bound that wait at
+    /// no more than half of it.
+    #[test]
+    fn row_ended_resume_outlasts_minvmds_revocation_wait() {
+        let registry =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../minvmd/src/box_registry.rs");
+        let source = std::fs::read_to_string(&registry)
+            .unwrap_or_else(|error| panic!("read {}: {error}", registry.display()));
+        let lead = "pub const REVOCATION_WAIT: Duration = Duration::from_secs(";
+        let wait: u64 = source
+            .split_once(lead)
+            .and_then(|(_, rest)| rest.split_once(");"))
+            .and_then(|(secs, _)| secs.parse().ok())
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} no longer writes `{lead}<secs>);`: update this test",
+                    registry.display()
+                )
+            });
+        assert!(
+            std::time::Duration::from_secs(wait * 2) <= ROW_ENDED_RESUME_TIMEOUT,
+            "minvmd waits {wait} s for a revocation; raise ROW_ENDED_RESUME_TIMEOUT to twice that"
+        );
+    }
+
+    /// A resume refused because a running box holds the name says which
+    /// spelling holds it. Any other refusal, and a row at another pair, is
+    /// a row that did not come back. A record with no row, and a host that
+    /// is not VM-backed, have nothing to ask back.
+    #[tokio::test]
+    async fn resume_after_row_ended_says_why_the_row_did_not_come_back() {
+        let (resumed, _) = resume_after_row_ended_answered_with(
+            None,
+            minimald_rpc::BoxControlReply::Error {
+                error: "a box named Web already exists".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(
+            resumed.unwrap(),
+            RowEndedResume::NameHeld {
+                held: "Web".to_string()
+            }
+        );
+
+        let (resumed, _) = resume_after_row_ended_answered_with(
+            None,
+            minimald_rpc::BoxControlReply::Error {
+                error: "no box \"web\" is registered on this host to resume".to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(resumed.unwrap(), RowEndedResume::NotBack(why) if why.contains("no box")),);
+
+        let (resumed, _) = resume_after_row_ended_answered_with(
+            None,
+            minimald_rpc::BoxControlReply::Registered(minimald_rpc::RegisteredBox {
+                switch_address: std::net::Ipv4Addr::new(100, 64, 0, 9),
+                loopback_address: PAIR.loopback_address,
+                box_id: minimald_rpc::BoxId::from_bytes([5; 16]),
+                task_addresses: Vec::new(),
+            }),
+        )
+        .await;
+        assert!(matches!(resumed.unwrap(), RowEndedResume::NotBack(_)));
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let ssh_sock = dir.path().join(paths::SSH_SOCK_FILE);
+        let mut rowless = own_ip_record(PAIR);
+        rowless.box_addresses = None;
+        assert_eq!(
+            resume_box_row_after_row_ended(&ssh_sock, Some(&rowless))
+                .await
+                .unwrap(),
+            RowEndedResume::NothingToResume
+        );
+        assert_eq!(
+            resume_box_row_after_row_ended(&ssh_sock, None)
+                .await
+                .unwrap(),
+            RowEndedResume::NothingToResume
+        );
+    }
+
+    /// NET-138: the row-ended status is the in-VM daemon's refusal only
+    /// when the VM host holds no row of the box's own. A row of the box's
+    /// id stands, so the status is the shell's own. A row another box holds
+    /// under the name, and no row at all, mean the box's row is gone. A
+    /// host that is not VM-backed has no row to read.
+    #[tokio::test]
+    async fn box_row_withdrawn_reads_the_boxs_own_row() {
+        use std::io::{BufRead as _, Write as _};
+        async fn read_answered_with(reply: minimald_rpc::BoxControlReply) -> bool {
+            let dir = tempfile::TempDir::new().unwrap();
+            let (_, listener) = silent_vm_host(&dir);
+            let daemon = std::thread::spawn(move || {
+                let stream = accept_within_bound(&listener);
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let request: minimald_rpc::BoxControlRequest =
+                    serde_json_lenient::from_str(line.trim()).unwrap();
+                assert_eq!(
+                    request,
+                    minimald_rpc::BoxControlRequest::ReadRow(minimald_rpc::ReadRowRequest {
+                        name: "web".to_string()
+                    })
+                );
+                let mut reply = serde_json_lenient::to_string(&reply).unwrap();
+                reply.push('\n');
+                (&stream).write_all(reply.as_bytes()).unwrap();
+            });
+            let mut record = own_ip_record(PAIR);
+            record.box_id = Some(minimald_rpc::BoxId::from_bytes([5; 16]));
+            let withdrawn =
+                box_row_withdrawn(&dir.path().join(paths::SSH_SOCK_FILE), Some(&record))
+                    .await
+                    .unwrap();
+            daemon.join().unwrap();
+            withdrawn
+        }
+        let row = |box_id| {
+            minimald_rpc::BoxControlReply::Row(minimald_rpc::BoxRow {
+                name: "web".to_string(),
+                box_id: minimald_rpc::BoxId::from_bytes(box_id),
+                switch_address: PAIR.switch_address,
+                egress_allow_list: Vec::new(),
+                declared_ports: Vec::new(),
+                runtime_ports: Vec::new(),
+            })
+        };
+        assert!(
+            !read_answered_with(row([5; 16])).await,
+            "the box's own row stands"
+        );
+        assert!(
+            read_answered_with(row([6; 16])).await,
+            "another box holds the name"
+        );
+        assert!(
+            read_answered_with(minimald_rpc::BoxControlReply::NoRow {
+                name: "web".to_string(),
+                no_row: true,
+            })
+            .await
+        );
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let native = dir.path().join("providers").join("local-minimald0");
+        std::fs::create_dir_all(&native).unwrap();
+        assert!(
+            !box_row_withdrawn(
+                &native.join(paths::SSH_SOCK_FILE),
+                Some(&own_ip_record(PAIR))
+            )
+            .await
+            .unwrap(),
+            "a native host has no row to read"
+        );
+    }
+
+    /// NET-138: a row read that cannot reach the VM host daemon says
+    /// neither, so the row-ended status passes through as the shell's own.
+    #[tokio::test]
+    async fn box_row_withdrawn_reads_an_unreachable_host_as_the_shells_status() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // The socket file stays, but nothing listens on it.
+        drop(silent_vm_host(&dir));
+        let mut record = own_ip_record(PAIR);
+        record.box_id = Some(minimald_rpc::BoxId::from_bytes([5; 16]));
+        assert!(
+            !box_row_withdrawn(&dir.path().join(paths::SSH_SOCK_FILE), Some(&record))
+                .await
+                .expect("an unreachable host is the shell's own status, not an error"),
+        );
+    }
+
+    /// [`NAME_HELD_REFUSAL`] copies the words minvmd's name-held refusal
+    /// is made of. minvmd's source must still write them, or a reworded
+    /// refusal reads as a row that did not come back for another reason.
+    #[test]
+    fn name_held_refusal_matches_the_words_minvmd_writes() {
+        let registry =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../minvmd/src/box_registry.rs");
+        let source = std::fs::read_to_string(&registry)
+            .unwrap_or_else(|error| panic!("read {}: {error}", registry.display()));
+        let (lead, tail) = NAME_HELD_REFUSAL;
+        let written = format!("#[error(\"{lead}{{held}}{tail}\")]");
+        assert!(
+            source.contains(&written),
+            "{} no longer writes `{written}`: update NAME_HELD_REFUSAL to match",
+            registry.display()
+        );
     }
 
     /// A `host_ip` registration asks to be held, and the connection its id

@@ -1018,7 +1018,16 @@ pub struct File {
 /// The entry keys that `[session]` and a task keep among their unknown
 /// fields but that a box spec reads (BOX-049, BOX-203), so they are not
 /// reported as unknown.
-const SPEC_READ_ENTRY_KEYS: &[&str] = &["timeout", "file_exports"];
+///
+/// An entry's `network` table is read by the minimal crate's task reader.
+/// That reader applies the table's `mode`, `egress` and
+/// `vpn_network_names` to a task box and refuses the other sub-keys (`quic443`, `bep`, `ingress`, …), which a
+/// task box does not apply. The sub-keys are not checked here: which ones
+/// a box reads differs per box type, and the minimal crate owns that
+/// knowledge. The projection of a `[network]` table onto a given box
+/// type's settings belongs in the BOX spec, not here. That refusal is
+/// interim (#3671): it goes when a task box applies those sub-keys.
+const SPEC_READ_ENTRY_KEYS: &[&str] = &["network", "timeout", "file_exports"];
 
 /// An entry's unknown fields, in key order, less the ones a box spec reads.
 fn unknown_entry_keys(extra: &HashMap<String, toml::Value>) -> Vec<&str> {
@@ -4845,6 +4854,37 @@ mod tests {
 
         // Another unknown key in the same entry is still reported, alone.
         let task: Task = toml::from_str("exec = [\"true\"]\ntimeout = 90\ncolour = 1\n").unwrap();
+        assert_eq!(unknown_entry_keys(&task.extra), ["colour"]);
+    }
+
+    /// A task's `network` table is a box setting the spec reads, so the
+    /// load does not report it as an unknown field.
+    #[test]
+    fn task_network_table_is_not_reported_unknown() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MFILE_NAME),
+            "[tasks.reach]\nbash = \"curl\"\n\n[tasks.reach.network]\nmode = \"own_ip\"\n",
+        )
+        .unwrap();
+
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        File::from_dir(dir.path()).expect("a task network table loads");
+        drop(guard);
+
+        let out = capture.contents();
+        assert!(!out.contains("unknown fields"), "{out}");
+        assert!(!out.contains("update to a newer version"), "{out}");
+
+        // Another unknown key in the same task is still reported, alone.
+        let task: Task =
+            toml::from_str("bash = \"curl\"\ncolour = 1\n\n[network]\nmode = \"own_ip\"\n")
+                .unwrap();
         assert_eq!(unknown_entry_keys(&task.extra), ["colour"]);
     }
 

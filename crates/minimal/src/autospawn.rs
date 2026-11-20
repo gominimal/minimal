@@ -81,6 +81,22 @@ fn boot_failure_error(stderr: &str) -> io::Error {
     ))
 }
 
+/// What a failed VM start adds when the VM provider is the default only
+/// because `/dev/kvm` runs VMs ([`crate::hosts::vm_chosen_by_kvm`]): why
+/// the VM was chosen, and how to keep the native provider. No fallback to
+/// the native provider is made for the person: it would drop the VM's
+/// isolation without asking.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const VM_CHOSEN_BY_KVM_NOTE: &str = "min used the VM provider because /dev/kvm \
+     opens for you. To use the native provider instead, set MIN_PROVIDER=local or put \
+     provider = \"local\" in config.toml.";
+
+/// `error` with [`VM_CHOSEN_BY_KVM_NOTE`] on its own line after it.
+#[cfg(any(test, target_os = "linux"))]
+fn vm_chosen_by_kvm_error(error: &io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{error}\n{VM_CHOSEN_BY_KVM_NOTE}"))
+}
+
 /// Poll interval while waiting for a shutting-down minvmd to reach a terminal
 /// state before deciding whether to spawn.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -357,7 +373,13 @@ pub fn ensure_daemon_running(use_minvmd: bool, minimal_dir: Option<&Path>) -> io
 #[cfg(target_os = "linux")]
 pub fn ensure_daemon_running(use_minvmd: bool, minimal_dir: Option<&Path>) -> io::Result<()> {
     if use_minvmd {
-        return ensure_minvmd_running(minimal_dir);
+        return ensure_minvmd_running(minimal_dir).map_err(|error| {
+            if crate::hosts::vm_chosen_by_kvm() {
+                vm_chosen_by_kvm_error(&error)
+            } else {
+                error
+            }
+        });
     }
     let sock = crate::client::resolve_socket_path(minimal_dir, false)
         .map_err(|e| io::Error::other(format!("resolving native minimald socket path: {e}")))?;
@@ -509,7 +531,8 @@ fn ensure_minimald_running(socket_path: &Path, minimal_dir: Option<&Path>) -> io
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod tests {
     use super::{
-        Decision, boot_failure_error, classify, is_daemon_running, wait_for_minvmd_stopped,
+        Decision, VM_CHOSEN_BY_KVM_NOTE, boot_failure_error, classify, is_daemon_running,
+        vm_chosen_by_kvm_error, wait_for_minvmd_stopped,
     };
     use minvmd::lifecycle::Lifecycle;
     use minvmd::state::{State, StateDir};
@@ -556,6 +579,24 @@ mod tests {
 
     /// D1229: minvmd's report of the proxy's unreadable audit log refusal
     /// reaches the user whole, with the step that names the flag.
+    #[test]
+    fn a_vm_the_kvm_default_chose_says_so_when_it_fails() {
+        assert_eq!(
+            VM_CHOSEN_BY_KVM_NOTE,
+            "min used the VM provider because /dev/kvm opens for you. To use the native \
+             provider instead, set MIN_PROVIDER=local or put provider = \"local\" in config.toml."
+        );
+        let msg = vm_chosen_by_kvm_error(&boot_failure_error("timed out after 75s")).to_string();
+        assert!(
+            msg.starts_with("the Minimal VM (minvmd) failed to start: timed out after 75s."),
+            "{msg}"
+        );
+        assert!(
+            msg.ends_with(&format!("\n{VM_CHOSEN_BY_KVM_NOTE}")),
+            "the note is its own last line: {msg}"
+        );
+    }
+
     #[test]
     fn boot_failure_error_keeps_the_quarantine_step() {
         let stderr = format!(
