@@ -105,13 +105,11 @@ pub(crate) fn run(dir: &Path, out: &mut impl Write) -> anyhow::Result<Outcome> {
 /// breaks, and 0 when audit files are missing and the chain in the files
 /// that remain verifies. A non-zero exit prints no further message.
 pub(crate) fn cmd_doctor() -> anyhow::Result<()> {
-    // Interim (BEP-042), as for `min box audit`: the client reads the
-    // operator-owned log files under file mode, on the host. The design
-    // reads over the proxy's local socket (ruled on gominimal/arch#137;
-    // architecture, audit paragraph; Gatehouse §6.10). The interim is
-    // https://github.com/gominimal/minimal/issues/2459, and it ends when
-    // https://github.com/gominimal/minimal/issues/2463 serves the read.
-    // Flip: read the chain over that socket, and drop this direct read.
+    // Unlike `min box audit`, which reads the records over the proxy's
+    // control socket (BEP-042), doctor reads the log files on the host. The
+    // chain check (BEP-049) needs every segment's bytes as they are on disk,
+    // the lines that are not records included, and the socket sends only
+    // the records of the boxes a read names.
     let dir = bep::audit::default_dir()
         .context("cannot find the home directory, so the audit log cannot be found")?;
     match run(&dir, &mut std::io::stdout().lock())? {

@@ -19,7 +19,7 @@ use crate::*;
 
 mod admin;
 mod auth;
-mod box_audit;
+pub(crate) mod box_audit;
 mod box_spec;
 // `boxes.rs` is mounted under another name: see its module docs.
 #[path = "boxes.rs"]

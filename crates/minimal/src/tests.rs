@@ -7319,6 +7319,100 @@ mod mint_tests {
             None
         );
     }
+    // BEP-042: un-enrolled, `min box audit <box-id>` reads the records that
+    // `bep serve` wrote for the box over the proxy's control socket. The
+    // box is in no listing, as after a reap. The command is given the
+    // socket only, never the log's directory, so it opens no log file.
+    #[test]
+    fn box_audit_reads_over_the_proxy_socket() {
+        use bep::audit::{AuditLog, Rotation};
+
+        use crate::cmd::box_audit;
+        use crate::{BoxAuditArgs, BoxAuditOutputFormat};
+
+        const OTHER_HEX: &str = "0193f0c17a2b7c3d8e4fa0b1c2d3e4f6";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/control.sock");
+        let audit = dir.path().join("audit");
+        let log = AuditLog::open_dir(&audit, Rotation::default()).unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let control = runtime
+            .block_on(async {
+                Control::bind(&path, Registry::default(), BoxRegistry::default()).map(|control| {
+                    control
+                        .with_audit(Arc::new(std::sync::Mutex::new(log)))
+                        .with_audit_dir(&audit)
+                })
+            })
+            .unwrap();
+        runtime.spawn(control.run());
+
+        // The proxy writes the records, as at the box's mints.
+        let mut client = ControlClient::connect(&path).unwrap();
+        client.record_mint(BOX_HEX, "github:one").unwrap();
+        client.record_mint(OTHER_HEX, "github:other").unwrap();
+        client.record_mint(BOX_HEX, "github:two").unwrap();
+        drop(client);
+
+        let read = |output: Option<BoxAuditOutputFormat>| {
+            let args = BoxAuditArgs {
+                target: Some(BOX_ID.to_owned()),
+                parent: None,
+                output,
+                follow: false,
+            };
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            box_audit::run(&args, &[], false, &path, &mut out, &mut err, || false).unwrap();
+            (
+                String::from_utf8(out).unwrap(),
+                String::from_utf8(err).unwrap(),
+            )
+        };
+        let (out, err) = read(None);
+        assert!(err.is_empty(), "{err}");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "{out}");
+        assert!(lines[0].starts_with("mint  admit"), "{out}");
+        assert!(lines[0].contains("github:one"), "{out}");
+        assert!(lines[1].contains("github:two"), "{out}");
+        assert!(!out.contains("github:other"), "{out}");
+
+        // -o jsonl gives the proxy's lines as its log holds them.
+        let (out, _) = read(Some(BoxAuditOutputFormat::Jsonl));
+        let segments = bep::audit::segments(&audit).unwrap();
+        let on_disk: String = segments
+            .iter()
+            .map(|segment| std::fs::read_to_string(segment).unwrap())
+            .collect();
+        let expected: Vec<&str> = on_disk
+            .lines()
+            .filter(|line| line.contains(&format!("\"subject\":\"{BOX_HEX}\"")))
+            .collect();
+        assert_eq!(out.lines().collect::<Vec<_>>(), expected);
+
+        // With the proxy gone, the command says so and reads no file.
+        drop(runtime);
+        let args = BoxAuditArgs {
+            target: Some(BOX_ID.to_owned()),
+            parent: None,
+            output: None,
+            follow: false,
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let error =
+            box_audit::run(&args, &[], false, &path, &mut out, &mut err, || false).unwrap_err();
+        assert!(out.is_empty());
+        assert!(
+            error
+                .to_string()
+                .starts_with("Cannot read the audit log: the Box Egress Proxy does not answer on "),
+            "{error}"
+        );
+    }
 }
 
 /// BEP-070: on a host that is not enrolled, each box creation gets a box id
