@@ -952,9 +952,15 @@ sessions_live_msg='daemon has active sessions'
 # with $sessions_live_msg as bare `min stop` did. A listing that fails proves
 # nothing, so it refuses too, with $boxes_unknown_msg. A box list fails on a
 # version skew, which is the post-swap case, so a failed listing never ends a
-# box without consent. An older `min`, without `min host stop`, still gets
-# bare `min stop`.
+# box without consent. A listing that could not reach a host exits 0 but
+# leaves that host's boxes out, so it counts as a failed listing. A failed
+# `min host list` names no host to stop, so min_stop refuses with
+# $hosts_unknown_msg, with or without --force. An older `min`, without
+# `min host stop`, still gets bare `min stop`.
 boxes_unknown_msg='daemon did not list its boxes'
+hosts_unknown_msg='min host list failed'
+# What `min box list` prints on stderr for a host it could not reach.
+host_unreached_msg='its boxes are not listed'
 
 # Succeeds when the `min` on disk has `min host stop`.
 min_has_host_stop() {
@@ -964,8 +970,10 @@ min_has_host_stop() {
 # The local hosts that are not stopped, one name per line. A row of `min host
 # list` is `HOST PROVIDER STATE`. The header and the notes after the rows do
 # not name a provider, and the box `min` runs in (local-box) is never stopped.
+# Fails when `min host list` fails.
 live_hosts() {
-    "$bindir/min" host list 2>/dev/null </dev/null \
+    _hl="$("$bindir/min" host list 2>/dev/null </dev/null)" || return 1
+    printf '%s\n' "$_hl" \
         | awk 'NR > 1 && $2 ~ /^local(-minvmd)?$/ && $3 != "stopped" { print $1 }'
 }
 
@@ -976,13 +984,24 @@ min_stop() {
         "$bindir/min" stop "$@" </dev/null
         return
     fi
-    _hosts="$(live_hosts)"
+    if ! _hosts="$(live_hosts)"; then
+        echo "$hosts_unknown_msg" >&2
+        return 1
+    fi
     [ -n "$_hosts" ] || return 0
     if [ "${1:-}" != --force ]; then
-        if ! _boxes="$("$bindir/min" box list --all -o json 2>/dev/null </dev/null)"; then
+        # stderr rides with the JSON, so a host the listing did not reach
+        # shows up beside the rows.
+        if ! _boxes="$("$bindir/min" box list --all -o json 2>&1 </dev/null)"; then
             echo "$boxes_unknown_msg" >&2
             return 1
         fi
+        case "$_boxes" in
+            *"$host_unreached_msg"*)
+                echo "$boxes_unknown_msg" >&2
+                return 1
+                ;;
+        esac
         if printf '%s\n' "$_boxes" | grep -qE '"state": *"running"'; then
             echo "$sessions_live_msg" >&2
             return 1
@@ -999,7 +1018,7 @@ min_stop() {
 # `min` with `min host stop` names the host when one host runs.
 stop_command() {
     if min_has_host_stop; then
-        _sh="$(live_hosts)"
+        _sh="$(live_hosts)" || _sh=
         case "$_sh" in
             ""|*"
 "*) _sh='<host>' ;;
@@ -1087,10 +1106,30 @@ stop_running_daemon() {
                 confirm_force_stop pre "$_stop_out" || return 1
                 daemon_stop_consent=1
                 ;;
+            *"$hosts_unknown_msg"*)
+                hosts_unknown_refusal
+                return 1
+                ;;
         esac
         # Any other failure falls through to the force stop, silent as before.
     fi
-    min_stop --force >/dev/null 2>&1 || true
+    if ! _stop_out="$(min_stop --force 2>&1)"; then
+        case "$_stop_out" in
+            *"$hosts_unknown_msg"*)
+                hosts_unknown_refusal
+                return 1
+                ;;
+        esac
+    fi
+    return 0
+}
+
+# Why the pre-swap stop refuses when `min host list` fails: with no host
+# list, this run cannot find the daemon to stop.
+hosts_unknown_refusal() {
+    say ""
+    say "warning: 'min host list' failed, so this run cannot find the daemon to stop."
+    say "run '$bindir/min host list' to see why."
 }
 
 # Dispatch uninstall before any target/manifest work. resolve_prefix and

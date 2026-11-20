@@ -220,6 +220,11 @@ case "${1:-}" in
         fi
         case "${2:-}" in
             list)
+                # $HOME/hostlist.fail: the host listing fails.
+                if [ -f "$HOME/hostlist.fail" ]; then
+                    echo "error: the providers directory cannot be read" >&2
+                    exit 1
+                fi
                 printf 'HOST             PROVIDER       STATE\n'
                 if [ -f "$HOME/host.running" ]; then
                     printf 'local0           local          running\n'
@@ -242,9 +247,14 @@ case "${1:-}" in
     box)
         # `box list --all -o json`: session-alpha runs while sessions are
         # live. $HOME/boxlist.fail: the listing fails.
+        # $HOME/boxlist.unreached: a host does not answer, and the listing
+        # leaves its boxes out but exits 0, as `min box list` does.
         if [ -f "$HOME/boxlist.fail" ]; then
             echo "error: the daemon runs another build" >&2
             exit 1
+        fi
+        if [ -f "$HOME/boxlist.unreached" ]; then
+            echo "Could not reach host local1; its boxes are not listed." >&2
         fi
         if [ -f "$HOME/sessions.live" ]; then
             printf '[\n  {\n    "id": "session-alpha",\n    "state": "running"\n  }\n]\n'
@@ -2254,6 +2264,39 @@ stop" "$(cat "$HL12/stop.calls")" \
     check 0 "$rc" "an upgrade with an older min exits 0 (BCLI-042)"
     check "stop" "$(cat "$HS7/stop.calls")" \
         "an older min falls back to bare min stop (BCLI-042)"
+
+    # A box listing that did not reach a host exits 0, but that host's boxes
+    # are not in it. The installer treats it as a failed listing: it asks,
+    # and with no terminal it stops nothing.
+    HS8="$root/hs8"; mkdir -p "$HS8"
+    stage_host_stop_upgrade "$HS8" hoststopunreached
+    : >"$HS8/boxlist.unreached"
+    run hoststopunreached "$HS8"
+    check 1 "$rc" "an upgrade whose listing missed a host aborts without a terminal (BCLI-042)"
+    want_ok "the warning says the boxes were not listed (BCLI-042)" \
+        grep -q "did not list its boxes" "$OUT"
+    want_err "no host is stopped when a host's boxes are not listed (BCLI-042)" \
+        test -e "$HS8/stop.calls"
+    check "stale" "$(cat "$HS8/bin/minimald")" \
+        "nothing is installed when a host's boxes are not listed (BCLI-042)"
+
+    # A failed `min host list` names no host to stop. The upgrade aborts
+    # before it replaces an executable, says why, and stops nothing, with or
+    # without --force-stop.
+    for _hl_args in "" --force-stop; do
+        HS9="$root/hs9${_hl_args}"; mkdir -p "$HS9"
+        stage_host_stop_upgrade "$HS9" "hoststopnohosts${_hl_args}"
+        : >"$HS9/hostlist.fail"
+        # shellcheck disable=SC2086 # empty or one word on purpose
+        run "hoststopnohosts${_hl_args}" "$HS9" $_hl_args
+        check 1 "$rc" "an upgrade whose hosts are not listed aborts ${_hl_args:-graceful} (BCLI-042)"
+        want_ok "the abort says min host list failed ${_hl_args:-graceful} (BCLI-042)" \
+            grep -qF "'min host list' failed, so this run cannot find the daemon to stop." "$OUT"
+        want_err "no host is stopped when the hosts are not listed ${_hl_args:-graceful} (BCLI-042)" \
+            test -e "$HS9/stop.calls"
+        check "stale" "$(cat "$HS9/bin/minimald")" \
+            "nothing is installed when the hosts are not listed ${_hl_args:-graceful} (BCLI-042)"
+    done
 }
 
 case_shell_integration() {
