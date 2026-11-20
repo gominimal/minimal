@@ -25067,9 +25067,40 @@ fn cli_reference_lists_every_error_code() {
             "the row for `{code}` must give its exit code, got {exit:?}"
         );
     }
-    assert_eq!(documented["ambiguous"], "2");
-    assert_eq!(documented["not_found"], "4");
-    assert_eq!(documented["host_unreachable"], "7");
+    // The exit code of each row, as `failure_exit_code` and the commands
+    // give it. A row whose exit code changes fails here, so the reference
+    // and this table change together.
+    let exits = [
+        ("ambiguous", "2"),
+        ("not_found", "4"),
+        ("host_unreachable", "7"),
+        ("insufficient_resources", "8"),
+        ("github_sign_in_required", "3"),
+        ("gatehouse_unenrolled_node", "5"),
+        ("audit_self_unsupported_unenrolled", "1"),
+        ("timeout", "124"),
+        ("wait_timeout", "124"),
+        ("daemon_unreachable", "1"),
+        ("policy_unavailable", "1"),
+        ("output_failed", "1"),
+        ("unspecified", "1, or the exit code of the failure"),
+    ];
+    for (code, exit) in exits {
+        assert_eq!(
+            documented.get(code).map(String::as_str),
+            Some(exit),
+            "the row for `{code}` must give exit code {exit}"
+        );
+    }
+    let pinned: std::collections::BTreeSet<&str> = exits.iter().map(|(code, _)| *code).collect();
+    let unpinned: Vec<&String> = documented
+        .keys()
+        .filter(|code| !pinned.contains(code.as_str()))
+        .collect();
+    assert!(
+        unpinned.is_empty(),
+        "pin the exit code of each of {unpinned:?} in this test"
+    );
 }
 
 /// NET-138: an interactive attach that the in-VM daemon refuses because the
