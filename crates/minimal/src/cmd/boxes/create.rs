@@ -1535,12 +1535,111 @@ fn task_egress_from(bytes: &[u8], task: &str) -> anyhow::Result<ProjectEgress> {
     }) else {
         return Ok(ProjectEgress::default());
     };
+    refuse_unapplied_task_network(&file, &entry)?;
     entry_egress(&file, entry)
+}
+
+/// The `[network]` keys a task box takes from `minimal.toml`: the mode, the
+/// egress in its nested or its flat spelling, and `vpn_network_names`,
+/// which `put_task_spec` keeps on the stored spec. Every other key reaches
+/// a task box only by its run flag. This list is interim (#3671): it goes
+/// with [`refuse_unapplied_task_network`].
+const TASK_NETWORK_KEYS: [&str; 3] = ["mode", "egress", "vpn_network_names"];
+
+/// A `network` key that a task's own layers declare and that a task box
+/// does not apply, such as `quic443`, interim (#3671). The message names
+/// the key, the table and the next step. `min task run` and `min box spec` both
+/// read the task's network through `task_project_egress`, so the text
+/// fits both commands. An invalid project `minimal.toml` refuses the same
+/// way, so the command ends with exit 3 (`main.rs`), the code the
+/// architecture gives an invalid project file.
+#[derive(Debug)]
+pub struct TaskNetworkUnapplied {
+    /// The refusal, with the key, the table and the next step.
+    pub message: String,
+}
+
+impl TaskNetworkUnapplied {
+    /// The architecture's exit code for an invalid project file.
+    pub const EXIT_CODE: u8 = 3;
+}
+
+impl std::fmt::Display for TaskNetworkUnapplied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TaskNetworkUnapplied {}
+
+/// Refuses a `network` key that a task's own layers declare and that a
+/// task box does not apply, such as `quic443`. Without it the key is
+/// dropped in silence, and a `quic443 = "block"` runs as `auto`. Only
+/// `[tasks.<name>]` and `[defaults.task]` are read here. A `[defaults]
+/// network` key that a task box does not apply (for example
+/// `quic443 = "block"`) is still dropped for a task box without a
+/// refusal, and #3671 tracks it.
+///
+/// This is interim (#3671): the refusal and [`TASK_NETWORK_KEYS`] go when
+/// `task_box_network`/`put_task_spec` carry `quic443`, `bep`, `ingress`
+/// and `dynamic_ingress` from the expanded entry onto the task box's
+/// policy and stored spec.
+fn refuse_unapplied_task_network(
+    file: &toml::Table,
+    entry: &mfile::entry::BoxEntry,
+) -> anyhow::Result<()> {
+    let network_in = |table: Option<&toml::Table>| {
+        table
+            .and_then(|table| table.get("network"))
+            .and_then(toml::Value::as_table)
+            .cloned()
+    };
+    // The merge replaces the `network` table whole, so the entry's own
+    // table, when present, is the only one the task box reads.
+    let defaults_task = file
+        .get("defaults")
+        .and_then(toml::Value::as_table)
+        .and_then(|defaults| defaults.get(boxes::TASK_BOX_TYPE))
+        .and_then(toml::Value::as_table);
+    let (network, layer) = match network_in(Some(&entry.body)) {
+        Some(network) => (network, format!("[{}.{}]", entry.table.key(), entry.name)),
+        None => match network_in(defaults_task) {
+            Some(network) => (network, format!("[defaults.{}]", boxes::TASK_BOX_TYPE)),
+            None => return Ok(()),
+        },
+    };
+    let unapplied = network.iter().find(|(key, _)| {
+        !TASK_NETWORK_KEYS.contains(&key.as_str())
+            && !mfile::network::FLAT_EGRESS_KEYS
+                .iter()
+                .any(|(flat, _)| flat == key)
+    });
+    let Some((key, value)) = unapplied else {
+        return Ok(());
+    };
+    let remedy = if key == "quic443" {
+        let stance = value.as_str().unwrap_or("<stance>");
+        format!(
+            "Remove network.quic443 from {layer}, and set it with \
+             `min task run --quic443 {stance} {name}`.",
+            name = entry.name,
+        )
+    } else {
+        format!("Remove network.{key} from {layer}.")
+    };
+    Err(TaskNetworkUnapplied {
+        message: format!(
+            "{layer} in {file} sets network.{key}, which is not applied to a task box. \
+             {remedy}",
+            file = mfile::MFILE_NAME,
+        ),
+    }
+    .into())
 }
 
 /// The egress of `entry` in the parsed `file`: its `[defaults]`,
 /// `[defaults.<type>]` and entry layers, read as [`project_egress`] says.
-fn entry_egress(
+pub(crate) fn entry_egress(
     file: &toml::Table,
     entry: mfile::entry::BoxEntry,
 ) -> anyhow::Result<ProjectEgress> {
@@ -1962,7 +2061,7 @@ fn wire_vars(
 /// so a loadout that conflicts with the project fails here (BOX-183), and
 /// each hook of that spec names its declarer (BOX-179). The lists sent
 /// come from the expansion without the loadouts.
-fn box_entry(
+pub(crate) fn box_entry(
     project: &camino::Utf8Path,
     bytes: &[u8],
     entry: mfile::entry::BoxEntry,
@@ -7233,12 +7332,12 @@ mod tests {
         }
     }
 
-    // #2445: `min task run` makes no grant check, so `min box spec <entry>`
-    // does not refuse a task entry with no grant that sets `steering =
-    // "off"` with `proxy_env`. The same settings on a session entry are
-    // refused, as the test above shows.
+    // #2445: `min box spec <entry>` of a task entry gives the answer that
+    // `min task run` gives. A task box does not apply `network.bep`, so
+    // both commands refuse it with the same text and exit 3, and no rows
+    // print. The grant check of a session entry does not apply here.
     #[tokio::test]
-    async fn box_spec_task_entry_preview_accepts_what_task_run_accepts() {
+    async fn box_spec_task_entry_preview_refuses_what_task_run_refuses() {
         let home = tempfile::tempdir().expect("home dir");
         let project = tempfile::tempdir().expect("project dir");
         std::fs::write(
@@ -7247,6 +7346,8 @@ mod tests {
              [tasks.build.network.bep]\nsteering = \"off\"\nproxy_env = true\n",
         )
         .expect("write minimal.toml");
+        let root = camino::Utf8Path::from_path(project.path()).expect("utf-8 project dir");
+        let run = task_project_egress(root, "build").expect_err("min task run refuses");
         let global = GlobalArgs {
             repo_dir: Some(project.path().to_path_buf()),
             minimal_dir: Some(home.path().join("state")),
@@ -7256,16 +7357,44 @@ mod tests {
             vm: None,
         };
         let mut out = Vec::new();
-        crate::cmd::box_spec::box_spec_to(
+        let err = crate::cmd::box_spec::box_spec_to(
             &global,
             parsed_box_spec_args(&["min", "box", "spec", "build"]),
             false,
             &mut out,
         )
         .await
-        .expect("min box spec shows the task entry");
-        let text = String::from_utf8_lossy(&out);
-        assert!(text.contains("proxy_env"), "{text}");
+        .expect_err("min box spec refuses the task entry");
+        let refused = err
+            .downcast_ref::<TaskNetworkUnapplied>()
+            .unwrap_or_else(|| panic!("the box spec refusal: {err:#}"));
+        assert_eq!(refused.to_string(), run.to_string(), "same refusal text");
+        assert_eq!(
+            refused.to_string(),
+            "[tasks.build] in minimal.toml sets network.bep, which is not applied to a \
+             task box. Remove network.bep from [tasks.build]."
+        );
+        assert!(out.is_empty(), "no rows print");
+    }
+
+    // #3252: a task box applies `network.vpn_network_names`, so
+    // `min task run` and `min box spec` take it from `[tasks.<name>]` and
+    // from `[defaults.task]` without a refusal.
+    #[test]
+    fn task_vpn_network_names_is_not_refused() {
+        for toml in [
+            "[tasks.build]\necho = 'x'\n\n\
+             [tasks.build.network]\nvpn_network_names = [\"corp\"]\n",
+            "[defaults.task.network]\nvpn_network_names = [\"corp\"]\n\n\
+             [tasks.build]\necho = 'x'\n",
+        ] {
+            let project = tempfile::tempdir().expect("project dir");
+            std::fs::write(project.path().join(mfile::MFILE_NAME), toml)
+                .expect("write minimal.toml");
+            let root = camino::Utf8Path::from_path(project.path()).expect("utf-8 project dir");
+            task_project_egress(root, "build")
+                .unwrap_or_else(|err| panic!("{toml}: the task is not refused: {err:#}"));
+        }
     }
 
     // BEP-032: a box whose only proxy-served secrets are store references

@@ -36,8 +36,8 @@ mod wait;
 
 pub(crate) use address::*;
 pub use address::{AddressCandidate, BoxAddressRefusal};
-pub use attach::BoxAttachRefusal;
 pub(crate) use attach::*;
+pub use attach::{BoxAttachRefusal, RowNotBack};
 pub use create::*;
 pub use events::BoxFileRefusal;
 pub(crate) use events::*;
