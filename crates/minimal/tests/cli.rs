@@ -4646,8 +4646,8 @@ async fn create_session_with(
     };
     let request = CreateSessionRequest::new(name, project_path, network, policy);
     let id = match client.call::<CreateSession>(&request).await {
-        minimald_rpc::Errorable::Ok(r) => r.id,
-        minimald_rpc::Errorable::Err { error } => {
+        minimald_rpc::CreateSessionReply::Ok(r) => r.id,
+        minimald_rpc::CreateSessionReply::Err { error, .. } => {
             panic!("CreateSession failed: {error}")
         }
     };
