@@ -2374,12 +2374,13 @@ impl BoxChannel {
         // BCLI-010 (T62): a relaying helper prints `err:` lines on stderr,
         // and an older one prints only `msg:` lines.
         let note_tag = if relays { "err" } else { "msg" };
-        let (mut ctx, graph, _) = match self.refresh_tagged(stream, note_tag).await {
+        let (ctx, graph, _) = match self.refresh_tagged(stream, note_tag).await {
             Ok(v) => v,
             Err(e) => {
                 return relay_refusal_exit(stream, relays, task_name, refusal_exit_code(&e));
             }
         };
+        let mut ctx = self.task_context(ctx, task_name);
 
         let (mut task, mut graph) = match ctx.task(graph, task_name) {
             Err(e) => {
@@ -2471,8 +2472,15 @@ impl BoxChannel {
             let record = session.record().await.map_err(gone)?;
             let switch = session.net_switch().await.map_err(gone)?;
             let opt_out = session.deny_all_opt_out().await.map_err(gone)?;
-            let network =
-                crate::exec::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, opt_out);
+            // NET-079: a host-address task runs in the leaf of its box, so
+            // its plan follows the verdict of that leaf.
+            let network = crate::exec::task_network_in_box_leaf(
+                &record,
+                &switch,
+                boxes::EGRESS_DEFAULT_PHASE,
+                opt_out,
+                ctx.classifier_leaf(),
+            );
             let mut env = ctx
                 .make_env_with_network(
                     task_name,
@@ -2534,6 +2542,33 @@ impl BoxChannel {
         if let Some(forwarded) = forwarded {
             let _ = spawn_blocking(move || forwarded.finish(FORWARDED_STDIN_CLOSE_WAIT)).await;
         }
+    }
+
+    /// The context an in-box task run uses: `ctx` kept in the classifier
+    /// leaf of this box, when the host placed the box in one (NET-079). The
+    /// task env the context makes then joins that leaf, so the box's egress
+    /// verdict decides the task's connections, the same as for a process the
+    /// box itself starts. Logs the leaf the task runs in.
+    fn task_context(&self, ctx: Context, task_name: &str) -> Context {
+        let ctx = match self.classifier_leaf.clone() {
+            Some(leaf) => ctx.with_classifier_leaf(leaf),
+            None => ctx,
+        };
+        match ctx.classifier_leaf() {
+            Some(leaf) => tracing::info!(
+                box_name = %self.name,
+                task = %task_name,
+                leaf = %leaf.dir().display(),
+                "running an in-box task in the box's classifier leaf",
+            ),
+            None => tracing::info!(
+                box_name = %self.name,
+                task = %task_name,
+                leaf = "none",
+                "running an in-box task with no classifier leaf, because the box has none",
+            ),
+        }
+        ctx
     }
 
     /// Sends the end of a task run: its exit code for a relaying helper,
@@ -5286,6 +5321,7 @@ exit $rc
             .args(args)
             .current_dir(cwd)
             .env_remove("TRACEPARENT")
+            .env_remove(minimald_rpc::trace::OTEL_ENV)
             .env("PWD", cwd)
             .envs(envs.iter().copied())
             .env(
@@ -5333,6 +5369,7 @@ exit $rc
                 .args(["task", "run", "lint"])
                 .current_dir(rootfs)
                 .env_remove("TRACEPARENT")
+                .env_remove(minimald_rpc::trace::OTEL_ENV)
                 .env("PWD", rootfs)
                 .env(
                     "PATH",
@@ -5446,6 +5483,7 @@ exit $rc
             .args(["net", "expose", "8080"])
             .current_dir(rootfs)
             .env_remove("TRACEPARENT")
+            .env_remove(minimald_rpc::trace::OTEL_ENV)
             .env("PWD", rootfs)
             .env(
                 "PATH",
@@ -5477,20 +5515,44 @@ exit $rc
             .find(|candidate| candidate.is_file())
     }
 
+    /// How long one helper run against the test channel can take before
+    /// the watchdog kills it. A healthy run takes well under a second.
+    const MIN_HELPER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
     /// Runs the installed `min` helper with `args` and `stdin` on its
     /// stdin, through the host's real `socat`, against a socket that
     /// `serve` answers in place of `/run/minenv_sock`. The listener reads
     /// the request line as the session listener does, with a buffered read
     /// that it then drops. Returns stdout, stderr and the exit code, or
-    /// `None` when the host has no bash or no socat.
+    /// `None` when the host has no bash or no socat. A run that does not
+    /// end within `MIN_HELPER_DEADLINE` panics with the stderr it printed.
     fn run_min_against_channel(
         rootfs: &Path,
         args: &[&str],
         stdin: Vec<u8>,
         serve: impl FnOnce(UnixStream, String) + Send + 'static,
     ) -> Option<(String, String, i32)> {
-        use std::io::{BufRead as _, BufReader};
+        run_min_against_channel_within(rootfs, args, stdin, true, MIN_HELPER_DEADLINE, serve)
+    }
+
+    /// `run_min_against_channel`, with the deadline given, and a stdin that
+    /// stays open after `stdin` when `close_stdin` is false. The helper
+    /// runs in its own process group. A watchdog thread kills that group,
+    /// bash and socat with it, when the run outlives `deadline`. The
+    /// channel side's reads time out before that, so a channel that waits
+    /// for an EOF that never comes fails too.
+    fn run_min_against_channel_within(
+        rootfs: &Path,
+        args: &[&str],
+        stdin: Vec<u8>,
+        close_stdin: bool,
+        deadline: std::time::Duration,
+        serve: impl FnOnce(UnixStream, String) + Send + 'static,
+    ) -> Option<(String, String, i32)> {
+        use std::io::{BufRead as _, BufReader, Read as _};
         use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::process::CommandExt as _;
+        use std::sync::{Arc, Mutex, mpsc};
 
         let Some(socat) = host_socat() else {
             eprintln!("no socat to run the min helper with — skipping");
@@ -5512,8 +5574,13 @@ exit $rc
         .unwrap();
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
 
+        // The channel side's reads give up before the watchdog fires, so a
+        // read that waits for an EOF that never comes fails with its own
+        // message.
+        let read_timeout = deadline * 2 / 3;
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(read_timeout)).unwrap();
             // Bytes that arrive before the channel asks for them would sit
             // in the kernel buffer now, and the buffered read below would
             // take them with the line.
@@ -5529,7 +5596,10 @@ exit $rc
             .arg(script.to_str().unwrap())
             .args(args)
             .current_dir(rootfs)
+            // Both change the request's first group, and the channel side
+            // expects a bare `run%`.
             .env_remove("TRACEPARENT")
+            .env_remove("MINIMAL_OTEL")
             .env("PWD", rootfs)
             .env(
                 "PATH",
@@ -5539,26 +5609,133 @@ exit $rc
                     std::env::var("PATH").unwrap_or_default()
                 ),
             )
+            .process_group(0)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| eprintln!("no bash to run the min helper with — skipping: {e}"))
             .ok()?;
+        let pgid = child.id() as libc::pid_t;
+
+        // The watchdog waits for the run to end, and kills the helper's
+        // process group when it does not end by the deadline.
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            if let Err(mpsc::RecvTimeoutError::Timeout) = done_rx.recv_timeout(deadline) {
+                // SAFETY: kill(2) with a negative pid signals the process
+                // group that `process_group(0)` made for this child.
+                unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                true
+            } else {
+                false
+            }
+        });
+
+        let (release_tx, release_rx) = mpsc::channel::<()>();
         let mut pipe = child.stdin.take().unwrap();
         let feeder = std::thread::spawn(move || {
             // A task that ends before it reads all of its stdin closes the
             // pipe, so this write can fail.
             let _ = pipe.write_all(&stdin);
+            if !close_stdin {
+                // Hold the stdin open until the helper ends.
+                let _ = release_rx.recv();
+            }
         });
-        let out = child.wait_with_output().unwrap();
+        let collect = |mut from: Box<dyn std::io::Read + Send>| {
+            let sink = Arc::new(Mutex::new(Vec::new()));
+            let into = Arc::clone(&sink);
+            let reader = std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = from.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    into.lock().unwrap().extend_from_slice(&buf[..n]);
+                }
+            });
+            (sink, reader)
+        };
+        let (stdout, stdout_reader) = collect(Box::new(child.stdout.take().unwrap()));
+        let (stderr, stderr_reader) = collect(Box::new(child.stderr.take().unwrap()));
+        let status = child.wait().unwrap();
+        let _ = done_tx.send(());
+        let killed = watchdog.join().unwrap();
+        // The group is gone after a kill. On a normal exit, a background
+        // copy can still hold the pipes, so end the group before the reads.
+        // SAFETY: as above, the child's own process group.
+        unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        let _ = stdout_reader.join();
+        let _ = stderr_reader.join();
+        drop(release_tx);
         let _ = feeder.join();
-        server.join().expect("the channel side passes its checks");
-        Some((
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-            out.status.code().unwrap_or(-1),
-        ))
+        let stdout = String::from_utf8_lossy(&stdout.lock().unwrap()).into_owned();
+        let stderr = String::from_utf8_lossy(&stderr.lock().unwrap()).into_owned();
+        assert!(
+            !killed,
+            "the min helper did not end within {deadline:?} and was killed; stderr: {stderr}"
+        );
+        // The channel side reads with a timeout, so it ends soon after the
+        // helper does.
+        let waited = std::time::Instant::now();
+        while !server.is_finished() && waited.elapsed() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            server.is_finished(),
+            "the channel side did not end within {deadline:?}; helper stderr: {stderr}"
+        );
+        if server.join().is_err() {
+            panic!("the channel side failed its checks; helper stderr: {stderr}");
+        }
+        Some((stdout, stderr, status.code().unwrap_or(-1)))
+    }
+
+    // A run whose stdin never ends and whose channel waits for that EOF
+    // fails within seconds, with the helper's stderr, and does not hang
+    // the test binary.
+    #[test]
+    fn min_helper_run_against_channel_fails_fast_when_stdin_never_ends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+        install_min_helpers(rootfs).unwrap();
+        if host_socat().is_none() {
+            eprintln!("no socat to run the min helper with — skipping");
+            return;
+        }
+        let deadline = std::time::Duration::from_secs(3);
+        let started = std::time::Instant::now();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_min_against_channel_within(
+                rootfs,
+                &["task", "run", "query"],
+                b"never ends\n".to_vec(),
+                false,
+                deadline,
+                |mut stream, _line| {
+                    use std::io::Read as _;
+                    writeln!(stream, "stdin:").unwrap();
+                    let mut got = Vec::new();
+                    stream.read_to_end(&mut got).unwrap();
+                },
+            )
+        }));
+        let elapsed = started.elapsed();
+        let panic = outcome.expect_err("a run that never ends must fail");
+        let message = panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .unwrap_or_default();
+        assert!(
+            message.contains("stderr:"),
+            "the failure carries the helper's stderr: {message}"
+        );
+        assert!(
+            elapsed < deadline * 3,
+            "the failure came after {elapsed:?}, not within seconds"
+        );
     }
 
     /// The data of a `run` request line, past `run%`.
@@ -6616,6 +6793,57 @@ exit $rc
             rx,
         };
         (state, rootfs, cwd, channel, tx)
+    }
+
+    /// NET-079: an in-box task of a host-address box runs in the classifier
+    /// leaf of its box, and its network follows the verdict of that leaf. A
+    /// box with no leaf runs its task with none, and a task of an own-address
+    /// box takes no host-address leaf.
+    #[test]
+    fn run_task_runs_in_the_box_classifier_leaf() {
+        let (_state, _rootfs, _cwd, mut channel) = setup_channel();
+        let unplaced = channel.ctx.clone();
+        assert_eq!(unplaced.classifier_leaf(), None);
+        assert_eq!(
+            channel
+                .task_context(unplaced.clone(), "t")
+                .classifier_leaf(),
+            None
+        );
+
+        let leaf = ClassifierLeaf::under(
+            Path::new("/sys/fs/cgroup/minimald.slice"),
+            "box-1",
+            sandbox::config::Verdict::Allow,
+        );
+        channel.classifier_leaf = Some(leaf.clone());
+        let ctx = channel.task_context(unplaced, "t");
+        assert_eq!(ctx.classifier_leaf(), Some(&leaf));
+
+        assert_eq!(
+            crate::net::classifier::task_box_leaf(
+                boxes::NetworkMode::HostNet,
+                ctx.classifier_leaf()
+            ),
+            Some((leaf.clone(), sandbox::config::Verdict::Allow))
+        );
+        let deny = ClassifierLeaf::under(
+            Path::new("/sys/fs/cgroup/minimald.slice"),
+            "box-2",
+            sandbox::config::Verdict::Deny,
+        );
+        assert_eq!(
+            crate::net::classifier::task_box_leaf(boxes::NetworkMode::HostNet, Some(&deny)),
+            Some((deny, sandbox::config::Verdict::Deny))
+        );
+        assert_eq!(
+            crate::net::classifier::task_box_leaf(boxes::NetworkMode::OwnIp, Some(&leaf)),
+            None
+        );
+        assert_eq!(
+            crate::net::classifier::task_box_leaf(boxes::NetworkMode::HostNet, None),
+            None
+        );
     }
 
     /// TEL-045 at the channel's own loop: an opted-out helper request

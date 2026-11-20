@@ -62,6 +62,28 @@ use serde::{Deserialize, Serialize};
 /// not start with it is a shell command for the session, never a daemon one.
 pub const EXEC_SCHEME: &str = "min://";
 
+/// The exit code a command the daemon injects into a box ends with when the
+/// box stopped before the command started: the box's classifier leaf was
+/// gone when the injection tried to join it. The architecture's exit code
+/// for a box that is not running.
+pub const INJECTION_BOX_STOPPED_EXIT: u8 = 2;
+
+/// The line an injection prints on its stderr when it ends with
+/// [`INJECTION_BOX_STOPPED_EXIT`]. `min box exec` reads it as a refusal.
+pub const INJECTION_BOX_STOPPED_TEXT: &str = "The box stopped before the command started.\n";
+
+/// The exit code a command the daemon injects into a box ends with when it
+/// cannot join the box's classifier leaf for any other reason: the box's
+/// network rules would not apply to it, so it never runs. The
+/// architecture's exit code for a refusal.
+pub const INJECTION_UNPLACED_EXIT: u8 = 5;
+
+/// The start of the line an injection prints on its stderr when it ends
+/// with [`INJECTION_UNPLACED_EXIT`]. A colon and the error the join met
+/// follow it. `min box exec` reads it as a refusal.
+pub const INJECTION_UNPLACED_TEXT: &str =
+    "Did not run the command: the host could not apply the box's network rules to it";
+
 /// What a client asked the daemon to run on an exec channel.
 ///
 /// Build one with the constructors below and render it with

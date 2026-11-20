@@ -190,8 +190,10 @@ instead of Hypervisor.framework availability.
   Before `krun_start_enter`, `minvmd` shall verify that `/dev/kvm` is
   accessible (readable) on Linux. If not accessible, `boot` and `run` shall
   exit with a clear user-facing error naming `/dev/kvm` and suggesting
-  privilege/module remediation. On macOS the check is skipped (Hypervisor
-  .framework availability is verified by `krun_create_ctx` itself).
+  privilege/module remediation. On macOS, `boot` and `run` shall read
+  `sysctl kern.hv_support` and, when it is 0, exit with a one-line error
+  saying the Mac has no hypervisor support; an absent or unreadable value
+  does not refuse.
 - **R2.5**: `main.rs` shall update the crate description from "macOS-only
   host daemon" to "VM provider host daemon" and remove any macOS-specific
   messaging from subcommand docs.

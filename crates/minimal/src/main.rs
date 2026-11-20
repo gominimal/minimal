@@ -263,14 +263,17 @@ fn answer_failure(
 /// more than one host, 4 when the address names no box, 7 when a host did
 /// not answer the lookup), the code a `min box exec` refusal carries
 /// (`minimal::BoxExecRefusal`: 2 for `-t` without a terminal or a box that
-/// is not running, 5 when its spec turns exec off), the code an `--exec
+/// is not running or stopped before the command started, 5 when its spec
+/// turns exec off or its network rules could not be applied to the
+/// command), the code an `--exec
 /// <id>` refusal of `min box stop`, `logs` or `wait` carries
 /// (`minimal::BoxExecIdRefusal`: 2 for text that is not an exec id, 4 for an
 /// exec the box does not have), the code a start
 /// refusal carries (`minimal::StartEntryRefusal`: 4 when the start does not
 /// find the entry, 2 when it cannot pick or start it), 2 when a start needs a terminal
 /// it does not have (`minimal::StartNeedsTerminal`) or asks for a held name
-/// (`minimal::StartNameHeld`), 124 when an exec ran past its own timeout
+/// (`minimal::StartNameHeld`), 2 when an attach cannot get its row back
+/// because another box holds the name (`minimal::RowNotBack`), 124 when an exec ran past its own timeout
 /// (`minimal::BoxExecTimedOut`) or a box ran past its own timeout or a
 /// `min box wait --timeout` ran out (`minimal::BoxTimedOut`), and 1, the unspecified error,
 /// for everything else — a refusal the host answered included. Both
@@ -279,6 +282,11 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     // BEP-008/009/010/017/056: a box spec refused at activation.
     if let Some(refused) = e.downcast_ref::<boxes::core::bep::ActivationRefused>() {
         return refused.exit_code();
+    }
+    // BEP-003 (#3276): a create refusal only the daemon made, such as a
+    // non-GitHub broker grant on a host a proxy serves, keeps its exit code.
+    if let Some(refused) = e.downcast_ref::<minimal::DaemonCreateRefusal>() {
+        return refused.exit_code.max(1);
     }
     // BCLI-004: `min box rm` of a running box without `--force`.
     if e.downcast_ref::<minimal::BoxRunningRefusal>().is_some() {
@@ -350,6 +358,11 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     if e.downcast_ref::<minimal::StartNameHeld>().is_some() {
         return minimal::StartNameHeld::EXIT_CODE;
     }
+    // NET-138: an attach whose row did not come back; 2 when another box
+    // holds the name, 1 otherwise.
+    if let Some(refusal) = e.downcast_ref::<minimal::RowNotBack>() {
+        return refusal.exit_code();
+    }
     // BOX-163: a create under a name a running box holds.
     if e.downcast_ref::<minimald_rpc::HeldNameRefusal>().is_some() {
         return minimald_rpc::HeldNameRefusal::EXIT_CODE;
@@ -367,6 +380,11 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     // exits 3, as the start does.
     if e.downcast_ref::<minimal::SpecFileInvalid>().is_some() {
         return minimal::SpecFileInvalid::EXIT_CODE;
+    }
+    // A `network` key a task box does not apply is the project file
+    // refusing the command the same way, so it ends with exit 3 too.
+    if e.downcast_ref::<minimal::TaskNetworkUnapplied>().is_some() {
+        return minimal::TaskNetworkUnapplied::EXIT_CODE;
     }
     // BCLI-019, BCLI-020: `min type` of a project whose box types do not
     // load exits 3, and `min type show` of a name that is no type exits 4.
@@ -513,6 +531,25 @@ fn machine_mode_answer(e: &anyhow::Error) -> MachineModeAnswer {
             code,
             format!("{e:#}"),
             hint,
+        ));
+    }
+    // #3276: the same, for a refusal only the daemon made. The daemon's
+    // reply carries the defined error and its next step.
+    // A code this build does not define answers `unspecified` below.
+    if let Some(refused) = e.downcast_ref::<minimal::DaemonCreateRefusal>()
+        && let Some(code) = refused.code.as_deref().and_then(|code| {
+            [
+                boxes::core::bep::GATEHOUSE_UNENROLLED_NODE,
+                boxes::core::bep::GITHUB_SIGN_IN_REQUIRED,
+            ]
+            .into_iter()
+            .find(|known| *known == code)
+        })
+    {
+        return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
+            code,
+            format!("{e:#}"),
+            refused.hint.clone(),
         ));
     }
     // BCLI-020: `min type show` of a name that is no type is `not_found`.
@@ -714,6 +751,11 @@ fn machine_output_mode(cli: &minimal::Cli) -> bool {
         // `min/v1/error` object.
         Some(minimal::Command::Box(minimal::BoxArgs {
             command: minimal::BoxCommand::Show(args),
+        })) => args.output.is_some(),
+        // BCLI-013, BCLI-033: a `min box wait -o json` failure, a
+        // `wait_timeout` among them, is one `min/v1/error` object.
+        Some(minimal::Command::Box(minimal::BoxArgs {
+            command: minimal::BoxCommand::Wait(args),
         })) => args.output.is_some(),
         // BCLI-019, BCLI-020: `min type list|show -o json|yaml|toml`.
         Some(minimal::Command::Type(minimal::TypeArgs {
@@ -1011,6 +1053,37 @@ mod tests {
 
     // BEP-003, Gatehouse §6.2: a refused grant box reads as its defined
     // error under `-o json`, with the refusal's next step as the hint.
+    // #3276: a create refusal only the daemon made exits with the code the
+    // daemon gave it, and `-o json` answers with its defined error.
+    #[test]
+    fn daemon_only_broker_refusal_exits_5_with_its_code() {
+        let refused = |code: Option<&str>| {
+            anyhow::Error::new(minimal::DaemonCreateRefusal {
+                message: "Cannot create the box.".to_string(),
+                code: code.map(str::to_string),
+                exit_code: 5,
+                hint: "remove aws from the secrets".to_string(),
+            })
+        };
+        let err = refused(Some("gatehouse_unenrolled_node"));
+        assert_eq!(failure_exit_code(&err), 5);
+        match machine_mode_answer(&err) {
+            MachineModeAnswer::Object(failure) => {
+                assert_eq!(failure.code(), "gatehouse_unenrolled_node");
+                assert_eq!(failure.hint(), "remove aws from the secrets");
+                assert_eq!(failure.message(), "Cannot create the box.");
+            }
+            other => panic!("a refusal is an object, got {other:?}"),
+        }
+        // A code this build does not define keeps the exit code.
+        let err = refused(Some("a_code_from_a_newer_daemon"));
+        assert_eq!(failure_exit_code(&err), 5);
+        match machine_mode_answer(&err) {
+            MachineModeAnswer::Object(failure) => assert_eq!(failure.code(), "unspecified"),
+            other => panic!("a refusal is an object, got {other:?}"),
+        }
+    }
+
     #[test]
     fn machine_mode_names_the_grant_refusal_code() {
         use boxes::core::bep::{ActivationRefused, BepRefusal, ProxyAbsence};
@@ -1356,6 +1429,14 @@ mod tests {
                 4,
             ),
             (
+                minimal::BoxAddressRefusal::OnStoppedVm {
+                    name: address("beta"),
+                    vm: address("alpha"),
+                },
+                "not_found",
+                4,
+            ),
+            (
                 minimal::BoxAddressRefusal::Unreachable {
                     address: address("web"),
                     hosts: vec![address("beta.local-minvmd0")],
@@ -1381,7 +1462,7 @@ mod tests {
             ),
         ] {
             let text = refusal.to_string();
-            let hint = refusal.hint();
+            let hint = refusal.hint().into_owned();
             let err = anyhow::Error::from(refusal).context("showing the box");
             let MachineModeAnswer::Object(failure) = machine_mode_answer(&err) else {
                 panic!("a box address refusal is an error object: {err:#}");
@@ -1455,6 +1536,21 @@ mod tests {
         assert_eq!(failure_exit_code(&err), 2, "{err:#}");
     }
 
+    /// An attach whose row did not come back ends with 2 when another box
+    /// holds its name, and with 1 otherwise (NET-138).
+    #[test]
+    fn row_not_back_exit_codes() {
+        let held = anyhow::Error::new(minimal::RowNotBack::NameHeld {
+            name: "web".to_string(),
+            held: "Web".to_string(),
+        });
+        assert_eq!(failure_exit_code(&held), 2, "{held:#}");
+        let not_back = anyhow::Error::new(minimal::RowNotBack::NotBack {
+            name: "web".to_string(),
+        });
+        assert_eq!(failure_exit_code(&not_back), 1, "{not_back:#}");
+    }
+
     /// BCLI-053: an exec that its own timeout ended ends the run with 124
     /// in both output modes, and a machine-mode run answers it with the
     /// `timeout` object. The exec refusals end with 2 and 5.
@@ -1503,7 +1599,25 @@ mod tests {
                 },
                 5,
             ),
-            (minimal::BoxExecRefusal::SpecUnreadable { target }, 5),
+            (
+                minimal::BoxExecRefusal::SpecUnreadable {
+                    target: target.clone(),
+                },
+                5,
+            ),
+            (
+                minimal::BoxExecRefusal::StoppedBeforeStart {
+                    target: target.clone(),
+                },
+                2,
+            ),
+            (
+                minimal::BoxExecRefusal::NetworkRulesNotApplied {
+                    target,
+                    cause: "Permission denied (os error 13)".to_string(),
+                },
+                5,
+            ),
         ] {
             assert_eq!(failure_exit_code(&anyhow::Error::new(refusal)), code);
         }
@@ -1813,6 +1927,26 @@ mod tests {
             error: mfile::Error::HarnessTable(None),
         };
         let e = anyhow::Error::new(invalid).context("activating the session");
+        assert_eq!(failure_exit_code(&e), 3);
+    }
+
+    /// #3252: a task's `minimal.toml` that sets a `network` key a task box
+    /// does not apply refuses the run with exit 3, the code an invalid
+    /// project file ends with, through the context the run adds over it.
+    /// `task`'s test of the same name proves the refusal names the key, the
+    /// table and the next step.
+    #[test]
+    fn task_network_key_a_task_does_not_apply_exits_3() {
+        let e = anyhow::Error::new(minimal::TaskNetworkUnapplied {
+            message: "[tasks.build] in minimal.toml sets network.quic443, which is \
+                      not applied to a task box."
+                .to_owned(),
+        })
+        .context("running the task");
+        assert_eq!(
+            failure_exit_code(&e),
+            minimal::TaskNetworkUnapplied::EXIT_CODE
+        );
         assert_eq!(failure_exit_code(&e), 3);
     }
 

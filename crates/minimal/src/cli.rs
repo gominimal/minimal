@@ -871,6 +871,19 @@ pub struct BoxWaitArgs {
     /// running or ended
     #[arg(long = "exec", value_name = "EXEC_ID")]
     pub exec: Option<String>,
+    /// When the box ends, write how it ended in this format on stdout
+    // BCLI-013, BCLI-033: one `min/v1/wait` object. An exec has no such
+    // object, so `--exec` refuses the flag.
+    #[arg(short = 'o', long = "output", value_enum, conflicts_with = "exec")]
+    pub output: Option<BoxWaitOutputFormat>,
+}
+
+/// The formats `min box wait` writes, beside text.
+// BCLI-033: the format carries one `min/v1/wait` object.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum BoxWaitOutputFormat {
+    /// JSON: one object that lists how the box ended
+    Json,
 }
 
 // BOX-149 (BCLI-053): `min box exec <box> [-t|--detach] [--timeout <d>] -- <cmd>`.
@@ -900,8 +913,10 @@ pub struct BoxExecArgs {
 }
 
 /// Why `min box exec` ran no command in the box: `-t` without a terminal
-/// (exit 2), the box is not running (BOX-149, exit 2), or its spec turns
-/// exec off (BOX-153, exit 5). `target` is the box as the user named it.
+/// (exit 2), the box is not running or stopped before the command started
+/// (BOX-149, exit 2), its spec turns exec off (BOX-153, exit 5), or the
+/// box's network rules could not be applied to the command (NET-079, exit
+/// 5). `target` is the box as the user named it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BoxExecRefusal {
     /// `-t` ran with a stdin that is not a terminal, so nothing started.
@@ -927,6 +942,20 @@ pub enum BoxExecRefusal {
         /// The box as the user named it.
         target: String,
     },
+    /// The box stopped after the exec reached it, before the command
+    /// started. Exit 2.
+    StoppedBeforeStart {
+        /// The box as the user named it.
+        target: String,
+    },
+    /// The box's host could not apply the box's network rules to the
+    /// command, so the command never started. Exit 5.
+    NetworkRulesNotApplied {
+        /// The box as the user named it.
+        target: String,
+        /// The error the host met, as the daemon's injection reported it.
+        cause: String,
+    },
 }
 
 impl BoxExecRefusal {
@@ -935,8 +964,12 @@ impl BoxExecRefusal {
     #[must_use]
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::NoTerminal { .. } | Self::NotRunning { .. } => 2,
-            Self::ExecDisabled { .. } | Self::SpecUnreadable { .. } => 5,
+            Self::NoTerminal { .. } | Self::NotRunning { .. } | Self::StoppedBeforeStart { .. } => {
+                2
+            }
+            Self::ExecDisabled { .. }
+            | Self::SpecUnreadable { .. }
+            | Self::NetworkRulesNotApplied { .. } => 5,
         }
     }
 
@@ -948,6 +981,8 @@ impl BoxExecRefusal {
             Self::NotRunning { .. } => "not running",
             Self::ExecDisabled { .. } => "exec disabled",
             Self::SpecUnreadable { .. } => "spec unreadable",
+            Self::StoppedBeforeStart { .. } => "stopped before start",
+            Self::NetworkRulesNotApplied { .. } => "network rules not applied",
         }
     }
 }
@@ -973,6 +1008,15 @@ impl std::fmt::Display for BoxExecRefusal {
             Self::SpecUnreadable { target } => write!(
                 f,
                 "{target} does not allow exec: its spec cannot be read, so exec stays off."
+            ),
+            Self::StoppedBeforeStart { target } => {
+                write!(f, "{target} stopped before the command started.")
+            }
+            Self::NetworkRulesNotApplied { target, cause } => write!(
+                f,
+                "Did not run the command in {target}: the host could not apply the \
+                 box's network rules to it: {cause}. If it keeps failing, run \
+                 `min bug` to collect a diagnostic bundle."
             ),
         }
     }
@@ -1616,10 +1660,12 @@ pub struct GlobalArgs {
     pub config_dir: Option<PathBuf>,
     /// Select the daemon backend that hosts sessions.
     ///
-    /// On Linux, `local` (the default) runs minimald on the host;
-    /// `local-minvmd` runs it inside the minvmd microVM. No effect on macOS,
-    /// where minvmd is the only backend. `min provider list --all` lists the
-    /// providers on this machine.
+    /// On Linux, `local` runs minimald on the host and `local-minvmd` runs it
+    /// inside the minvmd microVM. Without this flag, `min` uses
+    /// `MIN_PROVIDER`, then the `provider` key of config.toml, then
+    /// `local-minvmd` where /dev/kvm opens for you and `local` where it does
+    /// not. No effect on macOS, where minvmd is the only backend. `min
+    /// provider list --all` lists the providers on this machine.
     #[arg(long, global = true, value_name = "PROVIDER")]
     pub provider: Option<Provider>,
     /// Skip interactive prompts that need a terminal.
@@ -1643,8 +1689,9 @@ pub struct GlobalArgs {
 }
 
 impl GlobalArgs {
-    /// Whether the minvmd microVM backend (DM1) is selected via
-    /// `--provider local-minvmd`.
+    /// Whether the minvmd microVM backend (DM1) is selected: by
+    /// `--provider local-minvmd`, or by the default a flagless command
+    /// resolves at dispatch ([`crate::hosts::resolve_default_provider`]).
     pub fn use_minvmd(&self) -> bool {
         matches!(self.provider, Some(Provider::LocalMinvmd))
     }
@@ -1845,14 +1892,19 @@ pub struct EgressArgs {
 
 /// Which daemon backend (box host) serves sessions, as `--provider` names it.
 ///
-/// On Linux the default is the host-native daemon (DM2); `local-minvmd` runs
-/// `minimald` inside the minvmd microVM (DM1) instead. On macOS minvmd is the
-/// only backend, so the choice has no effect there.
+/// On Linux `local` is the host-native daemon (DM2) and `local-minvmd` runs
+/// `minimald` inside the minvmd microVM (DM1). A command without
+/// `--provider` takes `MIN_PROVIDER`, then the `provider` key of
+/// `config.toml`, then `local-minvmd` where `/dev/kvm` opens for reading and
+/// writing and `local` otherwise ([`crate::hosts::resolve_default_provider`]).
+/// On macOS minvmd is the only backend, so the choice has no effect there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Provider {
-    /// Linux: run minimald natively on the host (the default).
+    /// Linux: run minimald natively on the host (the default where
+    /// /dev/kvm does not open).
     Local,
-    /// Run minimald inside the minvmd microVM.
+    /// Run minimald inside the minvmd microVM (the Linux default where
+    /// /dev/kvm opens).
     LocalMinvmd,
     /// The old name of `local`.
     // BCLI-046: read as `local` for one release, with a hint on stderr

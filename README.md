@@ -214,7 +214,7 @@ patches = [
     { dest = ".config/zellij/layouts/", source = "~/dotfiles/zellij/layouts/**/*.kdl" },
 ]
 
-[vars]
+[env_vars]
 EDITOR    = "hx"
 VISUAL    = "hx"
 

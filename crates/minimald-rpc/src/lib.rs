@@ -840,7 +840,10 @@ pub struct RegisterBoxRequest {
     /// connection open: the client writes one `commit` line once its
     /// session is active, and a close or an error before that line
     /// withdraws the row, so an activation that dies between registering
-    /// and committing leaves no row holding its name. A client that omits
+    /// and committing leaves no row holding its name. A `host_ip`
+    /// registration has no row and is held the same way: a close before
+    /// the commit withdraws its registration name, unless a box is already
+    /// admitted under its id. A client that omits
     /// the field, or a daemon that predates it, keeps the one-shot
     /// registration: one line each way, and the row lives until its
     /// creator withdraws it.
@@ -2512,7 +2515,73 @@ pub struct CreateSessionResponse {
 impl OneshotSshRpc for CreateSession {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "CreateSession");
     type Request<'a> = CreateSessionRequest;
-    type Response = Errorable<CreateSessionResponse>;
+    type Response = CreateSessionReply;
+}
+
+/// The reply to a [`CreateSession`]: the allocated session, or a refusal.
+///
+/// The wire form of [`Errorable`], with optional fields on the refusal. A
+/// refusal that has a defined error carries its code, the exit code the
+/// client ends with, and the next step (#3276). A reply from a daemon that
+/// predates the fields, and every refusal with no defined error, carries
+/// `error` alone and still decodes. A client that reads no code ends the
+/// way it ends on any other refusal.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum CreateSessionReply {
+    Ok(CreateSessionResponse),
+    Err {
+        /// The refusal for the user: what was refused, why, and the next
+        /// step.
+        error: String,
+        /// The refusal's defined error, such as
+        /// `gatehouse_unenrolled_node`, for the machine-mode answer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        /// The exit code the client ends with on this refusal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<u8>,
+        /// The next step alone, for the machine-mode answer's hint.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hint: Option<String>,
+    },
+}
+
+impl CreateSessionReply {
+    /// A refusal that carries its text alone.
+    #[must_use]
+    pub fn refused(error: impl Into<String>) -> Self {
+        Self::Err {
+            error: error.into(),
+            code: None,
+            exit_code: None,
+            hint: None,
+        }
+    }
+
+    /// The allocated session. Panics on a refusal.
+    pub fn unwrap(self) -> CreateSessionResponse {
+        match self {
+            Self::Ok(created) => created,
+            Self::Err { error, .. } => panic!("unwrap of error value: {error}"),
+        }
+    }
+
+    /// The allocated session, or `None` on a refusal.
+    pub fn ok(self) -> Option<CreateSessionResponse> {
+        match self {
+            Self::Ok(created) => Some(created),
+            Self::Err { .. } => None,
+        }
+    }
+
+    /// The refusal text, or `None` when the create succeeded.
+    pub fn err(self) -> Option<String> {
+        match self {
+            Self::Ok(_) => None,
+            Self::Err { error, .. } => Some(error),
+        }
+    }
 }
 
 /// An RPC to compose a session's loadout, completing its create flow.
@@ -2819,6 +2888,23 @@ impl OneshotSshRpc for RenameSession {
     type Request<'a> = RenameSessionRequest;
     type Response = Errorable<RenameSessionResponse>;
 }
+
+/// The exit status an interactive attach ends with when the in-VM daemon
+/// refused it because the VM host daemon withdrew the box's host-side row
+/// (NET-138). The client reads it as its cue to ask the VM host daemon for
+/// the row back ([`BoxControlRequest::ResumeBox`]), which reinstates it
+/// from the host's own record of the box's creation under the same box id,
+/// and to retry the attach one time. Only the interactive attach's channel
+/// carries it: an exec channel ends the same refusal with 1.
+///
+/// This is the SSH channel's status, not `min`'s. `min` reads it as the
+/// refusal only when the VM host holds no row of the box's own, and then
+/// exits with 2 when another box holds the box's name, so the row cannot
+/// come back under it, and with 1 when the row does not come back for
+/// another reason or the retried attach is refused again. `min` exits with
+/// this status when the box's shell exited with it, and when it could not
+/// read the session's record, so could not check the row.
+pub const ATTACH_ROW_ENDED_EXIT_STATUS: u32 = 253;
 
 /// An RPC to stop a running box and keep its record (BOX-013, BOX-018).
 ///

@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use boxes::core::bep::{
-    ActivationRefused, ActivationSpec, BepRefusal, BepSettings, BepTables, BepWarning, HostFacts,
-    Quic443, SecretGrant, SecretGrants, Steering, StoreAction, StoreRules, refusals,
+    ActivationSpec, BepSettings, BepTables, BepWarning, HostFacts, Quic443, SecretGrant,
+    SecretGrants, Steering, StoreAction, StoreRules, check_activation, check_store_references,
     store_references,
 };
 
@@ -30,11 +30,13 @@ pub(crate) struct SpecInputs<'a> {
     /// The SHA-256 fingerprint of the proxy's root certificate, as colon
     /// separated hex pairs, or `None` when the proxy has not published it.
     pub root_fingerprint: Option<&'a str>,
-    /// `[session.network.bep]`.
+    /// The `network.bep` table of the expanded box entry, with
+    /// `[defaults.network.bep]` and the entry's own table merged in.
     pub bep: &'a BepSettings,
-    /// `[session.network] quic443`, `None` when not declared.
+    /// The `network.quic443` of the expanded box entry, `None` when not
+    /// declared.
     pub quic443: Option<Quic443>,
-    /// `[session.secrets]`.
+    /// The `secrets` table of the expanded box entry.
     pub secrets: &'a SecretGrants,
     /// Whether the client configuration sets the full-breadth
     /// acknowledgement.
@@ -42,6 +44,10 @@ pub(crate) struct SpecInputs<'a> {
     /// The box's network mode, from `min box spec --network`, the same
     /// mode `min session activate --network` gives the box it creates.
     pub network: boxes::NetworkMode,
+    /// The box's effective egress, as `min box start` sends it in the
+    /// create request: the project's egress with the egress flags applied.
+    /// `None` when neither declares egress.
+    pub egress: Option<&'a boxes::EgressPolicy>,
     /// Whether this host resolves the box's steered names, the same host
     /// fact the box's creation reads (BEP-017, BEP-081):
     /// `host_resolves_box_names` for this host and [`Self::network`]. On a
@@ -61,22 +67,15 @@ pub(crate) struct SpecInputs<'a> {
 ///
 /// # Errors
 ///
-/// [`ActivationRefused`] (exit 3) when a GitHub grant declares scopes
-/// narrower than `full` and the client configuration does not acknowledge
-/// full breadth (BEP-057), and the writer's error.
+/// [`boxes::core::bep::ActivationRefused`] (exit 3) with every refusal that `min box start`
+/// gives for the same spec, network, egress and host, then the store
+/// reference refusals of the start (BEP-034, BEP-036), and the writer's
+/// error.
 pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> anyhow::Result<()> {
-    let credentialed = inputs.secrets.values().any(SecretGrant::is_credentialed);
-    if !credentialed {
-        writeln!(
-            out,
-            "This project declares no broker secret, so its box does not use the proxy."
-        )?;
-        return Ok(());
-    }
-
     // BEP-057: every host is un-enrolled today.
-    // Interim: only BEP-057, BEP-009 (from `--network`) and BEP-017 are
-    // previewed here; the full exit-3 set is gominimal/minimal#2445.
+    // #2445: the preview runs the whole check that the start runs, with the
+    // same network, egress and host facts, so every refusal of the start
+    // is a refusal here, with exit 3.
     // BEP-017: the resolver fact is the one creation reads, so the two
     // agree.
     let host = HostFacts {
@@ -84,28 +83,32 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
         box_zone_resolver: inputs.box_zone_resolver,
         ..HostFacts::LOCAL
     };
-    let egress = None;
     let spec = ActivationSpec {
         network: inputs.network,
-        egress,
+        egress: inputs.egress,
         bep: inputs.bep,
         secrets: inputs.secrets,
         tables: inputs.tables,
     };
-    let narrow: Vec<BepRefusal> = refusals(&spec, host, inputs.github_hosts)
-        .into_iter()
-        .filter(|refusal| {
-            matches!(
-                refusal,
-                BepRefusal::NarrowScopesUnenrolled { .. }
-                    | BepRefusal::BrokerScopeNotGithub { .. }
-                    | BepRefusal::NoNetworkWithGrant { .. }
-                    | BepRefusal::NoResolver { .. }
-            )
-        })
-        .collect();
-    if !narrow.is_empty() {
-        return Err(ActivationRefused { refusals: narrow }.into());
+    check_activation(&spec, host, inputs.github_hosts)?;
+    // BEP-034, BEP-036: the start then checks each store reference against
+    // the deny set and the egress, so the preview does the same, in the
+    // same order.
+    let module_hosts = crate::config::store_module_hosts();
+    check_store_references(
+        inputs.secrets,
+        inputs.egress,
+        inputs.store_rules,
+        crate::config::store_deny_set(&module_hosts),
+    )?;
+
+    let credentialed = inputs.secrets.values().any(SecretGrant::is_credentialed);
+    if !credentialed {
+        writeln!(
+            out,
+            "This project declares no broker secret, so its box does not use the proxy."
+        )?;
+        return Ok(());
     }
 
     match inputs.root_fingerprint {
@@ -440,8 +443,10 @@ fn project_rows(global: &GlobalArgs, args: &BoxSpecArgs, out: &mut Vec<u8>) -> a
         .repo_dir
         .clone()
         .unwrap_or_else(|| PathBuf::from("."));
-    let session = match mfile::File::from_dir_recursive(&project) {
-        Ok(file) => file.session,
+    // This parse only maps a missing or invalid project file to its
+    // message. The expansion below loads the file again.
+    match mfile::File::from_dir_recursive(&project) {
+        Ok(_) => {}
         Err(mfile::Error::NotFound) => anyhow::bail!(
             "No {} found in {} or its parent directories.",
             mfile::MFILE_NAME,
@@ -451,31 +456,189 @@ fn project_rows(global: &GlobalArgs, args: &BoxSpecArgs, out: &mut Vec<u8>) -> a
             return Err(crate::ProjectFileInvalid { error }.into());
         }
     };
-    let (bep, quic443, secrets) = session.map_or_else(Default::default, |session| {
-        let network = session.network.unwrap_or_default();
-        (
-            network.bep.unwrap_or_default(),
-            network.quic443,
-            session.secrets,
-        )
-    });
+    // The rows read the expanded session entry, the same expansion that
+    // `min box start` grants from, so `[defaults.network.bep]` and the
+    // entry's own tables both reach them.
+    // The expansion records the project root, which must be absolute, so
+    // the default `.` resolves against the working directory first.
+    let absolute = std::path::absolute(&project)
+        .with_context(|| format!("Cannot resolve the project path {}.", project.display()))?;
+    let utf8_project = camino::Utf8Path::from_path(&absolute)
+        .ok_or_else(|| anyhow::anyhow!("The project path {} is not UTF-8.", project.display()))?;
+    let (bep, secrets, quic443) = match crate::project_bep_and_grants(utf8_project, None) {
+        Ok((bep, secrets, _, quic443)) => (bep, secrets, quic443),
+        // A project with several session entries and none named `default`
+        // still gets its preview: the bare form never refuses for that
+        // pick. The rows then read an entry with an empty body, so
+        // `[defaults]` and `[defaults.session]` merge as for any entry.
+        // An entry of a project Box Type, or a `default` entry that is not
+        // a session, keeps the start's refusal: no implicit session entry
+        // applies there.
+        Err(error)
+            if matches!(
+                error.downcast_ref::<crate::SessionEntryUndecided>(),
+                Some(crate::SessionEntryUndecided::NoDefault { .. })
+            ) =>
+        {
+            tracing::debug!(
+                project = %project.display(),
+                error = %error,
+                "min box spec: no single session entry, rendering the merged [defaults] and [defaults.session] tables"
+            );
+            session_defaults_rows(utf8_project)?
+        }
+        Err(error) => return Err(error),
+    };
     tracing::debug!(project = %project.display(), "rendering min box spec");
-    let (network, _) = preview_host(crate::daemon_host_kind(global), args);
-    // This path reads `[defaults.session]`, as `min box start` does.
+    let (network, egress) = project_network(&project, args)?;
     proxy_rows(
         global,
         &bep,
         quic443,
         &secrets,
         network,
+        egress.as_ref(),
         BepTables::SESSION,
         None,
         out,
     )
 }
 
+/// The `network.bep`, `secrets` and `network.quic443` of an entry with an
+/// empty body of the `session` Box Type. The entry expands as `min box
+/// start` expands a picked entry: over `[defaults]`, `[defaults.session]`
+/// and the layers of the `session` type chain (BOX-048, BOX-064). Bare
+/// `min box spec` reads these when the project has no single session entry
+/// to expand.
+fn session_defaults_rows(
+    project: &camino::Utf8Path,
+) -> anyhow::Result<(BepSettings, SecretGrants, Option<Quic443>)> {
+    let format_error = |error| crate::ProjectFileInvalid {
+        error: mfile::Error::Format(error),
+    };
+    let Some((_, bytes)) = project_file_bytes(project.as_std_path())? else {
+        return Ok(Default::default());
+    };
+    let entry = mfile::entry::BoxEntry {
+        name: mfile::entry::DEFAULT_ENTRY_NAME.to_owned(),
+        table: mfile::entry::EntryTable::Sessions,
+        box_type: Some(boxes::SESSION_BOX_TYPE.to_owned()),
+        body: toml::Table::new(),
+        implicit: true,
+    };
+    let expanded = crate::box_entry(
+        project,
+        &bytes,
+        entry,
+        true,
+        &crate::SelectedLoadouts::default(),
+        None,
+    )?;
+    let spec = &expanded.spec;
+    let secrets = spec
+        .get("secrets")
+        .cloned()
+        .map(boxes::core::bep::deserialize_project_secrets)
+        .transpose()
+        .map_err(format_error)?
+        .unwrap_or_default();
+    let network = spec.get("network").and_then(toml::Value::as_table);
+    let bep = network
+        .and_then(|network| network.get("bep"))
+        .cloned()
+        .map(toml::Value::try_into)
+        .transpose()
+        .map_err(format_error)?
+        .unwrap_or_default();
+    let quic443 = network
+        .and_then(|network| network.get("quic443"))
+        .cloned()
+        .map(toml::Value::try_into)
+        .transpose()
+        .map_err(format_error)?;
+    Ok((bep, secrets, quic443))
+}
+
+/// The egress of an entry with an empty body of the `session` Box Type:
+/// the same entry that [`session_defaults_rows`] expands, read over
+/// `[defaults]` and `[defaults.session]`.
+fn session_defaults_egress(project: &Path) -> anyhow::Result<crate::ProjectEgress> {
+    let Some((_, bytes)) = project_file_bytes(project)? else {
+        return Ok(Default::default());
+    };
+    let file: toml::Table =
+        toml::from_slice(&bytes).map_err(|error| crate::ProjectFileInvalid {
+            error: mfile::Error::Format(error),
+        })?;
+    let entry = mfile::entry::BoxEntry {
+        name: mfile::entry::DEFAULT_ENTRY_NAME.to_owned(),
+        table: mfile::entry::EntryTable::Sessions,
+        box_type: Some(boxes::SESSION_BOX_TYPE.to_owned()),
+        body: toml::Table::new(),
+        implicit: true,
+    };
+    super::box_verbs::entry_egress(&file, entry)
+}
+
+/// The network mode and the effective egress that `min box start` gives
+/// the session box of `project`, with `--network` from `args`. The same
+/// helpers as the start resolve them, so the start and the preview check
+/// the grants against the same facts (#2445).
+///
+/// # Errors
+///
+/// The refusals of the start: ingress off an `own_ip` box, and egress on a
+/// `none` box.
+fn project_network(
+    project: &Path,
+    args: &BoxSpecArgs,
+) -> anyhow::Result<(boxes::NetworkMode, Option<boxes::EgressPolicy>)> {
+    let project = camino::Utf8Path::from_path(project)
+        .ok_or_else(|| anyhow::anyhow!("Project path is not valid UTF-8"))?;
+    let mut activate = crate::ActivateArgs::unflagged();
+    activate.network = args.overrides.network;
+    let (port_mappings, flags) = super::box_verbs::flag_network_overrides(&activate)?;
+    let mut project_egress = match super::box_verbs::project_egress(project, None) {
+        Ok(project_egress) => project_egress,
+        // The bare form is read-only and never refuses for the session
+        // entry pick (D3598). With several session entries and no
+        // `default`, it previews the egress of the empty-body session entry
+        // that `session_defaults_rows` reads the grants from, so the check
+        // sees the `[defaults.network]` and `[defaults.session.network]`
+        // egress of those grants.
+        Err(error)
+            if matches!(
+                error.downcast_ref::<crate::SessionEntryUndecided>(),
+                Some(crate::SessionEntryUndecided::NoDefault { .. })
+            ) =>
+        {
+            tracing::debug!(
+                error = %error,
+                "min box spec: no single session entry, previewing the egress of the merged [defaults] and [defaults.session] tables"
+            );
+            session_defaults_egress(project.as_std_path())?
+        }
+        Err(error) => return Err(error),
+    };
+    let (network, port_mappings) =
+        super::box_verbs::session_box_network(&activate, &mut project_egress, port_mappings)?;
+    let egress = super::box_verbs::session_effective_egress(
+        project_egress,
+        flags,
+        network.into(),
+        &activate.egress,
+    )?;
+    let policy = super::box_verbs::network_override_policy(&activate, port_mappings, egress.policy);
+    tracing::debug!(
+        network = boxes::NetworkMode::from(network).word(),
+        egress = ?policy.egress,
+        "the preview's network and effective egress, as the start sends them"
+    );
+    Ok((network.into(), policy.egress))
+}
+
 /// Writes the Box Egress Proxy rows for `secrets` (BEP-038) to `out`, for
-/// a box of `network` on this host. `read_rules` holds the client's
+/// a box of `network` with `egress` on this host. `read_rules` holds the client's
 /// `[secret-store-rules]` when the caller already read them, and the rows
 /// then do not read them again. `tables` holds the minimal.toml tables
 /// that a refusal names.
@@ -486,11 +649,16 @@ fn proxy_rows(
     quic443: Option<Quic443>,
     secrets: &SecretGrants,
     network: boxes::NetworkMode,
+    egress: Option<&boxes::EgressPolicy>,
     tables: BepTables<'_>,
     read_rules: Option<&StoreRules>,
     out: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
-    let acknowledged = crate::config::full_breadth_acknowledged(global)?;
+    // BEP-057: the client configuration is read only when a grant needs the
+    // acknowledgement, as the start reads it, so an entry with no narrow
+    // grant never depends on config.toml.
+    let acknowledged = secrets.values().any(SecretGrant::is_narrower_than_full)
+        && crate::config::full_breadth_acknowledged(global)?;
     let store_rules = match read_rules {
         Some(rules) => rules.clone(),
         None if boxes::core::bep::store_references(secrets).next().is_some() => {
@@ -515,6 +683,7 @@ fn proxy_rows(
             secrets,
             acknowledged,
             network,
+            egress,
             box_zone_resolver,
             github_hosts: &github_hosts,
             store_rules: &store_rules,
@@ -529,7 +698,10 @@ fn proxy_rows(
 /// steered names: the switch's DNS gate for `own_ip`, and the box's own
 /// steering answerer for `host_ip` (BEP-081). Creation reads the same fact
 /// for the same mode, so `min box spec --network <mode>` refuses what `min
-/// session activate --network <mode>` refuses.
+/// session activate --network <mode>` refuses. The preview itself reads
+/// the network through [`project_network`], which also applies the
+/// project's `network.mode`. The tests keep this form to check the flag.
+#[cfg(test)]
 pub(crate) fn preview_host(
     kind: paths::HostKind,
     args: &BoxSpecArgs,
@@ -681,6 +853,45 @@ pub(crate) fn expansion_store_rules(
         .collect()
 }
 
+/// Expands `entry` over `layers` as a create sends it (BOX-071). When the
+/// expanded spec has a `source = "store"` reference and `global` is given,
+/// the client's `[secret-store-rules]` are read once, set as
+/// [`mfile::expand::Layers::store_rules`], and the entry expands again, so
+/// each store reference carries its rule's `upstream` and `inject`.
+///
+/// Returns the expansion and the rules read. The rules are `None` when the
+/// spec has no store reference, or with no `global`.
+///
+/// # Errors
+///
+/// Fails with exit 3 on an entry that does not expand, and on a client
+/// configuration whose store rules do not read.
+pub(crate) fn expand_with_store_rules(
+    global: Option<&GlobalArgs>,
+    entry: &mfile::entry::BoxEntry,
+    layers: &mut mfile::expand::Layers,
+) -> anyhow::Result<(mfile::expand::Expansion, Option<StoreRules>)> {
+    let invalid = |error| crate::ProjectFileInvalid { error };
+    let expansion = mfile::expand::expand(entry, layers).map_err(invalid)?;
+    let Some(global) = global else {
+        return Ok((expansion, None));
+    };
+    let store_ids = store_reference_ids(&expansion.spec);
+    if store_ids.is_empty() {
+        return Ok((expansion, None));
+    }
+    let (_, rules) = crate::config::read_client_config_and_store_rules(global)?;
+    layers.store_rules = expansion_store_rules(&rules);
+    tracing::debug!(
+        entry = %entry.name,
+        store_references = store_ids.len(),
+        store_rules = layers.store_rules.len(),
+        "expanded the entry with the client's secret-store rules"
+    );
+    let expansion = mfile::expand::expand(entry, layers).map_err(invalid)?;
+    Ok((expansion, Some(rules)))
+}
+
 /// An entry's expanded spec, the source of each value, and the proxy rows
 /// of an entry with a credentialed upstream.
 struct EntrySpec {
@@ -800,22 +1011,13 @@ fn expand_entry(
         entry.box_type.as_deref(),
         &project_types,
     );
-    let mut expansion = mfile::expand::expand(entry, &layers).map_err(invalid)?;
     // BOX-071: the client's `[secret-store-rules]` write each store
-    // reference's `upstream` and `inject` into the expanded spec. They are
-    // read once, only for a spec with a store reference, and the proxy rows
-    // below use the same read.
-    // Gap: the v0 spec that a create sends has no `[secrets]` table, so
-    // these values do not reach the daemon yet. #2410 moves the wire to the
-    // expanded spec.
+    // reference's `upstream` and `inject` into the expanded spec, as the
+    // create writes them into the spec it sends. They are read once, only
+    // for a spec with a store reference, and the proxy rows below use the
+    // same read.
+    let (expansion, read_rules) = expand_with_store_rules(Some(global), entry, &mut layers)?;
     let store_ids = store_reference_ids(&expansion.spec);
-    let mut read_rules = None;
-    if !store_ids.is_empty() {
-        let (_, rules) = crate::config::read_client_config_and_store_rules(global)?;
-        layers.store_rules = expansion_store_rules(&rules);
-        expansion = mfile::expand::expand(entry, &layers).map_err(invalid)?;
-        read_rules = Some(rules);
-    }
     let mut spec = expansion.spec;
     let mut sources = std::collections::BTreeMap::new();
     for (key, origin) in &expansion.report.values {
@@ -888,6 +1090,13 @@ fn expand_entry(
             loadout: Some(loadout.name().as_ref().to_owned()),
         })
         .into());
+    }
+    // BOX-206, BOX-207: a loadout that sets `vars` or `vars_lenient`, or a
+    // variable name that is not POSIX-shaped, fails the start, so it fails
+    // the spec the same way.
+    for loadout in &active.loadouts {
+        let layer = crate::loadout_layer(loadout, None)?;
+        mfile::expand::check_loadout_vars(&layer).map_err(invalid)?;
     }
     let loadouts = Some(
         active
@@ -962,12 +1171,12 @@ fn expand_entry(
     network.insert("mode".to_owned(), mode.word().into());
     sources.insert("network.mode".to_owned(), mode_source);
     let egress_flagged = overrides.egress != crate::EgressArgs::default();
-    match egress {
+    match &egress {
         Some(egress) => {
             let had = network.contains_key("egress");
             network.insert(
                 "egress".to_owned(),
-                toml::Value::try_from(&egress).context("Cannot encode the egress")?,
+                toml::Value::try_from(egress).context("Cannot encode the egress")?,
             );
             let mut source = if had {
                 network_label.clone().unwrap_or_default()
@@ -1021,41 +1230,59 @@ fn expand_entry(
             }
         }
     }
-    let mut rows_text = Vec::new();
-    if grants.values().any(SecretGrant::is_credentialed) {
-        let bep: BepSettings = network
-            .get("bep")
-            .cloned()
-            .map(toml::Value::try_into)
-            .transpose()
-            .map_err(|e| invalid(mfile::Error::Format(e)))?
-            .unwrap_or_default();
-        let quic443: Option<Quic443> = network
-            .get("quic443")
-            .cloned()
-            .map(toml::Value::try_into)
-            .transpose()
-            .map_err(|e| invalid(mfile::Error::Format(e)))?;
-        let mut rows = Vec::new();
-        let tables = BepTables {
-            secrets: &secrets_table,
-            network_bep: &bep_table,
-        };
-        proxy_rows(
-            global,
-            &bep,
-            quic443,
-            &grants,
-            mode,
-            tables,
-            read_rules.as_ref(),
-            &mut rows,
-        )?;
-        rows_text = String::from_utf8_lossy(&rows)
+    // #2445: every session entry runs the start's whole check, with or
+    // without a grant, so a refusal of the start (BEP-010 needs no grant) is
+    // a refusal here. `min task run` makes no such check, so a task entry is
+    // checked only for a credentialed grant, as before. Only a credentialed
+    // grant prints rows.
+    let credentialed = grants.values().any(SecretGrant::is_credentialed);
+    if box_type == boxes::TASK_BOX_TYPE && !credentialed {
+        return Ok(EntrySpec {
+            entry: entry.name.clone(),
+            box_type,
+            spec,
+            sources,
+            proxy_rows: Vec::new(),
+            loadouts,
+        });
+    }
+    let bep: BepSettings = network
+        .get("bep")
+        .cloned()
+        .map(toml::Value::try_into)
+        .transpose()
+        .map_err(|e| invalid(mfile::Error::Format(e)))?
+        .unwrap_or_default();
+    let quic443: Option<Quic443> = network
+        .get("quic443")
+        .cloned()
+        .map(toml::Value::try_into)
+        .transpose()
+        .map_err(|e| invalid(mfile::Error::Format(e)))?;
+    let mut rows = Vec::new();
+    let tables = BepTables {
+        secrets: &secrets_table,
+        network_bep: &bep_table,
+    };
+    proxy_rows(
+        global,
+        &bep,
+        quic443,
+        &grants,
+        mode,
+        egress.as_ref(),
+        tables,
+        read_rules.as_ref(),
+        &mut rows,
+    )?;
+    let rows_text = if credentialed {
+        String::from_utf8_lossy(&rows)
             .lines()
             .map(str::to_owned)
-            .collect();
-    }
+            .collect()
+    } else {
+        Vec::new()
+    };
     Ok(EntrySpec {
         entry: entry.name.clone(),
         box_type,
@@ -1369,7 +1596,7 @@ fn write_yaml(value: &serde_json_lenient::Value, indent: usize, out: &mut String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boxes::core::bep::GrantSource;
+    use boxes::core::bep::{ActivationRefused, BepRefusal, GrantSource};
 
     const HOSTS: &[&str] = &[
         "github.com",
@@ -1440,6 +1667,15 @@ mod tests {
         .expect("a store reference parses")
     }
 
+    /// An egress that admits every host of the GitHub set, so a GitHub
+    /// grant passes BEP-008.
+    fn github_egress() -> boxes::EgressPolicy {
+        boxes::EgressPolicy {
+            allow_dns_hosts: Some(HOSTS.iter().map(|host| (*host).to_owned()).collect()),
+            ..boxes::EgressPolicy::default()
+        }
+    }
+
     fn proxy_env() -> BepSettings {
         BepSettings {
             steering: Some(Steering::ProxyEnv),
@@ -1464,6 +1700,7 @@ mod tests {
                 // An own-address box on the VM host, whose switch resolves
                 // box names (BEP-017).
                 network: boxes::NetworkMode::OwnIp,
+                egress: Some(&github_egress()),
                 box_zone_resolver: true,
                 github_hosts: HOSTS,
                 store_rules: &StoreRules::new(),
@@ -1491,6 +1728,15 @@ mod tests {
             basic_auth: None,
             action: None,
         };
+        // The egress admits the rule's upstream, so the start's store
+        // check (BEP-036) accepts the reference.
+        let egress = boxes::EgressPolicy {
+            allow_dns_hosts: Some(vec![
+                "api.anthropic.com".into(),
+                "console.anthropic.com".into(),
+            ]),
+            ..boxes::EgressPolicy::default()
+        };
         let render_with = |rules: &StoreRules| {
             let mut out = Vec::new();
             render(
@@ -1501,6 +1747,7 @@ mod tests {
                     secrets: &secrets,
                     acknowledged: false,
                     network: boxes::NetworkMode::OwnIp,
+                    egress: Some(&egress),
                     box_zone_resolver: false,
                     github_hosts: HOSTS,
                     store_rules: rules,
@@ -1565,6 +1812,7 @@ mod tests {
                 secrets: &secrets,
                 acknowledged: false,
                 network: boxes::NetworkMode::OwnIp,
+                egress: Some(&egress),
                 box_zone_resolver: false,
                 github_hosts: HOSTS,
                 store_rules: &other,
@@ -1594,6 +1842,7 @@ mod tests {
                 secrets: &secrets,
                 acknowledged: false,
                 network: boxes::NetworkMode::OwnIp,
+                egress: Some(&egress),
                 box_zone_resolver: false,
                 github_hosts: HOSTS,
                 store_rules: &other,
@@ -1647,6 +1896,7 @@ mod tests {
                 secrets: &secrets,
                 acknowledged: false,
                 network: boxes::NetworkMode::OwnIp,
+                egress: Some(&github_egress()),
                 box_zone_resolver: false,
                 github_hosts: HOSTS,
                 store_rules: &StoreRules::new(),
@@ -1714,6 +1964,7 @@ mod tests {
                 secrets: &secrets,
                 acknowledged: false,
                 network: boxes::NetworkMode::OwnIp,
+                egress: Some(&github_egress()),
                 box_zone_resolver: false,
                 github_hosts: HOSTS,
                 store_rules: &StoreRules::new(),
