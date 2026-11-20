@@ -4844,20 +4844,12 @@ async fn a_box_holding_a_host_row_refuses_remint_after_its_host_loop_ends() {
         "the refusal must be surfaced as an attach error; got: {refusal:?}"
     );
     assert!(
-        refusal.contains("the VM host daemon released this session's network addresses"),
+        refusal.contains("the VM host released this box's network addresses"),
         "the refusal must name the host-row cause; got: {refusal:?}"
     );
     assert!(
-        refusal.contains("min session activate"),
-        "the refusal must name the step that registers a box again; got: {refusal:?}"
-    );
-    assert!(
-        refusal.contains("min session destroy <session>"),
-        "the refusal must name the session argument the destroy step takes; got: {refusal:?}"
-    );
-    assert!(
-        refusal.contains("run the same command again"),
-        "the refusal must name the re-run that resumes the row; got: {refusal:?}"
+        refusal.contains("Run the same command again to ask for them back"),
+        "the refusal names the re-run that asks for the row back; got: {refusal:?}"
     );
     assert_eq!(
         super::launch_publish_seam::observed(id).len(),
@@ -4873,7 +4865,7 @@ async fn assert_attach_refused_rowless(client: &mut TestClient, id: SessionId) {
     let refusal = collect_to_close(&mut channel).await;
     assert!(
         refusal.contains("Cannot attach to the box:")
-            && refusal.contains("the VM host daemon released this session's network addresses"),
+            && refusal.contains("the VM host released this box's network addresses"),
         "the attach must be refused for the ended host-side row; got: {refusal:?}"
     );
 }

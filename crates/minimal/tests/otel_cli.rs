@@ -65,6 +65,8 @@ async fn run_min_env(
             command.env_remove(&k);
         }
     }
+    // The native test daemon, whatever /dev/kvm allows on this host.
+    command.env("MIN_PROVIDER", "local");
     command.envs(env.iter().copied());
     let t = Instant::now();
     let out = command.output().await.unwrap();
@@ -604,6 +606,8 @@ async fn run_min_tty(
         quote(minimal_dir.to_str().unwrap()),
         "--config-dir".to_owned(),
         quote(config_dir.path().to_str().unwrap()),
+        "--provider".to_owned(),
+        "local".to_owned(),
     ];
     line.extend(extra.iter().map(|a| quote(a)));
     let mut command = tokio::process::Command::new("script");

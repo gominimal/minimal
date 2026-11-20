@@ -5713,3 +5713,42 @@ async fn an_unread_exit_notice_does_not_hold_the_status() {
     .await;
     assert_eq!(status, 125);
 }
+
+/// NET-138. An exec or a run refused because the VM host released the
+/// box's row ends its channel with 1, never the interactive attach's
+/// row-ended status, so `min session exec`, `min box exec` and
+/// `min session run`, which pass the channel's status through, never exit
+/// 253 for it. The exec (`BoxExec`) and the run (`TaskExec`) both turn
+/// `ensure_host`'s [`crate::box_actor::AttachError`] into the stream's
+/// error, as this stream carries it, and the bridge ends it with 1.
+#[tokio::test]
+async fn an_exec_or_run_refused_for_a_released_row_ends_with_1() {
+    use futures::StreamExt as _;
+    let refusal = crate::box_actor::AttachError::BoxHostRowEnded;
+    let stream = futures::stream::iter(vec![Err::<super::testing::MockProcess, _>(
+        std::io::Error::other(format!("{refusal}")),
+    )])
+    .boxed();
+    let (_client_stdin, mut bridge_stdin) = duplex(1024);
+    let (mut bridge_stdout, _client_stdout) = duplex(1024);
+    let (mut bridge_stderr, mut client_stderr) = duplex(4096);
+    let exit = bridge(
+        "test",
+        stream,
+        &mut bridge_stdin,
+        &mut bridge_stdout,
+        &mut bridge_stderr,
+        client_lost(),
+        super::UnreadStdin::Keep,
+    )
+    .await;
+    assert_eq!(exit, 1);
+    assert_ne!(exit, minimald_rpc::ATTACH_ROW_ENDED_EXIT_STATUS);
+    drop(bridge_stderr);
+    let mut err = String::new();
+    client_stderr.read_to_string(&mut err).await.unwrap();
+    assert!(
+        err.contains("the VM host released this box's network addresses"),
+        "{err}"
+    );
+}

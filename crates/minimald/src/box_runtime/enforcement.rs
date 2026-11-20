@@ -963,11 +963,53 @@ pub(super) fn unenforced_placement_notice(
 /// writes an injected process. Everything the program forks later takes the
 /// leaf from its parent, so the box is in its leaf from its first process to
 /// its last.
+///
+/// The placement is confirmed, not assumed: the leaf's own `cgroup.procs` is
+/// read back and must list the supervisor. The write and the read both name
+/// pids in the daemon's PID namespace, where `supervisor` is the pid the
+/// spawn returned. The program is still held at its start gate here, so the
+/// supervisor is alive for the read. An `Err` means the supervisor is not in
+/// the leaf.
 pub(super) fn place_box_processes(
     leaf: &sandbox::config::ClassifierLeaf,
     supervisor: u32,
 ) -> std::io::Result<()> {
-    sandbox::classifier::place_pid(&leaf.procs(), supervisor)
+    sandbox::classifier::place_pid(&leaf.procs(), supervisor)?;
+    let members = std::fs::read_to_string(leaf.procs())?;
+    leaf_lists_pid(&members, supervisor)
+}
+
+/// `Ok` when `members`, the text of a leaf's `cgroup.procs`, lists `pid`:
+/// one pid per line, as the kernel writes it.
+pub(super) fn leaf_lists_pid(members: &str, pid: u32) -> std::io::Result<()> {
+    let pid_text = pid.to_string();
+    if members.lines().any(|line| line.trim() == pid_text) {
+        return Ok(());
+    }
+    Err(std::io::Error::other(format!(
+        "the cgroup does not list process {pid} after the move"
+    )))
+}
+
+/// The error a launch fails with when the box's supervisor could not be
+/// placed in its classifier leaf (NET-079: every process of a host-address
+/// box stays in the cgroup its verdict is decided on). `cause` is
+/// [`place_box_processes`]'s error: a leaf that is gone reads `NotFound`, a
+/// move the kernel refused reads `PermissionDenied`, and anything else,
+/// such as a leaf that does not list the supervisor after the move, says
+/// itself. The daemon logs the full error with the leaf and the pid, which
+/// a `min bug` bundle carries.
+pub(super) fn supervisor_placement_refusal(cause: &std::io::Error) -> std::io::Error {
+    let cause = match cause.kind() {
+        std::io::ErrorKind::NotFound => "The cgroup no longer exists.".to_string(),
+        std::io::ErrorKind::PermissionDenied => "The kernel refused the move.".to_string(),
+        _ => format!("The move failed: {cause}."),
+    };
+    std::io::Error::other(format!(
+        "the box did not start: Minimal could not move the box's supervisor \
+         process into the cgroup that decides the box's network access. {cause} \
+         If it keeps failing, run `min bug` to collect a diagnostic bundle."
+    ))
 }
 
 /// Every process of one box, as a stop signals them (BOX-013): the

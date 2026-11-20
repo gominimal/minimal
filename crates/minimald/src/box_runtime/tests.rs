@@ -9272,7 +9272,7 @@ async fn drain_attach(channel: &mut russh::Channel<russh::client::Msg>) -> (Stri
     (String::from_utf8_lossy(&seen).into_owned(), exit_status)
 }
 
-/// BCLI-068: a stop or a removal while a client is attached ends the
+/// BCLI-068: a stop, a restart or a removal while a client is attached ends the
 /// attach from the daemon's side. The box's entrypoint does not end the box
 /// here, so a shell that exits on its own raises the shell-exit prompt. A
 /// stop signals that same shell, and a removal kills it, but the host knows
@@ -9280,7 +9280,7 @@ async fn drain_attach(channel: &mut russh::Channel<russh::client::Msg>) -> (Stri
 /// "Disconnecting - …" line, and ends with the daemon-ended status, 254.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stop_while_attached_ends_binding_without_shell_exit_prompt() {
-    for end in [BoxEnd::Stop, BoxEnd::Removal] {
+    for end in [BoxEnd::Stop, BoxEnd::Restart, BoxEnd::Removal] {
         let (host, handle) = Host::build(
             MockLauncher::default(),
             HostParams {
@@ -9325,7 +9325,7 @@ async fn stop_while_attached_ends_binding_without_shell_exit_prompt() {
         // then ends the shell as each one does.
         handle.announce_end(end).await;
         match end {
-            BoxEnd::Stop => {
+            BoxEnd::Stop | BoxEnd::Restart => {
                 let pid = handle
                     .get_attrs()
                     .await
@@ -9359,4 +9359,262 @@ async fn stop_while_attached_ends_binding_without_shell_exit_prompt() {
         assert_eq!(DAEMON_ENDED_EXIT_STATUS, 254);
         let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
     }
+}
+
+/// BCLI-068: the stop half of `min box restart` records the `restart`
+/// ending reason on its `exited` event before the restart starts the box
+/// again. A client whose attach the restart ended can read the box
+/// `stopped` between the stop and the start. The event then already names
+/// the restart. A start that fails leaves the box stopped with that event
+/// last. A start that succeeds writes `started` after it. A plain stop
+/// records no such reason. The binding ends a restarted attach with 254, as
+/// it does for a stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_records_restart_reason_before_start() {
+    use crate::box_actor::{STOPPED_BY, STOPPED_BY_RESTART};
+    use boxes::core::record::RecordState;
+    use boxes::events::{BoxEvent, BoxEventType};
+
+    const GRACE: Duration = Duration::from_secs(2);
+
+    assert_eq!(
+        MainloopExitReason::BoxEnded(BoxEnd::Restart).exit_status(),
+        DAEMON_ENDED_EXIT_STATUS
+    );
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+    spec.lifetime = mfile::spec::Lifetime::UntilStopped;
+    spec.pty_enabled = true;
+    let mut req = crate::test_harness::create_session_req("restart-reason", "/uwu");
+    req.spec = Some(serde_json_lenient::to_value(&spec).expect("a spec serializes"));
+    let id = client
+        .call::<minimald_rpc::CreateSession>(&req)
+        .await
+        .unwrap()
+        .id;
+    crate::test_harness::unwrap_ready(
+        client
+            .call::<minimald_rpc::ConfigureLoadout>(&minimald_rpc::ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    match client
+        .call::<minimald_rpc::FinalizeSession>(&minimald_rpc::FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
+        .await
+    {
+        minimald_rpc::Errorable::Ok(_) => {}
+        minimald_rpc::Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+    }
+
+    let manager = server.state.sessions_manager().await;
+    let events = || async { manager.box_events(id).await.unwrap().read_new().unwrap() };
+    let record_state = || async {
+        manager
+            .get_record(crate::box_manager::BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the box keeps its record")
+            .state()
+            .unwrap()
+    };
+    // The client reads these exact strings (`ends_of` in `min`, pinned by
+    // `attach_ended_by_restart_names_restart_exit254`). Pin the wire text here
+    // too, so a change on either side fails a test.
+    assert_eq!((STOPPED_BY, STOPPED_BY_RESTART), ("stopped_by", "restart"));
+    let by_restart =
+        |event: &BoxEvent| event.data.get("stopped_by").and_then(|v| v.as_str()) == Some("restart");
+    manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves")
+        .ensure_host("tester".to_string())
+        .await
+        .expect("a running box launches a headless host");
+
+    // The start fails: what the stop half recorded is all there is, so it
+    // was recorded before the start.
+    let before = events().await.len();
+    crate::box_actor::restart_launch_seam::fail_next(id);
+    match manager.restart_box_with_grace(id, GRACE).await {
+        Err(crate::box_actor::RestartError::Failed(_)) => {}
+        other => panic!("the restart's start did not fail: {other:?}"),
+    }
+    let RecordState::Stopped(_) = record_state().await else {
+        panic!("a failed start leaves the box stopped");
+    };
+    let added = events().await.split_off(before);
+    let kinds: Vec<_> = added.iter().map(|event| event.kind).collect();
+    assert_eq!(kinds, [BoxEventType::Exited], "{added:?}");
+    assert_eq!(added[0].data["reason"], "stopped", "{added:?}");
+    assert!(
+        by_restart(&added[0]),
+        "the stop half names the restart: {added:?}"
+    );
+
+    // The actor ended with the failed start. The next restart starts the
+    // box from stopped, and so has no stop half.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let restarted = loop {
+        match manager.restart_box_with_grace(id, GRACE).await {
+            Err(crate::box_actor::RestartError::Failed(error))
+                if error
+                    .to_string()
+                    .contains("ended before its restart finished")
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            other => break other,
+        }
+    };
+    assert!(!restarted.expect("the box starts from stopped"));
+    assert_eq!(record_state().await, RecordState::Running);
+
+    // A restart of the running box records the restart, then `started`.
+    let before = events().await.len();
+    assert!(
+        manager
+            .restart_box_with_grace(id, GRACE)
+            .await
+            .expect("the running box restarts"),
+        "the restart stopped a running box"
+    );
+    assert_eq!(record_state().await, RecordState::Running);
+    let added = events().await.split_off(before);
+    let exited = added
+        .iter()
+        .position(|event| event.kind == BoxEventType::Exited)
+        .unwrap_or_else(|| panic!("the stop half recorded its end: {added:?}"));
+    let started = added
+        .iter()
+        .rposition(|event| event.kind == BoxEventType::Started)
+        .unwrap_or_else(|| panic!("the start recorded `started`: {added:?}"));
+    assert!(exited < started, "{added:?}");
+    assert!(by_restart(&added[exited]), "{added:?}");
+
+    // A plain stop names no restart.
+    let before = events().await.len();
+    manager
+        .stop_box_with_grace(id, false, GRACE)
+        .await
+        .expect("the box stops");
+    let added = events().await.split_off(before);
+    let exited: Vec<_> = added
+        .iter()
+        .filter(|event| event.kind == BoxEventType::Exited)
+        .collect();
+    assert_eq!(exited.len(), 1, "{added:?}");
+    assert_eq!(exited[0].data["reason"], "stopped", "{added:?}");
+    assert!(exited[0].data.get(STOPPED_BY).is_none(), "{added:?}");
+}
+
+/// NET-079: the supervisor's placement is confirmed by the leaf's own
+/// members, never assumed from the write. A pid counts only as a whole line,
+/// so a pid that shares digits with a member is not taken for it.
+#[test]
+fn a_supervisor_placement_is_confirmed_by_the_leafs_members() {
+    assert!(super::leaf_lists_pid("41\n4242\n", 4242).is_ok());
+    assert!(super::leaf_lists_pid("4242", 4242).is_ok());
+    for members in ["", "424\n", "42420\n", "14242\n"] {
+        assert!(
+            super::leaf_lists_pid(members, 4242).is_err(),
+            "{members:?} does not list 4242"
+        );
+    }
+}
+
+/// NET-079: a supervisor the daemon could not write into its leaf is an
+/// error, which the launch turns into a refused start. A stand-in leaf with
+/// no `cgroup.procs` refuses the write the way a removed leaf does.
+#[test]
+fn a_supervisor_placement_the_leaf_refuses_is_an_error() {
+    let dir = tempfile::tempdir().expect("a stand-in tree");
+    let leaf = sandbox::config::ClassifierLeaf::new(dir.path().join("boxes/deny/b1"));
+    let err = super::place_box_processes(&leaf, std::process::id())
+        .expect_err("no cgroup.procs to write the supervisor into");
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+/// The text a launch fails with when its supervisor could not be placed:
+/// what failed, the cause the placement's error names, and one command.
+#[test]
+fn the_supervisor_placement_refusal_says_the_box_did_not_start() {
+    let refusal = |cause: std::io::Error| super::supervisor_placement_refusal(&cause).to_string();
+    let head = "the box did not start: Minimal could not move the box's supervisor \
+                process into the cgroup that decides the box's network access.";
+    let tail = "If it keeps failing, run `min bug` to collect a diagnostic bundle.";
+    assert_eq!(
+        refusal(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        format!("{head} The cgroup no longer exists. {tail}")
+    );
+    assert_eq!(
+        refusal(std::io::Error::from_raw_os_error(libc::EACCES)),
+        format!("{head} The kernel refused the move. {tail}")
+    );
+    assert_eq!(
+        refusal(super::leaf_lists_pid("41\n", 4242).expect_err("4242 is not listed")),
+        format!(
+            "{head} The move failed: the cgroup does not list process 4242 after the move. {tail}"
+        )
+    );
+}
+
+/// An abandoned launch kills its box's processes, not only the supervisor.
+/// A program that has not armed `PR_SET_PDEATHSIG` yet outlives a killed
+/// supervisor and would exec once its start gate is gone. The stand-in
+/// supervisor's child here never arms it, so only `kill_abandoned_box`
+/// ends it.
+#[test]
+fn an_abandoned_launch_kills_the_program_the_supervisor_forked() {
+    use std::io::BufRead as _;
+    let mut supervisor = std::process::Command::new("sh")
+        .args(["-c", "sleep 600 & echo $!; wait"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("a stand-in supervisor");
+    let mut line = String::new();
+    std::io::BufReader::new(supervisor.stdout.take().expect("piped stdout"))
+        .read_line(&mut line)
+        .expect("the program's pid");
+    let program: i32 = line.trim().parse().expect("a pid");
+    let program_ends = |within: Duration| {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            // Gone, or a zombie its parent has not reaped: either has ended.
+            let ended =
+                std::fs::read_to_string(format!("/proc/{program}/stat")).map_or(true, |stat| {
+                    stat.rsplit_once(')')
+                        .and_then(|(_, rest)| rest.split_whitespace().next())
+                        .is_some_and(|state| matches!(state, "Z" | "X"))
+                });
+            if ended || std::time::Instant::now() >= deadline {
+                return ended;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    assert!(
+        !program_ends(Duration::ZERO),
+        "the program runs before the kill"
+    );
+
+    super::kill_abandoned_box(supervisor.id());
+
+    let ended = program_ends(Duration::from_secs(10));
+    let _ = supervisor.kill();
+    let _ = supervisor.wait();
+    if !ended {
+        // SAFETY: kill(2) reads no memory of ours.
+        unsafe { libc::kill(program, libc::SIGKILL) };
+    }
+    assert!(ended, "the program the supervisor forked is killed with it");
 }

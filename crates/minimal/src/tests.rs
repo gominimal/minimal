@@ -8384,7 +8384,7 @@ async fn every_box_verb_refuses_box_on_stopped_vm() {
     results.push(("box exec", exec.expect_err("exec")));
     let attach = cmd::box_attach_exec_target(hosts(), "beta", FIRST_EXEC_ID).await;
     results.push(("box attach --exec", attach.expect_err("attach")));
-    let rm = cmd::rm_box_on_hosts(hosts(), "beta", false).await;
+    let rm = cmd::rm_box_on_hosts(hosts(), "beta", false, &mut confirmed_rm()).await;
     results.push(("box rm", rm.expect_err("rm")));
     let stop = cmd::stop_box_on_hosts(hosts(), &mut Vec::new(), "beta", false).await;
     results.push(("box stop", stop.expect_err("stop")));
@@ -9941,7 +9941,7 @@ async fn ambiguous_name_across_hosts_exit2_lists_candidates_for_stop_and_rm() {
     let stop = cmd::stop_box_on_hosts(hosts.clone(), &mut out, "web", false)
         .await
         .expect_err("stop refuses the name");
-    let rm = cmd::rm_box_on_hosts(hosts, "web", true)
+    let rm = cmd::rm_box_on_hosts(hosts, "web", true, &mut confirmed_rm())
         .await
         .expect_err("rm refuses the name");
     for err in [stop, rm] {
@@ -9991,7 +9991,7 @@ async fn unqualified_name_with_unreachable_host_exit7_names_host_for_stop_and_rm
     let stop = cmd::stop_box_on_hosts(hosts.clone(), &mut Vec::new(), "web", false)
         .await
         .expect_err("stop refuses the name");
-    let rm = cmd::rm_box_on_hosts(hosts, "web", true)
+    let rm = cmd::rm_box_on_hosts(hosts, "web", true, &mut confirmed_rm())
         .await
         .expect_err("rm refuses the name");
     for err in [stop, rm] {
@@ -10244,6 +10244,176 @@ where
     exit
 }
 
+/// A `min box rm` prompt for a person on a terminal who answers yes.
+fn confirmed_rm() -> RmPrompt<'static> {
+    RmPrompt {
+        no_input: false,
+        stdin_is_terminal: true,
+        ask: Box::new(|_, _| Ok(true)),
+    }
+}
+
+/// A `min box rm` prompt with no person to answer it: `--no-input` off a
+/// terminal. Asking it fails the test.
+fn headless_rm() -> RmPrompt<'static> {
+    RmPrompt {
+        no_input: true,
+        stdin_is_terminal: false,
+        ask: Box::new(|_, question| panic!("a headless min box rm asked: {question}")),
+    }
+}
+
+// BCLI-004: `min box rm` without `--force` asks before it removes a box
+// whose files changed. A clean box is removed. A changed box on a terminal
+// is asked about, and "no" aborts. Off a terminal, a changed box or one
+// whose files cannot be checked is refused with exit 2, naming `--force`.
+// `--force` removes the box without the question.
+#[tokio::test]
+async fn box_rm_without_force_gates_changed_files() {
+    let changed = vec![
+        "1 file with uncommitted changes:".to_owned(),
+        "  notes.txt".to_owned(),
+    ];
+    let dirty = AtRiskState::Dirty(changed.clone());
+    let question = "Remove web? This permanently deletes its files.".to_owned();
+
+    // A clean box: removed, and nobody is asked.
+    rm_gate("web", false, &AtRiskState::Clean, &mut headless_rm()).expect("a clean box is removed");
+
+    // A changed box on a terminal: the changed files and the question,
+    // and "no" aborts.
+    let mut asked = Vec::new();
+    let mut prompt = RmPrompt {
+        no_input: false,
+        stdin_is_terminal: true,
+        ask: Box::new(|lines: &[String], question: &str| {
+            asked.push((lines.to_vec(), question.to_owned()));
+            Ok(false)
+        }),
+    };
+    let err = rm_gate("web", false, &dirty, &mut prompt).expect_err("no aborts the removal");
+    drop(prompt);
+    assert!(err.is::<RmAborted>(), "{err:#}");
+    assert_eq!(asked, vec![(changed.clone(), question.clone())]);
+
+    // A changed box with no person to answer: exit 2, naming `--force`.
+    for (no_input, stdin_is_terminal) in [(true, true), (false, false), (true, false)] {
+        let mut prompt = RmPrompt {
+            no_input,
+            stdin_is_terminal,
+            ask: Box::new(|_, question| panic!("a headless min box rm asked: {question}")),
+        };
+        let err = rm_gate("web", false, &dirty, &mut prompt).expect_err("refused headless");
+        assert_eq!(
+            box_command_ending(&Err(err)),
+            (
+                "web has changed files, so it was not removed. \
+                 Removing it deletes them. \
+                 Run min box rm web --force to remove it anyway."
+                    .to_owned(),
+                2
+            ),
+            "no_input {no_input}, stdin_is_terminal {stdin_is_terminal}"
+        );
+    }
+
+    // A state that cannot be read is gated too: asked on a terminal, with
+    // a line that says so.
+    let mut asked = Vec::new();
+    let mut prompt = RmPrompt {
+        no_input: false,
+        stdin_is_terminal: true,
+        ask: Box::new(|lines: &[String], question: &str| {
+            asked.push((lines.to_vec(), question.to_owned()));
+            Ok(true)
+        }),
+    };
+    rm_gate("web", false, &AtRiskState::Unknowable, &mut prompt).expect("yes removes the box");
+    drop(prompt);
+    assert_eq!(
+        asked,
+        vec![(
+            vec!["The files of web could not be checked for changes.".to_owned()],
+            question.clone()
+        )]
+    );
+
+    // `--force`: removed, and nobody is asked.
+    for state in [AtRiskState::Clean, dirty, AtRiskState::Unknowable] {
+        rm_gate("web", true, &state, &mut headless_rm()).expect("--force removes the box");
+    }
+
+    // Over a harness daemon: the daemon cannot read the files of a stopped
+    // box, so a headless `min box rm` refuses it with exit 2 and the box
+    // stays. `min box rm --force` removes it.
+    let state = tempfile::tempdir().expect("a temp minimal state dir");
+    let global = GlobalArgs {
+        repo_dir: None,
+        minimal_dir: Some(state.path().to_path_buf()),
+        config_dir: None,
+        provider: Some(Provider::LocalMinimald),
+        no_input: true,
+        vm: None,
+    };
+    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
+        .expect("the native daemon's socket path");
+    std::fs::create_dir_all(sock.parent().expect("the socket has a dir"))
+        .expect("the native daemon's state dir");
+    let server = minimald::test_harness::TestServer::new().await;
+    server.listen_on_uds(&sock).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let mut daemon = server.connect().await;
+    let id = minimald::test_harness::create_configured_session(
+        &mut daemon,
+        "web",
+        project.path().to_str().expect("a UTF-8 project path"),
+    )
+    .await
+    .to_string();
+    let listed = async || -> Vec<String> {
+        let mut client = connect_daemon(&global).await.expect("the daemon");
+        list_box_records(&mut client, None)
+            .await
+            .expect("the listing")
+            .into_iter()
+            .map(|entry| entry.box_id.to_string())
+            .collect()
+    };
+
+    stop_box_on_hosts(local_hosts(&global).unwrap(), &mut Vec::new(), "web", false)
+        .await
+        .expect("the box stops");
+    let result = rm_box_on_hosts(
+        local_hosts(&global).unwrap(),
+        "web",
+        false,
+        &mut headless_rm(),
+    )
+    .await
+    .map(drop);
+    assert_eq!(
+        box_command_ending(&result),
+        (
+            "The files of web could not be checked for changes, \
+             so it was not removed. \
+             Run min box rm web --force to remove it anyway."
+                .to_owned(),
+            2
+        )
+    );
+    assert!(listed().await.contains(&id), "the refused box stays");
+
+    rm_box_on_hosts(
+        local_hosts(&global).unwrap(),
+        "web",
+        true,
+        &mut headless_rm(),
+    )
+    .await
+    .expect("--force removes the box");
+    assert!(!listed().await.contains(&id), "the box is removed");
+}
+
 // The first slice end to end (BCLI-001, BCLI-003, BCLI-004, BCLI-051,
 // BCLI-059, BCLI-060): `min box list|show|stop|rm` of one box over a
 // harness daemon that the native host's socket serves. Each step resolves
@@ -10378,7 +10548,7 @@ async fn box_first_slice_list_show_stop_rm_end_to_end() {
     // `--force`, and the box keeps running.
     let rm = async |out: &mut Vec<u8>| {
         let _ = out;
-        rm_box_on_hosts(local_hosts(&global)?, "web", false).await?;
+        rm_box_on_hosts(local_hosts(&global)?, "web", false, &mut confirmed_rm()).await?;
         Ok(())
     };
     let exit = run_box_command(&mut runs, "rm", "min box rm web".into(), &id, rm).await;
@@ -11840,7 +12010,7 @@ async fn attach_ended_from_other_side_notice_exit254() {
         None,
         true,
         async |_: &BoxAttachTarget| {
-            cmd::rm_box_on_hosts(hosts.clone(), "web", true)
+            cmd::rm_box_on_hosts(hosts.clone(), "web", true, &mut confirmed_rm())
                 .await
                 .expect("the removal succeeds");
             Ok(254)
@@ -11931,9 +12101,25 @@ async fn attach_ended_from_other_side_notice_exit254() {
 /// count that rose is a restart. A count that did not rise is another
 /// terminal. A count that the host did not give names no cause, so the
 /// line names the host that ended the attach.
+///
+/// The command can read the box between the restart's stop and its start.
+/// It reads `stopped` then, and the restart's stop wrote the `restart`
+/// ending reason on its `exited` event. A new end that names the restart is
+/// a restart. Any other read of a stopped box is a stop.
 #[test]
 fn attach_ended_by_restart_names_restart_exit254() {
-    use cmd::{BoxRestart, EndsBefore, attach_restart, box_attach_ending, ends_show_restart};
+    use cmd::{
+        BoxRestart, EndsAfter, EndsBefore, attach_restart, box_attach_ending, ends_of,
+        ends_show_restart, stop_shows_restart,
+    };
+    let count = |count: u64| EndsAfter {
+        count,
+        last_by_restart: false,
+    };
+    let by_restart = |count: u64| EndsAfter {
+        count,
+        last_by_restart: true,
+    };
 
     assert_eq!(
         ends_show_restart(EndsBefore::Running(Some(1)), Some(2)),
@@ -11967,7 +12153,7 @@ fn attach_ended_by_restart_names_restart_exit254() {
             &target,
             254,
             &running,
-            attach_restart(254, &running, before, after),
+            attach_restart(254, &running, before, after.map(count)),
         )
         .expect("an ending")
     };
@@ -12013,7 +12199,7 @@ fn attach_ended_by_restart_names_restart_exit254() {
     // that runs.
     let mut stopped = ending_entry("stopped");
     stopped.reason = Some("stopped".to_owned());
-    let rose = (EndsBefore::Running(Some(0)), Some(1));
+    let rose = (EndsBefore::Running(Some(0)), Some(count(1)));
     for (code, after) in [
         (0, running.clone()),
         (255, running.clone()),
@@ -12033,25 +12219,118 @@ fn attach_ended_by_restart_names_restart_exit254() {
         BoxRestart::Restarted
     );
     assert_eq!(
-        attach_restart(254, &running, EndsBefore::Running(Some(1)), Some(1)),
+        attach_restart(254, &running, EndsBefore::Running(Some(1)), Some(count(1))),
         BoxRestart::NotRestarted
     );
     assert_eq!(
         attach_restart(254, &running, EndsBefore::Running(Some(1)), None),
         BoxRestart::Unread
     );
+
+    // A box that reads `stopped`: only a new end that names the restart is
+    // a restart.
+    let stopped_after = BoxAfterAttach::Listed(stopped.clone());
     assert_eq!(
-        box_attach_ending(
-            &target,
-            254,
-            &BoxAfterAttach::Listed(stopped),
-            BoxRestart::Restarted
+        stop_shows_restart(EndsBefore::Running(Some(0)), Some(by_restart(1))),
+        BoxRestart::Restarted
+    );
+    for (before, after, why) in [
+        (EndsBefore::Running(Some(0)), Some(count(1)), "a plain stop"),
+        (
+            EndsBefore::Running(Some(1)),
+            Some(by_restart(1)),
+            "an end from before the attach",
         ),
+        (
+            EndsBefore::Running(None),
+            Some(by_restart(1)),
+            "a count before that was not read",
+        ),
+        (
+            EndsBefore::Running(Some(0)),
+            None,
+            "ends after that were not read",
+        ),
+        (
+            EndsBefore::Ended(0),
+            Some(by_restart(1)),
+            "a box that did not run",
+        ),
+    ] {
+        assert_eq!(
+            stop_shows_restart(before, after),
+            BoxRestart::NotRestarted,
+            "{why}"
+        );
+        assert_eq!(
+            box_attach_ending(
+                &target,
+                254,
+                &stopped_after,
+                attach_restart(254, &stopped_after, before, after)
+            ),
+            Ok(AttachEnding {
+                code: 254,
+                notice: Some("Detached: web was stopped.".to_owned())
+            }),
+            "{why} is a stop"
+        );
+    }
+    let restarted = attach_restart(
+        254,
+        &stopped_after,
+        EndsBefore::Running(Some(0)),
+        Some(by_restart(1)),
+    );
+    assert_eq!(restarted, BoxRestart::Restarted);
+    assert_eq!(
+        box_attach_ending(&target, 254, &stopped_after, restarted),
+        Ok(AttachEnding {
+            code: 254,
+            notice: Some(
+                "Detached: web was restarted. Run min box attach web to attach again.".to_owned()
+            )
+        }),
+        "a stopped box whose new end names the restart"
+    );
+    assert_eq!(
+        attach_restart(
+            0,
+            &stopped_after,
+            EndsBefore::Running(Some(0)),
+            Some(by_restart(1))
+        ),
+        BoxRestart::NotRestarted,
+        "only a 254 names a restart"
+    );
+    assert_eq!(
+        box_attach_ending(&target, 254, &stopped_after, BoxRestart::Unread),
         Ok(AttachEnding {
             code: 254,
             notice: Some("Detached: web was stopped.".to_owned())
-        })
+        }),
+        "a stopped record still proves a stop"
     );
+
+    // The ends come from the `exited` events, and the last one decides.
+    let exited = |data: &[(&str, &str)]| boxes::events::BoxEvent {
+        box_id: boxes::SessionId::nil(),
+        parent: None,
+        ts: 0,
+        kind: boxes::events::BoxEventType::Exited,
+        data: data
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).into()))
+            .collect(),
+    };
+    let restart_stop = exited(&[("reason", "stopped"), ("stopped_by", "restart")]);
+    let plain_stop = exited(&[("reason", "stopped")]);
+    assert_eq!(ends_of(&[]), count(0));
+    assert_eq!(
+        ends_of(&[plain_stop.clone(), restart_stop.clone()]),
+        by_restart(2)
+    );
+    assert_eq!(ends_of(&[restart_stop, plain_stop]), count(2));
     for restarted in [BoxRestart::Restarted, BoxRestart::Unread] {
         assert_eq!(
             box_attach_ending(&target, 0, &running, restarted),
@@ -12071,8 +12350,10 @@ fn attach_ended_by_restart_names_restart_exit254() {
 /// start half itself: it writes back the record of the running box.
 ///
 /// A restart stops the box and then starts it. When the command reads the
-/// box between the two, it reads `stopped` and prints the line for a stop.
-/// The second case pins that, with the box left stopped.
+/// box between the two, it reads `stopped`. The restart's stop wrote the
+/// `restart` ending reason on its `exited` event, so the command still
+/// prints the line for a restart. The second case pins that, with the box
+/// left stopped.
 #[tokio::test]
 async fn attach_ended_by_restart_names_restart_exit254_through_the_host() {
     let (alpha, state) = exec_attach_host("alpha.local-minvmd0").await;
@@ -12093,7 +12374,10 @@ async fn attach_ended_by_restart_names_restart_exit254_through_the_host() {
             true,
             "Detached: web was restarted. Run min box attach web to attach again.",
         ),
-        (false, "Detached: web was stopped."),
+        (
+            false,
+            "Detached: web was restarted. Run min box attach web to attach again.",
+        ),
     ] {
         let (attached_tx, attached_rx) = tokio::sync::oneshot::channel::<()>();
         let (restarted_tx, restarted_rx) = tokio::sync::oneshot::channel::<()>();
@@ -12211,7 +12495,7 @@ async fn attach_ended_from_other_side_notice_exit254_before_the_record() {
 /// next round of a test attaches to a running box. A harness box resumes
 /// through the same create flow, so this creates it afresh under the name.
 async fn resume_for_attach_test(daemon: &mut minimald::test_harness::TestClient, host: &LocalHost) {
-    cmd::rm_box_on_hosts(vec![host.clone()], "web", true)
+    cmd::rm_box_on_hosts(vec![host.clone()], "web", true, &mut confirmed_rm())
         .await
         .expect("the stopped box is removed");
     let project = tempfile::TempDir::new().unwrap();
@@ -12498,7 +12782,13 @@ async fn box_address_and_json_output_end_to_end() {
     assert_eq!(exit, 0, "{transcript}");
     let rm = async |out: &mut Vec<u8>| {
         let _ = out;
-        rm_box_on_hosts(local_hosts(&global)?, &qualified, false).await?;
+        rm_box_on_hosts(
+            local_hosts(&global)?,
+            &qualified,
+            false,
+            &mut confirmed_rm(),
+        )
+        .await?;
         Ok(())
     };
     let command = format!("min box rm {qualified}");
@@ -13527,9 +13817,14 @@ async fn events_follow_replays_then_tails() {
             .expect("the box stops");
         let tailed = shared.more_than(replayed.len()).await;
         assert_eq!(tailed[..replayed.len()], replayed[..]);
-        rm_box_on_hosts(local_hosts(&global).unwrap(), "web", false)
-            .await
-            .expect("the stopped box is removed");
+        rm_box_on_hosts(
+            local_hosts(&global).unwrap(),
+            "web",
+            false,
+            &mut confirmed_rm(),
+        )
+        .await
+        .expect("the stopped box is removed");
     };
     let (followed, ()) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
         tokio::join!(follow, drive)
@@ -15054,9 +15349,14 @@ async fn type_noun_logs_follow() {
             stop_box_on_hosts(local_hosts(&global).unwrap(), &mut Vec::new(), name, false)
                 .await
                 .expect("the box stops");
-            rm_box_on_hosts(local_hosts(&global).unwrap(), name, false)
-                .await
-                .expect("the stopped box is removed");
+            rm_box_on_hosts(
+                local_hosts(&global).unwrap(),
+                name,
+                false,
+                &mut confirmed_rm(),
+            )
+            .await
+            .expect("the stopped box is removed");
         }
     };
     let (results, ()) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
@@ -18972,6 +19272,141 @@ async fn box_spec_path_form_renders_bep_rows() {
         "min box spec does not take --ingress when it shows the project's proxy rows. \
          Run min box spec without --ingress."
     );
+}
+
+// D3598: bare `min box spec` reads the expanded session entry, so a
+// `[defaults.network.bep]` steering mode reaches its steering row, the same
+// value that `min box spec default` shows.
+#[tokio::test]
+async fn box_spec_bare_reads_defaults_network_bep() {
+    let (_project, global) = spec_project(
+        "[defaults.network.bep]\nsteering = \"proxy_env\"\n\n\
+         [sessions.default]\npackages = [\"git\"]\n\n\
+         [sessions.default.secrets.GH_TOKEN]\nsource = \"broker\"\nscopes = [\"github:full\"]\n",
+    );
+    let bare = box_spec_text(&global, &["min", "box", "spec", "--network", "host_ip"])
+        .await
+        .expect("the rows render");
+    assert!(bare.contains("\nsteering  proxy_env\n"), "{bare}");
+    assert!(bare.contains("GH_TOKEN"), "{bare}");
+
+    let entry = box_spec_text(&global, &["min", "box", "spec", "default"])
+        .await
+        .expect("the entry renders");
+    assert!(entry.contains("# steering  proxy_env\n"), "{entry}");
+}
+
+// D3598: bare `min box spec` stays a read-only preview when the start
+// cannot pick one session entry. Two session entries and no `default`
+// render the merged `[defaults]` and `[defaults.session]` rows, not the
+// start's refusal.
+#[tokio::test]
+async fn box_spec_bare_reads_defaults_network_bep_undecided_entry() {
+    let (_project, global) = spec_project(
+        "[defaults.session.network.bep]\nsteering = \"proxy_env\"\n\n\
+         [defaults.session.secrets.GH_TOKEN]\nsource = \"broker\"\nscopes = [\"github:full\"]\n\n\
+         [sessions.one]\npackages = [\"git\"]\n\n\
+         [sessions.two]\npackages = [\"git\"]\n",
+    );
+    let bare = box_spec_text(&global, &["min", "box", "spec", "--network", "host_ip"])
+        .await
+        .expect("the rows render without a picked session entry");
+    assert!(bare.contains("\nsteering  proxy_env\n"), "{bare}");
+}
+
+// D3598: with no single session entry, bare `min box spec` still merges
+// the top-level `[defaults]` under `[defaults.session]`, so a
+// `[defaults.network.bep]` steering mode reaches its row and the command
+// succeeds.
+#[tokio::test]
+async fn box_spec_bare_reads_defaults_network_bep_top_level_undecided_entry() {
+    let (_project, global) = spec_project(
+        "[defaults.network.bep]\nsteering = \"proxy_env\"\n\n\
+         [defaults.session.secrets.GH_TOKEN]\nsource = \"broker\"\nscopes = [\"github:full\"]\n\n\
+         [sessions.one]\npackages = [\"git\"]\n\n\
+         [sessions.two]\npackages = [\"git\"]\n",
+    );
+    let bare = box_spec_text(&global, &["min", "box", "spec", "--network", "host_ip"])
+        .await
+        .expect("the rows render without a picked session entry");
+    assert!(bare.contains("\nsteering  proxy_env\n"), "{bare}");
+    assert!(bare.contains("GH_TOKEN"), "{bare}");
+}
+
+// D3598: with no single session entry, bare `min box spec` expands an
+// entry with an empty body as `min box start` expands a picked entry, type
+// chain included. Its rows match the start projection of an entry with an
+// empty body, and a project type that extends `session` does not reach
+// them.
+#[tokio::test]
+async fn box_spec_bare_reads_defaults_network_bep_matches_start_projection() {
+    let (project, global) = spec_project(
+        "[defaults.network.bep]\nsteering = \"proxy_env\"\n\n\
+         [defaults.session.secrets.GH_TOKEN]\nsource = \"broker\"\nscopes = [\"github:full\"]\n\n\
+         [box_types.dev]\nextends = \"session\"\n\n\
+         [box_types.dev.defaults.network.bep]\nsteering = \"dns\"\n\n\
+         [sessions.one]\n\n\
+         [sessions.two]\n",
+    );
+    let path = camino::Utf8Path::from_path(project.path()).expect("a UTF-8 path");
+    let (start_bep, start_secrets, _, start_quic443) =
+        crate::project_bep_and_grants(path, Some("one")).expect("the start projection");
+    assert_eq!(
+        start_bep.steering,
+        Some(boxes::core::bep::Steering::ProxyEnv)
+    );
+    assert!(start_secrets.contains_key("GH_TOKEN"), "{start_secrets:?}");
+    assert_eq!(start_quic443, None);
+
+    let bare = box_spec_text(&global, &["min", "box", "spec", "--network", "host_ip"])
+        .await
+        .expect("the rows render without a picked session entry");
+    assert!(bare.contains("\nsteering  proxy_env\n"), "{bare}");
+    assert!(bare.contains("GH_TOKEN"), "{bare}");
+}
+
+// D3598: with no single session entry, bare `min box spec` checks the
+// grants it reads from the merged `[defaults]` and `[defaults.session]`
+// tables against the egress of that same entry. A `[defaults.network]`
+// egress that admits the GitHub hosts lets an `own_ip` preview render the
+// broker grant, and the command does not refuse.
+#[tokio::test]
+async fn box_spec_bare_reads_defaults_network_bep_undecided_entry_own_ip_egress() {
+    let (_project, global) = spec_project(
+        "[defaults.network.bep]\nsteering = \"proxy_env\"\n\n\
+         [defaults.network.egress]\nallow_dns_hosts = [\"github.com\", \"api.github.com\", \
+         \"uploads.github.com\", \"codeload.github.com\"]\n\n\
+         [defaults.session.secrets.GH_TOKEN]\nsource = \"broker\"\nscopes = [\"github:full\"]\n\n\
+         [sessions.one]\npackages = [\"git\"]\n\n\
+         [sessions.two]\npackages = [\"git\"]\n",
+    );
+    let bare = box_spec_text(&global, &["min", "box", "spec", "--network", "own_ip"])
+        .await
+        .expect("the rows render, and the egress admits the grant");
+    assert!(bare.contains("GH_TOKEN"), "{bare}");
+}
+
+// D3598: bare `min box spec` falls back to the merged `[defaults]` rows
+// only for several session entries with no `default`. A `default` entry of
+// a project Box Type keeps the start's refusal and prints no proxy rows.
+#[tokio::test]
+async fn box_spec_bare_reads_defaults_network_bep_project_type_refuses() {
+    let (_project, global) = spec_project(
+        "[defaults.network.bep]\nsteering = \"proxy_env\"\n\n\
+         [box_types.mydev]\nextends = \"session\"\n\n\
+         [boxes.default]\ntype = \"mydev\"\n",
+    );
+    let error = box_spec_text(&global, &["min", "box", "spec", "--network", "host_ip"])
+        .await
+        .expect_err("a project Box Type keeps the refusal");
+    assert!(
+        matches!(
+            error.downcast_ref::<crate::SessionEntryUndecided>(),
+            Some(crate::SessionEntryUndecided::TypeUnresolved { name, .. }) if name == "default"
+        ),
+        "{error:#}"
+    );
+    assert!(!format!("{error:#}").contains("steering"), "{error:#}");
 }
 
 // BCLI-021: `min box spec <entry>` with the `[network]` override flags
@@ -24747,4 +25182,339 @@ fn box_verbs_complete_box_names() {
             );
         }
     }
+}
+
+/// NET-138: an interactive attach that the in-VM daemon refuses because the
+/// VM host withdrew the box's row ends with its own status. The client then
+/// asks the VM host for the row back with a resume, presenting the record's
+/// name, pair and box id, and attaches one more time. The box keeps its id
+/// and its addresses: the record the attach read stays right, and nothing
+/// new is registered. When the second attach is refused too, `min` exits 1
+/// and asks for the row no third time.
+///
+/// The box's shell exit is stood in for by its record: a launch bound the
+/// row, and the daemon restarted with no host in the box's slot. No VM host
+/// answers the daemon's own read of the row, so the row reads as withdrawn
+/// on both attaches. A stand-in VM host answers the client's resume on the
+/// control socket beside the daemon's ssh socket.
+#[tokio::test]
+async fn attach_after_row_withdrawn_resumes_the_same_creation() {
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+        FinalizeSessionRequest,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+    const PAIR: boxes::BoxAddresses = boxes::BoxAddresses {
+        switch_address: std::net::Ipv4Addr::new(100, 64, 128, 40),
+        loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 40),
+    };
+    let box_id = minimald_rpc::BoxId::from_bytes([0x50; 16]);
+
+    // An own-address box with the addresses its registration handed.
+    let state = tempfile::TempDir::new().unwrap();
+    let state_path = state.path().to_path_buf();
+    let server = minimald::test_harness::TestServer::new_in(state).await;
+    let mut daemon = server.connect().await;
+    let mut request = minimald::test_harness::create_session_req("web", "/uwu");
+    request.config.network = boxes::NetworkMode::OwnIp;
+    request.config.box_addresses = Some(PAIR);
+    let id = daemon.call::<CreateSession>(&request).await.unwrap().id;
+    minimald::test_harness::unwrap_ready(
+        daemon
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    match daemon
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
+        .await
+    {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+    }
+    drop(daemon);
+
+    // A launch bound the row under the id the VM host minted, and the
+    // daemon restarted. The daemon takes a box id only from the VM host
+    // daemon at creation, and this test has none then, so the record is
+    // seeded with it.
+    let record_path = box_state_dir(&state_path, id).join("record.json");
+    let mut record: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+    record["host_row_bound"] = serde_json_lenient::Value::Bool(true);
+    record["box_id"] = serde_json_lenient::Value::String(box_id.simple().to_string());
+    std::fs::write(&record_path, serde_json_lenient::to_vec(&record).unwrap()).unwrap();
+    let server = minimald::test_harness::TestServer::new_in(server.into_state_dir()).await;
+
+    // The daemon serves the ssh socket of a VM host's provider dir.
+    let dir = tempfile::TempDir::new().unwrap();
+    let host_dir = dir.path().join("providers").join("local-minvmd0");
+    std::fs::create_dir_all(&host_dir).unwrap();
+    let sock = host_dir.join(paths::SSH_SOCK_FILE);
+    server.listen_on_uds(&sock).await;
+
+    // The record the attach reads first holds the box id it was created with.
+    let record = attached_box_record(&sock, id)
+        .await
+        .unwrap()
+        .expect("the box's record");
+    assert_eq!(
+        record.box_id,
+        Some(box_id),
+        "the record holds the box's own id"
+    );
+
+    // The stand-in VM host reads no row for the box, as the in-VM daemon
+    // read it, and answers every resume with the box's own row. It counts
+    // the reads and the resumes.
+    let listener =
+        tokio::net::UnixListener::bind(host_dir.join(client::attach::VM_HOST_CONTROL_SOCK_FILE))
+            .unwrap();
+    let reads = std::sync::Arc::new(AtomicUsize::new(0));
+    let resumes = std::sync::Arc::new(AtomicUsize::new(0));
+    let host = tokio::spawn({
+        let (reads, resumes) = (
+            std::sync::Arc::clone(&reads),
+            std::sync::Arc::clone(&resumes),
+        );
+        async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = tokio::io::BufReader::new(stream);
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                let request: minimald_rpc::BoxControlRequest =
+                    serde_json_lenient::from_str(line.trim()).unwrap();
+                let reply = match request {
+                    minimald_rpc::BoxControlRequest::ReadRow(read) => {
+                        assert_eq!(read.name, "web");
+                        reads.fetch_add(1, Ordering::SeqCst);
+                        minimald_rpc::BoxControlReply::NoRow {
+                            name: read.name,
+                            no_row: true,
+                        }
+                    }
+                    minimald_rpc::BoxControlRequest::ResumeBox(resume) => {
+                        assert_eq!(
+                            resume,
+                            minimald_rpc::ResumeBoxRequest {
+                                name: "web".to_string(),
+                                switch_address: PAIR.switch_address,
+                                loopback_address: PAIR.loopback_address,
+                                box_id: Some(box_id),
+                            },
+                            "the client resumes the box's own creation, under its own id"
+                        );
+                        resumes.fetch_add(1, Ordering::SeqCst);
+                        minimald_rpc::BoxControlReply::Registered(minimald_rpc::RegisteredBox {
+                            switch_address: PAIR.switch_address,
+                            loopback_address: PAIR.loopback_address,
+                            box_id,
+                            task_addresses: Vec::new(),
+                        })
+                    }
+                    other => panic!("the client reads the row or resumes it, got {other:?}"),
+                };
+                let reply = serde_json_lenient::to_string(&reply).unwrap();
+                stream
+                    .get_mut()
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+
+    /// The text an attach wrote before its channel closed, and its status.
+    /// An attach that does not close within the bound fails the test.
+    async fn attach_once(
+        server: &minimald::test_harness::TestServer,
+        id: boxes::SessionId,
+    ) -> (String, Option<u32>) {
+        let mut daemon = server.connect().await;
+        let mut channel = daemon.open_shell(id).await;
+        let (mut out, mut status) = (Vec::new(), None);
+        loop {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(60), channel.wait())
+                .await
+                .expect("the attach's channel closes within the bound");
+            match msg {
+                None => break,
+                Some(russh::ChannelMsg::Data { data }) => out.extend_from_slice(&data),
+                Some(russh::ChannelMsg::ExitStatus { exit_status }) => status = Some(exit_status),
+                Some(_) => {}
+            }
+        }
+        (String::from_utf8_lossy(&out).into_owned(), status)
+    }
+
+    let attaches = AtomicUsize::new(0);
+    let server = &server;
+    let attaches_ref = &attaches;
+    let exit = attach_retrying_row_ended(
+        || async move {
+            attaches_ref.fetch_add(1, Ordering::SeqCst);
+            let (refusal, status) = attach_once(server, id).await;
+            assert!(
+                refusal.contains("the VM host released this box's network addresses"),
+                "the attach is refused for the withdrawn row: {refusal:?}"
+            );
+            assert_eq!(status, Some(minimald_rpc::ATTACH_ROW_ENDED_EXIT_STATUS));
+            Ok(i32::try_from(status.unwrap()).unwrap())
+        },
+        || client::box_registration::box_row_withdrawn(&sock, Some(&record)),
+        || resume_after_row_ended(&sock, Some(&record)),
+    )
+    .await
+    .expect("the row came back, so the resume is no error");
+    assert_eq!(
+        attaches.load(Ordering::SeqCst),
+        2,
+        "the attach runs once more after the row came back, and no third time"
+    );
+    assert_eq!(
+        resumes.load(Ordering::SeqCst),
+        1,
+        "the row is asked back once"
+    );
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "each refusal is told from a shell's own status by the host's row"
+    );
+    assert_eq!(
+        exit, ROW_ENDED_REFUSED,
+        "`min` never exits with the row-ended status for a refusal: it exits 1"
+    );
+    host.abort();
+
+    let after = attached_box_record(&sock, id)
+        .await
+        .unwrap()
+        .expect("the box's record");
+    assert_eq!(
+        (after.box_addresses, after.box_id),
+        (Some(PAIR), Some(box_id)),
+        "the box keeps its addresses and its id"
+    );
+}
+
+/// The retry around an interactive attach (NET-138): the row-ended status
+/// asks for the row back only when the VM host holds no row of the box's
+/// own, so a shell that exits with the same status by itself keeps it. The
+/// attach runs once more only when the row came back, never a third time,
+/// and a refusal not followed by an attach ends with 1.
+#[tokio::test]
+async fn an_attach_retries_once_when_its_row_comes_back() {
+    use std::cell::RefCell;
+
+    /// Runs the retry over `codes`, one per attach, with `ended` as the
+    /// row reads' answers and `resumed` as the resume's. Returns the exit
+    /// status or the error text, the attaches run, the rows read and the
+    /// resumes asked.
+    async fn retry(
+        codes: &[i32],
+        ended: &[bool],
+        resumed: anyhow::Result<bool>,
+    ) -> (Result<i32, String>, usize, usize, usize) {
+        let codes = RefCell::new(codes.iter().copied());
+        let ended = RefCell::new(ended.iter().copied());
+        let (attaches, reads, resumes) = (RefCell::new(0), RefCell::new(0), RefCell::new(0));
+        let exit = attach_retrying_row_ended(
+            || {
+                *attaches.borrow_mut() += 1;
+                let code = codes.borrow_mut().next().expect("an attach too many");
+                async move { Ok(code) }
+            },
+            || {
+                *reads.borrow_mut() += 1;
+                let ended = ended.borrow_mut().next().expect("a row read too many");
+                async move { Ok(ended) }
+            },
+            || {
+                *resumes.borrow_mut() += 1;
+                async move { resumed }
+            },
+        )
+        .await
+        .map_err(|error| format!("{error:#}"));
+        (
+            exit,
+            attaches.into_inner(),
+            reads.into_inner(),
+            resumes.into_inner(),
+        )
+    }
+
+    let row_ended = ROW_ENDED_ATTACH;
+    assert_eq!(retry(&[0], &[], Ok(true)).await, (Ok(0), 1, 0, 0));
+    assert_eq!(retry(&[130], &[], Ok(true)).await, (Ok(130), 1, 0, 0));
+    assert_eq!(
+        retry(&[row_ended], &[false], Ok(true)).await,
+        (Ok(row_ended), 1, 1, 0),
+        "the box's row stands: the status is the shell's own, and nothing is asked back"
+    );
+    assert_eq!(
+        retry(&[row_ended, 0], &[true], Ok(true)).await,
+        (Ok(0), 2, 1, 1),
+        "the row came back, so the attach runs once more"
+    );
+    assert_eq!(
+        retry(&[row_ended, row_ended], &[true, true], Ok(true)).await,
+        (Ok(ROW_ENDED_REFUSED), 2, 2, 1),
+        "a second refusal ends the attach with 1, with no third attempt"
+    );
+    assert_eq!(
+        retry(&[row_ended, row_ended], &[true, false], Ok(true)).await,
+        (Ok(row_ended), 2, 2, 1),
+        "after the retry, a shell that exits with the status by itself keeps it"
+    );
+    assert_eq!(
+        retry(&[row_ended], &[true], Ok(false)).await,
+        (Ok(ROW_ENDED_REFUSED), 1, 1, 1),
+        "no row to ask back: the refusal on screen ends the attach with 1"
+    );
+    let not_back = RowNotBack::NotBack {
+        name: "web".to_string(),
+    };
+    assert_eq!(
+        retry(&[row_ended], &[true], Err(not_back.into())).await,
+        (
+            Err(
+                "box web cannot get its network addresses back from the VM host. Run \
+                 `min box attach web` again. If it is refused again, remove the box with \
+                 `min box rm --force web` and start a new one with `min session start`."
+                    .to_string()
+            ),
+            1,
+            1,
+            1
+        )
+    );
+}
+
+/// The text an interactive attach ends with when another box holds its
+/// box's name now (NET-138): it names both boxes and the rename that frees
+/// the name, so a second attach does not fail the same way. It never offers
+/// to remove the other box, which is running and holds its own data.
+#[test]
+fn row_not_back_names_the_box_that_holds_the_name() {
+    let held = RowNotBack::NameHeld {
+        name: "web".to_string(),
+        held: "Web".to_string(),
+    };
+    assert_eq!(
+        held.to_string(),
+        "box web cannot get its network addresses back. Another box, Web, holds its name \
+         now. Give that box another name with `min box rename Web <new-name>`, then run \
+         `min box attach web` again."
+    );
 }
