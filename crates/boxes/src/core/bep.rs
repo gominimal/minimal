@@ -1343,10 +1343,12 @@ pub fn store_references(secrets: &SecretGrants) -> impl Iterator<Item = StoreRef
 /// Every reason to refuse the store references in `secrets`, in grant name
 /// order (BEP-034, BEP-036). A reference to the GitHub sign-in item is
 /// refused. So is a reference whose rule registers an upstream host that
-/// `egress` does not admit.
+/// `egress` does not admit. A box that [`egress_admits_every_name`] says
+/// reaches every name admits every host, as the GitHub check does.
 #[must_use]
 pub fn store_refusals(
     secrets: &SecretGrants,
+    network: NetworkMode,
     egress: Option<&EgressPolicy>,
     rules: &StoreRules,
     deny: StoreDenySet<'_>,
@@ -1355,6 +1357,7 @@ pub fn store_refusals(
         .and_then(|egress| egress.allow_dns_hosts.as_ref())
         .map(|hosts| hosts.iter().map(|h| normalize_host(h)).collect())
         .unwrap_or_default();
+    let admits_every_name = egress_admits_every_name(network, egress);
     let mut out = Vec::new();
     for reference in store_references(secrets) {
         if deny.is_sign_in_item(reference.id) {
@@ -1364,6 +1367,9 @@ pub fn store_refusals(
                 grant: reference.grant.to_string(),
                 table: SESSION_SECRETS_TABLE.to_owned(),
             });
+            continue;
+        }
+        if admits_every_name {
             continue;
         }
         let Some(rule) = reference.rule(rules) else {
@@ -1394,11 +1400,12 @@ pub fn store_refusals(
 /// [`store_refusals`].
 pub fn check_store_references(
     secrets: &SecretGrants,
+    network: NetworkMode,
     egress: Option<&EgressPolicy>,
     rules: &StoreRules,
     deny: StoreDenySet<'_>,
 ) -> Result<(), ActivationRefused> {
-    let refusals = store_refusals(secrets, egress, rules, deny);
+    let refusals = store_refusals(secrets, network, egress, rules, deny);
     if refusals.is_empty() {
         return Ok(());
     }
@@ -3046,8 +3053,14 @@ mod tests {
             "TOKEN".to_string(),
             store_grant("keychain", "dev.minimal.github-sign-in"),
         )]);
-        let err = check_store_references(&secrets, None, &StoreRules::new(), deny())
-            .expect_err("a reference to the sign-in item is refused");
+        let err = check_store_references(
+            &secrets,
+            NetworkMode::OwnIp,
+            None,
+            &StoreRules::new(),
+            deny(),
+        )
+        .expect_err("a reference to the sign-in item is refused");
         assert_eq!(err.exit_code(), REFUSAL_EXIT_CODE);
         assert_eq!(
             err.refusals,
@@ -3090,6 +3103,47 @@ mod tests {
         assert!(PROJECT_STORE_RULES_IGNORED.contains("config.toml"));
     }
 
+    /// BEP-036: with no egress section, a host_ip box admits every
+    /// registered upstream host, as the GitHub check does (BEP-008). A box
+    /// in any other mode admits none of them. The sign-in item is refused
+    /// in every mode.
+    #[test]
+    fn store_reference_with_rule_and_no_egress() {
+        let rules = StoreRules::from([("claude".to_string(), rule(&["api.example.com"]))]);
+        let secrets =
+            SecretGrants::from([("CLAUDE".to_string(), store_grant("keychain", "claude"))]);
+        assert!(
+            check_store_references(&secrets, NetworkMode::HostNet, None, &rules, deny()).is_ok()
+        );
+        for network in [NetworkMode::OwnIp, NetworkMode::NoNet] {
+            let err = check_store_references(&secrets, network, None, &rules, deny())
+                .expect_err("a box with no egress section admits no name");
+            assert_eq!(err.exit_code(), REFUSAL_EXIT_CODE);
+            assert_eq!(
+                err.refusals,
+                vec![BepRefusal::StoreHostsOutsideEgress {
+                    grant: "CLAUDE".into(),
+                    missing: vec!["api.example.com".into()],
+                }],
+                "{network:?}"
+            );
+        }
+        let sign_in = SecretGrants::from([(
+            "TOKEN".to_string(),
+            store_grant("keychain", "dev.minimal.github-sign-in"),
+        )]);
+        for network in [NetworkMode::HostNet, NetworkMode::OwnIp, NetworkMode::NoNet] {
+            let refusals = store_refusals(&sign_in, network, None, &rules, deny());
+            assert!(
+                matches!(
+                    refusals.as_slice(),
+                    [BepRefusal::StoreReferenceToSignIn { .. }]
+                ),
+                "{network:?}: {refusals:?}"
+            );
+        }
+    }
+
     const STORE_HOSTS: &[&str] = &["api.anthropic.com", "mcp.linear.app", "mcp.sentry.dev"];
 
     proptest! {
@@ -3123,7 +3177,8 @@ mod tests {
                 .filter(|h| !allowed.contains(h))
                 .map(|h| (*h).to_string())
                 .collect();
-            match check_store_references(&secrets, Some(&egress), &rules, deny()) {
+            // An egress section decides by what it lists, on a host_ip box too.
+            match check_store_references(&secrets, NetworkMode::HostNet, Some(&egress), &rules, deny()) {
                 Ok(()) => prop_assert!(missing.is_empty()),
                 Err(err) => {
                     prop_assert_eq!(err.exit_code(), REFUSAL_EXIT_CODE);
@@ -3138,7 +3193,9 @@ mod tests {
             }
             // A reference with no rule registers nothing to check.
             let other = SecretGrants::from([("X".to_string(), store_grant("keychain", "other"))]);
-            prop_assert!(check_store_references(&other, None, &rules, deny()).is_ok());
+            prop_assert!(
+                check_store_references(&other, NetworkMode::OwnIp, None, &rules, deny()).is_ok()
+            );
         }
     }
 }
