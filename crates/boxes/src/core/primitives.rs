@@ -4,12 +4,11 @@
 //!
 //! Two flavors of name are recognized:
 //!
-//! - [`StrictVarName`] — POSIX-shaped (`[A-Z_][A-Z0-9_]*`). The default; what
-//!   the bare-string wire form decodes into. Catches typos like `MY VAR`
-//!   at config-load time.
+//! - [`StrictVarName`] — POSIX-shaped (`[A-Za-z_][A-Za-z0-9_]*`). What every
+//!   `env_vars` table decodes into. Catches typos like `MY VAR` at
+//!   config-load time.
 //! - [`LenientVarName`] — anything the Linux kernel accepts (no `=`, no
-//!   NUL). Loud, explicit opt-in via the `vars_lenient` array form on
-//!   [`crate::core::loadout::Loadout`]; never produced by the bare-string path.
+//!   NUL). Never produced by an `env_vars` table.
 //!
 //! [`VarName`] is the sum of the two for places that need to hold either.
 //!
@@ -76,8 +75,8 @@ pub enum VarError {
     EmptyName,
     /// A var name failed POSIX validation (used by [`StrictVarName`]).
     #[error(
-        "variable name `{0}` is not POSIX-shaped (expected `[A-Z_][A-Z0-9_]*`); \
-         use the `vars_lenient` form for non-POSIX names"
+        "variable name `{0}` is not POSIX-shaped: a name holds only ASCII letters, \
+         digits and `_`, and does not start with a digit"
     )]
     NotPosixName(String),
     /// A var name contained `=` or NUL, which the kernel won't accept.
@@ -194,7 +193,10 @@ pub enum PatchError {
 // Names
 // =====================================================================
 
-/// A POSIX-shaped environment variable name: `[A-Z_][A-Z0-9_]*`.
+/// A POSIX-shaped environment variable name: `[A-Za-z_][A-Za-z0-9_]*`.
+///
+/// Lower-case letters are POSIX-shaped too, so `http_proxy` is a strict
+/// name (BOX-207).
 ///
 /// Stricter than what the kernel will accept, intentionally — the strict
 /// form catches typos at config-load time and matches the convention
@@ -209,18 +211,18 @@ impl StrictVarName {
     ///
     /// Returns [`VarError::EmptyName`] for empty input, or
     /// [`VarError::NotPosixName`] if the name contains anything outside
-    /// `[A-Z_][A-Z0-9_]*`.
+    /// `[A-Za-z_][A-Za-z0-9_]*`.
     pub fn try_new(s: impl Into<String>) -> Result<Self, VarError> {
         let s = s.into();
         let mut chars = s.chars();
         let Some(first) = chars.next() else {
             return Err(VarError::EmptyName);
         };
-        if !(first.is_ascii_uppercase() || first == '_') {
+        if !(first.is_ascii_alphabetic() || first == '_') {
             return Err(VarError::NotPosixName(s));
         }
         for c in chars {
-            if !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_') {
+            if !(c.is_ascii_alphanumeric() || c == '_') {
                 return Err(VarError::NotPosixName(s));
             }
         }
@@ -1364,15 +1366,28 @@ mod tests {
 
     #[test]
     fn strict_rejects_non_posix_shapes() {
-        for n in ["", "lowercase", "1FOO", "FOO-BAR", "FOO BAR", "FOO=BAR"] {
+        for n in ["", "1FOO", "1foo", "FOO-BAR", "FOO BAR", "FOO=BAR", "foo.bar"] {
             assert!(StrictVarName::try_new(n).is_err(), "accepted: {n}");
         }
     }
 
+    // BOX-207: `env_vars` takes POSIX names, and a lower-case letter is
+    // one, so `http_proxy` is strict.
     #[test]
-    fn strict_deserialize_rejects_lowercase() {
-        let err = toml::from_str::<Wrap<StrictVarName>>(r#"x = "foo""#).unwrap_err();
-        assert!(err.to_string().contains("POSIX"), "got: {err}");
+    fn strict_var_name_accepts_lower_case_names() {
+        for n in ["http_proxy", "lowercase", "Mixed_Case1", "_x"] {
+            assert!(StrictVarName::try_new(n).is_ok(), "rejected: {n}");
+        }
+        let parsed: StrictVarName = parse(r#"x = "no_proxy""#);
+        assert_eq!(parsed.as_str(), "no_proxy");
+    }
+
+    #[test]
+    fn strict_deserialize_rejects_non_posix() {
+        let err = toml::from_str::<Wrap<StrictVarName>>(r#"x = "foo-bar""#).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("POSIX"), "got: {msg}");
+        assert!(!msg.contains("vars_lenient"), "got: {msg}");
     }
 
     #[test]
@@ -1468,7 +1483,7 @@ mod tests {
     fn strict_var_name_parses_via_from_str() {
         let n: StrictVarName = "EDITOR".parse().unwrap();
         assert_eq!(n.as_str(), "EDITOR");
-        let err = "lowercase".parse::<StrictVarName>().unwrap_err();
+        let err = "foo-bar".parse::<StrictVarName>().unwrap_err();
         assert!(matches!(err, VarError::NotPosixName(_)));
     }
 
