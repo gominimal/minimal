@@ -50,7 +50,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
     tier:   T1
     verify: cargo nextest run -p minimald colliding_box_id_refuses_creation
     property: For every generated store of retained records and every minted `box_id` that one of them names, creation is refused and the store is unchanged.
-  - WHERE a box is created on a path that sends the daemon no expanded spec THE SYSTEM SHALL record as its `box_type` the type of the creating verb, `session` for a box created by `min session activate` and `task` for one created by `min task run`.
+  - WHERE a box is created on a path that sends the daemon no expanded spec THE SYSTEM SHALL record as its `box_type` the type of the creating verb, `session` for a box created by `min session start` or a bare `min`, and `task` for one created by `min task run`.
     tier:   T0
     verify: cargo nextest run -p minimald legacy_create_path_records_type_from_creating_verb
   - WHEN a box is created THE SYSTEM SHALL record in it the root of the project whose `minimal.toml` the box's entry came from.
