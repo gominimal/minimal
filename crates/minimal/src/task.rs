@@ -1693,8 +1693,13 @@ pub(crate) async fn run_entry(
         .await
         .map_err(|error| crate::session_rpc_failed(crate::SessionRpc::CreateSession, error))?;
     let created = match resp {
-        minimald_rpc::Errorable::Ok(r) => r,
-        minimald_rpc::Errorable::Err { error } => return Err(crate::create_refusal(error)),
+        minimald_rpc::CreateSessionReply::Ok(r) => r,
+        minimald_rpc::CreateSessionReply::Err {
+            error,
+            code,
+            exit_code,
+            hint,
+        } => return Err(crate::create_refusal(error, code, exit_code, hint)),
     };
     // A daemon too old to know the field ignored it and echoes no version;
     // that silence is the skew. Caught here, before the upload and the

@@ -280,6 +280,11 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     if let Some(refused) = e.downcast_ref::<boxes::core::bep::ActivationRefused>() {
         return refused.exit_code();
     }
+    // BEP-003 (#3276): a create refusal only the daemon made, such as a
+    // non-GitHub broker grant on a host a proxy serves, keeps its exit code.
+    if let Some(refused) = e.downcast_ref::<minimal::DaemonCreateRefusal>() {
+        return refused.exit_code.max(1);
+    }
     // BCLI-004: `min box rm` of a running box without `--force`.
     if e.downcast_ref::<minimal::BoxRunningRefusal>().is_some() {
         return minimal::BoxRunningRefusal::EXIT_CODE;
@@ -525,6 +530,25 @@ fn machine_mode_answer(e: &anyhow::Error) -> MachineModeAnswer {
             hint,
         ));
     }
+    // #3276: the same, for a refusal only the daemon made. The daemon's
+    // reply carries the defined error and its next step.
+    // A code this build does not define answers `unspecified` below.
+    if let Some(refused) = e.downcast_ref::<minimal::DaemonCreateRefusal>()
+        && let Some(code) = refused.code.as_deref().and_then(|code| {
+            [
+                boxes::core::bep::GATEHOUSE_UNENROLLED_NODE,
+                boxes::core::bep::GITHUB_SIGN_IN_REQUIRED,
+            ]
+            .into_iter()
+            .find(|known| *known == code)
+        })
+    {
+        return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
+            code,
+            format!("{e:#}"),
+            refused.hint.clone(),
+        ));
+    }
     // BCLI-020: `min type show` of a name that is no type is `not_found`.
     if e.downcast_ref::<minimal::BoxTypeNotFound>().is_some() {
         return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
@@ -711,6 +735,11 @@ fn machine_output_mode(cli: &minimal::Cli) -> bool {
         // `min/v1/error` object.
         Some(minimal::Command::Box(minimal::BoxArgs {
             command: minimal::BoxCommand::Show(args),
+        })) => args.output.is_some(),
+        // BCLI-013, BCLI-033: a `min box wait -o json` failure, a
+        // `wait_timeout` among them, is one `min/v1/error` object.
+        Some(minimal::Command::Box(minimal::BoxArgs {
+            command: minimal::BoxCommand::Wait(args),
         })) => args.output.is_some(),
         // BCLI-019, BCLI-020: `min type list|show -o json|yaml|toml`.
         Some(minimal::Command::Type(minimal::TypeArgs {
@@ -973,6 +1002,37 @@ mod tests {
 
     // BEP-003, Gatehouse §6.2: a refused grant box reads as its defined
     // error under `-o json`, with the refusal's next step as the hint.
+    // #3276: a create refusal only the daemon made exits with the code the
+    // daemon gave it, and `-o json` answers with its defined error.
+    #[test]
+    fn daemon_only_broker_refusal_exits_5_with_its_code() {
+        let refused = |code: Option<&str>| {
+            anyhow::Error::new(minimal::DaemonCreateRefusal {
+                message: "Cannot create the box.".to_string(),
+                code: code.map(str::to_string),
+                exit_code: 5,
+                hint: "remove aws from the secrets".to_string(),
+            })
+        };
+        let err = refused(Some("gatehouse_unenrolled_node"));
+        assert_eq!(failure_exit_code(&err), 5);
+        match machine_mode_answer(&err) {
+            MachineModeAnswer::Object(failure) => {
+                assert_eq!(failure.code(), "gatehouse_unenrolled_node");
+                assert_eq!(failure.hint(), "remove aws from the secrets");
+                assert_eq!(failure.message(), "Cannot create the box.");
+            }
+            other => panic!("a refusal is an object, got {other:?}"),
+        }
+        // A code this build does not define keeps the exit code.
+        let err = refused(Some("a_code_from_a_newer_daemon"));
+        assert_eq!(failure_exit_code(&err), 5);
+        match machine_mode_answer(&err) {
+            MachineModeAnswer::Object(failure) => assert_eq!(failure.code(), "unspecified"),
+            other => panic!("a refusal is an object, got {other:?}"),
+        }
+    }
+
     #[test]
     fn machine_mode_names_the_grant_refusal_code() {
         use boxes::core::bep::{ActivationRefused, BepRefusal, ProxyAbsence};

@@ -1610,8 +1610,10 @@ kill "$peer" 2>/dev/null
         };
         let mut client = server.connect().await;
         let session_id = match client.call::<CreateSession>(&req).await {
-            Errorable::Ok(r) => r.id,
-            Errorable::Err { error } => panic!("CreateSession failed: {error}"),
+            minimald_rpc::CreateSessionReply::Ok(r) => r.id,
+            minimald_rpc::CreateSessionReply::Err { error, .. } => {
+                panic!("CreateSession failed: {error}")
+            }
         };
         unwrap_ready(
             client

@@ -106,11 +106,21 @@ pub enum Error {
         first: String,
         second: String,
     },
-    /// One layer sets a variable twice, to different values (BOX-184).
-    /// Carries the variable and the layer, as the message names it. Exits 3.
-    DuplicateVar {
+    /// A layer sets `vars` or `vars_lenient` as one of its own keys
+    /// (BOX-206). Carries the key, the table that sets it (`None` for the
+    /// top level of a loadout file) and the file. Exits 3.
+    RetiredVarKey {
+        key: String,
+        table: Option<String>,
+        file: String,
+    },
+    /// An `env_vars` table sets a variable whose name is not POSIX-shaped
+    /// (BOX-207). Carries the name, the table (`None` for the top level of
+    /// a loadout file) and the file. Exits 3.
+    InvalidVarName {
         name: String,
-        layer: String,
+        table: Option<String>,
+        file: String,
     },
     /// A `[[file_exports]]` path is absolute, has a `..` component, or
     /// names the project root itself (BOX-189). Carries the path and the
@@ -211,7 +221,8 @@ impl Error {
             | Error::ConstraintViolated { .. }
             | Error::BoxType(_)
             | Error::LoadoutVarConflict { .. }
-            | Error::DuplicateVar { .. }
+            | Error::RetiredVarKey { .. }
+            | Error::InvalidVarName { .. }
             | Error::ExportOutsideProject { .. } => Some(3),
             _ => None,
         }
@@ -458,11 +469,34 @@ impl fmt::Display for Error {
                  or add `{name}` to the `ignore` list under `[vars]` in \
                  user_policy.toml to drop every value of `{name}`."
             ),
-            Error::DuplicateVar { name, layer } => write!(
-                f,
-                "{layer} sets the variable `{name}` twice, to different values. \
-                 Remove one of the two settings."
-            ),
+            Error::RetiredVarKey { key, table, file } => match table {
+                Some(table) => write!(
+                    f,
+                    "{table} in {file} sets `{key}`. This key is no longer read. \
+                     Move its variables to `env_vars` in {table}."
+                ),
+                None => write!(
+                    f,
+                    "{file} sets `{key}` at its top level. This key is no longer \
+                     read. Move its variables to an `[env_vars]` table in that file."
+                ),
+            },
+            Error::InvalidVarName { name, table, file } => {
+                match table {
+                    Some(table) => write!(f, "{table} in {file} sets ")?,
+                    None => write!(f, "{file} sets ")?,
+                }
+                if name.is_empty() {
+                    write!(f, "a variable with an empty name in `env_vars`.")?;
+                } else {
+                    write!(f, "the variable `{name}` in `env_vars`.")?;
+                }
+                write!(
+                    f,
+                    " A variable name can hold only ASCII letters, digits and `_`, \
+                     and cannot start with a digit. Rename the variable."
+                )
+            }
             Error::ExportOutsideProject { path, layer } => write!(
                 f,
                 "{layer} exports `{path}`, which points outside the folder \
@@ -500,7 +534,8 @@ impl std::error::Error for Error {
             // once.
             Error::BoxType(_) => None,
             Error::LoadoutVarConflict { .. } => None,
-            Error::DuplicateVar { .. } => None,
+            Error::RetiredVarKey { .. } => None,
+            Error::InvalidVarName { .. } => None,
             Error::ExportOutsideProject { .. } => None,
         }
     }

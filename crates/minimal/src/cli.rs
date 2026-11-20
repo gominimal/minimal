@@ -848,6 +848,19 @@ pub struct BoxWaitArgs {
     /// running or ended
     #[arg(long = "exec", value_name = "EXEC_ID")]
     pub exec: Option<String>,
+    /// When the box ends, write how it ended in this format on stdout
+    // BCLI-013, BCLI-033: one `min/v1/wait` object. An exec has no such
+    // object, so `--exec` refuses the flag.
+    #[arg(short = 'o', long = "output", value_enum, conflicts_with = "exec")]
+    pub output: Option<BoxWaitOutputFormat>,
+}
+
+/// The formats `min box wait` writes, beside text.
+// BCLI-033: the format carries one `min/v1/wait` object.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum BoxWaitOutputFormat {
+    /// JSON: one object that lists how the box ended
+    Json,
 }
 
 // BOX-149 (BCLI-053): `min box exec <box> [-t|--detach] [--timeout <d>] -- <cmd>`.

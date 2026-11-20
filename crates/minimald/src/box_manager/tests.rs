@@ -78,9 +78,9 @@ async fn create_and_configure(
     (state, cache, mngr, id, response)
 }
 
-/// A project mfile whose `[session.vars]` entry forces the composer down
+/// A project mfile whose `[defaults.session.env_vars]` entry forces the composer down
 /// the Pending path: a daemon-collected var must be gated by the client.
-const PENDING_VAR_MFILE: &str = "[session.vars]\nRUST_LOG = \"info\"\n";
+const PENDING_VAR_MFILE: &str = "[defaults.session.env_vars]\nRUST_LOG = \"info\"\n";
 
 /// Drives a session to the point of awaiting a verdict: created,
 /// workspace seeded with [`PENDING_VAR_MFILE`], loadout configured and
@@ -1435,7 +1435,7 @@ async fn abort_refuses_active_session() {
 }
 
 /// The full Pending → verdict → Active flow through the session
-/// actor's state machine: a project `[session.vars]` entry pends
+/// actor's state machine: a project `[defaults.session.env_vars]` entry pends
 /// the loadout, `get_session` resolves the live Draft actor, an
 /// approving verdict promotes the on-disk record to `Active`,
 /// and the finalized composition (carrying the gated var) stays
@@ -4617,7 +4617,7 @@ async fn server_switch_control(
 /// id the request carried.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn guest_create_ignores_a_client_supplied_box_id_and_replies_with_the_minted_id() {
-    use minimald_rpc::{CreateSession, Errorable};
+    use minimald_rpc::{CreateSession, CreateSessionReply};
     let temp = TempDir::new().unwrap();
     let state = temp.path().to_path_buf();
     let server = crate::test_harness::TestServer::new_in(temp).await;
@@ -4639,8 +4639,10 @@ async fn guest_create_ignores_a_client_supplied_box_id_and_replies_with_the_mint
     crate::net::listeners::clear_vm_report_door_for_tests(&control);
     door_task.abort();
     match reply {
-        Errorable::Ok(created) => assert_eq!(created.id, minted, "the box takes the minted id"),
-        Errorable::Err { error } => panic!("the create was refused: {error}"),
+        CreateSessionReply::Ok(created) => {
+            assert_eq!(created.id, minted, "the box takes the minted id")
+        }
+        CreateSessionReply::Err { error, .. } => panic!("the create was refused: {error}"),
     }
     assert!(matches!(
         asks.recv().await,
@@ -4653,7 +4655,7 @@ async fn guest_create_ignores_a_client_supplied_box_id_and_replies_with_the_mint
 /// never a closed channel, and leaves no box behind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn guest_create_ignores_a_client_supplied_box_id_and_replies_when_no_door_answers() {
-    use minimald_rpc::{CreateSession, Errorable};
+    use minimald_rpc::{CreateSession, CreateSessionReply};
     let temp = TempDir::new().unwrap();
     let state = temp.path().to_path_buf();
     let server = crate::test_harness::TestServer::new_in(temp).await;
@@ -4667,12 +4669,14 @@ async fn guest_create_ignores_a_client_supplied_box_id_and_replies_when_no_door_
     let reply = client.call::<CreateSession>(&request).await;
     crate::net::listeners::clear_vm_report_door_for_tests(&control);
     match reply {
-        Errorable::Err { error } => assert_eq!(
+        CreateSessionReply::Err { error, .. } => assert_eq!(
             error,
             "No session was created. The VM gave the new session no id: it did not answer \
              in time."
         ),
-        Errorable::Ok(created) => panic!("a create with no minted id was filed as {}", created.id),
+        CreateSessionReply::Ok(created) => {
+            panic!("a create with no minted id was filed as {}", created.id)
+        }
     }
     let manager = server.state.sessions_manager().await;
     assert!(manager.list_boxes(None).await.unwrap().is_empty());
@@ -6713,7 +6717,7 @@ fn broker_secret_aws() -> serde_json_lenient::Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn broker_secret_unenrolled_exit5_reply_over_socket() {
     use crate::test_harness::{TestServer, create_session_req};
-    use minimald_rpc::{CreateSession, Errorable};
+    use minimald_rpc::{CreateSession, CreateSessionReply};
 
     let server = TestServer::new().await;
     let mut client = server.connect().await;
@@ -6724,14 +6728,14 @@ async fn broker_secret_unenrolled_exit5_reply_over_socket() {
         serde_json_lenient::json!({ "gh": broker_secret() }),
     ));
     match client.call::<CreateSession>(&req).await {
-        Errorable::Err { error } => {
+        CreateSessionReply::Err { error, .. } => {
             assert!(error.contains("gh"), "{error}");
             assert!(
                 error.contains("no Box Egress Proxy serves boxes on this machine"),
                 "{error}"
             );
         }
-        Errorable::Ok(reply) => panic!("the create is refused, not {reply:?}"),
+        CreateSessionReply::Ok(reply) => panic!("the create is refused, not {reply:?}"),
     }
     let mngr = server.state.sessions_manager().await;
     assert!(mngr.list_boxes(None).await.unwrap().is_empty());
