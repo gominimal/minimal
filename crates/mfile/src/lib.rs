@@ -6418,4 +6418,121 @@ bash = \"true\"
         .unwrap_err();
         assert!(matches!(err, Error::IO(..)), "error: {err:?}");
     }
+
+    /// The toml examples of a reference page, each with the line its
+    /// fence opens on. A block whose first line names `user_policy.toml`
+    /// is left out: that file's `[vars]` is a policy section, not a layer.
+    fn reference_doc_toml_examples(page: &str) -> Vec<(usize, String)> {
+        let path = format!("{}/../../docs/reference/{page}", env!("CARGO_MANIFEST_DIR"));
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let mut blocks = Vec::new();
+        let mut open: Option<(usize, String)> = None;
+        for (index, line) in text.lines().enumerate() {
+            let fence = line.trim_start();
+            match open.take() {
+                None if fence == "```toml" => open = Some((index + 1, String::new())),
+                None => {}
+                Some(block) if fence.starts_with("```") => blocks.push(block),
+                Some((at, mut body)) => {
+                    // An example nested in a list item is indented.
+                    let indent = line.len() - fence.len();
+                    body.push_str(if indent >= 2 {
+                        &line[2.min(indent)..]
+                    } else {
+                        line
+                    });
+                    body.push('\n');
+                    open = Some((at, body));
+                }
+            }
+        }
+        assert!(open.is_none(), "{page}: a toml example is not closed");
+        blocks
+            .into_iter()
+            .filter(|(_, body)| !body.trim_start().starts_with("# user_policy.toml"))
+            .collect()
+    }
+
+    /// The dotted paths of every `vars` or `vars_lenient` key in `value`.
+    /// A key inside an `env_vars` table is a variable name, not a table.
+    fn retired_var_keys(value: &toml::Value, at: &str, found: &mut Vec<String>) {
+        let toml::Value::Table(table) = value else {
+            if let toml::Value::Array(items) = value {
+                for item in items {
+                    retired_var_keys(item, at, found);
+                }
+            }
+            return;
+        };
+        for (key, child) in table {
+            let path = if at.is_empty() {
+                key.clone()
+            } else {
+                format!("{at}.{key}")
+            };
+            if key == "vars" || key == "vars_lenient" {
+                found.push(path.clone());
+            }
+            if key != "env_vars" {
+                retired_var_keys(child, &path, found);
+            }
+        }
+    }
+
+    /// The keys named `vars` or `vars_lenient` in a schema sketch, read
+    /// from its table headers and the dotted keys before each `=`.
+    fn retired_var_keys_in_sketch(body: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        for line in body.lines() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            let key = if line.starts_with('[') {
+                line.trim_matches(|c| c == '[' || c == ']')
+            } else if let Some((key, _)) = line.split_once('=') {
+                key
+            } else {
+                continue;
+            };
+            let segments: Vec<&str> = key.split('.').map(str::trim).collect();
+            let named = segments
+                .iter()
+                .take_while(|segment| **segment != "env_vars")
+                .any(|segment| *segment == "vars" || *segment == "vars_lenient");
+            if named {
+                found.push(key.trim().to_owned());
+            }
+        }
+        found
+    }
+
+    // BOX-205, BOX-206: the reference pages set variables in `env_vars`
+    // only. Every example parses, or is a schema sketch with placeholders.
+    #[test]
+    fn reference_doc_examples_use_env_vars() {
+        let mut checked = 0;
+        for page in ["loadouts.md", "minimal-dot-toml.md", "tasks.md"] {
+            let examples = reference_doc_toml_examples(page);
+            assert!(!examples.is_empty(), "{page}: no toml examples");
+            for (line, body) in examples {
+                let mut found = Vec::new();
+                match toml::from_str::<toml::Value>(&body) {
+                    Ok(value) => retired_var_keys(&value, "", &mut found),
+                    // A schema sketch with `<placeholder>` values is not
+                    // toml. Read its keys line by line instead.
+                    Err(e) => {
+                        assert!(
+                            body.contains('<'),
+                            "{page}:{line}: the example does not parse: {e}"
+                        );
+                        found = retired_var_keys_in_sketch(&body);
+                    }
+                }
+                assert!(
+                    found.is_empty(),
+                    "{page}:{line}: the example sets {found:?}, not env_vars"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0);
+    }
 }
