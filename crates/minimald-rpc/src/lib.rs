@@ -2823,6 +2823,23 @@ impl OneshotSshRpc for RenameSession {
     type Response = Errorable<RenameSessionResponse>;
 }
 
+/// The exit status an interactive attach ends with when the in-VM daemon
+/// refused it because the VM host daemon withdrew the box's host-side row
+/// (NET-138). The client reads it as its cue to ask the VM host daemon for
+/// the row back ([`BoxControlRequest::ResumeBox`]), which reinstates it
+/// from the host's own record of the box's creation under the same box id,
+/// and to retry the attach one time. Only the interactive attach's channel
+/// carries it: an exec channel ends the same refusal with 1.
+///
+/// This is the SSH channel's status, not `min`'s. `min` reads it as the
+/// refusal only when the VM host holds no row of the box's own, and then
+/// exits with 2 when another box holds the box's name, so the row cannot
+/// come back under it, and with 1 when the row does not come back for
+/// another reason or the retried attach is refused again. `min` exits with
+/// this status when the box's shell exited with it, and when it could not
+/// read the session's record, so could not check the row.
+pub const ATTACH_ROW_ENDED_EXIT_STATUS: u32 = 253;
+
 /// An RPC to stop a running box and keep its record (BOX-013, BOX-018).
 ///
 /// The daemon sends SIGTERM to every process in the box, waits its grace
