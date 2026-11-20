@@ -1585,6 +1585,19 @@ fn read_host_ip_ids_file(path: &std::path::Path) -> HostIpIds {
     HostIpIds::default()
 }
 
+/// The build rows last written at `path`, for [`BoxRegistry::persist`] to
+/// keep until the registry file no longer holds them: none when the file is
+/// missing or unusable. It never sets a file aside; a start already has
+/// ([`read_build_rows_file`]).
+fn read_build_rows_quietly(path: &std::path::Path) -> Vec<BuildRowEntry> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json_lenient::from_slice::<BuildRowsFile>(&bytes).ok())
+        .filter(|file| file.version == BUILD_ROWS_FILE_VERSION)
+        .map(|file| file.build_rows)
+        .unwrap_or_default()
+}
+
 /// Reads the build rows persisted at `path`, each box id's kind: none when
 /// there is no file yet. A file that cannot be read, does not parse, or is
 /// of another version than [`BUILD_ROWS_FILE_VERSION`] reloads no build row
@@ -4373,10 +4386,14 @@ impl BoxRegistry {
             version: REGISTRY_FILE_VERSION,
             boxes: self.creations().all().cloned().collect(),
         };
-        // The build rows first: a crash between the two writes leaves a
-        // build row the registry file does not hold yet, which reloads
-        // nothing, never a build row reloaded as a box.
-        let build_rows = BuildRowsFile {
+        // A crash between two writes must never leave a build row the
+        // registry file holds without its kind: it would reload as a box.
+        // So the build rows file first gains the new rows and keeps the ones
+        // already written, the registry file follows, and only once that
+        // write landed does the build rows file drop the rows it no longer
+        // holds. A kind the registry file does not hold reloads nothing.
+        let rows_path = path.with_file_name(BUILD_ROWS_FILE);
+        let mut rows = BuildRowsFile {
             version: BUILD_ROWS_FILE_VERSION,
             build_rows: file
                 .boxes
@@ -4389,20 +4406,37 @@ impl BoxRegistry {
                 })
                 .collect(),
         };
-        let rows_path = path.with_file_name(BUILD_ROWS_FILE);
-        if let Err(error) = write_registry_file(&rows_path, &build_rows) {
-            tracing::warn!(
-                path = %rows_path.display(),
-                %error,
-                "could not persist the build rows; a restart reloads them as boxes"
-            );
-        }
+        let held = rows.build_rows.len();
+        let leaving: Vec<BuildRowEntry> = read_build_rows_quietly(&rows_path)
+            .into_iter()
+            .filter(|written| {
+                rows.build_rows
+                    .iter()
+                    .all(|row| row.box_id != written.box_id)
+            })
+            .collect();
+        rows.build_rows.extend(leaving);
+        let write_rows = |rows: &BuildRowsFile| {
+            if let Err(error) = write_registry_file(&rows_path, rows) {
+                tracing::warn!(
+                    path = %rows_path.display(),
+                    %error,
+                    "could not persist the build rows; a restart reloads them as boxes"
+                );
+            }
+        };
+        write_rows(&rows);
         if let Err(error) = write_registry_file(path, &file) {
             tracing::warn!(
                 path = %path.display(),
                 %error,
                 "could not persist the box registry; its rows will not survive this process"
             );
+            return;
+        }
+        if rows.build_rows.len() > held {
+            rows.build_rows.truncate(held);
+            write_rows(&rows);
         }
     }
 
@@ -10721,6 +10755,42 @@ mod tests {
             persisted_registry(&dir).row_by_name("build-web").is_none(),
             "the retirement ended its creation too"
         );
+    }
+
+    /// NET-169: a build row's kind outlives its creation in the registry
+    /// file. The registry write fails after the grant ends, as a crash
+    /// between the two writes would leave it, and the restart still knows
+    /// the creation the registry file holds as a grant's, so it never
+    /// reloads as a box. Once the registry write lands, the kind goes too.
+    #[test]
+    fn a_failed_registry_write_never_reloads_a_build_row_as_a_box() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let before = persisted_registry(&dir);
+        before
+            .register_build_row(client_spec("build-web-1"), BuildRow::Grant)
+            .expect("the plan has an address for the grant row");
+        // The registry write cannot replace its temporary file.
+        let blocker = dir.path().join(REGISTRY_FILE).with_extension("json.tmp");
+        std::fs::create_dir(&blocker).expect("block the registry write");
+        assert!(before.withdraw_build_row("build-web-1").is_some());
+        drop(before);
+        std::fs::remove_dir(&blocker).expect("unblock the registry write");
+        let registry = std::fs::read_to_string(dir.path().join(REGISTRY_FILE))
+            .expect("the registry file reads");
+        assert!(registry.contains("build-web-1"), "the creation stays");
+
+        let after = persisted_registry(&dir);
+        assert!(after.row_by_name("build-web-1").is_none(), "no row stands");
+        assert!(persisted_box_names(dir.path()).is_empty(), "no box listed");
+        drop(after);
+        let registry = std::fs::read_to_string(dir.path().join(REGISTRY_FILE))
+            .expect("the registry file reads");
+        assert!(!registry.contains("build-web-1"), "the reload dropped it");
+        let rows: BuildRowsFile = serde_json_lenient::from_slice(
+            &std::fs::read(dir.path().join(BUILD_ROWS_FILE)).expect("the build rows file reads"),
+        )
+        .expect("the build rows file parses");
+        assert!(rows.build_rows.is_empty(), "{rows:?}");
     }
 
     /// NET-169: a requester build row's dormant creation ends at its box's
