@@ -1716,8 +1716,8 @@ mod tests {
     async fn native_attach_adopts_the_forwards_bound_at_activation() {
         const HANDED: Ipv4Addr = Ipv4Addr::new(127, 0, 64, 13);
         let dir = tempfile::TempDir::new().unwrap();
-        let mut native = SwitchClient::new(dir.path().join("gvproxy-min"), dir.path())
-            .with_host_id("aaaa1");
+        let mut native =
+            SwitchClient::new(dir.path().join("gvproxy-min"), dir.path()).with_host_id("aaaa1");
         native.serve_externally();
         let control_path = native.control_socket();
         let switch = Arc::new(Mutex::new(native));

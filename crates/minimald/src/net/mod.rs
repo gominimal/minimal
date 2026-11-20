@@ -805,7 +805,9 @@ impl SwitchClient {
     fn control_channel(&self) -> policy::ControlChannel {
         match self.transport {
             SwitchTransport::LocalSpawn => policy::ControlChannel::Unix(self.control_socket()),
-            SwitchTransport::HostShuttle { cid, port } => policy::ControlChannel::Vsock { cid, port },
+            SwitchTransport::HostShuttle { cid, port } => {
+                policy::ControlChannel::Vsock { cid, port }
+            }
         }
     }
 
