@@ -2447,3 +2447,42 @@ fn get_version_reports_expander_version() {
         )
     );
 }
+
+/// #3276: a coded `CreateSession` refusal carries its text, its code, its
+/// exit code and its next step on the wire, beside `error`. A plain error
+/// reply, from a daemon that predates the fields, still decodes.
+#[test]
+fn create_session_refusal_carries_its_code() {
+    let coded = CreateSessionReply::Err {
+        error: "the box was refused".to_string(),
+        code: Some("gatehouse_unenrolled_node".to_string()),
+        exit_code: Some(5),
+        hint: Some("enroll this host".to_string()),
+    };
+    let wire = serde_json_lenient::to_string(&coded).expect("a refusal serializes");
+    assert_eq!(
+        wire,
+        r#"{"error":"the box was refused","code":"gatehouse_unenrolled_node","exit_code":5,"hint":"enroll this host"}"#
+    );
+    let back: CreateSessionReply = serde_json_lenient::from_str(&wire).expect("it decodes");
+    assert_eq!(back, coded);
+
+    // An older client reads the same reply as a plain error.
+    let old: Errorable<CreateSessionResponse> =
+        serde_json_lenient::from_str(&wire).expect("an older client decodes it");
+    assert_eq!(old.err().as_deref(), Some("the box was refused"));
+
+    // A plain error reply with no code still decodes, with no code.
+    let plain: CreateSessionReply =
+        serde_json_lenient::from_str(r#"{"error":"A session with that name already exists"}"#)
+            .expect("a plain error decodes");
+    assert_eq!(
+        plain,
+        CreateSessionReply::refused("A session with that name already exists")
+    );
+    assert_eq!(
+        serde_json_lenient::to_string(&plain).expect("it serializes"),
+        r#"{"error":"A session with that name already exists"}"#,
+        "a refusal with no code keeps the old wire form"
+    );
+}
