@@ -1461,7 +1461,8 @@ async fn activate_refusal_names_finalize_install_for_apparmor_restriction() {
              unprivileged user namespaces), so no box can start here yet.\n\
              Finish the install to allow it for Minimal only: min finalize-install   \
              (see what it changes first: min finalize-install --show). The profile takes \
-             effect when the daemon next starts: run min stop, then your command again.\n\
+             effect when the daemon next starts: run min host stop <host>, then your command \
+             again.\n\
              A daemon built from source is not covered: attach the profile to this binary \
              instead, from a checkout: sudo scripts/install-apparmor-profile.sh --path {bin}, \
              then the same restart."
@@ -1588,7 +1589,7 @@ async fn task_run_prints_the_user_namespace_refusal_verbatim() {
              unprivileged user namespaces), so no box can start here yet.\n\
              Finish the install to allow it for Minimal only: min finalize-install   (see what \
              it changes first: min finalize-install --show). The profile takes effect when the \
-             daemon next starts: run min stop, then your command again.\n\
+             daemon next starts: run min host stop <host>, then your command again.\n\
              A daemon built from source is not covered: attach the profile to this binary \
              instead, from a checkout: sudo scripts/install-apparmor-profile.sh --path {bin}, \
              then the same restart."

@@ -3393,7 +3393,8 @@ impl UsernsRestriction {
                 format!(
                     "Finish the install to allow it for Minimal only: min finalize-install   (see \
                      what it changes first: min finalize-install --show). The profile takes effect \
-                     when the daemon next starts: run min stop, then your command again.\n\
+                     when the daemon next starts: run min host stop <host>, then your command \
+                     again.\n\
                      A daemon built from source is not covered: attach the profile to this \
                      binary instead, from a checkout: sudo scripts/install-apparmor-profile.sh \
                      --path {bin}, then the same restart."
@@ -4745,7 +4746,7 @@ mod tests {
             remedy,
             "Finish the install to allow it for Minimal only: min finalize-install   (see what \
              it changes first: min finalize-install --show). The profile takes effect when the \
-             daemon next starts: run min stop, then your command again.\n\
+             daemon next starts: run min host stop <host>, then your command again.\n\
              A daemon built from source is not covered: attach the profile to this binary \
              instead, from a checkout: sudo scripts/install-apparmor-profile.sh --path \
              /home/me/src/minimal/target/debug/minimald, then the same restart."
