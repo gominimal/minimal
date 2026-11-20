@@ -189,7 +189,10 @@ fn needs_provider(command: Option<&Command>) -> bool {
 /// Their stderr is not a command the person typed.
 fn shows_native_boxes_notice(command: Option<&Command>) -> bool {
     needs_provider(command)
-        && !matches!(command, Some(Command::Proxy(_) | Command::CompleteSessionStr(_)))
+        && !matches!(
+            command,
+            Some(Command::Proxy(_) | Command::CompleteSessionStr(_))
+        )
         && !is_debug_helper(command)
 }
 
@@ -198,7 +201,10 @@ fn shows_native_boxes_notice(command: Option<&Command>) -> bool {
 /// variant, so the match is compiled only where they exist.
 #[cfg(debug_assertions)]
 fn is_debug_helper(command: Option<&Command>) -> bool {
-    matches!(command, Some(Command::Spin(_) | Command::DebugAnswererCommand))
+    matches!(
+        command,
+        Some(Command::Spin(_) | Command::DebugAnswererCommand)
+    )
 }
 
 /// A release build has no debug helper to match.
