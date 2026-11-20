@@ -282,13 +282,33 @@ it with the `min` **already on disk**, which is the build that matches the daemo
 it started and is the one about to be overwritten. Only `<bin>/min` is ever run,
 never a `min` found on `$PATH`, which is not this installer's footprint.
 
-The stop is **graceful first**: `<bin>/min stop`, which succeeds when nothing is
-running and refuses while sessions are live. That refusal, recognized by the
-message the CLI prints for it rather than by a bare non-zero exit, is the one
-outcome an upgrade must not decide on the user's behalf: it means live work is
-about to be destroyed. The installer then lists the running sessions
-(`<bin>/min ls`), asks whether to end them, and only on an explicit yes runs
-`<bin>/min stop --force` and carries on. A declined upgrade exits non-zero
+The stop is **graceful first**. A `min` from a release with `min host stop`
+has no bare `min stop` (BCLI-042). `min host stop <host>` ends each running box
+on its host and asks nothing, so the installer makes its own running-box check
+first: `<bin>/min box list --all -o json`. A box in state `running` refuses the
+graceful stop. A listing that fails refuses it too. So does a listing that did
+not reach a host: `min box list` then exits 0 but leaves that host's boxes out.
+A listing that is not complete proves nothing, and this refusal says that the
+daemon did not list its boxes. When no box runs, the installer runs
+`<bin>/min host stop <host>` for each local host that `<bin>/min host list`
+shows as not stopped. It never stops `local-box`, the host of the box that
+`min` itself runs in.
+
+An older `min`, without `min host stop`, gets the stop that it has:
+`<bin>/min stop`, which succeeds when nothing is running and refuses while
+sessions are live. The installer recognizes that refusal by the message the CLI
+prints for it, not by a bare non-zero exit. The installer prints the same
+message for its own running-box refusal.
+
+A refusal is the one outcome an upgrade must not decide on the user's behalf:
+it means live work is about to be destroyed. The installer then lists the
+running sessions (`<bin>/min ls`), asks whether to end them, and only on an
+explicit yes runs the forced stop and carries on. The forced stop is
+`<bin>/min host stop --force <host>` for each host that runs, or
+`<bin>/min stop --force` on an older `min`. A failed `<bin>/min host list`
+names no host to stop. The installer then refuses the upgrade before the first
+executable replacement, with or without consent, and names `min host list`.
+A declined upgrade exits non-zero
 before the first **executable** replacement, dropping the temp download and
 leaving the daemon, its sessions, every installed executable, and the install
 record exactly as they were. It claims no more than that: the stop is attempted
@@ -308,8 +328,9 @@ already means "remove modified files too" in uninstall mode.
 
 Every other outcome stays **best-effort and silent**, output discarded and exit
 status ignored: "no `min` installed yet" (a fresh install), "no daemon running"
-(`min stop` merely connects; it never autospawns, so this is a failed connect
-and nothing more), "the installed `min` is too old to know `stop`", and a
+(`min host list` shows no host that runs, or an older `min stop` merely
+connects and never autospawns, so this is a failed connect and nothing more),
+"the installed `min` is too old to know `stop`", and a
 transport drop on an otherwise successful stop are all just *nothing to stop*.
 None of them may fail an install whose binaries are otherwise fine, and none of
 them may raise the question — treating a bare failure as "sessions are live"
@@ -336,16 +357,18 @@ the run already has consent: `--force-stop`, `MINIMAL_INSTALL_FORCE_STOP`, or a
 yes to the pre-swap question — and that yes covers only the sessions it listed
 at the time. Any session opened after it (or a failed listing of the live
 sessions) makes the stop graceful again for the sessions now live, so the
-installer asks again. With consent it is `<bin>/min stop --force`. When the
-graceful stop refuses because sessions are live, the installer asks on the
-terminal, as the pre-swap stop does, and a yes runs `stop --force`. On a no, or
-with no terminal, it leaves the daemon running. It tells the user to run
-`min stop` after those sessions end, or `min stop --force` to end them now —
-never to rerun the installer, which cannot do this stop, because a rerun
-replaces nothing. The upgrade still succeeds. Any other failure of the graceful
-stop falls through to `stop --force`, as the pre-swap stop does. When a
-`stop --force` of the post-swap stop fails, the installer says the old daemon
-can still be running and names `min stop --force`.
+installer asks again. With consent it is the forced stop. When the graceful
+stop refuses because sessions are live, the installer asks on the terminal, as
+the pre-swap stop does, and a yes runs the forced stop. On a no, or with no
+terminal, it leaves the daemon running. It tells the user to run
+`min host stop <host>` after those sessions end, or `min host stop --force <host>`
+to end them now. It fills in the host when one host runs. An older `min` gets
+`min stop` and `min stop --force` in this advice. The advice never says to
+rerun the installer, which cannot do this stop, because a rerun replaces
+nothing. The upgrade still succeeds. Any other failure of the graceful stop
+falls through to the forced stop, as the pre-swap stop does. When the forced
+stop of the post-swap stop fails, the installer says the old daemon can still
+be running and names the forced stop command.
 
 The post-swap stop also runs when the run dies after the pre-swap stop, for
 example on a failed download or checksum of a later component. The installer
@@ -377,6 +400,8 @@ both hash columns in place of digests.
   *same* manifest performs zero downloads and no re-sign, but a rerun against a
   manifest whose `sha256` for that component *changed* re-downloads and re-signs
   it, the recorded installed hash does not mask a new release.
+- The R5.5 tests below that name `stop` run against an older `min`, without
+  `min host stop`. The `min host stop` tests follow them.
 - **Test** (R5.5): a fresh install stops nothing (no `min` on disk yet) and an
   up-to-date rerun stops nothing (nothing replaced); an upgrade whose components
   are stale runs the on-disk `min` with exactly `stop`, once, however many
@@ -409,8 +434,8 @@ both hash columns in place of digests.
   leaves the stale component and no temp file behind, and reports that no
   executable was replaced.
 - **Test** (R5.5): the refusal message the installer matches on is asserted, by
-  the workspace test suite, to still be present in the CLI source that prints
-  it. The signal crosses a language boundary with nothing else holding the two
+  the workspace test suite, to be the text an older `min stop` prints, and to
+  be the text the installer prints for its own running-box refusal. The signal crosses a language boundary with nothing else holding the two
   ends together, and a reword on the CLI side would otherwise return every
   upgrade to an unconditional force-stop with the installer's own tests — which
   supply their own copy of the message — still green.
@@ -420,6 +445,22 @@ both hash columns in place of digests.
 - **Test** (R5.5): the escape hatch, given as an argument or through the
   environment, force-stops without a graceful attempt and without asking, and
   completes the upgrade; given after the target, the target still resolves.
+- **Test** (R5.5): with a `min` that has `min host stop` and no box running,
+  the upgrade runs exactly `host stop local0`, asks nothing, and never stops
+  `local-box`. A running box makes the installer list the sessions and ask. A
+  yes runs exactly `host stop --force local0`. With no terminal it exits
+  non-zero, names the escape hatch and stops nothing. `--force-stop` runs
+  `host stop --force local0` and asks nothing. A host that is already stopped
+  is not stopped again.
+- **Test** (R5.5): a box listing that fails, and one that exits 0 but did not
+  reach a host, both make the installer say that the daemon did not list its
+  boxes. With no terminal, the upgrade exits non-zero, stops nothing and
+  installs nothing.
+- **Test** (R5.5): a failed `min host list` aborts the upgrade with and without
+  `--force-stop`. The output names `min host list`, nothing is stopped, and no
+  executable is replaced.
+- **Test** (R5.5): an older `min`, without `min host stop`, gets exactly
+  `stop`.
 - **Test** (R5.6): a `symlink` component lands as a symlink at its `dest`
   pointing at the manifest target, with no download; a rerun skips it, and a
   retargeted link is repaired on the next run, still with no download.
@@ -731,8 +772,10 @@ none in uninstall mode.
 - **Test** (R10.1): the harness captures every run to a file, so no run's
   output may contain an ESC byte; asserted on a full install.
 - **Test** (R10.4): a fresh install and an up-to-date rerun both end on the
-  card, it names `min session activate --attach .`, and it is still the parting
-  block when the AppArmor advisory is the last note before it.
+  card, it names `min`, which starts a session box and attaches to it (the
+  card named the removed `min session activate --attach .` before BCLI-042),
+  and it is still the parting block when the AppArmor advisory is the last
+  note before it.
 - **Test** (R10.4): a failed install (checksum mismatch) prints no card.
 - **Not automated**: the terminal-only behaviors — attributes, the in-place row
   rewrite, and the mark (R10.2/R10.3) — are unreachable from the harness, whose
