@@ -17225,7 +17225,7 @@ echo = "ok"
         ("check", "task")
     );
     // A task's own vars have the task shape, so a task entry sends none.
-    assert_eq!(task.vars, None);
+    assert_eq!(task.env_vars, None);
     // `--no-hooks` sends no hook list, so the daemon's own stays cleared.
     let no_hooks = crate::session_box_entry(root, None, false)
         .unwrap()

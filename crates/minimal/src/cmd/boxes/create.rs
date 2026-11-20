@@ -2029,44 +2029,24 @@ pub(crate) fn task_box_entry(
     .map(Some)
 }
 
-/// The wire's two variable lists from the expanded spec's `env_vars`
-/// (BOX-205): a strict POSIX name (`[A-Z_][A-Z0-9_]*`) in the first, any
-/// other name in the second, in name order. Both are `None` when the spec
-/// sets no `env_vars`.
-#[allow(clippy::type_complexity)]
-fn wire_vars(
+/// The wire's `env_vars` from the expanded spec's `env_vars` (BOX-205),
+/// whole and by name. `None` when the spec sets no `env_vars`. The
+/// expansion already refused a name that is not POSIX-shaped (BOX-207), so
+/// every name reads as a [`StrictVarName`](boxes::core::primitives::StrictVarName).
+fn wire_env_vars(
     spec: &toml::Table,
 ) -> Result<
-    (
-        Option<
-            std::collections::BTreeMap<
-                boxes::core::primitives::StrictVarName,
-                boxes::core::primitives::VarValue,
-            >,
+    Option<
+        std::collections::BTreeMap<
+            boxes::core::primitives::StrictVarName,
+            boxes::core::primitives::VarValue,
         >,
-        Option<Vec<boxes::core::primitives::LenientVarEntry>>,
-    ),
+    >,
     toml::de::Error,
 > {
-    use boxes::core::primitives::{LenientVarEntry, StrictVarName, VarValue};
-    let Some(value) = spec.get(mfile::expand::ENV_VARS_KEY) else {
-        return Ok((None, None));
-    };
-    let vars: std::collections::BTreeMap<String, VarValue> = value.clone().try_into()?;
-    let mut strict = std::collections::BTreeMap::new();
-    let mut lenient = Vec::new();
-    for (name, value) in vars {
-        match StrictVarName::try_new(name.clone()) {
-            Ok(name) => {
-                strict.insert(name, value);
-            }
-            Err(_) => lenient.push(
-                LenientVarEntry::try_new(name, value)
-                    .map_err(<toml::de::Error as serde::de::Error>::custom)?,
-            ),
-        }
-    }
-    Ok((Some(strict), (!lenient.is_empty()).then_some(lenient)))
+    spec.get(mfile::expand::ENV_VARS_KEY)
+        .map(|value| value.clone().try_into())
+        .transpose()
 }
 
 /// Expands `entry` of the `minimal.toml` in `bytes` over `[defaults]` and
@@ -2209,7 +2189,7 @@ pub(crate) fn box_entry(
     // and `[defaults.task]` values for them do not reach the task box.
     // gominimal/minimal#3266 tracks that gap.
     if box_type != boxes::TASK_BOX_TYPE {
-        (wire.vars, wire.vars_lenient) = wire_vars(spec).map_err(format_error)?;
+        wire.env_vars = wire_env_vars(spec).map_err(format_error)?;
         wire.patches = list(spec, "patches").map_err(format_error)?;
     }
     tracing::info!(
