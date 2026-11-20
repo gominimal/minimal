@@ -8,13 +8,13 @@ In Minimal, your dev shell is a **session**, which is a long-lived, isolated dev
 
 ## Launch a shell
 
-From your project directory, activate a session and attach to it in one step:
+From your project directory, start a session and attach to it in one step:
 
 ```shell
-$ min session activate --attach .
+$ min session start
 ```
 
-This creates a session for the project and drops you into its interactive shell. The path argument defaults to the current directory, so `min session activate --attach` on its own works too.
+This creates a session for the project and drops you into its interactive shell. The project is the current directory. To start a session for another directory, pass it with `-C`: `min -C <dir> session start`.
 
 Activation uploads your project files into the session's workspace, so the shell starts with a copy of your project. Edits you make inside stay in the session. To bring them back to the host, use `git push min://<session>`. Committing inside the session and pulling from it also works.
 
@@ -99,7 +99,7 @@ Exit the shell to detach. The session keeps running in the background. To reatta
 ```shell
 $ min session attach            # reattach to a session (resolves from the current directory)
 $ min ls                        # list sessions
-$ min session destroy <session> # terminate a session by name or id (or --all)
+$ min box rm --force <box>      # stop and remove a session by name or id
 ```
 
 For running one-shot commands in their own sandbox rather than an interactive session, see [Tasks](./tasks.md).
