@@ -221,6 +221,7 @@ COMPONENTS=(
     "git-remote-min|linux|amd64|symlink|bin/git-remote-min|min"
     "gvproxy-min|linux|amd64|file|bin/gvproxy-min|gvproxy-linux-amd64"
     "minvmd|linux|amd64|file|bin/minvmd|minvmd-linux-amd64"
+    "bep|linux|amd64|file|bin/bep|bep-linux-amd64"
     "initramfs|linux|amd64|file|data/initramfs.cpio|initramfs-amd64.cpio"
     "rootfs|linux|amd64|file|data/rootfs.img|rootfs-amd64.img"
     "vmlinuz|linux|amd64|file|data/vmlinuz|vmlinuz-amd64"
@@ -232,6 +233,7 @@ COMPONENTS=(
     "git-remote-min|linux|arm64|symlink|bin/git-remote-min|min"
     "gvproxy-min|linux|arm64|file|bin/gvproxy-min|gvproxy-linux-arm64"
     "minvmd|linux|arm64|file|bin/minvmd|minvmd-linux-arm64"
+    "bep|linux|arm64|file|bin/bep|bep-linux-arm64"
     "initramfs|linux|arm64|file|data/initramfs.cpio|initramfs-arm64.cpio"
     "rootfs|linux|arm64|file|data/rootfs.img|rootfs-arm64.img"
     "vmlinuz|linux|arm64|file|data/vmlinuz|vmlinuz-arm64"
@@ -255,7 +257,8 @@ COMPONENTS=(
     # row is required, so a release with part of the bundle fails the stage.
     # The installer works through the rows in order, so the link comes last:
     # an earlier plain bin/bep stays in place until the whole bundle is down.
-    # macOS only: the proxy does not run on Linux.
+    # Linux ships bep as a plain file beside minvmd (the rows above): its
+    # keys live in the TPM or Secret Service, which need no bundle.
     "bep-program|darwin|arm64|file|bin/bep.app/Contents/MacOS/bep|bep-macos-arm64"
     "bep-info|darwin|arm64|file|bin/bep.app/Contents/Info.plist|bep-macos-arm64-Info.plist"
     "bep-profile|darwin|arm64|file|bin/bep.app/Contents/embedded.provisionprofile|bep-macos-arm64-profile"

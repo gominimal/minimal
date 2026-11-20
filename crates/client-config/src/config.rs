@@ -21,6 +21,12 @@ use crate::store_rules::{
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Config {
+    /// `provider`: the box host `min` uses on Linux when a command has no
+    /// `--provider` and `MIN_PROVIDER` is unset, as `--provider` names
+    /// it (`local` or `local-minvmd`). The client checks the value. A top-level
+    /// key, so it goes before the first table in the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     /// `[loadouts]` section: preferences that apply across the
     /// loadout subsystem.
     #[serde(default)]
@@ -502,6 +508,22 @@ mod tests {
         );
         let cfg = read_config_file(&path).unwrap();
         assert!(cfg.loadouts.follow_symlinks);
+    }
+
+    /// A top-level `provider` key reads as written, and a file without it
+    /// names no provider.
+    #[test]
+    fn read_config_file_keeps_provider() {
+        let dir = TempDir::new().unwrap();
+        let path = write_file(
+            dir.path(),
+            "config.toml",
+            "provider = \"local\"\n\n[telemetry]\nenabled = true\n",
+        );
+        let config = read_config_file(&path).unwrap();
+        assert_eq!(config.provider.as_deref(), Some("local"));
+        let empty = write_file(dir.path(), "empty.toml", "");
+        assert_eq!(read_config_file(&empty).unwrap().provider, None);
     }
 
     /// An empty config file parses to `Config::default()`.
