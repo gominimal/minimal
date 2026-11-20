@@ -680,6 +680,9 @@ where
         None,
         false,
         Some(node_dns),
+        // NET-084: the daemon's relay admits the `host_ip` cohort's address
+        // beside its lease, because host-address boxes leave as it.
+        Some(subnet.host_ip_cohort_address()),
         lease,
         subnet,
     )
@@ -722,7 +725,7 @@ where
     W: AsyncWriteExt + Unpin + Send + 'static,
 {
     spawn_relay_with(
-        tap_fd, sock_rx, sock_tx, gate, box_name, announce, None, lease, subnet,
+        tap_fd, sock_rx, sock_tx, gate, box_name, announce, None, None, lease, subnet,
     )
 }
 
@@ -739,6 +742,7 @@ fn spawn_relay_with<R, W>(
     box_name: Option<&str>,
     announce: bool,
     node_dns: Option<DnsGate>,
+    cohort: Option<Ipv4Addr>,
     lease: Ipv4Addr,
     subnet: SwitchSubnet,
 ) -> io::Result<SwitchRelay>
@@ -797,7 +801,8 @@ where
     // NET-084: every relay rejects a frame whose source is not its lease — a
     // session relay's lease is the box's, the daemon relay's its own address —
     // and says so through the notice below.
-    let reject = ForeignSourceReject::for_relay(gate.as_deref(), lease);
+    let cohort = cohort.map(CohortSource::new);
+    let reject = ForeignSourceReject::for_relay(gate.as_deref(), lease).with_cohort(cohort.clone());
     // The switch's write half is shared with the reset writer below: the
     // egress leg's forwarded frames and the gate's synthesized resets both
     // leave by it, one brief lock per write.
@@ -831,7 +836,8 @@ where
     let box_reset_writer = box_resets_rx.map(|box_resets_rx| {
         crate::traced::spawn(write_box_resets(box_resets_rx, Arc::clone(&tap)))
     });
-    let switch_to_tap = crate::traced::spawn(relay_switch_to_tap(sock_rx, tap, gate.clone()));
+    let switch_to_tap =
+        crate::traced::spawn(relay_switch_to_tap(sock_rx, tap, gate.clone(), cohort));
     // A gated vsock attach announces its lease as its relay's first frame — the
     // delay carries it past gvproxy's `/connect` hijack, and the row it
     // carries is NET-138's. Discarded like every fire-and-forget writer the
@@ -950,9 +956,12 @@ where
         // rejection says so once per lease per minute, naming the session,
         // the lease and the source the frame carried.
         let summary = egress::summarize(&buf[..n]);
-        if let Some(reason) = egress::foreign_source(&summary, reject.lease.octets()) {
+        if let Some(reason) = reject.foreign(&summary) {
             reject.emit(&reason);
             continue;
+        }
+        if let Some(cohort) = &reject.cohort {
+            cohort.egress(&mut buf[..n]);
         }
         // NET-004: on a box relay the literal host address is default-deny —
         // the shared verdict below drops every frame to it — but the relay
@@ -1348,6 +1357,98 @@ impl LegacyHostNotice {
     }
 }
 
+/// The `host_ip` cohort's source on the daemon's own relay (NET-078): the
+/// guest's `eth0` carries the cohort address beside the daemon's, so both
+/// leave through one tap and one MAC. The Box Egress Proxy's leg admits a
+/// source only at its switch-derived MAC, so this relay sends the cohort's
+/// frames at the cohort address's derived MAC, and gives the tap's own MAC
+/// back to every frame the switch sends to it.
+#[derive(Clone)]
+struct CohortSource {
+    /// The cohort's address, `100.64.255.251` on the default subnet.
+    addr: [u8; 4],
+    /// The cohort address's switch-derived MAC.
+    mac: [u8; 6],
+    /// The tap's own MAC, as the cohort's first frame carried it: bit 48
+    /// set once it is known, the MAC in the low 48 bits.
+    tap_mac: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl CohortSource {
+    const ETHERTYPE_IPV4: [u8; 2] = [0x08, 0x00];
+    const ETHERTYPE_ARP: [u8; 2] = [0x08, 0x06];
+    const KNOWN: u64 = 1 << 48;
+
+    fn new(addr: Ipv4Addr) -> Self {
+        Self {
+            addr: addr.octets(),
+            mac: super::MacAddr::for_switch_ip(addr).0,
+            tap_mac: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// Whether `frame` is an IPv4 packet from the cohort's address, or an
+    /// ARP packet whose sender is the cohort's address.
+    fn sent_by_cohort(&self, frame: &[u8]) -> Option<bool> {
+        let ethertype = frame.get(12..14)?;
+        if ethertype == Self::ETHERTYPE_IPV4 {
+            return Some(frame.get(26..30)? == self.addr);
+        }
+        if ethertype == Self::ETHERTYPE_ARP {
+            return Some(frame.get(28..32)? == self.addr);
+        }
+        Some(false)
+    }
+
+    /// The egress half: a cohort frame leaves at the cohort's derived MAC,
+    /// in its Ethernet source and, for ARP, its sender hardware address.
+    fn egress(&self, frame: &mut [u8]) {
+        if self.sent_by_cohort(frame) != Some(true) {
+            return;
+        }
+        let Some(src) = frame.get_mut(6..12) else {
+            return;
+        };
+        let mut tap = [0u8; 8];
+        if let Some(low) = tap.get_mut(2..8) {
+            low.copy_from_slice(src);
+        }
+        self.tap_mac
+            .store(u64::from_be_bytes(tap) | Self::KNOWN, Ordering::Relaxed);
+        src.copy_from_slice(&self.mac);
+        if frame.get(12..14) == Some(&Self::ETHERTYPE_ARP[..])
+            && let Some(sha) = frame.get_mut(22..28)
+        {
+            sha.copy_from_slice(&self.mac);
+        }
+    }
+
+    /// The ingress half: a frame the switch sends to the cohort's derived
+    /// MAC reaches the tap at the tap's own MAC, so the guest's kernel
+    /// takes it. Nothing changes until the cohort sent its first frame.
+    fn ingress(&self, frame: &mut [u8]) {
+        let known = self.tap_mac.load(Ordering::Relaxed);
+        if known & Self::KNOWN == 0 {
+            return;
+        }
+        let bytes = known.to_be_bytes();
+        let Some(tap) = bytes.get(2..8) else {
+            return;
+        };
+        if let Some(dst) = frame.get_mut(0..6)
+            && *dst == self.mac
+        {
+            dst.copy_from_slice(tap);
+        }
+        if frame.get(12..14) == Some(&Self::ETHERTYPE_ARP[..])
+            && let Some(tha) = frame.get_mut(32..38)
+            && *tha == self.mac
+        {
+            tha.copy_from_slice(tap);
+        }
+    }
+}
+
 /// NET-084's rejection notice on the egress relay leg: when a relay's tap
 /// emits a frame whose source is not the lease the relay was attached with,
 /// the relay rejects it — the frame never reaches the switch — and says so,
@@ -1365,6 +1466,10 @@ struct ForeignSourceReject {
     /// is one, so every rule's line on one relay keeps its own interval; a
     /// fresh one for the daemon's own relay, which has no gate to share.
     limiter: Arc<PolicyWarnLimiter>,
+    /// The second source the daemon's own relay admits: the `host_ip`
+    /// cohort's address, which the guest's classifier SNATs a host-address
+    /// box's connections to (NET-084, NET-078). `None` on every box relay.
+    cohort: Option<CohortSource>,
 }
 
 impl ForeignSourceReject {
@@ -1378,6 +1483,23 @@ impl ForeignSourceReject {
                 || Arc::new(PolicyWarnLimiter::new()),
                 |gate| Arc::clone(&gate.limiter),
             ),
+            cohort: None,
+        }
+    }
+
+    /// The same rejection, admitting `cohort`'s address beside the lease.
+    fn with_cohort(mut self, cohort: Option<CohortSource>) -> Self {
+        self.cohort = cohort;
+        self
+    }
+
+    /// Why the frame is rejected (NET-084), or `None` when its source is
+    /// the lease or, on the daemon's own relay, the cohort's address.
+    fn foreign(&self, summary: &FrameSummary) -> Option<DropReason> {
+        let reason = egress::foreign_source(summary, self.lease.octets())?;
+        match &self.cohort {
+            Some(cohort) if summary.source() == Some(cohort.addr) => None,
+            _ => Some(reason),
         }
     }
 
@@ -4333,6 +4455,7 @@ async fn relay_switch_to_tap<R>(
     mut sock: R,
     tap: Arc<AsyncFd<std::fs::File>>,
     gate: Option<Arc<BoxGate>>,
+    cohort: Option<CohortSource>,
 ) -> io::Result<()>
 where
     R: AsyncReadExt + Unpin,
@@ -4362,6 +4485,9 @@ where
             ));
         }
         sock.read_exact(&mut frame[..n]).await?;
+        if let Some(cohort) = &cohort {
+            cohort.ingress(&mut frame[..n]);
+        }
         // The frame's TCP addressing, parsed once for both of this leg's new
         // consumers below — the revoked-port refusal (NET-121) and the
         // unpublished-port reset (NET-014) — and the inbound-flow record
@@ -5295,6 +5421,61 @@ pub(crate) mod tests {
         f.extend_from_slice(&[0; 6]); // target MAC (unread in a request)
         f.extend_from_slice(&Ipv4Addr::new(100, 64, 0, 1).octets()); // target protocol address
         f
+    }
+
+    /// NET-084 with NET-078 on the daemon's own relay: a frame from the
+    /// `host_ip` cohort's address passes the lease check beside the lease's
+    /// own, and any other source is still rejected. A cohort frame leaves at
+    /// the cohort address's derived MAC, which the Box Egress Proxy's leg
+    /// checks, and the switch's answer to that MAC reaches the tap at its
+    /// own MAC again.
+    #[test]
+    fn node_relay_admits_the_cohort_address_at_its_derived_mac() {
+        let subnet = SwitchSubnet::default();
+        let lease = subnet.daemon_ip();
+        let cohort_ip = subnet.host_ip_cohort_address();
+        let cohort = CohortSource::new(cohort_ip);
+        let reject = ForeignSourceReject::for_relay(None, lease).with_cohort(Some(cohort.clone()));
+        let tap_mac = [0x52, 0x54, 0x00, 0x00, 0x00, 0x02];
+        let cohort_mac = super::super::MacAddr::for_switch_ip(cohort_ip).0;
+
+        let from_lease = tcp_frame(0x0800, IPPROTO_TCP, 0x02, lease, 443);
+        assert!(reject.foreign(&egress::summarize(&from_lease)).is_none());
+        let mut from_cohort = tcp_frame(0x0800, IPPROTO_TCP, 0x02, cohort_ip, 443);
+        assert!(reject.foreign(&egress::summarize(&from_cohort)).is_none());
+        let stranger = tcp_frame(0x0800, IPPROTO_TCP, 0x02, Ipv4Addr::new(100, 64, 0, 9), 443);
+        assert!(reject.foreign(&egress::summarize(&stranger)).is_some());
+        let box_relay = ForeignSourceReject::for_relay(None, lease);
+        assert!(
+            box_relay
+                .foreign(&egress::summarize(&from_cohort))
+                .is_some(),
+            "a relay without the cohort still rejects its address"
+        );
+
+        // The daemon's own frame keeps the tap's MAC.
+        let mut own = from_lease.clone();
+        cohort.egress(&mut own);
+        assert_eq!(own, from_lease);
+        // The cohort's leaves at its derived MAC, ARP sender included.
+        cohort.egress(&mut from_cohort);
+        assert_eq!(from_cohort[6..12], cohort_mac);
+        let mut arp = arp_frame(cohort_ip);
+        cohort.egress(&mut arp);
+        assert_eq!(arp[6..12], cohort_mac);
+        assert_eq!(arp[22..28], cohort_mac);
+
+        // The answer to the derived MAC reaches the tap at the tap's MAC.
+        let mut answer = tcp_frame(0x0800, IPPROTO_TCP, 0x12, subnet.gateway(), 40000);
+        answer[0..6].copy_from_slice(&cohort_mac);
+        cohort.ingress(&mut answer);
+        assert_eq!(answer[0..6], tap_mac);
+        let mut arp_reply = arp_frame(subnet.gateway());
+        arp_reply[0..6].copy_from_slice(&cohort_mac);
+        arp_reply[32..38].copy_from_slice(&cohort_mac);
+        cohort.ingress(&mut arp_reply);
+        assert_eq!(arp_reply[0..6], tap_mac);
+        assert_eq!(arp_reply[32..38], tap_mac);
     }
 
     /// An IPv6 frame: dropped as a family (NET-082), payload unread.

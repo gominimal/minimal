@@ -2611,8 +2611,8 @@ const REHEARSAL_MOUNTINFO_ENV: &str = "MINIMAL_OVERRIDE_CGROUP_MOUNTINFO";
 
 /// What the guest's own boot hands the installer's render: the tree this
 /// daemon mounted, the listener its deny-all boxes' lookups are steered onto,
-/// and NET-078's two source identities — which on a guest are both the
-/// guest's own address, but the render is told so, never left to assume.
+/// and NET-078's two source identities — on a guest, the `host_ip` cohort's
+/// reserved address and the daemon's own, two distinct addresses.
 pub struct GuestRender<'a> {
     /// The tree root this daemon itself laid out: `sandbox`'s
     /// `classifier::TREE_ROOT`, under the cgroup2 its boot mounted.
@@ -7614,6 +7614,40 @@ mod tests {
     /// the one address an un-enrolled host gives it, both rules still
     /// render — the daemon hands the render the pair, never leaves it to
     /// assume one identity from the other.
+    #[test]
+    fn guest_render_gives_cohort_and_node_plane_distinct_addresses() {
+        // NET-078 on a microVM guest: the boot hands the render the subnet's
+        // two reserved addresses, and the table SNATs the cohort's mark to
+        // 100.64.255.251 and the node plane's mark to 100.64.255.253, so the
+        // VM host's gate picks the cohort's rules or the node's by source.
+        let subnet = crate::net::SwitchSubnet::default();
+        let cohort = IpAddr::V4(subnet.host_ip_cohort_address());
+        let node_plane = IpAddr::V4(subnet.daemon_ip());
+        assert_eq!(cohort, IpAddr::V4(Ipv4Addr::new(100, 64, 255, 251)));
+        assert_eq!(node_plane, IpAddr::V4(Ipv4Addr::new(100, 64, 255, 253)));
+        let rendered = String::from_utf8(guest_ruleset(cohort, node_plane))
+            .expect("the guest's render is text");
+
+        let cohort_bit = GUEST_CT_MARK_MASK & GUEST_CT_MARK_MASK.wrapping_neg();
+        let node_bit = GUEST_CT_MARK_MASK ^ cohort_bit;
+        let postrouting = chain_rules(&rendered, "postrouting");
+        assert_eq!(
+            postrouting,
+            [
+                format!(
+                    "ct mark and 0x{GUEST_CT_MARK_MASK:08x} == 0x{cohort_bit:08x} \
+                     oifname != \"lo\" snat ip to {cohort}"
+                ),
+                format!(
+                    "ct mark and 0x{GUEST_CT_MARK_MASK:08x} == 0x{node_bit:08x} \
+                     oifname != \"lo\" snat ip to {node_plane}"
+                ),
+            ],
+            "the cohort's mark leaves as the cohort address and the node \
+             plane's as the daemon's: {postrouting:?}"
+        );
+    }
+
     #[test]
     fn guest_render_takes_node_plane_and_cohort_separately() {
         let cohort = IpAddr::V4(Ipv4Addr::new(100, 72, 0, 9));

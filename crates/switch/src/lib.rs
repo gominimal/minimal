@@ -268,7 +268,7 @@ impl SwitchSubnet {
     /// # Errors
     ///
     /// Returns [`InvalidPrefix`] for a prefix outside `8..=29`. A prefix narrower
-    /// than /29 has no room for the reserved network/gateway/proxy/daemon/
+    /// than /29 has no room for the reserved network/gateway/cohort/proxy/daemon/
     /// host-alias/broadcast addresses plus a PTask address. A prefix wider than /8 lets the high octet
     /// vary, which [`MacAddr::for_switch_ip`] does not fold into the derived MAC,
     /// so two addresses differing only in that octet would collide.
