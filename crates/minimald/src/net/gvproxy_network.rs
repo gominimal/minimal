@@ -419,7 +419,31 @@ async fn finish_own_ip_attach(
     // not this box's publish: tasks declare no ingress, so they never reach
     // for a published address at all.
     let published = own_address.and_then(|reporter| reporter.published_address());
+    // On a native host the box's finalize drew this lease and bound the
+    // declared forwards toward it, before any attach. The attach adopts
+    // them and binds nothing again. They get this attach's gate, so a
+    // revocation ends their connections. With no published address the
+    // attach fails below, and the detach of the lease unbinds them.
+    let adopted = match published {
+        Some(_) => switch.lock().await.take_activation_forwards(lease),
+        None => None,
+    };
     let exposed = match (ingress, published) {
+        (_, Some(published)) if adopted.is_some() => {
+            let adopted: Vec<PortForwarder> = adopted
+                .into_iter()
+                .flatten()
+                .map(|forwarder| forwarder.with_gate(gate.cloned()))
+                .collect();
+            tracing::debug!(
+                session = session_name,
+                address = %published,
+                switch_address = %lease_ip,
+                forwards = adopted.len(),
+                "adopted the declared forwards bound at the box's activation"
+            );
+            adopted
+        }
         (Some(ingress), _) if ingress.port_mappings.is_empty() => Vec::new(),
         (Some(ingress), Some(published)) => {
             // The ports this box yields at a shared address (NET-129,
@@ -1679,6 +1703,133 @@ mod tests {
             locals_of(&unbound, "/services/forwarder/unexpose"),
             vec![format!("{HANDED}:8080"), format!("{HANDED}:9090")],
             "teardown unbinds every forwarder it held: {unbound:?}"
+        );
+        fake.abort();
+    }
+
+    /// A native finalize draws the box's lease and binds its declared
+    /// forwards toward it before any attach. The box's first attach takes
+    /// the same lease and adopts those forwards: the switch sees no second
+    /// expose, and the attach still registers the name. The attach's
+    /// teardown unbinds the adopted forwards and gives the lease back.
+    #[tokio::test]
+    async fn native_attach_adopts_the_forwards_bound_at_activation() {
+        const HANDED: Ipv4Addr = Ipv4Addr::new(127, 0, 64, 13);
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut native = SwitchClient::new(dir.path().join("gvproxy-min"), dir.path())
+            .with_host_id("aaaa1");
+        native.serve_externally();
+        let control_path = native.control_socket();
+        let switch = Arc::new(Mutex::new(native));
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let (handed_tx, _handed_rx) = mpsc::channel(4);
+        let fake =
+            spawn_control_channel_deciding(control_path.clone(), |_, _| ok(), events_tx, handed_tx);
+        let control = ControlChannel::Unix(control_path);
+        assert!(
+            !control.host_unbinds_declared_forwards(),
+            "the native shape: the daemon unbinds its own forwards"
+        );
+        let registry = Arc::new(std::sync::RwLock::new(dns::HostnameRegistry::new(
+            "aaaa1", true,
+        )));
+        let reporter = crate::net::provider::OwnAddressReporter::new(
+            Arc::clone(&registry),
+            boxes::SessionId::nil(),
+        );
+        let policy = declared_two_ports();
+        let ingress = policy.ingress.clone().expect("two declared ports");
+        {
+            let mut reg = registry.write().expect("registry lock");
+            reg.publish_own_address(
+                boxes::SessionId::nil(),
+                "web",
+                HANDED,
+                BTreeSet::from([8080, 9090]),
+            );
+            reg.register_own_ip(boxes::SessionId::nil(), "web", BTreeSet::from([8080, 9090]));
+        }
+
+        // The finalize's half: draw the lease, bind toward it, keep the
+        // forwards on the switch.
+        let drawn = switch
+            .lock()
+            .await
+            .draw_for_activation(boxes::SessionId::nil(), None)
+            .await
+            .expect("the native switch draws the box's lease");
+        let forwards = crate::net::policy::bind_declared_at_publish(
+            &control,
+            HANDED,
+            drawn.ip,
+            &ingress,
+            &[],
+            &|_| minimald_rpc::PortHolder::Host,
+        )
+        .await
+        .expect("the stand-in binds the declared forwards");
+        switch
+            .lock()
+            .await
+            .record_activation_forwards(boxes::SessionId::nil(), forwards);
+        let bound = collect_until(&mut events_rx, "/services/forwarder/expose", 2).await;
+        assert_eq!(
+            locals_of(&bound, "/services/forwarder/expose"),
+            vec![format!("{HANDED}:8080"), format!("{HANDED}:9090")],
+            "the finalize binds each declared port: {bound:?}"
+        );
+
+        // The attach's half: the launch's draw takes the same lease.
+        let attached = switch
+            .lock()
+            .await
+            .attach_drawn(Some(boxes::SessionId::nil()))
+            .await
+            .expect("the attach takes the lease the finalize drew");
+        assert_eq!(attached.lease, drawn, "the attach takes the drawn lease");
+        assert_eq!(
+            switch.lock().await.attached(),
+            1,
+            "the drawn lease counts once, from the draw on"
+        );
+        let scenario = attach_scenario(&dir, "unused.sock");
+        let guard = crate::net::gvproxy_network::complete_own_ip_attach(
+            &switch,
+            scenario.tap_fd,
+            control,
+            attached.lease,
+            "web",
+            Some(&policy),
+            Some(&reporter),
+            false,
+        )
+        .await
+        .expect("the attach completes against the stand-in");
+        let events = collect_until(&mut events_rx, "/services/dns/add", 1).await;
+        assert!(
+            locals_of(&events, "/services/forwarder/expose").is_empty(),
+            "the attach binds nothing again: {events:?}"
+        );
+        assert!(
+            switch
+                .lock()
+                .await
+                .release_activation_bind(boxes::SessionId::nil())
+                .is_none(),
+            "the attach owns the forwards, so a stop has none to release"
+        );
+
+        Box::new(guard).teardown().await;
+        let unbound = collect_until(&mut events_rx, "/services/forwarder/unexpose", 2).await;
+        assert_eq!(
+            locals_of(&unbound, "/services/forwarder/unexpose"),
+            vec![format!("{HANDED}:8080"), format!("{HANDED}:9090")],
+            "the teardown unbinds the adopted forwards: {unbound:?}"
+        );
+        assert_eq!(switch.lock().await.attached(), 0, "the lease went back");
+        assert!(
+            switch.lock().await.leases().is_empty(),
+            "the drawn lease left the table with the attach"
         );
         fake.abort();
     }
