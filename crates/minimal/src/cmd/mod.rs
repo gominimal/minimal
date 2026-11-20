@@ -57,9 +57,36 @@ pub use session::*;
 pub use types::{BoxTypeNotFound, BoxTypesCause, BoxTypesInvalid};
 
 pub async fn run(mut cli: Cli) -> Result<(), anyhow::Error> {
+    // A command with no `--provider` takes `MIN_PROVIDER`, then the
+    // `provider` key of config.toml, then the VM provider where /dev/kvm
+    // opens (Linux only). Resolved before the alias, so an old name in
+    // either place gets the same hint as the flag.
+    if let Err(error) = hosts::resolve_default_provider(&mut cli.global_args) {
+        // The shell's completion helper never fails: a provider that does
+        // not resolve offers no candidates, as the dynamic completer does.
+        if matches!(cli.command, Some(Command::CompleteSessionStr(_))) {
+            tracing::debug!(%error, "no provider resolved: no completions");
+            return Ok(());
+        }
+        // A command that needs no provider runs without one, so a bad
+        // `MIN_PROVIDER` or config.toml blocks only the commands that
+        // would reach the wrong host.
+        if needs_provider(cli.command.as_ref()) {
+            return Err(error);
+        }
+        tracing::debug!(%error, "no provider resolved: the command reads none");
+    }
     // BCLI-046: `--provider local-minimald` reads as `local`. Its hint
     // prints after the command ends, never before an attached shell.
-    let alias_hint = hosts::read_provider_alias(&mut cli.global_args);
+    // Where the `/dev/kvm` default moved the command to the VM provider
+    // while the native provider still has boxes or a daemon, the notice
+    // that says so takes the same path. The two never meet: the old name
+    // is always a named provider.
+    let alias_hint = hosts::read_provider_alias(&mut cli.global_args).or_else(|| {
+        shows_native_boxes_notice(cli.command.as_ref())
+            .then(|| hosts::native_boxes_notice(cli.global_args.minimal_dir.as_deref()))
+            .flatten()
+    });
     // The verb and the outcome go on the root span (BCLI-033
     // observability), so one span tells what ran. `box_id` stays empty
     // until a command records the id it resolved, through
@@ -117,6 +144,60 @@ pub async fn run(mut cli: Cli) -> Result<(), anyhow::Error> {
         None => Ok(()),
         Some(handoff) => Err(handoff.finish()),
     }
+}
+
+/// Whether `command` needs the provider: it talks to a host, or reports
+/// the host the provider selects (`provider list`, `version`). The rest
+/// run when the default provider does not resolve. `dirs` is among them,
+/// because it is how a user finds the config.toml to repair.
+///
+/// `finalize-install` needs one: the provider picks which host changes
+/// it installs, so a provider that does not resolve would install the
+/// changes for a target the user did not name. `finalize-install --undo`
+/// does not: it removes what an earlier install left on this host,
+/// whichever provider that install was for.
+///
+/// `proxy --socket` does not: ssh starts it without the parent's flags,
+/// and it connects to the socket it is given, whatever the provider.
+fn needs_provider(command: Option<&Command>) -> bool {
+    !matches!(
+        command,
+        Some(
+            Command::Loadout(_)
+                | Command::Type(_)
+                | Command::FinalizeInstall(FinalizeInstallArgs { undo: true, .. })
+                | Command::Proxy(ProxyArgs {
+                    socket: Some(_),
+                    ..
+                })
+                | Command::Dirs
+                | Command::Doctor
+                | Command::Bug(_)
+                | Command::Diag(_)
+                | Command::Auth(_)
+                | Command::Secret(_)
+                | Command::Login(_)
+                | Command::UpdateCheck(_)
+                | Command::Completions(_)
+        )
+    )
+}
+
+/// Whether `command` prints [`hosts::NATIVE_BOXES_NOTICE`] after it ends,
+/// when the notice applies: a command that reaches the provider, other
+/// than the helpers that ssh, the shell's completion and the spinner run.
+/// Their stderr is not a command the person typed.
+fn shows_native_boxes_notice(command: Option<&Command>) -> bool {
+    needs_provider(command)
+        && !matches!(
+            command,
+            Some(
+                Command::Proxy(_)
+                    | Command::CompleteSessionStr(_)
+                    | Command::Spin(_)
+                    | Command::DebugAnswererCommand
+            )
+        )
 }
 
 /// The verb a run dispatches, as the user typed it (`box show`,
@@ -1539,10 +1620,10 @@ pub(crate) fn arm_activation_interrupt(
     // Resolved here, not inside the task: the withdrawal's socket is the
     // same host dir's, and the borrow must not cross the spawn. Keyed
     // on the host kind — the rule the socket resolution itself and the
-    // fabric display turn on — not on `use_minvmd()`, which is true only
-    // under an explicit `--provider local-minvmd`: on macOS every invocation
-    // is minvmd-backed with no flag at all, and a Ctrl-C that keyed on the
-    // flag would leave exactly that host's box row published.
+    // fabric display turn on — not on `use_minvmd()`, which reads only the
+    // Linux provider choice: on macOS every invocation is minvmd-backed with
+    // no provider chosen at all, and a Ctrl-C that keyed on the choice would
+    // leave exactly that host's box row published.
     let control_sock =
         vm_host_control_sock(daemon_host_kind(global), global.minimal_dir.as_deref());
     let host_ip_box_id = std::sync::Arc::new(std::sync::OnceLock::new());
@@ -1713,6 +1794,36 @@ impl SessionRpc {
 #[cfg(test)]
 mod tests {
     use crate::{SessionRpc, session_rpc_failed};
+
+    /// The native-boxes notice prints after a command that reaches a
+    /// provider, never after a helper that ssh or the shell runs, and
+    /// `proxy --socket` needs no provider at all.
+    #[test]
+    fn the_native_boxes_notice_skips_helpers() {
+        use clap::Parser as _;
+        let command = |args: &[&str]| {
+            crate::Cli::try_parse_from(std::iter::once("min").chain(args.iter().copied()))
+                .unwrap()
+                .command
+        };
+        assert!(super::shows_native_boxes_notice(command(&["ls"]).as_ref()));
+        assert!(super::shows_native_boxes_notice(
+            command(&["session", "attach", "web"]).as_ref()
+        ));
+        assert!(!super::shows_native_boxes_notice(
+            command(&["proxy"]).as_ref()
+        ));
+        assert!(!super::shows_native_boxes_notice(
+            command(&["complete-session-str"]).as_ref()
+        ));
+        assert!(!super::shows_native_boxes_notice(
+            command(&["dirs"]).as_ref()
+        ));
+        assert!(!super::needs_provider(
+            command(&["proxy", "--socket", "/s"]).as_ref()
+        ));
+        assert!(super::needs_provider(command(&["proxy"]).as_ref()));
+    }
 
     /// BEP-082: a Ctrl-C during a `host_ip` activation withdraws the box's
     /// name with the id its registration handed back, as the activation's
