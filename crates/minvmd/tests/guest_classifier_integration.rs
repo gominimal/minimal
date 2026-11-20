@@ -1614,8 +1614,8 @@ fn probe_families(record: &str) -> Vec<(&str, &str)> {
 /// The sha256 of the native installer's `--print-ruleset` output for the
 /// guest's own parameters: the same tree root, the guest's own DNS listener
 /// as the carve-out, the
-/// two source identities the guest's boot hands as its one address
-/// (NET-078), and the same ct-mark bits — rendered over a stand-in mount
+/// two source identities the guest's boot hands, the cohort address and
+/// the daemon address (NET-078), and the same ct-mark bits — rendered over a stand-in mount
 /// table that spells the guest's own cgroup2 mount (`/sys/fs/cgroup`, root
 /// `/`, nsdelegate), which is the one fact the render is told rather than
 /// reads, and the only way this host-side render can name the guest's
@@ -1635,11 +1635,12 @@ fn native_ruleset_digest() -> String {
     )
     .expect("writing the stand-in mount table");
 
-    // NET-078 on an un-enrolled guest: the cohort's and the node plane's
-    // source identities are both the guest's own address — the daemon's
-    // switch address on the default subnet, which is what the guest's boot
-    // renders with (`DEFAULT_SUBNET.daemon_ip()` in its `main`).
-    let identity = switch::DEFAULT_SUBNET.daemon_ip();
+    // NET-078 on a guest: the cohort leaves as the subnet's cohort address
+    // and the node plane as the daemon's, which is what the guest's boot
+    // renders with (`host_ip_cohort_address()` and `daemon_ip()` in its
+    // `main`).
+    let cohort = switch::DEFAULT_SUBNET.host_ip_cohort_address();
+    let node_plane = switch::DEFAULT_SUBNET.daemon_ip();
     // The guest's resolver carve-out (NET-079): the guest's own DNS
     // listener — the answerer's port at the guest's loopback, the pair its
     // `main` renders with (`guest_dns::LISTENER_ADDRESS`/`LISTENER_PORT`,
@@ -1670,9 +1671,9 @@ fn native_ruleset_digest() -> String {
             "--answerer-port",
             listener_port,
             "--cohort-address",
-            &identity.to_string(),
+            &cohort.to_string(),
             "--node-plane-address",
-            &identity.to_string(),
+            &node_plane.to_string(),
             "--ct-mark-mask",
             GUEST_CT_MARK_MASK_ARG,
             "--cohort-dscp",
