@@ -156,8 +156,8 @@ mip cache clean [--older-than <DURATION>]
 ```
 
 Removes stale entries from the local cache: cached build artifacts whose
-last recorded use is older than the cutoff, or that were written that long
-ago without ever being used. Packages needed by the current project's tasks
+last recorded use and last write are both older than the cutoff. An
+artifact with neither time recorded is deleted too. Packages needed by the current project's tasks
 and stack are always kept. Also removes sandbox, task, and temporary build
 directories whose owning process is no longer running.
 
