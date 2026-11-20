@@ -374,6 +374,11 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     if e.downcast_ref::<minimal::SpecFileInvalid>().is_some() {
         return minimal::SpecFileInvalid::EXIT_CODE;
     }
+    // A `network` key a task box does not apply is the project file
+    // refusing the command the same way, so it ends with exit 3 too.
+    if e.downcast_ref::<minimal::TaskNetworkUnapplied>().is_some() {
+        return minimal::TaskNetworkUnapplied::EXIT_CODE;
+    }
     // BCLI-019, BCLI-020: `min type` of a project whose box types do not
     // load exits 3, and `min type show` of a name that is no type exits 4.
     if e.downcast_ref::<minimal::BoxTypesInvalid>().is_some() {
@@ -1842,6 +1847,26 @@ mod tests {
             error: mfile::Error::HarnessTable(None),
         };
         let e = anyhow::Error::new(invalid).context("activating the session");
+        assert_eq!(failure_exit_code(&e), 3);
+    }
+
+    /// #3252: a task's `minimal.toml` that sets a `network` key a task box
+    /// does not apply refuses the run with exit 3, the code an invalid
+    /// project file ends with, through the context the run adds over it.
+    /// `task`'s test of the same name proves the refusal names the key, the
+    /// table and the next step.
+    #[test]
+    fn task_network_key_a_task_does_not_apply_exits_3() {
+        let e = anyhow::Error::new(minimal::TaskNetworkUnapplied {
+            message: "[tasks.build] in minimal.toml sets network.quic443, which is \
+                      not applied to a task box."
+                .to_owned(),
+        })
+        .context("running the task");
+        assert_eq!(
+            failure_exit_code(&e),
+            minimal::TaskNetworkUnapplied::EXIT_CODE
+        );
         assert_eq!(failure_exit_code(&e), 3);
     }
 
