@@ -13264,6 +13264,23 @@ async fn box_exec_reports_an_injection_that_never_started_as_a_refusal() {
         assert_eq!(run.message().as_deref(), Some(message), "{run}");
         assert_eq!(run.stdout, "", "{run}");
         assert_eq!(run.stderr, "", "no other words\n{run}");
+
+        // One stderr write can arrive as two messages: the line split across
+        // them is still the refusal.
+        let (head, tail) = line.as_bytes().split_at(line.len() / 2);
+        let mut split = answer(b"", head, code);
+        split.msgs.insert(
+            1,
+            russh::ChannelMsg::ExtendedData {
+                data: tail.to_vec().into(),
+                ext: 1,
+            },
+        );
+        let (run, _) =
+            run_scripted_exec(&box_exec_request("web", &[], &["make"]), vec![split]).await;
+        assert_eq!(u32::from(run.exit), code, "split\n{run}");
+        assert_eq!(run.message().as_deref(), Some(message), "split\n{run}");
+        assert_eq!(run.stderr, "", "split: no other words\n{run}");
     }
 
     for line in [INJECTION_BOX_STOPPED_TEXT, unplaced.as_str()] {

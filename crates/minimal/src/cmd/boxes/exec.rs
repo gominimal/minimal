@@ -455,9 +455,10 @@ pub(crate) struct Relayed {
 }
 
 /// Relays the exec on `channel`: `input` to the command's stdin, its stdout
-/// to `out`, its stderr to `err`. With `hold_refusal`, a first stderr chunk
+/// to `out`, its stderr to `err`. With `hold_refusal`, a first stderr line
 /// that reads as the daemon's refusal is held back, so the caller can print
-/// the refusal in its own words. Any later output releases it.
+/// the refusal in its own words, even when it arrives in several messages.
+/// Any later output releases it.
 async fn relay_box_channel<C, O, E>(
     mut channel: C,
     input: ExecInput,
@@ -503,16 +504,27 @@ where
                 out.flush().await.context("write the command's stdout")?;
             }
             russh::ChannelMsg::ExtendedData { data, ext: 1 } => {
-                if hold_refusal && !seen_output && held.is_empty() && reads_as_refusal(&data) {
+                // One stderr write can arrive as several messages: the
+                // first stderr is held while it can still become a
+                // refusal line, and classified once it is whole.
+                if hold_refusal && !seen_output {
                     held.extend_from_slice(&data);
+                    match held_stderr(&held) {
+                        HeldStderr::Refusal => seen_output = true,
+                        HeldStderr::Partial => {}
+                        HeldStderr::Output => {
+                            release_held(&mut held, err).await?;
+                            seen_output = true;
+                        }
+                    }
                 } else {
                     release_held(&mut held, err).await?;
                     err.write_all(&data)
                         .await
                         .context("write the command's stderr")?;
                     err.flush().await.context("write the command's stderr")?;
+                    seen_output = true;
                 }
-                seen_output = true;
             }
             russh::ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
             _ => {}
@@ -570,6 +582,47 @@ fn reads_as_refusal(chunk: &[u8]) -> bool {
             || text.contains(EXEC_DISABLED_MARK)
             || text.contains(SPEC_UNREADABLE_MARK));
     refused_by_box || text == INJECTION_BOX_STOPPED_TEXT || unplaced_cause(&text).is_some()
+}
+
+/// What the stderr held at the start of an exec is.
+#[derive(Debug, PartialEq, Eq)]
+enum HeldStderr {
+    /// A whole refusal line: it stays held.
+    Refusal,
+    /// The start of an injection's refusal line: it stays held until the
+    /// rest arrives.
+    Partial,
+    /// Anything else: the command's own stderr, released now.
+    Output,
+}
+
+/// The most stderr held while it can still become a refusal line: the
+/// longer injection text with room for the error it names.
+const HELD_LIMIT: usize = 512
+    + if INJECTION_UNPLACED_TEXT.len() > INJECTION_BOX_STOPPED_TEXT.len() {
+        INJECTION_UNPLACED_TEXT.len()
+    } else {
+        INJECTION_BOX_STOPPED_TEXT.len()
+    };
+
+/// Classifies the stderr `held` at the start of an exec.
+fn held_stderr(held: &[u8]) -> HeldStderr {
+    if reads_as_refusal(held) {
+        return HeldStderr::Refusal;
+    }
+    if held.contains(&b'\n') || held.len() > HELD_LIMIT {
+        return HeldStderr::Output;
+    }
+    let starts = |text: &str| {
+        let text = text.as_bytes();
+        let n = held.len().min(text.len());
+        held[..n] == text[..n]
+    };
+    if starts(INJECTION_BOX_STOPPED_TEXT) || starts(INJECTION_UNPLACED_TEXT) {
+        HeldStderr::Partial
+    } else {
+        HeldStderr::Output
+    }
 }
 
 /// The error the join met, from the one line the daemon's injection prints
@@ -1035,5 +1088,33 @@ pub(crate) fn write_exec_stop_line(
         )
     } else {
         writeln!(out, "Stopped exec {exec_id} in {target}.")
+    }
+}
+
+#[cfg(test)]
+mod held_stderr_tests {
+    use super::*;
+
+    #[test]
+    fn the_start_of_a_refusal_line_waits_for_the_rest() {
+        let unplaced = format!("{INJECTION_UNPLACED_TEXT}: Permission denied (os error 13).\n");
+        for line in [INJECTION_BOX_STOPPED_TEXT, unplaced.as_str()] {
+            let (head, _) = line.as_bytes().split_at(line.len() / 2);
+            assert_eq!(held_stderr(head), HeldStderr::Partial, "{line:?}");
+            assert_eq!(
+                held_stderr(line.as_bytes()),
+                HeldStderr::Refusal,
+                "{line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_stderr_is_released_at_once() {
+        for chunk in [&b"warning: unused"[..], b"e", b"The box is fine.\n", b"\n"] {
+            assert_eq!(held_stderr(chunk), HeldStderr::Output, "{chunk:?}");
+        }
+        let long = format!("{INJECTION_UNPLACED_TEXT}: {}", "x".repeat(HELD_LIMIT));
+        assert_eq!(held_stderr(long.as_bytes()), HeldStderr::Output);
     }
 }
