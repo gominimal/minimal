@@ -896,6 +896,18 @@ async fn removed_session_verbs_fail_as_unknown_commands() {
         );
     }
 
+    // `--sync` left with `min session activate`: no start takes it.
+    for argv in [
+        &["min", "session", "start", "--sync", "none"][..],
+        &["min", "box", "start", "--sync", "none"],
+    ] {
+        let rendered = refused(argv, ErrorKind::UnknownArgument);
+        assert!(
+            rendered.contains("unexpected argument '--sync'"),
+            "{argv:?}: {rendered}"
+        );
+    }
+
     // The command model has none of them, hidden or not, so neither help
     // nor completions offer them.
     let cli = Cli::command();
