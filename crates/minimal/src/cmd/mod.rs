@@ -189,15 +189,22 @@ fn needs_provider(command: Option<&Command>) -> bool {
 /// Their stderr is not a command the person typed.
 fn shows_native_boxes_notice(command: Option<&Command>) -> bool {
     needs_provider(command)
-        && !matches!(
-            command,
-            Some(
-                Command::Proxy(_)
-                    | Command::CompleteSessionStr(_)
-                    | Command::Spin(_)
-                    | Command::DebugAnswererCommand
-            )
-        )
+        && !matches!(command, Some(Command::Proxy(_) | Command::CompleteSessionStr(_)))
+        && !is_debug_helper(command)
+}
+
+/// Whether `command` is one of the helpers only a debug build has: the
+/// spinner demo and the answerer-command probe. A release build has neither
+/// variant, so the match is compiled only where they exist.
+#[cfg(debug_assertions)]
+fn is_debug_helper(command: Option<&Command>) -> bool {
+    matches!(command, Some(Command::Spin(_) | Command::DebugAnswererCommand))
+}
+
+/// A release build has no debug helper to match.
+#[cfg(not(debug_assertions))]
+fn is_debug_helper(_command: Option<&Command>) -> bool {
+    false
 }
 
 /// The verb a run dispatches, as the user typed it (`box show`,
