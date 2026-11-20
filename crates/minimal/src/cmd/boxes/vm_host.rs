@@ -401,6 +401,83 @@ pub(crate) async fn retire_stopped_box_with_vm_host(
     .await;
 }
 
+/// How long a stop waits for the VM host daemon to release a stopped box's
+/// declared forwards. The daemon waits up to 30 s for its own unbind, and a
+/// margin covers the exchange around it.
+const FORWARD_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(35);
+
+/// Asks the VM host daemon to release stopped box `record`'s declared
+/// ingress forwards, and waits for its reply (NET-121: a forwarder is held
+/// until the box stops). On a VM-backed host the host binds and unbinds
+/// those forwards, and the in-VM daemon cannot withdraw a declared one. So
+/// without this ask the ports stay bound after the stop, and the next start
+/// of the box finds them in use. The host keeps the box's row, so the next
+/// start binds the ports again.
+///
+/// The request presents the pair and the box id off the record. A record
+/// with no declared port, no pair or no id asks for nothing, and so does a
+/// host with no control socket: no VM host binds a forward for it. Returns
+/// `Ok(true)` when the host released the forwards, `Ok(false)` when nothing
+/// was asked, and the reason when the release did not complete.
+pub(crate) async fn release_stopped_box_forwards_with_vm_host(
+    control_sock: Option<std::path::PathBuf>,
+    record: &boxes::Record,
+) -> Result<bool, String> {
+    let declares_ports = record
+        .policy
+        .ingress
+        .as_ref()
+        .is_some_and(|ingress| !ingress.port_mappings.is_empty());
+    let (true, Some(addresses), Some(box_id), Some(sock_path)) = (
+        declares_ports,
+        record.box_addresses,
+        record.box_id,
+        control_sock,
+    ) else {
+        return Ok(false);
+    };
+    let name = record.name.clone().unwrap_or_default();
+    let request = minimald_rpc::BoxControlRequest::ReleaseBoxForwards(
+        minimald_rpc::ReleaseBoxForwardsRequest {
+            name: name.clone(),
+            switch_address: addresses.switch_address,
+            loopback_address: addresses.loopback_address,
+            box_id,
+        },
+    );
+    let sent = tokio::time::timeout(
+        FORWARD_RELEASE_TIMEOUT,
+        control_request_with_vm_host(&sock_path, request),
+    )
+    .await;
+    let failure = match sent {
+        Ok(Ok(minimald_rpc::BoxControlReply::Addresses(_))) => None,
+        Ok(Ok(minimald_rpc::BoxControlReply::Error { error })) => Some(error),
+        Ok(Ok(other)) => Some(format!("another verb's reply: {other:?}")),
+        Ok(Err(error)) => Some(format!("{error:#}")),
+        Err(_) => Some(format!("no answer within {FORWARD_RELEASE_TIMEOUT:?}")),
+    };
+    match failure {
+        None => {
+            tracing::info!(
+                box = %name,
+                switch_address = %addresses.switch_address,
+                "the VM host daemon released the stopped box's declared forwards"
+            );
+            Ok(true)
+        }
+        Some(reason) => {
+            tracing::warn!(
+                box = %name,
+                switch_address = %addresses.switch_address,
+                %reason,
+                "the VM host daemon did not release the stopped box's declared forwards"
+            );
+            Err(reason)
+        }
+    }
+}
+
 /// A session's record by its `id`, bounded by [`BOX_CONTROL_TIMEOUT`]:
 /// `None` once the session is gone. An interactive attach on a VM-backed
 /// host reads it twice — before the attach, for the pair the box's row was
@@ -2358,6 +2435,133 @@ mod tests {
             )],
             "the run's end retires the host_ip box's egress"
         );
+    }
+
+    /// NET-121: a forwarder is held until the box stops. On a VM-backed host
+    /// the host holds a box's declared forwards, so `min box stop` asks the
+    /// VM host daemon to release them and waits for the reply before it
+    /// returns. The one request is the release verb, with the pair and the
+    /// box id off the record. A box that declares no port asks for nothing.
+    /// A release the host does not confirm leaves the stop done and prints
+    /// one line that says a start can fail on a port in use.
+    #[tokio::test]
+    async fn box_stop_releases_declared_ports_on_vm_host() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let host_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        let requests = fake_vm_host(
+            host_dir.join("control.sock"),
+            r#"{"switch_address":"100.64.0.2","loopback_address":"127.0.64.3"}"#.to_string(),
+        )
+        .await;
+        let control_sock = || vm_host_control_sock(paths::HostKind::Minvmd, Some(dir.path()));
+        let addresses = boxes::BoxAddresses {
+            switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
+            loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 3),
+        };
+        let row_id = minimald_rpc::BoxId::from_bytes([9; 16]);
+        let mut record = boxes::Record {
+            id: boxes::SessionId::mint(),
+            name: Some("web".to_string()),
+            username: None,
+            project_path: paths::HostAbsPath::try_new("/p").unwrap(),
+            network: NetworkMode::OwnIp,
+            policy: boxes::BoxPolicy {
+                egress: None,
+                ingress: Some(boxes::IngressPolicy {
+                    port_mappings: vec![boxes::PortMapping {
+                        external_port: 8080,
+                        internal_port: 80,
+                        proto: boxes::IpProto::Tcp,
+                    }],
+                    ..Default::default()
+                }),
+                credentialed_upstream: None,
+                quic443: None,
+            },
+            status: boxes::BoxState::default(),
+            reason: None,
+            exit_code: None,
+            signal: None,
+            hooks_enabled: true,
+            task_addresses: Vec::new(),
+            box_addresses: Some(addresses),
+            host_ip_enforcement: None,
+            box_id: Some(row_id),
+            host_row_bound: false,
+            bound_ports: std::collections::BTreeSet::new(),
+            ends_with_run: false,
+            sealed_deliveries: Vec::new(),
+            root_certificate: None,
+            box_type: None,
+            parent: None,
+            project_root: None,
+            attrs: Default::default(),
+        };
+
+        let mut err = Vec::new();
+        release_ports_after_stop(control_sock(), Some(&record), "web", &mut err)
+            .await
+            .unwrap();
+        assert!(err.is_empty(), "a confirmed release prints nothing");
+        {
+            let seen = requests.lock().unwrap();
+            assert_eq!(seen.len(), 1, "one stop, one release: {seen:?}");
+            let minimald_rpc::BoxControlRequest::ReleaseBoxForwards(request) =
+                serde_json_lenient::from_str(&seen[0]).expect("the request is the wire type")
+            else {
+                panic!("the ports are freed by the release verb: {}", seen[0]);
+            };
+            assert_eq!(request.name, "web");
+            assert_eq!(request.switch_address, addresses.switch_address);
+            assert_eq!(request.loopback_address, addresses.loopback_address);
+            assert_eq!(request.box_id, row_id, "the record's box id is the proof");
+        }
+
+        // A native host has no control socket: nothing is asked.
+        assert_eq!(
+            release_stopped_box_forwards_with_vm_host(None, &record).await,
+            Ok(false)
+        );
+        // A gone record is a gone box: nothing is asked.
+        release_ports_after_stop(control_sock(), None, "web", &mut err)
+            .await
+            .unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1, "nothing more was sent");
+
+        // A host that refuses the release: the stop stands, and one line
+        // says what can happen next.
+        let refusing = tempfile::TempDir::new().unwrap();
+        let refusing_dir = refusing.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&refusing_dir).unwrap();
+        let _refused = fake_vm_host(
+            refusing_dir.join("control.sock"),
+            r#"{"error":"a declared forward of box web stays bound after the retries"}"#
+                .to_string(),
+        )
+        .await;
+        let mut err = Vec::new();
+        release_ports_after_stop(
+            vm_host_control_sock(paths::HostKind::Minvmd, Some(refusing.path())),
+            Some(&record),
+            "web",
+            &mut err,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "The VM did not confirm that the ports of web are free. \
+             `min box start web` can fail while a port is still in use.\n"
+        );
+
+        // A box that declares no port asks for nothing.
+        record.policy.ingress = None;
+        assert_eq!(
+            release_stopped_box_forwards_with_vm_host(control_sock(), &record).await,
+            Ok(false)
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1, "nothing more was sent");
     }
 
     /// #1116: renaming an own-address box tells the VM host daemon, which

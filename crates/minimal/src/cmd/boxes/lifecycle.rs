@@ -477,7 +477,60 @@ pub async fn cmd_box_stop(global: &GlobalArgs, args: BoxStopArgs) -> Result<(), 
     // The retire goes to the VM that keeps the box, which need not be the
     // selected one.
     let control_sock = box_host_control_sock(&stopped.host);
-    retire_stopped_box_with_vm_host(control_sock, stopped.box_id).await;
+    retire_stopped_box_with_vm_host(control_sock.clone(), stopped.box_id).await;
+    // A VM host keeps a stopped box's declared ports bound until it is
+    // asked to release them (NET-121). The stop returns after the release,
+    // so a start of the box right after binds the ports again. Only a VM
+    // host has a control socket, so a native stop reads nothing more.
+    if control_sock.is_some() {
+        let record = match attached_box_record(&stopped.host.sock, stopped.box_id).await {
+            Ok(record) => record,
+            Err(error) => {
+                tracing::warn!(
+                    box = %args.target,
+                    error = %format!("{error:#}"),
+                    "could not read the stopped box's record to release its declared forwards"
+                );
+                None
+            }
+        };
+        release_ports_after_stop(
+            control_sock,
+            record.as_ref(),
+            &args.target,
+            &mut std::io::stderr().lock(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Asks the VM host to free stopped box `record`'s declared ports, and
+/// waits for the answer ([`release_stopped_box_forwards_with_vm_host`]).
+/// The stop itself is done, so a release that does not complete does not
+/// fail the command. It writes one line to `err`: the ports can still be
+/// held, and a start of the box can then fail on a port in use. A record
+/// that is gone means the box is gone, and its row's withdrawal frees the
+/// ports.
+pub(crate) async fn release_ports_after_stop(
+    control_sock: Option<std::path::PathBuf>,
+    record: Option<&boxes::Record>,
+    target: &str,
+    err: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    let Some(record) = record else {
+        return Ok(());
+    };
+    if release_stopped_box_forwards_with_vm_host(control_sock, record)
+        .await
+        .is_err()
+    {
+        writeln!(
+            err,
+            "The VM did not confirm that the ports of {target} are free. \
+             `min box start {target}` can fail while a port is still in use."
+        )?;
+    }
     Ok(())
 }
 
