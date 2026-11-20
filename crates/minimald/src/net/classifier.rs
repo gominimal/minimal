@@ -9689,6 +9689,191 @@ mod tests {
         );
     }
 
+    /// Two ct-mark users of the install's bits: firewalld's, by its table
+    /// name, over bit 0x10000000, and one in a table no program is known
+    /// by, over bit 0x80000000. The highest pair neither one uses is
+    /// 0x60000000.
+    const OWNED_AND_UNKNOWN_CT_MARK_USERS: &str = "table inet firewalld {\n\
+         \tchain mangle_PREROUTING {\n\
+         \t\ttype filter hook prerouting priority mangle; policy accept;\n\
+         \t\tmeta l4proto tcp ct mark set ct mark | 0x10000000\n\
+         \t}\n\
+         }\n\
+         table inet edge_marks {\n\
+         \tchain tag {\n\
+         \t\ttype filter hook output priority mangle; policy accept;\n\
+         \t\tudp dport 53 ct mark set ct mark | 0x80000000\n\
+         \t}\n\
+         }\n";
+
+    /// A refusal over another ct-mark user names the program each rule
+    /// belongs to, when its table or chain name says, and the highest two
+    /// contiguous bits that no rule uses as the --ct-mark-mask to run
+    /// with. An install with that mask goes ahead over the same rules.
+    #[test]
+    fn install_refusal_names_rule_owner_and_free_mask() {
+        let mount = standin_mount();
+        let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+        host_ruleset_tools(tools.path(), OWNED_AND_UNKNOWN_CT_MARK_USERS, "");
+        let refused = run_install_with(&mount, &[], tools.path());
+        let text = said(&refused);
+        assert!(
+            !refused.status.success(),
+            "the install refuses over a user of its bits: {text}"
+        );
+        assert!(
+            text.contains(
+                "The rule in table inet firewalld, chain mangle_PREROUTING belongs to \
+                 firewalld, by the name of its table or chain.\n"
+            ),
+            "the refusal names the program the rule belongs to: {text}"
+        );
+        assert!(
+            !text.contains("table inet edge_marks"),
+            "a rule that uses none of the default bits is not named: {text}"
+        );
+        assert!(
+            text.contains(
+                "No rule this step read uses the bits 0x60000000, and no program this step \
+                 knows marks connections with them. To use them, run: min finalize-install \
+                 --ct-mark-mask 0x60000000\n"
+            ),
+            "the refusal names a free mask: {text}"
+        );
+        assert!(
+            text.contains("refusing to install over another ct-mark user"),
+            "the refusal still ends with its reason: {text}"
+        );
+
+        // Under another mask, the rule over those bits is named, and one
+        // in a table no program is known by is said to be so.
+        let mount_both = standin_mount();
+        let refused_both =
+            run_install_with(&mount_both, &["--ct-mark-mask", "0x18000000"], tools.path());
+        let both = said(&refused_both);
+        assert!(!refused_both.status.success(), "{both}");
+        assert!(
+            both.contains("belongs to firewalld"),
+            "the firewalld rule uses bit 0x10000000: {both}"
+        );
+        let mount_unknown = standin_mount();
+        let refused_unknown = run_install_with(
+            &mount_unknown,
+            &["--ct-mark-mask", "0xc0000000"],
+            tools.path(),
+        );
+        let unknown = said(&refused_unknown);
+        assert!(!refused_unknown.status.success(), "{unknown}");
+        assert!(
+            unknown.contains(
+                "The rule in table inet edge_marks, chain tag belongs to a program that this \
+                 step cannot name from its table and chain.\n"
+            ),
+            "a rule in a table no program is known by is said to be so: {unknown}"
+        );
+        assert!(
+            unknown.contains("--ct-mark-mask 0x60000000\n"),
+            "the free mask is the same whichever mask was refused: {unknown}"
+        );
+
+        // The named mask installs over the same rules.
+        let mount = standin_mount();
+        let installed = run_install_with(&mount, &["--ct-mark-mask", "0x60000000"], tools.path());
+        assert!(
+            installed.status.success(),
+            "the free mask installs: {}",
+            said(&installed)
+        );
+
+        // A rule that writes every bit leaves no mask free, so none is named.
+        let mount = standin_mount();
+        let whole = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+        host_ruleset_tools(
+            whole.path(),
+            "table inet wg_quick {\n\tchain postmangle {\n\t\tmeta l4proto udp ct mark set meta mark\n\t}\n}\n",
+            "",
+        );
+        let refused = run_install_with(&mount, &[], whole.path());
+        let text = said(&refused);
+        assert!(!refused.status.success(), "{text}");
+        assert!(
+            text.contains("The rule in table inet wg_quick, chain postmangle belongs to wg-quick"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("No rule on this host uses the bits"),
+            "no mask avoids a whole-mark writer: {text}"
+        );
+    }
+
+    /// The helper-only mode installs the QUIC block helper and its sudoers
+    /// rule over a ruleset the full install refuses: it reads no ct mark,
+    /// so the scan does not run, and it lays out no tree and loads no
+    /// table.
+    #[test]
+    fn quic443_helper_only_installs_over_ct_mark_conflict() {
+        let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+        host_ruleset_tools(tools.path(), OWNED_AND_UNKNOWN_CT_MARK_USERS, "");
+        let scratch = tempfile::tempdir().expect("a dir for the helper");
+        let helper = scratch.path().join("lib/quic443-leaf");
+        let sudoers = scratch.path().join("sudoers.d/minimal-quic443-leaf");
+        let (uid, gid) = delegated_owner();
+        let run = |mount: &StandinMount, flags: &[&str]| {
+            step_command(mount, flags, Some(tools.path()))
+                .env("SUDO_UID", uid.to_string())
+                .env("SUDO_GID", gid.to_string())
+                .env("MINIMAL_OVERRIDE_QUIC443_HELPER", &helper)
+                .env("MINIMAL_OVERRIDE_QUIC443_SUDOERS", &sudoers)
+                .output()
+                .expect("running the step")
+        };
+
+        let mount = standin_mount();
+        let refused = run(&mount, &[]);
+        assert!(
+            !refused.status.success(),
+            "the full install refuses over the conflict: {}",
+            said(&refused)
+        );
+        assert!(
+            !helper.exists() && !sudoers.exists(),
+            "a refused full install writes no helper"
+        );
+
+        let installed = run(&mount, &["--quic443-helper-only"]);
+        let text = said(&installed);
+        assert!(
+            installed.status.success(),
+            "the helper-only mode installs over the conflict: {text}"
+        );
+        assert!(
+            !text.contains("ct-mark"),
+            "the helper-only mode does not scan the ct mark: {text}"
+        );
+        assert!(
+            text.contains(&format!("installed {}", helper.display())),
+            "the mode says what it installed: {text}"
+        );
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&helper)
+                .expect("the helper is installed")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o755, "the helper is executable");
+        }
+        let rule = std::fs::read_to_string(&sudoers).expect("the sudoers rule is installed");
+        assert!(
+            rule.contains(&format!("#{uid} ALL=(root) NOPASSWD: {}", helper.display())),
+            "the rule lets the delegated account run the helper: {rule}"
+        );
+        assert!(
+            !mount.root.join(sandbox::classifier::TABLE_MARKER).exists()
+                && !mount.root.join("boxes").exists(),
+            "the helper-only mode lays out no tree and writes no marker: {text}"
+        );
+    }
+
     /// Tailscale's connmark rules for its rp_filter workaround, as
     /// tailscaled 1.104.2 installs them through iptables-nft in the ip and
     /// ip6 mangle tables (gominimal/inbox#1201): `iptables-save` spells

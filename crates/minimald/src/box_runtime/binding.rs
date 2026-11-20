@@ -135,8 +135,8 @@ pub(super) enum MainloopExitReason {
     HostGone,
     /// The client detached.
     Detach,
-    /// The box was stopped or removed while this binding was attached
-    /// (BCLI-068). The attach ends from the daemon's side: no shell-exit
+    /// The box was stopped, restarted or removed while this binding was
+    /// attached (BCLI-068). The attach ends from the daemon's side: no shell-exit
     /// prompt, and no line of the binding's own.
     BoxEnded(BoxEnd),
     /// The client went away without a detach: it closed its channel, or
@@ -188,7 +188,7 @@ pub(super) enum Farewell {
     DaemonShutdown(Vec<u8>),
     /// The client detached.
     Detach(Vec<u8>),
-    /// The box was stopped or removed.
+    /// The box was stopped, restarted or removed.
     BoxEnded(BoxEnd, Vec<u8>),
 }
 
@@ -199,10 +199,15 @@ pub(super) enum Farewell {
 /// (BCLI-068).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BoxEnd {
-    /// `min box stop`, or the stop half of a restart.
+    /// `min box stop`.
     Stop,
     /// `min box rm`.
     Removal,
+    /// The stop half of `min box restart`. The box starts again after it,
+    /// so the stop records the `restart` ending reason on its `exited`
+    /// event, and a client that reads the box between the stop and the
+    /// start still names the restart.
+    Restart,
 }
 
 pub(super) enum BindingMsg {
@@ -1048,7 +1053,7 @@ impl Binding {
                 tracing::info!(
                     session = %self.name,
                     ?end,
-                    "the box was stopped or removed; the attach ends with no shell-exit prompt"
+                    "the box was stopped, restarted or removed; the attach ends with no shell-exit prompt"
                 );
                 false
             }

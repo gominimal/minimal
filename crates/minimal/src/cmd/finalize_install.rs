@@ -85,6 +85,15 @@ pub(crate) struct Item {
     /// The step's block in the script, while the item is missing.
     #[serde(skip)]
     script: Option<String>,
+    /// The id of the item whose block this one runs just ahead of, while
+    /// that item is missing too. A step that refuses ends the script, so a
+    /// step that must not wait on another one runs before it.
+    #[serde(skip)]
+    script_before: Option<&'static str>,
+    /// A line the script runs after every block, for a block that records
+    /// its status in place of ending the script.
+    #[serde(skip)]
+    script_end: Option<&'static str>,
 }
 
 impl Item {
@@ -98,6 +107,8 @@ impl Item {
             step: None,
             cause: None,
             script: None,
+            script_before: None,
+            script_end: None,
         }
     }
 
@@ -117,6 +128,8 @@ impl Item {
             step: Some(step),
             cause: None,
             script: Some(script),
+            script_before: None,
+            script_end: None,
         }
     }
 
@@ -130,6 +143,8 @@ impl Item {
             step: None,
             cause: Some(cause),
             script: None,
+            script_before: None,
+            script_end: None,
         }
     }
 
@@ -143,6 +158,8 @@ impl Item {
             step: None,
             cause: Some(cause),
             script: None,
+            script_before: None,
+            script_end: None,
         }
     }
 }
@@ -215,10 +232,27 @@ impl Plan {
             labels.join(", ")
         );
         let mut script = crate::resolver::script_header(&what, crate::resolver::FINALIZE_SHOWN_BY);
-        // Two items can share one step (the classifier step installs the
-        // QUIC block helper too), and the script runs that step once.
+        // The blocks keep plan order. A block that must run before another
+        // item's block moves to just ahead of it, so that step refusing does
+        // not keep it from running. Two items that carry the same block run
+        // it once.
+        let moved = |item: &Item| {
+            item.script_before
+                .is_some_and(|id| missing.iter().any(|other| other.id == id))
+        };
+        let mut ordered: Vec<&Item> = Vec::new();
+        for item in missing.iter().copied().filter(|item| !moved(item)) {
+            ordered.extend(
+                missing
+                    .iter()
+                    .copied()
+                    .filter(|early| early.script_before == Some(item.id)),
+            );
+            ordered.push(item);
+        }
         let mut blocks: Vec<&str> = Vec::new();
-        for item in missing {
+        let mut ends: Vec<&str> = Vec::new();
+        for item in ordered {
             let block = item.script.as_deref().unwrap_or_default();
             if blocks.contains(&block) {
                 continue;
@@ -226,6 +260,17 @@ impl Plan {
             blocks.push(block);
             script.push('\n');
             script.push_str(block);
+            if let Some(end) = item.script_end.filter(|end| !ends.contains(end)) {
+                ends.push(end);
+            }
+        }
+        // A block that recorded its status ends the script with it here,
+        // after the blocks that come later had their turn.
+        if !ends.is_empty() {
+            script.push('\n');
+            for end in ends {
+                script.push_str(end);
+            }
         }
         Some(script)
     }
@@ -387,12 +432,40 @@ pub async fn cmd_finalize_install(
         eprintln!("min finalize-install: {refusal}");
         exit(1);
     }
-    run_as_root(&script, SCRIPT_POINTER)?;
+    let status = run_script_as_root(&script, SCRIPT_POINTER)?;
+    if !status.success() {
+        // A step that refuses ends the script, and a step that ran ahead of
+        // it can still have installed its item. The host is read again, so
+        // each item the script carried reports its own result.
+        let after = plan_for_this_host(global, args.ct_mark_mask).await;
+        eprint!("{}", run_report(&plan, &after));
+        exit(status.code().unwrap_or(1));
+    }
     print!(
         "{}",
         closing_lines(plan.installs_other_items(), plan.adds_kvm_group())
     );
     Ok(())
+}
+
+/// What a run whose script stopped with an error reports: one line per
+/// item the script carried, read from `after`, the host as it is once the
+/// script ended. An item is installed when `after` lists it as done.
+pub(crate) fn run_report(ran: &Plan, after: &Plan) -> String {
+    let mut out =
+        String::from("min finalize-install: the install script stopped with the error above.\n");
+    for item in ran.missing() {
+        let done = after
+            .items
+            .iter()
+            .any(|now| now.id == item.id && now.state == ItemState::Done);
+        if done {
+            out.push_str(&format!("  ✓ {}: installed\n", item.label));
+        } else {
+            out.push_str(&format!("  ✗ {}: not installed\n", item.label));
+        }
+    }
+    out
 }
 
 /// The lines a completed run ends with: [`PICKED_UP`] when the script
@@ -483,6 +556,19 @@ pub(crate) fn write_private_script(script: &str) -> Result<tempfile::NamedTempFi
 /// the process exits with the script's status. The script is the one
 /// `--show --script` prints, byte for byte.
 fn run_as_root(script: &str, pointer: &str) -> Result<(), anyhow::Error> {
+    let status = run_script_as_root(script, pointer)?;
+    if !status.success() {
+        exit(status.code().unwrap_or(1));
+    }
+    Ok(())
+}
+
+/// [`run_as_root`] that returns the script's exit status rather than
+/// exiting with it, so the caller can report before it exits.
+fn run_script_as_root(
+    script: &str,
+    pointer: &str,
+) -> Result<std::process::ExitStatus, anyhow::Error> {
     let stdin_is_tty = std::io::stdin().is_terminal();
     let sudo_runs_quietly = !stdin_is_tty
         && std::process::Command::new("sudo")
@@ -511,10 +597,7 @@ fn run_as_root(script: &str, pointer: &str) -> Result<(), anyhow::Error> {
     // Removed before the exit below, which runs no destructor.
     file.close()
         .context("min finalize-install: could not remove the script")?;
-    if !status.success() {
-        exit(status.code().unwrap_or(1));
-    }
-    Ok(())
+    Ok(status)
 }
 
 /// Every item this host has, probed in the order the summary lists them.
@@ -1586,8 +1669,11 @@ pub(crate) mod linux {
 
     /// The QUIC block helper item (BEP-018): done when the helper and its
     /// sudoers drop-in are installed root-owned. Otherwise it names the
-    /// helper's path and carries the classifier step, which installs both,
-    /// or it is blocked by what blocks that step.
+    /// helper's path and carries its own block, the classifier step's
+    /// helper-only mode, which runs ahead of the classifier step. A
+    /// classifier step that refuses (a connection-mark conflict, say) then
+    /// leaves the helper installed. It is blocked by what blocks the
+    /// classifier step.
     #[cfg(test)]
     pub(crate) fn quic443_helper_item_over(
         helper: Quic443HelperFacts,
@@ -1623,20 +1709,24 @@ pub(crate) mod linux {
         );
         match step.script {
             // The wording is the task's diagnostics line (#2607).
-            Some(script) => Item::missing(
-                QUIC443_HELPER_ID,
-                QUIC443_HELPER_LABEL,
-                format!(
-                    "not installed at {QUIC443_HELPER_PATH}. Run `min finalize-install` to \
+            Some(_) => Item {
+                script_before: Some(CLASSIFIER_ID),
+                script_end: Some(QUIC443_HELPER_END),
+                ..Item::missing(
+                    QUIC443_HELPER_ID,
+                    QUIC443_HELPER_LABEL,
+                    format!(
+                        "not installed at {QUIC443_HELPER_PATH}. Run `min finalize-install` to \
                      install it."
-                ),
-                format!(
-                    "installs the helper at {QUIC443_HELPER_PATH} that blocks UDP port 443 \
+                    ),
+                    format!(
+                        "installs the helper at {QUIC443_HELPER_PATH} that blocks UDP port 443 \
                      (QUIC) for boxes, and the sudoers rule at {QUIC443_SUDOERS_PATH} that \
                      lets {operator}'s daemon run it"
-                ),
-                script,
-            ),
+                    ),
+                    quic443_helper_steps(operator),
+                )
+            },
             None => Item::cannot(
                 QUIC443_HELPER_ID,
                 QUIC443_HELPER_LABEL,
@@ -1644,6 +1734,34 @@ pub(crate) mod linux {
             ),
         }
     }
+
+    /// The QUIC block helper's block: the classifier step's helper-only
+    /// mode, from a staged copy of the bytes this binary carries. The copy
+    /// the boot unit runs is left alone, and the staged copy is removed
+    /// whether the step installs or refuses.
+    fn quic443_helper_steps(operator: &str) -> String {
+        let staged = format!("{CLASSIFIER_PROGRAM_PATH}.quic443");
+        format!(
+            "# The QUIC block helper and its sudoers rule, from the egress classifier's\n\
+             # step in its helper-only mode. It runs ahead of the classifier step, so a\n\
+             # classifier step that refuses leaves the helper installed. A helper step\n\
+             # that fails does not stop the steps after it. The script ends with its status.\n\
+             mkdir -p {ANSWERER_PROGRAM_DIR}\n\
+             cat > {staged} <<\\{CLASSIFIER_SCRIPT_HEREDOC}\n\
+             {CLASSIFIER_SCRIPT}\
+             {CLASSIFIER_SCRIPT_HEREDOC}\n\
+             chmod 0755 {staged}\n\
+             quic443_status=0\n\
+             {staged} --user '{operator}' --quic443-helper-only || quic443_status=$?\n\
+             rm -f {staged}\n"
+        )
+    }
+
+    /// The script's last line while the QUIC block helper's block runs: a
+    /// helper step that failed ends the script with its status, after the
+    /// blocks that follow it ran.
+    const QUIC443_HELPER_END: &str = "# The QUIC block helper step's status, recorded above.\n\
+         [ \"$quic443_status\" -eq 0 ] || exit \"$quic443_status\"\n";
 
     /// The classifier item and the QUIC block helper item over this host's
     /// reads, in that order.
@@ -3288,8 +3406,8 @@ mod tests {
 
     /// BEP-018 (#2607): the QUIC block helper item is done when the helper
     /// and its sudoers drop-in are root-owned. Otherwise it names the
-    /// helper's path and the step that installs it, which is the classifier
-    /// step, and a run carries that step once.
+    /// helper's path and the step that installs it, the classifier step's
+    /// helper-only mode, and a run carries the classifier step once.
     #[test]
     fn finalize_install_names_the_quic_block_helper() {
         use linux::{
@@ -3351,7 +3469,7 @@ mod tests {
                 item.script
                     .as_deref()
                     .is_some_and(|block| block.contains(crate::resolver::CLASSIFIER_PROGRAM_PATH)),
-                "the step is the classifier step"
+                "the step is the classifier step's helper-only mode"
             );
             let summary = Plan {
                 items: vec![item.clone()],
@@ -3429,6 +3547,256 @@ mod tests {
             run.matches(&format!("\n{program}")).count(),
             1,
             "one classifier step: {run}"
+        );
+    }
+
+    /// A host where the classifier step and the QUIC block helper are both
+    /// missing, and nothing blocks either: the two items, in plan order.
+    fn classifier_and_quic443_helper_missing(sock: &str) -> [Item; 2] {
+        use linux::{
+            Cgroup2Mount, ClassifierFacts, Quic443HelperFacts, classifier_item_over,
+            quic443_helper_item_over,
+        };
+        let facts = ClassifierFacts {
+            table_present: false,
+            recorded_mask: None,
+            requested_mask: None,
+            copy_current: false,
+            units_enabled: Some(false),
+            other_owner: None,
+            root: false,
+            mount: Cgroup2Mount::Delegated,
+            unplaced_daemon: None,
+            placer_listening: Some(true),
+        };
+        let helper = Quic443HelperFacts {
+            helper_root_owned: false,
+            sudoers_root_owned: false,
+        };
+        [
+            classifier_item_over(&facts, "alice", sock),
+            quic443_helper_item_over(helper, &facts, "alice", sock),
+        ]
+    }
+
+    /// The helper has a block of its own, the classifier step's
+    /// helper-only mode, and the script runs it ahead of the classifier
+    /// step. A classifier step that refuses then leaves the helper
+    /// installed, and the script still ends with the refusal's status.
+    #[test]
+    fn quic443_helper_installs_when_classifier_step_refuses() {
+        use crate::resolver::{ANSWERER_PROGRAM_DIR, CLASSIFIER_PROGRAM_PATH, CLASSIFIER_SCRIPT};
+        let root = tempfile::tempdir().expect("a temp dir");
+        let lib = root.path().join("lib");
+        let units = root.path().join("units");
+        let var = root.path().join("var");
+        let bin = root.path().join("bin");
+        for dir in [&lib, &units, &var, &bin] {
+            std::fs::create_dir_all(dir).expect("a scratch dir");
+        }
+        let sock = root.path().join("home/alice/ssh.sock");
+        let plan = Plan {
+            items: classifier_and_quic443_helper_missing(
+                sock.to_str().expect("the temp root is UTF-8"),
+            )
+            .to_vec(),
+        };
+        let script = plan.script().expect("a script while items are missing");
+        let helper_at = script
+            .find("--user 'alice' --quic443-helper-only")
+            .expect("the helper's own block runs the helper-only mode");
+        let classifier_at = script
+            .find(&format!(
+                "\nif {CLASSIFIER_PROGRAM_PATH} --user 'alice'; then\n"
+            ))
+            .expect("the classifier step");
+        assert!(
+            helper_at < classifier_at,
+            "the helper's block runs ahead of the classifier step: {script}"
+        );
+
+        // The step stubbed: its helper-only mode installs, and the full
+        // install refuses as over a connection-mark conflict.
+        let installed = root.path().join("helper-installed");
+        let stub = format!(
+            "#!/bin/sh\n\
+             for arg in \"$@\"; do\n\
+             \x20 if [ \"$arg\" = --quic443-helper-only ]; then : > '{}'; exit 0; fi\n\
+             done\n\
+             echo 'error: refusing to install over another ct-mark user.' >&2\n\
+             exit 1\n",
+            installed.display()
+        );
+        let script = script
+            .replace(CLASSIFIER_SCRIPT, &stub)
+            .replace(ANSWERER_PROGRAM_DIR, &lib.display().to_string())
+            .replace("/etc/systemd/system", &units.display().to_string())
+            .replace("/var/lib/minimal", &var.display().to_string());
+        let output = crate::resolver::tests::run_confined(root.path(), &bin, &script);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "the script ends with the classifier step's status: {stderr}"
+        );
+        assert!(
+            installed.exists(),
+            "the helper is installed before the classifier step refuses: {stderr}"
+        );
+        assert!(
+            stderr.contains("refusing to install over another ct-mark user"),
+            "the classifier step ran and refused: {stderr}"
+        );
+        assert!(
+            !lib.join("install-host-classifier.sh.quic443").exists(),
+            "the helper's staged copy is removed"
+        );
+        assert!(
+            !lib.join("install-host-classifier.sh").exists(),
+            "a refused first install leaves no classifier copy"
+        );
+    }
+
+    /// The helper's block runs just ahead of the classifier step, after the
+    /// blocks that come before that step in plan order. A helper step that
+    /// fails does not stop the script: the classifier step still runs, and
+    /// the script ends with the helper step's status.
+    #[test]
+    fn quic443_helper_failure_lets_later_blocks_run() {
+        use crate::resolver::{ANSWERER_PROGRAM_DIR, CLASSIFIER_PROGRAM_PATH, CLASSIFIER_SCRIPT};
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().expect("a temp dir");
+        let lib = root.path().join("lib");
+        let units = root.path().join("units");
+        let var = root.path().join("var");
+        let bin = root.path().join("bin");
+        let marks = root.path().join("marks");
+        for dir in [&lib, &units, &var, &bin, &marks] {
+            std::fs::create_dir_all(dir).expect("a scratch dir");
+        }
+        let systemctl = bin.join("systemctl");
+        std::fs::write(&systemctl, "#!/bin/sh\nexit 0\n").expect("a systemctl stub");
+        std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755))
+            .expect("the stub is executable");
+        let sock = root.path().join("home/alice/ssh.sock");
+        let [classifier, helper] =
+            classifier_and_quic443_helper_missing(sock.to_str().expect("the temp root is UTF-8"));
+        let marked = |id: &'static str| {
+            Item::missing(
+                id,
+                id,
+                format!("{id} is missing"),
+                format!("installs {id}"),
+                format!("# {id}\n: > '{}'\n", marks.join(id).display()),
+            )
+        };
+        let plan = Plan {
+            items: vec![
+                marked("userns-profile"),
+                marked("names"),
+                classifier,
+                helper,
+            ],
+        };
+        let script = plan.script().expect("a script while items are missing");
+        let at = |needle: &str| {
+            script
+                .find(needle)
+                .unwrap_or_else(|| panic!("the script carries {needle:?}: {script}"))
+        };
+        let helper_at = at("--user 'alice' --quic443-helper-only");
+        assert!(
+            at("# userns-profile\n") < helper_at && at("# names\n") < helper_at,
+            "the helper's block runs after the blocks ahead of the classifier step: {script}"
+        );
+        assert!(
+            helper_at
+                < at(&format!(
+                    "\nif {CLASSIFIER_PROGRAM_PATH} --user 'alice'; then\n"
+                )),
+            "the helper's block runs ahead of the classifier step: {script}"
+        );
+
+        // The step stubbed: its helper-only mode fails, and every other
+        // call installs.
+        let stub = format!(
+            "#!/bin/sh\n\
+             for arg in \"$@\"; do\n\
+             \x20 if [ \"$arg\" = --quic443-helper-only ]; then echo 'error: nft is missing.' >&2; exit 3; fi\n\
+             done\n\
+             : > '{}'\n\
+             exit 0\n",
+            marks.join("classifier").display()
+        );
+        let script = script
+            .replace(CLASSIFIER_SCRIPT, &stub)
+            .replace(ANSWERER_PROGRAM_DIR, &lib.display().to_string())
+            .replace("/etc/systemd/system", &units.display().to_string())
+            .replace("/var/lib/minimal", &var.display().to_string());
+        let output = crate::resolver::tests::run_confined(root.path(), &bin, &script);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for id in ["userns-profile", "names", "classifier"] {
+            assert!(
+                marks.join(id).exists(),
+                "the {id} block ran after the helper step failed: {stderr}"
+            );
+        }
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "the script ends with the helper step's status: {stderr}"
+        );
+        assert!(
+            !lib.join("install-host-classifier.sh.quic443").exists(),
+            "the helper's staged copy is removed"
+        );
+    }
+
+    /// After a script that stopped with an error, the run reports each item
+    /// the script carried on its own line: the helper installed, the
+    /// classifier not. An item that was done before the run is not listed.
+    #[test]
+    fn summary_reports_each_item_after_classifier_refusal() {
+        use linux::{Cgroup2Mount, ClassifierFacts, Quic443HelperFacts, quic443_helper_item_over};
+        let sock = "/home/alice/.local/state/minimal/providers/local-minimald0/ssh.sock";
+        let [classifier, helper] = classifier_and_quic443_helper_missing(sock);
+        let profile = Item::done("userns-profile", "the private sandbox every box runs in");
+        let ran = Plan {
+            items: vec![profile.clone(), classifier.clone(), helper],
+        };
+        let facts = ClassifierFacts {
+            table_present: false,
+            recorded_mask: None,
+            requested_mask: None,
+            copy_current: false,
+            units_enabled: Some(false),
+            other_owner: None,
+            root: false,
+            mount: Cgroup2Mount::Delegated,
+            unplaced_daemon: None,
+            placer_listening: Some(true),
+        };
+        let after = Plan {
+            items: vec![
+                profile,
+                classifier,
+                quic443_helper_item_over(
+                    Quic443HelperFacts {
+                        helper_root_owned: true,
+                        sudoers_root_owned: true,
+                    },
+                    &facts,
+                    "alice",
+                    sock,
+                ),
+            ],
+        };
+        assert_eq!(
+            run_report(&ran, &after),
+            "min finalize-install: the install script stopped with the error above.\n\
+             \x20 ✗ deny-all egress enforcement for boxes that share this machine's address \
+             (--network host_ip with --deny-all-egress): not installed\n\
+             \x20 ✓ QUIC block helper: installed\n"
         );
     }
 
