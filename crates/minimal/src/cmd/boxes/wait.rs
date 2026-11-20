@@ -578,7 +578,7 @@ pub async fn cmd_box_wait(global: &GlobalArgs, args: BoxWaitArgs) -> Result<(), 
             // BCLI-013: under `-o json`, how the box ended goes on stdout
             // before the command exits with its code.
             write_wait_output(&mut std::io::stdout().lock(), args.output, &waited)
-                .context("write how the box ended")?;
+                .context(OutputWriteError)?;
             let one = waited.into_iter().next().expect("one box for one target");
             tracing::debug!(verb = "box wait", box_id = %one.box_id, "the wait ended");
             one.ended?
