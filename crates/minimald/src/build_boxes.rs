@@ -17,7 +17,7 @@ use tokio::sync::Mutex;
 type RunningKey = (String, String);
 
 /// The build boxes running now, by requesting box id then build. A build
-/// box keeps no record (BOX-186), so this is all that lists it (NET-171).
+/// box keeps no record (BOX-210), so this is all that lists it (NET-171).
 static RUNNING: LazyLock<
     std::sync::Mutex<HashMap<String, BTreeMap<RunningKey, minimald_rpc::RunningBuildBox>>>,
 > = LazyLock::new(Default::default);

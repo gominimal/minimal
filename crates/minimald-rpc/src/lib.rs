@@ -3279,7 +3279,7 @@ pub struct BoxListingEntry {
     pub build_boxes: Vec<RunningBuildBox>,
 }
 
-/// A build box running for a box (NET-171). It keeps no record (BOX-186), so
+/// A build box running for a box (NET-171). It keeps no record (BOX-210), so
 /// a client sees it only here, while it runs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunningBuildBox {

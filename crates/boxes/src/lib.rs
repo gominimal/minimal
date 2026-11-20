@@ -1573,10 +1573,10 @@ pub const SESSION_BOX_TYPE: &str = "session";
 /// The Box Type of a box `min task run` creates (BOX-001).
 pub const TASK_BOX_TYPE: &str = "task";
 
-/// The Box Type of a box `min` expands from a Package Build Spec (BOX-185).
+/// The Box Type of a box `min` expands from a Package Build Spec (BOX-209).
 pub const BUILD_BOX_TYPE: &str = "build";
 
-/// The Box Spec of a box of the `build` type (BOX-185): the part a Package
+/// The Box Spec of a box of the `build` type (BOX-209): the part a Package
 /// Build Spec does not choose. Everything but the package, its dependencies,
 /// its parent and its egress is the type's own.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -2204,7 +2204,7 @@ pub mod box_name {
 mod tests {
     use super::*;
 
-    /// BOX-185: everything but the package, its dependencies, its parent and
+    /// BOX-209: everything but the package, its dependencies, its parent and
     /// its egress is the `build` type's own.
     #[test]
     fn build_box_spec_derives_from_the_build_spec() {
