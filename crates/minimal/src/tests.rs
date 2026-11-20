@@ -24201,7 +24201,6 @@ async fn task_run_broker_secret_unenrolled_exits_5() {
         &global,
         TaskRunArgs {
             task: "ci".into(),
-            path: None,
             network: None,
             egress: EgressArgs::default(),
             other: crate::BoxOverrideArgs::default(),
