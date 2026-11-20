@@ -257,6 +257,28 @@ hosts; a **sandbox** is the isolated execution context composed from a package
 closure; and a **task** is a declared command that runs in such a sandbox. Your
 project config and loadouts decide what goes into all three.
 
+## Old command names
+
+Earlier releases spelled some session commands differently. These spellings
+are gone, and `min` refuses each of them as an unknown command, with exit
+code 2. Use the command on the right in its place.
+
+| Old spelling | Use now |
+|--------------|---------|
+| `min session activate` | `min session start` |
+| `min session destroy <box>` | `min box rm --force <box>` |
+| `min session exec <box>` | `min box exec <box> -- <command>` |
+| `min session rename <box> <name>` | `min box rename <box> <name>` |
+| `min session policy <box>` | `min box show <box> --network` |
+| `min session hooks <box>` | `min box spec <box-id>` |
+| `min session run` | No replacement yet. `min task run <task>` runs a task in a box of its own |
+| `min task run --path <dir>` | `min -C <dir> task run <task>` |
+| `min stop` | `min host stop <host>`. `min host list` prints the host names |
+
+The provider name `local-minimald` still works for `--provider`, and means
+`local`. After such a command ends, `min` prints a hint that names `local`.
+Release 0.9 removes the old name, so use `--provider local` now.
+
 ## See also
 
 - [`min` command reference](../reference/cli-min.md) for every command and flag.
