@@ -2127,7 +2127,10 @@ mod tests {
                 "allow_dns_hosts = [\"a.example\"]\ndeny_subnets = [\"10.0.0.0/8\"]"
             ))
         );
-        assert_eq!(network["bep"], toml::Value::Table(table("proxy_env = true")));
+        assert_eq!(
+            network["bep"],
+            toml::Value::Table(table("proxy_env = true"))
+        );
         assert_eq!(
             e.report.network.get("egress").map(|o| o.layer),
             Some(Layer::Defaults)
