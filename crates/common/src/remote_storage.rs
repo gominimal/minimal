@@ -343,10 +343,12 @@ async fn source_hosts_admitting(
 /// A name and the addresses a probe connects to for it.
 type PinnedName = (String, Vec<std::net::SocketAddr>);
 
-/// The client that probes one hop. It follows no redirect. With `pinned`, it
+/// The client that probes one hop. It sends the `User-Agent` a build box's
+/// fetch sends, so a source that refuses a request without one redirects the
+/// probe as it redirects the fetch. It follows no redirect. With `pinned`, it
 /// connects to those addresses for the hop's name and to no others.
 fn probe_client(pinned: Option<&PinnedName>) -> reqwest::Result<reqwest::Client> {
-    let builder = reqwest::Client::builder()
+    let builder = crate::fetchers::web_client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(PROBE_TIMEOUT);
     match pinned {
@@ -615,6 +617,21 @@ mod tests {
             .expect("the download succeeds");
         assert_eq!(std::fs::read(&fetched).unwrap(), body);
 
+        let head = served.await.unwrap().to_ascii_lowercase();
+        let agent = format!(
+            "\r\nuser-agent: {}\r\n",
+            crate::fetchers::user_agent().to_ascii_lowercase()
+        );
+        assert!(head.contains(&agent), "{agent:?} in {head}");
+    }
+
+    /// NET-167: a redirect probe sends the `User-Agent` a build box's fetch
+    /// sends. A source that refuses a request without one would otherwise
+    /// end the walk before it learns the host the fetch is redirected to.
+    #[tokio::test]
+    async fn a_redirect_probe_sends_the_user_agent() {
+        let (addr, served) = serve_once(b"").await;
+        source_hosts_admitting(&[format!("http://{addr}/one")], |_| true).await;
         let head = served.await.unwrap().to_ascii_lowercase();
         let agent = format!(
             "\r\nuser-agent: {}\r\n",
