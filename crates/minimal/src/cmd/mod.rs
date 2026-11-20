@@ -1184,13 +1184,13 @@ pub(crate) async fn send_abort(client: &mut client::Client, session_id: boxes::S
         Ok(minimald_rpc::Errorable::Err { error }) => {
             eprintln!(
                 "warning: could not cancel the unfinished session {session_id}: {error}; \
-                 run `min session destroy {session_id}` to remove it"
+                 run `min box rm --force {session_id}` to remove it"
             );
         }
         Err(e) => {
             eprintln!(
                 "warning: could not cancel the unfinished session {session_id}: {e}; \
-                 run `min session destroy {session_id}` to remove it"
+                 run `min box rm --force {session_id}` to remove it"
             );
         }
     }
@@ -1207,7 +1207,7 @@ pub(crate) async fn send_abort(client: &mut client::Client, session_id: boxes::S
 /// a VM whose bridge accepted but whose guest never answered) can
 /// make the RPC hang indefinitely, which would swallow the
 /// operator-visible primary error we're supposed to be racing
-/// back to `cmd_activate`.
+/// back to `activate_box`.
 ///
 /// With `only_if_unfinalized` (the cleanup after an activation the client
 /// gave up on) the daemon keeps a session that finished after all
@@ -1236,20 +1236,20 @@ pub(crate) async fn best_effort_destroy(
         Ok(Ok(minimald_rpc::Errorable::Err { error })) => {
             eprintln!(
                 "warning: could not remove the unfinished session {session_id}: {error}; \
-                 run `min session destroy {session_id}` to remove it"
+                 run `min box rm --force {session_id}` to remove it"
             );
         }
         Ok(Err(e)) => {
             eprintln!(
                 "warning: could not remove the unfinished session {session_id}: {e}; \
-                 run `min session destroy {session_id}` to remove it"
+                 run `min box rm --force {session_id}` to remove it"
             );
         }
         Err(_) => {
             eprintln!(
                 "warning: could not remove the unfinished session {session_id}: the \
                  daemon did not answer within {DESTROY_TIMEOUT:?}; the session may \
-                 still exist; run `min session destroy {session_id}` to remove it",
+                 still exist; run `min box rm --force {session_id}` to remove it",
             );
         }
     }
@@ -1343,14 +1343,14 @@ async fn cleanup_after_failed_finalize(
         Some(Ok(minimald_rpc::Errorable::Err { error })) => {
             eprintln!(
                 "warning: could not remove the unfinished session {session_id}: {error}; \
-                 check `min ls`, and run `min session destroy {session_id}` to remove it"
+                 check `min ls`, and run `min box rm --force {session_id}` to remove it"
             );
             CleanupOutcome::Unknown
         }
         Some(Err(e)) => {
             eprintln!(
                 "warning: could not remove the unfinished session {session_id}: {e}; \
-                 check `min ls`, and run `min session destroy {session_id}` to remove it"
+                 check `min ls`, and run `min box rm --force {session_id}` to remove it"
             );
             CleanupOutcome::Unknown
         }
@@ -1358,7 +1358,7 @@ async fn cleanup_after_failed_finalize(
             eprintln!(
                 "warning: stopped waiting for session {session_id}; the daemon is still \
                  finishing or removing it. `min ls` shows which once it is done, and `min \
-                 session destroy {session_id}` removes it if it is still there"
+                 box rm --force {session_id}` removes it if it is still there"
             );
             CleanupOutcome::Unknown
         }

@@ -40,12 +40,6 @@ pub fn box_registered_start_line(
     }
 }
 
-/// The activation flow shared by [`cmd_activate`] and the bare-`min` router.
-/// `offer_scaffold` gates the `minimal.toml` scaffold offer: `cmd_activate`
-/// keeps it (its long-standing behavior, unchanged), while bare `min`
-/// suppresses it — that path must land in a session, never in a config
-/// prompt. Everything else, including the session id on stdout, is
-/// identical for both callers.
 /// Refuses a dynamic ingress declaration on a box that is not `own_ip`:
 /// only an own-IP box has a published address a runtime publish could
 /// apply to, so a stance or range on a `host_ip` or `none` box would be a
@@ -4045,6 +4039,9 @@ async fn report_expander_skew(client: &mut client::Client) {
     }
 }
 
+/// The activation flow that bare `min` and `min session start` share.
+/// `options` carries `offer_scaffold`, which gates the `minimal.toml`
+/// scaffold offer.
 pub(crate) async fn activate_box(
     global: &GlobalArgs,
     mut args: ActivateArgs,

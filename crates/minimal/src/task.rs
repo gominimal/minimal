@@ -10,11 +10,11 @@
 //! status is on the wire (NET-131), whether or not this client is still
 //! here.
 //!
-//! Deliberately composed from the same client/RPC primitives `cmd_activate`
+//! Deliberately composed from the same client/RPC primitives `activate_box`
 //! uses (`BoxConfig`, `CreateSession`, the upload gates,
 //! `ConfigureLoadout`, the gating hooks, `FinalizeSession`) rather than
 //! refactored out of it: a few duplicated lines of glue keep
-//! `cmd_activate`'s diff at zero.
+//! `activate_box`'s diff at zero.
 
 use std::io::Read as _;
 
@@ -1288,9 +1288,8 @@ fn arm_task_run_interrupt(
                              `min box stop {box_name}` to stop it."
                         ),
                         InterruptEnds::Destroy => eprintln!(
-                            "DestroySession timed out after {bound:?}; the session may \
-                             still be present (run `min session destroy {box_name}` to clean \
-                             up manually)"
+                            "Box {box_name} was not removed within {bound:?}. Run \
+                             `min box rm --force {box_name}` to remove it."
                         ),
                     }
                 }
@@ -1465,7 +1464,7 @@ pub(crate) async fn run_entry(
     {
         return Err(RunFlagMisplaced::removed_path(&args.entry, arg).into());
     }
-    // Same project-path resolution as `cmd_activate`: explicit path, then
+    // Same project-path resolution as `activate_box`: explicit path, then
     // `-C`/`--repo-dir`, then the cwd.
     let effective_path = match (&args.path, &global.repo_dir) {
         (Some(p), _) => std::path::PathBuf::from(p),
@@ -1747,7 +1746,7 @@ pub(crate) async fn run_entry(
         }
     };
 
-    // Pending gating: the same two lanes as `cmd_activate` — the
+    // Pending gating: the same two lanes as `activate_box` — the
     // interactive prompt on a real terminal, the collect-and-abort
     // `NoPromptHook` anywhere else (there is no `--no-prompt` flag here;
     // a non-TTY implies it).

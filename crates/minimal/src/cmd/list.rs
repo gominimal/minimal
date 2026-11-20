@@ -64,9 +64,9 @@ pub(crate) async fn cmd_bare(global: &GlobalArgs) -> Result<(), anyhow::Error> {
 }
 
 /// The `ActivateArgs` a bare `min` activates with when no sessions exist:
-/// exactly `min session activate --attach .` — default sync, autogen name,
+/// the flags a session start takes by default — default sync, autogen name,
 /// default network — leaving the path to the `-C`/cwd resolution
-/// [`cmd_activate`] already performs for a missing path argument.
+/// `activate_box` already performs for a missing path argument.
 pub(crate) fn bare_activate_args() -> ActivateArgs {
     ActivateArgs {
         name: None,

@@ -281,11 +281,6 @@ fn every_daemon_connection_is_classified() {
             // with the Box Egress Proxy over its control socket. The proxy is
             // not the daemon, and the daemon's build is not in question here.
             "cmd/boxes/create.rs::mint_grants = ungated",
-            // Not a product path: the destroy-race test's own connection to
-            // the harness daemon. The destroy it drives sends no gated RPC —
-            // the race's loser just reports what the daemon said — so the
-            // harness connection carries no gate to record.
-            "cmd/boxes/lifecycle.rs::a_destroy_of_an_already_destroyed_session_reports_it = ungated",
             // `min box prune` probes each host it did not select and checks
             // its build before the prune, so a daemon outside the supported
             // window removes nothing.
