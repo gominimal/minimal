@@ -6451,4 +6451,112 @@ bash = \"true\"
         .unwrap_err();
         assert!(matches!(err, Error::IO(..)), "error: {err:?}");
     }
+
+    /// The toml examples of a reference page, each with the line its
+    /// fence opens on. A block whose first line names `user_policy.toml`
+    /// is left out: that file's `[vars]` is a policy section, not a layer.
+    fn reference_doc_toml_examples(page: &str) -> Vec<(usize, String)> {
+        let path = format!("{}/../../docs/reference/{page}", env!("CARGO_MANIFEST_DIR"));
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let mut blocks = Vec::new();
+        let mut open: Option<(usize, String)> = None;
+        for (index, line) in text.lines().enumerate() {
+            let fence = line.trim_start();
+            match open.take() {
+                None if fence == "```toml" => open = Some((index + 1, String::new())),
+                None => {}
+                Some(block) if fence.starts_with("```") => blocks.push(block),
+                Some((at, mut body)) => {
+                    // An example nested in a list item is indented.
+                    let indent = line.len() - fence.len();
+                    body.push_str(if indent >= 2 {
+                        &line[2.min(indent)..]
+                    } else {
+                        line
+                    });
+                    body.push('\n');
+                    open = Some((at, body));
+                }
+            }
+        }
+        assert!(open.is_none(), "{page}: a toml example is not closed");
+        blocks
+            .into_iter()
+            .filter(|(_, body)| !body.trim_start().starts_with("# user_policy.toml"))
+            .collect()
+    }
+
+    /// The dotted paths of every `vars` or `vars_lenient` key in `value`.
+    /// A key inside an `env_vars` table is a variable name, not a table.
+    fn retired_var_keys(value: &toml::Value, at: &str, found: &mut Vec<String>) {
+        let toml::Value::Table(table) = value else {
+            if let toml::Value::Array(items) = value {
+                for item in items {
+                    retired_var_keys(item, at, found);
+                }
+            }
+            return;
+        };
+        for (key, child) in table {
+            let path = if at.is_empty() {
+                key.clone()
+            } else {
+                format!("{at}.{key}")
+            };
+            if key == "vars" || key == "vars_lenient" {
+                found.push(path.clone());
+            }
+            if key != "env_vars" {
+                retired_var_keys(child, &path, found);
+            }
+        }
+    }
+
+    /// A schema sketch made into toml: each `<placeholder>` becomes its
+    /// bare name and each `, ...` list tail goes away. Anything else that
+    /// does not parse stays an error.
+    fn fill_sketch_placeholders(body: &str) -> String {
+        let mut filled = String::new();
+        let mut rest = body.replace(", ...", "");
+        while let Some(open) = rest.find('<') {
+            let Some(len) = rest[open..].find('>') else {
+                break;
+            };
+            let name = &rest[open + 1..open + len];
+            if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == ' ') {
+                break;
+            }
+            filled.push_str(&rest[..open]);
+            filled.push_str(&name.replace(' ', "_"));
+            rest = rest[open + len + 1..].to_owned();
+        }
+        filled.push_str(&rest);
+        filled
+    }
+
+    // BOX-205, BOX-206: the reference pages set variables in `env_vars`
+    // only. Every example parses, or is a schema sketch with placeholders.
+    #[test]
+    fn reference_doc_examples_use_env_vars() {
+        let mut checked = 0;
+        for page in ["loadouts.md", "minimal-dot-toml.md", "tasks.md"] {
+            let examples = reference_doc_toml_examples(page);
+            assert!(!examples.is_empty(), "{page}: no toml examples");
+            for (line, body) in examples {
+                // A schema sketch with `<placeholder>` values is not toml
+                // until its placeholders are filled in. It must parse then.
+                let value = toml::from_str::<toml::Value>(&body)
+                    .or_else(|_| toml::from_str(&fill_sketch_placeholders(&body)))
+                    .unwrap_or_else(|e| panic!("{page}:{line}: the example does not parse: {e}"));
+                let mut found = Vec::new();
+                retired_var_keys(&value, "", &mut found);
+                assert!(
+                    found.is_empty(),
+                    "{page}:{line}: the example sets {found:?}, not env_vars"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0);
+    }
 }
