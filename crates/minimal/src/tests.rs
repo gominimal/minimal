@@ -857,7 +857,10 @@ fn removed_session_verbs_are_unknown_commands() {
 
     // The parser's own refusal for a word it does not know, for comparison.
     let unknown = refused(&["min", "session", "bogus"], ErrorKind::InvalidSubcommand);
-    assert!(unknown.contains("unrecognized subcommand 'bogus'"), "{unknown}");
+    assert!(
+        unknown.contains("unrecognized subcommand 'bogus'"),
+        "{unknown}"
+    );
 
     for noun in ["session", "sessions"] {
         for verb in REMOVED_SESSION_VERBS {
@@ -910,7 +913,9 @@ fn removed_session_verbs_are_unknown_commands() {
         .and_then(|task| task.find_subcommand("run"))
         .expect("`min task run` stays");
     assert!(
-        task_run.get_arguments().all(|arg| arg.get_long() != Some("path")),
+        task_run
+            .get_arguments()
+            .all(|arg| arg.get_long() != Some("path")),
         "no `min task run --path`"
     );
 }
@@ -4939,11 +4944,7 @@ fn network_parser_round_trips_every_mode_word() {
 fn deny_all_egress_refuses_the_allow_flags() {
     use clap::Parser as _;
 
-    for verb in [
-        &["session", "start"][..],
-        &["task", "run"],
-        &["box", "run"],
-    ] {
+    for verb in [&["session", "start"][..], &["task", "run"], &["box", "run"]] {
         let line = |rest: &[&'static str]| {
             ["min"]
                 .iter()
@@ -5030,7 +5031,8 @@ fn dynamic_ingress_flags_parse() {
     assert_eq!(a.dynamic_ingress, Some(boxes::DynamicIngress::Ask));
     assert_eq!(a.dynamic_range, None, "a mode alone carries no range");
 
-    let Err(err) = parse_activate_args(&["min", "session", "activate", "--dynamic-ingress", "maybe"])
+    let Err(err) =
+        parse_activate_args(&["min", "session", "activate", "--dynamic-ingress", "maybe"])
     else {
         panic!("an unknown dynamic ingress mode must not parse");
     };
