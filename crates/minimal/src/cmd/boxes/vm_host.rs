@@ -18,8 +18,8 @@ use minimal_client::box_registration::{
 /// The host kind this invocation's daemon connection resolves through:
 /// `client_host_kind`, the same key the socket resolution itself and the
 /// fabric display turn on. Every gate that decides whether the host is
-/// VM-backed keys on this and never on `use_minvmd()` — the flag is the
-/// linux-only way to *ask* for the VM host, while macOS has no native
+/// VM-backed keys on this and never on `use_minvmd()` — the provider
+/// choice is the linux-only way to *ask* for the VM host, while macOS has no native
 /// backend, so a flagless invocation there is minvmd-backed all the same
 /// and the flag's own reading would leave exactly that host with no box
 /// registration, no control socket to withdraw through, and a start line

@@ -196,6 +196,8 @@ impl Shared {
                                 .clone()
                                 .map(|section| boxes::BoxPolicy::new(Some(section), None)),
                             record.task_addresses.clone(),
+                            None,
+                            None,
                         ),
                         record: record.clone(),
                         switch: Arc::clone(&switch),
@@ -274,6 +276,8 @@ impl BoxReach {
                 &name,
                 Some(boxes::BoxPolicy::new(Some(egress.clone()), None)),
                 addresses.clone(),
+                None,
+                None,
             )
         })
     }

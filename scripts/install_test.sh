@@ -109,6 +109,37 @@ write_min_stub() {
 # Every call records whether it ran with the installer's update-check guard
 # (MINIMAL_UNDER_INSTALLER) and its verb, in $HOME/min.calls.
 printf '%s %s\n' "${MINIMAL_UNDER_INSTALLER:-unset}" "${1:-}" >>"$HOME/min.calls"
+# The provider each call ran under (its MIN_PROVIDER, or unset) and its verb,
+# in $HOME/min.provider.
+printf '%s %s\n' "${MIN_PROVIDER:-unset}" "${1:-}" >>"$HOME/min.provider"
+# MIN_PROVIDER as `min` reads it: a value that names no provider is refused,
+# unless this stub stands for a `min` from before the variable (the
+# "pre-provider" label), which ignores it. With $HOME/kvm.opens, a call of a
+# current `min` with no MIN_PROVIDER reaches the VM provider, where no daemon
+# runs: `version` prints no server line, `stop` finds nothing, `ls` lists
+# nothing.
+_pre_provider=0
+grep -q '^# mock min (pre-provider)' "$0" && _pre_provider=1
+_on_vm=0
+if [ "$_pre_provider" -eq 0 ]; then
+    case "${MIN_PROVIDER:-}" in
+        ""|local|local-minvmd) ;;
+        *)
+            echo "error: MIN_PROVIDER=$MIN_PROVIDER names no provider. Set MIN_PROVIDER to local or local-minvmd, or unset it." >&2
+            exit 1
+            ;;
+    esac
+    if [ -f "$HOME/kvm.opens" ] && [ -z "${MIN_PROVIDER:-}" ]; then
+        _on_vm=1
+    fi
+fi
+if [ "$_on_vm" -eq 1 ]; then
+    case "${1:-}" in
+        version) printf 'Client: minimal v1\n'; exit 0 ;;
+        stop) printf 'vm %s\n' "$*" >>"$HOME/stop.calls"; echo "error: no daemon is running" >&2; exit 1 ;;
+        ls) exit 0 ;;
+    esac
+fi
 comp_target() {
     case "$1" in
         bash) printf '%s/bash-completion/completions/min\n' "${XDG_DATA_HOME:-$HOME/.local/share}" ;;
@@ -1577,6 +1608,32 @@ case_target_validation() {
     want_ok "--version is told the install is counted (R6.1b)" grep -q "no release notices for --version" "$OUT"
     want_ok "--version is told what is sent and the switch (R6.1b)" grep -q "MINIMAL_TELEMETRY=0" "$OUT"
     want_ok "--version is told the channel it sends (R6.1b)" grep -q "(pinned), version, OS, architecture, install method" "$OUT"
+    # `v1` is not a release the card can place, so it gives the range.
+    want_ok "--version with a name the card cannot place gives the range (R6.1b)" \
+        grep -q "min 0.7.4 and later report this install once a day" "$OUT"
+    # A release the card can place is told which of the two it is. The mock
+    # serves the same bytes under two more version names.
+    ln -s v1 "$mock/versions/0.7.3"
+    ln -s v1 "$mock/versions/0.7.4"
+    HVO="$root/hvold"; mkdir -p "$HVO"
+    run versionold "$HVO" --version 0.7.3
+    check 0 "$rc" "--version 0.7.3 installs (R6.1b)"
+    want_ok "a release before 0.7.4 is told it sends nothing (R6.1b)" \
+        grep -q "min 0.7.3 does not check for updates and sends nothing" "$OUT"
+    want_ok "a release before 0.7.4 is told from when installs report (R6.1b)" \
+        grep -q "Releases from 0.7.4 on report an" "$OUT"
+    if grep -q "MINIMAL_TELEMETRY=0" "$OUT"; then
+        bad "a release before 0.7.4 is not told of a switch for a request it never makes (R6.1b)"
+    else
+        ok "a release before 0.7.4 is not told of a switch for a request it never makes (R6.1b)"
+    fi
+    HVN="$root/hvnew"; mkdir -p "$HVN"
+    run versionnew "$HVN" --version 0.7.4
+    check 0 "$rc" "--version 0.7.4 installs (R6.1b)"
+    want_ok "0.7.4 is told it reports, with no range (R6.1b)" \
+        grep -q "min reports this install once a day (no release notices for --version)" "$OUT"
+    want_ok "0.7.4 is told the switch (R6.1b)" grep -q "MINIMAL_TELEMETRY=0" "$OUT"
+    rm "$mock/versions/0.7.3" "$mock/versions/0.7.4"
     HV2="$root/hv2"; mkdir -p "$HV2"
     run versioneq "$HV2" --force-stop --version=v1
     check 0 "$rc" "--version=VER with another flag installs (R2.5)"
@@ -2016,6 +2073,52 @@ stop" "$(cat "$HL9/stop.calls")" \
         "the failed run still takes the closing stop (R5.5)"
     check "$h_minimald" "$(hash_file "$HL9/daemon.running")" \
         "the daemon the failed run leaves serves the minimald it installed (R5.5)"
+
+    # An upgrade from a `min` that predates MIN_PROVIDER, on a Linux host where
+    # /dev/kvm opens. The old `min` ran the native daemon, and a client
+    # respawns it from the old binaries during the run. The new `min` with no
+    # flag would reach the VM provider and find no daemon there, so the
+    # closing stop runs with MIN_PROVIDER=local and stops the native one. The
+    # variable stays inside that stop: the later finalize-install probe runs
+    # without it.
+    HL12="$root/hl12"; mkdir -p "$HL12"
+    stage_live_upgrade "$HL12" nativebeforeprovider
+    rm -f "$HL12/sessions.live"
+    write_min_stub "$HL12/bin/min" pre-provider
+    printf 'stale\n' >"$HL12/daemon.running"
+    : >"$HL12/daemon.reconnect"
+    : >"$HL12/kvm.opens"
+    rm -f "$HL12/min.provider"
+    run nativebeforeprovider "$HL12"
+    check 0 "$rc" "an upgrade from a min before MIN_PROVIDER exits 0 (R5.5)"
+    want_ok "the closing stop finds the old native daemon (R5.5)" \
+        grep -q "stopping a daemon still running from build old" "$OUT"
+    check "stop
+stop" "$(cat "$HL12/stop.calls")" \
+        "graceful stop before the swap, then a graceful closing stop of the native daemon (R5.5)"
+    want_ok "the closing stop asks the native provider (R5.5)" \
+        grep -qx "local version" "$HL12/min.provider"
+    want_err "no call reached the VM provider (R5.5)" grep -q "^vm " "$HL12/stop.calls"
+    want_err "nothing after the closing stop runs with MIN_PROVIDER=local (R5.5)" \
+        grep -qx "local finalize-install" "$HL12/min.provider"
+    check "$h_minimald" "$(hash_file "$HL12/daemon.running")" \
+        "the daemon the run leaves is the one just installed (R5.5)"
+
+    # The same host with a session opened in the respawned native daemon and
+    # no terminal: the advice names the native provider, which a flagless
+    # `min` no longer reaches there.
+    HL13="$root/hl13"; mkdir -p "$HL13"
+    stage_live_upgrade "$HL13" nativeadvice
+    rm -f "$HL13/sessions.live"
+    write_min_stub "$HL13/bin/min" pre-provider
+    printf 'stale\n' >"$HL13/daemon.running"
+    : >"$HL13/daemon.reconnect"
+    : >"$HL13/respawn.sessions"
+    : >"$HL13/kvm.opens"
+    run nativeadvice "$HL13"
+    check 0 "$rc" "an upgrade that leaves the native daemon running exits 0 (R5.5)"
+    want_ok "the advice names the native provider (R5.5)" \
+        grep -qF "run 'min --provider local stop' after those sessions end, or 'min --provider local stop --force' to end them now." "$OUT"
 }
 
 case_shell_integration() {
@@ -3856,7 +3959,7 @@ case_linux_vm_stack() {
         grep -qE "^  switch-binary +(verified|current)" "$OUT"
 }
 
-# --- #2498: the Box Egress Proxy installs beside minvmd on macOS -------------
+# --- #2498: the Box Egress Proxy installs beside minvmd ----------------------
 # minvmd starts `bep` from beside its own binary, so an installed minvmd finds
 # the proxy only when both land in the same directory. The proof reads the
 # release's own component table (scripts/stage-release.sh), then installs a
@@ -3873,8 +3976,16 @@ case_bep_installs_beside_minvmd() {
     check 'file|bin/bep.app/Contents/MacOS/bep|bep-macos-arm64"' "$(_row bep-program)" \
         "the release stages the bep program inside bin/bep.app"
     check "bin/minvmd" "$(_row minvmd | cut -d'|' -f2)" "the release stages minvmd for darwin/arm64 at bin/minvmd"
-    want_err "the release stages no bep for Linux" \
-        grep -qE '^    "bep[-a-z]*\|linux\|' "$_table"
+    # Linux ships bep as a plain file beside minvmd: its keys live in the TPM
+    # or Secret Service, which need no bundle.
+    for _arch in amd64 arm64; do
+        check "file|bin/bep|bep-linux-$_arch\"" \
+            "$(awk -F'|' -v a="$_arch" '$1 ~ /"bep$/ && $2 == "linux" && $3 == a {print $4 "|" $5 "|" $6}' "$_table")" \
+            "the release stages bep for linux/$_arch at bin/bep"
+        check "bin/minvmd" \
+            "$(awk -F'|' -v a="$_arch" '$1 ~ /"minvmd$/ && $2 == "linux" && $3 == a {print $5}' "$_table")" \
+            "the release stages minvmd for linux/$_arch at bin/minvmd"
+    done
 
     printf 'darwin-arm64-minvmd-body\n' >"$mock/versions/v1/minvmd-macos-arm64"
     printf 'darwin-arm64-bep-body\n'    >"$mock/versions/v1/bep-macos-arm64"

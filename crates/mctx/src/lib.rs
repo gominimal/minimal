@@ -276,6 +276,11 @@ pub struct Context {
     /// Every package build the context starts runs in one of them. `None`
     /// for a context that builds outside any box.
     pub(crate) build_boxes: Option<Arc<dyn op::BuildBoxes>>,
+    /// The classifier leaf a task env of this context runs in, on a
+    /// VM-backed host_ip box, so the box's egress verdict decides the task's
+    /// connections. `None` for a context made for no such box. Package
+    /// builds take their box from `build_boxes`, never from this leaf.
+    pub(crate) classifier_leaf: Option<sandbox::config::ClassifierLeaf>,
     /// The workspace a box's `minimal.toml` edits and re-reads must stay
     /// inside, for a context the daemon builds for a box (inbox#1245).
     /// `None` for a context whose caller chose the project itself, as the
@@ -444,6 +449,7 @@ impl Context {
             daemon,
             mfile,
             build_boxes: None,
+            classifier_leaf: None,
             mfile_edit_root: None,
             state_root: None,
         })
@@ -469,6 +475,7 @@ impl Context {
             daemon,
             mfile,
             build_boxes: None,
+            classifier_leaf: None,
             mfile_edit_root: None,
             state_root: None,
         }
@@ -484,6 +491,7 @@ impl Context {
             daemon,
             mfile,
             build_boxes: None,
+            classifier_leaf: None,
             mfile_edit_root: None,
             state_root: None,
         }
@@ -495,6 +503,19 @@ impl Context {
     pub fn with_build_boxes(mut self, boxes: Arc<dyn op::BuildBoxes>) -> Self {
         self.build_boxes = Some(boxes);
         self
+    }
+
+    /// Places every task env this context makes in `leaf`, the classifier
+    /// leaf of the box the tasks run for.
+    #[must_use]
+    pub fn with_classifier_leaf(mut self, leaf: sandbox::config::ClassifierLeaf) -> Self {
+        self.classifier_leaf = Some(leaf);
+        self
+    }
+
+    /// The classifier leaf this context's task envs run in, if any.
+    pub fn classifier_leaf(&self) -> Option<&sandbox::config::ClassifierLeaf> {
+        self.classifier_leaf.as_ref()
     }
 
     /// The build boxes this context's package builds run in, if any.
@@ -569,6 +590,7 @@ impl Context {
         let mfile = strategy.find_mfile()?;
         Ok(Self {
             build_boxes: self.build_boxes.clone(),
+            classifier_leaf: self.classifier_leaf.clone(),
             mfile_edit_root: self.mfile_edit_root.clone(),
             state_root: self.state_root.clone(),
             ..Self::from_daemon(Arc::clone(&self.daemon), mfile)
@@ -1216,28 +1238,36 @@ impl Context {
             Error::Other(anyhow::Error::from(e).context("creating base sandbox directory"))
         })?;
 
-        let mut env = Env::build(
-            self,
-            graph,
-            EnvArgs {
-                name,
-                state_base_dir,
-                transitives: transitive_deps,
-                cwd: wd,
-                wd_layout,
-                patches,
-                home,
-                env_vars,
-                hostname: Some(name.to_string()),
-                network,
-                ot: self.daemon.config.ot.clone(),
-            },
-        )
-        .await?;
+        let args = self.task_env_args(EnvArgs {
+            name,
+            state_base_dir,
+            transitives: transitive_deps,
+            cwd: wd,
+            wd_layout,
+            patches,
+            home,
+            env_vars,
+            hostname: Some(name.to_string()),
+            network,
+            classifier_leaf: None,
+            ot: self.daemon.config.ot.clone(),
+        });
+        let mut env = Env::build(self, graph, args).await?;
         env.associate_tempdirs(temp_dirs);
         env.associate_tempdirs([base]);
 
         Ok(env)
+    }
+
+    /// `args` placed in this context's classifier leaf, if it has one. A task
+    /// env made for a host-address box then runs in the leaf of its box, so
+    /// the box's egress verdict decides the task's connections, the same as
+    /// for the package builds the context starts (NET-155).
+    pub(crate) fn task_env_args<'a>(&self, args: EnvArgs<'a>) -> EnvArgs<'a> {
+        EnvArgs {
+            classifier_leaf: self.classifier_leaf.clone(),
+            ..args
+        }
     }
 
     /// Returns the list of all packages brought in through tasks, profiles and stacks.
@@ -1951,6 +1981,68 @@ mod tests {
             .await
             .unwrap();
         assert!(orchestrator.backend.build_boxes().is_some());
+    }
+
+    /// A task env made from a context with a classifier leaf runs in that
+    /// leaf, so a task of a host-address box gets its box's egress. A context
+    /// made for no box gives a task env with no leaf.
+    #[test]
+    fn task_env_carries_the_box_classifier_leaf() {
+        let state = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let config = ConfigBuilder::new()
+            .with_state_dir(state.path().to_path_buf())
+            .with_cache_dir(cache.path().to_path_buf())
+            .with_stdlib_dir(
+                std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("../stdlib/minimal-ncl"),
+            )
+            .build()
+            .unwrap();
+        let daemon = Arc::new(DaemonContext::init(config).unwrap());
+        let repo = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("testdata")
+            .join("fakerepo");
+        let mfile = MFileSearchStrategy::Override(repo)
+            .find_mfile()
+            .expect("fakerepo has a minimal.toml");
+        let leaf = sandbox::config::ClassifierLeaf::under(
+            std::path::Path::new("/sys/fs/cgroup/minimald.slice"),
+            "box-1",
+            sandbox::config::Verdict::Allow,
+        );
+        let args = || EnvArgs {
+            name: "task",
+            transitives: std::collections::HashMap::new(),
+            state_base_dir: state.path().to_path_buf(),
+            cwd: state.path().to_path_buf(),
+            wd_layout: WdLayout::BoundDir,
+            patches: None,
+            home: PatchHome::Ambient,
+            env_vars: None,
+            hostname: None,
+            network: Arc::new(sandbox::HostNet),
+            classifier_leaf: None,
+            ot: None,
+        };
+
+        let plain = Context::from_daemon(Arc::clone(&daemon), mfile);
+        let unplaced = plain.task_env_args(args());
+        assert_eq!(unplaced.classifier_leaf, None);
+        let config = env::place_in_classifier_leaf(
+            sandbox::config::Config::new("task"),
+            unplaced.classifier_leaf,
+        );
+        assert_eq!(config.classifier_leaf, None);
+
+        let boxed = plain.with_classifier_leaf(leaf.clone());
+        let placed = boxed.task_env_args(args());
+        assert_eq!(placed.classifier_leaf.as_ref(), Some(&leaf));
+        let config = env::place_in_classifier_leaf(
+            sandbox::config::Config::new("task"),
+            placed.classifier_leaf,
+        );
+        assert_eq!(config.classifier_leaf, Some(leaf));
     }
 
     #[test]

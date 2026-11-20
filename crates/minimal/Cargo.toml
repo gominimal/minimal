@@ -55,7 +55,8 @@ hex.workspace = true
 # enough; the datagram is this crate's own UdpSocket.
 hickory-proto.workspace = true
 # `signal`: `min net forward` dies of the SIGTERM it caught (cmd::die_of).
-nix = { workspace = true, features = ["signal"] }
+# `ioctl`: the default-provider probe asks /dev/kvm for its API version.
+nix = { workspace = true, features = ["signal", "ioctl"] }
 mctx.workspace = true
 mfile.workspace = true
 minimal-client.workspace = true

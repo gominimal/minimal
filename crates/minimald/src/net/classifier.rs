@@ -81,6 +81,40 @@ use sandbox::config::Verdict;
 /// deny-all box to them would admit it to everything upstream.
 pub const ANSWERER_ADDRESS: Ipv4Addr = Ipv4Addr::LOCALHOST;
 
+/// The leaf a task of a box runs in (NET-079), and the verdict its plan
+/// follows. A task of a host-address box shares the namespace of its box, so
+/// the task joins the box's own existing leaf: the packet filter then decides
+/// the task's connections on the box's verdict, the same as for a process the
+/// box itself starts. A task places no leaf of its own. `None` for every
+/// other mode, and for a box the host placed in no leaf.
+pub(crate) fn task_box_leaf(
+    mode: boxes::NetworkMode,
+    box_leaf: Option<&sandbox::config::ClassifierLeaf>,
+) -> Option<(sandbox::config::ClassifierLeaf, Verdict)> {
+    if mode != boxes::NetworkMode::HostNet {
+        return None;
+    }
+    let leaf = box_leaf?.clone();
+    let verdict = if leaf.is_deny() {
+        Verdict::Deny
+    } else {
+        Verdict::Allow
+    };
+    Some((leaf, verdict))
+}
+
+/// The decision a task in `leaf`, the existing leaf of its box, plans over
+/// (NET-079). A native deny leaf of a running box exists only when its launch
+/// decided per box: a launch that did not is refused, or places no leaf. So
+/// the task carries a decided decision with the carve-out the tree records
+/// now, and its plan repeats the stale carve-out check of the box launch. The
+/// task does not probe the table again. `None` for an allow leaf, whose plan
+/// makes no such check.
+pub(crate) fn task_box_decision(leaf: &sandbox::config::ClassifierLeaf) -> Option<Decision> {
+    leaf.is_deny()
+        .then(|| Decision::decided().with_carve_out(recorded_carve_out(&leaf.tree_root())))
+}
+
 /// Which cohort subtree `declaration` places a box's leaf in (NET-079): the
 /// deny subtree is for the declaration that admits no destination — the one
 /// shape `boxes::EgressPolicy::deny_all` materializes, every `allow_*`

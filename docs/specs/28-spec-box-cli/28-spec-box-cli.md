@@ -205,7 +205,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     tier:   T0
     verify: cargo nextest run -p minimal box_spec_entry_override_flags_match_start
 
-- **BCLI-077** WHEN `min box spec <entry>` renders an entry's `vars` and `vars_lenient` THE SYSTEM SHALL render each variable name once, in the table and with the value that BOX-180's merge gives it. Beside each name it SHALL name the layer that set it, as BOX-161 reports.
+- **BCLI-077** WHEN `min box spec <entry>` renders an entry's `env_vars` (BOX-205) THE SYSTEM SHALL render each variable name once, with the value that BOX-180's merge gives it. Beside each name it SHALL name the layer that set it, as BOX-161 reports.
   <!-- event-driven; BOX-180: up to and including the entry, the most specific layer that sets a name wins, and each selected loadout adds the names it sets -->
   tier:     T0
   verify:   cargo nextest run -p minimal box_spec_renders_merged_vars_once_with_layer
@@ -214,14 +214,15 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     tier:   T0
     verify: cargo nextest run -p minimal box_spec_withholds_loadout_set_var_values
 
-- **BCLI-078** IF expanding an entry fails under BOX-172, BOX-174, BOX-181, BOX-182, BOX-183 or BOX-184 THEN THE SYSTEM SHALL fail `min box spec <entry>`, `min box start`, `min box run`, `min session start` and `min task run` with exit 3, and print the error that requirement states. It SHALL create nothing and render nothing.
+- **BCLI-078** IF expanding an entry fails under BOX-172, BOX-174, BOX-181, BOX-182, BOX-183, BOX-206 or BOX-207 THEN THE SYSTEM SHALL fail `min box spec <entry>`, `min box start`, `min box run`, `min session start` and `min task run` with exit 3, and print the error that requirement states. It SHALL create nothing and render nothing.
   <!-- unwanted; spec 29 states each refusal's content, and this requirement binds the commands that print it. What each error tells the person:
        BOX-172: the loadout and the key, that a loadout cannot set `loadout_mode`, and to remove the key from that loadout.
        BOX-174: the key, the value and the layer that set it, and that `sealed` and `open` are the accepted values.
        BOX-181: the type whose constraint holds `loadout_mode`, the key and the layer that set the other value, as BOX-061 names them. The expansion fails before any loadout is read.
        BOX-182: the file and the `ask` rule in the client's `[loadout-file-rules]` that met no terminal. The read is denied.
        BOX-183: the variable and both sources that set it to different resolved values, and the remedy of adding the variable to the `ignore` list of the user policy.
-       BOX-184: the variable and the one layer that sets it twice to different values, in `vars_lenient` or in both `vars` and `vars_lenient` -->
+       BOX-206: the file, the table that sets `vars` or `vars_lenient` as its own key, and the key, and to move the variables to `env_vars`.
+       BOX-207: the variable and the file, and which characters a variable name can hold -->
   tier:     T0
   verify:   cargo nextest run -p minimal expansion_refusals_exit3_on_spec_and_create_verbs
 

@@ -832,6 +832,268 @@ fn cli_reference_has_no_retired_commands() {
     );
 }
 
+/// The `min session` verbs that BCLI-042 removes.
+const REMOVED_SESSION_VERBS: [&str; 7] = [
+    "activate", "destroy", "exec", "rename", "policy", "hooks", "run",
+];
+
+/// The names a script calls `min` by: the binary and the e2e's wrappers.
+const MIN_INVOKERS: [&str; 8] = [
+    "min",
+    "mnl",
+    "bn_warm",
+    "mnl2",
+    "nasr_mnl2",
+    "lt_mn",
+    "two_vm_mn",
+    "eib_two_mn",
+];
+
+/// The global flags of `min` that take a value, so a check can skip the
+/// value on its way to the subcommand.
+const MIN_VALUE_FLAGS: [&str; 6] = [
+    "--minimal-dir",
+    "--config-dir",
+    "--vm",
+    "--provider",
+    "--repo-dir",
+    "-C",
+];
+
+/// The removed spellings (BCLI-042) on one line of a script or a reference
+/// page, each as `min ...`. The line is read as words: quotes, backticks
+/// and shell punctuation separate words.
+fn removed_spellings_in_line(line: &str) -> Vec<String> {
+    // Each command on the line is read alone, so a flag of one command
+    // never counts for the command before it.
+    line.split([';', '|', '&'])
+        .flat_map(removed_spellings_in_command)
+        .collect()
+}
+
+/// The removed spellings in one command of a line.
+fn removed_spellings_in_command(command: &str) -> Vec<String> {
+    let spaced: String = command
+        .chars()
+        .map(|c| if "`'\"()".contains(c) { ' ' } else { c })
+        .collect();
+    let words: Vec<&str> = spaced.split_whitespace().collect();
+    let mut found = Vec::new();
+    for (i, pair) in words.windows(2).enumerate() {
+        if pair[0] == "session" && REMOVED_SESSION_VERBS.contains(&pair[1]) {
+            found.push(format!("min session {}", pair[1]));
+        }
+        if pair == ["task", "run"]
+            && words[i + 2..]
+                .iter()
+                .any(|w| *w == "--path" || w.starts_with("--path="))
+        {
+            found.push("min task run --path".to_owned());
+        }
+    }
+    for (i, word) in words.iter().enumerate() {
+        if !MIN_INVOKERS.contains(word) {
+            continue;
+        }
+        // Skip the global options, and the value of each one that takes a
+        // value, to reach the subcommand.
+        let mut j = i + 1;
+        while let Some(next) = words.get(j) {
+            if MIN_VALUE_FLAGS.contains(next) {
+                j += 2;
+            } else if next.starts_with('-') || next.starts_with('$') {
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        if words.get(j) == Some(&"stop") {
+            found.push("min stop".to_owned());
+        }
+    }
+    found
+}
+
+/// The shell functions in `text` whose body runs `min` or `"$MIN"` with
+/// `"$@"`: the wrappers a script calls `min` by. Each line that runs `min`
+/// with `"$@"` belongs to the function that is open at that line. A
+/// function closes at a `}` in the first column, or on its own line when
+/// the whole function is one line.
+fn min_wrappers_in_script(text: &str) -> Vec<(usize, String)> {
+    let mut wrappers: Vec<(usize, String)> = Vec::new();
+    let mut current: Option<(usize, String)> = None;
+    for (n, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        let mut one_line_function = false;
+        if let Some((name, rest)) = trimmed.split_once("()")
+            && !name.is_empty()
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && rest.trim_start().starts_with('{')
+        {
+            current = Some((n + 1, name.to_owned()));
+            one_line_function = rest.trim_end().ends_with('}');
+        }
+        let spaced: String = line
+            .replace("${MIN}", "$MIN")
+            .chars()
+            .map(|c| if "`'\"();|&{}".contains(c) { ' ' } else { c })
+            .collect();
+        let words: Vec<&str> = spaced.split_whitespace().collect();
+        let runs_min = words.iter().any(|w| *w == "min" || *w == "$MIN");
+        if runs_min && words.contains(&"$@") {
+            let owner = current
+                .clone()
+                .unwrap_or_else(|| (n + 1, "<no function>".to_owned()));
+            if !wrappers.iter().any(|(_, name)| *name == owner.1) {
+                wrappers.push(owner);
+            }
+        }
+        if one_line_function || line.starts_with('}') {
+            current = None;
+        }
+    }
+    wrappers
+}
+
+// BCLI-042: the session e2e, the smaller scripts and every CLI reference
+// page use none of the removed spellings, so no caller meets an unknown
+// command when the parser drops them.
+#[test]
+fn scripts_and_cli_reference_use_no_removed_session_verb() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut files: Vec<std::path::PathBuf> = [
+        "scripts/session-e2e.sh",
+        "scripts/bulk-upload-e2e.sh",
+        "scripts/stress-session-e2e.sh",
+        "scripts/kernel-bump-review.sh",
+        "justfile",
+    ]
+    .iter()
+    .map(|file| root.join(file))
+    .collect();
+    let reference = root.join("docs/reference");
+    let mut pages: Vec<std::path::PathBuf> = std::fs::read_dir(&reference)
+        .expect("docs/reference must be readable")
+        .map(|entry| {
+            entry
+                .expect("a docs/reference entry must be readable")
+                .path()
+        })
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("cli") && name.ends_with(".md"))
+        })
+        .collect();
+    pages.sort();
+    assert!(
+        pages.iter().any(|page| page.ends_with("cli-min.md")),
+        "the check must read docs/reference/cli-min.md, read: {pages:?}"
+    );
+    files.extend(pages);
+
+    let mut hits = Vec::new();
+    for file in &files {
+        let text = std::fs::read_to_string(file)
+            .unwrap_or_else(|e| panic!("{} must be readable: {e}", file.display()));
+        // A wrapper that MIN_INVOKERS does not list hides a bare `stop`
+        // from the check below, so every wrapper must be listed.
+        if file.extension().is_some_and(|ext| ext == "sh") {
+            for (n, name) in min_wrappers_in_script(&text) {
+                if !MIN_INVOKERS.contains(&name.as_str()) {
+                    hits.push(format!(
+                        "{}:{n}: the wrapper {name} runs min with \"$@\" and is not in MIN_INVOKERS",
+                        file.display()
+                    ));
+                }
+            }
+        }
+        // A `#` comment in the justfile can name an old verb as history. A
+        // recipe line or an echo there is what a person runs, so it is read.
+        let is_justfile = file.ends_with("justfile");
+        for (n, line) in text.lines().enumerate() {
+            if is_justfile && line.trim_start().starts_with('#') {
+                continue;
+            }
+            for spelling in removed_spellings_in_line(line) {
+                hits.push(format!(
+                    "{}:{}: {spelling}: {}",
+                    file.display(),
+                    n + 1,
+                    line.trim()
+                ));
+            }
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "these lines use a removed spelling (BCLI-042), or define a wrapper the check does not know:\n{}",
+        hits.join("\n")
+    );
+}
+
+/// The wrapper finder names each function that runs `min` or `"$MIN"` with
+/// `"$@"`, on one line or several, and skips a function that does not.
+#[test]
+fn min_wrappers_in_script_finds_each_form() {
+    let script = "mnl() {\n  # min \"$@\" in a comment\n  min ${E2E_MINIMAL_ARGS:-} \"$@\"\n}\n\
+                  two() { \"$MIN\" --vm x \"$@\"; }\n\
+                  other() {\n  echo \"$@\"\n}\n\
+                  three() {\n  \"${MIN}\" \"$@\"\n}\n\
+                  min \"$@\"\n";
+    let names: Vec<String> = min_wrappers_in_script(script)
+        .into_iter()
+        .map(|(_, name)| name)
+        .collect();
+    assert_eq!(names, ["mnl", "two", "three", "<no function>"]);
+}
+
+/// The line reader finds each removed spelling, and passes the verbs that
+/// stay and the marked NET-058 lines.
+#[test]
+fn removed_spellings_in_line_reads_each_form() {
+    for (line, want) in [
+        (
+            "mnl session activate . --no-prompt",
+            vec!["min session activate"],
+        ),
+        (
+            "echo \"'min session exec $sid' failed\"",
+            vec!["min session exec"],
+        ),
+        (
+            "  # `min session run <session> <task>`",
+            vec!["min session run"],
+        ),
+        ("mnl session policy \"$b\"", vec!["min session policy"]),
+        ("mnl stop --force >/dev/null 2>&1 || true", vec!["min stop"]),
+        (
+            "min ${E2E_MINIMAL_ARGS:-} --minimal-dir \"$D\" stop --force",
+            vec!["min stop"],
+        ),
+        (
+            "min task run --path ../proj build",
+            vec!["min task run --path"],
+        ),
+        ("min task run build; cmd --path x", vec![]),
+        ("mnl host stop \"$E2E_HOST\" --force", vec![]),
+        ("mnl box stop \"$sid\"", vec![]),
+        ("minvmd stop >/dev/null 2>&1", vec![]),
+        ("mnl session start --detach --no-input", vec![]),
+        ("min session attach \"$sid\"", vec![]),
+        ("proof_session_rename", vec![]),
+        (
+            "sudo -n install-apparmor-profile.sh --path \"$bin\"",
+            vec![],
+        ),
+    ] {
+        assert_eq!(removed_spellings_in_line(line), want, "line: {line}");
+    }
+}
+
 /// Entry constructor for the bare-`min` state-report tests.
 fn twin_entry(
     id: &str,
@@ -18715,6 +18977,141 @@ async fn box_spec_path_form_renders_bep_rows() {
     );
 }
 
+// D3598: bare `min box spec` reads the expanded session entry, so a
+// `[defaults.network.bep]` steering mode reaches its steering row, the same
+// value that `min box spec default` shows.
+#[tokio::test]
+async fn box_spec_bare_reads_defaults_network_bep() {
+    let (_project, global) = spec_project(
+        "[defaults.network.bep]\nsteering = \"proxy_env\"\n\n\
+         [sessions.default]\npackages = [\"git\"]\n\n\
+         [sessions.default.secrets.GH_TOKEN]\nsource = \"broker\"\nscopes = [\"github:full\"]\n",
+    );
+    let bare = box_spec_text(&global, &["min", "box", "spec", "--network", "host_ip"])
+        .await
+        .expect("the rows render");
+    assert!(bare.contains("\nsteering  proxy_env\n"), "{bare}");
+    assert!(bare.contains("GH_TOKEN"), "{bare}");
+
+    let entry = box_spec_text(&global, &["min", "box", "spec", "default"])
+        .await
+        .expect("the entry renders");
+    assert!(entry.contains("# steering  proxy_env\n"), "{entry}");
+}
+
+// D3598: bare `min box spec` stays a read-only preview when the start
+// cannot pick one session entry. Two session entries and no `default`
+// render the merged `[defaults]` and `[defaults.session]` rows, not the
+// start's refusal.
+#[tokio::test]
+async fn box_spec_bare_reads_defaults_network_bep_undecided_entry() {
+    let (_project, global) = spec_project(
+        "[defaults.session.network.bep]\nsteering = \"proxy_env\"\n\n\
+         [defaults.session.secrets.GH_TOKEN]\nsource = \"broker\"\nscopes = [\"github:full\"]\n\n\
+         [sessions.one]\npackages = [\"git\"]\n\n\
+         [sessions.two]\npackages = [\"git\"]\n",
+    );
+    let bare = box_spec_text(&global, &["min", "box", "spec", "--network", "host_ip"])
+        .await
+        .expect("the rows render without a picked session entry");
+    assert!(bare.contains("\nsteering  proxy_env\n"), "{bare}");
+}
+
+// D3598: with no single session entry, bare `min box spec` still merges
+// the top-level `[defaults]` under `[defaults.session]`, so a
+// `[defaults.network.bep]` steering mode reaches its row and the command
+// succeeds.
+#[tokio::test]
+async fn box_spec_bare_reads_defaults_network_bep_top_level_undecided_entry() {
+    let (_project, global) = spec_project(
+        "[defaults.network.bep]\nsteering = \"proxy_env\"\n\n\
+         [defaults.session.secrets.GH_TOKEN]\nsource = \"broker\"\nscopes = [\"github:full\"]\n\n\
+         [sessions.one]\npackages = [\"git\"]\n\n\
+         [sessions.two]\npackages = [\"git\"]\n",
+    );
+    let bare = box_spec_text(&global, &["min", "box", "spec", "--network", "host_ip"])
+        .await
+        .expect("the rows render without a picked session entry");
+    assert!(bare.contains("\nsteering  proxy_env\n"), "{bare}");
+    assert!(bare.contains("GH_TOKEN"), "{bare}");
+}
+
+// D3598: with no single session entry, bare `min box spec` expands an
+// entry with an empty body as `min box start` expands a picked entry, type
+// chain included. Its rows match the start projection of an entry with an
+// empty body, and a project type that extends `session` does not reach
+// them.
+#[tokio::test]
+async fn box_spec_bare_reads_defaults_network_bep_matches_start_projection() {
+    let (project, global) = spec_project(
+        "[defaults.network.bep]\nsteering = \"proxy_env\"\n\n\
+         [defaults.session.secrets.GH_TOKEN]\nsource = \"broker\"\nscopes = [\"github:full\"]\n\n\
+         [box_types.dev]\nextends = \"session\"\n\n\
+         [box_types.dev.defaults.network.bep]\nsteering = \"dns\"\n\n\
+         [sessions.one]\n\n\
+         [sessions.two]\n",
+    );
+    let path = camino::Utf8Path::from_path(project.path()).expect("a UTF-8 path");
+    let (start_bep, start_secrets, _, start_quic443) =
+        crate::project_bep_and_grants(path, Some("one")).expect("the start projection");
+    assert_eq!(
+        start_bep.steering,
+        Some(boxes::core::bep::Steering::ProxyEnv)
+    );
+    assert!(start_secrets.contains_key("GH_TOKEN"), "{start_secrets:?}");
+    assert_eq!(start_quic443, None);
+
+    let bare = box_spec_text(&global, &["min", "box", "spec", "--network", "host_ip"])
+        .await
+        .expect("the rows render without a picked session entry");
+    assert!(bare.contains("\nsteering  proxy_env\n"), "{bare}");
+    assert!(bare.contains("GH_TOKEN"), "{bare}");
+}
+
+// D3598: with no single session entry, bare `min box spec` checks the
+// grants it reads from the merged `[defaults]` and `[defaults.session]`
+// tables against the egress of that same entry. A `[defaults.network]`
+// egress that admits the GitHub hosts lets an `own_ip` preview render the
+// broker grant, and the command does not refuse.
+#[tokio::test]
+async fn box_spec_bare_reads_defaults_network_bep_undecided_entry_own_ip_egress() {
+    let (_project, global) = spec_project(
+        "[defaults.network.bep]\nsteering = \"proxy_env\"\n\n\
+         [defaults.network.egress]\nallow_dns_hosts = [\"github.com\", \"api.github.com\", \
+         \"uploads.github.com\", \"codeload.github.com\"]\n\n\
+         [defaults.session.secrets.GH_TOKEN]\nsource = \"broker\"\nscopes = [\"github:full\"]\n\n\
+         [sessions.one]\npackages = [\"git\"]\n\n\
+         [sessions.two]\npackages = [\"git\"]\n",
+    );
+    let bare = box_spec_text(&global, &["min", "box", "spec", "--network", "own_ip"])
+        .await
+        .expect("the rows render, and the egress admits the grant");
+    assert!(bare.contains("GH_TOKEN"), "{bare}");
+}
+
+// D3598: bare `min box spec` falls back to the merged `[defaults]` rows
+// only for several session entries with no `default`. A `default` entry of
+// a project Box Type keeps the start's refusal and prints no proxy rows.
+#[tokio::test]
+async fn box_spec_bare_reads_defaults_network_bep_project_type_refuses() {
+    let (_project, global) = spec_project(
+        "[defaults.network.bep]\nsteering = \"proxy_env\"\n\n\
+         [box_types.mydev]\nextends = \"session\"\n\n\
+         [boxes.default]\ntype = \"mydev\"\n",
+    );
+    let error = box_spec_text(&global, &["min", "box", "spec", "--network", "host_ip"])
+        .await
+        .expect_err("a project Box Type keeps the refusal");
+    assert!(
+        matches!(
+            error.downcast_ref::<crate::SessionEntryUndecided>(),
+            Some(crate::SessionEntryUndecided::TypeUnresolved { name, .. }) if name == "default"
+        ),
+        "{error:#}"
+    );
+    assert!(!format!("{error:#}").contains("steering"), "{error:#}");
+}
+
 // BCLI-021: `min box spec <entry>` with the `[network]` override flags
 // renders the network that `min box start` sends with the same flags:
 // the mode, the egress and the ingress, each flag marked as the source.
@@ -24488,4 +24885,339 @@ fn box_verbs_complete_box_names() {
             );
         }
     }
+}
+
+/// NET-138: an interactive attach that the in-VM daemon refuses because the
+/// VM host withdrew the box's row ends with its own status. The client then
+/// asks the VM host for the row back with a resume, presenting the record's
+/// name, pair and box id, and attaches one more time. The box keeps its id
+/// and its addresses: the record the attach read stays right, and nothing
+/// new is registered. When the second attach is refused too, `min` exits 1
+/// and asks for the row no third time.
+///
+/// The box's shell exit is stood in for by its record: a launch bound the
+/// row, and the daemon restarted with no host in the box's slot. No VM host
+/// answers the daemon's own read of the row, so the row reads as withdrawn
+/// on both attaches. A stand-in VM host answers the client's resume on the
+/// control socket beside the daemon's ssh socket.
+#[tokio::test]
+async fn attach_after_row_withdrawn_resumes_the_same_creation() {
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+        FinalizeSessionRequest,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+    const PAIR: boxes::BoxAddresses = boxes::BoxAddresses {
+        switch_address: std::net::Ipv4Addr::new(100, 64, 128, 40),
+        loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 40),
+    };
+    let box_id = minimald_rpc::BoxId::from_bytes([0x50; 16]);
+
+    // An own-address box with the addresses its registration handed.
+    let state = tempfile::TempDir::new().unwrap();
+    let state_path = state.path().to_path_buf();
+    let server = minimald::test_harness::TestServer::new_in(state).await;
+    let mut daemon = server.connect().await;
+    let mut request = minimald::test_harness::create_session_req("web", "/uwu");
+    request.config.network = boxes::NetworkMode::OwnIp;
+    request.config.box_addresses = Some(PAIR);
+    let id = daemon.call::<CreateSession>(&request).await.unwrap().id;
+    minimald::test_harness::unwrap_ready(
+        daemon
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    match daemon
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
+        .await
+    {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+    }
+    drop(daemon);
+
+    // A launch bound the row under the id the VM host minted, and the
+    // daemon restarted. The daemon takes a box id only from the VM host
+    // daemon at creation, and this test has none then, so the record is
+    // seeded with it.
+    let record_path = box_state_dir(&state_path, id).join("record.json");
+    let mut record: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+    record["host_row_bound"] = serde_json_lenient::Value::Bool(true);
+    record["box_id"] = serde_json_lenient::Value::String(box_id.simple().to_string());
+    std::fs::write(&record_path, serde_json_lenient::to_vec(&record).unwrap()).unwrap();
+    let server = minimald::test_harness::TestServer::new_in(server.into_state_dir()).await;
+
+    // The daemon serves the ssh socket of a VM host's provider dir.
+    let dir = tempfile::TempDir::new().unwrap();
+    let host_dir = dir.path().join("providers").join("local-minvmd0");
+    std::fs::create_dir_all(&host_dir).unwrap();
+    let sock = host_dir.join(paths::SSH_SOCK_FILE);
+    server.listen_on_uds(&sock).await;
+
+    // The record the attach reads first holds the box id it was created with.
+    let record = attached_box_record(&sock, id)
+        .await
+        .unwrap()
+        .expect("the box's record");
+    assert_eq!(
+        record.box_id,
+        Some(box_id),
+        "the record holds the box's own id"
+    );
+
+    // The stand-in VM host reads no row for the box, as the in-VM daemon
+    // read it, and answers every resume with the box's own row. It counts
+    // the reads and the resumes.
+    let listener =
+        tokio::net::UnixListener::bind(host_dir.join(client::attach::VM_HOST_CONTROL_SOCK_FILE))
+            .unwrap();
+    let reads = std::sync::Arc::new(AtomicUsize::new(0));
+    let resumes = std::sync::Arc::new(AtomicUsize::new(0));
+    let host = tokio::spawn({
+        let (reads, resumes) = (
+            std::sync::Arc::clone(&reads),
+            std::sync::Arc::clone(&resumes),
+        );
+        async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = tokio::io::BufReader::new(stream);
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                let request: minimald_rpc::BoxControlRequest =
+                    serde_json_lenient::from_str(line.trim()).unwrap();
+                let reply = match request {
+                    minimald_rpc::BoxControlRequest::ReadRow(read) => {
+                        assert_eq!(read.name, "web");
+                        reads.fetch_add(1, Ordering::SeqCst);
+                        minimald_rpc::BoxControlReply::NoRow {
+                            name: read.name,
+                            no_row: true,
+                        }
+                    }
+                    minimald_rpc::BoxControlRequest::ResumeBox(resume) => {
+                        assert_eq!(
+                            resume,
+                            minimald_rpc::ResumeBoxRequest {
+                                name: "web".to_string(),
+                                switch_address: PAIR.switch_address,
+                                loopback_address: PAIR.loopback_address,
+                                box_id: Some(box_id),
+                            },
+                            "the client resumes the box's own creation, under its own id"
+                        );
+                        resumes.fetch_add(1, Ordering::SeqCst);
+                        minimald_rpc::BoxControlReply::Registered(minimald_rpc::RegisteredBox {
+                            switch_address: PAIR.switch_address,
+                            loopback_address: PAIR.loopback_address,
+                            box_id,
+                            task_addresses: Vec::new(),
+                        })
+                    }
+                    other => panic!("the client reads the row or resumes it, got {other:?}"),
+                };
+                let reply = serde_json_lenient::to_string(&reply).unwrap();
+                stream
+                    .get_mut()
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+
+    /// The text an attach wrote before its channel closed, and its status.
+    /// An attach that does not close within the bound fails the test.
+    async fn attach_once(
+        server: &minimald::test_harness::TestServer,
+        id: boxes::SessionId,
+    ) -> (String, Option<u32>) {
+        let mut daemon = server.connect().await;
+        let mut channel = daemon.open_shell(id).await;
+        let (mut out, mut status) = (Vec::new(), None);
+        loop {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(60), channel.wait())
+                .await
+                .expect("the attach's channel closes within the bound");
+            match msg {
+                None => break,
+                Some(russh::ChannelMsg::Data { data }) => out.extend_from_slice(&data),
+                Some(russh::ChannelMsg::ExitStatus { exit_status }) => status = Some(exit_status),
+                Some(_) => {}
+            }
+        }
+        (String::from_utf8_lossy(&out).into_owned(), status)
+    }
+
+    let attaches = AtomicUsize::new(0);
+    let server = &server;
+    let attaches_ref = &attaches;
+    let exit = attach_retrying_row_ended(
+        || async move {
+            attaches_ref.fetch_add(1, Ordering::SeqCst);
+            let (refusal, status) = attach_once(server, id).await;
+            assert!(
+                refusal.contains("the VM host released this box's network addresses"),
+                "the attach is refused for the withdrawn row: {refusal:?}"
+            );
+            assert_eq!(status, Some(minimald_rpc::ATTACH_ROW_ENDED_EXIT_STATUS));
+            Ok(i32::try_from(status.unwrap()).unwrap())
+        },
+        || client::box_registration::box_row_withdrawn(&sock, Some(&record)),
+        || resume_after_row_ended(&sock, Some(&record)),
+    )
+    .await
+    .expect("the row came back, so the resume is no error");
+    assert_eq!(
+        attaches.load(Ordering::SeqCst),
+        2,
+        "the attach runs once more after the row came back, and no third time"
+    );
+    assert_eq!(
+        resumes.load(Ordering::SeqCst),
+        1,
+        "the row is asked back once"
+    );
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "each refusal is told from a shell's own status by the host's row"
+    );
+    assert_eq!(
+        exit, ROW_ENDED_REFUSED,
+        "`min` never exits with the row-ended status for a refusal: it exits 1"
+    );
+    host.abort();
+
+    let after = attached_box_record(&sock, id)
+        .await
+        .unwrap()
+        .expect("the box's record");
+    assert_eq!(
+        (after.box_addresses, after.box_id),
+        (Some(PAIR), Some(box_id)),
+        "the box keeps its addresses and its id"
+    );
+}
+
+/// The retry around an interactive attach (NET-138): the row-ended status
+/// asks for the row back only when the VM host holds no row of the box's
+/// own, so a shell that exits with the same status by itself keeps it. The
+/// attach runs once more only when the row came back, never a third time,
+/// and a refusal not followed by an attach ends with 1.
+#[tokio::test]
+async fn an_attach_retries_once_when_its_row_comes_back() {
+    use std::cell::RefCell;
+
+    /// Runs the retry over `codes`, one per attach, with `ended` as the
+    /// row reads' answers and `resumed` as the resume's. Returns the exit
+    /// status or the error text, the attaches run, the rows read and the
+    /// resumes asked.
+    async fn retry(
+        codes: &[i32],
+        ended: &[bool],
+        resumed: anyhow::Result<bool>,
+    ) -> (Result<i32, String>, usize, usize, usize) {
+        let codes = RefCell::new(codes.iter().copied());
+        let ended = RefCell::new(ended.iter().copied());
+        let (attaches, reads, resumes) = (RefCell::new(0), RefCell::new(0), RefCell::new(0));
+        let exit = attach_retrying_row_ended(
+            || {
+                *attaches.borrow_mut() += 1;
+                let code = codes.borrow_mut().next().expect("an attach too many");
+                async move { Ok(code) }
+            },
+            || {
+                *reads.borrow_mut() += 1;
+                let ended = ended.borrow_mut().next().expect("a row read too many");
+                async move { Ok(ended) }
+            },
+            || {
+                *resumes.borrow_mut() += 1;
+                async move { resumed }
+            },
+        )
+        .await
+        .map_err(|error| format!("{error:#}"));
+        (
+            exit,
+            attaches.into_inner(),
+            reads.into_inner(),
+            resumes.into_inner(),
+        )
+    }
+
+    let row_ended = ROW_ENDED_ATTACH;
+    assert_eq!(retry(&[0], &[], Ok(true)).await, (Ok(0), 1, 0, 0));
+    assert_eq!(retry(&[130], &[], Ok(true)).await, (Ok(130), 1, 0, 0));
+    assert_eq!(
+        retry(&[row_ended], &[false], Ok(true)).await,
+        (Ok(row_ended), 1, 1, 0),
+        "the box's row stands: the status is the shell's own, and nothing is asked back"
+    );
+    assert_eq!(
+        retry(&[row_ended, 0], &[true], Ok(true)).await,
+        (Ok(0), 2, 1, 1),
+        "the row came back, so the attach runs once more"
+    );
+    assert_eq!(
+        retry(&[row_ended, row_ended], &[true, true], Ok(true)).await,
+        (Ok(ROW_ENDED_REFUSED), 2, 2, 1),
+        "a second refusal ends the attach with 1, with no third attempt"
+    );
+    assert_eq!(
+        retry(&[row_ended, row_ended], &[true, false], Ok(true)).await,
+        (Ok(row_ended), 2, 2, 1),
+        "after the retry, a shell that exits with the status by itself keeps it"
+    );
+    assert_eq!(
+        retry(&[row_ended], &[true], Ok(false)).await,
+        (Ok(ROW_ENDED_REFUSED), 1, 1, 1),
+        "no row to ask back: the refusal on screen ends the attach with 1"
+    );
+    let not_back = RowNotBack::NotBack {
+        name: "web".to_string(),
+    };
+    assert_eq!(
+        retry(&[row_ended], &[true], Err(not_back.into())).await,
+        (
+            Err(
+                "box web cannot get its network addresses back from the VM host. Run \
+                 `min box attach web` again. If it is refused again, remove the box with \
+                 `min box rm --force web` and start a new one with `min session start`."
+                    .to_string()
+            ),
+            1,
+            1,
+            1
+        )
+    );
+}
+
+/// The text an interactive attach ends with when another box holds its
+/// box's name now (NET-138): it names both boxes and the rename that frees
+/// the name, so a second attach does not fail the same way. It never offers
+/// to remove the other box, which is running and holds its own data.
+#[test]
+fn row_not_back_names_the_box_that_holds_the_name() {
+    let held = RowNotBack::NameHeld {
+        name: "web".to_string(),
+        held: "Web".to_string(),
+    };
+    assert_eq!(
+        held.to_string(),
+        "box web cannot get its network addresses back. Another box, Web, holds its name \
+         now. Give that box another name with `min box rename Web <new-name>`, then run \
+         `min box attach web` again."
+    );
 }
