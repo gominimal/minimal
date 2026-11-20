@@ -26019,7 +26019,10 @@ const BOX_VERB_FLAGS: &[(&str, &[&str])] = &[
 
 /// The type-noun verbs BCLI-030 names, as aliases of the `min box` forms.
 const TYPE_NOUN_VERBS: &[(&str, &[&str])] = &[
-    ("session", &["list", "start", "attach", "logs", "stop", "rm"]),
+    (
+        "session",
+        &["list", "start", "attach", "logs", "stop", "rm"],
+    ),
     ("task", &["run", "list", "logs", "stop", "rm"]),
 ];
 
@@ -26067,7 +26070,9 @@ fn box_verbs_exist_with_arch_flags() {
     }
 
     for argv in [
-        &["min", "box", "start", "web", "--name", "api", "--new", "--detach"][..],
+        &[
+            "min", "box", "start", "web", "--name", "api", "--new", "--detach",
+        ][..],
         &["min", "box", "run", "build", "--detach", "--", "a"],
         &["min", "box", "list", "--all", "-o", "json"],
         &["min", "box", "show", "web", "--network", "-o", "json"],
@@ -26168,7 +26173,7 @@ fn help_and_completions_from_one_model() {
                     "`min {noun} {name} --help` lists `{flag}`: {long_help}"
                 );
                 assert!(
-                    flag_offers.iter().any(|o| *o == flag),
+                    flag_offers.contains(&flag),
                     "the completions offer `{flag}` for `min {noun} {name}`: {flag_offers:?}"
                 );
             }
@@ -26318,7 +26323,9 @@ fn setup_zed_unchanged() {
 
     let mut cli = Cli::command();
     cli.build();
-    let session = cli.find_subcommand("session").expect("`min session` exists");
+    let session = cli
+        .find_subcommand("session")
+        .expect("`min session` exists");
     let setup_zed = session
         .find_subcommand("setup-zed")
         .expect("`min session setup-zed` exists");
@@ -26356,7 +26363,10 @@ fn setup_zed_unchanged() {
             command: SessionCommand::SetupZed(a),
         })) => {
             assert_eq!(a.session, "my-box");
-            assert_eq!(a.settings.as_deref(), Some(std::path::Path::new("/tmp/s.json")));
+            assert_eq!(
+                a.settings.as_deref(),
+                Some(std::path::Path::new("/tmp/s.json"))
+            );
             assert!(a.print);
         }
         _ => panic!("expected `min session setup-zed`"),
