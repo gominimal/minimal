@@ -3804,8 +3804,24 @@ proof_host_ip_deny_all() {
         | sed -n 's/^MINIMAL_CLASSIFIER_COVER=//p' | head -n1 || true)"
       if [ -n "$hida_cover" ]; then hida_cover_pid="$hida_pid_m"; break; fi
     done
+    # Here the tree the launch binds is the host's own cgroup2, mounted with
+    # nsdelegate (the installer's mount check above refuses any other), and
+    # the slice delegates memory. The first cgroup2 mount meets the bind's
+    # superblock and is refused with EBUSY. The retry over the fallback
+    # tmpfs is what lands the design's cover, so a CI native lane requires
+    # it: a fallback here means that retry no longer lands. The e2e never
+    # sets the sandbox's forced-fallback knob, so only a host that refuses
+    # the mount itself explains a fallback, and only off CI.
     case "$hida_cover" in
-      cgroup2 | tmpfs-fallback) ;;
+      cgroup2) ;;
+      tmpfs-fallback)
+        if [ -n "${CI:-}" ]; then
+          echo "::error::the box in boxes/deny/$hida_sid got MINIMAL_CLASSIFIER_COVER=tmpfs-fallback, not cgroup2: on this native lane the classifier tree is the host's own cgroup2, and the cgroup2 cover must land"
+          hida_log '"cover":"tmpfs-fallback"' | tail -n 3
+          fail
+        fi
+        echo "::warning::the box in boxes/deny/$hida_sid got MINIMAL_CLASSIFIER_COVER=tmpfs-fallback, not cgroup2: this host refused the cgroup2 cover"
+        ;;
       *)
         echo "::error::no process in the box's leaf boxes/deny/$hida_sid carries a classifier cover in its environment (MINIMAL_CLASSIFIER_COVER='$hida_cover'): the cover is the one fact the box can report for itself"
         fail
