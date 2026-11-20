@@ -225,19 +225,23 @@ pub struct SessionArgs {
 #[derive(Debug, Subcommand)]
 pub enum SessionCommand {
     // BCLI-030: `min box list`, filtered to session boxes.
-    /// List the session boxes of the current project, in any state, as
-    /// `min box list` lists boxes. `--all` lists the session boxes of every
-    /// project
+    /// List the session boxes of the current project, in any state
+    ///
+    /// The list is `min box list`, limited to session boxes. `--all` lists
+    /// the session boxes of every project
     #[command(visible_alias = "ls")]
     List(BoxListArgs),
     // BCLI-042: no `activate`, `destroy`, `exec`, `rename`, `policy`,
     // `hooks` or `run` here. They fail as unknown commands.
-    /// Create a box from a session entry of the project and attach this
-    /// terminal to it. `--detach` creates the box, prints its id and returns
+    /// Create a box from a session entry and attach this terminal to it
+    ///
+    /// `--detach` creates the box, prints its id and returns
     Start(SessionStartArgs),
-    /// Attach this terminal to a session box's terminal. With no box named,
-    /// attach to this project's running session box that has a terminal,
-    /// else to its only stopped or exited one, which starts again
+    /// Attach this terminal to a session box's terminal
+    ///
+    /// With no box named, attach to this project's running session box that
+    /// has a terminal, else to its only stopped or exited one, which starts
+    /// again
     Attach(AttachArgs),
     /// Register a session as an SSH remote in Zed's settings
     ///
@@ -260,18 +264,22 @@ pub enum SessionCommand {
     #[command(name = "setup-zed", verbatim_doc_comment)]
     #[command(hide = true)]
     SetupZed(SetupZedArgs),
-    /// Show what a session's terminal printed, from its start. `-f` keeps
-    /// showing new output until the session is removed or the command is
-    /// interrupted
+    /// Show what a session's terminal printed, from its start
+    ///
+    /// `-f` keeps showing new output until the session is removed or the
+    /// command is interrupted
     Logs(BoxLogsArgs),
     // BCLI-030: `min box stop`, filtered to session boxes.
-    /// Stop a running session box and keep it, as `min box stop` does.
-    /// `--force` kills every process in the box at once, with no grace
-    /// period
+    /// Stop a running session box and keep it
+    ///
+    /// The stop is `min box stop`, limited to session boxes. `--force` kills
+    /// every process in the box at once, with no grace period
     Stop(BoxStopArgs),
     // BCLI-030: `min box rm`, filtered to session boxes.
-    /// Remove a stopped or exited session box, as `min box rm` does. A
-    /// running box is refused unless `--force` is given
+    /// Remove a stopped or exited session box
+    ///
+    /// The removal is `min box rm`, limited to session boxes. A running box
+    /// is refused unless `--force` is given
     Rm(BoxRmArgs),
 }
 
@@ -388,55 +396,73 @@ pub struct BoxArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum BoxCommand {
-    /// Show the spec of an entry of the project before a start, or the
-    /// spec a box was created with. An entry's spec names the minimal.toml
-    /// table or flag that set each value. With no entry or box named, show
-    /// how the project's box reaches GitHub through the local proxy: the
-    /// proxy's root certificate fingerprint, each secret with its hosts,
-    /// the steering mode and the UDP 443 stance
+    /// Show the spec of an entry of the project or of a box
+    ///
+    /// An entry's spec is the spec a start sends, before any box exists. It
+    /// names the minimal.toml table or flag that set each value. A box's
+    /// spec is the spec the box was created with. With no entry or box
+    /// named, show how the project's box reaches GitHub through the local
+    /// proxy: the proxy's root certificate fingerprint, each secret with its
+    /// hosts, the steering mode and the UDP 443 stance
     Spec(BoxSpecArgs),
-    /// Show what the local proxy recorded for one box: each request it
-    /// admitted or refused, each secret minted for the box, and the box's
-    /// revocation. A removed box's records stay readable by its id
+    /// Show what the local proxy recorded for one box
+    ///
+    /// Each request it admitted or refused, each secret minted for the box,
+    /// and the box's revocation. A removed box's records stay readable by
+    /// its id
     Audit(BoxAuditArgs),
-    /// List the boxes of the current project, in any state: their id,
-    /// name, type, parent, project and state, with how a stopped or exited
-    /// box ended, and the provider and host each box runs on. `--all`
-    /// lists the boxes of every project
+    /// List the boxes of the current project, in any state
+    ///
+    /// Each box shows its id, name, type, parent, project and state, with
+    /// how a stopped or exited box ended, and the provider and host it runs
+    /// on. `--all` lists the boxes of every project
     List(BoxListArgs),
-    /// Show one box: its id, name, type, parent, project, state, how it
-    /// ended, the identity it runs under, and its provider and host.
-    /// `--network` shows the box's effective network policy in its place
+    /// Show one box, or its network policy with `--network`
+    ///
+    /// The box's id, name, type, parent, project, state, how it ended, the
+    /// identity it runs under, and its provider and host. `--network` shows
+    /// the box's effective network policy in their place
     Show(BoxShowArgs),
-    /// Stop a running box and keep it: its record, its events and its
-    /// files stay until `min box rm` removes them. `--force` kills every
-    /// process in the box at once, with no grace period
+    /// Stop a running box and keep it
+    ///
+    /// Its record, its events and its files stay until `min box rm` removes
+    /// them. `--force` kills every process in the box at once, with no grace
+    /// period
     Stop(BoxStopArgs),
-    /// Remove a stopped or exited box: its record, its events and its
-    /// files. A running box is refused unless `--force` is given, which
-    /// stops the box at once and then removes it
+    /// Remove a stopped or exited box
+    ///
+    /// The box's record, its events and its files go. A running box is
+    /// refused unless `--force` is given, which stops the box at once and
+    /// then removes it
     Rm(BoxRmArgs),
-    /// Stop a box that runs until it is stopped, if it runs, and start it
-    /// again from the settings it was created with. The box keeps its id,
-    /// its name and its files. A box that runs to completion cannot
+    /// Stop a box that runs until it is stopped, and start it again
+    ///
+    /// The box starts again from the settings it was created with. It keeps
+    /// its id, its name and its files. A box that runs to completion cannot
     /// restart: run it again with `min box run`
     Restart(BoxRestartArgs),
-    /// Attach this terminal to a box's terminal. With no box named, attach
-    /// to this project's running box that has a terminal, else to its only
-    /// stopped or exited one, which starts again
+    /// Attach this terminal to a box's terminal
+    ///
+    /// With no box named, attach to this project's running box that has a
+    /// terminal, else to its only stopped or exited one, which starts again
     Attach(BoxAttachArgs),
-    /// Start a stopped or exited box that has a terminal again, from the
-    /// spec it was created with, and attach this terminal to it. A box that
-    /// is not stopped or exited is refused. Attach to a running box with
-    /// `min box attach`
+    /// Start a stopped or exited box again and attach this terminal to it
+    ///
+    /// The box must have a terminal. It starts from the spec it was created
+    /// with. A box that is not stopped or exited is refused. Attach to a
+    /// running box with `min box attach`
     Resume(BoxResumeArgs),
-    /// Create a box from an entry of the project. A box with a terminal
-    /// attaches this terminal to it, unless `--detach` is given. Any other
-    /// box starts with no input, and the command prints its id and returns
+    /// Create a box from an entry of the project
+    ///
+    /// A box with a terminal attaches this terminal to it, unless `--detach`
+    /// is given. Any other box starts with no input, and the command prints
+    /// its id and returns
     Start(BoxStartArgs),
-    /// Create a box from an entry of the project, run it without a terminal
-    /// and exit with its exit code. This command's stdin, stdout and stderr
-    /// are the box's. `--detach` starts the box, prints its id and returns
+    /// Create a box from an entry, run it and exit with its exit code
+    ///
+    /// The box runs without a terminal. This command's stdin, stdout and
+    /// stderr are the box's. `--detach` starts the box, prints its id and
+    /// returns
     ///
     /// The box's network and egress come from `--network`, the egress flags
     /// and the entry's `network` keys in minimal.toml, as for `min task
@@ -444,33 +470,44 @@ pub enum BoxCommand {
     /// network or egress flag after an entry argument is refused. An
     /// argument that shares a flag's name goes after `--`.
     Run(BoxRunArgs),
-    /// Run a command in a running box and exit with the command's exit
-    /// code. `-t` gives the command a terminal, and `--detach` starts it
-    /// and returns its exec id
+    /// Run a command in a running box and exit with its exit code
+    ///
+    /// `-t` gives the command a terminal, and `--detach` starts it and
+    /// returns its exec id
     Exec(BoxExecArgs),
-    /// Wait until a box ends and exit with its exit code. A box that ended
-    /// already returns at once. A box stopped by a signal exits with 128
-    /// plus the signal, and a box that ran past its own timeout with 124
+    /// Wait until a box ends and exit with its exit code
+    ///
+    /// A box that ended already returns at once. A box stopped by a signal
+    /// exits with 128 plus the signal, and a box that ran past its own
+    /// timeout with 124
     Wait(BoxWaitArgs),
-    /// Show what happened to a box: each event the daemon recorded for
-    /// it, such as its creation, each start and stop, each exec and its
-    /// exit, oldest first. A stopped or exited box keeps its events until
+    /// Show the events the daemon recorded for a box, oldest first
+    ///
+    /// Events such as the box's creation, each start and stop, each exec
+    /// and its exit. A stopped or exited box keeps its events until
     /// `min box rm` removes it
     Events(BoxEventsArgs),
-    /// Copy a file out of a box to this machine. A stopped or exited box
-    /// keeps its files, so a copy from it works too
+    /// Copy a file out of a box to this machine
+    ///
+    /// A stopped or exited box keeps its files, so a copy from it works too
     Cp(BoxCpArgs),
-    /// Give a box a new name. The box keeps its id, its state and its
-    /// files. A name that a running box on the same host holds is refused
+    /// Give a box a new name
+    ///
+    /// The box keeps its id, its state and its files. A name that a running
+    /// box on the same host holds is refused
     Rename(BoxRenameArgs),
-    /// Remove every stopped or exited box: its record, its events and its
-    /// files. A running box is never removed. `--older-than` and `--parent`
-    /// narrow what is removed. Off a terminal, `--yes` is required
+    /// Remove every stopped or exited box
+    ///
+    /// Each box's record, its events and its files go. A running box is
+    /// never removed. `--older-than` and `--parent` narrow what is removed.
+    /// Off a terminal, `--yes` is required
     Prune(BoxPruneArgs),
-    /// Show what a box printed, from its start. A stopped or exited box
-    /// keeps its output until `min box rm` removes it. `-f` keeps showing
-    /// new output until the box is removed or the command is interrupted.
-    /// `--exec` shows what one command that `min box exec` started printed
+    /// Show what a box printed, from its start
+    ///
+    /// A stopped or exited box keeps its output until `min box rm` removes
+    /// it. `-f` keeps showing new output until the box is removed or the
+    /// command is interrupted. `--exec` shows what one command that
+    /// `min box exec` started printed
     Logs(BoxLogsExecArgs),
 }
 
@@ -1252,22 +1289,28 @@ pub enum TaskCommand {
     /// that shares a flag's name goes after `--`.
     Run(TaskRunArgs),
     // BCLI-015, BCLI-030: `min box list`, filtered to task boxes.
-    /// List the task boxes of the current project, in any state, as
-    /// `min box list` lists boxes. A task that ended shows its exit code,
-    /// as `exited (exit 3)`, until `min box prune` removes it. `--all`
-    /// lists the tasks of every project
+    /// List the task boxes of the current project, in any state
+    ///
+    /// The list is `min box list`, limited to task boxes. A task that ended
+    /// shows its exit code, as `exited (exit 3)`, until `min box prune`
+    /// removes it. `--all` lists the tasks of every project
     List(BoxListArgs),
-    /// Show what a task printed, from its start. `-f` keeps showing new
-    /// output until the task's box is removed or the command is interrupted
+    /// Show what a task printed, from its start
+    ///
+    /// `-f` keeps showing new output until the task's box is removed or the
+    /// command is interrupted
     Logs(BoxLogsArgs),
     // BCLI-030: `min box stop`, filtered to task boxes.
-    /// Stop a running task box and keep it, as `min box stop` does.
-    /// `--force` kills every process in the box at once, with no grace
-    /// period
+    /// Stop a running task box and keep it
+    ///
+    /// The stop is `min box stop`, limited to task boxes. `--force` kills
+    /// every process in the box at once, with no grace period
     Stop(BoxStopArgs),
     // BCLI-030: `min box rm`, filtered to task boxes.
-    /// Remove a stopped or exited task box, as `min box rm` does. A running
-    /// box is refused unless `--force` is given
+    /// Remove a stopped or exited task box
+    ///
+    /// The removal is `min box rm`, limited to task boxes. A running box is
+    /// refused unless `--force` is given
     Rm(BoxRmArgs),
 }
 
