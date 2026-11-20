@@ -48,10 +48,10 @@ patches = [
 ]
 ```
 
-Environment variables can be inherited from the host as well, under `[defaults.session.vars]`:
+Environment variables can be inherited from the host as well, under `[defaults.session.env_vars]`:
 
 ```toml
-[defaults.session.vars]
+[defaults.session.env_vars]
 ANTHROPIC_API_KEY = { inherit = true }
 ```
 

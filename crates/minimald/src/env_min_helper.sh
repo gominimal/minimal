@@ -234,9 +234,11 @@ __min_rpc() {
             stdin)
                 # The task starts: copy this command's stdin to it. The
                 # copy's end closes the connection's sending side, so the
-                # task reads EOF.
+                # task reads EOF. The copy keeps only its stdout as the
+                # sending side, and none of this shell's other copies, so
+                # its exit is the last close socat waits for.
                 if [[ "$forward" -eq 1 && -z "$feeder" ]]; then
-                    cat <&"$stdin_fd" >&"$sock_in" &
+                    cat <&"$stdin_fd" >&"$sock_in" {sock_in}>&- {sock_out}<&- {stdin_fd}<&- &
                     feeder=$!
                     exec {sock_in}>&-
                     sock_in=""

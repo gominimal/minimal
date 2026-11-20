@@ -1175,9 +1175,16 @@ impl Context {
                          name, such as \"dev\"."
                     ));
                 }
+                // The key is one directory name, so the state directory's path
+                // failed to resolve: a symlink on it, or a path that cannot be read.
+                // The reason follows a colon, so each of its three forms ("resolves
+                // to ..., which is outside the state base ...", "cannot resolve the
+                // state base ...", "cannot resolve ... under the state base ...")
+                // reads as a statement of its own.
                 Error::Other(anyhow!(
-                    "refusing to use state key {key:?}: {reason}. Choose a state key \
-                     that is a single directory name"
+                    "The state directory for task `{name}` and state key {key:?} cannot be used: \
+                     {reason}. Check that path for a symlink or a permission problem, then \
+                     run the task again."
                 ))
             })?
             .ok_or_else(|| {
@@ -1234,28 +1241,36 @@ impl Context {
             Error::Other(anyhow::Error::from(e).context("creating base sandbox directory"))
         })?;
 
-        let mut env = Env::build(
-            self,
-            graph,
-            EnvArgs {
-                name,
-                state_base_dir,
-                transitives: transitive_deps,
-                cwd: wd,
-                wd_layout,
-                patches,
-                home,
-                env_vars,
-                hostname: Some(name.to_string()),
-                network,
-                ot: self.daemon.config.ot.clone(),
-            },
-        )
-        .await?;
+        let args = self.task_env_args(EnvArgs {
+            name,
+            state_base_dir,
+            transitives: transitive_deps,
+            cwd: wd,
+            wd_layout,
+            patches,
+            home,
+            env_vars,
+            hostname: Some(name.to_string()),
+            network,
+            classifier_leaf: None,
+            ot: self.daemon.config.ot.clone(),
+        });
+        let mut env = Env::build(self, graph, args).await?;
         env.associate_tempdirs(temp_dirs);
         env.associate_tempdirs([base]);
 
         Ok(env)
+    }
+
+    /// `args` placed in this context's classifier leaf, if it has one. A task
+    /// env made for a host-address box then runs in the leaf of its box, so
+    /// the box's egress verdict decides the task's connections, the same as
+    /// for the package builds the context starts (NET-155).
+    pub(crate) fn task_env_args<'a>(&self, args: EnvArgs<'a>) -> EnvArgs<'a> {
+        EnvArgs {
+            classifier_leaf: self.classifier_leaf.clone(),
+            ..args
+        }
     }
 
     /// Returns the list of all packages brought in through tasks, profiles and stacks.
@@ -1819,6 +1834,99 @@ mod tests {
         );
     }
 
+    /// A context on the `fakerepo` project with its state and cache in the
+    /// given directories, for the state-key tests of `make_env`.
+    fn fakerepo_context(state: &Path, cache: &Path) -> Context {
+        let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+        let config = ConfigBuilder::new()
+            .with_state_dir(state.to_path_buf())
+            .with_cache_dir(cache.to_path_buf())
+            .with_repo_dir(manifest.join("testdata").join("fakerepo"))
+            .with_stdlib_dir(manifest.join("../stdlib/minimal-ncl"))
+            .build()
+            .unwrap();
+        Context::new(config).unwrap()
+    }
+
+    /// The message `make_env` refuses a state key with, for a task named
+    /// `build`. Panics if the environment is made.
+    async fn make_env_refusal(ctx: &mut Context, key: &str) -> String {
+        let mut graph = Graph::new();
+        let key = key.to_owned();
+        match ctx
+            .make_env(
+                "build",
+                &mut graph,
+                None,
+                Some(&key),
+                None,
+                None,
+                Vec::<String>::new(),
+                PatchHome::Ambient,
+            )
+            .await
+        {
+            Ok(_) => panic!("state key {key:?} must be refused"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// A state key that is not one directory name reaches `make_env` only
+    /// from a caller that did not load it from the project's file, as that
+    /// load refuses it. `make_env` still refuses it, and names the task and
+    /// where to set `state_key`.
+    #[tokio::test]
+    async fn make_env_names_the_task_for_a_state_key_that_is_not_one_name() {
+        let (state, cache) = (tempdir().unwrap(), tempdir().unwrap());
+        let mut ctx = fakerepo_context(state.path(), cache.path());
+        for (key, reason) in [
+            ("..", "it names the parent directory"),
+            ("a/b", "it contains '/'"),
+        ] {
+            assert_eq!(
+                make_env_refusal(&mut ctx, key).await,
+                format!(
+                    "Task `build` has the state key {key:?}, and {reason}. Set `state_key` on \
+                     the task or in `[defaults.task]` to one directory name, such as \"dev\"."
+                )
+            );
+        }
+    }
+
+    /// A state key that is one directory name, whose state directory
+    /// resolves outside the state base through a symlink, is refused with
+    /// the task, the key and where the path leads, and a next step that fits
+    /// that cause. It does not tell the person to choose another key.
+    #[tokio::test]
+    async fn make_env_refuses_a_state_directory_behind_a_symlink() {
+        let (state, cache, outside) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
+        let mut ctx = fakerepo_context(state.path(), cache.path());
+        let base = ctx.daemon.config.state_base_dir();
+        let dir = durable_state_dir(ctx.minimal_file(), "dev", base.clone(), ctx.state_root())
+            .unwrap()
+            .expect("fakerepo's minimal file has a directory");
+        // `dir` is `<base>/<project>/dev`: make `<project>` a symlink out.
+        let project = dir.parent().unwrap();
+        std::fs::create_dir_all(&base).unwrap();
+        std::os::unix::fs::symlink(outside.path(), project).unwrap();
+
+        let msg = make_env_refusal(&mut ctx, "dev").await;
+        assert!(
+            msg.starts_with(
+                "The state directory for task `build` and state key \"dev\" cannot be used: resolves to "
+            ),
+            "{msg}"
+        );
+        assert!(msg.contains("which is outside the state base"), "{msg}");
+        assert!(
+            msg.ends_with(
+                "Check that path for a symlink or a permission problem, then run the task again."
+            ),
+            "{msg}"
+        );
+        assert!(!msg.contains("Choose a state key"), "{msg}");
+    }
+
     /// NET-155: a context made for a box carries the box's classifier leaf,
     /// across a clone and a reload of its mfile, into the orchestrator it
     /// builds with. A context made for no box carries no leaf.
@@ -1887,6 +1995,68 @@ mod tests {
             .unwrap();
         assert!(orchestrator.backend.box_network().is_some());
         assert_eq!(orchestrator.backend.classifier_leaf(), None);
+    }
+
+    /// A task env made from a context with a classifier leaf runs in that
+    /// leaf, so a task of a host-address box gets its box's egress. A context
+    /// made for no box gives a task env with no leaf.
+    #[test]
+    fn task_env_carries_the_box_classifier_leaf() {
+        let state = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let config = ConfigBuilder::new()
+            .with_state_dir(state.path().to_path_buf())
+            .with_cache_dir(cache.path().to_path_buf())
+            .with_stdlib_dir(
+                std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("../stdlib/minimal-ncl"),
+            )
+            .build()
+            .unwrap();
+        let daemon = Arc::new(DaemonContext::init(config).unwrap());
+        let repo = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("testdata")
+            .join("fakerepo");
+        let mfile = MFileSearchStrategy::Override(repo)
+            .find_mfile()
+            .expect("fakerepo has a minimal.toml");
+        let leaf = sandbox::config::ClassifierLeaf::under(
+            std::path::Path::new("/sys/fs/cgroup/minimald.slice"),
+            "box-1",
+            sandbox::config::Verdict::Allow,
+        );
+        let args = || EnvArgs {
+            name: "task",
+            transitives: std::collections::HashMap::new(),
+            state_base_dir: state.path().to_path_buf(),
+            cwd: state.path().to_path_buf(),
+            wd_layout: WdLayout::BoundDir,
+            patches: None,
+            home: PatchHome::Ambient,
+            env_vars: None,
+            hostname: None,
+            network: Arc::new(sandbox::HostNet),
+            classifier_leaf: None,
+            ot: None,
+        };
+
+        let plain = Context::from_daemon(Arc::clone(&daemon), mfile);
+        let unplaced = plain.task_env_args(args());
+        assert_eq!(unplaced.classifier_leaf, None);
+        let config = env::place_in_classifier_leaf(
+            sandbox::config::Config::new("task"),
+            unplaced.classifier_leaf,
+        );
+        assert_eq!(config.classifier_leaf, None);
+
+        let boxed = plain.with_classifier_leaf(leaf.clone());
+        let placed = boxed.task_env_args(args());
+        assert_eq!(placed.classifier_leaf.as_ref(), Some(&leaf));
+        let config = env::place_in_classifier_leaf(
+            sandbox::config::Config::new("task"),
+            placed.classifier_leaf,
+        );
+        assert_eq!(config.classifier_leaf, Some(leaf));
     }
 
     #[test]
@@ -2316,7 +2486,7 @@ mod tests {
                     "
                     stack = {{ use = \"fake-stack\", build_packages = [] }}
                     tasks = {{ something = {{ exec = \"./something\" }} }}
-                    session = {{ packages = [], vars = {{ ANSWER = \"42\" }} }}
+                    session = {{ packages = [], env_vars = {{ ANSWER = \"42\" }} }}
 
                     [upstream]
                     dir = \"{}\"
@@ -2412,7 +2582,7 @@ mod tests {
         let session = &doc["defaults"]["session"];
         assert!(session.is_inline_table(), "session lost inline form");
         assert_eq!(str_list(&session["packages"]), ["uroot"]);
-        assert_eq!(session["vars"]["ANSWER"].as_str(), Some("42"));
+        assert_eq!(session["env_vars"]["ANSWER"].as_str(), Some("42"));
 
         // The surviving settings must still parse into the config.
         let session = ctx.minimal_file().session.clone().unwrap_or_default();
@@ -2443,7 +2613,7 @@ mod tests {
                     [session]
                     packages = [\"uroot\"]
 
-                    [session.vars]
+                    [session.env_vars]
                     ANSWER = \"42\"
 
                     [defaults.session]
@@ -2485,7 +2655,7 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert_eq!(packages, ["uroot", "extra-runtime-pkg"], "{text}");
-        assert_eq!(session["vars"]["ANSWER"].as_str(), Some("42"), "{text}");
+        assert_eq!(session["env_vars"]["ANSWER"].as_str(), Some("42"), "{text}");
 
         // The written file carries no legacy table, so a read prints no hint.
         let mut raw: toml::Table = toml::from_str(&text).unwrap();

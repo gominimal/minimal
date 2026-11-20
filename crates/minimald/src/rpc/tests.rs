@@ -130,7 +130,16 @@ async fn clean_cache_streams_progress_then_a_terminal_done() {
     let mut client = server.connect().await;
 
     // Two cold entries — nothing has read them, and no session needs them.
+    // Their metadata says they were written an hour ago. Their directories'
+    // mtimes, which a clean judges them by, are a minute before the cutoff
+    // the request sets, so they are in scope.
     let cache = server.state.daemon_context().await.local_cache();
+    let written = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(60 * 60))
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
     for byte in [1u8, 2] {
         let w = cache
             .write_dir(&common::SpecHash::from_bytes([byte; 32]))
@@ -139,13 +148,21 @@ async fn clean_cache_streams_progress_then_a_terminal_done() {
         w.finalize(EntryMeta {
             inner: MetaInner::Spec(format!("pkg-{byte}")),
             fetched: false,
+            epoch_millis: written,
             ..Default::default()
         })
         .unwrap();
+        let cold = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(60))
+            .unwrap();
+        std::fs::File::open(cache.entry_path(&common::SpecHash::from_bytes([byte; 32])))
+            .unwrap()
+            .set_modified(cold)
+            .unwrap();
     }
 
-    // `older_than_secs` of 1 rather than the daemon default, so entries
-    // written a moment ago are in scope.
+    // `older_than_secs` of 1 rather than the daemon default, so the entries
+    // are in scope.
     let updates = clean_cache(
         &mut client,
         CleanCacheRequest::default().with_older_than_secs(1),
@@ -271,7 +288,10 @@ async fn stream_workspace_files_refuses_a_session_awaiting_its_verdict() {
     // A daemon-collected var must be gated by the client, so the
     // configure parks the session instead of finalizing it.
     server
-        .seed_workspace_mfile(session_id, "[session.vars]\nRUST_LOG = \"info\"\n")
+        .seed_workspace_mfile(
+            session_id,
+            "[defaults.session.env_vars]\nRUST_LOG = \"info\"\n",
+        )
         .await;
     let configured = client
         .call::<minimald_rpc::ConfigureLoadout>(&minimald_rpc::ConfigureLoadoutRequest {
@@ -2026,7 +2046,7 @@ async fn per_box_host_refuses_unenforceable_host_ip_declaration() {
     // so what the create reads here is the machine-mode code the
     // launch's identically-typed refusal carries too.
     let error = match client.call::<CreateSession>(&deny_a_range).await {
-        Errorable::Err { error } => error,
+        minimald_rpc::CreateSessionReply::Err { error, .. } => error,
         other => panic!("a per-box host refuses the denied range, got: {other:?}"),
     };
     assert!(
@@ -2062,7 +2082,7 @@ async fn per_box_host_refuses_unenforceable_host_ip_declaration() {
         None,
     );
     let error = match client.call::<CreateSession>(&allow_a_subnet).await {
-        Errorable::Err { error } => error,
+        minimald_rpc::CreateSessionReply::Err { error, .. } => error,
         other => panic!("a per-box host refuses the narrowing allow list, got: {other:?}"),
     };
     assert!(
@@ -4270,7 +4290,7 @@ async fn create_session_errors_if_name_not_unique() {
         .id;
     assert!(id != SessionId::nil());
 
-    let Errorable::Err { error } = client
+    let minimald_rpc::CreateSessionReply::Err { error, .. } = client
         .call::<CreateSession>(&req("my-session", "/uwu"))
         .await
     else {
@@ -4356,11 +4376,10 @@ async fn create_session_rejects_policy_incompatible_with_network_mode() {
         .await;
     assert_eq!(
         resp,
-        Errorable::Err {
-            error: "egress rules need network mode own_ip or host_ip (this box is none): \
-                    a none box has no network to apply them to"
-                .to_string()
-        }
+        minimald_rpc::CreateSessionReply::refused(
+            "egress rules need network mode own_ip or host_ip (this box is none): \
+                    a none box has no network to apply them to",
+        )
     );
 
     // The rejected session left nothing behind in the store.
@@ -4398,11 +4417,10 @@ async fn create_session_rejects_static_ingress_on_host_net() {
         .await;
     assert_eq!(
         resp,
-        Errorable::Err {
-            error: "ingress port mappings need network mode own_ip (this box is host_ip): \
-                    only an own-IP box has a published address to apply them to"
-                .to_string()
-        }
+        minimald_rpc::CreateSessionReply::refused(
+            "ingress port mappings need network mode own_ip (this box is host_ip): \
+                    only an own-IP box has a published address to apply them to",
+        )
     );
 
     // The rejected session left nothing behind in the store.

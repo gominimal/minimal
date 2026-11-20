@@ -1272,23 +1272,11 @@ pub(crate) fn project_bep_and_grants(
     };
     // BEP-011: the names of the variables the box spec's own environment
     // sets, so the activation can warn for a trust variable.
-    let vars_lenient: Vec<boxes::core::primitives::LenientVarEntry> = spec
-        .get("vars_lenient")
-        .cloned()
-        .map(toml::Value::try_into)
-        .transpose()
-        .map_err(format_error)?
-        .unwrap_or_default();
     let spec_env = spec
-        .get("vars")
+        .get(mfile::expand::ENV_VARS_KEY)
         .and_then(toml::Value::as_table)
         .into_iter()
         .flat_map(|vars| vars.keys().cloned())
-        .chain(
-            vars_lenient
-                .iter()
-                .map(|entry| entry.name().as_ref().to_string()),
-        )
         .collect();
     let network = spec.get("network").and_then(toml::Value::as_table);
     let bep = network
@@ -1547,12 +1535,111 @@ fn task_egress_from(bytes: &[u8], task: &str) -> anyhow::Result<ProjectEgress> {
     }) else {
         return Ok(ProjectEgress::default());
     };
+    refuse_unapplied_task_network(&file, &entry)?;
     entry_egress(&file, entry)
+}
+
+/// The `[network]` keys a task box takes from `minimal.toml`: the mode, the
+/// egress in its nested or its flat spelling, and `vpn_network_names`,
+/// which `put_task_spec` keeps on the stored spec. Every other key reaches
+/// a task box only by its run flag. This list is interim (#3671): it goes
+/// with [`refuse_unapplied_task_network`].
+const TASK_NETWORK_KEYS: [&str; 3] = ["mode", "egress", "vpn_network_names"];
+
+/// A `network` key that a task's own layers declare and that a task box
+/// does not apply, such as `quic443`, interim (#3671). The message names
+/// the key, the table and the next step. `min task run` and `min box spec` both
+/// read the task's network through `task_project_egress`, so the text
+/// fits both commands. An invalid project `minimal.toml` refuses the same
+/// way, so the command ends with exit 3 (`main.rs`), the code the
+/// architecture gives an invalid project file.
+#[derive(Debug)]
+pub struct TaskNetworkUnapplied {
+    /// The refusal, with the key, the table and the next step.
+    pub message: String,
+}
+
+impl TaskNetworkUnapplied {
+    /// The architecture's exit code for an invalid project file.
+    pub const EXIT_CODE: u8 = 3;
+}
+
+impl std::fmt::Display for TaskNetworkUnapplied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TaskNetworkUnapplied {}
+
+/// Refuses a `network` key that a task's own layers declare and that a
+/// task box does not apply, such as `quic443`. Without it the key is
+/// dropped in silence, and a `quic443 = "block"` runs as `auto`. Only
+/// `[tasks.<name>]` and `[defaults.task]` are read here. A `[defaults]
+/// network` key that a task box does not apply (for example
+/// `quic443 = "block"`) is still dropped for a task box without a
+/// refusal, and #3671 tracks it.
+///
+/// This is interim (#3671): the refusal and [`TASK_NETWORK_KEYS`] go when
+/// `task_box_network`/`put_task_spec` carry `quic443`, `bep`, `ingress`
+/// and `dynamic_ingress` from the expanded entry onto the task box's
+/// policy and stored spec.
+fn refuse_unapplied_task_network(
+    file: &toml::Table,
+    entry: &mfile::entry::BoxEntry,
+) -> anyhow::Result<()> {
+    let network_in = |table: Option<&toml::Table>| {
+        table
+            .and_then(|table| table.get("network"))
+            .and_then(toml::Value::as_table)
+            .cloned()
+    };
+    // The merge replaces the `network` table whole, so the entry's own
+    // table, when present, is the only one the task box reads.
+    let defaults_task = file
+        .get("defaults")
+        .and_then(toml::Value::as_table)
+        .and_then(|defaults| defaults.get(boxes::TASK_BOX_TYPE))
+        .and_then(toml::Value::as_table);
+    let (network, layer) = match network_in(Some(&entry.body)) {
+        Some(network) => (network, format!("[{}.{}]", entry.table.key(), entry.name)),
+        None => match network_in(defaults_task) {
+            Some(network) => (network, format!("[defaults.{}]", boxes::TASK_BOX_TYPE)),
+            None => return Ok(()),
+        },
+    };
+    let unapplied = network.iter().find(|(key, _)| {
+        !TASK_NETWORK_KEYS.contains(&key.as_str())
+            && !mfile::network::FLAT_EGRESS_KEYS
+                .iter()
+                .any(|(flat, _)| flat == key)
+    });
+    let Some((key, value)) = unapplied else {
+        return Ok(());
+    };
+    let remedy = if key == "quic443" {
+        let stance = value.as_str().unwrap_or("<stance>");
+        format!(
+            "Remove network.quic443 from {layer}, and set it with \
+             `min task run --quic443 {stance} {name}`.",
+            name = entry.name,
+        )
+    } else {
+        format!("Remove network.{key} from {layer}.")
+    };
+    Err(TaskNetworkUnapplied {
+        message: format!(
+            "{layer} in {file} sets network.{key}, which is not applied to a task box. \
+             {remedy}",
+            file = mfile::MFILE_NAME,
+        ),
+    }
+    .into())
 }
 
 /// The egress of `entry` in the parsed `file`: its `[defaults]`,
 /// `[defaults.<type>]` and entry layers, read as [`project_egress`] says.
-fn entry_egress(
+pub(crate) fn entry_egress(
     file: &toml::Table,
     entry: mfile::entry::BoxEntry,
 ) -> anyhow::Result<ProjectEgress> {
@@ -1736,39 +1823,43 @@ pub(crate) struct SelectedLoadouts {
 }
 
 impl SelectedLoadouts {
-    /// The layer of each loadout, with its name: the keys that BOX-167
-    /// applies, without the vars that the policy ignores.
-    fn layers(&self) -> anyhow::Result<Vec<(String, toml::Table)>> {
-        const APPLIED: [&str; 5] = [
-            "packages",
-            "patches",
-            "vars",
-            "vars_lenient",
-            "lifecycle_hooks",
-        ];
-        let ignored = |name: &str| self.ignore.as_ref().is_some_and(|g| g.is_match(name));
+    /// The layer of each loadout, with its name and file: the keys that
+    /// BOX-167 applies, without the vars that the policy ignores, and the
+    /// retired variable keys, which the expansion refuses (BOX-206).
+    fn layers(&self) -> anyhow::Result<Vec<mfile::expand::LoadoutLayer>> {
         self.loadouts
             .iter()
-            .map(|loadout| {
-                let name = loadout.name().as_ref().to_owned();
-                let mut table = toml::Table::try_from(loadout)
-                    .with_context(|| format!("Cannot read loadout {name}"))?;
-                table.retain(|key, _| APPLIED.contains(&key));
-                if let Some(toml::Value::Table(vars)) = table.get_mut("vars") {
-                    vars.retain(|var, _| !ignored(var));
-                }
-                if let Some(toml::Value::Array(items)) = table.get_mut("vars_lenient") {
-                    items.retain(|item| {
-                        !item
-                            .get("name")
-                            .and_then(toml::Value::as_str)
-                            .is_some_and(ignored)
-                    });
-                }
-                Ok((name, table))
-            })
+            .map(|loadout| loadout_layer(loadout, self.ignore.as_ref()))
             .collect()
     }
+}
+
+/// The layer of `loadout` at the selected-loadouts layer: the keys that
+/// BOX-167 applies, its `env_vars` without the names that `ignore`
+/// matches, the retired variable keys `vars` and `vars_lenient` as the
+/// file sets them, and the loadout's file.
+pub(crate) fn loadout_layer(
+    loadout: &boxes::core::loadout::Loadout,
+    ignore: Option<&boxes::core::policy::VarNameGlobs>,
+) -> anyhow::Result<mfile::expand::LoadoutLayer> {
+    const APPLIED: [&str; 4] = [
+        "packages",
+        "patches",
+        mfile::expand::ENV_VARS_KEY,
+        "lifecycle_hooks",
+    ];
+    let name = loadout.name().as_ref().to_owned();
+    let mut table =
+        toml::Table::try_from(loadout).with_context(|| format!("Cannot read loadout {name}"))?;
+    table.retain(|key, _| APPLIED.contains(&key) || mfile::expand::RETIRED_VAR_KEYS.contains(&key));
+    if let Some(toml::Value::Table(vars)) = table.get_mut(mfile::expand::ENV_VARS_KEY) {
+        vars.retain(|var, _| !ignore.is_some_and(|g| g.is_match(var)));
+    }
+    Ok(mfile::expand::LoadoutLayer {
+        name,
+        path: loadout.path().map(std::path::Path::to_path_buf),
+        table,
+    })
 }
 
 /// An expanded entry: the lists the daemon composes, and the whole
@@ -1861,6 +1952,25 @@ pub(crate) fn session_box_expansion(
     hooks_enabled: bool,
     selected: &SelectedLoadouts,
 ) -> anyhow::Result<Option<BoxEntryExpansion>> {
+    session_box_expansion_with_rules(project, entry, hooks_enabled, selected, None)
+}
+
+/// [`session_box_expansion`], with the client's `[secret-store-rules]`
+/// read through `global` for an entry with a store reference, so the
+/// expanded spec's `[secrets]` carry each rule's `upstream` and `inject`
+/// (BOX-071). With no `global`, no rule is read.
+///
+/// # Errors
+///
+/// As [`session_box_expansion`], and fails on a client configuration whose
+/// store rules do not read.
+pub(crate) fn session_box_expansion_with_rules(
+    project: &camino::Utf8Path,
+    entry: Option<&str>,
+    hooks_enabled: bool,
+    selected: &SelectedLoadouts,
+    global: Option<&GlobalArgs>,
+) -> anyhow::Result<Option<BoxEntryExpansion>> {
     let Some(bytes) = project_file_bytes(project)? else {
         return Ok(None);
     };
@@ -1873,21 +1983,25 @@ pub(crate) fn session_box_expansion(
         // project's `[session]` table.
         None => pick_session_entry(&entries)?,
     };
-    box_entry(project, &bytes, picked, hooks_enabled, selected).map(Some)
+    box_entry(project, &bytes, picked, hooks_enabled, selected, global).map(Some)
 }
 
 /// The expanded `[tasks.<task>]` entry of the project at `project`, for the
 /// daemon to compose the task box from (BOX-068), with the expanded spec
-/// that the stored spec reads its `[[file_exports]]` from (BOX-203). `None`
-/// when the project declares no such entry.
+/// that the stored spec reads its `[[file_exports]]` and `[secrets]` from
+/// (BOX-203, BOX-071). With `global`, the client's `[secret-store-rules]`
+/// are read for a task with a store reference. `None` when the project
+/// declares no such entry.
 ///
 /// # Errors
 ///
-/// Fails with exit 3 on a `minimal.toml` whose entry does not expand.
+/// Fails with exit 3 on a `minimal.toml` whose entry does not expand, and
+/// on a client configuration whose store rules do not read.
 pub(crate) fn task_box_entry(
     project: &camino::Utf8Path,
     task: &str,
     hooks_enabled: bool,
+    global: Option<&GlobalArgs>,
 ) -> anyhow::Result<Option<BoxEntryExpansion>> {
     let Some(bytes) = project_file_bytes(project)? else {
         return Ok(None);
@@ -1910,8 +2024,49 @@ pub(crate) fn task_box_entry(
         entry,
         hooks_enabled,
         &SelectedLoadouts::default(),
+        global,
     )
     .map(Some)
+}
+
+/// The wire's two variable lists from the expanded spec's `env_vars`
+/// (BOX-205): a strict POSIX name (`[A-Z_][A-Z0-9_]*`) in the first, any
+/// other name in the second, in name order. Both are `None` when the spec
+/// sets no `env_vars`.
+#[allow(clippy::type_complexity)]
+fn wire_vars(
+    spec: &toml::Table,
+) -> Result<
+    (
+        Option<
+            std::collections::BTreeMap<
+                boxes::core::primitives::StrictVarName,
+                boxes::core::primitives::VarValue,
+            >,
+        >,
+        Option<Vec<boxes::core::primitives::LenientVarEntry>>,
+    ),
+    toml::de::Error,
+> {
+    use boxes::core::primitives::{LenientVarEntry, StrictVarName, VarValue};
+    let Some(value) = spec.get(mfile::expand::ENV_VARS_KEY) else {
+        return Ok((None, None));
+    };
+    let vars: std::collections::BTreeMap<String, VarValue> = value.clone().try_into()?;
+    let mut strict = std::collections::BTreeMap::new();
+    let mut lenient = Vec::new();
+    for (name, value) in vars {
+        match StrictVarName::try_new(name.clone()) {
+            Ok(name) => {
+                strict.insert(name, value);
+            }
+            Err(_) => lenient.push(
+                LenientVarEntry::try_new(name, value)
+                    .map_err(<toml::de::Error as serde::de::Error>::custom)?,
+            ),
+        }
+    }
+    Ok((Some(strict), (!lenient.is_empty()).then_some(lenient)))
 }
 
 /// Expands `entry` of the `minimal.toml` in `bytes` over `[defaults]` and
@@ -1920,7 +2075,7 @@ pub(crate) fn task_box_entry(
 /// composes from the expanded spec.
 ///
 /// A list the spec has no key for stays `None`. A task entry sends only
-/// `packages` and `lifecycle_hooks`. It sends no `vars`, `vars_lenient` or
+/// `packages` and `lifecycle_hooks`. It sends no `env_vars` or
 /// `patches`. `min task run` reads only the `[tasks.<name>]` table, so those
 /// keys from `[defaults]` and `[defaults.task]` do not reach a task box.
 /// gominimal/minimal#3266 tracks that gap. With hooks off (`--no-hooks`), no
@@ -1930,12 +2085,18 @@ pub(crate) fn task_box_entry(
 /// so a loadout that conflicts with the project fails here (BOX-183), and
 /// each hook of that spec names its declarer (BOX-179). The lists sent
 /// come from the expansion without the loadouts.
-fn box_entry(
+///
+/// With `global`, that spec also expands with the client's
+/// `[secret-store-rules]`, read only for an entry with a store reference,
+/// so its `[secrets]` are the ones a create sends (BOX-071). `min box spec`
+/// expands with the same rules ([`expand_with_store_rules`]).
+pub(crate) fn box_entry(
     project: &camino::Utf8Path,
     bytes: &[u8],
     entry: mfile::entry::BoxEntry,
     hooks_enabled: bool,
     selected: &SelectedLoadouts,
+    global: Option<&GlobalArgs>,
 ) -> anyhow::Result<BoxEntryExpansion> {
     let format_error = |error| ProjectFileInvalid {
         error: mfile::Error::Format(error),
@@ -1979,8 +2140,7 @@ fn box_entry(
     whole.loadouts = selected.layers()?;
     (whole.type_defaults, whole.type_constraints) = entry_type_layers(&doc, &entry);
     whole.host_vars = host_vars(&whole);
-    let mut full =
-        mfile::expand::expand(&entry, &whole).map_err(|error| ProjectFileInvalid { error })?;
+    let (mut full, _) = crate::cmd::box_spec::expand_with_store_rules(global, &entry, &mut whole)?;
     // With hooks off (`--no-hooks`), the spec carries no hook.
     if !hooks_enabled {
         full.spec.remove("lifecycle_hooks");
@@ -2045,12 +2205,11 @@ fn box_entry(
             .transpose()
             .map_err(format_error)?;
     }
-    // A task entry sends no `vars`, `vars_lenient` or `patches`, so the
-    // `[defaults]` and `[defaults.task]` values for them do not reach the
-    // task box. gominimal/minimal#3266 tracks that gap.
+    // A task entry sends no `env_vars` or `patches`, so the `[defaults]`
+    // and `[defaults.task]` values for them do not reach the task box.
+    // gominimal/minimal#3266 tracks that gap.
     if box_type != boxes::TASK_BOX_TYPE {
-        wire.vars = list(spec, "vars").map_err(format_error)?;
-        wire.vars_lenient = list(spec, "vars_lenient").map_err(format_error)?;
+        (wire.vars, wire.vars_lenient) = wire_vars(spec).map_err(format_error)?;
         wire.patches = list(spec, "patches").map_err(format_error)?;
     }
     tracing::info!(
@@ -2158,7 +2317,7 @@ fn network_key_invalid(
 /// # Errors
 ///
 /// The refusal, when `network` is `none` and the box has egress.
-fn session_effective_egress(
+pub(crate) fn session_effective_egress(
     project: ProjectEgress,
     flags: Option<boxes::EgressPolicy>,
     network: boxes::NetworkMode,
@@ -2579,13 +2738,34 @@ fn proxy_stance(network: boxes::NetworkMode) -> Option<bep::boxes::Stance> {
 }
 
 /// Whether a node-local Box Egress Proxy serves boxes on this host: the
-/// proxy published its identity at `identity`, and its control socket is
-/// at `control`. A missing home directory gives neither path.
+/// proxy published its identity at `identity`, and something answers a
+/// connection on its control socket at `control`. A socket file that a
+/// stopped `bep serve` left behind refuses the connection, so it does not
+/// count. A missing home directory gives neither path.
 pub(crate) fn proxy_present(
     identity: Option<&std::path::Path>,
     control: Option<&std::path::Path>,
 ) -> bool {
-    identity.is_some_and(std::path::Path::exists) && control.is_some_and(std::path::Path::exists)
+    identity.is_some_and(std::path::Path::exists)
+        && control.is_some_and(|control| std::os::unix::net::UnixStream::connect(control).is_ok())
+}
+
+/// [`proxy_absence`] of this host: the proxy's published identity and
+/// control socket, the `bep` program that `min secret` names, and the log
+/// the host daemon writes the proxy's output to.
+pub(crate) fn host_proxy_absence(global: &GlobalArgs) -> Option<boxes::core::bep::ProxyAbsence> {
+    let identity = crate::mint::identity_path();
+    let control = crate::mint::control_path();
+    let binary = bep::store::proxy_binary_on_path(
+        std::env::var_os(bep::store::PROXY_BIN_ENV).as_deref(),
+        std::env::var_os("PATH").as_deref(),
+    );
+    proxy_absence(
+        identity.as_deref(),
+        control.as_deref(),
+        binary,
+        proxy_log_path(global.minimal_dir.as_deref()),
+    )
 }
 
 /// Why no node-local proxy serves boxes on this host, or `None` when one
@@ -2608,10 +2788,17 @@ pub(crate) fn proxy_absence(
     }
     let absence = match binary {
         // The text names the log only when the host daemon wrote it.
-        Ok(path) if path.exists() => ProxyAbsence::NotAnswering {
-            path,
-            log: log.filter(|log| log.exists()),
-        },
+        Ok(path) if path.exists() => {
+            let log = log.filter(|log| log.exists());
+            let last_error = log
+                .as_deref()
+                .and_then(|log| crate::mint::last_error_line(log, control));
+            ProxyAbsence::NotAnswering {
+                path,
+                log,
+                last_error,
+            }
+        }
         Ok(path) => ProxyAbsence::NotInstalled { path: Some(path) },
         Err(ProxyLookupError::RelativeEnv(path)) => ProxyAbsence::RelativePath { path },
         Err(ProxyLookupError::NoMinvmd) => ProxyAbsence::NotInstalled { path: None },
@@ -2884,6 +3071,7 @@ fn mint_grants(
     box_id: Option<String>,
     egress: Vec<String>,
     network: boxes::NetworkMode,
+    proxy_log: Option<&std::path::Path>,
 ) -> Result<MintedGrants, anyhow::Error> {
     use crate::mint::{
         ControlClient, GrantBox, HostClientKeyStore, MintError, ProxyRegistration,
@@ -2903,8 +3091,10 @@ fn mint_grants(
         "a GitHub grant"
     };
     // A box with store references only is told about its secrets, not
-    // about a GitHub grant it does not declare.
+    // about a GitHub grant it does not declare. A proxy that does not
+    // answer is named with its log and that log's last error.
     let mint_error = |error: MintError| -> anyhow::Error {
+        let error = error.with_proxy_log(proxy_log);
         if stored {
             StoreOnlyMintError(error).into()
         } else {
@@ -3063,7 +3253,12 @@ fn proxy_egress(
 /// override, which the store mint checks `bep serve` agrees with. No box
 /// exists yet, so a failure only withdraws the row the box's registration
 /// bought (T66). `box_name` is the name that row was registered under. A
-/// box with no `--name` has none on the request (BOX-163).
+/// box with no `--name` has none on the request (BOX-163). `proxy_log` is
+/// the proxy's `bep.log`, which the refusal names when the proxy does not
+/// answer.
+// Each argument is one fact the activation already holds, and a struct
+// for one caller only moves the list.
+#[allow(clippy::too_many_arguments)]
 async fn mint_into_request(
     request: &mut minimald_rpc::CreateSessionRequest,
     box_name: Option<&str>,
@@ -3072,6 +3267,7 @@ async fn mint_into_request(
     store_grants: &[crate::mint::StoreGrant],
     config_dir: Option<std::path::PathBuf>,
     control_sock: Option<std::path::PathBuf>,
+    proxy_log: Option<std::path::PathBuf>,
 ) -> Result<Option<crate::mint::ProxyRegistration>, anyhow::Error> {
     let grants = github_grants.to_vec();
     let stores = store_grants.to_vec();
@@ -3094,6 +3290,7 @@ async fn mint_into_request(
             box_id,
             egress,
             network,
+            proxy_log.as_deref(),
         )
     })
     .await
@@ -3317,6 +3514,50 @@ pub(crate) fn put_spec(
     Ok(())
 }
 
+/// Puts `spec` on the create request with the `[secrets]` of `expanded`,
+/// the entry's expanded spec, and sets the client's projection digest of
+/// the spec it sends (BOX-068, BOX-071). Each store reference in
+/// `expanded` already carries the `upstream` and `inject` that the client's
+/// store rules wrote, so the digest binds the secret grants, and the daemon
+/// reads the same grants from the spec it receives.
+///
+/// # Errors
+///
+/// Fails if the spec cannot be encoded as JSON.
+pub(crate) fn put_expanded_spec(
+    request: &mut minimald_rpc::CreateSessionRequest,
+    spec: &mfile::spec::BoxSpec,
+    expanded: &toml::Table,
+) -> Result<(), anyhow::Error> {
+    let mut spec = spec.clone();
+    take_expanded_secrets(&mut spec, expanded);
+    put_spec(request, &spec)
+}
+
+/// Puts the `[secrets]` table of `expanded` on `spec`, whole, or takes it
+/// off when `expanded` has none (BOX-071).
+pub(crate) fn take_expanded_secrets(spec: &mut mfile::spec::BoxSpec, expanded: &toml::Table) {
+    match expanded.get("secrets") {
+        Some(secrets) => {
+            spec.kept_keys.insert(
+                "secrets".to_owned(),
+                mfile::spec::StoredExport(secrets.clone()),
+            );
+        }
+        None => {
+            spec.kept_keys.remove("secrets");
+        }
+    }
+    tracing::debug!(
+        entry = %spec.entry,
+        secrets = expanded
+            .get("secrets")
+            .and_then(toml::Value::as_table)
+            .map_or(0, toml::Table::len),
+        "put the expanded spec's secrets on the box spec"
+    );
+}
+
 /// Sets the client's projection digest of `spec` on `request` (BOX-071).
 /// `spec` is the typed spec that [`put_spec`] also sends as JSON. The
 /// client converts it to a TOML table with `toml::Table::try_from` and
@@ -3327,10 +3568,8 @@ pub(crate) fn put_spec(
 /// the daemon then refuses the create. A spec that names no type is of the
 /// creating verb's type, as the daemon reads it.
 ///
-/// Gap: the typed spec has no `[secrets]` table, so this digest binds no
-/// secret grants or store rules (BOX-071 says the projection holds the
-/// requested secret scopes). It binds them when the create sends the
-/// expanded spec in place of the typed one, which #2410 tracks.
+/// A spec that [`put_expanded_spec`] built carries the expanded
+/// `[secrets]`, so the digest binds its secret grants and store rules.
 ///
 /// A spec that does not project carries no client digest. The daemon then
 /// stores none.
@@ -3372,8 +3611,9 @@ pub(crate) fn stamp_client_projection_digest(
 }
 
 /// Adds each `--vpn-network-names` value to the `network.vpn_network_names`
-/// list of the spec on `request` (BCLI-024). A name the list already holds
-/// is not added again. The daemon stores the list with the box's spec, and
+/// list of the spec on `request` (BCLI-024). The list already holds the
+/// names the entry declares, so a flag value adds to them, after them. A
+/// name the list already holds is not added again. The daemon stores the list with the box's spec, and
 /// does not enforce it (BOX-076). Nothing changes when `names` is empty.
 ///
 /// # Errors
@@ -3501,23 +3741,66 @@ pub(crate) async fn daemon_box_name(
 }
 
 /// The error a refused create ends the command with. A held name ends it
-/// with exit 2, naming the holder (BOX-163). Any other refusal is the
-/// daemon's text as it is.
-pub(crate) fn create_refusal(error: String) -> anyhow::Error {
-    match minimal_client::box_name::held_name_refusal(&error) {
-        Some(refusal) => {
+/// with exit 2, naming the holder (BOX-163). A refusal the daemon gave an
+/// exit code keeps that code and its defined error (#3276). Any other
+/// refusal is the daemon's text as it is.
+pub(crate) fn create_refusal(
+    error: String,
+    code: Option<String>,
+    exit_code: Option<u8>,
+    hint: Option<String>,
+) -> anyhow::Error {
+    if let Some(refusal) = minimal_client::box_name::held_name_refusal(&error) {
+        tracing::info!(
+            name = %refusal.name,
+            holder = ?refusal.holder,
+            holder_name = %refusal.holder_name,
+            exit_code = minimald_rpc::HeldNameRefusal::EXIT_CODE,
+            "the create was refused: a running box holds the name"
+        );
+        return anyhow::Error::new(refusal);
+    }
+    match exit_code {
+        Some(exit_code) => {
             tracing::info!(
-                name = %refusal.name,
-                holder = ?refusal.holder,
-                holder_name = %refusal.holder_name,
-                exit_code = minimald_rpc::HeldNameRefusal::EXIT_CODE,
-                "the create was refused: a running box holds the name"
+                code = code.as_deref().unwrap_or(""),
+                exit_code,
+                "the create was refused by the daemon with an exit code"
             );
-            anyhow::Error::new(refusal)
+            anyhow::Error::new(DaemonCreateRefusal {
+                message: error,
+                code,
+                exit_code,
+                hint: hint.unwrap_or_default(),
+            })
         }
         None => anyhow::anyhow!("{error}"),
     }
 }
+
+/// A create the daemon refused and gave an exit code (#3276), such as a
+/// brokered secret on a host with no identity plane. `min` ends with
+/// `exit_code`, and `-o json` answers with `code` and `hint`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonCreateRefusal {
+    /// The daemon's refusal text: what was refused, why, and the next step.
+    pub message: String,
+    /// The refusal's defined error, when it has one.
+    pub code: Option<String>,
+    /// The exit code the command ends with.
+    pub exit_code: u8,
+    /// The next step alone, for the `-o json` hint. Empty when the daemon
+    /// sent none.
+    pub hint: String,
+}
+
+impl std::fmt::Display for DaemonCreateRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DaemonCreateRefusal {}
 
 /// The id and name of the box that holds `held`, read from the daemon by
 /// name. `None` when the read fails or finds no box.
@@ -3585,7 +3868,7 @@ pub(crate) fn stamp_session_spec(
     request: &mut minimald_rpc::CreateSessionRequest,
     dir: &camino::Utf8Path,
 ) -> Result<(), anyhow::Error> {
-    stamp_session_spec_as(request, dir, None, None)
+    stamp_session_spec_as(request, dir, None, None, None)
 }
 
 /// [`stamp_session_spec`] for the session entry `entry`, with `name` as the
@@ -3599,22 +3882,29 @@ pub(crate) fn stamp_session_spec(
 /// `entry`, the session entry pick applies. A project with no
 /// `minimal.toml` gets the spec of an empty `[session]` table.
 ///
+/// The spec carries the expanded `[secrets]`. With `global`, each store
+/// reference carries the `upstream` and `inject` of the client's store rule
+/// for it (BOX-071), and the client digest binds them.
+///
 /// # Errors
 ///
 /// Fails on a `minimal.toml` in `dir` or a parent of it that does not load
 /// or does not expand, and when no single session entry can be picked.
+/// Fails too on a client configuration whose store rules do not read.
 pub(crate) fn stamp_session_spec_as(
     request: &mut minimald_rpc::CreateSessionRequest,
     dir: &camino::Utf8Path,
     entry: Option<&str>,
     name: Option<&str>,
+    global: Option<&GlobalArgs>,
 ) -> Result<(), anyhow::Error> {
     let flags = spec_flags(request);
-    let expanded = session_box_expansion(
+    let expanded = session_box_expansion_with_rules(
         dir,
         entry,
         flags.hooks_enabled,
         &SelectedLoadouts::default(),
+        global,
     )?;
     let mut spec = match &expanded {
         Some(expanded) => mfile::spec::BoxSpec::for_session_entry(
@@ -3638,7 +3928,10 @@ pub(crate) fn stamp_session_spec_as(
         packages = spec.packages.len(),
         "built the session box's spec from its expanded entry"
     );
-    put_spec(request, &spec)
+    match &expanded {
+        Some(expanded) => put_expanded_spec(request, &spec, &expanded.spec),
+        None => put_spec(request, &spec),
+    }
 }
 
 /// The project root to record for an activation from `dir`. Tarball sync
@@ -4155,6 +4448,7 @@ pub(crate) async fn activate_box(
                 &utf8_path,
                 options.entry.as_deref(),
                 options.box_name.as_deref(),
+                Some(global),
             )?;
             if let Some(hooks) = spec_hooks {
                 put_spec_hooks(&mut request, hooks)?;
@@ -4324,6 +4618,7 @@ pub(crate) async fn activate_box(
             &store_grants,
             global.config_dir.clone(),
             control_sock.clone(),
+            proxy_log_path(global.minimal_dir.as_deref()),
         ))
         .await?;
 
@@ -4366,8 +4661,13 @@ pub(crate) async fn activate_box(
                     }
                 };
                 match resp {
-                    minimald_rpc::Errorable::Ok(r) => r,
-                    minimald_rpc::Errorable::Err { error } => {
+                    minimald_rpc::CreateSessionReply::Ok(r) => r,
+                    minimald_rpc::CreateSessionReply::Err {
+                        error,
+                        code,
+                        exit_code,
+                        hint,
+                    } => {
                         // Any other create failure abandons the activation and
                         // its row the same way. A held name is one of them: it
                         // ends the command with exit 2, naming the holder.
@@ -4380,7 +4680,7 @@ pub(crate) async fn activate_box(
                                 .and_then(|registration| registration.box_id),
                         )
                         .await;
-                        return Err(create_refusal(error));
+                        return Err(create_refusal(error, code, exit_code, hint));
                     }
                 }
             };
@@ -5439,6 +5739,101 @@ mod tests {
         assert_eq!(client, daemon);
     }
 
+    /// BOX-071, BOX-072: a session entry with a store reference sends its
+    /// expanded `[secrets]`, with the client's store rule written in. The
+    /// client digest equals the daemon's digest of the sent JSON, and binds
+    /// the rule. The daemon reads the sent spec as a box spec, with the
+    /// secrets kept, and a later edit of the spec's hooks keeps them.
+    #[test]
+    fn create_stores_a_client_digest_equal_to_the_daemon_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+        std::fs::write(
+            dir.path().join(mfile::MFILE_NAME),
+            "[sessions.dev]\n\n[sessions.dev.secrets.NPM_TOKEN]\nsource = \"store\"\n\
+             store = \"keychain\"\nid = \"npm-token\"\n",
+        )
+        .unwrap();
+        let config = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(config.path().join("minimal")).unwrap();
+        std::fs::write(
+            config.path().join("minimal/config.toml"),
+            "[secret-store-rules.npm-token]\nupstream = [\"registry.npmjs.org\"]\n\
+             header = \"Authorization\"\nprefix = \"Bearer \"\n",
+        )
+        .unwrap();
+        let global = GlobalArgs {
+            config_dir: Some(config.path().to_path_buf()),
+            ..Default::default()
+        };
+        let new_request = || {
+            minimald_rpc::CreateSessionRequest::new(
+                "dev",
+                paths::HostAbsPath::try_new(root.to_path_buf()).unwrap(),
+                boxes::NetworkMode::OwnIp,
+                boxes::BoxPolicy::default(),
+            )
+        };
+
+        let mut request = new_request();
+        stamp_session_spec_as(&mut request, root, Some("dev"), None, Some(&global)).unwrap();
+        let wire = request.spec.clone().expect("the spec is on the request");
+        let grant = &wire["secrets"]["NPM_TOKEN"];
+        assert_eq!(grant["source"], "store", "{wire}");
+        assert_eq!(grant["id"], "npm-token", "{wire}");
+        assert_eq!(
+            grant["upstream"],
+            serde_json_lenient::json!(["registry.npmjs.org"]),
+            "the client's store rule reaches the sent spec: {wire}"
+        );
+        assert_eq!(grant["inject"]["header"], "Authorization", "{wire}");
+        assert_eq!(grant["inject"]["prefix"], "Bearer ", "{wire}");
+
+        let daemon = mfile::projection::spec_digest(&wire, boxes::SESSION_BOX_TYPE)
+            .expect("the sent spec projects");
+        assert_eq!(
+            request.config.client_projection_digest(),
+            Some(daemon.as_str())
+        );
+
+        // The digest binds the rule: with no rule read, the sent spec has
+        // no authorities, and its digest differs.
+        let mut unruled = new_request();
+        stamp_session_spec_as(&mut unruled, root, Some("dev"), None, None).unwrap();
+        let unruled_wire = unruled.spec.clone().expect("the spec is on the request");
+        assert!(
+            unruled_wire["secrets"]["NPM_TOKEN"]
+                .get("upstream")
+                .is_none(),
+            "{unruled_wire}"
+        );
+        assert_ne!(
+            unruled.config.client_projection_digest(),
+            Some(daemon.as_str())
+        );
+
+        // The daemon reads the sent spec as a box spec, secrets kept.
+        let read: mfile::spec::BoxSpec =
+            serde_json_lenient::from_value(wire.clone()).expect("the daemon reads the sent spec");
+        assert_eq!(
+            read.kept_keys.get("secrets").map(|kept| &kept.0),
+            Some(&toml::Value::try_from(&wire["secrets"]).unwrap())
+        );
+
+        // Putting the hooks on the spec keeps the secrets and the digest.
+        put_spec_hooks(&mut request, Vec::new()).unwrap();
+        let rehooked = request.spec.as_ref().expect("the spec is on the request");
+        assert_eq!(rehooked["secrets"], wire["secrets"]);
+        assert_eq!(
+            request.config.client_projection_digest(),
+            Some(
+                mfile::projection::spec_digest(rehooked, boxes::SESSION_BOX_TYPE)
+                    .expect("the sent spec projects")
+                    .as_str()
+            )
+        );
+    }
+
     /// BOX-001: with no tarball upload root, a subdirectory resolves to the
     /// directory that holds `minimal.toml`, and a `minimal.toml` that does
     /// not load is an error. A resolved upload root is reused as it is.
@@ -5728,6 +6123,7 @@ mod tests {
             &[],
             None,
             Some(sock_path.clone()),
+            None,
         )
         .await;
         assert!(result.is_err(), "the grant mint fails");
@@ -5870,7 +6266,8 @@ mod tests {
 
         // A create under the fixed name is not a fresh instance: a second
         // registration of the name a live registration holds is refused.
-        register("dev".to_string())
+        // The held registration's lease stays open while it is bound here.
+        let _held = register("dev".to_string())
             .await
             .expect("answered")
             .expect("registered");
@@ -5941,6 +6338,68 @@ mod tests {
         assert!(ensure_registered_id(Some(&registration(false, Some(minted))), other).is_ok());
     }
 
+    /// A `min create` of a `host_ip` grant box that dies between its
+    /// registration and its box's admission drops its lease uncommitted.
+    /// The VM host daemon then withdraws the name at once, so a new create
+    /// of the same name registers with a fresh id and gets no held-name
+    /// refusal.
+    #[tokio::test]
+    async fn host_ip_grant_box_on_vm_host_frees_its_name_when_the_lease_drops() {
+        use minimal_client::box_registration::register_box_for_activation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let host_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        let sock_path = host_dir.join("control.sock");
+        let registry = minvmd::box_registry::BoxRegistry::new(switch::SwitchSubnet::default());
+        let _server = minvmd::control::spawn(
+            sock_path.clone(),
+            registry.clone(),
+            minvmd::net::answerer::AnswererStatus::allocating_for_tests("host-ip-lease-node"),
+            minvmd::control::ProxyPublishStatus::default(),
+        )
+        .expect("the control server binds its socket");
+        let grant_policy = boxes::BoxPolicy {
+            credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
+            ..boxes::BoxPolicy::default()
+        };
+        let register = || {
+            register_box_for_activation(
+                paths::HostKind::Minvmd,
+                Some(dir.path()),
+                boxes::NetworkMode::HostNet,
+                "agent",
+                &grant_policy,
+            )
+        };
+
+        let killed = register()
+            .await
+            .expect("the control server answers the registration")
+            .expect("a host_ip grant box on a VM host registers");
+        let killed_id = killed.box_id.expect("the host minted an id");
+        assert!(killed.lease.is_some(), "the registration holds a lease");
+        // The create dies before the admit: its registration, lease and
+        // all, is dropped uncommitted.
+        drop(killed);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while registry.host_ip_id_for("agent").is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the lease's close withdraws the name"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let again = register()
+            .await
+            .expect("a new create of the name is not refused")
+            .expect("a host_ip grant box on a VM host registers");
+        let again_id = again.box_id.expect("the host minted an id");
+        assert_ne!(again_id, killed_id, "the new create gets a fresh id");
+        assert_eq!(registry.host_ip_id_for("agent"), Some(again_id.to_bytes()));
+    }
+
     /// BEP-082: a GitHub grant box with `--network host_ip` on a VM host
     /// registers for a box id, with no address and no row in the host's
     /// address table. With that id the proxy serves it, so the grant check
@@ -5980,7 +6439,10 @@ mod tests {
         .expect("a host_ip grant box on a VM host registers");
         assert!(registered.host_ip);
         assert_eq!(registered.row_addresses(), None, "the box has no row");
-        assert!(registered.lease.is_none(), "no row, so no lease to hold");
+        assert!(
+            registered.lease.is_some(),
+            "the registration's connection is the name's lease"
+        );
         let id = registered.box_id.expect("the host minted an id");
         assert!(registry.holds_host_ip_id(id.to_bytes()));
         assert!(
@@ -6168,7 +6630,7 @@ mod tests {
             .collect::<Vec<_>>()
         };
         assert_eq!(
-            warnings("vars = { SSL_CERT_FILE = \"/etc/my-ca.pem\" }\n"),
+            warnings("env_vars = { SSL_CERT_FILE = \"/etc/my-ca.pem\" }\n"),
             vec![
                 "This box sets SSL_CERT_FILE itself, so tools that read it will not \
                  trust the proxy's certificate."
@@ -6796,6 +7258,7 @@ mod tests {
                         secrets: &secrets,
                         acknowledged: false,
                         network,
+                        egress: Some(&egress),
                         box_zone_resolver: resolver,
                         github_hosts: &github_hosts,
                         store_rules: &rules,
@@ -6872,6 +7335,7 @@ mod tests {
                             secrets: &secrets,
                             acknowledged: false,
                             network: spec_network,
+                            egress: Some(&egress),
                             box_zone_resolver: spec_resolver,
                             github_hosts: &github_hosts,
                             store_rules: &rules,
@@ -6937,6 +7401,245 @@ mod tests {
         }
     }
 
+    /// The refusal that `min session activate` gives for the project in
+    /// `project`, with the flags `flags`. It runs the start's own steps, in
+    /// the start's order, up to the grant check.
+    fn start_refusal(global: &GlobalArgs, project: &std::path::Path, flags: &[&str]) -> String {
+        start_refusal_of(global, project, None, flags)
+    }
+
+    /// [`start_refusal`] for the entry `entry` of the project, and with the
+    /// store reference check that follows the grant check.
+    fn start_refusal_of(
+        global: &GlobalArgs,
+        project: &std::path::Path,
+        entry: Option<&str>,
+        flags: &[&str],
+    ) -> String {
+        let mut argv = vec!["min", "session", "activate"];
+        argv.extend(flags);
+        let mut args = parsed_activate_args(&argv);
+        let path = camino::Utf8Path::from_path(project).expect("utf-8 path");
+        let (bep, secrets, spec_env, _) = project_bep_and_grants(path, entry).expect("loads");
+        let (port_mappings, flag_egress) = flag_network_overrides(&args).expect("flags parse");
+        let mut project_egress = project_egress(path, entry).expect("egress loads");
+        let (network, port_mappings) =
+            session_box_network(&args, &mut project_egress, port_mappings).expect("network");
+        args.network = Some(network);
+        let egress =
+            session_effective_egress(project_egress, flag_egress, network.into(), &args.egress)
+                .expect("egress");
+        let policy = network_override_policy(&args, port_mappings, egress.policy);
+        let (network, resolver) = creation_host(daemon_host_kind(global), &args);
+        let err = refuse_unhonourable_grants(
+            network,
+            policy.egress.as_ref(),
+            &bep,
+            &secrets,
+            false,
+            resolver,
+            &spec_env,
+        )
+        .and_then(|_| check_store_grants(global, &secrets, policy.egress.as_ref(), false))
+        .expect_err("the start refuses");
+        let refused = err
+            .downcast_ref::<boxes::core::bep::ActivationRefused>()
+            .expect("the start's refusal is the box spec refusal");
+        assert_eq!(refused.exit_code(), 3);
+        refused.to_string()
+    }
+
+    // #2445: `min box spec` refuses a project with a GitHub grant whose
+    // egress does not admit the GitHub hosts (BEP-008), as the start does,
+    // with exit 3 and the same text. Before, the preview checked the grant
+    // with no egress and printed the rows.
+    #[tokio::test]
+    async fn box_spec_preview_refuses_like_start() {
+        let home = tempfile::tempdir().expect("home dir");
+        let grant = "[session.network.bep]\nsteering = \"proxy_env\"\n\
+                     [session.secrets.GH_TOKEN]\nsource = \"broker\"\n\
+                     scopes = [\"github:user-token\"]\n";
+        // An egress that names other hosts only, on the default network,
+        // and no egress on an `own_ip` box.
+        let cases: [(&str, &[&str]); 2] = [
+            (
+                "[defaults.network.egress]\nallow_dns_hosts = [\"example.com\"]\n",
+                &[],
+            ),
+            ("", &["--network", "own_ip"]),
+        ];
+        for (egress, flags) in cases {
+            let project = tempfile::tempdir().expect("project dir");
+            std::fs::write(
+                project.path().join(mfile::MFILE_NAME),
+                format!("{grant}{egress}"),
+            )
+            .expect("write minimal.toml");
+            let global = GlobalArgs {
+                repo_dir: Some(project.path().to_path_buf()),
+                minimal_dir: Some(home.path().join("state")),
+                config_dir: Some(home.path().join("config")),
+                provider: None,
+                no_input: true,
+                vm: None,
+            };
+            let case = format!("{egress:?} {flags:?}");
+
+            let started = start_refusal(&global, project.path(), flags);
+
+            let mut argv = vec!["min", "box", "spec"];
+            argv.extend(flags);
+            let mut out = Vec::new();
+            let err = crate::cmd::box_spec::box_spec_to(
+                &global,
+                parsed_box_spec_args(&argv),
+                false,
+                &mut out,
+            )
+            .await
+            .expect_err("min box spec refuses");
+            let refused = err
+                .downcast_ref::<boxes::core::bep::ActivationRefused>()
+                .unwrap_or_else(|| panic!("{case}: the box spec refusal: {err:#}"));
+            assert_eq!(refused.exit_code(), 3, "{case}");
+            assert_eq!(refused.to_string(), started, "{case}: same refusal text");
+            assert!(started.contains("github.com"), "{case}: {started}");
+            assert!(out.is_empty(), "{case}: no rows print");
+        }
+    }
+
+    // #2445: `min box spec <entry>` runs the start's whole check for every
+    // entry. An entry with no grant and `steering = "off"` with
+    // `proxy_env` (BEP-010), a store reference with no egress (BEP-036),
+    // and an `allow_dns_hosts` list on a `host_ip` box on a VM host
+    // (BEP-008) each give the start's refusal, with exit 3.
+    #[tokio::test]
+    async fn box_spec_entry_preview_refuses_like_start() {
+        let entry = "[sessions.dev]\npackages = [\"git\"]\n\n";
+        let off = "[defaults.session.network.bep]\nsteering = \"off\"\nproxy_env = true\n";
+        let store = "[defaults.session.network.bep]\nsteering = \"proxy_env\"\n\
+                     [defaults.session.secrets.OPENAI_KEY]\nsource = \"store\"\n\
+                     store = \"keychain\"\nid = \"openai-key\"\n";
+        let host_ip = "[defaults.session.secrets.GH_TOKEN]\nsource = \"broker\"\n\
+                       scopes = [\"github:user-token\"]\n\
+                       [defaults.network.egress]\n\
+                       allow_dns_hosts = [\"example.com\"]\n";
+        let rule = "[secret-store-rules.openai-key]\nupstream = [\"api.openai.com\"]\n\
+                    header = \"Authorization\"\nprefix = \"Bearer \"\n";
+        let cases: [(&str, &[&str], bool, &str); 3] = [
+            (off, &[], false, "proxy_env"),
+            (store, &[], false, "api.openai.com"),
+            (host_ip, &["--network", "host_ip"], true, "github.com"),
+        ];
+        for (body, flags, vm, names) in cases {
+            let home = tempfile::tempdir().expect("home dir");
+            let config = home.path().join("config");
+            std::fs::create_dir_all(config.join("minimal")).expect("config dir");
+            std::fs::write(config.join("minimal/config.toml"), rule).expect("write config.toml");
+            let project = tempfile::tempdir().expect("project dir");
+            std::fs::write(
+                project.path().join(mfile::MFILE_NAME),
+                format!("{entry}{body}"),
+            )
+            .expect("write minimal.toml");
+            let global = GlobalArgs {
+                repo_dir: Some(project.path().to_path_buf()),
+                minimal_dir: Some(home.path().join("state")),
+                config_dir: Some(config),
+                provider: vm.then_some(crate::Provider::LocalMinvmd),
+                no_input: true,
+                vm: None,
+            };
+            let case = format!("{body:?} {flags:?} vm={vm}");
+
+            let started = start_refusal_of(&global, project.path(), Some("dev"), flags);
+
+            let mut argv = vec!["min", "box", "spec", "dev"];
+            argv.extend(flags);
+            let mut out = Vec::new();
+            let err = crate::cmd::box_spec::box_spec_to(
+                &global,
+                parsed_box_spec_args(&argv),
+                false,
+                &mut out,
+            )
+            .await
+            .expect_err("min box spec refuses");
+            let refused = err
+                .downcast_ref::<boxes::core::bep::ActivationRefused>()
+                .unwrap_or_else(|| panic!("{case}: the box spec refusal: {err:#}"));
+            assert_eq!(refused.exit_code(), 3, "{case}");
+            assert_eq!(refused.to_string(), started, "{case}: same refusal text");
+            assert!(started.contains(names), "{case}: {started}");
+            assert!(out.is_empty(), "{case}: no rows print");
+        }
+    }
+
+    // #2445: `min box spec <entry>` of a task entry gives the answer that
+    // `min task run` gives. A task box does not apply `network.bep`, so
+    // both commands refuse it with the same text and exit 3, and no rows
+    // print. The grant check of a session entry does not apply here.
+    #[tokio::test]
+    async fn box_spec_task_entry_preview_refuses_what_task_run_refuses() {
+        let home = tempfile::tempdir().expect("home dir");
+        let project = tempfile::tempdir().expect("project dir");
+        std::fs::write(
+            project.path().join(mfile::MFILE_NAME),
+            "[tasks.build]\necho = 'x'\n\n\
+             [tasks.build.network.bep]\nsteering = \"off\"\nproxy_env = true\n",
+        )
+        .expect("write minimal.toml");
+        let root = camino::Utf8Path::from_path(project.path()).expect("utf-8 project dir");
+        let run = task_project_egress(root, "build").expect_err("min task run refuses");
+        let global = GlobalArgs {
+            repo_dir: Some(project.path().to_path_buf()),
+            minimal_dir: Some(home.path().join("state")),
+            config_dir: Some(home.path().join("config")),
+            provider: None,
+            no_input: true,
+            vm: None,
+        };
+        let mut out = Vec::new();
+        let err = crate::cmd::box_spec::box_spec_to(
+            &global,
+            parsed_box_spec_args(&["min", "box", "spec", "build"]),
+            false,
+            &mut out,
+        )
+        .await
+        .expect_err("min box spec refuses the task entry");
+        let refused = err
+            .downcast_ref::<TaskNetworkUnapplied>()
+            .unwrap_or_else(|| panic!("the box spec refusal: {err:#}"));
+        assert_eq!(refused.to_string(), run.to_string(), "same refusal text");
+        assert_eq!(
+            refused.to_string(),
+            "[tasks.build] in minimal.toml sets network.bep, which is not applied to a \
+             task box. Remove network.bep from [tasks.build]."
+        );
+        assert!(out.is_empty(), "no rows print");
+    }
+
+    // #3252: a task box applies `network.vpn_network_names`, so
+    // `min task run` and `min box spec` take it from `[tasks.<name>]` and
+    // from `[defaults.task]` without a refusal.
+    #[test]
+    fn task_vpn_network_names_is_not_refused() {
+        for toml in [
+            "[tasks.build]\necho = 'x'\n\n\
+             [tasks.build.network]\nvpn_network_names = [\"corp\"]\n",
+            "[defaults.task.network]\nvpn_network_names = [\"corp\"]\n\n\
+             [tasks.build]\necho = 'x'\n",
+        ] {
+            let project = tempfile::tempdir().expect("project dir");
+            std::fs::write(project.path().join(mfile::MFILE_NAME), toml)
+                .expect("write minimal.toml");
+            let root = camino::Utf8Path::from_path(project.path()).expect("utf-8 project dir");
+            task_project_egress(root, "build")
+                .unwrap_or_else(|err| panic!("{toml}: the task is not refused: {err:#}"));
+        }
+    }
+
     // BEP-032: a box whose only proxy-served secrets are store references
     // is refused in words that name no GitHub grant. A GitHub grant box
     // keeps the GitHub wording.
@@ -6947,6 +7650,8 @@ mod tests {
         let not_running = || MintError::NotRunning {
             path: "/home/me/.minimal/bep/control.sock".into(),
             error: std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+            log: None,
+            last_error: None,
         };
         let store = StoreOnlyMintError(not_running()).to_string();
         assert!(

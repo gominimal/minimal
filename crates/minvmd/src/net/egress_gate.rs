@@ -5289,6 +5289,7 @@ async fn relay_frames_to_switch(
 ) -> io::Result<()> {
     let mut len_buf = [0u8; 2];
     let mut frame = vec![0u8; max_frame()];
+    let mut first_openings = FirstOpeningDrops::default();
     loop {
         match guest.read_exact(&mut len_buf).await {
             // The count is the buffer's length by construction; only the
@@ -5388,6 +5389,8 @@ async fn relay_frames_to_switch(
                 continue;
             }
             Err(GateDrop::NodePlaneUnpinned { src, dst, dst_port }) => {
+                let opening = FirstOpeningDrops::is_opening(l4.as_ref());
+                first_openings.note(NODE_PLANE_UNPINNED_RULE, src, dst, dst_port, opening);
                 limiter.warn_node_plane_unpinned(src, dst, dst_port);
                 continue;
             }
@@ -5397,6 +5400,8 @@ async fn relay_frames_to_switch(
                 dst_port,
                 resident,
             }) => {
+                let opening = FirstOpeningDrops::is_opening(l4.as_ref());
+                first_openings.note(HOST_IP_BOXES_RULE, src, dst, dst_port, opening);
                 limiter.warn_host_ip_unbounded(src, dst, dst_port, resident);
                 continue;
             }
@@ -5699,6 +5704,67 @@ enum GateAdmit {
 /// resident `host_ip` box's rules admit it, or when no `host_ip` box is
 /// resident: the rate-limit key and the drop line's `rule_matched`.
 pub(crate) const HOST_IP_BOXES_RULE: &str = "egress-host-ip-boxes";
+
+/// How many sources one relay keeps a first-opening-drop latch for
+/// ([`FirstOpeningDrops`]). Node-plane and `host_ip` drops come from the
+/// node's own addresses, so a guest has few. Past the bound no new source
+/// is named, and the rate-limited drop line still covers it.
+const FIRST_OPENING_DROP_SOURCES: usize = 64;
+
+/// The first dropped opening packet, logged once per rule and source
+/// address on this relay (D3574). A node-plane drop and a `host_ip` drop
+/// leave from the node's own address, and every `host_ip` box shares that
+/// address with the node plane, so the latch does not name a box. The
+/// rate-limited drop line can name a later frame, or an ACK, in place of
+/// the packet that opened the connection. This line names the opening
+/// packet itself, with the source, the destination and the port.
+#[derive(Debug, Default)]
+struct FirstOpeningDrops {
+    seen: std::collections::HashSet<(&'static str, [u8; 4])>,
+}
+
+impl FirstOpeningDrops {
+    /// Whether `l4` opens a connection: a TCP SYN with no ACK, or a UDP
+    /// datagram, which has no handshake to open with.
+    fn is_opening(l4: Option<&dns_pins::L4Packet>) -> bool {
+        l4.is_some_and(|pkt| match pkt.proto {
+            egress::IPPROTO_TCP => {
+                pkt.tcp_flags & egress::TCP_SYN != 0 && pkt.tcp_flags & egress::TCP_ACK == 0
+            }
+            egress::IPPROTO_UDP => true,
+            _ => false,
+        })
+    }
+
+    /// Logs the drop of an opening packet from `src` under `rule`, the
+    /// first time this relay drops one from that source under that rule.
+    /// Returns whether a line was written.
+    fn note(
+        &mut self,
+        rule: &'static str,
+        src: [u8; 4],
+        dst: [u8; 4],
+        dst_port: u16,
+        opening: bool,
+    ) -> bool {
+        if !opening
+            || self.seen.len() >= FIRST_OPENING_DROP_SOURCES
+            || !self.seen.insert((rule, src))
+        {
+            return false;
+        }
+        tracing::warn!(
+            source = %Ipv4Addr::from(src),
+            destination = %Ipv4Addr::from(dst),
+            port = %if dst_port == 0 { "none".to_string() } else { dst_port.to_string() },
+            rule_matched = rule,
+            "dropped the first opening packet leaving the VM under this rule from this source \
+             address; later drops under this rule from this source are only in the \
+             rate-limited drop line",
+        );
+        true
+    }
+}
 
 /// How long a bare SYN the ingress leg delivered at a port no publish dials
 /// stays refusable ([`ReplyTables::observe_refusable`]): the refusal follows
@@ -8488,6 +8554,48 @@ mod tests {
 
     /// The default switch subnet, the plan every registry below is built for.
     const SUBNET: SwitchSubnet = switch::DEFAULT_SUBNET;
+
+    /// D3574: the first dropped opening packet is logged once per rule and
+    /// source address, with the source, the destination and the port, for a
+    /// node-plane drop and a `host_ip` drop. A packet that opens nothing is
+    /// not named. Every `host_ip` box leaves from the node address, so a
+    /// second `host_ip` box's opening under the same rule writes no line.
+    #[test]
+    fn first_opening_drop_is_logged_once_per_rule_and_source() {
+        use super::{FirstOpeningDrops, NODE_PLANE_UNPINNED_RULE};
+        let (log, _guard) = capture_log();
+        let mut drops = FirstOpeningDrops::default();
+        let node = [192, 168, 127, 2];
+        let google = [142, 250, 80, 4];
+        let cloudflare = [1, 1, 1, 1];
+
+        assert!(!drops.note(NODE_PLANE_UNPINNED_RULE, node, google, 443, false));
+        assert!(drops.note(NODE_PLANE_UNPINNED_RULE, node, google, 443, true));
+        assert!(!drops.note(NODE_PLANE_UNPINNED_RULE, node, cloudflare, 443, true));
+        assert!(drops.note(HOST_IP_BOXES_RULE, node, cloudflare, 443, true));
+        // A second `host_ip` box sends from the same node address: no line.
+        assert!(!drops.note(HOST_IP_BOXES_RULE, node, google, 443, true));
+
+        let lines: Vec<String> = log
+            .contents()
+            .lines()
+            .filter(|line| line.contains("dropped the first opening packet"))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(lines.len(), 2, "one line per rule and source: {lines:#?}");
+        assert!(lines[0].contains("source=192.168.127.2"), "{}", lines[0]);
+        assert!(
+            lines[0].contains("destination=142.250.80.4"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[0].contains("port=443"), "{}", lines[0]);
+        assert!(lines[0].contains(NODE_PLANE_UNPINNED_RULE), "{}", lines[0]);
+        assert!(lines[1].contains("source=192.168.127.2"), "{}", lines[1]);
+        assert!(lines[1].contains(HOST_IP_BOXES_RULE), "{}", lines[1]);
+        assert!(lines[1].contains("destination=1.1.1.1"), "{}", lines[1]);
+        assert!(lines[1].contains("port=443"), "{}", lines[1]);
+    }
 
     /// The lease of the one published box below: the one source its frames
     /// may carry.

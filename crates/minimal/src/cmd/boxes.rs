@@ -36,8 +36,8 @@ mod wait;
 
 pub(crate) use address::*;
 pub use address::{AddressCandidate, BoxAddressRefusal};
-pub use attach::BoxAttachRefusal;
 pub(crate) use attach::*;
+pub use attach::{BoxAttachRefusal, RowNotBack};
 pub use create::*;
 pub use events::BoxFileRefusal;
 pub(crate) use events::*;
@@ -90,7 +90,9 @@ pub(crate) async fn box_logs_on_hosts(
     let address = args.target.as_str();
     let resolved = match box_type {
         None => resolve_box_on_hosts(hosts, address, verb).await?,
-        Some(box_type) => resolve_typed_box_on_hosts(hosts, address, box_type, verb).await?,
+        Some(box_type) => {
+            crate::cmd::session::resolve_box_of_type(hosts, address, box_type, verb).await?
+        }
     };
     crate::output::record_box_id(&resolved.box_id.to_string());
     let box_id = resolved.box_id;
@@ -120,48 +122,6 @@ pub(crate) async fn box_logs_on_hosts(
     let outcome = if written.is_ok() { "ok" } else { "error" };
     tracing::info!(verb, box_id = %box_id, follow = args.follow, stripped, outcome);
     written
-}
-
-/// [`resolve_box_on_hosts`] with the records of every type but `box_type`
-/// dropped before resolution, so a type noun never reaches a box of
-/// another type. Such an address is refused as one that no box holds.
-async fn resolve_typed_box_on_hosts(
-    mut hosts: Vec<crate::cmd::list::LocalHost>,
-    address: &str,
-    box_type: &str,
-    verb: &'static str,
-) -> Result<ResolvedBox, anyhow::Error> {
-    if let BoxAddress::Qualified { provider, host, .. } = parse_box_address(address) {
-        hosts.retain(|h| h.provider == provider && h.host == host);
-    }
-    let mut listings = Vec::with_capacity(hosts.len());
-    for host in hosts {
-        let boxes = read_host_boxes(&host).await.inspect_err(|err| {
-            tracing::info!(verb, outcome = "error", host = %host.host, "{err:#}");
-        })?;
-        let boxes = boxes.map(|records| {
-            records
-                .into_iter()
-                .filter(|entry| entry.box_type.as_deref() == Some(box_type))
-                .collect()
-        });
-        listings.push(HostListing { host, boxes });
-    }
-    match resolve_box_address(address, &listings) {
-        Ok(resolved) => {
-            tracing::info!(
-                verb,
-                box_id = %resolved.box_id,
-                host = %resolved.host.host,
-                outcome = "resolved"
-            );
-            Ok(resolved)
-        }
-        Err(refusal) => {
-            tracing::info!(verb, address, box_type, outcome = "refused", "{refusal}");
-            Err(refusal.into())
-        }
-    }
 }
 
 /// Whether the stored spec of box `box_id` gives it a terminal. Only the
