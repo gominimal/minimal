@@ -61,6 +61,10 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
   <!-- the refusal itself is BOX-019's -->
   tier:     T0
   verify:   cargo nextest run -p minimal rm_running_box_refuses_naming_force
+  - IF `min box rm` targets a box that is not running, without `--force`, and the box has changed files or the system cannot read whether it has THEN THE SYSTEM SHALL ask for a confirmation before it removes the box when stdin is a terminal and `--no-input` is absent. Otherwise it SHALL fail with exit 2 naming `--force`, and keep the box. A box with no changed files SHALL be removed without a question.
+    <!-- the gate `min session destroy` ran before BCLI-042 removed that verb. Interim: `min box rm` refuses a running box first, and `GetWorkspaceDelta` answers `Unavailable` for a box with no live host. So every box that reaches this gate is unchecked. A headless `min box rm` without `--force` always refuses as unchecked, and the clean-box clause and the changed-files refusal are not reached yet. This changes when the daemon answers `GetWorkspaceDelta` for a stopped box (gominimal/inbox#1295). The design's global `-y, --yes` (architecture.md, box-provider-api.md) answers this confirmation off a TTY. The tree has no `--yes` yet, and gominimal/inbox#1296 adds it. -->
+    tier:   T0
+    verify: cargo nextest run -p minimal box_rm_without_force_gates_changed_files
 
 - **BCLI-005** IF `min box prune` runs off a TTY without `--yes` or `--dry-run` THEN THE SYSTEM SHALL fail with exit 2 naming `--yes`. A dry run reaps nothing, so it needs no `--yes` (BCLI-006).
   tier:     T0
@@ -135,6 +139,9 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     <!-- event-driven; the architecture's `min box wait` paragraph: many clients, and a parent through `--parent`, can wait on one box, so a wait that ends it competes with the others; a script that must stop the box stops it by its id on the `wait_timeout` error -->
     tier:   T0
     verify: cargo nextest run -p minimal box_wait_timeout_flag_leaves_box_unchanged
+  - WHEN `min box wait <box> -o json` sees the box end THE SYSTEM SHALL write one `min/v1/wait` object to stdout. For each box it waited on, the object SHALL give the box's id and name, the `state`, `reason`, `exit_code` and `signal` its record keeps, and the `code` the wait returns for it. Without `-o`, the wait SHALL write nothing to stdout.
+    tier:   T0
+    verify: cargo nextest run -p minimal box_wait_json_lists_how_the_box_ended
 
 - **BCLI-014** IF a box ends with `exited.reason = "timeout"` THEN THE SYSTEM SHALL emit a machine-mode error with `code = "timeout"` and return 124 from `min task run`, `min box run` and `min box wait`.
   <!-- the CLI half; the timeout reason is BOX-037's. `min box run` and `min box wait` follow the architecture's exit-code table (L370, L377) -->
@@ -400,7 +407,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     tier:   T0
     verify: cargo nextest run -p minimal session_attach_without_address_unreachable_host_exit7
 
-- **BCLI-033** THE SYSTEM SHALL emit every object in `-o json` and `-o jsonl` output with a `schema` field `min/v1/<type>`, the types being `box`, `event`, `error`, `type`, `host`, `provider`, `spec` and `exec` (the exec listing in `box show`).
+- **BCLI-033** THE SYSTEM SHALL emit every object in `-o json` and `-o jsonl` output with a `schema` field `min/v1/<type>`, the types being `box`, `event`, `error`, `type`, `host`, `provider`, `spec`, `exec` (the exec listing in `box show`) and `wait` (how the boxes of `box wait` ended).
   <!-- bound to every object, as the architecture's Output conventions (L381) and design principle 4 (L334) state -->
   tier:     T0
   verify:   cargo nextest run -p minimal json_output_schema_per_object

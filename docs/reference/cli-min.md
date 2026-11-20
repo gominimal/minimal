@@ -419,6 +419,41 @@ value. `minimald` does not connect the box to a VPN yet. With `-o json`,
 of the text. The document lists the names in `vpn_network_names`. The
 command refuses `-o yaml` with `--network`, with exit code 2.
 
+### `box wait`
+
+```
+min box wait [--timeout <DURATION>] [-o json] <BOX>
+min box wait --exec <EXEC_ID> [--timeout <DURATION>] <BOX>
+```
+
+Waits until the box ends, and exits with the box's exit code. A box that a
+signal stopped gives 128 plus the signal, such as 143 for SIGTERM. A box
+that ran past its own timeout gives 124. When the box ends, the command
+copies the files the box declares as exports into the project. If it skips
+an export of a box that exited with 0, it exits with 125.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--timeout <DURATION>` | | Stop waiting after this long: a number of seconds, or a number followed by `s`, `m` or `h`. The box keeps running, and the command exits with code 124 |
+| `--exec <EXEC_ID>` | | Wait for one command, by the exec id that `min box exec` printed for it, and exit with that command's exit code |
+| `--output json` | `-o` | When the box ends, write how it ended as one JSON object on stdout. Not available with `--exec` |
+
+With `-o json`, the command writes one `min/v1/wait` object on one line when
+the box ends. Its `boxes` array has one entry for the box, with these fields:
+
+| Field | Value |
+|-------|-------|
+| `box_id` | The box's id |
+| `name` | The box's name, or `null` |
+| `state` | `exited` or `stopped` |
+| `reason` | How the box ended, as its record keeps it, such as `exit`, `stopped` or `timeout` |
+| `exit_code` | The exit code the box's record keeps, or `null` |
+| `signal` | The signal that ended the box, or `null` |
+| `code` | The exit code of `min box wait` for this box |
+
+A wait that `--timeout` ends before the box ends writes no object. Under
+`-o json`, a failure is one `min/v1/error` object on stderr.
+
 ### `box spec`
 
 ```
