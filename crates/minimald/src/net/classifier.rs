@@ -9632,7 +9632,7 @@ mod tests {
                 "the refusal says why no mask avoids it: {text}"
             );
             assert!(
-                text.contains("then run min finalize-install again."),
+                text.contains("run min finalize-install again."),
                 "the refusal names the command to run once the rule is changed: {text}"
             );
             assert!(
@@ -10002,6 +10002,97 @@ mod tests {
                 "`ct mark set {value}` writes every bit: {text}"
             );
         }
+    }
+
+    /// Tailscale's connmark save in its nftables mode, in the ip and ip6
+    /// mangle tables: a native `ct mark set meta mark & 0x00ff0000`, which
+    /// replaces the whole connection mark, under the packet-mark match
+    /// `meta mark & 0x00ff0000 != 0x00000000`. Neither the table nor the
+    /// chain carries a name that ties it to Tailscale.
+    const TAILSCALE_NFT_MODE_CONNMARK: &str = "table ip mangle {\n\
+         \tchain OUTPUT {\n\
+         \t\ttype route hook output priority mangle; policy accept;\n\
+         \t\tct state new meta mark & 0x00ff0000 != 0x00000000 ct mark set meta mark & 0x00ff0000\n\
+         \t}\n\
+         }\n\
+         table ip6 mangle {\n\
+         \tchain OUTPUT {\n\
+         \t\ttype route hook output priority mangle; policy accept;\n\
+         \t\tct state new meta mark & 0x00ff0000 != 0x00000000 ct mark set meta mark & 0x00ff0000\n\
+         \t}\n\
+         }\n";
+
+    /// NET-079: Tailscale's nftables-mode connmark save writes every bit of
+    /// the connection mark, so the install refuses it under every mask. The
+    /// refusal names the packet-mark match, says that its bits are the range
+    /// Tailscale marks connections with, and does not tell the user to
+    /// change a rule that Tailscale loads.
+    #[test]
+    fn install_refuses_tailscale_nft_mode_connmark_with_its_match() {
+        for mask in [None, Some("0x0c000000")] {
+            let mount = standin_mount();
+            let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+            host_ruleset_tools(tools.path(), TAILSCALE_NFT_MODE_CONNMARK, "");
+            let flags: Vec<&str> = mask.map(|m| vec!["--ct-mark-mask", m]).unwrap_or_default();
+            let refused = run_install_with(&mount, &flags, tools.path());
+            let text = said(&refused);
+            assert!(
+                !refused.status.success(),
+                "the install refuses under mask {mask:?}: {text}"
+            );
+            for family in ["ip", "ip6"] {
+                assert!(
+                    text.contains(&format!(
+                        "table {family} mangle, chain OUTPUT: ct state new meta mark & 0x00ff0000 \
+                         != 0x00000000 ct mark set meta mark & 0x00ff0000 (writes every bit of the \
+                         connection mark, for packets that match meta mark & 0x00ff0000 != \
+                         0x00000000)\n"
+                    )),
+                    "the refusal names the {family} rule and its packet-mark match: {text}"
+                );
+                assert!(
+                    text.contains(&format!(
+                        "The rule in table {family} mangle, chain OUTPUT matches the packet-mark \
+                         bits 0x00ff0000, which Tailscale marks connections with.\n"
+                    )),
+                    "the refusal names the mark range the {family} rule matches: {text}"
+                );
+            }
+            assert!(
+                !text.contains("Change that rule"),
+                "the refusal does not tell the user to change Tailscale's rule: {text}"
+            );
+            assert!(
+                text.contains(
+                    "no --ct-mark-mask avoids it. The lines above name the program or the mark \
+                     range of that rule. When this host's ruleset no longer has the rule, run \
+                     min finalize-install again.\n"
+                ),
+                "the refusal says what to wait for and the command to run: {text}"
+            );
+            assert!(
+                !mount.root.join(sandbox::classifier::TABLE_MARKER).exists(),
+                "a refused install writes no marker: {text}"
+            );
+        }
+
+        // The same write with no packet-mark match, in a table no program
+        // is known by, is still the user's rule to change.
+        let mount = standin_mount();
+        let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+        host_ruleset_tools(
+            tools.path(),
+            "table inet other {\n\tchain c {\n\t\tct mark set meta mark & 0x00ff0000\n\t}\n}\n",
+            "",
+        );
+        let refused = run_install_with(&mount, &[], tools.path());
+        let text = said(&refused);
+        assert!(!refused.status.success(), "{text}");
+        assert!(
+            text.contains("(writes every bit of the connection mark)\n")
+                && text.contains("Change that rule to write only the bits it uses"),
+            "a whole-mark rule no program or range accounts for is the user's to change: {text}"
+        );
     }
 
     /// One family's mangle table as `nft -a --debug=netlink list ruleset`

@@ -1491,7 +1491,20 @@ ct_mark_conflicts_in() {
             if (hit) {
                 comp = where == "" ? "the host ruleset" : where
                 if (chain != "") comp = comp ", chain " chain
-                printf "  %s: %s%s\n", comp, line, whole ? " (writes every bit of the connection mark)" : ""
+                # The packet-mark match of a whole-mark write, read from the
+                # rule before its first `ct mark set`: the packets it writes
+                # the connection mark for. ct_mark_rule_owners reads its mask
+                # back to name a well-known mark range.
+                why = ""
+                if (whole) {
+                    why = " (writes every bit of the connection mark"
+                    head = line
+                    if (index(head, "ct mark set ")) head = substr(head, 1, index(head, "ct mark set ") - 1)
+                    if (match(head, /meta mark (&|and) 0[xX][0-9a-fA-F]+( (!=|==))? 0[xX][0-9a-fA-F]+/))
+                        why = why ", for packets that match " substr(head, RSTART, RLENGTH)
+                    why = why ")"
+                }
+                printf "  %s: %s%s\n", comp, line, why
             }
         }
     '
@@ -1622,9 +1635,34 @@ EOF_RANGES
 # <chain>: <rule>"), one line that names the program whose table or chain
 # name the rule carries, or says that the names match no program this step
 # knows. The names are a convention each program keeps, so the line says
-# the match is by name.
+# the match is by name. A rule no name matches, whose packet-mark match
+# (ct_mark_conflicts_in) touches a range in WELL_KNOWN_MARK_RANGES, is said
+# to match that range instead. With "unowned" as $1 it prints only the
+# whole-mark rules that neither a name nor a range ties to a program.
 ct_mark_rule_owners() {
-    awk '
+    RANGES="$WELL_KNOWN_MARK_RANGES" awk -v unowned="${1:-}" '
+        function bit(v, x) { return int(v / x) % 2 == 1 }
+        function hex(s,  i, d, v) {
+            v = 0
+            for (i = 1; i <= length(s); i++) {
+                d = index("0123456789abcdef", tolower(substr(s, i, 1))) - 1
+                if (d < 0) return -1
+                v = v * 16 + d
+            }
+            return v
+        }
+        # The well-known range the mask m shares a bit with, as
+        # "<component> <range>", or "" for none.
+        function range_of(m,  r, f, v, x) {
+            for (r = 1; r <= nranges; r++) {
+                if (split(ranges[r], f, " ") != 2) continue
+                v = hex(substr(f[2], 3))
+                for (x = 1; x < 4294967296; x *= 2)
+                    if (bit(v, x) && bit(m, x)) return f[1] " " f[2]
+            }
+            return ""
+        }
+        BEGIN { nranges = split(ENVIRON["RANGES"], ranges, "\n") }
         function owner(table, chain,  t, c) {
             t = tolower(table); c = tolower(chain)
             if (t ~ /tailscale/ || c ~ /^ts-/) return "Tailscale"
@@ -1647,16 +1685,29 @@ ct_mark_rule_owners() {
             colon = index(line, ": ")
             if (colon == 0) next
             where = substr(line, 1, colon - 1)
-            if (where in seen) next
+            if (unowned == "" && (where in seen)) next
             seen[where] = 1
             table = where; chain = ""
             at = index(where, ", chain ")
             if (at > 0) { table = substr(where, 1, at - 1); chain = substr(where, at + 8) }
             n = split(table, words, " ")
             name = owner(words[n], chain)
+            known = ""
+            if (match(line, /for packets that match meta mark (&|and) 0[xX][0-9a-fA-F]+/)) {
+                m = substr(line, RSTART, RLENGTH)
+                sub(/.* /, "", m)
+                known = range_of(hex(substr(m, 3)))
+            }
+            if (unowned != "") {
+                if (line ~ /\(writes every bit of the connection mark/ && name == "" && known == "") print line
+                next
+            }
             if (name != "")
                 printf "The rule in %s belongs to %s, by the name of its table or chain.\n", where, name
-            else
+            else if (known != "") {
+                split(known, f, " ")
+                printf "The rule in %s matches the packet-mark bits %s, which %s marks connections with.\n", where, f[2], f[1]
+            } else
                 printf "The rule in %s belongs to a program that this step cannot name from its table and chain.\n", where
         }
     '
@@ -1736,8 +1787,14 @@ scan_ct_mark_conflicts() {
         case "$conflicting" in
             *"$UNLISTED_CONNMARK"*)
                 die "refusing to install over an iptables CONNMARK rule whose masks this step cannot read, so it may write the bits this install uses. Install iptables with its nf_tables backend, so that iptables-save and ip6tables-save list the rule, then run min finalize-install again." ;;
-            *"(writes every bit of the connection mark)"*)
-                die "refusing to install over a rule that writes every bit of the connection mark: no --ct-mark-mask avoids it. Change that rule to write only the bits it uses, then run min finalize-install again." ;;
+            *"(writes every bit of the connection mark"*)
+                # A rule another program loads is that program's to change,
+                # so the refusal tells the user to change it only when some
+                # whole-mark rule has no known program or mark range.
+                if [ -n "$(printf '%s\n' "$conflicting" | ct_mark_rule_owners unowned)" ]; then
+                    die "refusing to install over a rule that writes every bit of the connection mark: no --ct-mark-mask avoids it. Change that rule to write only the bits it uses, then run min finalize-install again."
+                fi
+                die "refusing to install over a rule that writes every bit of the connection mark: no --ct-mark-mask avoids it. The lines above name the program or the mark range of that rule. When this host's ruleset no longer has the rule, run min finalize-install again." ;;
         esac
         local free
         if free="$(free_ct_mark_mask)"; then
