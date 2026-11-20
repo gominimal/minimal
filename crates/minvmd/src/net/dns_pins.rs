@@ -1319,7 +1319,8 @@ impl DnsPins {
         if pkt.src.port() != DNS_PORT {
             return;
         }
-        if *pkt.dst.ip() == table.subnet().daemon_ip()
+        if (*pkt.dst.ip() == table.subnet().daemon_ip()
+            || *pkt.dst.ip() == table.subnet().host_ip_cohort_address())
             && let Some(entry) = self.host_ip_entry(table)
         {
             entry.observe(pkt, datagram, limiter, now);
@@ -1364,7 +1365,11 @@ impl DnsPins {
         {
             return;
         }
-        if *pkt.src.ip() == table.subnet().daemon_ip() && box_cohort_marked {
+        // A query from the cohort's own address is the cohort's, marked or
+        // not. A marked one from the node address is an older guest's.
+        if (*pkt.src.ip() == table.subnet().daemon_ip() && box_cohort_marked)
+            || *pkt.src.ip() == table.subnet().host_ip_cohort_address()
+        {
             if let Some(entry) = self.host_ip_entry(table) {
                 entry.record_query(pkt, datagram, now);
             }
