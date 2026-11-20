@@ -1025,7 +1025,8 @@ pub struct File {
 /// task box does not apply. The sub-keys are not checked here: which ones
 /// a box reads differs per box type, and the minimal crate owns that
 /// knowledge. The projection of a `[network]` table onto a given box
-/// type's settings belongs in the BOX spec, not here.
+/// type's settings belongs in the BOX spec, not here. That refusal is
+/// interim (#3671): it goes when a task box applies those sub-keys.
 const SPEC_READ_ENTRY_KEYS: &[&str] = &["network", "timeout", "file_exports"];
 
 /// An entry's unknown fields, in key order, less the ones a box spec reads.

@@ -3624,8 +3624,8 @@ mod tests {
 
     /// #3252: a `network` key that a task box does not apply, declared in
     /// the task's own table or `[defaults.task]`, refuses the run and names
-    /// the key, the table and the next step. A key in `[defaults]` reaches
-    /// every Box Type and does not refuse a task.
+    /// the key, the table and the next step. A key in `[defaults]` does not
+    /// refuse a task, and the task box drops it: the known gap of #3671.
     #[test]
     fn task_box_network_refuses_a_network_key_a_task_does_not_apply() {
         let (_dir, project) = project_with(
@@ -3651,8 +3651,10 @@ mod tests {
              task box. Remove network.bep from [defaults.task]."
         );
 
-        // The keys a task box applies, flat egress spellings included, and
-        // a key in `[defaults]`, run.
+        // The keys a task box applies, flat egress spellings included, run.
+        // The `lint` task runs with `[defaults.network] quic443 = "block"`
+        // dropped. That is the known gap of #3671, not a key correctly
+        // left out.
         let (_dir, applied) = project_with(
             "[defaults.network]\nquic443 = \"block\"\n\n\
              [tasks.build]\nexec = 'true'\n\n\

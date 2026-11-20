@@ -1554,12 +1554,13 @@ fn task_egress_from(bytes: &[u8], task: &str) -> anyhow::Result<ProjectEgress> {
 /// The `[network]` keys a task box takes from `minimal.toml`: the mode, the
 /// egress in its nested or its flat spelling, and `vpn_network_names`,
 /// which `put_task_spec` keeps on the stored spec. Every other key reaches
-/// a task box only by its run flag.
+/// a task box only by its run flag. This list is interim (#3671): it goes
+/// with [`refuse_unapplied_task_network`].
 const TASK_NETWORK_KEYS: [&str; 3] = ["mode", "egress", "vpn_network_names"];
 
 /// A `network` key that a task's own layers declare and that a task box
-/// does not apply, such as `quic443` (#3252). The message names the key,
-/// the table and the next step. `min task run` and `min box spec` both
+/// does not apply, such as `quic443`, interim (#3671). The message names
+/// the key, the table and the next step. `min task run` and `min box spec` both
 /// read the task's network through `task_project_egress`, so the text
 /// fits both commands. An invalid project `minimal.toml` refuses the same
 /// way, so the command ends with exit 3 (`main.rs`), the code the
@@ -1584,10 +1585,17 @@ impl std::fmt::Display for TaskNetworkUnapplied {
 impl std::error::Error for TaskNetworkUnapplied {}
 
 /// Refuses a `network` key that a task's own layers declare and that a
-/// task box does not apply, such as `quic443` (#3252). Without it the key
-/// is dropped in silence, and a `quic443 = "block"` runs as `auto`. Only
-/// `[tasks.<name>]` and `[defaults.task]` are read here: `[defaults]`
-/// reaches every Box Type, so a key there is not written for the task.
+/// task box does not apply, such as `quic443`. Without it the key is
+/// dropped in silence, and a `quic443 = "block"` runs as `auto`. Only
+/// `[tasks.<name>]` and `[defaults.task]` are read here. A `[defaults]
+/// network` key that a task box does not apply (for example
+/// `quic443 = "block"`) is still dropped for a task box without a
+/// refusal, and #3671 tracks it.
+///
+/// This is interim (#3671): the refusal and [`TASK_NETWORK_KEYS`] go when
+/// `task_box_network`/`put_task_spec` carry `quic443`, `bep`, `ingress`
+/// and `dynamic_ingress` from the expanded entry onto the task box's
+/// policy and stored spec.
 fn refuse_unapplied_task_network(
     file: &toml::Table,
     entry: &mfile::entry::BoxEntry,
