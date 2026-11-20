@@ -2,21 +2,23 @@
 //! the `min` CLI.
 //!
 //! `scripts/install.sh` decides whether a `curl … | sh` upgrade is about to
-//! destroy live work by matching `min stop`'s refusal message, not its exit
-//! status (a bare non-zero also means no daemon, a failed connect, or a `min`
-//! too old to know the subcommand). That reuses the CLI's existing signal
-//! rather than adding a parallel session check, but it couples a shell literal
-//! to a Rust one across crates with nothing in between. Reword the `bail!` and
-//! the installer silently stops asking and goes back to force-stopping every
-//! upgrade — the exact bug the prompt exists to prevent, with every installer
-//! test still green, because the harness stubs `min` with its own copy of the
-//! string and so cannot notice.
+//! destroy live work by matching a refusal message, not an exit status. An
+//! older `min` has bare `min stop`, which refuses while sessions are live with
+//! `daemon has active sessions; pass --force to shut down anyway`. Those
+//! releases are already on disk and cannot change, so the installer's literal
+//! must keep matching their text. A `min` with `min host stop` has no bare
+//! `min stop` (BCLI-042), and `min host stop` refuses nothing, so the
+//! installer makes its own running-box check and prints the same literal for
+//! its own refusal. Reword the literal and the installer silently stops asking
+//! an older client's daemon, and goes back to force-stopping it: the exact bug
+//! the prompt exists to prevent, with every installer test still green,
+//! because the harness stubs `min` with its own copy of the string.
 //!
-//! Both files are read as text: this asserts the contract without `common`
-//! taking a dependency on `minimal` or on the installer. It lives beside
-//! `shell_lint.rs` for the same reason that one does — the workspace test run
-//! is the reviewed-code extension point CI schedules over
-//! (docs/ci-strategy.md §10), and `.github/workflows/` is frozen.
+//! The installer is read as text: this asserts the contract without `common`
+//! taking a dependency on the installer. It lives beside `shell_lint.rs` for
+//! the same reason that one does — the workspace test run is the
+//! reviewed-code extension point CI schedules over (docs/ci-strategy.md §10),
+//! and `.github/workflows/` is frozen.
 
 use std::path::PathBuf;
 
@@ -57,17 +59,23 @@ fn installer_matches_the_message_the_cli_actually_prints() {
          with a stopped daemon would prompt"
     );
 
-    let cli_path = root.join("crates/minimal/src/cmd/boxes/lifecycle.rs");
-    let cli = std::fs::read_to_string(&cli_path)
-        .expect("failed to read crates/minimal/src/cmd/boxes/lifecycle.rs");
-
+    // The refusal an older `min stop` prints. Released clients carry it, so
+    // it is fixed here rather than read from the current CLI source.
+    let released = "daemon has active sessions; pass --force to shut down anyway";
     assert!(
-        cli.contains(needle),
-        "scripts/install.sh gates the upgrade prompt on the substring {needle:?}, which no longer \
-         appears in {}. `min stop`'s active-sessions refusal is the installer's only signal that \
-         an upgrade is about to end live sessions; with the wording changed the installer stops \
-         asking and force-stops the daemon unconditionally. Update the literal on both sides \
-         together.",
-        cli_path.display(),
+        released.contains(needle),
+        "scripts/install.sh gates the upgrade prompt on the substring {needle:?}, which the \
+         refusal of an older `min stop` ({released:?}) does not contain. That refusal is the \
+         installer's only signal that an upgrade over an older client is about to end live \
+         sessions."
+    );
+
+    // A `min` with `min host stop` refuses nothing, so the installer prints
+    // the refusal itself after its own running-box check.
+    assert!(
+        installer.contains("echo \"$sessions_live_msg\" >&2"),
+        "{} no longer prints $sessions_live_msg for its own running-box check, so an upgrade \
+         with `min host stop` never asks before it ends a box",
+        installer_path.display(),
     );
 }
