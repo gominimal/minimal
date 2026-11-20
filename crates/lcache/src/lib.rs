@@ -115,10 +115,18 @@ impl PendingDir {
         // its direct children and can predate this finalize by the whole
         // build (or come from an extract that preserves upstream times). The
         // cache clean reads this mtime as the write time of an entry nobody
-        // has read yet, so stamp it now.
-        std::fs::File::open(to)
-            .and_then(|d| d.set_modified(std::time::SystemTime::now()))
-            .map_err(CacheErr::IO)?;
+        // has read yet, so stamp it now. The stamp serves only the clean, so
+        // a failure is logged and does not abort the finalize: the entry is
+        // already in place and still needs its metadata.
+        if let Err(err) =
+            std::fs::File::open(to).and_then(|d| d.set_modified(std::time::SystemTime::now()))
+        {
+            tracing::warn!(
+                path = %to.display(),
+                error = %err,
+                "could not stamp the cache entry's write time"
+            );
+        }
 
         drop(st);
 
