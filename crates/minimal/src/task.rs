@@ -171,6 +171,11 @@ pub(crate) fn put_task_spec(
 /// The refusal is the daemon's for the same spec: it names each brokered
 /// secret, in name order, and exits 5 (`gatehouse_unenrolled_node`).
 ///
+/// Interim until #3679: `min task run` sends no proxy root certificate, so
+/// the daemon refuses a brokered task secret on every host, also on a host
+/// with a proxy. A session box can use the same secret. #3679 tracks the
+/// task path.
+///
 /// # Errors
 ///
 /// [`boxes::core::bep::ActivationRefused`] for a brokered secret with no
@@ -1713,6 +1718,8 @@ pub(crate) async fn run_entry(
     // BOX-081, #3650: the run sends no proxy root certificate. So where no
     // proxy serves boxes, the daemon refuses each brokered secret of the
     // spec. The run refuses it here first, with exit 5, before a box exists.
+    // Interim until #3679: with no root certificate, the daemon refuses a
+    // brokered task secret also where a proxy serves boxes.
     refuse_unserved_broker_secrets(request.spec.as_ref(), || crate::host_proxy_absence(global))?;
 
     // Loadouts and user policy, resolved before the daemon connection so a
