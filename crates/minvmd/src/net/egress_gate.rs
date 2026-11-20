@@ -173,7 +173,7 @@ use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::bep_attach::{BoxId, BoxIdText};
-use crate::box_registry::{BoxRecord, BoxTable, RowWithdrawal};
+use crate::box_registry::{BoxRecord, BoxTable, ForwardRelease, RowWithdrawal};
 
 use super::baseline::{self, NodeBaselinePhase, NodePlaneBaseline};
 use super::dns_pins;
@@ -1332,9 +1332,11 @@ impl EgressGate {
         // follows from this one: held, the supervisor's start phase would
         // never export (`telemetry::vm_task`).
         let withdrawn = table.subscribe_row_withdrawals();
+        let releases = table.subscribe_forward_releases();
         let revoker = tokio::spawn(
             revoke_on_row_withdrawal(
                 withdrawn,
+                releases,
                 switch_sock.clone(),
                 Arc::clone(&forwards),
                 replies.clone(),
@@ -3472,6 +3474,43 @@ impl PublishedForwards {
     }
 }
 
+/// Unbinds a stopped box's declared forwards while its row stays live, and
+/// terminates their connections (NET-121: a forwarder is held until the box
+/// stops). The work is [`revoke_box_forwards`]'s, on a revocation that holds
+/// no address. The waiting caller reads `true` when every forward is
+/// unbound, and `false` when one stays bound after the backoff. One info
+/// line for each release, so the daemon log shows the stop's unbind beside
+/// each forward's line.
+async fn release_box_forwards(
+    switch_sock: PathBuf,
+    forwards: Arc<PublishedForwards>,
+    replies: ReplyTables,
+    release: ForwardRelease,
+    backoff: &'static [Duration],
+) {
+    let switch_addr = release.switch_addr();
+    let (revocation, done) = release.into_revocation();
+    let released = revoke_box_forwards(switch_sock, forwards, replies, revocation, backoff)
+        .await
+        .is_none();
+    if released {
+        tracing::info!(
+            %switch_addr,
+            reason = "box stopped",
+            "released the stopped box's declared forwards; its row stays"
+        );
+    } else {
+        tracing::error!(
+            %switch_addr,
+            reason = "box stopped",
+            "gave up releasing the stopped box's declared forwards; a forward stays bound"
+        );
+    }
+    // The caller may have stopped waiting at its bound: then nobody reads
+    // the answer, and the log line above is the record.
+    let _ = done.send(released);
+}
+
 /// The gate's half of host-side ingress revocation (design §7.1, NET-121,
 /// NET-017): for every row the registry withdraws, whichever path withdrew
 /// it, the box has ended, so its forwards are unbound and their connections
@@ -3480,16 +3519,39 @@ impl PublishedForwards {
 /// revocation that gives up hands its withdrawal back, and the loop keeps it
 /// for the gate's lifetime: the addresses it holds stay unregistrable while
 /// a forward is still bound there. The loop ends when the registry is gone.
+///
+/// The same loop serves the forward releases of a stopped box whose row
+/// stays live ([`release_box_forwards`], NET-121): the unbind and the resets
+/// are the ones a withdrawal runs, and the caller that waits is told the
+/// result.
 async fn revoke_on_row_withdrawal(
     mut withdrawn: tokio::sync::mpsc::UnboundedReceiver<RowWithdrawal>,
+    mut releases: tokio::sync::mpsc::UnboundedReceiver<ForwardRelease>,
     switch_sock: PathBuf,
     forwards: Arc<PublishedForwards>,
     replies: ReplyTables,
 ) {
     let mut revocations = JoinSet::new();
     let mut stranded: Vec<RowWithdrawal> = Vec::new();
+    let mut releases_open = true;
     loop {
         tokio::select! {
+            next = releases.recv(), if releases_open => {
+                let Some(release) = next else {
+                    releases_open = false;
+                    continue;
+                };
+                tokio::spawn(
+                    release_box_forwards(
+                        switch_sock.clone(),
+                        Arc::clone(&forwards),
+                        replies.clone(),
+                        release,
+                        &UNBIND_RETRY_BACKOFF,
+                    )
+                    .in_current_span(),
+                );
+            }
             next = withdrawn.recv() => {
                 let Some(withdrawal) = next else {
                     break;
@@ -11808,6 +11870,120 @@ mod tests {
         assert!(registry.table().revocation_pending(LEASE));
         drop(kept);
         assert!(!registry.table().revocation_pending(LEASE));
+    }
+
+    /// NET-121: a forwarder is held until the box stops. A stop on a
+    /// VM-backed host asks the gate to release the box's declared forwards,
+    /// and the stop's wait returns only after the gate unbound each one. The
+    /// row stays live, with its name and its addresses, so the next start of
+    /// the box binds its declared port again at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stopped_box_declared_forwards_released_before_stop_returns() {
+        use crate::box_registry::ForwardReleaseOutcome;
+        let dir = tempfile::TempDir::new().expect("a tempdir");
+        let sock = dir.path().join("switch.sock");
+        static ANSWERS: [(&str, &str); 1] = [("200 OK", "")];
+        let (server, mut asked) = forwarder_answering(&sock, &ANSWERS);
+        let registry = BoxRegistry::new(SUBNET);
+        let table = registry.table();
+        registry.register(
+            BoxRegistration::new("web", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080]),
+        );
+        let row = table.by_source(LEASE).expect("the row stands");
+        let forwards = Arc::new(PublishedForwards::new());
+        assert_eq!(
+            forwards.note_published(
+                ([127, 0, 0, 1], 8080),
+                LEASE,
+                18080,
+                super::egress::IPPROTO_TCP,
+                boxes::core::switch_request::Applied::Row
+            ),
+            Ok(true)
+        );
+        let revoker = tokio::spawn(super::revoke_on_row_withdrawal(
+            table.subscribe_row_withdrawals(),
+            table.subscribe_forward_releases(),
+            sock.clone(),
+            Arc::clone(&forwards),
+            ReplyTables::new(),
+        ));
+
+        // A pair that does not prove the row releases nothing.
+        let wrong = table.clone();
+        let refused = tokio::task::spawn_blocking(move || {
+            wrong.release_row_forwards(
+                Ipv4Addr::from(LEASE),
+                Ipv4Addr::new(127, 0, 64, 9),
+                row.box_id(),
+                Duration::from_secs(5),
+            )
+        })
+        .await
+        .expect("the release thread ends");
+        assert_eq!(refused, ForwardReleaseOutcome::NotTheBox);
+        assert_eq!(forwards.published_at(LEASE).len(), 1, "still bound");
+
+        let stop = table.clone();
+        let row = table.by_source(LEASE).expect("the row stands");
+        let outcome = tokio::task::spawn_blocking(move || {
+            stop.release_row_forwards(
+                row.switch_addr(),
+                row.loopback_addr(),
+                row.box_id(),
+                Duration::from_secs(5),
+            )
+        })
+        .await
+        .expect("the release thread ends");
+        assert_eq!(outcome, ForwardReleaseOutcome::Released);
+        // By the time the wait returns, the forward is unbound.
+        assert!(
+            forwards.published_at(LEASE).is_empty(),
+            "the declared forward is unbound before the stop returns"
+        );
+        let request = asked
+            .try_recv()
+            .expect("the gate asked the switch to unbind");
+        assert!(request.ends_with(r#"{"local":"127.0.0.1:8080","protocol":"tcp"}"#));
+        assert!(
+            table.by_source(LEASE).is_some(),
+            "the stopped box keeps its row"
+        );
+        assert!(
+            !table.revocation_pending(LEASE),
+            "a release holds no address against reuse"
+        );
+        // The listener is free for the next start's bind at once.
+        assert_eq!(
+            forwards.note_published(
+                ([127, 0, 0, 1], 8080),
+                LEASE,
+                18080,
+                super::egress::IPPROTO_TCP,
+                boxes::core::switch_request::Applied::Row
+            ),
+            Ok(true),
+            "the next start binds the declared port again"
+        );
+
+        // With no gate left to answer, a release says so.
+        revoker.abort();
+        let _ended = revoker.await;
+        server.abort();
+        let row = table.by_source(LEASE).expect("the row stands");
+        let outcome = tokio::task::spawn_blocking(move || {
+            table.release_row_forwards(
+                row.switch_addr(),
+                row.loopback_addr(),
+                row.box_id(),
+                Duration::from_secs(5),
+            )
+        })
+        .await
+        .expect("the release thread ends");
+        assert_eq!(outcome, ForwardReleaseOutcome::NoGate);
     }
 
     /// gvproxy answers an unexpose of a listener it holds no forward at with

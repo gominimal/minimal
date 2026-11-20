@@ -976,6 +976,34 @@ pub struct RenameBoxRequest {
     pub box_id: BoxId,
 }
 
+/// A creator's request that the VM host daemon release a stopped box's
+/// declared ingress forwards ([`BoxControlRequest::ReleaseBoxForwards`],
+/// NET-121): the forwards are held until the box stops, and the host binds
+/// and unbinds them, so the stop asks the host before it returns. The row
+/// stays: the box keeps its name and its addresses, and its next start binds
+/// the forwards again.
+///
+/// The pair and the box id prove the creator, as a rename's do
+/// ([`RenameBoxRequest`]). A row at the pair under another id or another
+/// loopback address is refused with [`BoxControlReply::Error`]. A pair the
+/// host holds no row for is answered as the echo: nothing is bound for it.
+/// Served on the host's control socket only, answered with
+/// [`BoxControlReply::Addresses`] echoing the pair once every forward is
+/// unbound.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReleaseBoxForwardsRequest {
+    /// The box's name, for the host's log line. The host finds the row by
+    /// the pair and the id, never by this.
+    pub name: String,
+    /// The switch address the registration handed back, which keys the row.
+    pub switch_address: std::net::Ipv4Addr,
+    /// The loopback address the registration handed back.
+    pub loopback_address: std::net::Ipv4Addr,
+    /// The box id the registration handed back.
+    #[serde(with = "boxes::box_id_hex")]
+    pub box_id: BoxId,
+}
+
 /// A creator's request for its box's row back
 /// ([`BoxControlRequest::ResumeBox`], NET-138): the session that registered
 /// the box presenting the pair — and the id, when it holds one — the
@@ -1691,6 +1719,12 @@ pub enum BoxControlRequest {
     /// control socket only, answered with [`BoxControlReply::Addresses`]
     /// echoing the pair.
     RenameBox(RenameBoxRequest),
+    /// Release a stopped box's declared ingress forwards
+    /// ([`ReleaseBoxForwardsRequest`], NET-121): the host unbinds them and
+    /// ends their connections, and keeps the row. Served on the host's
+    /// control socket only, answered with [`BoxControlReply::Addresses`]
+    /// echoing the pair once the forwards are unbound.
+    ReleaseBoxForwards(ReleaseBoxForwardsRequest),
     /// Read the machine's zone-answerer status (see [`ZoneAnswererStatus`])
     /// — the read-only verb: no row is touched, no state changes, the reply
     /// is the status the answerer's acquisition last left.

@@ -4180,8 +4180,10 @@ async fn activation_refused_when_vm_host_hands_no_switch_address() {
     );
     let logged = capture.contents();
     assert!(
-        logged.lines().any(|line| line.contains("no switch address")
-            && line.contains(&format!("session={id}"))),
+        logged
+            .lines()
+            .any(|line| line.contains("no switch address")
+                && line.contains(&format!("session={id}"))),
         "one warn line names the session and the reason, got: {logged}"
     );
     // The refusal comes before any forward request: a bind would have gone

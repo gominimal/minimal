@@ -253,6 +253,16 @@ type WithdrawalReport = Vec<([u8; 4], BoxId)>;
 /// registry and every [`BoxTable`] it hands out.
 type RowWithdrawals = Arc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<RowWithdrawal>>>>;
 
+/// The subscribers to forward releases ([`BoxTable::subscribe_forward_releases`]):
+/// one sender per subscriber. Shared by the registry and every [`BoxTable`]
+/// it hands out. The egress gate subscribes.
+type ForwardReleases = Arc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<ForwardRelease>>>>;
+
+/// How long a caller of [`BoxTable::release_row_forwards`] waits for the
+/// gate's answer. The gate retries a failed unbind on its backoff, which
+/// with a switch that answers slowly can take most of this bound.
+pub const FORWARD_RELEASE_WAIT: Duration = Duration::from_secs(30);
+
 /// How long a client-driven registration waits for a withdrawn box's
 /// revocation to release the addresses it asks for, before it is refused
 /// with [`AllocationError::RevocationPending`]. A revocation that goes well
@@ -372,6 +382,62 @@ impl RowWithdrawal {
     pub fn held_addrs(&self) -> &[[u8; 4]] {
         &self.hold.addrs
     }
+}
+
+/// A request that the forward-release subscriber unbind the declared
+/// forwards of a row that stays live ([`BoxTable::release_row_forwards`]):
+/// the box stopped, and its declared ports must be free before the stop
+/// returns (NET-121: a forwarder is held until the box stops). The row is not
+/// withdrawn, so its addresses are not held against reuse: a new box cannot
+/// register at a live row's address anyway.
+#[derive(Debug)]
+pub struct ForwardRelease {
+    switch_addr: Ipv4Addr,
+    done: std::sync::mpsc::Sender<bool>,
+}
+
+impl ForwardRelease {
+    /// The row's switch address: the address its forwards dial.
+    #[must_use]
+    pub fn switch_addr(&self) -> Ipv4Addr {
+        self.switch_addr
+    }
+
+    /// The release as a revocation the gate's unbind takes: a
+    /// [`RowWithdrawal`] at the row's switch address that holds no address,
+    /// with the sender that reports the result to the waiting caller. The
+    /// caller reads `true` when every forward is unbound.
+    #[must_use]
+    pub fn into_revocation(self) -> (RowWithdrawal, std::sync::mpsc::Sender<bool>) {
+        let withdrawal = RowWithdrawal {
+            switch_addr: self.switch_addr,
+            hold: Arc::new(RevocationHold {
+                addrs: Vec::new(),
+                revoking: Arc::new(Revoking::default()),
+            }),
+        };
+        (withdrawal, self.done)
+    }
+}
+
+/// What [`BoxTable::release_row_forwards`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardReleaseOutcome {
+    /// The gate unbound every declared forward of the row, and terminated
+    /// their connections.
+    Released,
+    /// No live row stands at the switch address: nothing is bound for it.
+    NoRow,
+    /// A row stands at the switch address under another box id or another
+    /// loopback address. It is not the asking box's row, so nothing is
+    /// released.
+    NotTheBox,
+    /// No gate subscribes to releases: nothing can unbind the forwards.
+    NoGate,
+    /// The gate gave up on a forward: it stays bound.
+    GaveUp,
+    /// The gate did not answer within the bound.
+    TimedOut,
 }
 
 /// The hold a [`RowWithdrawal`]'s copies share, released when the last copy
@@ -3204,6 +3270,10 @@ pub struct BoxRegistry {
     /// told the switch address of every row removed, whichever path removed
     /// it. The egress gate subscribes, to unbind a withdrawn box's forwards.
     row_withdrawals: RowWithdrawals,
+    /// The forward-release subscribers
+    /// ([`BoxTable::subscribe_forward_releases`]): the egress gate, which
+    /// unbinds a stopped box's declared forwards while its row stays live.
+    forward_releases: ForwardReleases,
     /// The addresses withdrawn boxes' revocations still hold against reuse
     /// ([`Revoking`]), shared by every clone and every [`BoxTable`].
     revoking: Arc<Revoking>,
@@ -3724,6 +3794,7 @@ impl Clone for BoxRegistry {
             withdrawal_reports: self.withdrawal_reports.clone(),
             withdrawal_reports_rx: Mutex::new(None),
             row_withdrawals: Arc::clone(&self.row_withdrawals),
+            forward_releases: Arc::clone(&self.forward_releases),
             revoking: Arc::clone(&self.revoking),
             switch_book: Arc::clone(&self.switch_book),
             #[cfg(test)]
@@ -3771,6 +3842,7 @@ impl BoxRegistry {
             withdrawal_reports: reports,
             withdrawal_reports_rx: Mutex::new(Some(reports_rx)),
             row_withdrawals: Arc::new(Mutex::new(Vec::new())),
+            forward_releases: Arc::new(Mutex::new(Vec::new())),
             revoking: Arc::new(Revoking::default()),
             switch_book: Arc::new(Mutex::new(SwitchAddressBook::new(subnet))),
             #[cfg(test)]
@@ -6914,6 +6986,7 @@ impl BoxRegistry {
             subnet: self.subnet,
             withdrawal_reports: self.withdrawal_reports.clone(),
             row_withdrawals: Arc::clone(&self.row_withdrawals),
+            forward_releases: Arc::clone(&self.forward_releases),
             revoking: Arc::clone(&self.revoking),
             row_epoch: Arc::clone(&self.row_epoch),
             mirror_ledger: Arc::clone(&self.mirror_ledger),
@@ -8771,6 +8844,7 @@ pub struct BoxTable {
     subnet: SwitchSubnet,
     withdrawal_reports: std::sync::mpsc::Sender<WithdrawalReport>,
     row_withdrawals: RowWithdrawals,
+    forward_releases: ForwardReleases,
     revoking: Arc<Revoking>,
     row_epoch: Arc<AtomicU64>,
     mirror_ledger: MirrorLedgerSlot,
@@ -8820,6 +8894,81 @@ impl BoxTable {
             .expect("the withdrawal subscribers' lock is held only across pushes and sends")
             .push(sender);
         receiver
+    }
+
+    /// Subscribes to forward releases ([`ForwardRelease`]): the receiver
+    /// gets a request each time a caller asks for the declared forwards of a
+    /// live row to be unbound ([`Self::release_row_forwards`]). The egress
+    /// gate subscribes, and answers each request on the sender it carries.
+    /// A subscriber that drops its receiver is pruned on the next request.
+    #[must_use]
+    pub fn subscribe_forward_releases(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<ForwardRelease> {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        self.forward_releases
+            .lock()
+            .expect("the release subscribers' lock is held only across pushes and sends")
+            .push(sender);
+        receiver
+    }
+
+    /// Asks the forward-release subscriber to unbind the declared forwards
+    /// of the live row at `switch_addr`, and waits up to `bound` for its
+    /// answer. The row stays: a stopped box keeps its row, its name and its
+    /// addresses, and only its forwards go (NET-121). The pair and the id
+    /// are the proof, as for a rename: a row at the address under another
+    /// id or another loopback address is not the asking box's row. Blocks
+    /// the calling thread, so call it from a control connection's thread,
+    /// never from the runtime.
+    pub fn release_row_forwards(
+        &self,
+        switch_addr: Ipv4Addr,
+        loopback_addr: Ipv4Addr,
+        box_id: BoxId,
+        bound: Duration,
+    ) -> ForwardReleaseOutcome {
+        let row = self
+            .rows
+            .read()
+            .expect("the row lock is never held across a panic, so it cannot be poisoned")
+            .get(&switch_addr.octets())
+            .filter(|record| !record.is_task_row())
+            .map(Arc::clone);
+        let Some(row) = row else {
+            return ForwardReleaseOutcome::NoRow;
+        };
+        if row.box_id != box_id || row.loopback_addr() != loopback_addr {
+            return ForwardReleaseOutcome::NotTheBox;
+        }
+        let (done, answer) = std::sync::mpsc::channel();
+        let sent = {
+            let mut subscribers = self
+                .forward_releases
+                .lock()
+                .expect("the release subscribers' lock is held only across pushes and sends");
+            subscribers.retain(|subscriber| {
+                subscriber
+                    .send(ForwardRelease {
+                        switch_addr,
+                        done: done.clone(),
+                    })
+                    .is_ok()
+            });
+            !subscribers.is_empty()
+        };
+        drop(done);
+        if !sent {
+            return ForwardReleaseOutcome::NoGate;
+        }
+        match answer.recv_timeout(bound) {
+            Ok(true) => ForwardReleaseOutcome::Released,
+            Ok(false) => ForwardReleaseOutcome::GaveUp,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => ForwardReleaseOutcome::TimedOut,
+            // Every subscriber dropped its request unanswered: the gate
+            // ended while it held the request.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => ForwardReleaseOutcome::NoGate,
+        }
     }
 
     /// Whether a withdrawn box's revocation still holds `addr` against
