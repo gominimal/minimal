@@ -83,8 +83,10 @@
 #                                    --timeout 124, a stopped box refused
 #   attach_ends_on_stop              `min box stop` ends an attach with exit
 #                                    254 and a line that names the stop, never
-#                                    the shell-exit prompt (#3526). T62
-#                                    (#3635) adds the restart step.
+#                                    the shell-exit prompt (#3526). `min box
+#                                    restart` of an until_stopped box ends it
+#                                    with 254 and the restart line, on the
+#                                    first try (#3635).
 #   session_rename                   `min box rename`; rename-to-self refused
 #   session_outbound_request         an outbound request from inside the session (NET-107)
 #   own_ip                           `--network own_ip` tap + switch attach
@@ -500,6 +502,7 @@ TASK_SEED_DIR="" # seeded by the `min task run` proof below; removed on teardown
 TN_SEED_DIR="" # seeded by the task-network proof below; removed on teardown
 TN_LISTENER_PID="" # the task-network proof's host-side http.server; killed on teardown
 HOOK_SEED_DIR="" # seeded by the lifecycle-hooks proof below; removed on teardown
+AE_SEED_DIR="" # seeded by the attach-end proof's restart step; removed on teardown
 PATCH_SRC_DIR="" # patch sources for the patch-modes proof; removed on teardown
 SKIP_SEED_DIR="" # seeded by the skip-lane scaffold proof below; removed on teardown
 OWNIP_SEED_DIR="" # seeded by the own-IP proof below; removed on teardown
@@ -835,7 +838,7 @@ fi
 # VM-backed run must drive the CLI with `--provider local-minvmd`, because
 # the flag is what makes the CLI treat minvmd as minvmd for its OWN
 # bookkeeping too. `GlobalArgs::use_minvmd()`
-# (crates/minimal/src/cli.rs) is a strict check of the flag, and it gates
+# (crates/minimal/src/cli.rs) reads the provider choice, and it gates
 # the box registration with the VM host daemon and its withdrawal (T66,
 # crates/minimal/src/cmd/session.rs): an own_ip box that activates without
 # them runs UNREGISTERED — the guest self-allocates its switch address
@@ -852,11 +855,21 @@ fi
 # e2e-env adds the args on Linux only), so the script supplies the flag
 # for them itself. That default is what #1816 retires; until that fix
 # lands, this branch keeps supplying the flag exactly as it is.
-# An explicit E2E_MINIMAL_ARGS is kept verbatim, and
-# Linux is untouched: a Linux run without provider args is the native
-# lane and must stay exactly that.
-if [ "$(uname -s)" = Darwin ] && [ -z "${E2E_MINIMAL_ARGS:-}" ]; then
-  E2E_MINIMAL_ARGS="--provider local-minvmd"
+# An explicit E2E_MINIMAL_ARGS is kept verbatim. A Linux run without
+# provider args is the native lane and must stay exactly that, so the
+# script names `--provider local` itself: without a flag the CLI would
+# take MIN_PROVIDER, the config's provider key, or the VM provider
+# wherever /dev/kvm opens (resolve_default_provider in
+# crates/minimal/src/cmd/hosts.rs), and a runner with KVM would move the
+# native lane into a VM. MIN_PROVIDER=local holds the same for a `min`
+# call that does not go through E2E_MINIMAL_ARGS; a flag still wins over it.
+if [ -z "${E2E_MINIMAL_ARGS:-}" ]; then
+  if [ "$(uname -s)" = Darwin ]; then
+    E2E_MINIMAL_ARGS="--provider local-minvmd"
+  else
+    E2E_MINIMAL_ARGS="--provider local"
+    export MIN_PROVIDER=local
+  fi
 fi
 #
 # The daemon that name resolves to on THIS run is `minimald` on a native
@@ -1217,6 +1230,7 @@ teardown() {
     TN_LISTENER_PID=""
   fi
   [ -n "$HOOK_SEED_DIR" ] && rm -rf "$HOOK_SEED_DIR"
+  [ -n "$AE_SEED_DIR" ] && rm -rf "$AE_SEED_DIR"
   [ -n "$PATCH_SRC_DIR" ] && rm -rf "$PATCH_SRC_DIR"
   [ -n "$SKIP_SEED_DIR" ] && rm -rf "$SKIP_SEED_DIR"
   [ -n "$OWNIP_SEED_DIR" ] && rm -rf "$OWNIP_SEED_DIR"
@@ -2217,8 +2231,10 @@ if [ "$rc" -ne 2 ] || ! grep -Fq "$stop_sid is stopped. Only a running box can r
   echo "--- stderr ---"; cat "$WORK/box-exec-stopped.err" 2>/dev/null || true
   fail
 fi
-mnl box rm "$stop_sid" </dev/null >"$WORK/box-exec-rm.out" 2>&1 || {
-  echo "::error::'min box rm $stop_sid' failed"
+# --force: without a terminal, min box rm refuses a box whose files it
+# cannot check, and the daemon cannot read the files of a stopped box.
+mnl box rm --force "$stop_sid" </dev/null >"$WORK/box-exec-rm.out" 2>&1 || {
+  echo "::error::'min box rm --force $stop_sid' failed"
   cat "$WORK/box-exec-rm.out" 2>/dev/null || true
   fail
 }
@@ -2237,16 +2253,22 @@ echo "::endgroup::"
 # gominimal/minimal#3526; BCLI-068). The attach runs over a real pty, with a
 # shell that sleeps, so only the stop can end it. The stop ends the attach
 # with exit 254 and one line that names the stop. The shell-exit prompt never
-# shows: the box did not end by its shell.
+# shows: the box did not end by its shell. A restart of a box whose entry
+# sets lifetime = "until_stopped" ends the attach the same way, with the line
+# that names the restart (T62, gominimal/minimal#3635). The restart step runs
+# once, with no retry: the line must be right on the first try.
 
-# Removes the attach-end box, then fails the run, so a later run can reuse
-# the name.
+# Removes the attach-end boxes, then fails the run, so a later run can reuse
+# the names.
 ae_fail() {
   mnl box rm --force "$ae_sid" </dev/null >/dev/null 2>&1 || true
+  if [ -n "${aer_sid:-}" ]; then
+    mnl box rm --force "$aer_sid" </dev/null >/dev/null 2>&1 || true
+  fi
   fail
 }
 
-# $1: the step (stop). $2: the box name. Starts the attach in the
+# $1: the step (stop or restart). $2: the box name. Starts the attach in the
 # background, waits until its shell runs, and sets AE_PID to the driver's pid.
 attach_end_start() {
   local ae_live=""
@@ -2310,7 +2332,45 @@ out="$(cd "$PROJECT_DIR" && mnl session start --detach --name "$ae_name" ${E2E_A
 }
 ae_sid="$(printf '%s\n' "$out" | tail -n1 | tr -d '\r')"
 
-# T62 (gominimal/minimal#3635) adds the restart-while-attached step.
+# T62: a restart ends the attach with exit 254 and one line that names the
+# restart. Only a box whose entry sets lifetime = "until_stopped" restarts,
+# so this step starts one from a project of its own. The restart's stop
+# records the restart before its start runs, so the line is the same whether
+# the attach reads the box stopped or running again. One try, no retry.
+aer_name="e2e-attach-restart"
+aer_sid=""
+AE_SEED_DIR="$(hook_mktemp /tmp/mnlae.XXXXXX)"
+{
+  hook_seed_preamble
+  printf '\n[sessions.ae.box]\nlifetime = "until_stopped"\n'
+} > "$AE_SEED_DIR/minimal.toml"
+mkdir "$AE_SEED_DIR/.git"
+# shellcheck disable=SC2086
+out="$(cd "$AE_SEED_DIR" && mnl session start ae --detach --name "$aer_name" ${E2E_ACTIVATE_ARGS:-} 2>"$WORK/aer-start.err")" || {
+  echo "::error::'min session start ae --detach --name $aer_name' failed for the attach-end proof's restart step"
+  echo "--- stderr ---"; cat "$WORK/aer-start.err" 2>/dev/null || true
+  ae_fail
+}
+aer_sid="$(printf '%s\n' "$out" | tail -n1 | tr -d '\r')"
+attach_end_start restart "$aer_name"
+mnl box restart "$aer_name" </dev/null >"$WORK/ae-restart-cmd.out" 2>&1 || {
+  echo "::error::'min box restart $aer_name' failed while a terminal was attached"
+  cat "$WORK/ae-restart-cmd.out" 2>/dev/null || true
+  kill "$AE_PID" 2>/dev/null || true
+  ae_fail
+}
+attach_end_wait restart "$aer_name"
+aer_line="Detached: $aer_name was restarted. Run min box attach $aer_name to attach again."
+ae_lines="$(grep -cF "$aer_line" "$WORK/ae-restart.out" || true)"
+if [ "$ae_lines" != 1 ]; then
+  echo "::error::the attach that the restart ended printed '$aer_line' $ae_lines times (expected once)"
+  echo "--- transcript ---"; cat "$WORK/ae-restart.out" 2>/dev/null || true
+  ae_fail
+fi
+echo "restart while attached: exit 254, one line that names the restart"
+mnl box rm --force "$aer_sid" </dev/null >/dev/null 2>&1 || true
+aer_sid=""
+rm -rf "$AE_SEED_DIR"; AE_SEED_DIR=""
 
 # T57: a stop ends the attach with exit 254 and one line that names the stop.
 attach_end_start stop "$ae_name"
@@ -3794,8 +3854,24 @@ proof_host_ip_deny_all() {
         | sed -n 's/^MINIMAL_CLASSIFIER_COVER=//p' | head -n1 || true)"
       if [ -n "$hida_cover" ]; then hida_cover_pid="$hida_pid_m"; break; fi
     done
+    # Here the tree the launch binds is the host's own cgroup2, mounted with
+    # nsdelegate (the installer's mount check above refuses any other), and
+    # the slice delegates memory. The first cgroup2 mount meets the bind's
+    # superblock and is refused with EBUSY. The retry over the fallback
+    # tmpfs is what lands the design's cover, so a CI native lane requires
+    # it: a fallback here means that retry no longer lands. The e2e never
+    # sets the sandbox's forced-fallback knob, so only a host that refuses
+    # the mount itself explains a fallback, and only off CI.
     case "$hida_cover" in
-      cgroup2 | tmpfs-fallback) ;;
+      cgroup2) ;;
+      tmpfs-fallback)
+        if [ -n "${CI:-}" ]; then
+          echo "::error::the box in boxes/deny/$hida_sid got MINIMAL_CLASSIFIER_COVER=tmpfs-fallback, not cgroup2: on this native lane the classifier tree is the host's own cgroup2, and the cgroup2 cover must land"
+          hida_log '"cover":"tmpfs-fallback"' | tail -n 3
+          fail
+        fi
+        echo "::warning::the box in boxes/deny/$hida_sid got MINIMAL_CLASSIFIER_COVER=tmpfs-fallback, not cgroup2: this host refused the cgroup2 cover"
+        ;;
       *)
         echo "::error::no process in the box's leaf boxes/deny/$hida_sid carries a classifier cover in its environment (MINIMAL_CLASSIFIER_COVER='$hida_cover'): the cover is the one fact the box can report for itself"
         fail
@@ -7003,9 +7079,11 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
       fail
     fi
     for tk_i in $(seq 1 20); do
-      mnl box rm "$tk_name" >/dev/null 2>"$WORK/task-rm.err" && break
+      # --force: off a terminal, the gate for changed files refuses a box
+      # that is not running, because the daemon cannot read its files.
+      mnl box rm --force "$tk_name" </dev/null >/dev/null 2>"$WORK/task-rm.err" && break
       if [ "$tk_i" -eq 20 ]; then
-        echo "::error::'min box rm $tk_name' failed after 'min task run $tk_task'"
+        echo "::error::'min box rm --force $tk_name' failed after 'min task run $tk_task'"
         cat "$WORK/task-rm.err" 2>/dev/null || true
         fail
       fi
@@ -7118,8 +7196,9 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     mnl ls 2>&1 || true
     fail
   fi
-  if ! mnl box rm "$ti_name" >/dev/null 2>"$WORK/task-int-rm.err"; then
-    echo "::error::'min box rm $ti_name' failed after an interrupted run"
+  # --force: off a terminal, the gate for changed files refuses a stopped box.
+  if ! mnl box rm --force "$ti_name" </dev/null >/dev/null 2>"$WORK/task-int-rm.err"; then
+    echo "::error::'min box rm --force $ti_name' failed after an interrupted run"
     cat "$WORK/task-int-rm.err" 2>/dev/null || true
     fail
   fi
@@ -7133,10 +7212,13 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   # headless and names the flag, so a script cannot remove a live box by
   # accident (BCLI-004).
   #
-  # Changed assertion: this step used to write into the box and assert that a
-  # headless remove without --force refused a box with changed files. `min box
-  # rm` has no gate for changed files yet. T63 (gominimal/minimal#3638) adds
-  # that gate and moves this step back to it.
+  # The dirty gate: a file written into the box puts its work at risk. Once
+  # the box is stopped, a headless `min box rm` without --force exits 2,
+  # names --force and keeps the box (BCLI-004). The daemon cannot read the
+  # files of a stopped box, so the gate refuses it as unchecked, which is
+  # the same refusal a changed box gets. When gominimal/inbox#1295 lets the
+  # daemon read a stopped box's files, this step asserts the
+  # `has changed files` text.
   sr_sid="$(cd "$TASK_SEED_DIR" && mnl session start --detach --no-input \
     --name e2e-task-sr 2>"$WORK/session-rm-start.err")" || {
     echo "::error::'min session start' for the box rm refusal step failed"
@@ -7144,15 +7226,32 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     fail
   }
   sr_sid="$(printf '%s\n' "$sr_sid" | tail -n1 | tr -d '\r')"
-  if mnl box rm "$sr_sid" >/dev/null 2>"$WORK/rm-refuse.err"; then
+  mnl box exec "$sr_sid" -- sh -c 'echo dirty > e2e-dirty-gate' </dev/null >/dev/null 2>"$WORK/dirty-write.err" \
+    || { echo "::error::could not write a file in box $sr_sid"; cat "$WORK/dirty-write.err" 2>/dev/null || true; fail; }
+  if mnl box rm "$sr_sid" </dev/null >/dev/null 2>"$WORK/rm-refuse.err"; then
     echo "::error::headless 'min box rm' of a running box without --force should refuse"
     fail
   fi
   grep -q -- "--force" "$WORK/rm-refuse.err" \
     || { echo "::error::the refusal of 'min box rm' does not name --force"; cat "$WORK/rm-refuse.err" 2>/dev/null || true; fail; }
-  mnl box rm --force "$sr_sid" >/dev/null 2>&1 \
-    || { echo "::error::'min box rm --force $sr_sid' failed"; fail; }
   echo "min box rm refused a running box without --force OK"
+  mnl box stop "$sr_sid" </dev/null >"$WORK/dirty-stop.out" 2>&1 \
+    || { echo "::error::'min box stop $sr_sid' failed"; cat "$WORK/dirty-stop.out" 2>/dev/null || true; fail; }
+  mnl box rm "$sr_sid" </dev/null >/dev/null 2>"$WORK/dirty-refuse.err"
+  rc=$?
+  if [ "$rc" -ne 2 ] || ! grep -q -- "--force" "$WORK/dirty-refuse.err"; then
+    echo "::error::headless 'min box rm $sr_sid' of a stopped box with a changed file exited $rc (expected 2 and a refusal that names --force)"
+    cat "$WORK/dirty-refuse.err" 2>/dev/null || true
+    fail
+  fi
+  listed="$(mnl ls --raw 2>/dev/null || true)"
+  if ! printf '%s\n' "$listed" | grep -Fqx "$sr_sid"; then
+    echo "::error::the dirty gate refused 'min box rm $sr_sid', but the box is not listed any more"
+    fail
+  fi
+  mnl box rm --force "$sr_sid" </dev/null >/dev/null 2>&1 \
+    || { echo "::error::'min box rm --force $sr_sid' failed"; fail; }
+  echo "dirty gate refused headless min box rm of a changed box OK"
 
   # Unknown task: an instant client-side error listing what IS declared.
   if (cd "$TASK_SEED_DIR" && mnl task run no-such-task >/dev/null 2>"$WORK/task-unknown.err"); then
@@ -7412,7 +7511,7 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
       return 0
     fi
     for _ in $(seq 1 20); do
-      mnl box rm "$tn_kept" >/dev/null 2>&1 && return 0
+      mnl box rm --force "$tn_kept" </dev/null >/dev/null 2>&1 && return 0
       sleep 0.5
     done
     echo "::warning::'min box rm $tn_kept' failed after the task-run leg"
@@ -14066,7 +14165,7 @@ bep_live_gate() {
   local lg_control="$HOME/.minimal/bep/control.sock" lg_status lg_try
   local lg_log="$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log"
   if [ "$(uname -s)" != "Darwin" ]; then
-    not_run "$1" "the Box Egress Proxy runs on macOS only"
+    not_run "$1" "the live Box Egress Proxy cases run on macOS lanes only; Linux: https://github.com/gominimal/minimal/issues/3652"
     return 1
   fi
   if [ -z "$E2E_VM" ] || [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
@@ -14127,9 +14226,9 @@ bep_live_gate() {
 # Egress Proxy running, two boxes that declare a GitHub grant start one after
 # the other, headless, and neither asks for a sign-in. Each creation mints a
 # sealed sign-in reference and registers the box with the proxy, so the second
-# box reuses the sign-in the first one found. `bep serve` runs on macOS only,
-# and the case needs a sign-in a person made with `min auth login`, so a lane
-# without both records it as NOT RUN.
+# box reuses the sign-in the first one found. The live proxy cases run on
+# macOS lanes only, and the case needs a sign-in a person made with `min auth
+# login`, so a lane without both records it as NOT RUN.
 proof_bep_second_box_needs_no_sign_in() {
   echo "::group::GitHub grant boxes: the second box needs no sign-in"
   bep_live_gate bep_second_box_needs_no_sign_in || { echo "::endgroup::"; return 0; }
@@ -15902,8 +16001,9 @@ proof_bep_revoke_and_sign_out_end_to_end() {
 # the gvproxy switch. A box on a credentialed lane with the default `dns`
 # steering and `quic443 = "block"` starts. Where a Box Egress Proxy runs, an A
 # lookup of api.github.com must first get an address. Then the case stops the
-# proxy (`bep serve`, which minvmd starts on macOS only, so elsewhere no proxy
-# runs and it is down from the start) and, from inside the box:
+# proxy (`bep serve`, which minvmd starts when a bep binary is beside it, so
+# on a lane without one no proxy runs and it is down from the start) and,
+# from inside the box:
 #   1. an A lookup of api.github.com, a steered name, must be answered
 #      SERVFAIL (rcode 2) by the box's resolver, never by real DNS (BEP-062);
 #   2. AAAA, HTTPS and SVCB lookups of it must be NODATA: rcode 0, no
@@ -26597,8 +26697,9 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     fi
     # The ended box keeps its record (BOX-038). Remove it, so no later case
     # finds it listed.
-    if ! po_rm_out="$(mnl box rm "$po_task_box" </dev/null 2>&1)"; then
-      echo "::error::min box rm $po_task_box failed for the ended run box"
+    # --force: off a terminal, the gate for changed files refuses an ended box.
+    if ! po_rm_out="$(mnl box rm --force "$po_task_box" </dev/null 2>&1)"; then
+      echo "::error::min box rm --force $po_task_box failed for the ended run box"
       printf '%s\n' "$po_rm_out"
       fail
     fi

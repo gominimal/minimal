@@ -9272,7 +9272,7 @@ async fn drain_attach(channel: &mut russh::Channel<russh::client::Msg>) -> (Stri
     (String::from_utf8_lossy(&seen).into_owned(), exit_status)
 }
 
-/// BCLI-068: a stop or a removal while a client is attached ends the
+/// BCLI-068: a stop, a restart or a removal while a client is attached ends the
 /// attach from the daemon's side. The box's entrypoint does not end the box
 /// here, so a shell that exits on its own raises the shell-exit prompt. A
 /// stop signals that same shell, and a removal kills it, but the host knows
@@ -9280,7 +9280,7 @@ async fn drain_attach(channel: &mut russh::Channel<russh::client::Msg>) -> (Stri
 /// "Disconnecting - …" line, and ends with the daemon-ended status, 254.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stop_while_attached_ends_binding_without_shell_exit_prompt() {
-    for end in [BoxEnd::Stop, BoxEnd::Removal] {
+    for end in [BoxEnd::Stop, BoxEnd::Restart, BoxEnd::Removal] {
         let (host, handle) = Host::build(
             MockLauncher::default(),
             HostParams {
@@ -9325,7 +9325,7 @@ async fn stop_while_attached_ends_binding_without_shell_exit_prompt() {
         // then ends the shell as each one does.
         handle.announce_end(end).await;
         match end {
-            BoxEnd::Stop => {
+            BoxEnd::Stop | BoxEnd::Restart => {
                 let pid = handle
                     .get_attrs()
                     .await
@@ -9426,6 +9426,162 @@ async fn an_exec_and_a_hook_into_a_placed_box_join_its_leaf() {
         "a hook into a host-address box takes the UDP 443 check"
     );
     assert_eq!(hook.box_id, host.session_id.to_string());
+}
+
+/// BCLI-068: the stop half of `min box restart` records the `restart`
+/// ending reason on its `exited` event before the restart starts the box
+/// again. A client whose attach the restart ended can read the box
+/// `stopped` between the stop and the start. The event then already names
+/// the restart. A start that fails leaves the box stopped with that event
+/// last. A start that succeeds writes `started` after it. A plain stop
+/// records no such reason. The binding ends a restarted attach with 254, as
+/// it does for a stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_records_restart_reason_before_start() {
+    use crate::box_actor::{STOPPED_BY, STOPPED_BY_RESTART};
+    use boxes::core::record::RecordState;
+    use boxes::events::{BoxEvent, BoxEventType};
+
+    const GRACE: Duration = Duration::from_secs(2);
+
+    assert_eq!(
+        MainloopExitReason::BoxEnded(BoxEnd::Restart).exit_status(),
+        DAEMON_ENDED_EXIT_STATUS
+    );
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+    spec.lifetime = mfile::spec::Lifetime::UntilStopped;
+    spec.pty_enabled = true;
+    let mut req = crate::test_harness::create_session_req("restart-reason", "/uwu");
+    req.spec = Some(serde_json_lenient::to_value(&spec).expect("a spec serializes"));
+    let id = client
+        .call::<minimald_rpc::CreateSession>(&req)
+        .await
+        .unwrap()
+        .id;
+    crate::test_harness::unwrap_ready(
+        client
+            .call::<minimald_rpc::ConfigureLoadout>(&minimald_rpc::ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    match client
+        .call::<minimald_rpc::FinalizeSession>(&minimald_rpc::FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
+        .await
+    {
+        minimald_rpc::Errorable::Ok(_) => {}
+        minimald_rpc::Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+    }
+
+    let manager = server.state.sessions_manager().await;
+    let events = || async { manager.box_events(id).await.unwrap().read_new().unwrap() };
+    let record_state = || async {
+        manager
+            .get_record(crate::box_manager::BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the box keeps its record")
+            .state()
+            .unwrap()
+    };
+    // The client reads these exact strings (`ends_of` in `min`, pinned by
+    // `attach_ended_by_restart_names_restart_exit254`). Pin the wire text here
+    // too, so a change on either side fails a test.
+    assert_eq!((STOPPED_BY, STOPPED_BY_RESTART), ("stopped_by", "restart"));
+    let by_restart =
+        |event: &BoxEvent| event.data.get("stopped_by").and_then(|v| v.as_str()) == Some("restart");
+    manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves")
+        .ensure_host("tester".to_string())
+        .await
+        .expect("a running box launches a headless host");
+
+    // The start fails: what the stop half recorded is all there is, so it
+    // was recorded before the start.
+    let before = events().await.len();
+    crate::box_actor::restart_launch_seam::fail_next(id);
+    match manager.restart_box_with_grace(id, GRACE).await {
+        Err(crate::box_actor::RestartError::Failed(_)) => {}
+        other => panic!("the restart's start did not fail: {other:?}"),
+    }
+    let RecordState::Stopped(_) = record_state().await else {
+        panic!("a failed start leaves the box stopped");
+    };
+    let added = events().await.split_off(before);
+    let kinds: Vec<_> = added.iter().map(|event| event.kind).collect();
+    assert_eq!(kinds, [BoxEventType::Exited], "{added:?}");
+    assert_eq!(added[0].data["reason"], "stopped", "{added:?}");
+    assert!(
+        by_restart(&added[0]),
+        "the stop half names the restart: {added:?}"
+    );
+
+    // The actor ended with the failed start. The next restart starts the
+    // box from stopped, and so has no stop half.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let restarted = loop {
+        match manager.restart_box_with_grace(id, GRACE).await {
+            Err(crate::box_actor::RestartError::Failed(error))
+                if error
+                    .to_string()
+                    .contains("ended before its restart finished")
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            other => break other,
+        }
+    };
+    assert!(!restarted.expect("the box starts from stopped"));
+    assert_eq!(record_state().await, RecordState::Running);
+
+    // A restart of the running box records the restart, then `started`.
+    let before = events().await.len();
+    assert!(
+        manager
+            .restart_box_with_grace(id, GRACE)
+            .await
+            .expect("the running box restarts"),
+        "the restart stopped a running box"
+    );
+    assert_eq!(record_state().await, RecordState::Running);
+    let added = events().await.split_off(before);
+    let exited = added
+        .iter()
+        .position(|event| event.kind == BoxEventType::Exited)
+        .unwrap_or_else(|| panic!("the stop half recorded its end: {added:?}"));
+    let started = added
+        .iter()
+        .rposition(|event| event.kind == BoxEventType::Started)
+        .unwrap_or_else(|| panic!("the start recorded `started`: {added:?}"));
+    assert!(exited < started, "{added:?}");
+    assert!(by_restart(&added[exited]), "{added:?}");
+
+    // A plain stop names no restart.
+    let before = events().await.len();
+    manager
+        .stop_box_with_grace(id, false, GRACE)
+        .await
+        .expect("the box stops");
+    let added = events().await.split_off(before);
+    let exited: Vec<_> = added
+        .iter()
+        .filter(|event| event.kind == BoxEventType::Exited)
+        .collect();
+    assert_eq!(exited.len(), 1, "{added:?}");
+    assert_eq!(exited[0].data["reason"], "stopped", "{added:?}");
+    assert!(exited[0].data.get(STOPPED_BY).is_none(), "{added:?}");
 }
 
 /// NET-079: the supervisor's placement is confirmed by the leaf's own
