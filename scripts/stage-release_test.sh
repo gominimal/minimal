@@ -305,7 +305,8 @@ fi
 
 # #2498: minvmd starts the Box Egress Proxy from beside its own binary, so the
 # darwin manifest puts bin/bep next to bin/minvmd: a link to the program in
-# bin/bep.app (#2812, checked with the bundle rows below). Linux has none.
+# bin/bep.app (#2812, checked with the bundle rows below). Linux ships bep as
+# a plain file beside minvmd, for each arch.
 if [ -n "$(printf '%s\n' "$bundle_out" | awk '$1 == "bep" && $2 == "darwin" && $3 == "arm64" \
         && $6 == "symlink" && $7 == "bin/bep" && $8 == "bep.app/Contents/MacOS/bep"')" ] \
     && [ -n "$(printf '%s\n' "$bundle_out" | awk '$1 == "minvmd" && $2 == "darwin" && $7 == "bin/minvmd"')" ]; then
@@ -313,11 +314,16 @@ if [ -n "$(printf '%s\n' "$bundle_out" | awk '$1 == "bep" && $2 == "darwin" && $
 else
     bad "no darwin row puts bin/bep beside bin/minvmd (out: $bundle_out)"
 fi
-if [ -z "$(printf '%s\n' "$bundle_out" | awk '$1 ~ /^bep/ && $2 == "linux"')" ]; then
-    ok "the manifest carries no linux bep row"
-else
-    bad "the manifest carries a linux bep row (out: $bundle_out)"
-fi
+for arch in amd64 arm64; do
+    if [ -n "$(printf '%s\n' "$bundle_out" | awk -v arch="$arch" '$1 == "bep" && $2 == "linux" \
+            && $3 == arch && $6 == "file" && $7 == "bin/bep" && $8 ~ ("/bep-linux-" arch "$")')" ] \
+        && [ -n "$(printf '%s\n' "$bundle_out" | awk -v arch="$arch" '$1 == "minvmd" && $2 == "linux" \
+            && $3 == arch && $7 == "bin/minvmd"')" ]; then
+        ok "the linux $arch manifest puts bin/bep beside bin/minvmd"
+    else
+        bad "no linux $arch row puts bin/bep beside bin/minvmd (out: $bundle_out)"
+    fi
+done
 
 # The bundle stages whole or not at all: with one of its files missing and
 # the rest present, the stage fails naming the missing file and uploads

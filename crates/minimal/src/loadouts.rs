@@ -175,7 +175,7 @@ const BUILTIN_DEFAULT_TOML: &str = r#"
 name = "default"
 description = "orientation banner and shaped prompt"
 
-[vars]
+[env_vars]
 PROMPT_COMMAND = 'eval "$MINIMAL_MOTD"; unset PROMPT_COMMAND MINIMAL_MOTD'
 PS1 = 'minimal:\w\$ '
 MINIMAL_MOTD = '''
@@ -295,8 +295,14 @@ pub(crate) fn resolve_active_loadouts(
             // BCLI-034: a loadout name with no loadout file is not found
             // (exit 4), from `--loadout` and `default_loadouts` alike. The
             // text is the same as before.
-            boxes::client::disk::load_loadout(loadouts_dir.as_utf8_path().as_std_path(), &name)
-                .map(|(loadout, _layout)| loadout)
+            let dir = loadouts_dir.as_utf8_path().as_std_path();
+            // The loadout keeps its file, so a refusal of its keys names
+            // the file (BOX-206, BOX-207).
+            boxes::client::disk::load_loadout(dir, &name)
+                .map(|(loadout, layout)| {
+                    let path = layout.path_for(dir, &name);
+                    loadout.with_path(path)
+                })
                 .map_err(|e| match e {
                     boxes::client::disk::LoadError::NotFound { .. } => {
                         anyhow::Error::new(LoadoutNotFound {
@@ -775,6 +781,14 @@ pub(crate) fn prepare_activation_inputs_with_config(
         }
         .into());
     }
+    // BOX-206, BOX-207: a loadout that sets `vars` or `vars_lenient`, or a
+    // variable name that is not POSIX-shaped, is refused here as the
+    // expansion refuses it, so a start with no minimal.toml refuses it too.
+    for loadout in &active.loadouts {
+        let layer = crate::loadout_layer(loadout, None)?;
+        mfile::expand::check_loadout_vars(&layer)
+            .map_err(|error| crate::ProjectFileInvalid { error })?;
+    }
     let loadout_names = active
         .loadouts
         .iter()
@@ -1199,7 +1213,7 @@ mod tests {
 name = "dev"
 packages = ["helix"]
 
-[vars]
+[env_vars]
 EDITOR = "hx"
 
 [[lifecycle_hooks]]
@@ -1275,6 +1289,25 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
     /// [`builtin_default_loadout`]) and has the shape the banner
     /// feature promises: no packages, no lifecycle hooks, and the three
     /// MOTD/prompt vars — no task or run-target lines.
+    // BOX-205: the built-in default loadout sets its variables in
+    // `[env_vars]`, so the expansion has nothing to refuse and a fresh
+    // install's box still gets the orientation banner.
+    #[test]
+    fn builtin_default_loadout_sets_env_vars() {
+        let table: toml::Table = toml::from_str(BUILTIN_DEFAULT_TOML).expect("parses");
+        assert!(table.contains_key("env_vars"), "{table:?}");
+        assert!(!table.contains_key("vars") && !table.contains_key("vars_lenient"));
+        let l = builtin_default_loadout();
+        assert_eq!(l.retired_var_keys().count(), 0);
+        let names: Vec<&str> = l.vars().keys().map(AsRef::as_ref).collect();
+        assert_eq!(names, ["MINIMAL_MOTD", "PROMPT_COMMAND", "PS1"]);
+        // The layer the expansion takes carries the banner, and passes.
+        let layer = crate::loadout_layer(&l, None).expect("the layer");
+        mfile::expand::check_loadout_vars(&layer).expect("nothing to refuse");
+        let vars = layer.table["env_vars"].as_table().expect("a table");
+        assert!(vars.contains_key("MINIMAL_MOTD") && vars.contains_key("PROMPT_COMMAND"));
+    }
+
     #[test]
     fn builtin_default_loadout_has_banner_shape() {
         let l = builtin_default_loadout();

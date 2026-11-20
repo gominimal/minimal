@@ -339,6 +339,109 @@ pub(crate) fn injection_leaf(
     }
 }
 
+/// Builds the command that runs `injection` in the box `box_id`, placed in
+/// the box's classifier leaf `leaf`. Every process the daemon injects into a
+/// box takes this path, an exec and a lifecycle hook alike, so none of them
+/// runs in the daemon's own leaf (NET-079). `host_ip_enforced` says whether
+/// the box runs with host-address enforcement, which is what makes it a
+/// member of the `host_ip` cohort `cohort`: the daemon's one
+/// ([`crate::net::classifier::cohort_quic443`]) outside tests.
+///
+/// # Errors
+///
+/// The injection's own errors; see [`crate::nsenter::Injection::command`].
+pub(crate) fn placed_injection_command(
+    injection: crate::nsenter::Injection,
+    box_id: &str,
+    leaf: Option<&sandbox::config::ClassifierLeaf>,
+    host_ip_enforced: bool,
+    cohort: &'static std::sync::Mutex<crate::net::classifier::CohortQuic443>,
+) -> Result<std::process::Command, crate::nsenter::NsenterError> {
+    // NET-079: the box's leaf, so the injected process joins it in the
+    // shim before it joins the namespaces — the only place the join can
+    // happen from (see [`Injection::with_classifier_leaf`]). BEP-018:
+    // while the `host_ip` cohort blocks UDP 443, the cohort's blocked
+    // leaf instead, so an exec or a hook cannot escape the block.
+    let box_id = box_id.to_string();
+    let (joined_leaf, adopt) = injection_leaf(&box_id, leaf.cloned(), cohort);
+    let injection = match joined_leaf {
+        Some(leaf) => injection.with_classifier_leaf(leaf),
+        None => injection,
+    };
+    let mut command = injection.command()?;
+    // BEP-018: once the shim is in its leaf, the cohort is checked again
+    // under its lock. A shim in the blocked leaf is recorded under this
+    // box, so it and the program it forks go home when the block lifts.
+    // A shim in the box's own leaf moves into the blocked leaf when a
+    // blocking member's admit ran between `injection_leaf` and the join.
+    // A box without host-address enforcement never joins the cohort
+    // (`join_quic443_cohort`), so the check can change nothing for it
+    // and its injection does not wait for the join.
+    let own = leaf
+        .filter(|_| host_ip_enforced)
+        .map(|leaf| leaf.dir().to_path_buf());
+    let session_id = box_id.clone();
+    if let Some(own) = own
+        && let Err(error) = report_spawned_pid(&mut command, move |pid| {
+            // Pinned first: the shim can exit and its pid be reused
+            // while the check waits.
+            // Only `ESRCH` says the shim is gone. After any other pin
+            // error the shim can still run, so `/proc` says whether it
+            // does, and a refusal stops it by its pid. The shim is the
+            // daemon's unreaped child, so its pid is not free for reuse.
+            let pin = pin_pid(pid);
+            let gone = pin
+                .as_ref()
+                .is_err_and(|error| error.raw_os_error() == Some(libc::ESRCH));
+            let shim = pin.ok();
+            let moves = crate::net::classifier::KernelMoves;
+            let blocked = cohort
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .blocked_leaf()
+                .map(std::path::Path::to_path_buf);
+            let mut leaves = vec![own.as_path()];
+            leaves.extend(blocked.as_deref());
+            let alive = || match &shim {
+                Some(shim) => !pinned_exited(shim),
+                None => !gone && proc_alive(pid),
+            };
+            let joined = wait_for_injection_join(pid, &leaves, &moves, alive, INJECTION_JOIN_WAIT);
+            // A shim that is gone cannot join `own` later, so what it
+            // forked before it went is still moved.
+            let joined = joined || !alive();
+            if let Err(refused) =
+                settle_injection(&box_id, pid, adopt, joined, &own, cohort, &moves)
+            {
+                match &shim {
+                    Some(shim) => kill_pinned(shim),
+                    None if !gone => kill_unpinned(pid),
+                    None => {}
+                }
+                let stopped = stop_stranded(&refused.stranded, &own, &moves);
+                tracing::warn!(
+                    box_id,
+                    shim_pid = pid,
+                    pid = refused.pid,
+                    error = %refused.error,
+                    ?stopped,
+                    "cannot move a process injected into a host-address box into the \
+                     UDP 443 blocked leaf; the injection is stopped"
+                );
+            }
+        })
+    {
+        tracing::warn!(
+            %session_id,
+            %error,
+            "cannot check a process injected under the host-address cohort's UDP 443 \
+             block after it joins its leaf; it can escape the block or stay blocked \
+             when the block lifts"
+        );
+    }
+    Ok(command)
+}
+
 /// How long the daemon waits for an injected shim to join its classifier
 /// leaf before it checks the `host_ip` cohort again anyway (BEP-018).
 #[cfg_attr(test, allow(dead_code))]
@@ -1037,21 +1140,22 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         let injection = crate::nsenter::Injection::new(self.session_leader_pid()?, program, args)
             .with_cwd(environment.cwd)
             .with_env(vars);
-        // NET-079: the box's leaf, so the injected process joins it in the
-        // shim before it joins the namespaces — the only place the join can
-        // happen from (see [`Injection::with_classifier_leaf`]). BEP-018:
-        // while the `host_ip` cohort blocks UDP 443, the cohort's blocked
-        // leaf instead, so an exec or a hook cannot escape the block.
-        let box_id = self.session_id.to_string();
-        let (leaf, adopt) = injection_leaf(
-            &box_id,
-            self.leaf.clone(),
-            crate::net::classifier::cohort_quic443(),
-        );
-        let injection = match leaf {
-            Some(leaf) => injection.with_classifier_leaf(leaf),
-            None => injection,
-        };
+        self.injected_command(injection)
+    }
+
+    /// The command that runs `injection` in this box: sealed as the box's
+    /// launch is, and placed in the box's classifier leaf (NET-079), with
+    /// the `host_ip` cohort's UDP 443 check (BEP-018). Built apart from
+    /// [`Self::command_in_session`] so a test can build it: under test that
+    /// method builds a host-side command instead.
+    ///
+    /// # Errors
+    ///
+    /// The injection's own errors; see [`crate::nsenter::Injection::command`].
+    fn injected_command(
+        &self,
+        injection: crate::nsenter::Injection,
+    ) -> Result<std::process::Command, crate::nsenter::NsenterError> {
         // Every injection is sealed: a none box's full seal is named
         // explicitly, and any other box's confined-families seal is the
         // shim's default — either way the shim reinstalls the filter the
@@ -1061,81 +1165,13 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         } else {
             injection
         };
-        let mut command = injection.command()?;
-        // BEP-018: once the shim is in its leaf, the cohort is checked again
-        // under its lock. A shim in the blocked leaf is recorded under this
-        // box, so it and the program it forks go home when the block lifts.
-        // A shim in the box's own leaf moves into the blocked leaf when a
-        // blocking member's admit ran between `injection_leaf` and the join.
-        // A box without host-address enforcement never joins the cohort
-        // (`join_quic443_cohort`), so the check can change nothing for it
-        // and its injection does not wait for the join.
-        let own = self
-            .leaf
-            .as_ref()
-            .filter(|_| self.attrs.host_ip_enforcement.is_some())
-            .map(|leaf| leaf.dir().to_path_buf());
-        if let Some(own) = own
-            && let Err(error) = report_spawned_pid(&mut command, move |pid| {
-                // Pinned first: the shim can exit and its pid be reused
-                // while the check waits.
-                // Only `ESRCH` says the shim is gone. After any other pin
-                // error the shim can still run, so `/proc` says whether it
-                // does, and a refusal stops it by its pid. The shim is the
-                // daemon's unreaped child, so its pid is not free for reuse.
-                let pin = pin_pid(pid);
-                let gone = pin
-                    .as_ref()
-                    .is_err_and(|error| error.raw_os_error() == Some(libc::ESRCH));
-                let shim = pin.ok();
-                let moves = crate::net::classifier::KernelMoves;
-                let cohort = crate::net::classifier::cohort_quic443();
-                let blocked = cohort
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .blocked_leaf()
-                    .map(std::path::Path::to_path_buf);
-                let mut leaves = vec![own.as_path()];
-                leaves.extend(blocked.as_deref());
-                let alive = || match &shim {
-                    Some(shim) => !pinned_exited(shim),
-                    None => !gone && proc_alive(pid),
-                };
-                let joined =
-                    wait_for_injection_join(pid, &leaves, &moves, alive, INJECTION_JOIN_WAIT);
-                // A shim that is gone cannot join `own` later, so what it
-                // forked before it went is still moved.
-                let joined = joined || !alive();
-                if let Err(refused) =
-                    settle_injection(&box_id, pid, adopt, joined, &own, cohort, &moves)
-                {
-                    match &shim {
-                        Some(shim) => kill_pinned(shim),
-                        None if !gone => kill_unpinned(pid),
-                        None => {}
-                    }
-                    let stopped = stop_stranded(&refused.stranded, &own, &moves);
-                    tracing::warn!(
-                        box_id,
-                        shim_pid = pid,
-                        pid = refused.pid,
-                        error = %refused.error,
-                        ?stopped,
-                        "cannot move a process injected into a host-address box into the \
-                         UDP 443 blocked leaf; the injection is stopped"
-                    );
-                }
-            })
-        {
-            tracing::warn!(
-                session_id = %self.session_id,
-                %error,
-                "cannot check a process injected under the host-address cohort's UDP 443 \
-                 block after it joins its leaf; it can escape the block or stay blocked \
-                 when the block lifts"
-            );
-        }
-        Ok(command)
+        placed_injection_command(
+            injection,
+            &self.session_id.to_string(),
+            self.leaf.as_ref(),
+            self.attrs.host_ip_enforcement.is_some(),
+            crate::net::classifier::cohort_quic443(),
+        )
     }
 
     /// Under test, build a plain host-side command instead of injecting into
@@ -1193,20 +1229,9 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                 return None;
             }
         };
-        let environment = self.guard.command_environment();
         Some(HookPlan {
             event,
-            commands: crate::hooks::InjectedCommands {
-                leader_pid,
-                cwd: environment.cwd,
-                vars: environment.vars,
-                // A hook joins the namespaces rather than being forked from the
-                // filtered shell, so the box's seal has to be handed to it the
-                // same way the interactive attach path hands it to an injected
-                // command: the none box's full seal by flag, the shim's
-                // confined-families default for the rest.
-                seal_none_box: self.seal_injection,
-            },
+            commands: self.hook_commands(leader_pid),
             composition,
             session_id: self.session_id,
             session_name: self.session_name.clone(),
@@ -1214,6 +1239,28 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             workspace: self.workspace_dir.clone(),
             output: crate::hooks::HookOutput::Tty(self.tty_path.clone()),
         })
+    }
+
+    /// How a hook of this box is injected into it, by joining the
+    /// namespaces of `leader_pid`, the box's session leader.
+    fn hook_commands(&self, leader_pid: u32) -> crate::hooks::InjectedCommands {
+        let environment = self.guard.command_environment();
+        crate::hooks::InjectedCommands {
+            leader_pid,
+            cwd: environment.cwd,
+            vars: environment.vars,
+            // A hook joins the namespaces rather than being forked from the
+            // filtered shell, so the box's seal has to be handed to it the
+            // same way the interactive attach path hands it to an injected
+            // command: the none box's full seal by flag, the shim's
+            // confined-families default for the rest.
+            seal_none_box: self.seal_injection,
+            // NET-079: a hook runs in the box's leaf, as an exec does.
+            box_id: self.session_id.to_string(),
+            leaf: self.leaf.clone(),
+            host_ip_enforced: self.attrs.host_ip_enforcement.is_some(),
+            cohort: crate::net::classifier::cohort_quic443(),
+        }
     }
 
     /// Snapshot a plan and run it, if there is anything to run.

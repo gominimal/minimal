@@ -658,21 +658,54 @@ fn wait_for_vm_stopped_at(dir: &std::path::Path, timeout: std::time::Duration) -
     }
 }
 
-/// The refusal of `min box rm` for a running box without `--force`
-/// (BCLI-004, BOX-019). `target` is the box as the user named it.
+/// The refusal of `min box rm` without `--force` (BCLI-004, BOX-019): for
+/// a running box, and off a terminal for a box whose files changed or could
+/// not be checked. `target` is the box as the user named it. The type keeps
+/// its name because `main` maps it to exit 2 by that name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoxRunningRefusal {
     pub(crate) target: String,
+    cause: RmRefusalCause,
+}
+
+/// Why `min box rm` without `--force` refused the box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RmRefusalCause {
+    /// The box is running.
+    Running,
+    /// The box has changed files, and no person was there to confirm.
+    ChangedFiles,
+    /// The box's files could not be checked, and no person was there to
+    /// confirm.
+    Unchecked,
 }
 
 impl BoxRunningRefusal {
     /// The exit code `min box rm` ends with on this refusal.
     pub const EXIT_CODE: u8 = 2;
 
-    /// The refusal for the box the user named `target`.
+    /// The refusal for the running box the user named `target`.
     pub fn new(target: impl Into<String>) -> Self {
         Self {
             target: target.into(),
+            cause: RmRefusalCause::Running,
+        }
+    }
+
+    /// The headless refusal for the box `target`, which has changed files.
+    pub(crate) fn changed_files(target: impl Into<String>) -> Self {
+        Self {
+            target: target.into(),
+            cause: RmRefusalCause::ChangedFiles,
+        }
+    }
+
+    /// The headless refusal for the box `target`, whose files could not be
+    /// checked for changes.
+    pub(crate) fn unchecked(target: impl Into<String>) -> Self {
+        Self {
+            target: target.into(),
+            cause: RmRefusalCause::Unchecked,
         }
     }
 }
@@ -680,11 +713,25 @@ impl BoxRunningRefusal {
 impl std::fmt::Display for BoxRunningRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let target = &self.target;
-        write!(
-            f,
-            "{target} is running. Stop it with min box stop {target}, \
-             or remove it now with min box rm {target} --force."
-        )
+        match self.cause {
+            RmRefusalCause::Running => write!(
+                f,
+                "{target} is running. Stop it with min box stop {target}, \
+                 or remove it now with min box rm {target} --force."
+            ),
+            RmRefusalCause::ChangedFiles => write!(
+                f,
+                "{target} has changed files, so it was not removed. \
+                 Removing it deletes them. \
+                 Run min box rm {target} --force to remove it anyway."
+            ),
+            RmRefusalCause::Unchecked => write!(
+                f,
+                "The files of {target} could not be checked for changes, \
+                 so it was not removed. \
+                 Run min box rm {target} --force to remove it anyway."
+            ),
+        }
     }
 }
 
@@ -832,11 +879,30 @@ fn write_stop_line(
 /// `min box rm <box> [--force]`: removes the box. A running box without
 /// `--force` is refused on stderr with exit 2 (BCLI-004): the refusal
 /// returns as a [`BoxRunningRefusal`], and the process maps it to its exit
-/// code.
+/// code. Without `--force`, a box whose files changed or could not be
+/// checked is removed only when a person confirms it on a terminal.
 pub async fn cmd_box_rm(global: &GlobalArgs, args: BoxRmArgs) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
     let hosts = crate::cmd::list::local_hosts(global)?;
-    let (host, removed) = rm_box_on_hosts(hosts, &args.target, args.force).await?;
+    let mut prompt = RmPrompt {
+        no_input: global.no_input,
+        stdin_is_terminal: std::io::stdin().is_terminal(),
+        ask: Box::new(|lines: &[String], question: &str| {
+            for line in lines {
+                println!("{line}");
+            }
+            confirm(question, false)
+        }),
+    };
+    let (host, removed) = match rm_box_on_hosts(hosts, &args.target, args.force, &mut prompt).await
+    {
+        Ok(removed) => removed,
+        Err(e) if e.is::<RmAborted>() => {
+            writeln!(std::io::stdout().lock(), "Aborted.")?;
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
     // The box is gone. Its creator withdraws the row on the VM host
     // daemon, or releases the name the zone held, as `destroy_box` does.
     // Both are best-effort and warn on failure. Both go to the VM that
@@ -849,6 +915,65 @@ pub async fn cmd_box_rm(global: &GlobalArgs, args: BoxRmArgs) -> Result<(), anyh
     // The line goes last, so a closed stdout cannot skip the cleanup above.
     writeln!(std::io::stdout().lock(), "Removed {}.", args.target)?;
     Ok(())
+}
+
+/// How `min box rm` without `--force` asks a person before it removes a
+/// box whose files changed or could not be checked.
+pub(crate) struct RmPrompt<'a> {
+    /// `--no-input`: never ask.
+    pub(crate) no_input: bool,
+    /// Whether stdin is a terminal, so a person can answer.
+    pub(crate) stdin_is_terminal: bool,
+    /// Shows the lines, then asks the question. Returns the answer.
+    #[allow(clippy::type_complexity)]
+    pub(crate) ask: Box<dyn FnMut(&[String], &str) -> Result<bool, anyhow::Error> + Send + 'a>,
+}
+
+/// The person answered no to the question of `min box rm`, so the box
+/// was not removed. `min box rm` prints `Aborted.` and exits 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RmAborted;
+
+impl std::fmt::Display for RmAborted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Aborted.")
+    }
+}
+
+impl std::error::Error for RmAborted {}
+
+/// The at-risk gate of `min box rm` for the box `target` names: proceeds
+/// under `force` or for a clean box, asks through `prompt` on a terminal,
+/// and refuses with [`BoxRunningRefusal`] (exit 2, naming `--force`) off
+/// one. A "no" returns [`RmAborted`].
+pub(crate) fn rm_gate(
+    target: &str,
+    force: bool,
+    at_risk: &AtRiskState,
+    prompt: &mut RmPrompt<'_>,
+) -> Result<(), anyhow::Error> {
+    match destroy_gate(force, at_risk, prompt.no_input, prompt.stdin_is_terminal) {
+        Ok(DestroyGate::Proceed) => Ok(()),
+        Ok(DestroyGate::Confirm) => {
+            let lines = match at_risk {
+                AtRiskState::Dirty(lines) => lines.clone(),
+                _ => vec![format!(
+                    "The files of {target} could not be checked for changes."
+                )],
+            };
+            let question = format!("Remove {target}? This permanently deletes its files.");
+            if (prompt.ask)(&lines, &question)? {
+                Ok(())
+            } else {
+                Err(RmAborted.into())
+            }
+        }
+        Err(_) => Err(match at_risk {
+            AtRiskState::Dirty(_) => BoxRunningRefusal::changed_files(target),
+            _ => BoxRunningRefusal::unchecked(target),
+        }
+        .into()),
+    }
 }
 
 /// A box that `rm_listed_box` reaped: what its creator needs to retire
@@ -864,15 +989,40 @@ pub(crate) struct RemovedBox {
 }
 
 /// Resolves the address `target` over `hosts` and reaps that box on the
-/// host that keeps it, as [`rm_listed_box`] does. Returns that host and
-/// the box it reaped.
+/// host that keeps it, as [`rm_listed_box`] does. Without `force`, a
+/// running box is refused first, and then the box's changed files go
+/// through [`rm_gate`] with `prompt`. Returns that host and the box it
+/// reaped.
 pub(crate) async fn rm_box_on_hosts(
     hosts: Vec<crate::cmd::list::LocalHost>,
     target: &str,
     force: bool,
+    prompt: &mut RmPrompt<'_>,
 ) -> Result<(crate::cmd::list::LocalHost, RemovedBox), anyhow::Error> {
     let ResolvedBox { host, box_id } = resolve_box_on_hosts(hosts, target, "box rm").await?;
     let mut client = gated_box_host_client(&host).await?;
+    if !force {
+        // The running refusal comes before the question: a running box is
+        // never asked about.
+        crate::output::record_box_id(&box_id.to_string());
+        let running = list_box_records(&mut client, None)
+            .await?
+            .iter()
+            .any(|entry| entry.box_id == box_id && entry.state == "running");
+        if running {
+            return Err(BoxRunningRefusal::new(target).into());
+        }
+        // Until gominimal/inbox#1295, the daemon answers `Unavailable` for a
+        // box with no live host. So `box_delta` gets `Unavailable` here and
+        // `at_risk` is `Unknowable`.
+        let at_risk = assess_at_risk(box_delta(&mut client, box_id).await);
+        tracing::debug!(
+            r#box = target,
+            ?at_risk,
+            "min box rm checked the box's files"
+        );
+        rm_gate(target, force, &at_risk, prompt)?;
+    }
     let removed = rm_listed_box(&mut client, box_id, target, force).await?;
     Ok((host, removed))
 }
