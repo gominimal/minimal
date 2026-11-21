@@ -2777,7 +2777,13 @@ impl<C: Channel> Sandbox<C> {
 
             // Step 3: wire this invocation's netns. Torn down explicitly once
             // the invocation completes (both arms).
-            let net_guard = match planned.attach_child(&mut child).await {
+            // A process that ended before its attach failed was reaped by
+            // that check: what the hook returned goes before the release
+            // awaits.
+            let net_guard = match planned
+                .attach_child(&mut child, || drop(spawned.take()))
+                .await
+            {
                 Ok(guard) => guard,
                 Err(e) => {
                     // Attach failed after spawn: kill+reap the child so it
@@ -3616,6 +3622,10 @@ impl PlannedLaunch {
     /// stands for that outcome. The plan's release has run by then, because
     /// a next step's plan can replace what the release gives back.
     ///
+    /// The check that the process ended reaps it, and `on_reaped` runs then,
+    /// before the release awaits: once reaped, its pid can belong to another
+    /// process.
+    ///
     /// # Errors
     ///
     /// Propagates the provider's attach failure while the process still runs.
@@ -3623,10 +3633,17 @@ impl PlannedLaunch {
     pub async fn attach_child(
         self,
         child: &mut hakoniwa::Child,
+        on_reaped: impl FnOnce(),
     ) -> Result<Option<Box<dyn NetGuard>>, Error> {
         let spawned = network::Spawned::from_child(child);
-        self.attach_unless_ended(spawned, || matches!(child.try_wait(), Ok(Some(_))))
-            .await
+        self.attach_unless_ended(spawned, || {
+            let ended = matches!(child.try_wait(), Ok(Some(_)));
+            if ended {
+                on_reaped();
+            }
+            ended
+        })
+        .await
     }
 
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -5827,7 +5844,7 @@ int main(int argc, char **argv) {
     }
 
     /// A program that writes one line, closes its stdout and stderr, and
-    /// keeps running for a while.
+    /// then waits for a release that never comes: only a signal ends it.
     #[cfg(target_os = "linux")]
     const WRITE_CLOSE_LINGER_C: &str = r#"
 #include <stdio.h>
@@ -5837,7 +5854,7 @@ int main(void) {
     fflush(stdout);
     close(1);
     close(2);
-    sleep(5);
+    for (;;) pause();
     return 0;
 }
 "#;
@@ -5935,8 +5952,11 @@ int main(void) {
 
         let alive_at_drop = std::sync::Arc::new(std::sync::Mutex::new(None));
         let noted = alive_at_drop.clone();
+        let spawned_pid = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let hook_pid = spawned_pid.clone();
         let options = RunOptions {
             on_spawn: Some(Box::new(move |pid| {
+                *hook_pid.lock().unwrap() = Some(pid);
                 Ok(Box::new(PidRecord {
                     pid,
                     alive_at_drop: noted.clone(),
@@ -5944,19 +5964,30 @@ int main(void) {
             })),
             ..RunOptions::default()
         };
-        let started = std::time::Instant::now();
-        let result = sandbox
-            .run_with_cancel(
-                vec![Invocation {
-                    executable: "/usr/bin/linger".to_string(),
-                    args: Vec::new(),
-                    envs: Default::default(),
-                }],
-                Some(FailingWriter),
-                None::<Vec<u8>>,
-                options,
-            )
-            .await;
+        // The program never exits on its own, so the run returns only if its
+        // cleanup ends it. The watchdog fails a stalled run instead of
+        // hanging: the dropped run never reaped the program, so its pid is
+        // still the program's, and the watchdog kills it.
+        let run = sandbox.run_with_cancel(
+            vec![Invocation {
+                executable: "/usr/bin/linger".to_string(),
+                args: Vec::new(),
+                envs: Default::default(),
+            }],
+            Some(FailingWriter),
+            None::<Vec<u8>>,
+            options,
+        );
+        let Ok(result) = tokio::time::timeout(std::time::Duration::from_secs(60), run).await else {
+            if let Some(pid) = *spawned_pid.lock().unwrap() {
+                // SAFETY: `kill` reads no memory of ours; the program was
+                // never reaped, so its pid is still its own.
+                unsafe {
+                    libc::kill(i32::try_from(pid).unwrap(), libc::SIGKILL);
+                }
+            }
+            panic!("the run did not end the program after its writer failed");
+        };
         assert!(
             matches!(result, Err(Error::IO("writing to stdout writer", _, _))),
             "the run returns the writer's error: {result:?}"
@@ -5965,10 +5996,6 @@ int main(void) {
             *alive_at_drop.lock().unwrap(),
             Some(false),
             "the hook's value is dropped only once the process is gone"
-        );
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(4),
-            "the run killed the process rather than waiting for it to exit"
         );
     }
 

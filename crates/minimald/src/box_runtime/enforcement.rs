@@ -1743,7 +1743,12 @@ impl TaskContainer {
         self.signal_scanned(&self.pids(), signal)
     }
 
-    /// Sends `signal` to the processes a scan found, `scanned`.
+    /// Sends `signal` to the processes a scan found, `scanned`, then to the
+    /// supervisor through its pidfd when the scan listed it or listed
+    /// nothing. A scan that could not read the supervisor lists nothing, and
+    /// the pidfd still names it. A container in a PID namespace of its own
+    /// does not list its supervisor, which the namespace's processes are
+    /// signalled without.
     ///
     /// A descendant found by the scan can be reaped, and its pid given to
     /// another process, before the signal. So each descendant is pinned
@@ -1754,7 +1759,7 @@ impl TaskContainer {
     pub(crate) fn signal_scanned(&self, scanned: &[i32], signal: i32) -> usize {
         let root = i32::try_from(self.processes.root).unwrap_or(i32::MAX);
         let mut reached = 0;
-        let mut root_seen = false;
+        let mut root_seen = scanned.is_empty();
         for &pid in scanned {
             if pid == root {
                 root_seen = true;

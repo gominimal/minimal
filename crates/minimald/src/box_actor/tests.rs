@@ -15819,6 +15819,11 @@ async fn stop_forces_the_recorded_task_containers() {
         exit.code, 125,
         "the killed task carries the container's 125"
     );
+    assert_eq!(
+        exit.reason.map(|reason| reason.reason).as_deref(),
+        Some(format!("container received signal {}", libc::SIGKILL).as_str()),
+        "the escalation ended the task with SIGKILL"
+    );
     assert!(
         processes.pids().is_empty(),
         "no process of the task outlives the forced stop"
@@ -16154,6 +16159,33 @@ async fn a_stopping_box_records_no_new_task_container() {
     // The await reaps the stand-in.
     drop(relay_cleanup);
     entrypoint.await.unwrap().unwrap();
+}
+
+/// BOX-013: a scan that lists nothing while the supervisor still runs, as
+/// when `/proc` cannot be read, still signals the supervisor through its
+/// pidfd.
+#[test]
+fn a_task_container_supervisor_the_scan_missed_is_still_signalled() {
+    let box_id = SessionId::mint();
+    let container = spawn_stand_in_box("trap 'exit 0' TERM");
+    let _cleanup = KillOnDrop::pin(&container);
+    let _record = crate::box_runtime::record_task_container(
+        crate::box_runtime::untracked_task_run(box_id),
+        container.id(),
+    )
+    .unwrap();
+    let taken = crate::box_runtime::take_task_containers(box_id);
+    let [task] = taken.as_slice() else {
+        panic!("one task container is recorded");
+    };
+    assert_eq!(
+        task.signal_scanned(&[], libc::SIGTERM),
+        1,
+        "the supervisor got the signal through its pidfd"
+    );
+    let mut container = container;
+    let status = container.wait().unwrap();
+    assert_eq!(status.code(), Some(0), "the supervisor's TERM trap ran");
 }
 
 /// BOX-013: a process of a task container's tree that ends while the walk
