@@ -16,11 +16,15 @@ use tokio::sync::Mutex;
 /// hex. Two builds of one package at different spec hashes are two entries.
 type RunningKey = (String, String);
 
+/// One entry of a box's listing, and how many builds it stands for: two
+/// builds of one package at one spec hash in one box share it, and it
+/// leaves when the last of them ends.
+type RunningEntry = (minimald_rpc::RunningBuildBox, usize);
+
 /// The build boxes running now, by requesting box id then build. A build
 /// box keeps no record (BOX-210), so this is all that lists it (NET-171).
-static RUNNING: LazyLock<
-    std::sync::Mutex<HashMap<String, BTreeMap<RunningKey, minimald_rpc::RunningBuildBox>>>,
-> = LazyLock::new(Default::default);
+static RUNNING: LazyLock<std::sync::Mutex<HashMap<String, BTreeMap<RunningKey, RunningEntry>>>> =
+    LazyLock::new(Default::default);
 
 /// The build boxes running for the box `box_id`, by package.
 pub(crate) fn running_build_boxes(box_id: &str) -> Vec<minimald_rpc::RunningBuildBox> {
@@ -28,9 +32,18 @@ pub(crate) fn running_build_boxes(box_id: &str) -> Vec<minimald_rpc::RunningBuil
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .get(box_id)
-        .map(|running| running.values().cloned().collect())
+        .map(|running| {
+            running
+                .values()
+                .flat_map(|(entry, builds)| std::iter::repeat_n(entry.clone(), *builds))
+                .collect()
+        })
         .unwrap_or_default()
 }
+
+/// The most processes of one build box on its network at a time: the task
+/// addresses its row holds.
+const BUILD_SLOTS: usize = minimald_rpc::TASK_SLOTS_PER_BOX as usize;
 
 /// The daemon's own program, which a build box's fetch process runs. In the
 /// VM a sandbox cannot exec the running binary's path, so it runs the staged
@@ -186,7 +199,7 @@ impl Shared {
                 }
                 let record = self.record.clone();
                 let switch = Arc::clone(&self.switch);
-                Some(op::BuildNetwork::new(move || {
+                Some(op::BuildNetwork::new(BUILD_SLOTS, move || {
                     Arc::new(RequesterBuildNetwork {
                         inner: crate::net::provider::task_network_for(
                             boxes::NetworkMode::OwnIp,
@@ -276,7 +289,7 @@ impl BoxReach {
     ) -> op::BuildNetwork {
         let switch = Arc::clone(&self.shared.switch);
         let name = gate_name(&self.package);
-        op::BuildNetwork::new(move || {
+        op::BuildNetwork::new(BUILD_SLOTS, move || {
             crate::net::provider::task_network_for(
                 boxes::NetworkMode::OwnIp,
                 &switch,
@@ -369,7 +382,7 @@ impl BoxReach {
 /// Shows the reach a running build box was granted (NET-171).
 fn note_reach(box_id: &str, build: &RunningKey, granted: &Granted) {
     let mut all = RUNNING.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(running) = all.get_mut(box_id).and_then(|boxes| boxes.get_mut(build)) {
+    if let Some((running, _)) = all.get_mut(box_id).and_then(|boxes| boxes.get_mut(build)) {
         running.egress = Some(granted.egress.clone());
         running.granted = true;
     }
@@ -379,7 +392,7 @@ fn note_reach(box_id: &str, build: &RunningKey, granted: &Granted) {
 /// steps run with no address.
 fn note_no_network(box_id: &str, build: &RunningKey) {
     let mut all = RUNNING.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(running) = all.get_mut(box_id).and_then(|boxes| boxes.get_mut(build)) {
+    if let Some((running, _)) = all.get_mut(box_id).and_then(|boxes| boxes.get_mut(build)) {
         running.no_network = true;
     }
 }
@@ -412,17 +425,26 @@ impl op::BuildBoxes for BoxBuildBoxes {
         let mut all = RUNNING.lock().unwrap_or_else(PoisonError::into_inner);
         if running {
             tracing::info!(box_name = %self.0.box_name(), package, "a build box started");
-            all.entry(box_id).or_default().insert(
-                build,
-                minimald_rpc::RunningBuildBox {
-                    package: package.to_string(),
-                    egress: self.0.requester_egress(),
-                    granted: false,
-                    no_network: false,
-                },
-            );
+            all.entry(box_id)
+                .or_default()
+                .entry(build)
+                .or_insert_with(|| {
+                    let entry = minimald_rpc::RunningBuildBox {
+                        package: package.to_string(),
+                        egress: self.0.requester_egress(),
+                        granted: false,
+                        no_network: false,
+                    };
+                    (entry, 0)
+                })
+                .1 += 1;
         } else if let Some(running) = all.get_mut(&box_id) {
-            running.remove(&build);
+            if let Some((_, builds)) = running.get_mut(&build) {
+                *builds -= 1;
+                if *builds == 0 {
+                    running.remove(&build);
+                }
+            }
             if running.is_empty() {
                 all.remove(&box_id);
             }
@@ -466,18 +488,26 @@ impl sandbox::Network for RequesterBuildNetwork {
     }
 }
 
-/// The body of a build box's fetch process (`minimald __build-fetch <url>
-/// <sha256> <file>`): downloads one URL into one file, in the namespace the
-/// process runs in. The caller checks the hash again.
+/// The body of a build box's fetch process (`minimald __build-fetch <sha256>
+/// <file>`, its URL in [`op::build_box::BUILD_FETCH_URL_ENV`]): downloads one
+/// URL into one file, in the namespace the process runs in. The caller checks
+/// the hash again.
 ///
 /// # Errors
 ///
-/// The arguments are not three, or the download failed.
+/// The arguments are not two, the URL is not set, or the download failed.
 pub fn fetch_main(args: Vec<std::ffi::OsString>) -> Result<(), String> {
-    let [url, sha256, out] = args.as_slice() else {
+    let [sha256, out] = args.as_slice() else {
         return Err(format!(
-            "{} takes a URL, a sha256 and a file",
+            "{} takes a sha256 and a file",
             op::build_box::BUILD_FETCH_SUBCOMMAND
+        ));
+    };
+    let Some(url) = std::env::var_os(op::build_box::BUILD_FETCH_URL_ENV) else {
+        return Err(format!(
+            "{} needs its URL in {}",
+            op::build_box::BUILD_FETCH_SUBCOMMAND,
+            op::build_box::BUILD_FETCH_URL_ENV
         ));
     };
     let (Some(url), Some(sha256)) = (url.to_str(), sha256.to_str()) else {

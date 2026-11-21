@@ -433,6 +433,35 @@ mod tests {
         hex::encode(h.finalize())
     }
 
+    /// NET-155: the daemon takes a build box's fetched file into the cache
+    /// only when its hash is the declared one. A file with another hash
+    /// leaves nothing under the declared hash, and a later read finds
+    /// nothing.
+    #[test]
+    fn adopt_takes_only_a_file_with_the_declared_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = FileCache::new(tmp.path().join("cache")).unwrap();
+        let fetched = tmp.path().join("fetched");
+        std::fs::write(&fetched, b"the source").unwrap();
+        let want = sha256_hex(b"the source");
+
+        let other = sha256_hex(b"another source");
+        let err = cache.adopt("a.tar.gz", &other, &fetched).unwrap_err();
+        assert!(
+            matches!(&err, FileCacheError::HashMismatch { want: w, got } if *w == other && *got == want),
+            "{err:?}"
+        );
+        assert!(cache.read_cached("a.tar.gz", &other).unwrap().is_none());
+
+        let adopted = cache.adopt("a.tar.gz", &want, &fetched).unwrap();
+        assert_eq!(std::fs::read(&adopted).unwrap(), b"the source");
+        assert_eq!(cache.read_cached("a.tar.gz", &want).unwrap(), Some(adopted));
+        assert!(
+            cache.adopt("a.tar.gz", "../escape", &fetched).is_err(),
+            "a hash with a path separator is refused"
+        );
+    }
+
     /// A [FetchResponse] that yields one chunk, waits for `resume` to be
     /// notified, then yields `tail` (or fails if `tail` is `Err`).
     #[derive(Debug)]

@@ -27,6 +27,11 @@ use crate::Error;
 /// The hidden `minimald` subcommand that runs a build box's source fetch.
 pub const BUILD_FETCH_SUBCOMMAND: &str = "__build-fetch";
 
+/// The variable the fetch process reads its URL from. The URL stays out of
+/// the process's argv, which any process on the host can read, because a
+/// source URL can carry credentials or a signed query.
+pub const BUILD_FETCH_URL_ENV: &str = "MINIMAL_BUILD_FETCH_URL";
+
 /// The fetch process's output file, in the sandbox's output directory.
 const FETCHED_FILE: &str = "fetched";
 
@@ -35,8 +40,10 @@ const FETCHED_FILE: &str = "fetched";
 const FETCH_TO: &str = "output/fetched";
 
 /// Where the fetch process's program sits in the build box.
+const FETCH_PROGRAM_PATH: &str = "/fetcher";
+
 #[cfg(target_os = "linux")]
-const FETCH_PROGRAM: &str = "/fetcher";
+const FETCH_PROGRAM: &str = FETCH_PROGRAM_PATH;
 
 /// What the fetch process reads from the host: its program's libraries and
 /// the trust roots. It reads no box's data.
@@ -59,10 +66,6 @@ pub const NEEDS_NETWORK: &str = "the build needs the network and the box has non
 pub const NEEDS_NETWORK_RULES: &str =
     "the build needs the network and the egress rules of the box admit none";
 
-/// The most processes one build box runs on its network at a time: the task
-/// addresses its row holds.
-const NETWORK_SLOTS: usize = 4;
-
 /// Makes the network a build box attaches to. Each process gets a network of
 /// its own, because a network holds the reservation of one sandbox at a time
 /// and the dependency builds of one box can run at the same time.
@@ -73,11 +76,15 @@ pub struct BuildNetwork {
 }
 
 impl BuildNetwork {
-    /// A build network that `make` makes again for each process.
-    pub fn new(make: impl Fn() -> Arc<dyn sandbox::Network> + Send + Sync + 'static) -> Self {
+    /// A build network that `make` makes again for each process, with room
+    /// for `slots` processes at a time: the task addresses its row holds.
+    pub fn new(
+        slots: usize,
+        make: impl Fn() -> Arc<dyn sandbox::Network> + Send + Sync + 'static,
+    ) -> Self {
         Self {
             make: Arc::new(make),
-            slots: Arc::new(tokio::sync::Semaphore::new(NETWORK_SLOTS)),
+            slots: Arc::new(tokio::sync::Semaphore::new(slots)),
         }
     }
 
@@ -150,6 +157,8 @@ pub struct BuildBox {
     pub fetch_program: PathBuf,
     reach: Arc<dyn BuildReach>,
     opened: Arc<tokio::sync::OnceCell<Option<BuildNetwork>>>,
+    /// The build's cancellation, which stops a fetch in flight too.
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 /// The build boxes of one box (NET-155, NET-169).
@@ -257,7 +266,15 @@ impl BuildBox {
             fetch_program,
             reach,
             opened: Arc::default(),
+            cancel: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    /// This build box, its fetches stopped when `cancel` is.
+    #[must_use]
+    pub fn cancelled_by(mut self, cancel: tokio_util::sync::CancellationToken) -> Self {
+        self.cancel = cancel;
+        self
     }
 
     /// A build box on `network`, already open.
@@ -268,6 +285,7 @@ impl BuildBox {
             fetch_program,
             reach: Arc::new(FixedReach(network)),
             opened: Arc::new(opened),
+            cancel: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -353,10 +371,7 @@ impl BuildBox {
         self.run_fetch(package, network, url, sha256, dir.path(), opts)
             .await?;
         drop(slot);
-        op.set_done();
-        fetcher
-            .adopt(filename, sha256, &dir.path().join(FETCHED_FILE))
-            .map_err(Error::Other)
+        adopt_fetched(fetcher, filename, sha256, dir.path(), op)
     }
 
     /// The fetch process's sandbox: an empty working directory, the daemon's
@@ -391,19 +406,11 @@ impl BuildBox {
         let mut stdout: Vec<u8> = Vec::new();
         let mut stderr: Vec<u8> = Vec::new();
         let ran = sandbox
-            .run(
-                vec![sandbox::config::Invocation {
-                    executable: FETCH_PROGRAM.to_string(),
-                    args: vec![
-                        BUILD_FETCH_SUBCOMMAND.to_string(),
-                        url.to_string(),
-                        sha256.to_string(),
-                        FETCH_TO.to_string(),
-                    ],
-                    envs: Default::default(),
-                }],
+            .run_with_cancel(
+                vec![fetch_invocation(url, sha256)],
                 Some(&mut stdout),
                 Some(&mut stderr),
+                self.cancel.clone(),
             )
             .await;
         if let Err(e) = ran {
@@ -436,6 +443,44 @@ impl BuildBox {
     ) -> Result<(), Error> {
         Err(crate::sandbox_unsupported())
     }
+}
+
+/// The fetch process's invocation: its URL in [`BUILD_FETCH_URL_ENV`], and
+/// only the hash and the file in its argv.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn fetch_invocation(url: &str, sha256: &str) -> sandbox::config::Invocation {
+    sandbox::config::Invocation {
+        executable: FETCH_PROGRAM_PATH.to_string(),
+        args: vec![
+            BUILD_FETCH_SUBCOMMAND.to_string(),
+            sha256.to_string(),
+            FETCH_TO.to_string(),
+        ],
+        envs: [(BUILD_FETCH_URL_ENV.to_string(), url.to_string())].into(),
+    }
+}
+
+/// Takes the file the fetch process wrote into `dir` into the download cache,
+/// after the hash check, and only then marks the fetch done. A fetch that
+/// ended well and wrote nothing says so.
+fn adopt_fetched<SF: crate::SourceFetcher>(
+    fetcher: &SF,
+    filename: &str,
+    sha256: &str,
+    dir: &Path,
+    op: &OpTracker,
+) -> Result<PathBuf, Error> {
+    let fetched = dir.join(FETCHED_FILE);
+    if !fetched.is_file() {
+        return Err(Error::Other(anyhow::anyhow!(
+            "the source fetch ended without writing the file"
+        )));
+    }
+    let adopted = fetcher
+        .adopt(filename, sha256, &fetched)
+        .map_err(Error::Other)?;
+    op.set_done();
+    Ok(adopted)
 }
 
 /// What a failed source fetch says: the fetch process's own last line, as
@@ -845,8 +890,13 @@ mod tests {
     #[test]
     fn build_box_carries_no_session_data() {
         let build_box = BuildBox::on_network("/usr/bin/minimald".into(), None);
-        let network = BuildNetwork::new(|| Arc::new(sandbox::NoNet) as Arc<dyn sandbox::Network>);
+        let network =
+            BuildNetwork::new(1, || Arc::new(sandbox::NoNet) as Arc<dyn sandbox::Network>);
         let config = build_box.fetch_config("pkg", &network);
+        assert!(
+            config.network.is_some(),
+            "the fetch runs on the build box's network, never the host's"
+        );
         assert_eq!(
             config.read_only_host_paths,
             FETCH_HOST_PATHS.map(PathBuf::from)
@@ -858,6 +908,170 @@ mod tests {
                 FETCH_PROGRAM.to_string()
             )]
         );
+    }
+
+    /// NET-155: the fetch process gets its URL in its environment. Its argv,
+    /// which any process on the host can read, holds no part of the URL.
+    #[test]
+    fn the_fetch_argv_holds_no_part_of_the_url() {
+        let url = "https://user:secret@downloads.example.org/a.tar.gz?sig=abc";
+        let invocation = fetch_invocation(url, "aa");
+        assert_eq!(
+            invocation.args,
+            [BUILD_FETCH_SUBCOMMAND, "aa", FETCH_TO].map(str::to_string)
+        );
+        assert!(
+            invocation
+                .args
+                .iter()
+                .all(|arg| !arg.contains("secret") && !arg.contains("example.org"))
+        );
+        assert_eq!(
+            invocation.envs.get(BUILD_FETCH_URL_ENV).map(String::as_str),
+            Some(url)
+        );
+    }
+
+    /// A fetcher whose cache takes a file only when it holds `good`.
+    #[derive(Debug, Default)]
+    struct AdoptingFetcher {
+        adopted: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl crate::SourceFetcher for AdoptingFetcher {
+        async fn download_web(
+            &self,
+            url: &str,
+            _sha256: &str,
+            _op: &OpTracker,
+        ) -> Result<PathBuf, anyhow::Error> {
+            panic!("a build box never downloads {url} itself")
+        }
+
+        async fn download_gcs(
+            &self,
+            bucket_id: String,
+            _file: &str,
+            _sha256: &str,
+            _op: &OpTracker,
+        ) -> Result<PathBuf, anyhow::Error> {
+            panic!("a build box never downloads from {bucket_id} itself")
+        }
+
+        fn adopt(&self, filename: &str, _sha256: &str, from: &Path) -> anyhow::Result<PathBuf> {
+            anyhow::ensure!(std::fs::read(from)? == b"good", "hash mismatch");
+            self.adopted.lock().unwrap().push(filename.to_string());
+            Ok(from.with_file_name(filename))
+        }
+    }
+
+    /// NET-155: a fetch that ended well hands the file it wrote to the cache,
+    /// whose hash check decides it. A file the check refuses fails the
+    /// fetch, and a fetch that wrote nothing says so.
+    #[test]
+    fn a_fetched_file_reaches_the_cache_only_through_its_hash_check() {
+        let op = OpTracker::new_root();
+        let fetcher = AdoptingFetcher::default();
+        let dir = tempfile::tempdir().unwrap();
+
+        let err = adopt_fetched(&fetcher, "a.tar.gz", "aa", dir.path(), &op).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "other: the source fetch ended without writing the file"
+        );
+
+        std::fs::write(dir.path().join(FETCHED_FILE), b"tampered").unwrap();
+        let err = adopt_fetched(&fetcher, "a.tar.gz", "aa", dir.path(), &op).unwrap_err();
+        assert!(err.to_string().contains("hash mismatch"), "{err}");
+        assert!(fetcher.adopted.lock().unwrap().is_empty());
+
+        std::fs::write(dir.path().join(FETCHED_FILE), b"good").unwrap();
+        let adopted = adopt_fetched(&fetcher, "a.tar.gz", "aa", dir.path(), &op).unwrap();
+        assert_eq!(adopted, dir.path().join("a.tar.gz"));
+        assert_eq!(*fetcher.adopted.lock().unwrap(), ["a.tar.gz"]);
+    }
+
+    /// The listing of one box's builds, and the reach closes it saw.
+    #[derive(Debug, Default)]
+    struct Recorded {
+        running: std::sync::Mutex<Vec<(String, bool)>>,
+        closed: std::sync::atomic::AtomicUsize,
+    }
+
+    #[derive(Debug)]
+    struct RecordingBoxes(Arc<Recorded>);
+
+    impl BuildBoxes for RecordingBoxes {
+        fn build_box(&self, _: &str, _: Vec<String>, _: &SpecHash, _: bool) -> BuildBox {
+            BuildBox::new(
+                "/fetcher".into(),
+                Arc::new(RecordingReach(Arc::clone(&self.0))),
+            )
+        }
+
+        fn note_running(&self, package: &str, _spec_hash: &SpecHash, running: bool) {
+            self.0
+                .running
+                .lock()
+                .unwrap()
+                .push((package.to_string(), running));
+        }
+    }
+
+    #[derive(Debug)]
+    struct RecordingReach(Arc<Recorded>);
+
+    impl BuildReach for RecordingReach {
+        fn open(&self) -> ReachFuture<'_, Option<BuildNetwork>> {
+            Box::pin(async { None })
+        }
+
+        fn admits_source(&self, _host: &str) -> bool {
+            false
+        }
+
+        fn close(&self) -> ReachFuture<'_, ()> {
+            self.0
+                .closed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {})
+        }
+    }
+
+    /// NET-171: a build whose task is aborted still ends: it leaves the
+    /// box's listing at once, and its build box's network closes on a task
+    /// of its own.
+    #[tokio::test]
+    async fn an_aborted_build_leaves_the_listing_and_closes_its_network() {
+        let recorded = Arc::new(Recorded::default());
+        let boxes: Arc<dyn BuildBoxes> = Arc::new(RecordingBoxes(Arc::clone(&recorded)));
+        let spec_hash = SpecHash::from_bytes([7; 32]);
+        let build_box = boxes.build_box("pkg", Vec::new(), &spec_hash, true);
+        let (started, running) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _run = BuildBoxRun::start(Some(boxes), Some(build_box), "pkg", spec_hash);
+            started.send(()).expect("the test waits for the start");
+            std::future::pending::<()>().await;
+        });
+        running.await.unwrap();
+        assert_eq!(
+            *recorded.running.lock().unwrap(),
+            [("pkg".to_string(), true)]
+        );
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            *recorded.running.lock().unwrap(),
+            [("pkg".to_string(), true), ("pkg".to_string(), false)]
+        );
+        for _ in 0..100 {
+            if recorded.closed.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(recorded.closed.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// NET-155: a failed fetch's message keeps the error but strips the

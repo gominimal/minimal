@@ -277,6 +277,31 @@ async fn builds_of_one_package_at_two_spec_hashes_list_apart() {
     assert!(super::running_build_boxes(&box_id).is_empty());
 }
 
+/// NET-171: two builds of one package at one spec hash in one box list
+/// while either runs. The end of the first leaves the second listed.
+#[tokio::test]
+async fn two_builds_at_one_spec_hash_list_until_both_end() {
+    let state = tempfile::tempdir().unwrap();
+    let mut listed = record(boxes::NetworkMode::OwnIp, None);
+    listed.id = boxes::SessionId::mint();
+    let box_id = listed.id.to_string();
+    let boxes = BoxBuildBoxes::new(listed, switch(), false, state.path().to_path_buf());
+
+    boxes.note_running("pkg", &hash(1), true);
+    boxes.note_running("pkg", &hash(1), true);
+    assert_eq!(super::running_build_boxes(&box_id).len(), 2);
+
+    boxes.note_running("pkg", &hash(1), false);
+    assert_eq!(
+        super::running_build_boxes(&box_id).len(),
+        1,
+        "the second build still runs"
+    );
+
+    boxes.note_running("pkg", &hash(1), false);
+    assert!(super::running_build_boxes(&box_id).is_empty());
+}
+
 /// NET-165: a table that does not parse reads as none, so the build follows
 /// the box's own rules: in a deny-all box, no network. A table filed again
 /// replaces it whole.
@@ -295,11 +320,20 @@ async fn an_unreadable_table_grants_nothing() {
     assert!(build_box.network().await.is_some());
 }
 
-/// NET-155: `__build-fetch` takes a URL, a hash and a file, and says so.
+/// NET-155: `__build-fetch` takes a hash and a file, and says so. Its URL
+/// is never an argument.
 #[test]
 fn fetch_process_names_its_arguments() {
     assert_eq!(
         super::fetch_main(Vec::new()),
-        Err("__build-fetch takes a URL, a sha256 and a file".to_string())
+        Err("__build-fetch takes a sha256 and a file".to_string())
+    );
+    assert_eq!(
+        super::fetch_main(vec![
+            "https://downloads.example.org/a.tar.gz".into(),
+            "aa".into(),
+            "output/fetched".into(),
+        ]),
+        Err("__build-fetch takes a sha256 and a file".to_string())
     );
 }

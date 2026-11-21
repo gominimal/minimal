@@ -59,6 +59,13 @@ pub struct SpecBuild<'a, SF: crate::SourceFetcher> {
 }
 
 impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
+    /// The build box, its source fetches stopped when this build is.
+    fn cancellable_build_box(&self) -> Option<crate::BuildBox> {
+        self.build_box
+            .clone()
+            .map(|build_box| build_box.cancelled_by(self.cancel.clone()))
+    }
+
     async fn build_deps_mapped<'b>(
         &mut self,
         build: &BuildSpec,
@@ -75,11 +82,12 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
                     ..
                 } => build_deps.push(package_file_copy(full_path, filename)?),
                 BuildDep::Source(source) => {
+                    let build_box = self.cancellable_build_box();
                     let resolved_src = crate::SourceLoad {
                         source,
                         remote_fetcher: self.remote_fetcher,
                         into: None,
-                        build_box: self.build_box.as_ref(),
+                        build_box: build_box.as_ref(),
                         package: &build.name,
                     }
                     .run(&Options {
@@ -258,11 +266,12 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
                 .cache
                 .write_dir(&opts.graph.spec_hash(self.spec))
                 .unwrap();
+            let build_box = self.cancellable_build_box();
             let resolved_src = crate::SourceLoad {
                 source,
                 remote_fetcher: self.remote_fetcher,
                 into: Some(out_dir),
-                build_box: self.build_box.as_ref(),
+                build_box: build_box.as_ref(),
                 package: &build.name,
             }
             .run(opts)
@@ -899,7 +908,7 @@ mod tests {
     }
 
     fn some_network() -> crate::BuildNetwork {
-        crate::BuildNetwork::new(|| {
+        crate::BuildNetwork::new(1, || {
             std::sync::Arc::new(sandbox::NoNet) as std::sync::Arc<dyn sandbox::Network>
         })
     }
