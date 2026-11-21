@@ -614,6 +614,10 @@ pub struct SwitchClient {
     /// [`Self::take_activation_forwards`]). The box's stop or destroy releases
     /// them when no attach took them ([`Self::release_activation_bind`]).
     activation_binds: Vec<ActivationBind>,
+    /// How many times this supervisor spawned gvproxy. A forward lives in
+    /// the gvproxy that bound it, so a lease drawn under an earlier spawn
+    /// has lost its activation forwards.
+    spawns: u64,
     /// Whether a test serves this switch's control socket itself, so
     /// [`Self::ensure_running`] spawns nothing ([`Self::serve_externally`]).
     #[cfg(test)]
@@ -633,6 +637,9 @@ struct ActivationBind {
     /// Whether an attach took the lease. Its forwards are then the attach's
     /// to take, and the box's stop leaves them alone.
     claimed: bool,
+    /// [`SwitchClient::spawns`] when the forwards were bound. A later
+    /// spawn means the gvproxy that held them exited.
+    spawn: u64,
 }
 
 impl std::fmt::Debug for ActivationBind {
@@ -642,6 +649,7 @@ impl std::fmt::Debug for ActivationBind {
             .field("lease", &self.lease)
             .field("forwards", &self.forwards.len())
             .field("claimed", &self.claimed)
+            .field("spawn", &self.spawn)
             .finish()
     }
 }
@@ -680,6 +688,7 @@ impl SwitchClient {
             #[cfg(test)]
             allow_self_allocation: false,
             activation_binds: Vec::new(),
+            spawns: 0,
             #[cfg(test)]
             served_externally: false,
         }
@@ -1035,9 +1044,23 @@ impl SwitchClient {
         if matches!(self.transport, SwitchTransport::LocalSpawn) {
             self.ensure_running().await?;
         }
+        let spawns = self.spawns;
         let bind = &mut self.activation_binds[index];
         bind.claimed = true;
         let lease = bind.lease;
+        // The gvproxy that held the activation forwards exited, and the one
+        // running now has none of them. The attach then binds every declared
+        // port again, as it does when no forward stands.
+        if bind.spawn != spawns && !bind.forwards.is_empty() {
+            tracing::warn!(
+                ip = %lease.ip,
+                session_id = %bind.session,
+                forwards = bind.forwards.len(),
+                "the switch restarted after the box's activation; \
+                 the attach binds its declared ports again"
+            );
+            bind.forwards.clear();
+        }
         tracing::info!(
             ip = %lease.ip,
             epoch = lease.epoch,
@@ -1104,6 +1127,7 @@ impl SwitchClient {
             lease,
             forwards: Vec::new(),
             claimed: false,
+            spawn: self.spawns,
         });
         Ok(lease)
     }
@@ -1298,6 +1322,7 @@ impl SwitchClient {
             source,
         })?;
         self.child = Some(child);
+        self.spawns += 1;
 
         // If the control socket never appears, tear the half-started child down
         // so its timeout cannot leave gvproxy orphaned and a later attach does

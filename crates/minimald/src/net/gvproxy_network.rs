@@ -1958,6 +1958,102 @@ mod tests {
         fake.abort();
     }
 
+    /// The switch restarted between the box's activation and its first
+    /// attach, so the forwards bound at activation went with the old
+    /// gvproxy. The attach adopts none of them and binds every declared
+    /// port again, so the name never answers where no forward stands.
+    #[tokio::test]
+    async fn native_attach_adopts_the_forwards_bound_at_activation_only_from_the_same_switch() {
+        const HANDED: Ipv4Addr = Ipv4Addr::new(127, 0, 64, 17);
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut native =
+            SwitchClient::new(dir.path().join("gvproxy-min"), dir.path()).with_host_id("aaaa1");
+        native.serve_externally();
+        let control_path = native.control_socket();
+        let switch = Arc::new(Mutex::new(native));
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let (handed_tx, _handed_rx) = mpsc::channel(4);
+        let fake =
+            spawn_control_channel_deciding(control_path.clone(), |_, _| ok(), events_tx, handed_tx);
+        let control = ControlChannel::Unix(control_path);
+        let registry = Arc::new(std::sync::RwLock::new(dns::HostnameRegistry::new(
+            "aaaa1", true,
+        )));
+        let reporter = crate::net::provider::OwnAddressReporter::new(
+            Arc::clone(&registry),
+            boxes::SessionId::nil(),
+        );
+        let policy = declared_two_ports();
+        let ingress = policy.ingress.clone().expect("two declared ports");
+        {
+            let mut reg = registry.write().expect("registry lock");
+            reg.publish_own_address(
+                boxes::SessionId::nil(),
+                "web",
+                HANDED,
+                BTreeSet::from([8080, 9090]),
+            );
+            reg.register_own_ip(boxes::SessionId::nil(), "web", BTreeSet::from([8080, 9090]));
+        }
+
+        let drawn = switch
+            .lock()
+            .await
+            .draw_for_activation(boxes::SessionId::nil(), None)
+            .await
+            .expect("the native switch draws the box's lease");
+        let forwards = crate::net::policy::bind_declared_at_publish(
+            &control,
+            HANDED,
+            drawn.ip,
+            &ingress,
+            &[],
+            &|_| minimald_rpc::PortHolder::Host,
+        )
+        .await
+        .expect("the stand-in binds the declared forwards");
+        switch
+            .lock()
+            .await
+            .record_activation_forwards(boxes::SessionId::nil(), forwards);
+        let bound = collect_until(&mut events_rx, "/services/forwarder/expose", 2).await;
+        assert_eq!(locals_of(&bound, "/services/forwarder/expose").len(), 2);
+
+        // gvproxy exited and the switch spawned a new one, which holds no
+        // forward of the box's.
+        switch.lock().await.spawns += 1;
+
+        let attached = switch
+            .lock()
+            .await
+            .attach_drawn(Some(boxes::SessionId::nil()))
+            .await
+            .expect("the attach takes the lease the finalize drew");
+        assert_eq!(attached.lease, drawn, "the attach takes the drawn lease");
+        let scenario = attach_scenario(&dir, "unused.sock");
+        let guard = crate::net::gvproxy_network::complete_own_ip_attach(
+            &switch,
+            scenario.tap_fd,
+            control,
+            attached.lease,
+            "web",
+            Some(&policy),
+            Some(&reporter),
+            false,
+        )
+        .await
+        .expect("the attach completes against the stand-in");
+        let events = collect_until(&mut events_rx, "/services/dns/add", 1).await;
+        assert_eq!(
+            locals_of(&events, "/services/forwarder/expose"),
+            vec![format!("{HANDED}:8080"), format!("{HANDED}:9090")],
+            "the attach binds each declared port on the new switch: {events:?}"
+        );
+
+        Box::new(guard).teardown().await;
+        fake.abort();
+    }
+
     /// The box's publish moved between its activation and its first attach,
     /// as a present range landing moves it off the interim. The attach
     /// adopts only the forward bound at the box's current address. It
