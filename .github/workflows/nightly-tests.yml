@@ -43,13 +43,14 @@ jobs:
           command: check advisories
 
   session-e2e-soak:
-    # Boot a real microVM and round-trip a full session ten times to shake
-    # out the boot / first-connect raciness that a single PR-lane run cannot
-    # surface. Self-contained: builds minvmd + the CLI, materializes the
+    # Boot real microVMs over and over (ten iterations, each a cold boot per
+    # core session case) to shake out the boot / first-connect raciness that
+    # a single PR-lane run cannot surface. Self-contained: builds minvmd + the CLI, materializes the
     # guest images, then loops scripts/soak-session-e2e.sh.
     runs-on: ubuntu-latest
-    # 10 cold VM boots + build + bulk-upload + the concurrency-stress step below
-    # run long; 60 min was cutting it off mid-soak.
+    # Ten soak iterations (several cold VM boots each) + build + bulk-upload +
+    # the concurrency-stress step below run long; 60 min was cutting it off
+    # mid-soak.
     timeout-minutes: 90
     # The non-blocking stress step's real outcome, so notify can list it.
     outputs:
@@ -140,7 +141,7 @@ jobs:
         # overlay has no other end and every egress — including the in-guest
         # `pkgs` clone during session mint — dies with "Could not resolve host".
         run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy"
-      - name: Soak the session e2e (x10)
+      - name: Soak the session e2e (10 iterations)
         env:
           MINVMD_KERNEL_PATH: ${{ runner.temp }}/vmlinuz
           MINVMD_ROOTFS_PATH: ${{ runner.temp }}/rootfs.img

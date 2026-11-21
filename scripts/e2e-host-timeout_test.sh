@@ -91,5 +91,40 @@ else
   bad "stop after the kill: got exit $rc after ${elapsed}s, want 124 well before 30s"
 fi
 
+# With E2E_TIMEOUT_KILL_AFTER set, a command that ignores SIGTERM is killed
+# after the grace period, and the answer is still 124.
+rc=0
+t0=$SECONDS
+(PATH="$root/bin"; E2E_TIMEOUT_KILL_AFTER=1 e2e_timeout 1 sh -c 'trap "" TERM; sleep 30') || rc=$?
+elapsed=$((SECONDS - t0))
+if [ "$rc" -eq 124 ] && [ "$elapsed" -lt 10 ]; then
+  ok "a command that ignores TERM is killed after the grace, with 124 after ${elapsed}s"
+else
+  bad "TERM ignored: got exit $rc after ${elapsed}s, want 124 well before 30s"
+fi
+
+# The same through GNU timeout, when this host has it.
+if command -v timeout >/dev/null 2>&1; then
+  rc=0
+  t0=$SECONDS
+  E2E_TIMEOUT_KILL_AFTER=1 e2e_timeout 1 sh -c 'trap "" TERM; sleep 30' || rc=$?
+  elapsed=$((SECONDS - t0))
+  if [ "$rc" -eq 124 ] && [ "$elapsed" -lt 10 ]; then
+    ok "GNU timeout: a command that ignores TERM is killed, with 124 after ${elapsed}s"
+  else
+    bad "GNU timeout, TERM ignored: got exit $rc after ${elapsed}s, want 124 well before 30s"
+  fi
+
+  # A command that ends with 137 on its own, before the limit, is not a
+  # timeout: its own code passes through.
+  rc=0
+  E2E_TIMEOUT_KILL_AFTER=1 e2e_timeout 5 sh -c 'exit 137' || rc=$?
+  if [ "$rc" -eq 137 ]; then
+    ok "GNU timeout: an early exit 137 passes through"
+  else
+    bad "GNU timeout, early exit 137: got exit $rc, want 137"
+  fi
+fi
+
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 # Soak harness: run the unified session e2e (scripts/session-e2e.sh) N times
 # back-to-back against a VM-backed target, reaping leftover VM processes
-# between iterations, to shake out the boot / first-connect raciness (the
+# between runs, to shake out the boot / first-connect raciness (the
 # vsock-bridge wedge class) that a single PR-lane run cannot surface. Reports
 # a pass/fail tally and exits non-zero if ANY iteration failed.
+#
+# An iteration runs the cold-boot core cases (SOAK_CASES below), each as its
+# own session-e2e.sh invocation. Every invocation gets a fresh state dir, so
+# each case is a cold VM boot followed by a first connect. An iteration does
+# not run the whole lane: the KVM lane already runs it on every push to main,
+# and one whole-lane run now takes over 20 minutes on a hosted runner, so ten
+# of them cannot fit the nightly job's time limit.
 #
 # Then, once, the bulk host→guest upload proof (scripts/bulk-upload-e2e.sh):
 # no session-e2e iteration pushes enough data through the guest vsock to catch
@@ -16,10 +23,19 @@
 # on PATH, MINVMD_KERNEL_PATH / MINVMD_ROOTFS_PATH / MINVMD_INITRAMFS set,
 # libkrun on the loader path — and passes the VM knobs through the
 # environment (E2E_VM=1 E2E_MINIMAL_ARGS="--provider local-minvmd" E2E_PROJECT_DIR=/tmp),
-# same as the lane invocation. Each iteration runs session-e2e.sh, which
-# creates its own fresh XDG state, so every pass is a clean cold start.
+# same as the lane invocation. Each session-e2e.sh invocation creates its own
+# fresh XDG state, so every pass is a clean cold start.
 #
 # Environment:
+#   SOAK_CASES          the session-e2e.sh case names each iteration runs, in
+#                       order, separated by spaces (default: lifecycle
+#                       session_exec sandbox restart). `all` runs the whole
+#                       lane once per iteration instead.
+#   SOAK_CASE_TIMEOUT_SECS  time limit, in seconds, for one case's
+#                       session-e2e.sh run (default 240). A run that hangs
+#                       past it counts as a failed case, and the soak goes on
+#                       to the next case instead of losing the rest of the
+#                       night to the job's time limit. Not applied with `all`.
 #   SOAK_MIN_FREE_MIB   free-space floor, in MiB, for the filesystem holding the
 #                       per-iteration state dirs (default 4096). See the
 #                       headroom check below for why this harness needs one.
@@ -43,6 +59,70 @@ mkdir -p "$LOGDIR" || { echo "cannot create boot-log dir: '$LOGDIR'" >&2; exit 2
 # silently, exactly when a failing run needs it.
 LOGDIR="$(cd "$LOGDIR" && pwd)"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# The cases each iteration runs. Each one autospawns the daemon in a fresh VM
+# and then makes the first connect its proof needs: list, warm call and
+# destroy; a non-interactive exec; an interactive attach over the vsock
+# bridge; a daemon stop and its autospawn.
+CASES="${SOAK_CASES-lifecycle session_exec sandbox restart}"
+case "$CASES" in
+  all) CASES="" ;;  # session-e2e.sh with no argument runs the whole lane
+  *[![:space:]]*) ;;
+  *) echo "SOAK_CASES names no case; set it to case names or 'all'" >&2; exit 2 ;;
+esac
+# Check every name once, up front: session-e2e.sh refuses an unknown case
+# only when it runs, so a misspelt name would fail the same case in every
+# iteration. The accepted names are read from the arm of session-e2e.sh's
+# final dispatch that calls "proof_$1", so the two lists cannot drift. Some
+# proof_ functions are helpers that this arm does not name, and they are
+# refused here too.
+dispatch_cases() {
+  awk '
+    /^case "\$\{1:-\}" in$/ { in_case = 1; arm = 0; names = ""; next }
+    /^esac$/                { in_case = 0; next }
+    in_case && /^    ;;$/   { arm = 1; next }
+    in_case && arm && /^    "proof_\$1"$/ { print names; exit }
+    in_case && arm          { names = names " " $0 }
+  ' "$ROOT/scripts/session-e2e.sh" | tr '|\\)' '   '
+}
+KNOWN_CASES=" $(dispatch_cases | tr -s ' \t' '  ') "
+if [ -z "${KNOWN_CASES// /}" ]; then
+  echo "could not read the case names from scripts/session-e2e.sh" >&2
+  exit 2
+fi
+for c in $CASES; do
+  case "$KNOWN_CASES" in
+    *" $c "*) ;;
+    *) echo "SOAK_CASES names '$c', which is not a case of scripts/session-e2e.sh" >&2; exit 2 ;;
+  esac
+done
+
+# A healthy case takes well under a minute; a cold guest boot can spend up
+# to about 70 s probing hardware first. 240 s leaves room for that, and a
+# hang then costs at most this plus the kill grace below (5 minutes), so
+# the job's slack absorbs a few hangs and still reaches the steps after the
+# soak.
+CASE_TIMEOUT="${SOAK_CASE_TIMEOUT_SECS:-240}"
+case "$CASE_TIMEOUT" in
+  '' | *[!0-9]*) echo "SOAK_CASE_TIMEOUT_SECS must be a positive integer, got: '$CASE_TIMEOUT'" >&2; exit 2 ;;
+esac
+# Compare as a number, so 0 and 00 are both refused: GNU timeout reads a
+# zero limit as no limit at all.
+if [ "$((10#$CASE_TIMEOUT))" -eq 0 ]; then
+  echo "SOAK_CASE_TIMEOUT_SECS must be a positive integer, got: '$CASE_TIMEOUT'" >&2
+  exit 2
+fi
+# A case that outlives its limit gets SIGTERM, which runs session-e2e.sh's
+# teardown. That teardown stops the daemon and the VM, and against a wedged
+# daemon it can hang too, so SIGKILL follows if the case is still running
+# this long after the SIGTERM. Not exported: e2e_timeout reads it in this
+# shell, and session-e2e.sh's own calls of the helper keep their behaviour.
+# shellcheck disable=SC2034 # read by e2e_timeout, which is sourced below
+E2E_TIMEOUT_KILL_AFTER=60
+# e2e_timeout: a host-side timeout that also works with no GNU timeout on
+# PATH, as on a stock Mac.
+# shellcheck disable=SC1091
+source "$ROOT/scripts/e2e-host-timeout.sh"
 
 # Reap leftovers a failed boot may strand (the detached __krun-vmm grandchild
 # and the gvproxy switch can linger and wedge the next iteration's bridge).
@@ -114,7 +194,28 @@ for i in $(seq 1 "$ITER"); do
     echo "::endgroup::"
     exit 1
   fi
-  if MINVMD_BOOT_LOG="$LOGDIR/boot-$i.log" "$ROOT/scripts/session-e2e.sh"; then
+  iter_ok=1
+  if [ -z "$CASES" ]; then
+    MINVMD_BOOT_LOG="$LOGDIR/boot-$i.log" "$ROOT/scripts/session-e2e.sh" || iter_ok=0
+  else
+    first=1
+    for c in $CASES; do
+      # The iteration's own reap above already cleared the first case's way.
+      [ "$first" -eq 1 ] || reap
+      first=0
+      rc=0
+      MINVMD_BOOT_LOG="$LOGDIR/boot-$i-$c.log" \
+        e2e_timeout "$CASE_TIMEOUT" "$ROOT/scripts/session-e2e.sh" "$c" || rc=$?
+      if [ "$rc" -eq 124 ]; then
+        iter_ok=0
+        echo "::warning::soak iteration $i: case $c did not finish within ${CASE_TIMEOUT}s and was stopped (boot log: boot-$i-$c.log)"
+      elif [ "$rc" -ne 0 ]; then
+        iter_ok=0
+        echo "::warning::soak iteration $i: case $c FAILED"
+      fi
+    done
+  fi
+  if [ "$iter_ok" -eq 1 ]; then
     pass=$((pass + 1))
     echo "iteration $i: OK"
   else
