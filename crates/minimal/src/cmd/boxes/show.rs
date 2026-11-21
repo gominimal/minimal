@@ -616,7 +616,7 @@ fn build_box_reach(build: &minimald_rpc::RunningBuildBox) -> String {
         .is_some_and(|subnets| subnets.iter().any(|subnet| subnet == "0.0.0.0/0"));
     let hosts = egress.allow_dns_hosts.clone().unwrap_or_default();
     if internet {
-        "the internet".to_string()
+        "the public internet".to_string()
     } else if hosts.is_empty() {
         "no destination".to_string()
     } else {
@@ -754,7 +754,7 @@ mod build_box_tests {
             String::from_utf8(out).unwrap(),
             "build boxes (their own reach, not this box's)\n  \
              bucket: storage.googleapis.com\n  \
-             tooling: the internet\n  \
+             tooling: the public internet\n  \
              mine: follows this box's rules\n  \
              unlisted: no destination\n  \
              fetched: no network\n"

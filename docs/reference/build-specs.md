@@ -137,7 +137,13 @@ Where the package comes from decides what its build box can reach:
 | From an `[upstream]` or a sideload, at the pin `minimal.toml` held when `min` created the box | The hosts of its declared sources and the public internet hosts they redirect to, for the fetch alone. With `needs.dns` or `needs.internet`, on the package or in its dependencies, the public internet. A build box never reaches your local network, another box or the host. |
 | Written in the project, patched, or changed inside the box | The box's own rules. A box that admits nothing refuses a build that needs the network. |
 
-`min` reads the pins when it creates the box. The same reach applies to a
+A declared source on a loopback, private or link-local address gets no reach.
+In a box started with `--network none`, no build box has a network, wherever
+the package comes from.
+
+`min` reads the pins when it creates the box. If that takes longer than 5
+seconds, as it can when `min` first fetches an upstream, the box's builds follow
+the box's own rules. The same reach applies to a
 package you add to a running box with `min add`. A change to `[upstream]` or
 its pin inside a box gives that box nothing new: the builds it changes follow
 the box's own rules. The next box you create reads your `minimal.toml`.
@@ -145,3 +151,7 @@ the box's own rules. The next box you create reads your `minimal.toml`.
 While a build box runs, [`min box list`](./cli-min.md) lists it under the box
 it builds for, and `min session policy` and `min box show` print what it can
 reach. That reach is the build box's. The box's own rules do not change.
+In `min box list -o json`, a build box is an entry whose `type` is `build`, whose
+`id` is `null`, whose `name` is the package and whose `parent` is the id of the
+box it builds for. `min session list` and `min task list` do not show build
+boxes.

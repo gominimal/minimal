@@ -3976,9 +3976,14 @@ pub(crate) async fn hold_requester_build_row(
                 return Vec::new();
             }
             boxes::EffectiveEgress::Declared(section) => section,
-            boxes::EffectiveEgress::AllowAll => {
-                minimald_rpc::build_box_egress(&std::collections::BTreeSet::new(), true)
-            }
+            // The box's own rules, which allow everything: an internet grant
+            // is narrower than that (NET-168), so it is not this row's.
+            boxes::EffectiveEgress::AllowAll => boxes::EgressPolicy {
+                allow_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+                allow_dns_hosts: Some(Vec::new()),
+                allow_protocols: None,
+                deny_subnets: None,
+            },
         };
     let request = minimald_rpc::RegisterBoxRequest {
         name: minimald_rpc::requester_build_row_name(session_id),
