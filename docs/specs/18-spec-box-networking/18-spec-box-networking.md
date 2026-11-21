@@ -1056,7 +1056,10 @@ box that holds it returns to `running`. These terms follow the decision in
 - **NET-121** WHEN a box is published THE SYSTEM SHALL bind a forwarder for each ingress port its declaration names before its name is registered, and hold that forwarder until the box stops.
   tier:     T0
   verify:   cargo nextest run -p minimald declared_ports_bound_before_name_registered
-  <!-- S1b-2c; design §7.1 (enforcement parity, bind discipline); event-driven; NET-016 covers ports a permit range allows and no declaration names -->
+  verify:   cargo nextest run -p minimald activation_refused_when_vm_host_hands_no_switch_address
+  verify:   cargo nextest run -p minvmd stopped_box_declared_forwards_released_before_stop_returns
+  verify:   cargo nextest run -p minimal box_stop_releases_declared_ports_on_vm_host
+  <!-- S1b-2c; design §7.1 (enforcement parity, bind discipline); event-driven; NET-016 covers ports a permit range allows and no declaration names; on a VM-backed host the host binds a declared forward toward the box's switch address, so a box with declared ingress and no switch address fails its activation with the reason; a box stop asks the VM host daemon to release the box's declared forwards and returns after the release, and the box keeps its host row, so its next start binds the ports again -->
   - IF a declared port's ingress is revoked THEN THE SYSTEM SHALL unbind its forwarder and terminate the connections it holds.
     tier:   T0
     verify: cargo nextest run -p minimald ingress_revocation_unbinds_forwarder_and_terminates_connections

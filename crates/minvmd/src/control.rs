@@ -1304,6 +1304,14 @@ fn serve_request(
             let reply = order.apply(|| rename_box(boxes, &request));
             write_reply(stream, &reply)
         }
+        // A stopped box's forwards go, and its row stays (NET-121). No
+        // ticket: the release changes no row, and the wait for the gate's
+        // unbind must not hold up the verbs queued behind it.
+        (BoxControlRequest::ReleaseBoxForwards(request), ControlDoor::Host) => {
+            let reply =
+                release_box_forwards(boxes, &request, crate::box_registry::FORWARD_RELEASE_WAIT);
+            write_reply(stream, &reply)
+        }
         // A read of the host's own table, like the row read: no ticket.
         // The table is this supervisor's, and a supervisor runs one VM and
         // binds this door for that VM's vsock bridge alone, so the answer
@@ -2074,6 +2082,7 @@ fn request_verb(request: &BoxControlRequest) -> &'static str {
         BoxControlRequest::Register(_) => "register",
         BoxControlRequest::Withdraw(_) => "withdraw",
         BoxControlRequest::RenameBox(_) => "rename_box",
+        BoxControlRequest::ReleaseBoxForwards(_) => "release_box_forwards",
         BoxControlRequest::HoldBoxName(_) => "hold_box_name",
         BoxControlRequest::ReleaseBoxName(_) => "release_box_name",
         BoxControlRequest::AdmitHostIpBox(_) => "admit_host_ip_box",
@@ -2501,6 +2510,69 @@ fn allocate_box_address_keeping(
             error: format!("could not give the box an address: {reason}"),
         }
     })
+}
+
+/// Release the declared forwards of the stopped box the request's pair and
+/// id prove (NET-121), and build the reply: the pair echoed back once every
+/// forward is unbound, or when no row stands at the pair, and the reason
+/// otherwise. The row is not withdrawn. One line for each release.
+fn release_box_forwards(
+    boxes: &BoxRegistry,
+    request: &minimald_rpc::ReleaseBoxForwardsRequest,
+    bound: Duration,
+) -> BoxControlReply {
+    use crate::box_registry::ForwardReleaseOutcome;
+    let outcome = boxes.table().release_row_forwards(
+        request.switch_address,
+        request.loopback_address,
+        request.box_id.to_bytes(),
+        bound,
+    );
+    let echo = BoxControlReply::Addresses(BoxAddresses {
+        switch_address: request.switch_address,
+        loopback_address: request.loopback_address,
+    });
+    let error = match outcome {
+        ForwardReleaseOutcome::Released => {
+            tracing::info!(
+                box = %request.name,
+                switch_address = %request.switch_address,
+                "released the stopped box's declared forwards; the row stays"
+            );
+            return echo;
+        }
+        ForwardReleaseOutcome::NoRow => {
+            tracing::debug!(
+                box = %request.name,
+                switch_address = %request.switch_address,
+                "no host row for the stopped box; no forward to release"
+            );
+            return echo;
+        }
+        ForwardReleaseOutcome::NotTheBox => format!(
+            "the host row at {} is not box {}'s; its forwards stay",
+            request.switch_address, request.name
+        ),
+        ForwardReleaseOutcome::NoGate => {
+            "no egress gate runs on this host to release the forwards".to_string()
+        }
+        ForwardReleaseOutcome::GaveUp => format!(
+            "a declared forward of box {} stays bound after the retries",
+            request.name
+        ),
+        ForwardReleaseOutcome::TimedOut => format!(
+            "the release of box {}'s declared forwards did not finish within {}s",
+            request.name,
+            bound.as_secs()
+        ),
+    };
+    tracing::warn!(
+        box = %request.name,
+        switch_address = %request.switch_address,
+        ?outcome,
+        "refused or failed to release a stopped box's declared forwards"
+    );
+    BoxControlReply::Error { error }
 }
 
 /// Serves a renamed session's rename of its box (#1116): the registry
