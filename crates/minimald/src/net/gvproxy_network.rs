@@ -380,6 +380,106 @@ pub(crate) async fn complete_own_ip_attach(
     .await
 }
 
+/// Adopts the declared forwards a native finalize bound at the box's
+/// activation (`activated`), for the box's first attach. Only a forward
+/// that a declared mapping binds at `published`, on a port the box does not
+/// yield now, is kept, with `gate`. A present range landing can move the
+/// publish between the activation and the attach, so every other forward is
+/// unbound, and each declared mapping that no kept forward covers is bound
+/// here at `published`, toward `lease_ip`. A failed bind unbinds the kept
+/// forwards too, so nothing stands for a box whose attach failed.
+///
+/// # Errors
+///
+/// As [`crate::net::policy::apply_ingress_naming_holders`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "left positional: the single call site has every one of these at hand"
+)]
+async fn adopt_activation_forwards(
+    control: &ControlChannel,
+    activated: Vec<PortForwarder>,
+    published: std::net::Ipv4Addr,
+    lease_ip: std::net::Ipv4Addr,
+    ingress: Option<&boxes::IngressPolicy>,
+    gate: Option<&Arc<BoxGate>>,
+    yielded: &[crate::net::dns::SharedPortCollision],
+    holder_of: &(dyn Fn(u16) -> minimald_rpc::PortHolder + Sync),
+) -> io::Result<Vec<PortForwarder>> {
+    let wanted: Vec<&boxes::PortMapping> = ingress
+        .map(|ingress| ingress.port_mappings.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter(|mapping| {
+            !yielded
+                .iter()
+                .any(|collision| collision.port == mapping.external_port)
+        })
+        .collect();
+    let (kept, stale): (Vec<PortForwarder>, Vec<PortForwarder>) =
+        activated.into_iter().partition(|forwarder| {
+            wanted
+                .iter()
+                .any(|mapping| forwarder.is_forward_of(published, mapping))
+        });
+    for forwarder in &stale {
+        // A forward that does not unbind is said in the log. The attach
+        // goes on, since the box's name no longer answers at its address.
+        if let Err(e) = forwarder.unbind_moved(control).await {
+            tracing::warn!(
+                local = %forwarder.local(),
+                error = %e,
+                "unbinding a declared forward the box's activation left at an old address failed"
+            );
+        }
+    }
+    let missing: Vec<boxes::PortMapping> = wanted
+        .into_iter()
+        .filter(|mapping| {
+            !kept
+                .iter()
+                .any(|forwarder| forwarder.is_forward_of(published, mapping))
+        })
+        .cloned()
+        .collect();
+    let mut exposed: Vec<PortForwarder> = kept
+        .into_iter()
+        .map(|forwarder| forwarder.with_gate(gate.cloned()))
+        .collect();
+    if let (Some(ingress), false) = (ingress, missing.is_empty()) {
+        tracing::info!(
+            address = %published,
+            switch_address = %lease_ip,
+            missing = missing.len(),
+            "binding the declared forwards the box's activation did not bind at its current address"
+        );
+        let missing = boxes::IngressPolicy {
+            port_mappings: missing,
+            ..ingress.clone()
+        };
+        match crate::net::policy::apply_ingress_naming_holders(
+            control, published, lease_ip, &missing, gate, yielded, holder_of,
+        )
+        .await
+        {
+            Ok(bound) => exposed.extend(bound),
+            Err(e) => {
+                for forwarder in &exposed {
+                    if let Err(unbind) = forwarder.unbind_moved(control).await {
+                        tracing::warn!(
+                            local = %forwarder.local(),
+                            error = %unbind,
+                            "unbinding an adopted declared forward after a failed bind failed"
+                        );
+                    }
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(exposed)
+}
+
 /// Tail of the own-IP attach: apply static ingress forwards (R2.3) over
 /// `control`, then build the [`OwnIpGuard`]. On an ingress failure the relay is
 /// dropped (closing the switch-side connection); the attach-count rollback is
@@ -420,47 +520,67 @@ async fn finish_own_ip_attach(
     // for a published address at all.
     let published = own_address.and_then(|reporter| reporter.published_address());
     // On a native host the box's finalize drew this lease and bound the
-    // declared forwards toward it, before any attach. The attach adopts
-    // them and binds nothing again. They get this attach's gate, so a
-    // revocation ends their connections. With no published address the
-    // attach fails below, and the detach of the lease unbinds them.
+    // declared forwards toward it, before any attach. The attach adopts the
+    // ones that still match the box's publish, and binds nothing again for
+    // them. They get this attach's gate, so a revocation ends their
+    // connections. With no published address the attach fails below, and the
+    // detach of the lease unbinds them.
     let adopted = match published {
         Some(_) => switch.lock().await.take_activation_forwards(lease),
         None => None,
     };
+    // The ports this box yields at a shared address (NET-129, first-come)
+    // are known state from its publish, not a failed bind: their forwards
+    // are skipped and the box stays usable.
+    let yielded = own_address
+        .map(crate::net::provider::OwnAddressReporter::shared_port_collisions)
+        .unwrap_or_default();
+    // A taken port's refusal names its holder (NET-144): the box whose
+    // publish stands at that address and port, or the host.
+    let registry = own_address.map(crate::net::provider::OwnAddressReporter::registry);
+    let holder_of = |port: u16| match (&registry, published) {
+        (Some(registry), Some(published)) => {
+            crate::net::policy::port_holder(registry, session_name, published, port)
+        }
+        _ => minimald_rpc::PortHolder::Host,
+    };
     let exposed = match (ingress, published) {
         (_, Some(published)) if adopted.is_some() => {
-            let adopted: Vec<PortForwarder> = adopted
-                .into_iter()
-                .flatten()
-                .map(|forwarder| forwarder.with_gate(gate.cloned()))
-                .collect();
-            tracing::debug!(
-                session = session_name,
-                address = %published,
-                switch_address = %lease_ip,
-                forwards = adopted.len(),
-                "adopted the declared forwards bound at the box's activation"
-            );
-            adopted
+            match adopt_activation_forwards(
+                &control,
+                adopted.into_iter().flatten().collect(),
+                published,
+                lease_ip,
+                ingress,
+                gate,
+                &yielded,
+                &holder_of,
+            )
+            .await
+            {
+                Ok(exposed) => {
+                    tracing::debug!(
+                        session = session_name,
+                        address = %published,
+                        switch_address = %lease_ip,
+                        forwards = exposed.len(),
+                        "adopted the declared forwards bound at the box's activation"
+                    );
+                    exposed
+                }
+                // As a failed bind below: the attach fails, and the name
+                // finalize registered is withdrawn (NET-121).
+                Err(e) => {
+                    drop(relay);
+                    if let Some(own_address) = own_address {
+                        own_address.withdraw(session_name);
+                    }
+                    return Err(e);
+                }
+            }
         }
         (Some(ingress), _) if ingress.port_mappings.is_empty() => Vec::new(),
         (Some(ingress), Some(published)) => {
-            // The ports this box yields at a shared address (NET-129,
-            // first-come) are known state from its publish, not a failed
-            // bind: their forwards are skipped and the box stays usable.
-            let yielded = own_address
-                .map(crate::net::provider::OwnAddressReporter::shared_port_collisions)
-                .unwrap_or_default();
-            // A taken port's refusal names its holder (NET-144): the box
-            // whose publish stands at that address and port, or the host.
-            let registry = own_address.map(crate::net::provider::OwnAddressReporter::registry);
-            let holder_of = |port: u16| match &registry {
-                Some(registry) => {
-                    crate::net::policy::port_holder(registry, session_name, published, port)
-                }
-                None => minimald_rpc::PortHolder::Host,
-            };
             match crate::net::policy::apply_ingress_naming_holders(
                 &control, published, lease_ip, ingress, gate, &yielded, &holder_of,
             )
@@ -1830,6 +1950,141 @@ mod tests {
         assert!(
             switch.lock().await.leases().is_empty(),
             "the drawn lease left the table with the attach"
+        );
+        fake.abort();
+    }
+
+    /// The box's publish moved between its activation and its first attach,
+    /// as a present range landing moves it off the interim. The attach
+    /// adopts only the forward bound at the box's current address. It
+    /// unbinds the forward the activation left at the old address, and binds
+    /// that declared port again at the current address, so the name never
+    /// answers where a declared port is not bound.
+    #[tokio::test]
+    async fn native_attach_binds_the_forwards_a_moved_publish_left_unbound() {
+        const CURRENT: Ipv4Addr = Ipv4Addr::new(127, 0, 64, 15);
+        const OLD: Ipv4Addr = Ipv4Addr::new(127, 0, 64, 16);
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut native =
+            SwitchClient::new(dir.path().join("gvproxy-min"), dir.path()).with_host_id("aaaa1");
+        native.serve_externally();
+        let control_path = native.control_socket();
+        let switch = Arc::new(Mutex::new(native));
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let (handed_tx, _handed_rx) = mpsc::channel(4);
+        let fake =
+            spawn_control_channel_deciding(control_path.clone(), |_, _| ok(), events_tx, handed_tx);
+        let control = ControlChannel::Unix(control_path);
+        let registry = Arc::new(std::sync::RwLock::new(dns::HostnameRegistry::new(
+            "aaaa1", true,
+        )));
+        let reporter = crate::net::provider::OwnAddressReporter::new(
+            Arc::clone(&registry),
+            boxes::SessionId::nil(),
+        );
+        let policy = declared_two_ports();
+        let ingress = policy.ingress.clone().expect("two declared ports");
+        let only = |port: u16| boxes::IngressPolicy {
+            port_mappings: ingress
+                .port_mappings
+                .iter()
+                .filter(|mapping| mapping.external_port == port)
+                .cloned()
+                .collect(),
+            ..ingress.clone()
+        };
+
+        // The finalize's half: 8080 bound where the box publishes now, 9090
+        // where it published at its activation.
+        let drawn = switch
+            .lock()
+            .await
+            .draw_for_activation(boxes::SessionId::nil(), None)
+            .await
+            .expect("the native switch draws the box's lease");
+        let host = |_: u16| minimald_rpc::PortHolder::Host;
+        let mut forwards = crate::net::policy::bind_declared_at_publish(
+            &control,
+            CURRENT,
+            drawn.ip,
+            &only(8080),
+            &[],
+            &host,
+        )
+        .await
+        .expect("the stand-in binds 8080");
+        forwards.extend(
+            crate::net::policy::bind_declared_at_publish(
+                &control,
+                OLD,
+                drawn.ip,
+                &only(9090),
+                &[],
+                &host,
+            )
+            .await
+            .expect("the stand-in binds 9090"),
+        );
+        switch
+            .lock()
+            .await
+            .record_activation_forwards(boxes::SessionId::nil(), forwards);
+        let bound = collect_until(&mut events_rx, "/services/forwarder/expose", 2).await;
+        assert_eq!(
+            locals_of(&bound, "/services/forwarder/expose"),
+            vec![format!("{CURRENT}:8080"), format!("{OLD}:9090")],
+            "the activation binds: {bound:?}"
+        );
+        {
+            let mut reg = registry.write().expect("registry lock");
+            reg.publish_own_address(
+                boxes::SessionId::nil(),
+                "web",
+                CURRENT,
+                BTreeSet::from([8080, 9090]),
+            );
+            reg.register_own_ip(boxes::SessionId::nil(), "web", BTreeSet::from([8080, 9090]));
+        }
+
+        let attached = switch
+            .lock()
+            .await
+            .attach_drawn(Some(boxes::SessionId::nil()))
+            .await
+            .expect("the attach takes the lease the finalize drew");
+        let scenario = attach_scenario(&dir, "unused.sock");
+        let guard = crate::net::gvproxy_network::complete_own_ip_attach(
+            &switch,
+            scenario.tap_fd,
+            control,
+            attached.lease,
+            "web",
+            Some(&policy),
+            Some(&reporter),
+            false,
+        )
+        .await
+        .expect("the attach completes against the stand-in");
+        let events = collect_until(&mut events_rx, "/services/dns/add", 1).await;
+        assert_eq!(
+            locals_of(&events, "/services/forwarder/unexpose"),
+            vec![format!("{OLD}:9090")],
+            "the forward at the old address is unbound: {events:?}"
+        );
+        assert_eq!(
+            locals_of(&events, "/services/forwarder/expose"),
+            vec![format!("{CURRENT}:9090")],
+            "only the missing port binds at the current address: {events:?}"
+        );
+
+        Box::new(guard).teardown().await;
+        let unbound = collect_until(&mut events_rx, "/services/forwarder/unexpose", 2).await;
+        let mut unbound = locals_of(&unbound, "/services/forwarder/unexpose");
+        unbound.sort();
+        assert_eq!(
+            unbound,
+            vec![format!("{CURRENT}:8080"), format!("{CURRENT}:9090")],
+            "the teardown unbinds the adopted and the new forward"
         );
         fake.abort();
     }
