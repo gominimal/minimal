@@ -4009,7 +4009,7 @@ async fn create_with_name_held_by_running_box_refused_exit2_names_holder() {
         assert!(text.contains(&holder.to_string()), "{text}");
         assert!(text.contains("`dev`"), "{text}");
         assert!(
-            text.contains(&format!("min session rename {holder} <new-name>")),
+            text.contains(&format!("min box rename {holder} <new-name>")),
             "the refusal names the next step: {text}"
         );
     }
