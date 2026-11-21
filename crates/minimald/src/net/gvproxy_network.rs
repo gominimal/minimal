@@ -422,15 +422,18 @@ async fn adopt_activation_forwards(
                 .iter()
                 .any(|mapping| forwarder.is_forward_of(published, mapping))
         });
-    for forwarder in &stale {
-        // A forward that does not unbind is said in the log. The attach
-        // goes on, since the box's name no longer answers at its address.
+    // A forward that does not unbind is said in the log and kept, so the
+    // attach's teardown unbinds it again. The attach goes on, since the
+    // box's name no longer answers at its address.
+    let mut stranded: Vec<PortForwarder> = Vec::new();
+    for forwarder in stale {
         if let Err(e) = forwarder.unbind_moved(control).await {
             tracing::warn!(
                 local = %forwarder.local(),
                 error = %e,
                 "unbinding a declared forward the box's activation left at an old address failed"
             );
+            stranded.push(forwarder);
         }
     }
     let missing: Vec<boxes::PortMapping> = wanted
@@ -446,6 +449,7 @@ async fn adopt_activation_forwards(
         .into_iter()
         .map(|forwarder| forwarder.with_gate(gate.cloned()))
         .collect();
+    exposed.extend(stranded);
     if let (Some(ingress), false) = (ingress, missing.is_empty()) {
         tracing::info!(
             address = %published,
