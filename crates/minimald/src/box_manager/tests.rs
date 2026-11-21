@@ -7408,8 +7408,17 @@ async fn projection_digests_stored_side_by_side() {
         }
     };
 
+    // Each create that files a record takes its own name. Otherwise every
+    // box takes the entry's name, `digest`, and the second create is
+    // refused because a running box holds that name (BOX-163).
+    let named = |name: &str| {
+        let mut config = unnamed_config();
+        config.name = Some(name.to_owned());
+        config
+    };
+
     // A client that projected the same spec: both digests, equal.
-    let mut config = unnamed_config();
+    let mut config = named("digest-agreed");
     config.set_client_projection_digest(expected.clone());
     let (agreed, record) = create(config).await;
     assert_eq!(
@@ -7418,7 +7427,7 @@ async fn projection_digests_stored_side_by_side() {
     );
 
     // A digest a client sends under the daemon's key is dropped.
-    let mut config = unnamed_config();
+    let mut config = named("digest-asserted");
     config.set_client_projection_digest(expected.clone());
     config.attrs.insert(
         DAEMON_PROJECTION_DIGEST_ATTR.to_owned(),
@@ -7441,7 +7450,7 @@ async fn projection_digests_stored_side_by_side() {
     }
 
     // A client that predates the digest sends none: the daemon's alone.
-    let (_, record) = create(unnamed_config()).await;
+    let (_, record) = create(named("digest-none")).await;
     assert_eq!(digests_of(record), (None, Some(expected.clone())));
 
     // A create with no spec has no daemon digest, so the client's is not
@@ -7526,7 +7535,10 @@ async fn projection_digest_mismatch_refuses_create() {
         for (d, sent) in specs.iter().enumerate() {
             let client = digest(client_spec);
             let daemon = digest(sent);
+            // Each create takes its own name, so the entry's name, `x72`,
+            // held by an earlier box does not refuse it (BOX-163).
             let mut config = unnamed_config();
+            config.name = Some(format!("x72-{c}-{d}"));
             config.set_client_projection_digest(client.clone());
             let before = mngr.list_boxes(None).await.unwrap().len();
             let created = mngr

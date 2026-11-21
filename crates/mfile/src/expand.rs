@@ -3645,14 +3645,10 @@ mod tests {
         )
         .expect("the file reads");
         let session = read.session.expect("the session defaults read");
+        // A lower-case POSIX name is a strict name, so both land in `vars`.
         let strict: Vec<&str> = session.vars.keys().map(AsRef::as_ref).collect();
-        assert_eq!(strict, ["A"]);
-        let lenient: Vec<&str> = session
-            .vars_lenient
-            .iter()
-            .map(|v| v.name().as_ref())
-            .collect();
-        assert_eq!(lenient, ["my_var"]);
+        assert_eq!(strict, ["A", "my_var"]);
+        assert!(session.vars_lenient.is_empty());
         assert!(read.tasks["lint"].vars.contains_key("T"));
         // A session writes its variables back as one `env_vars` table.
         let written = toml::Table::try_from(&session).expect("the session writes");

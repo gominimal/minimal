@@ -532,6 +532,7 @@ fn session_defaults_rows(
         entry,
         true,
         &crate::SelectedLoadouts::default(),
+        None,
     )?;
     let spec = &expanded.spec;
     let secrets = spec
@@ -852,6 +853,45 @@ pub(crate) fn expansion_store_rules(
         .collect()
 }
 
+/// Expands `entry` over `layers` as a create sends it (BOX-071). When the
+/// expanded spec has a `source = "store"` reference and `global` is given,
+/// the client's `[secret-store-rules]` are read once, set as
+/// [`mfile::expand::Layers::store_rules`], and the entry expands again, so
+/// each store reference carries its rule's `upstream` and `inject`.
+///
+/// Returns the expansion and the rules read. The rules are `None` when the
+/// spec has no store reference, or with no `global`.
+///
+/// # Errors
+///
+/// Fails with exit 3 on an entry that does not expand, and on a client
+/// configuration whose store rules do not read.
+pub(crate) fn expand_with_store_rules(
+    global: Option<&GlobalArgs>,
+    entry: &mfile::entry::BoxEntry,
+    layers: &mut mfile::expand::Layers,
+) -> anyhow::Result<(mfile::expand::Expansion, Option<StoreRules>)> {
+    let invalid = |error| crate::ProjectFileInvalid { error };
+    let expansion = mfile::expand::expand(entry, layers).map_err(invalid)?;
+    let Some(global) = global else {
+        return Ok((expansion, None));
+    };
+    let store_ids = store_reference_ids(&expansion.spec);
+    if store_ids.is_empty() {
+        return Ok((expansion, None));
+    }
+    let (_, rules) = crate::config::read_client_config_and_store_rules(global)?;
+    layers.store_rules = expansion_store_rules(&rules);
+    tracing::debug!(
+        entry = %entry.name,
+        store_references = store_ids.len(),
+        store_rules = layers.store_rules.len(),
+        "expanded the entry with the client's secret-store rules"
+    );
+    let expansion = mfile::expand::expand(entry, layers).map_err(invalid)?;
+    Ok((expansion, Some(rules)))
+}
+
 /// An entry's expanded spec, the source of each value, and the proxy rows
 /// of an entry with a credentialed upstream.
 struct EntrySpec {
@@ -971,22 +1011,13 @@ fn expand_entry(
         entry.box_type.as_deref(),
         &project_types,
     );
-    let mut expansion = mfile::expand::expand(entry, &layers).map_err(invalid)?;
     // BOX-071: the client's `[secret-store-rules]` write each store
-    // reference's `upstream` and `inject` into the expanded spec. They are
-    // read once, only for a spec with a store reference, and the proxy rows
-    // below use the same read.
-    // Gap: the v0 spec that a create sends has no `[secrets]` table, so
-    // these values do not reach the daemon yet. #2410 moves the wire to the
-    // expanded spec.
+    // reference's `upstream` and `inject` into the expanded spec, as the
+    // create writes them into the spec it sends. They are read once, only
+    // for a spec with a store reference, and the proxy rows below use the
+    // same read.
+    let (expansion, read_rules) = expand_with_store_rules(Some(global), entry, &mut layers)?;
     let store_ids = store_reference_ids(&expansion.spec);
-    let mut read_rules = None;
-    if !store_ids.is_empty() {
-        let (_, rules) = crate::config::read_client_config_and_store_rules(global)?;
-        layers.store_rules = expansion_store_rules(&rules);
-        expansion = mfile::expand::expand(entry, &layers).map_err(invalid)?;
-        read_rules = Some(rules);
-    }
     let mut spec = expansion.spec;
     let mut sources = std::collections::BTreeMap::new();
     for (key, origin) in &expansion.report.values {

@@ -8,7 +8,6 @@ use std::io::IsTerminal as _;
 use std::process::ExitCode;
 
 use clap::{CommandFactory as _, Parser};
-use minimal::{ExecArgs, PolicyArgs, PolicyOutputFormat};
 use tracing_subscriber::fmt::format::{FormatEvent, Writer};
 use tracing_subscriber::fmt::{FmtContext, FormatFields};
 use tracing_subscriber::{
@@ -263,7 +262,9 @@ fn answer_failure(
 /// more than one host, 4 when the address names no box, 7 when a host did
 /// not answer the lookup), the code a `min box exec` refusal carries
 /// (`minimal::BoxExecRefusal`: 2 for `-t` without a terminal or a box that
-/// is not running, 5 when its spec turns exec off), the code an `--exec
+/// is not running or stopped before the command started, 5 when its spec
+/// turns exec off or its network rules could not be applied to the
+/// command), the code an `--exec
 /// <id>` refusal of `min box stop`, `logs` or `wait` carries
 /// (`minimal::BoxExecIdRefusal`: 2 for text that is not an exec id, 4 for an
 /// exec the box does not have), the code a start
@@ -616,27 +617,17 @@ impl std::io::Write for DashLog {
 
 /// Whether the command's stdout is a data contract that tracing must not
 /// pollute, so its logs go to stderr instead. The `completions` handlers emit a
-/// shell shim on stdout, `session exec` carries only the exec'd
-/// command's output, `box exec` carries the command's output or its exec
-/// id, and `task run` / `session run` stream the task's stdout —
+/// shell shim on stdout, `box exec` carries the command's output or its exec
+/// id, and `task run` / `box run` stream the task's stdout —
 /// a log line in any of them would be read as content. A bare `min` (no subcommand) is
 /// one too: its non-TTY twin promises an empty stdout to pipelines, and its
-/// interactive activate path prints only the session id there. So is
-/// `session policy -o json`, whose stdout is one document a script parses.
+/// interactive activate path prints only the session id there.
 fn stdout_is_data_contract(command: &Option<minimal::Command>) -> bool {
     matches!(
         command,
         None | Some(
             minimal::Command::CompleteSessionStr(_)
                 | minimal::Command::Completions(_)
-                | minimal::Command::Session(minimal::SessionArgs {
-                    command: minimal::SessionCommand::Exec(ExecArgs { .. })
-                        | minimal::SessionCommand::Run(_)
-                        | minimal::SessionCommand::Policy(PolicyArgs {
-                            output: Some(PolicyOutputFormat::Json),
-                            ..
-                        }),
-                })
                 | minimal::Command::Task(minimal::TaskArgs {
                     command: minimal::TaskCommand::Run(_),
                 })
@@ -719,7 +710,7 @@ impl tracing::field::Visit for MessageVisitor {
 
 /// Whether a run is under the machine output mode: the command's `-o`, the
 /// flag the architecture's machine-output contract hangs on — `json` for
-/// `min session policy -o json` and `jsonl` for `min box audit -o jsonl`.
+/// `min box show -o json` and `jsonl` for `min box audit -o jsonl`.
 /// `false` for every text run, and for a command that has not taken a
 /// machine `-o` yet, which is the same thing to the error path: its failure
 /// is a plain-text line. The error path keys on this, so a command joins
@@ -727,9 +718,6 @@ impl tracing::field::Visit for MessageVisitor {
 /// error path changes.
 fn machine_output_mode(cli: &minimal::Cli) -> bool {
     match &cli.command {
-        Some(minimal::Command::Session(minimal::SessionArgs {
-            command: minimal::SessionCommand::Policy(PolicyArgs { output, .. }),
-        })) => output.is_some(),
         // Architecture line 379: a `-o jsonl` failure is one `min/v1/error`
         // object too.
         Some(minimal::Command::Box(minimal::BoxArgs {
@@ -847,19 +835,6 @@ mod tests {
         assert!(stdout_is_data_contract(&None));
     }
 
-    /// `min session run` streams the task's stdout over the exec channel, so
-    /// tracing must route to stderr like the other stdout contracts.
-    #[test]
-    fn session_run_is_a_stdout_contract() {
-        let cmd = Some(Command::Session(minimal::SessionArgs {
-            command: minimal::SessionCommand::Run(minimal::SessionRunArgs {
-                session: "web".to_string(),
-                task: "build".to_string(),
-            }),
-        }));
-        assert!(stdout_is_data_contract(&cmd));
-    }
-
     /// `min task run` streams the task's stdout, so tracing must route to
     /// stderr there like the other stdout contracts.
     #[test]
@@ -867,7 +842,6 @@ mod tests {
         let cmd = Some(Command::Task(minimal::TaskArgs {
             command: minimal::TaskCommand::Run(minimal::TaskRunArgs {
                 task: "build".to_string(),
-                path: None,
                 network: None,
                 egress: minimal::EgressArgs::default(),
                 other: minimal::BoxOverrideArgs::default(),
@@ -974,27 +948,6 @@ mod tests {
             out.as_bytes().first().is_some_and(u8::is_ascii_digit),
             "timestamp missing: {out:?}"
         );
-    }
-
-    /// `min session policy -o json` writes one document a script parses, so
-    /// its tracing must route to stderr — and the text rendering, whose
-    /// stdout is for a person, must not be caught by the same gate.
-    #[test]
-    fn session_policy_json_is_a_stdout_contract() {
-        let cmd = Some(Command::Session(minimal::SessionArgs {
-            command: minimal::SessionCommand::Policy(PolicyArgs {
-                session: "web".to_string(),
-                output: Some(PolicyOutputFormat::Json),
-            }),
-        }));
-        assert!(stdout_is_data_contract(&cmd));
-        let cmd = Some(Command::Session(minimal::SessionArgs {
-            command: minimal::SessionCommand::Policy(PolicyArgs {
-                session: "web".to_string(),
-                output: None,
-            }),
-        }));
-        assert!(!stdout_is_data_contract(&cmd));
     }
 
     /// The error path's key: a `-o json` run is a machine-output run, a text
@@ -1213,28 +1166,6 @@ mod tests {
 
     #[test]
     fn machine_output_mode_keys_on_the_output_flag() {
-        let cli = minimal::Cli {
-            global_args: minimal::GlobalArgs::default(),
-            command: Some(Command::Session(minimal::SessionArgs {
-                command: minimal::SessionCommand::Policy(PolicyArgs {
-                    session: "web".to_string(),
-                    output: Some(PolicyOutputFormat::Json),
-                }),
-            })),
-        };
-        assert!(machine_output_mode(&cli));
-
-        let cli = minimal::Cli {
-            global_args: minimal::GlobalArgs::default(),
-            command: Some(Command::Session(minimal::SessionArgs {
-                command: minimal::SessionCommand::Policy(PolicyArgs {
-                    session: "web".to_string(),
-                    output: None,
-                }),
-            })),
-        };
-        assert!(!machine_output_mode(&cli));
-
         let cli = minimal::Cli {
             global_args: minimal::GlobalArgs::default(),
             command: None,
@@ -1597,7 +1528,25 @@ mod tests {
                 },
                 5,
             ),
-            (minimal::BoxExecRefusal::SpecUnreadable { target }, 5),
+            (
+                minimal::BoxExecRefusal::SpecUnreadable {
+                    target: target.clone(),
+                },
+                5,
+            ),
+            (
+                minimal::BoxExecRefusal::StoppedBeforeStart {
+                    target: target.clone(),
+                },
+                2,
+            ),
+            (
+                minimal::BoxExecRefusal::NetworkRulesNotApplied {
+                    target,
+                    cause: "Permission denied (os error 13)".to_string(),
+                },
+                5,
+            ),
         ] {
             assert_eq!(failure_exit_code(&anyhow::Error::new(refusal)), code);
         }
