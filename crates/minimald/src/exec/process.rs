@@ -233,17 +233,24 @@ pub(crate) async fn ensure_task_rows_stand(
     record: &boxes::Record,
     switch: &tokio::sync::Mutex<crate::net::SwitchClient>,
 ) -> io::Result<()> {
-    let Some(addresses) = record.box_addresses else {
-        return Ok(());
-    };
-    let standing = match record.box_id {
-        Some(box_id) => {
+    let standing = match (record.box_addresses, record.task_addresses.first()) {
+        (Some(addresses), _) => match record.box_id {
+            Some(box_id) => {
+                let control = crate::box_actor::switch_control_of(switch).await;
+                crate::net::listeners::host_row_standing(&control, addresses.switch_address, box_id)
+                    .await
+                    == Some(true)
+            }
+            None => false,
+        },
+        // A host-address box's task addresses are its build row's (NET-169),
+        // which `min` registered for it: the build asks that row stands.
+        (None, Some(&task_address)) => {
             let control = crate::box_actor::switch_control_of(switch).await;
-            crate::net::listeners::host_row_standing(&control, addresses.switch_address, box_id)
-                .await
+            crate::net::listeners::build_row_standing(&control, task_address, record.id).await
                 == Some(true)
         }
-        None => false,
+        (None, None) => return Ok(()),
     };
     if standing {
         Ok(())

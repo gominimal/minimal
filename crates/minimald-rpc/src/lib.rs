@@ -1169,6 +1169,14 @@ pub struct RowStandingRequest {
         with = "boxes::box_id_hex::option"
     )]
     pub box_id: Option<BoxId>,
+    /// The box whose build row the address is a task address of (NET-169):
+    /// a host-address box, whose own record names no row. The row is
+    /// answered as standing only when the box's build row
+    /// ([`requester_build_row_name`]) stands and the address is one of its
+    /// task rows. A host that predates this field reads it as no box id and
+    /// answers no row, fail-closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_row_of: Option<SessionId>,
 }
 
 /// The in-VM daemon's ask for the id of a box it is about to create

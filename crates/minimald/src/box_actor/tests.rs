@@ -5023,6 +5023,7 @@ async fn ensure_host_relaunches_a_registered_box_while_its_host_row_stands() {
         minimald_rpc::BoxControlRequest::RowStanding(minimald_rpc::RowStandingRequest {
             switch_address,
             box_id: Some(HANDED_BOX_ID),
+            build_row_of: None,
         }),
         "the read names the row's own key and the box's id, nothing else"
     );
@@ -16596,6 +16597,7 @@ async fn until_complete_ends_on_entrypoint_return_without_client_runs_a_task_beh
             minimald_rpc::BoxControlRequest::RowStanding(minimald_rpc::RowStandingRequest {
                 switch_address,
                 box_id: Some(HANDED_BOX_ID),
+                build_row_of: None,
             }),
             "the run reads the box's own row, nothing else"
         );

@@ -1431,14 +1431,7 @@ fn serve_request(
         (BoxControlRequest::RowStanding(request), ControlDoor::GuestReports) => {
             let reply = BoxControlReply::RowStanding {
                 switch_address: request.switch_address,
-                row_standing: boxes
-                    .table()
-                    .by_source(request.switch_address.octets())
-                    .is_some_and(|record| {
-                        request.box_id.is_some_and(|asked| {
-                            !record.is_task_row() && asked.to_bytes() == record.box_id()
-                        })
-                    }),
+                row_standing: row_standing(boxes, &request),
             };
             write_reply(stream, &reply)
         }
@@ -1873,6 +1866,22 @@ fn registration_reply(
         Ok(loopback_addr) => order
             .apply(move || register_box(boxes, answerer, request, loopback_addr, claim, build_row)),
         Err(reply) => reply,
+    }
+}
+
+/// Whether the row `request` asks about stands (NET-138): the box's own row
+/// at its switch address, under the id it names, or, for a host-address
+/// box's build row (NET-169), a task row of that build row at the address.
+fn row_standing(boxes: &BoxRegistry, request: &minimald_rpc::RowStandingRequest) -> bool {
+    let Some(record) = boxes.table().by_source(request.switch_address.octets()) else {
+        return false;
+    };
+    match (request.box_id, request.build_row_of) {
+        (Some(asked), _) => !record.is_task_row() && asked.to_bytes() == record.box_id(),
+        (None, Some(session_id)) => boxes
+            .row_by_name(&minimald_rpc::requester_build_row_name(session_id))
+            .is_some_and(|row| record.is_task_row() && row.box_id() == record.box_id()),
+        (None, None) => false,
     }
 }
 
@@ -7091,6 +7100,7 @@ mod tests {
             &BoxControlRequest::RowStanding(minimald_rpc::RowStandingRequest {
                 switch_address,
                 box_id,
+                build_row_of: None,
             }),
         )
         .expect("the read is answered")
@@ -9694,6 +9704,72 @@ mod tests {
         retire(destroyed, minimald_rpc::HostIpBoxEnd::Destroyed);
         assert!(registry.row_by_name(&destroyed_row).is_none());
         assert!(registry.row_by_name(&stopped_row).is_some());
+    }
+
+    /// NET-138, NET-169: the guest asks whether a host-address box's build
+    /// row stands at one of its task addresses. The row stands for that box
+    /// alone, through a stop, and not once the box is destroyed.
+    #[test]
+    fn a_build_row_read_answers_for_its_own_box_alone() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, _registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let session_id = boxes::SessionId::mint();
+        let reply = control(
+            &sock_path,
+            &BoxControlRequest::Register(RegisterBoxRequest {
+                name: minimald_rpc::requester_build_row_name(session_id),
+                ingress_ports: Vec::new(),
+                egress: None,
+                credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
+                hold: false,
+                task_slots: minimald_rpc::TASK_SLOTS_PER_BOX,
+                host_ip: false,
+                stays_detached: true,
+            }),
+        )
+        .expect("the register is answered");
+        let BoxControlReply::Registered(registered) = reply else {
+            panic!("{reply:?}");
+        };
+        let task_address = registered.task_addresses[0];
+        let standing = |switch_address, build_row_of| match control(
+            &sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE),
+            &BoxControlRequest::RowStanding(minimald_rpc::RowStandingRequest {
+                switch_address,
+                box_id: None,
+                build_row_of,
+            }),
+        )
+        .expect("the read is answered")
+        {
+            BoxControlReply::RowStanding { row_standing, .. } => row_standing,
+            other => panic!("expected a row-standing answer, got {other:?}"),
+        };
+        assert!(standing(task_address, Some(session_id)));
+        assert!(!standing(task_address, Some(boxes::SessionId::mint())));
+        assert!(!standing(task_address, None));
+        assert!(
+            !standing(registered.switch_address, Some(session_id)),
+            "the row's own address is not one of its task addresses"
+        );
+
+        let retire = |end| {
+            control(
+                &sock_path,
+                &BoxControlRequest::RetireHostIpBox(minimald_rpc::RetireHostIpBoxRequest {
+                    session_id,
+                    end,
+                }),
+            )
+            .expect("the retire is answered");
+        };
+        retire(minimald_rpc::HostIpBoxEnd::Stopped);
+        assert!(standing(task_address, Some(session_id)), "a stop keeps it");
+        retire(minimald_rpc::HostIpBoxEnd::Destroyed);
+        assert!(!standing(task_address, Some(session_id)));
     }
 
     /// NET-165: a grant that opens after its asker stopped waiting ends at

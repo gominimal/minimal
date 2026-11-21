@@ -467,11 +467,44 @@ pub(crate) async fn host_row_standing(
     switch_address: Ipv4Addr,
     box_id: minimald_rpc::BoxId,
 ) -> Option<bool> {
+    row_standing_read(
+        control,
+        minimald_rpc::RowStandingRequest {
+            switch_address,
+            box_id: Some(box_id),
+            build_row_of: None,
+        },
+    )
+    .await
+}
+
+/// Asks the VM host daemon whether the build row of the host-address box
+/// `session_id` (NET-169) still stands, with `task_address` among its task
+/// rows. `None` when the host cannot be asked.
+pub(crate) async fn build_row_standing(
+    control: &ControlChannel,
+    task_address: Ipv4Addr,
+    session_id: boxes::SessionId,
+) -> Option<bool> {
+    row_standing_read(
+        control,
+        minimald_rpc::RowStandingRequest {
+            switch_address: task_address,
+            box_id: None,
+            build_row_of: Some(session_id),
+        },
+    )
+    .await
+}
+
+/// One row read, retried within the report deadline.
+async fn row_standing_read(
+    control: &ControlChannel,
+    request: minimald_rpc::RowStandingRequest,
+) -> Option<bool> {
+    let switch_address = request.switch_address;
     let channel = box_report_channel(control)?;
-    let request = minimald_rpc::BoxControlRequest::RowStanding(minimald_rpc::RowStandingRequest {
-        switch_address,
-        box_id: Some(box_id),
-    });
+    let request = minimald_rpc::BoxControlRequest::RowStanding(request);
     let deadline = tokio::time::Instant::now() + REPORT_DEADLINE;
     for attempt in 1..=REPORT_ATTEMPTS {
         let bound = attempt_deadline(deadline, REPORT_DEADLINE, REPORT_ATTEMPTS);
