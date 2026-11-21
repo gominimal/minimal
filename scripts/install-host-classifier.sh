@@ -1637,7 +1637,8 @@ EOF_RANGES
 # knows. The names are a convention each program keeps, so the line says
 # the match is by name. A rule no name matches, whose packet-mark match
 # (ct_mark_conflicts_in) has a mask inside a range in
-# WELL_KNOWN_MARK_RANGES, is said to match that range instead. With
+# WELL_KNOWN_MARK_RANGES, is said to match that range, and the program that
+# uses the range is said to be one that can load it. With
 # "unowned" as $1 it prints only the whole-mark rules that neither a name
 # nor a range ties to a program.
 ct_mark_rule_owners() {
@@ -1716,7 +1717,10 @@ ct_mark_rule_owners() {
                 printf "The rule in %s belongs to %s, by the name of its table or chain.\n", where, name
             else if (known != "") {
                 split(known, f, " ")
-                printf "The rule in %s matches the packet-mark bits %s, which %s marks connections with.\n", where, f[2], f[1]
+                # Only the mask ties the rule to the range, so the line
+                # says the program can load it, not that it does, and names
+                # the step for a rule that another program loads.
+                printf "The rule in %s matches the packet-mark bits %s. %s marks connections with these bits, so %s can load this rule. If another program loads it, that program must write only the connection-mark bits it uses.\n", where, f[2], f[1], f[1]
             } else
                 printf "The rule in %s belongs to a program that this step cannot name from its table and chain.\n", where
         }

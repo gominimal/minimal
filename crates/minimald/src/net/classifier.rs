@@ -10025,8 +10025,8 @@ mod tests {
     /// NET-079: Tailscale's nftables-mode connmark save writes every bit of
     /// the connection mark, so the install refuses it under every mask. The
     /// refusal names the packet-mark match, says that its bits are the range
-    /// Tailscale marks connections with, and does not tell the user to
-    /// change a rule that Tailscale loads.
+    /// Tailscale marks connections with, so Tailscale can load the rule. It
+    /// does not tell the user to change the rule.
     #[test]
     fn install_refuses_tailscale_nft_mode_connmark_with_its_match() {
         for mask in [None, Some("0x0c000000")] {
@@ -10053,7 +10053,9 @@ mod tests {
                 assert!(
                     text.contains(&format!(
                         "The rule in table {family} mangle, chain OUTPUT matches the packet-mark \
-                         bits 0x00ff0000, which Tailscale marks connections with.\n"
+                         bits 0x00ff0000. Tailscale marks connections with these bits, so \
+                         Tailscale can load this rule. If another program loads it, that \
+                         program must write only the connection-mark bits it uses.\n"
                     )),
                     "the refusal names the mark range the {family} rule matches: {text}"
                 );
@@ -10109,7 +10111,7 @@ mod tests {
         assert!(!refused.status.success(), "{text}");
         assert!(
             text.contains("for packets that match meta mark & 0xffffffff != 0x00000000)\n")
-                && !text.contains("which Tailscale marks connections with")
+                && !text.contains("Tailscale marks connections with these bits")
                 && text.contains("Change that rule to write only the bits it uses"),
             "a match mask wider than a well-known range names no range: {text}"
         );
@@ -10129,8 +10131,8 @@ mod tests {
         assert!(!refused.status.success(), "{text}");
         assert!(
             text.contains("for packets that match meta mark & 0x01000000 != 0x00000000)\n")
-                && !text.contains("which Tailscale marks connections with")
-                && !text.contains("which kube-proxy")
+                && !text.contains("Tailscale marks connections with these bits")
+                && !text.contains("kube-proxy marks connections with these bits")
                 && text.contains("Change that rule to write only the bits it uses"),
             "a one-bit match mask outside every well-known range names no range: {text}"
         );
@@ -10153,7 +10155,9 @@ mod tests {
         assert!(
             text.contains(
                 "The rule in table inet other, chain c matches the packet-mark bits \
-                 0x00ff0000, which Tailscale marks connections with.\n"
+                 0x00ff0000. Tailscale marks connections with these bits, so Tailscale can \
+                 load this rule. If another program loads it, that program must write only \
+                 the connection-mark bits it uses.\n"
             ) && text.contains(
                 "The rule in table inet other, chain c belongs to a program that this step \
                  cannot name from its table and chain.\n"
