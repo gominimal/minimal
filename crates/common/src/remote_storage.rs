@@ -311,7 +311,8 @@ async fn source_hosts_admitting(
         let Ok(mut at) = reqwest::Url::parse(source) else {
             continue;
         };
-        let Ok(Some(pinned)) = tokio::time::timeout_at(deadline, redirect_addresses(&at, admits)).await
+        let Ok(Some(pinned)) =
+            tokio::time::timeout_at(deadline, redirect_addresses(&at, admits)).await
         else {
             continue;
         };
@@ -320,7 +321,8 @@ async fn source_hosts_admitting(
         };
         hosts.extend(at.host_str().map(str::to_ascii_lowercase));
         for _ in 0..MAX_REDIRECTS {
-            let Ok(Ok(response)) = tokio::time::timeout_at(deadline, probe.get(at.clone()).send()).await
+            let Ok(Ok(response)) =
+                tokio::time::timeout_at(deadline, probe.get(at.clone()).send()).await
             else {
                 break;
             };

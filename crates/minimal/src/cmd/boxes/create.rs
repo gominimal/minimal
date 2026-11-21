@@ -4000,14 +4000,14 @@ pub(crate) async fn hold_requester_build_row(
     match registration {
         Ok(Ok(registered)) => registered.task_addresses,
         Ok(Err(error)) => {
-            tracing::warn!(
+            tracing::info!(
                 error = %format!("{error:#}"),
                 "could not register the row of the box's builds"
             );
             Vec::new()
         }
         Err(_elapsed) => {
-            tracing::warn!(
+            tracing::info!(
                 timeout = ?minimal_client::box_registration::BOX_CONTROL_TIMEOUT,
                 "the VM host daemon did not answer the registration of the row of the box's \
                  builds in time"

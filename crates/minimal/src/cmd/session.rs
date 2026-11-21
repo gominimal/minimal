@@ -766,6 +766,25 @@ pub(crate) struct TypedBoxList<'a> {
     pub(crate) output: Option<BoxListOutputFormat>,
 }
 
+/// The records of `box_type` in `project_root`, every project when `None`.
+/// A typed listing shows boxes of its type only, so the build boxes a
+/// record carries are left out: `min box list` shows them.
+fn typed_records(
+    records: Vec<minimald_rpc::BoxListingEntry>,
+    box_type: &str,
+    project_root: Option<&paths::HostAbsPath>,
+) -> Vec<minimald_rpc::BoxListingEntry> {
+    records
+        .into_iter()
+        .filter(|entry| entry.box_type.as_deref() == Some(box_type))
+        .filter(|entry| project_root.is_none_or(|root| entry.project_root.as_ref() == Some(root)))
+        .map(|mut entry| {
+            entry.build_boxes.clear();
+            entry
+        })
+        .collect()
+}
+
 /// The typed listing over the local `hosts`: the `min box list` table, or
 /// its JSON array, with only the boxes of the requested type. A host that
 /// does not answer is named on `err`, and the list goes on without it. The
@@ -798,14 +817,8 @@ pub(crate) async fn typed_box_list_on_hosts(
             }
         };
         listed.extend(
-            records
+            typed_records(records, box_type, project_root.as_ref())
                 .into_iter()
-                .filter(|entry| entry.box_type.as_deref() == Some(box_type))
-                .filter(|entry| {
-                    project_root
-                        .as_ref()
-                        .is_none_or(|root| entry.project_root.as_ref() == Some(root))
-                })
                 .map(|record| ListedBox {
                     provider: host.provider.to_string(),
                     host: host.host.clone(),
@@ -959,6 +972,35 @@ pub(crate) async fn typed_box_rm_on_hosts(
 #[cfg(test)]
 mod tests {
     use super::activate_refusal;
+
+    /// BOX-210: `min session list` and `min task list` show boxes of their
+    /// type only, so a session's running build boxes are not rows there.
+    #[test]
+    fn a_typed_listing_leaves_out_build_boxes() {
+        let entry = |box_type: &str| minimald_rpc::BoxListingEntry {
+            build_boxes: vec![minimald_rpc::RunningBuildBox {
+                package: "claude-code".to_string(),
+                egress: None,
+                granted: false,
+                no_network: false,
+            }],
+            box_id: boxes::SessionId::mint(),
+            name: None,
+            box_type: Some(box_type.to_string()),
+            parent: None,
+            project_root: None,
+            state: "running".to_string(),
+            reason: None,
+            exit_code: None,
+            signal: None,
+            pty_enabled: true,
+            lifetime: None,
+        };
+        let typed = super::typed_records(vec![entry("session"), entry("task")], "session", None);
+        assert_eq!(typed.len(), 1);
+        assert_eq!(typed[0].box_type.as_deref(), Some("session"));
+        assert!(typed[0].build_boxes.is_empty());
+    }
 
     /// NET-144: the daemon's refusal reaches the person as its own text,
     /// with the port and the holder named, whatever context the

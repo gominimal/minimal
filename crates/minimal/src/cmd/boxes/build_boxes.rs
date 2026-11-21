@@ -27,6 +27,11 @@ const FILING_BYTES: usize = 48 * 1024;
 /// recurses past a runtime thread's stack.
 const EVALUATION_STACK: usize = 128 * 1024 * 1024;
 
+/// How long a start waits for the project's evaluation. An evaluation that
+/// has to fetch an upstream can take longer, and the start does not wait for
+/// it: the box gets no table, and its builds follow its own rules.
+const EVALUATION_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// What this activation knows about the box it prepares.
 pub(crate) struct BuildBoxActivation<'a> {
     pub(crate) global: &'a GlobalArgs,
@@ -45,25 +50,18 @@ pub(crate) async fn prepare_build_boxes(
     activation: BuildBoxActivation<'_>,
 ) {
     let started = std::time::Instant::now();
-    let table = match table_of_project(&activation).await {
-        Ok(table) => table,
-        Err(error) => {
-            tracing::info!(error = %format!("{error:#}"), "could not evaluate the project's packages");
-            BuildGrantTable::new()
-        }
-    };
+    let table = table_within(EVALUATION_BOUND, table_of_project(&activation)).await;
     tracing::info!(
         grants = table.len(),
         elapsed_ms = started.elapsed().as_millis(),
         "made the box's build table"
     );
-    let table = match &activation.control_sock {
-        Some(sock) => {
-            file_with_vm_host(sock, activation.session_id, table).await;
-            None
-        }
-        None => Some(table),
-    };
+    let table = hand_over(
+        activation.control_sock.as_deref(),
+        activation.session_id,
+        table,
+    )
+    .await;
     let prepared = client
         .oneshot_rpc::<PrepareBuildBoxes>(PrepareBuildBoxesRequest {
             session_id: activation.session_id,
@@ -77,6 +75,46 @@ pub(crate) async fn prepare_build_boxes(
             tracing::info!(%error, "the daemon did not take the box's build table");
         }
         Err(error) => tracing::info!(error = %format!("{error:#}"), "could not reach the daemon"),
+    }
+}
+
+/// Hands `table` to the host side: on a VM-backed host, the VM host daemon
+/// on `control_sock`, and the daemon gets none. On a host with no VM the
+/// daemon gets it, returned here.
+async fn hand_over(
+    control_sock: Option<&Path>,
+    session_id: boxes::SessionId,
+    table: BuildGrantTable,
+) -> Option<BuildGrantTable> {
+    match control_sock {
+        Some(sock) => {
+            file_with_vm_host(sock, session_id, table).await;
+            None
+        }
+        None => Some(table),
+    }
+}
+
+/// The table `evaluation` makes, or an empty one when it fails or takes
+/// longer than `bound`. Either way the start goes on.
+async fn table_within(
+    bound: std::time::Duration,
+    evaluation: impl std::future::Future<Output = anyhow::Result<BuildGrantTable>>,
+) -> BuildGrantTable {
+    match tokio::time::timeout(bound, evaluation).await {
+        Ok(Ok(table)) => table,
+        Ok(Err(error)) => {
+            tracing::info!(error = %format!("{error:#}"), "could not evaluate the project's packages");
+            BuildGrantTable::new()
+        }
+        Err(_elapsed) => {
+            tracing::info!(
+                bound = ?bound,
+                "the evaluation of the project's packages took too long; the box's builds \
+                 follow its own rules"
+            );
+            BuildGrantTable::new()
+        }
     }
 }
 
@@ -188,6 +226,183 @@ mod tests {
         }
         let joined: BuildGrantTable = parts.into_iter().flatten().collect();
         assert_eq!(joined, table);
+    }
+
+    /// NET-165: a start waits for the evaluation only up to its bound, and
+    /// an evaluation that fails or runs past it leaves an empty table.
+    #[tokio::test]
+    async fn an_evaluation_past_its_bound_leaves_an_empty_table() {
+        let bound = std::time::Duration::from_millis(50);
+        let one: BuildGrantTable = [(
+            "0".repeat(64),
+            BuildGrant {
+                sources: Vec::new(),
+                internet: true,
+            },
+        )]
+        .into();
+        assert_eq!(
+            table_within(bound, std::future::ready(Ok(one.clone()))).await,
+            one
+        );
+        assert!(
+            table_within(bound, std::future::ready(Err(anyhow::anyhow!("no graph"))))
+                .await
+                .is_empty()
+        );
+        let started = std::time::Instant::now();
+        assert!(table_within(bound, std::future::pending()).await.is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    fn one_grant() -> BuildGrantTable {
+        [(
+            "1".repeat(64),
+            BuildGrant {
+                sources: vec!["https://downloads.example.org/a.tar.gz".to_string()],
+                internet: false,
+            },
+        )]
+        .into()
+    }
+
+    /// A VM host on `sock` that answers each request with `reply` and keeps
+    /// the requests it took.
+    async fn fake_vm_host(
+        sock: &Path,
+        reply: BoxControlReply,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<BoxControlRequest>>> {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::UnixListener::bind(sock).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = std::sync::Arc::clone(&seen);
+        let reply = serde_json_lenient::to_string(&reply).unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let mut lines = tokio::io::BufReader::new(stream);
+                let mut line = String::new();
+                if lines.read_line(&mut line).await.is_err() {
+                    return;
+                }
+                kept.lock()
+                    .unwrap()
+                    .push(serde_json_lenient::from_str(line.trim()).unwrap());
+                let mut writer = lines.into_inner();
+                drop(writer.write_all(format!("{reply}\n").as_bytes()).await);
+            }
+        });
+        seen
+    }
+
+    /// NET-165: on a VM-backed host the table goes to the VM host daemon and
+    /// the daemon gets none. On a host with no VM the daemon gets it whole.
+    #[tokio::test]
+    async fn the_table_goes_to_the_vm_host_or_to_the_daemon() {
+        let id = boxes::SessionId::mint();
+        assert_eq!(hand_over(None, id, one_grant()).await, Some(one_grant()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        let seen = fake_vm_host(&sock, BoxControlReply::BuildTable { build_table: true }).await;
+        assert_eq!(hand_over(Some(&sock), id, one_grant()).await, None);
+        let seen = seen.lock().unwrap();
+        let [BoxControlRequest::FileBuildTable(filed)] = seen.as_slice() else {
+            panic!("one filing: {seen:?}");
+        };
+        assert_eq!(filed.session_id, id);
+        assert_eq!(filed.table, one_grant());
+    }
+
+    /// NET-165: a VM host that cannot be reached leaves the box with no
+    /// table, and the start goes on.
+    #[tokio::test]
+    async fn an_unreachable_vm_host_files_nothing_and_the_start_goes_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("absent.sock");
+        assert_eq!(
+            hand_over(Some(&sock), boxes::SessionId::mint(), one_grant()).await,
+            None
+        );
+    }
+
+    /// NET-169: only a host-address box on a VM-backed host registers a
+    /// row for its builds, and only when its rules admit something. The
+    /// row carries the box's own egress and returns its task addresses. A
+    /// refused registration leaves no row and the start goes on.
+    #[tokio::test]
+    async fn a_host_address_box_holds_a_build_row_on_its_own_rules() {
+        let id = boxes::SessionId::mint();
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        let addresses = vec![std::net::Ipv4Addr::new(192, 168, 127, 40)];
+        let seen = fake_vm_host(
+            &sock,
+            BoxControlReply::Registered(minimald_rpc::RegisteredBox {
+                switch_address: std::net::Ipv4Addr::new(192, 168, 127, 39),
+                loopback_address: std::net::Ipv4Addr::new(127, 0, 0, 39),
+                box_id: boxes::BoxId::mint(),
+                task_addresses: addresses.clone(),
+            }),
+        )
+        .await;
+        let hold = |sock: Option<&Path>, mode, declared: Option<boxes::EgressPolicy>| {
+            let sock = sock.map(Path::to_path_buf);
+            async move {
+                crate::hold_requester_build_row(sock.as_deref(), id, mode, declared.as_ref(), false)
+                    .await
+            }
+        };
+        let listed = boxes::EgressPolicy {
+            allow_subnets: Some(Vec::new()),
+            allow_dns_hosts: Some(vec!["downloads.example.org".to_string()]),
+            allow_protocols: None,
+            deny_subnets: None,
+        };
+
+        assert!(
+            hold(None, boxes::NetworkMode::HostNet, Some(listed.clone()))
+                .await
+                .is_empty()
+        );
+        assert!(
+            hold(Some(&sock), boxes::NetworkMode::OwnIp, Some(listed.clone()))
+                .await
+                .is_empty()
+        );
+        assert!(
+            hold(
+                Some(&sock),
+                boxes::NetworkMode::HostNet,
+                Some(boxes::EgressPolicy::deny_all())
+            )
+            .await
+            .is_empty()
+        );
+        assert!(seen.lock().unwrap().is_empty(), "nothing to register");
+
+        assert_eq!(
+            hold(
+                Some(&sock),
+                boxes::NetworkMode::HostNet,
+                Some(listed.clone())
+            )
+            .await,
+            addresses
+        );
+        let registered = seen.lock().unwrap().clone();
+        let [BoxControlRequest::Register(request)] = registered.as_slice() else {
+            panic!("one registration: {registered:?}");
+        };
+        assert_eq!(request.name, minimald_rpc::requester_build_row_name(id));
+        assert_eq!(request.egress, Some(listed.clone()));
+        assert!(!request.host_ip);
+
+        let absent = dir.path().join("absent.sock");
+        assert!(
+            hold(Some(&absent), boxes::NetworkMode::HostNet, Some(listed))
+                .await
+                .is_empty()
+        );
     }
 
     /// NET-165: an empty table files nothing.

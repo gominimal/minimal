@@ -389,8 +389,10 @@
 #                                    NET-155, NET-165: a deny-all box's cold
 #                                    build of a package at the pinned commit
 #                                    fetches its source cold and succeeds,
-#                                    and the box stays deny-all; NOT RUN
-#                                    without a switch or, natively, a tap
+#                                    the build box lists while it runs and
+#                                    leaves when it ends, and the box stays
+#                                    deny-all; NOT RUN without a switch or,
+#                                    natively, a tap
 #   host_ip_rules_follow_the_running_box
 #                                    NET-085, VM host: root in the VM
 #                                    wearing the node's address and the box
@@ -23517,7 +23519,7 @@ source=203.0.113.7 destination=$esu_host:$ESU_LISTEN_PORT verdict=refused at the
 proof_a_build_box_fetches_its_source() {
   local bbf_pkg="tree" bbf_sid="" bbf_out="" bbf_rc="" bbf_policy="" bbf_native=""
   local bbf_sha="513a53cbc42ca1f4ea06af2bab1f5283524a3848266b1d162416f8033afc4985"
-  local bbf_grant="" bbf_log_mark=0
+  local bbf_grant="" bbf_log_mark=0 bbf_listed="" bbf_build_pid=""
   echo "::group::a build box fetches its source for a deny-all box (NET-155, NET-165)"
   # An own-address box needs the switch, as the other own-IP proofs do, and
   # on a native lane the tap device too.
@@ -23585,16 +23587,31 @@ proof_a_build_box_fetches_its_source() {
   # Where this build's log lines begin: a grant the activation or an earlier
   # build opened is before it, and does not count.
   bbf_log_mark="$(bbf_grant_log | wc -l | tr -d ' ')"
+  # The build box's row in `min box list`, as JSON: a `build` entry for the
+  # package under this box. Empty when the list shows none.
+  bbf_listing() {
+    (cd "$BBF_SEED_DIR" && mnl box list -o json 2>/dev/null) \
+      | jq -c --arg pkg "$bbf_pkg" --arg sid "$bbf_sid" \
+        '.[] | select(.type == "build" and .name == $pkg and .parent == $sid)' 2>/dev/null \
+      | head -n1
+  }
+  # The build runs in the background, so the list can be read while it runs.
   # shellcheck disable=SC2016 # `$?` must reach the box's shell unexpanded.
-  bbf_out="$(mnl box exec "$bbf_sid" -- bash -c \
+  mnl box exec "$bbf_sid" -- bash -c \
     "timeout 600 min package build --rebuild $bbf_pkg 2>&1; echo build-exit=\$?" \
-    2>"$WORK/bbf-build.err")" || {
+    >"$WORK/bbf-build.out" 2>"$WORK/bbf-build.err" </dev/null &
+  bbf_build_pid=$!
+  while kill -0 "$bbf_build_pid" 2>/dev/null; do
+    [ -n "$bbf_listed" ] || bbf_listed="$(bbf_listing)"
+    sleep 0.2
+  done
+  wait "$bbf_build_pid" || {
     echo "::error::the in-box 'min package build --rebuild $bbf_pkg' could not run"
     cat "$WORK/bbf-build.err" 2>/dev/null || true
     bbf_logs
     fail
   }
-  bbf_out="$(printf '%s\n' "$bbf_out" | tr -d '\r')"
+  bbf_out="$(tr -d '\r' <"$WORK/bbf-build.out")"
   bbf_rc="$(printf '%s\n' "$bbf_out" | sed -n 's/^build-exit=//p' | tail -n1)"
   if [ "$bbf_rc" != 0 ]; then
     echo "::error::the cold build of $bbf_pkg failed (exit '$bbf_rc'): the table should give its fetch the source's host"
@@ -23616,11 +23633,27 @@ proof_a_build_box_fetches_its_source() {
         | grep -F -- '"box_name":"e2e-bbf"' | grep -F -- '"granted":true' \
         | grep -F -- "package: \\\"$bbf_pkg\\\"" | tail -n1
     else
+      # The host sees the spec hash alone, never the package's name, so the
+      # line is matched on this package's grant: its `gs://` source's host
+      # and no internet.
       bbf_grant_log | tail -n "+$((bbf_log_mark + 1))" \
         | grep -F -- 'opened a build grant' \
-        | grep -F -- "\"session\":\"$bbf_sid\"" | tail -n1
+        | grep -F -- "\"session\":\"$bbf_sid\"" \
+        | grep -F -- '"internet":false' \
+        | grep -F -- 'storage.googleapis.com' | tail -n1
     fi
   }
+  # BOX-210, NET-171: the build box listed under this box while it ran, and
+  # leaves the list with its build.
+  if [ -z "$bbf_listed" ]; then
+    echo "::error::the build of $bbf_pkg passed, but 'min box list' never showed its build box under box e2e-bbf"
+    fail
+  fi
+  echo "listed: $bbf_listed"
+  if [ -n "$(bbf_listing)" ]; then
+    echo "::error::the build of $bbf_pkg ended, but 'min box list' still shows its build box"
+    fail
+  fi
   # The daemon's file writer is asynchronous, so the line can land after the
   # build returns: wait for it, as esu_wait_gate_line does.
   for _ in $(seq 1 40); do
