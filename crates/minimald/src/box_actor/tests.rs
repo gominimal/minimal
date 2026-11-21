@@ -4266,6 +4266,126 @@ async fn a_native_activation_binds_declared_forwards_before_the_first_attach() {
     forwarder.abort();
 }
 
+/// NET-121 on a VM-backed host, through the finalize: the box's switch is
+/// served as a VM host's gated forwarder, and its creator handed it a switch
+/// address. The finalize binds the declared forward toward that address
+/// while the record is still `Materializing`, so the bind is done before the
+/// box goes `Active`. It draws no lease of its own, and no attach reaches
+/// the switch.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_vm_backed_activation_binds_declared_forwards_before_active() {
+    use tokio::io::AsyncWriteExt;
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 79);
+    let switch_address = std::net::Ipv4Addr::new(100, 64, 128, 79);
+    let server = TestServer::new().await;
+    let manager = server.state.sessions_manager().await;
+    let sock = daemon_switch_control(&server).await;
+    crate::net::policy::seed_vm_host_gate_for_tests(&sock);
+    std::fs::create_dir_all(sock.parent().expect("the socket has a dir"))
+        .expect("create the switch state dir");
+    let listener = tokio::net::UnixListener::bind(&sock).expect("bind the control socket");
+    let (exposed_tx, exposed_rx) = tokio::sync::oneshot::channel::<String>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let served = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = served.clone();
+    // A stand-in for the VM host's forwarder: it holds its answer to the
+    // first expose until the test has read the record, so the test sees the
+    // box's state while the bind is in flight.
+    let forwarder = crate::traced::spawn(async move {
+        let mut exposed_tx = Some(exposed_tx);
+        let mut release_rx = Some(release_rx);
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Some(request) = read_control_request(&mut stream).await else {
+                continue;
+            };
+            recorded.lock().expect("served lock").push(request.clone());
+            if request.contains("/services/forwarder/expose")
+                && let (Some(tx), Some(rx)) = (exposed_tx.take(), release_rx.take())
+            {
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the test fails on its own when it stops listening"
+                )]
+                let _ = tx.send(request);
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "a dropped release answers the expose all the same"
+                )]
+                let _ = rx.await;
+            }
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "the answer's fate is not what the stand-in records; the request is"
+            )]
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+        }
+    });
+    let mut client = server.connect().await;
+    let id = create_handed_own_ip_session(&mut client, "vmhost", switch_address, handed).await;
+
+    let finalize = finalize_session(&mut client, id);
+    let check = async {
+        let expose = tokio::time::timeout(Duration::from_secs(30), exposed_rx)
+            .await
+            .expect("the finalize binds the declared forward")
+            .expect("the stand-in forwarder ran");
+        assert!(
+            expose.contains(&format!("\"local\":\"{handed}:{}\"", declared_port()))
+                && expose.contains(&format!("\"remote\":\"{switch_address}:80\"")),
+            "the bind goes from the handed address toward the handed switch address: {expose}"
+        );
+        assert_eq!(
+            read_record(&server, id).await.status,
+            boxes::BoxState::Materializing,
+            "the box is not active while its declared forward is being bound"
+        );
+        release_tx
+            .send(())
+            .expect("the stand-in waits for the release");
+    };
+    let (_, ()) = tokio::join!(finalize, check);
+
+    assert_eq!(
+        read_record(&server, id).await.status,
+        boxes::BoxState::Active,
+        "the finalize activates the box once the forward is bound"
+    );
+    let switch = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves")
+        .net_switch()
+        .await
+        .unwrap();
+    assert_eq!(
+        switch.lock().await.activation_lease(id),
+        None,
+        "a VM-backed finalize draws no lease of its own"
+    );
+    let requests = served.lock().expect("served lock").clone();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.contains("/services/forwarder/expose"))
+            .count(),
+        1,
+        "one expose for the one declared port: {requests:?}"
+    );
+    assert!(
+        requests.iter().all(|request| !request.contains("/connect")),
+        "no attach reached the switch: {requests:?}"
+    );
+    crate::net::policy::clear_vm_host_gate_for_tests(&sock);
+    forwarder.abort();
+}
+
 /// NET-144: at the shared `127.0.0.1` fallback a declared port that another
 /// box already holds fails the second box's activation, naming the box that
 /// holds it, where before the second box yielded the port. The first box

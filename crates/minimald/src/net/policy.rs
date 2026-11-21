@@ -86,8 +86,44 @@ impl ControlChannel {
     /// switch directly, and the unbind is its own job.
     #[must_use]
     pub fn host_unbinds_declared_forwards(&self) -> bool {
+        #[cfg(test)]
+        if let Self::Unix(sock) = self
+            && VM_HOST_GATE_SEAM
+                .lock()
+                .expect("the vm host gate seam lock poisoned")
+                .contains(sock)
+        {
+            return true;
+        }
         matches!(self, Self::Vsock { .. })
     }
+}
+
+/// The switch control sockets a test serves as a VM host's gated forwarder:
+/// the harness reaches its switch over a unix socket, and a channel there
+/// reads as native unless its socket is seeded here
+/// ([`seed_vm_host_gate_for_tests`]).
+#[cfg(test)]
+static VM_HOST_GATE_SEAM: std::sync::LazyLock<Mutex<HashSet<std::path::PathBuf>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Makes the unix control channel at `control_socket` read as a VM host's
+/// (tests only), so a box on that switch takes the VM-backed paths.
+#[cfg(test)]
+pub(crate) fn seed_vm_host_gate_for_tests(control_socket: &std::path::Path) {
+    VM_HOST_GATE_SEAM
+        .lock()
+        .expect("the vm host gate seam lock poisoned")
+        .insert(control_socket.to_path_buf());
+}
+
+/// Clears what [`seed_vm_host_gate_for_tests`] seeded (tests only).
+#[cfg(test)]
+pub(crate) fn clear_vm_host_gate_for_tests(control_socket: &std::path::Path) {
+    VM_HOST_GATE_SEAM
+        .lock()
+        .expect("the vm host gate seam lock poisoned")
+        .remove(control_socket);
 }
 
 /// gvproxy's wire spelling of an [`IpProto`] in a forwarder request.
@@ -4163,9 +4199,10 @@ mod tests {
         /// later attach posts the same expose. The switch answers that the
         /// listener is already bound, because the forward the activation
         /// bound still holds the port, and the attach takes it as the box's
-        /// own. So a later attach does not fail on the port. That
-        /// `finalize` calls the activation entry is checked by the VM lane,
-        /// not here: this test has no vsock host.
+        /// own. So a later attach does not fail on the port. The
+        /// finalize's choice of this entry on a VM-backed host is proved by
+        /// `a_vm_backed_activation_binds_declared_forwards_before_active` in
+        /// `box_actor/tests.rs`.
         #[tokio::test]
         async fn declared_ingress_bound_at_activation() {
             let dir = tempfile::TempDir::new().unwrap();
