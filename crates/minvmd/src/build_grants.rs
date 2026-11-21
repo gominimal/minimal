@@ -266,9 +266,12 @@ impl BuildGrants {
     /// asked for it, so a list that leaves the box out is one the box left,
     /// or one a restarted guest daemon wrote after its builds died. A table
     /// ends when it was last filed at or before `previous`, the mark of the
-    /// good list read before this one: `min` files a table before the box
-    /// exists in the guest, so a table is only read as left over once a
-    /// whole list read went by after its filing.
+    /// good list read before this one, and ends the box's reservations with
+    /// it. `min` files a table once the in-VM daemon has created the box's
+    /// record, which its list holds from then on in every state until the
+    /// box's teardown. A list read that began before the filing can still
+    /// predate the box, so a table is only read as left over once a whole
+    /// list read went by after its filing.
     ///
     /// The guest controls its list, so a false absence can end a box's
     /// table and grants while it runs. That only takes network away from
@@ -316,6 +319,9 @@ impl BuildGrants {
                 );
                 state.tables.remove(session);
                 state.filed_at.remove(session);
+                state
+                    .reserved
+                    .retain(|_, reserved_for| reserved_for != session);
                 state.note_ended(*session);
             }
             !left.is_empty()
@@ -747,5 +753,24 @@ mod tests {
         );
         assert!(grants.lookup(starting, "aa").is_some());
         assert!(grants.holds_any());
+    }
+
+    /// NET-165: a grant still registering when the guest list ends its
+    /// box's table stands no more, as when the table drops.
+    #[test]
+    fn a_table_the_guest_list_ends_takes_its_reservations() {
+        let grants = BuildGrants::default();
+        let gone = boxes::SessionId::mint();
+        grants.file(gone, table("aa", false));
+        let registering = grants.next_row(gone).expect("room under the cap");
+        let first = grants.mark();
+        let none = BTreeSet::new();
+        assert!(grants.end_absent(&none, first, None).is_empty());
+        let second = grants.mark();
+        assert!(grants.end_absent(&none, second, Some(first)).is_empty());
+        assert!(grants.lookup(gone, "aa").is_none(), "the table ended");
+        let far = Instant::now() + BUILD_GRANT_DEADLINE;
+        assert!(!grants.opened(withdrawal(&registering), far));
+        assert!(!grants.holds_any());
     }
 }

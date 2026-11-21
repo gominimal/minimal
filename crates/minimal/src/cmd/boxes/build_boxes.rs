@@ -88,7 +88,13 @@ async fn hand_over(
 ) -> Option<BuildGrantTable> {
     match control_sock {
         Some(sock) => {
-            file_with_vm_host(sock, session_id, table).await;
+            file_with_vm_host(
+                sock,
+                session_id,
+                table,
+                minimal_client::box_registration::BOX_CONTROL_TIMEOUT,
+            )
+            .await;
             None
         }
         None => Some(table),
@@ -155,17 +161,35 @@ fn evaluate_table(config: mctx::Config) -> anyhow::Result<BuildGrantTable> {
         .collect())
 }
 
-/// Files `table` with the VM host daemon. A part it refuses leaves those
-/// packages to the box's own rules.
-async fn file_with_vm_host(sock: &Path, session_id: boxes::SessionId, table: BuildGrantTable) {
+/// Files `table` with the VM host daemon, waiting for its replies at most
+/// `bound` in all. A part it refuses leaves those packages to the box's own
+/// rules. A daemon that does not reply in time gets no further parts, and
+/// the start goes on.
+async fn file_with_vm_host(
+    sock: &Path,
+    session_id: boxes::SessionId,
+    table: BuildGrantTable,
+    bound: std::time::Duration,
+) {
+    let deadline = tokio::time::Instant::now() + bound;
     for table in filings(table) {
         let request =
             BoxControlRequest::FileBuildTable(FileBuildTableRequest { session_id, table });
-        match minimal_client::box_registration::control_request_with_vm_host(sock, request).await {
-            Ok(BoxControlReply::BuildTable { .. }) => {}
-            Ok(reply) => tracing::info!(?reply, "the VM host daemon did not take a build table"),
-            Err(error) => {
+        let filed = minimal_client::box_registration::control_request_with_vm_host(sock, request);
+        match tokio::time::timeout_at(deadline, filed).await {
+            Ok(Ok(BoxControlReply::BuildTable { .. })) => {}
+            Ok(Ok(reply)) => {
+                tracing::info!(?reply, "the VM host daemon did not take a build table");
+            }
+            Ok(Err(error)) => {
                 tracing::info!(error = %format!("{error:#}"), "could not file a build table");
+            }
+            Err(_elapsed) => {
+                tracing::info!(
+                    bound = ?bound,
+                    "the VM host daemon did not answer the build table filing in time"
+                );
+                return;
             }
         }
     }
@@ -323,6 +347,31 @@ mod tests {
             hand_over(Some(&sock), boxes::SessionId::mint(), one_grant()).await,
             None
         );
+    }
+
+    /// NET-165: a VM host that takes the filing and never answers holds the
+    /// start only up to the filing's bound.
+    #[tokio::test]
+    async fn a_silent_vm_host_holds_the_filing_only_to_its_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("silent.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let held = tokio::spawn(async move {
+            let mut open = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                open.push(stream);
+            }
+        });
+        let started = std::time::Instant::now();
+        file_with_vm_host(
+            &sock,
+            boxes::SessionId::mint(),
+            one_grant(),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        held.abort();
     }
 
     /// NET-169: only a host-address box on a VM-backed host registers a

@@ -4209,10 +4209,11 @@ impl BoxRegistry {
             // A grant's row outlives its grant only in the file: the grant,
             // its deadline and its withdrawal lived in the previous process.
             // Its creation is not reloaded, so no row admits its egress, and
-            // the write below drops it. A fetch the guest still runs can
-            // still send from its addresses, so they go back to the book in
-            // quarantine, as a withdrawn row's do, never straight to a new
-            // box.
+            // the write below drops it. No fetch outlives that process: a
+            // registry reloads only once this supervisor holds the alive
+            // lock, which the previous VM's VMM held until it exited, so no
+            // guest that ran the fetch is still running. The addresses still
+            // go back to the book in quarantine, as a withdrawn row's do.
             if creation.build_row == Some(BuildRow::Grant) {
                 if self.take_creation_addrs(&creation, now).is_ok() {
                     self.give_back_creation_addrs(&creation);

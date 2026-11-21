@@ -23650,8 +23650,24 @@ proof_a_build_box_fetches_its_source() {
     fail
   fi
   echo "listed: $bbf_listed"
-  if [ -n "$(bbf_listing)" ]; then
+  # Gone only on a list read that worked: a failed read proves nothing.
+  if ! (cd "$BBF_SEED_DIR" && mnl box list -o json) \
+      >"$WORK/bbf-after.json" 2>"$WORK/bbf-after.err" </dev/null; then
+    echo "::error::'min box list' failed after the build of $bbf_pkg, so it cannot show that the build box left"
+    cat "$WORK/bbf-after.err" 2>/dev/null || true
+    fail
+  fi
+  if ! bbf_left="$(jq -n -c --arg pkg "$bbf_pkg" --arg sid "$bbf_sid" \
+      'input | if type == "array" then
+         [.[] | select(.type == "build" and .name == $pkg and .parent == $sid)] | first // empty
+       else error("not a list") end' "$WORK/bbf-after.json")"; then
+    echo "::error::'min box list -o json' printed no JSON list after the build of $bbf_pkg"
+    head -c 2000 "$WORK/bbf-after.json" 2>/dev/null || true
+    fail
+  fi
+  if [ -n "$bbf_left" ]; then
     echo "::error::the build of $bbf_pkg ended, but 'min box list' still shows its build box"
+    echo "still listed: $bbf_left"
     fail
   fi
   # The daemon's file writer is asynchronous, so the line can land after the

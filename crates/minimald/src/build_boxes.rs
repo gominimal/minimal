@@ -12,14 +12,20 @@ use std::sync::{Arc, LazyLock, OnceLock, PoisonError};
 
 use tokio::sync::Mutex;
 
-/// One running build in a box's listing: its package and its spec hash in
-/// hex. Two builds of one package at different spec hashes are two entries.
-type RunningKey = (String, String);
+/// One running build in a box's listing: its package, its spec hash in hex
+/// and its build box's own number ([`op::BuildBox::listing`]). Two builds of
+/// one package, at one spec hash or two, are two entries, each with its own
+/// reach.
+type RunningKey = (String, String, u64);
 
-/// One entry of a box's listing, and how many builds it stands for: two
-/// builds of one package at one spec hash in one box share it, and it
-/// leaves when the last of them ends.
+/// One entry of a box's listing, and how many builds it stands for: more
+/// than one only for builds with no build box number, which share it until
+/// the last of them ends.
 type RunningEntry = (minimald_rpc::RunningBuildBox, usize);
+
+/// The number the next build box takes in its box's listing. 0 is left for
+/// a build that has none.
+static NEXT_LISTING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// The build boxes running now, by requesting box id then build. A build
 /// box keeps no record (BOX-210), so this is all that lists it (NET-171).
@@ -357,9 +363,14 @@ impl op::BuildReach for BoxReach {
     }
 }
 
-/// The listing entry of the build of `package` at `spec_hash`.
-fn running_key(package: &str, spec_hash: &common::SpecHash) -> RunningKey {
-    (package.to_string(), spec_hash.0.to_hex().to_string())
+/// The listing entry of the build of `package` at `spec_hash` in the build
+/// box numbered `listing`.
+fn running_key(package: &str, spec_hash: &common::SpecHash, listing: u64) -> RunningKey {
+    (
+        package.to_string(),
+        spec_hash.0.to_hex().to_string(),
+        listing,
+    )
 }
 
 /// An egress that admits no destination.
@@ -411,7 +422,8 @@ impl op::BuildBoxes for BoxBuildBoxes {
         spec_hash: &common::SpecHash,
         look_up: bool,
     ) -> op::BuildBox {
-        let listing = running_key(package, spec_hash);
+        let number = NEXT_LISTING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let listing = running_key(package, spec_hash, number);
         op::BuildBox::new(
             fetch_program(),
             Arc::new(BoxReach {
@@ -423,11 +435,18 @@ impl op::BuildBoxes for BoxBuildBoxes {
                 granted: OnceLock::new(),
             }),
         )
+        .listed_as(number)
     }
 
-    fn note_running(&self, package: &str, spec_hash: &common::SpecHash, running: bool) {
+    fn note_running(
+        &self,
+        package: &str,
+        spec_hash: &common::SpecHash,
+        listing: u64,
+        running: bool,
+    ) {
         let box_id = self.0.record.id.to_string();
-        let build = running_key(package, spec_hash);
+        let build = running_key(package, spec_hash, listing);
         let mut all = RUNNING.lock().unwrap_or_else(PoisonError::into_inner);
         if running {
             tracing::info!(box_name = %self.0.box_name(), package, "a build box started");
@@ -460,13 +479,49 @@ impl op::BuildBoxes for BoxBuildBoxes {
 
 /// The refusal of a network build in the host-address box `box_name` on a
 /// VM-backed host when the box has no build row (NET-169): a box created
-/// before its builds had addresses of their own. Its builds that need the
-/// network need the box created again.
+/// before its builds had addresses of their own, or one whose build row was
+/// not registered at its start. Its builds that need the network need the
+/// box created again, and the box can be running.
 fn no_build_row_refusal(box_name: &str) -> String {
     format!(
-        "the build needs the network, and box {box_name} has no addresses for its builds: \
-         it was created by an earlier version of min. Remove it with `min session rm \
-         {box_name}` and start it again with `min session start`, then run the build again."
+        "the build needs the network, and box {box_name} has no addresses for its builds. \
+         An earlier version of min created the box, or its addresses were not registered \
+         when it started. Remove the box with `min box rm --force {box_name}`, start it \
+         again with the command that created it, then run the build again."
+    )
+}
+
+/// Refuses a build of the host-address box `record` on its own rules when
+/// the VM host daemon cannot confirm its build row (NET-169): its task
+/// addresses are that row's, which `min` registered for it, so the build
+/// never attaches at addresses no row of this box holds. A host that cannot
+/// be asked reads as no row. A box with no task addresses, or one with a
+/// row of its own, asks nothing here.
+async fn ensure_build_row_stands(
+    record: &boxes::Record,
+    switch: &Mutex<crate::net::SwitchClient>,
+) -> std::io::Result<()> {
+    let (None, Some(&task_address)) = (record.box_addresses, record.task_addresses.first()) else {
+        return Ok(());
+    };
+    let control = crate::box_actor::switch_control_of(switch).await;
+    if crate::net::listeners::build_row_standing(&control, task_address, record.id).await
+        == Some(true)
+    {
+        return Ok(());
+    }
+    Err(std::io::Error::other(build_row_unconfirmed_refusal(
+        &record_name(record),
+    )))
+}
+
+/// The refusal of [`ensure_build_row_stands`] for the box `box_name`.
+fn build_row_unconfirmed_refusal(box_name: &str) -> String {
+    format!(
+        "the build needs the network, and the VM host daemon could not confirm the addresses \
+         of box {box_name}'s builds, so the build did not run. Run the build again. If it is \
+         refused again, remove the box with `min box rm --force {box_name}`, start it again \
+         with the command that created it, then run the build again."
     )
 }
 
@@ -475,7 +530,7 @@ fn no_build_row_refusal(box_name: &str) -> String {
 enum MissingStack {
     /// The host has no `/dev/net/tun`, so no network device can be made.
     Tun,
-    /// The daemon's network switch gave the build no address.
+    /// The daemon could not set up the build's network.
     Switch,
 }
 
@@ -485,13 +540,14 @@ enum MissingStack {
 /// host's network, so what is missing is named here, with the next step.
 fn own_stack_refusal(missing: MissingStack, error: &str) -> String {
     match missing {
-        MissingStack::Tun => "the build needs a network of its own, and this host has no \
-             /dev/net/tun to make one. Load the tun module with `sudo modprobe tun`, then \
-             run the build again."
+        MissingStack::Tun => "the build needs a network of its own, and the daemon finds no \
+             /dev/net/tun to make one. On a host, load the tun module with `sudo modprobe \
+             tun`. A daemon in a container needs the container to have the /dev/net/tun \
+             device. Then run the build again."
             .to_string(),
         MissingStack::Switch => format!(
-            "the build needs a network of its own, and the network switch of minimald gave \
-             it no address: {error}. Run `min bug` to collect a report of the daemon's logs."
+            "the build needs a network of its own, and the daemon could not set it up: \
+             {error}. Run `min bug` to collect a report of the daemon's logs."
         ),
     }
 }
@@ -580,6 +636,9 @@ impl sandbox::Network for RequesterBuildNetwork {
                 )));
             }
             crate::exec::ensure_task_rows_stand(&self.record, &self.switch)
+                .await
+                .map_err(sandbox::NetworkError::new)?;
+            ensure_build_row_stands(&self.record, &self.switch)
                 .await
                 .map_err(sandbox::NetworkError::new)?;
             self.inner.plan().await

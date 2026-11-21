@@ -159,6 +159,10 @@ pub struct BuildBox {
     opened: Arc<tokio::sync::OnceCell<Option<BuildNetwork>>>,
     /// The build's cancellation, which stops a fetch in flight too.
     cancel: tokio_util::sync::CancellationToken,
+    /// The build's own entry in the box's listing, from
+    /// [`Self::listed_as`]: two builds of one package at one spec hash keep
+    /// two entries. 0 when no listing set one.
+    listing: u64,
 }
 
 /// The build boxes of one box (NET-155, NET-169).
@@ -168,7 +172,8 @@ pub trait BuildBoxes: Send + Sync + std::fmt::Debug {
     /// looks `spec_hash` up. Without it, nothing is looked up: a patched
     /// build's spec is one the box can change, so the box's own rules decide
     /// it. Either way `spec_hash` names the build in the box's listing, as
-    /// [`Self::note_running`] does.
+    /// [`Self::note_running`] does, beside the build box's
+    /// [`BuildBox::listing`].
     fn build_box(
         &self,
         package: &str,
@@ -176,8 +181,9 @@ pub trait BuildBoxes: Send + Sync + std::fmt::Debug {
         spec_hash: &SpecHash,
         look_up: bool,
     ) -> BuildBox;
-    /// Tells the box's listing that this build started or ended.
-    fn note_running(&self, _package: &str, _spec_hash: &SpecHash, _running: bool) {}
+    /// Tells the box's listing that the build in the build box `listing`
+    /// ([`BuildBox::listing`]) started or ended.
+    fn note_running(&self, _package: &str, _spec_hash: &SpecHash, _listing: u64, _running: bool) {}
 }
 
 /// A build running in its build box, listed while it runs. [`Self::end`]
@@ -190,6 +196,7 @@ pub struct BuildBoxRun {
     build_box: Option<BuildBox>,
     package: String,
     spec_hash: SpecHash,
+    listing: u64,
 }
 
 impl BuildBoxRun {
@@ -201,14 +208,16 @@ impl BuildBoxRun {
         package: &str,
         spec_hash: SpecHash,
     ) -> Self {
+        let listing = build_box.as_ref().map_or(0, BuildBox::listing);
         if let Some(boxes) = &boxes {
-            boxes.note_running(package, &spec_hash, true);
+            boxes.note_running(package, &spec_hash, listing, true);
         }
         Self {
             boxes,
             build_box,
             package: package.to_string(),
             spec_hash,
+            listing,
         }
     }
 
@@ -222,7 +231,7 @@ impl BuildBoxRun {
 
     fn unlist(&mut self) {
         if let Some(boxes) = self.boxes.take() {
-            boxes.note_running(&self.package, &self.spec_hash, false);
+            boxes.note_running(&self.package, &self.spec_hash, self.listing, false);
         }
     }
 }
@@ -267,7 +276,21 @@ impl BuildBox {
             reach,
             opened: Arc::default(),
             cancel: tokio_util::sync::CancellationToken::new(),
+            listing: 0,
         }
+    }
+
+    /// This build box, its build the entry `listing` in the box's listing.
+    #[must_use]
+    pub fn listed_as(mut self, listing: u64) -> Self {
+        self.listing = listing;
+        self
+    }
+
+    /// The build's entry in the box's listing ([`Self::listed_as`]).
+    #[must_use]
+    pub fn listing(&self) -> u64 {
+        self.listing
     }
 
     /// This build box, its fetches stopped when `cancel` is.
@@ -286,6 +309,7 @@ impl BuildBox {
             reach: Arc::new(FixedReach(network)),
             opened: Arc::new(opened),
             cancel: tokio_util::sync::CancellationToken::new(),
+            listing: 0,
         }
     }
 
@@ -1009,7 +1033,7 @@ mod tests {
             )
         }
 
-        fn note_running(&self, package: &str, _spec_hash: &SpecHash, running: bool) {
+        fn note_running(&self, package: &str, _spec_hash: &SpecHash, _listing: u64, running: bool) {
             self.0
                 .running
                 .lock()

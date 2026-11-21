@@ -1261,8 +1261,9 @@ impl Context {
 
     /// `args` placed in this context's classifier leaf, if it has one. A task
     /// env made for a host-address box then runs in the leaf of its box, so
-    /// the box's egress verdict decides the task's connections, the same as
-    /// for the package builds the context starts (NET-155).
+    /// the box's egress verdict decides the task's connections (NET-079). The
+    /// package builds the context starts run in build boxes, outside the
+    /// leaf (NET-155).
     pub(crate) fn task_env_args<'a>(&self, args: EnvArgs<'a>) -> EnvArgs<'a> {
         EnvArgs {
             classifier_leaf: self.classifier_leaf.clone(),

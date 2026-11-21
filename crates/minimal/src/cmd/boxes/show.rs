@@ -604,11 +604,12 @@ fn build_box_reach(build: &minimald_rpc::RunningBuildBox) -> String {
     if build.no_network {
         return "no network".to_string();
     }
+    // A build with no grant yet, or none to get, is on this box's rules.
     if !build.granted {
-        return "follows this box's rules".to_string();
+        return "no grant, this box's rules".to_string();
     }
     let Some(egress) = &build.egress else {
-        return "the internet".to_string();
+        return "any destination".to_string();
     };
     let internet = egress
         .allow_subnets
@@ -755,7 +756,7 @@ mod build_box_tests {
             "build boxes (their own reach, not this box's)\n  \
              bucket: storage.googleapis.com\n  \
              tooling: the public internet\n  \
-             mine: follows this box's rules\n  \
+             mine: no grant, this box's rules\n  \
              unlisted: no destination\n  \
              fetched: no network\n"
         );

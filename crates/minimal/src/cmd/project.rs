@@ -880,6 +880,18 @@ pub(crate) fn append_entry_text(
     // BOX-063: an entry whose type, or whose type's built-in root, is not
     // session or task is refused with exit 3.
     let root = resolve_builtin_root(&doc, entry, box_type)?;
+    if root == "build" {
+        // A build box is never written by hand: `min` makes one for each
+        // package build (BOX-209), so no epic tracks the entry.
+        return Err(InitRefusal {
+            code: 3,
+            message: format!(
+                "min init did not add the entry {entry}: min makes a box of type build for each \
+                 package build, and never from an entry in minimal.toml. Use --type session or \
+                 --type task."
+            ),
+        });
+    }
     if INIT_REFUSED_TYPES.contains(&root.as_str()) {
         let what = if root == box_type {
             format!("type {box_type} is not supported yet")
@@ -1476,8 +1488,10 @@ mod init_tests {
             let refusal = run(&dir, &["init", "bot", "--type", ty]).unwrap_err();
             assert_eq!(refusal.code, 3, "{ty}: {}", refusal.message);
             assert!(refusal.message.contains(ty), "{}", refusal.message);
-            assert!(
+            // A build box is min's to make, so no epic is named for it.
+            assert_eq!(
                 refusal.message.contains("gominimal/inbox#678"),
+                ty != "build",
                 "{}",
                 refusal.message
             );

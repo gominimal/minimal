@@ -195,7 +195,7 @@ async fn a_box_refuses_a_source_host_it_does_not_list() {
         package: "pkg".to_string(),
         packages: Vec::new(),
         spec_hash,
-        listing: super::running_key("pkg", &hash(1)),
+        listing: super::running_key("pkg", &hash(1), 0),
         granted: std::sync::OnceLock::new(),
     };
     let own = reach(Some(listed.clone()), None);
@@ -224,13 +224,13 @@ async fn a_running_build_box_lists_until_its_build_ends() {
     let boxes = BoxBuildBoxes::new(listed, switch(), false, state.path().to_path_buf());
     assert!(super::running_build_boxes(&box_id).is_empty());
 
-    boxes.note_running("pkg", &expanded, true);
+    let build_box = boxes.build_box("pkg", Vec::new(), &expanded, true);
+    boxes.note_running("pkg", &expanded, build_box.listing(), true);
     let running = super::running_build_boxes(&box_id);
     assert_eq!(running.len(), 1);
     assert_eq!(running[0].package, "pkg");
     assert!(!running[0].granted, "it has not asked yet");
 
-    let build_box = boxes.build_box("pkg", Vec::new(), &expanded, true);
     assert!(build_box.network().await.is_some());
     let running = super::running_build_boxes(&box_id);
     assert!(running[0].granted);
@@ -240,7 +240,7 @@ async fn a_running_build_box_lists_until_its_build_ends() {
     let running = super::running_build_boxes(&box_id);
     assert!(running[0].no_network, "its steps run with no address now");
 
-    boxes.note_running("pkg", &expanded, false);
+    boxes.note_running("pkg", &expanded, build_box.listing(), false);
     assert!(super::running_build_boxes(&box_id).is_empty());
 }
 
@@ -255,11 +255,12 @@ async fn builds_of_one_package_at_two_spec_hashes_list_apart() {
     let box_id = listed.id.to_string();
     let boxes = BoxBuildBoxes::new(listed, switch(), false, state.path().to_path_buf());
 
-    boxes.note_running("pkg", &hash(1), true);
-    boxes.note_running("pkg", &hash(2), true);
+    let first = boxes.build_box("pkg", Vec::new(), &hash(1), false);
+    let second = boxes.build_box("pkg", Vec::new(), &hash(2), false);
+    boxes.note_running("pkg", &hash(1), first.listing(), true);
+    boxes.note_running("pkg", &hash(2), second.listing(), true);
     assert_eq!(super::running_build_boxes(&box_id).len(), 2);
 
-    let first = boxes.build_box("pkg", Vec::new(), &hash(1), false);
     first.close().await;
     let running = super::running_build_boxes(&box_id);
     assert_eq!(
@@ -268,37 +269,48 @@ async fn builds_of_one_package_at_two_spec_hashes_list_apart() {
         "only the closed build has no network: {running:?}"
     );
 
-    boxes.note_running("pkg", &hash(1), false);
+    boxes.note_running("pkg", &hash(1), first.listing(), false);
     let running = super::running_build_boxes(&box_id);
     assert_eq!(running.len(), 1, "the other build still runs");
     assert!(!running[0].no_network);
 
-    boxes.note_running("pkg", &hash(2), false);
+    boxes.note_running("pkg", &hash(2), second.listing(), false);
     assert!(super::running_build_boxes(&box_id).is_empty());
 }
 
-/// NET-171: two builds of one package at one spec hash in one box list
-/// while either runs. The end of the first leaves the second listed.
+/// NET-171: two builds of one package at one spec hash in one box are two
+/// entries, each with its own reach. The first build's network ending
+/// leaves the second's open, and the end of the first leaves the second
+/// listed.
 #[tokio::test]
-async fn two_builds_at_one_spec_hash_list_until_both_end() {
+async fn two_builds_at_one_spec_hash_list_apart_until_both_end() {
     let state = tempfile::tempdir().unwrap();
     let mut listed = record(boxes::NetworkMode::OwnIp, None);
     listed.id = boxes::SessionId::mint();
     let box_id = listed.id.to_string();
     let boxes = BoxBuildBoxes::new(listed, switch(), false, state.path().to_path_buf());
 
-    boxes.note_running("pkg", &hash(1), true);
-    boxes.note_running("pkg", &hash(1), true);
+    let first = boxes.build_box("pkg", Vec::new(), &hash(1), false);
+    let second = boxes.build_box("pkg", Vec::new(), &hash(1), false);
+    assert_ne!(first.listing(), second.listing());
+    boxes.note_running("pkg", &hash(1), first.listing(), true);
+    boxes.note_running("pkg", &hash(1), second.listing(), true);
     assert_eq!(super::running_build_boxes(&box_id).len(), 2);
 
-    boxes.note_running("pkg", &hash(1), false);
+    first.close().await;
+    let running = super::running_build_boxes(&box_id);
     assert_eq!(
-        super::running_build_boxes(&box_id).len(),
+        running.iter().filter(|build| build.no_network).count(),
         1,
-        "the second build still runs"
+        "only the closed build has no network: {running:?}"
     );
 
-    boxes.note_running("pkg", &hash(1), false);
+    boxes.note_running("pkg", &hash(1), first.listing(), false);
+    let running = super::running_build_boxes(&box_id);
+    assert_eq!(running.len(), 1, "the second build still runs");
+    assert!(!running[0].no_network, "its network is still open");
+
+    boxes.note_running("pkg", &hash(1), second.listing(), false);
     assert!(super::running_build_boxes(&box_id).is_empty());
 }
 
@@ -327,27 +339,44 @@ async fn an_unreadable_table_grants_nothing() {
 fn a_build_without_its_own_network_stack_is_refused() {
     assert_eq!(
         super::own_stack_refusal(super::MissingStack::Tun, ""),
-        "the build needs a network of its own, and this host has no /dev/net/tun to make \
-         one. Load the tun module with `sudo modprobe tun`, then run the build again."
+        "the build needs a network of its own, and the daemon finds no /dev/net/tun to make \
+         one. On a host, load the tun module with `sudo modprobe tun`. A daemon in a \
+         container needs the container to have the /dev/net/tun device. Then run the build \
+         again."
     );
     assert_eq!(
         super::own_stack_refusal(super::MissingStack::Switch, "no switch binary"),
-        "the build needs a network of its own, and the network switch of minimald gave it \
-         no address: no switch binary. Run `min bug` to collect a report of the daemon's \
-         logs."
+        "the build needs a network of its own, and the daemon could not set it up: no \
+         switch binary. Run `min bug` to collect a report of the daemon's logs."
     );
 }
 
-/// NET-169: a host-address box created before build rows has no task
-/// addresses, so its network build is refused with the step that gives it
-/// a row, never attached at no address.
+/// NET-169: a host-address box with no task addresses, created before build
+/// rows or with its row not registered at its start, has its network build
+/// refused with a step that works on a running box, never attached at no
+/// address.
 #[test]
 fn a_host_address_box_with_no_build_row_is_refused() {
     assert_eq!(
         super::no_build_row_refusal("web"),
-        "the build needs the network, and box web has no addresses for its builds: it was \
-         created by an earlier version of min. Remove it with `min session rm web` and \
-         start it again with `min session start`, then run the build again."
+        "the build needs the network, and box web has no addresses for its builds. An \
+         earlier version of min created the box, or its addresses were not registered when \
+         it started. Remove the box with `min box rm --force web`, start it again with the \
+         command that created it, then run the build again."
+    );
+}
+
+/// NET-169: a host-address box whose build row the VM host daemon cannot
+/// confirm has its network build refused in words of its own, never the
+/// task run's.
+#[test]
+fn a_build_whose_row_is_unconfirmed_is_refused() {
+    assert_eq!(
+        super::build_row_unconfirmed_refusal("web"),
+        "the build needs the network, and the VM host daemon could not confirm the addresses \
+         of box web's builds, so the build did not run. Run the build again. If it is \
+         refused again, remove the box with `min box rm --force web`, start it again with \
+         the command that created it, then run the build again."
     );
 }
 

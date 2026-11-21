@@ -353,7 +353,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
 - **BOX-063** THE SYSTEM SHALL expand and validate entries whose type, or whose type's built-in root, is `session` or `task`.
   tier:     T0
   verify:   cargo nextest run -p mfile session_and_task_entries_expand_and_validate
-  - IF an entry being expanded or created has a type, or a type's built-in root, of `agent`, `service`, `build` or `container-build`, or comes from an `[agents.<name>]` or `[services.<name>]` table, THEN THE SYSTEM SHALL refuse that entry with exit 3 naming the type and the Agent Box epic gominimal/inbox#678, and leave the file's other entries usable.
+  - IF an entry being expanded or created has a type, or a type's built-in root, of `agent`, `service`, `build` or `container-build`, or comes from an `[agents.<name>]` or `[services.<name>]` table, THEN THE SYSTEM SHALL refuse that entry with exit 3 naming the type, and leave the file's other entries usable. The refusal names gominimal/inbox#678, the epic for the Agent Box, for every type but `build`. The `build` refusal says that `min` makes build boxes itself.
     tier:   T0
     verify: cargo nextest run -p mfile other_builtin_type_entry_refused_exit3_other_entries_usable
 
