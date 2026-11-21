@@ -1057,6 +1057,10 @@ box that holds it returns to `running`. These terms follow the decision in
   tier:     T0
   verify:   cargo nextest run -p minimald declared_ports_bound_before_name_registered
   <!-- S1b-2c; design §7.1 (enforcement parity, bind discipline); event-driven; NET-016 covers ports a permit range allows and no declaration names -->
+  - WHILE the box host is VM-backed, WHEN a box is activated THE SYSTEM SHALL bind the forwarder for each ingress port its declaration names, and SHALL treat a forwarder that a later attach finds already bound as the box's own.
+    tier:   T0
+    verify: cargo nextest run -p minimald declared_ingress_bound_at_activation
+    <!-- S1b-2c; design §7.1 bind discipline; state-driven and event-driven; the bind is at activation, not at each attach, so a port that something takes after the activation does not fail a later attach; residual on a native host, tracked in https://github.com/gominimal/minimal/issues/3646: a native host still binds at the first attach; residuals on a VM-backed host, tracked in https://github.com/gominimal/minimal/issues/3689: at box stop the forwards go only when minvmd withdraws the row after its detach grace, not at once, and a box that the host hands no switch address binds nothing at activation, so its first attach binds after the name is published; the `(true, None)` arm of `finalize` in crates/minimald/src/box_actor/setup.rs is that case, and it does not meet design §7.1 line 255 -->
   - IF a declared port's ingress is revoked THEN THE SYSTEM SHALL unbind its forwarder and terminate the connections it holds.
     tier:   T0
     verify: cargo nextest run -p minimald ingress_revocation_unbinds_forwarder_and_terminates_connections
