@@ -592,6 +592,12 @@ a shell's pipes, globs and `$VAR`, run the shell as the command:
 min box exec web -- sh -c 'echo $PWD'
 ```
 
+When a daemon shutdown stops a command that `min` is still attached to,
+`min` prints `the daemon is shutting down, so the command was stopped` on
+stderr and exits with the command's own status. With `--tty`, `min` prints
+no notice and exits 254, as an attach the daemon ends does. With
+`--detach`, `min` has already returned and prints nothing.
+
 | Flag | Short | Description |
 |------|-------|-------------|
 | `--tty` | `-t` | Give the command a terminal and connect this terminal to it. The command's exec id is printed on stderr, so stdout has only the command's output. Refused when stdin is not a terminal |
