@@ -10113,6 +10113,27 @@ mod tests {
                 && text.contains("Change that rule to write only the bits it uses"),
             "a match mask wider than a well-known range names no range: {text}"
         );
+
+        // A one-bit packet-mark match outside every well-known range names
+        // no range either, and the rule is still the user's to change.
+        let mount = standin_mount();
+        let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+        host_ruleset_tools(
+            tools.path(),
+            "table inet other {\n\tchain c {\n\t\tmeta mark & 0x01000000 != 0x00000000 \
+             ct mark set meta mark & 0x00ff0000\n\t}\n}\n",
+            "",
+        );
+        let refused = run_install_with(&mount, &[], tools.path());
+        let text = said(&refused);
+        assert!(!refused.status.success(), "{text}");
+        assert!(
+            text.contains("for packets that match meta mark & 0x01000000 != 0x00000000)\n")
+                && !text.contains("which Tailscale marks connections with")
+                && !text.contains("which kube-proxy")
+                && text.contains("Change that rule to write only the bits it uses"),
+            "a one-bit match mask outside every well-known range names no range: {text}"
+        );
     }
 
     /// One family's mangle table as `nft -a --debug=netlink list ruleset`
