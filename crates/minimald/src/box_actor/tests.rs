@@ -16550,7 +16550,7 @@ async fn resume_refuses_when_name_held_by_running_box() {
         RecordState::Stopped(ending),
         &[
             "The running session `proj` holds the name `proj`",
-            &format!("min session rename {holder} <new-name>"),
+            &format!("min box rename {holder} <new-name>"),
         ],
         2,
     )
@@ -18738,7 +18738,7 @@ async fn restart_takes_resume_refusals_before_it_stops_anything() {
     for words in [
         "It stays running.",
         "The running session `pair` holds the name `pair`.",
-        &format!("min session rename {holder} <new-name>"),
+        &format!("min box rename {holder} <new-name>"),
     ] {
         assert!(
             refusal.message.contains(words),

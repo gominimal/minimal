@@ -1539,7 +1539,7 @@ fn held_name_refusal_exits_2_and_names_the_holder() {
         printed,
         "Cannot create a session named `default`: the running session `Default` \
          (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) holds that name. Rename that session \
-         with `min session rename 0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b <new-name>`, \
+         with `min box rename 0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b <new-name>`, \
          or choose another name."
     );
 
@@ -1575,7 +1575,7 @@ fn own_address_held_name_refusal_exits_2_and_names_the_holder() {
         format!("{error:#}"),
         "Cannot create a session named `dev`: the running session `Dev` \
          (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) holds that name. Rename that session \
-         with `min session rename 0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b <new-name>`, \
+         with `min box rename 0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b <new-name>`, \
          or choose another name."
     );
 

@@ -2330,7 +2330,7 @@ impl std::fmt::Display for HeldNameRefusal {
             Some(holder) => write!(
                 f,
                 "{head}{name}{taken}{holder_name}` ({holder}){holds} \
-                 Rename that session with `min session rename {holder} <new-name>`, \
+                 Rename that session with `min box rename {holder} <new-name>`, \
                  or choose another name.",
             ),
             None => write!(
