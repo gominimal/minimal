@@ -1351,6 +1351,9 @@ const BUILD_CONNECT_PROBE_C: &str = r#"
 #include <unistd.h>
 int main(int argc, char **argv) {
     if (argc < 2) return 2;
+    /* Stay in the leaf a while, so the proof can read the leaf's members
+       while the build is alive. */
+    usleep(500000);
     int port = atoi(argv[1]);
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) { fprintf(stderr, "socket failed: errno %d\n", errno); return 2; }
@@ -1531,6 +1534,45 @@ fn run_probe_build(
     (ok, output.text())
 }
 
+/// Runs `build` while a thread reads `leaf`'s `cgroup.procs`, and returns
+/// what `build` returned with the members the leaf listed whose parent is
+/// this process. The only child of this process while a probe build runs is
+/// the build's sandbox supervisor, which this process spawned.
+fn watching_leaf_for_children<T>(leaf: &Path, build: impl FnOnce() -> T) -> (T, Vec<u32>) {
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let own = std::process::id();
+    std::thread::scope(|scope| {
+        let watch = scope.spawn(|| {
+            let mut children = Vec::new();
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                let members =
+                    std::fs::read_to_string(leaf.join("cgroup.procs")).unwrap_or_default();
+                for pid in members
+                    .lines()
+                    .filter_map(|pid| pid.trim().parse::<u32>().ok())
+                {
+                    let parent = std::fs::read_to_string(format!("/proc/{pid}/status"))
+                        .ok()
+                        .and_then(|status| {
+                            status
+                                .lines()
+                                .find_map(|line| line.strip_prefix("PPid:"))
+                                .and_then(|ppid| ppid.trim().parse::<u32>().ok())
+                        });
+                    if parent == Some(own) && !children.contains(&pid) {
+                        children.push(pid);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            children
+        });
+        let built = build();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        (built, watch.join().expect("the leaf watch thread"))
+    })
+}
+
 /// NET-155, live: a package build placed for a box runs in that box's
 /// classifier leaf. In a deny leaf, the build's own connect to a local peer
 /// is refused by the loaded table. The same build in an allow leaf connects.
@@ -1595,7 +1637,14 @@ fn package_build_in_a_box_leaf_follows_its_verdict_over_a_loaded_table() {
     let base = tempfile::tempdir().expect("a temp dir for the probe builds");
     let rootfs = build_probe_rootfs(base.path());
 
-    let (ok, printed) = run_probe_build(base.path(), &rootfs, deny, port);
+    let ((ok, printed), supervisors) = watching_leaf_for_children(&deny_dir, || {
+        run_probe_build(base.path(), &rootfs, deny, port)
+    });
+    assert!(
+        !supervisors.is_empty(),
+        "while the build runs, the deny leaf lists the build's sandbox \
+         supervisor, the child of this process: {printed}"
+    );
     assert!(
         !ok,
         "the build in the deny leaf fails, because it cannot reach the peer: {printed}"
@@ -1610,7 +1659,14 @@ fn package_build_in_a_box_leaf_follows_its_verdict_over_a_loaded_table() {
          loaded chain's own rejection: {printed}"
     );
 
-    let (ok, printed) = run_probe_build(base.path(), &rootfs, allow, port);
+    let ((ok, printed), supervisors) = watching_leaf_for_children(&allow_dir, || {
+        run_probe_build(base.path(), &rootfs, allow, port)
+    });
+    assert!(
+        !supervisors.is_empty(),
+        "while the build runs, the allow leaf lists the build's sandbox \
+         supervisor, the child of this process: {printed}"
+    );
     assert!(
         ok && printed.contains(&format!("connected to 127.0.0.1 port {port}")),
         "the same build in the allow leaf connects to the peer: {printed}"

@@ -647,6 +647,44 @@ async fn a_refused_task_attach_stops_the_task() {
     );
 }
 
+/// NET-079. A task in a box's leaf whose supervisor the leaf refuses stops
+/// with the cause: the process is killed and reaped, and the task fails
+/// rather than run with its supervisor outside the leaf. The stand-in leaf
+/// has no `cgroup.procs`, so it is not a cgroup at all.
+#[test]
+fn a_task_supervisor_the_leaf_refuses_stops_the_task() {
+    struct Child {
+        reaped: bool,
+    }
+    impl super::Reapable for Child {
+        fn kill_and_reap(&mut self) {
+            self.reaped = true;
+        }
+    }
+
+    let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+    let leaf = sandbox::config::ClassifierLeaf::new(tree.path().join("box-leaf"));
+    std::fs::create_dir(leaf.dir()).expect("creating the stand-in leaf");
+
+    let mut child = Child { reaped: false };
+    let err = super::place_supervisor_or_reap(Some(&leaf), std::process::id(), &mut child)
+        .expect_err("a leaf with no cgroup.procs must refuse the supervisor");
+    assert!(child.reaped, "the task must not run on");
+    assert_eq!(
+        err.to_string(),
+        "the task did not start: Minimal could not move the task's supervisor process \
+         into the cgroup that decides the box's network access. The cgroup no longer \
+         exists. If it keeps failing, run `min bug` to collect a diagnostic bundle.",
+    );
+    assert!(!leaf.procs().exists(), "the move creates no cgroup.procs");
+
+    // A box with no leaf places nothing and leaves the process alone.
+    let mut unplaced = Child { reaped: false };
+    super::place_supervisor_or_reap(None, std::process::id(), &mut unplaced)
+        .expect("a box with no leaf has nothing to place");
+    assert!(!unplaced.reaped);
+}
+
 /// A guard whose teardown blocks until told to finish, then counts.
 struct SlowGuard {
     go: std::sync::Arc<tokio::sync::Notify>,
