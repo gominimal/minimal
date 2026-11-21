@@ -1,5 +1,5 @@
 ---
-description: Set up a project with min init, declare your session's tools in minimal.toml, then enter an isolated session with min session start.
+description: Set up a project with min init, declare your session's tools in minimal.toml, then enter an isolated session with min session activate.
 ---
 
 # Set up a project
@@ -59,7 +59,7 @@ Every name resolves against the [Minimal Public Registry](https://github.com/gom
 Create and attach to an isolated session for the project:
 
 ```shell
-min session start
+min session activate --attach .
 ```
 
 Minimal builds or fetches the declared packages, composes them into a sandbox seeded with a copy of your project (streamed in as a tarball), and drops you into a shell inside it. The `[defaults.session]` tools are on your `PATH`, and nothing touches the host. Type `exit` to leave; the session stays up, so you can `min session attach` back to it later.
