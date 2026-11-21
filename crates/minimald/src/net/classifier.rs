@@ -10134,6 +10134,32 @@ mod tests {
                 && text.contains("Change that rule to write only the bits it uses"),
             "a one-bit match mask outside every well-known range names no range: {text}"
         );
+
+        // One chain with a rule in a well-known range and then a rule in
+        // none: each rule gets its own line, so the rule the user is told
+        // to change is one the lines above name.
+        let mount = standin_mount();
+        let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+        host_ruleset_tools(
+            tools.path(),
+            "table inet other {\n\tchain c {\n\t\tmeta mark & 0x00ff0000 != 0x00000000 \
+             ct mark set meta mark & 0x00ff0000\n\t\tmeta mark & 0x01000000 != 0x00000000 \
+             ct mark set meta mark & 0x00ff0000\n\t}\n}\n",
+            "",
+        );
+        let refused = run_install_with(&mount, &[], tools.path());
+        let text = said(&refused);
+        assert!(!refused.status.success(), "{text}");
+        assert!(
+            text.contains(
+                "The rule in table inet other, chain c matches the packet-mark bits \
+                 0x00ff0000, which Tailscale marks connections with.\n"
+            ) && text.contains(
+                "The rule in table inet other, chain c belongs to a program that this step \
+                 cannot name from its table and chain.\n"
+            ) && text.contains("Change that rule to write only the bits it uses"),
+            "each rule in one chain gets the line that explains it: {text}"
+        );
     }
 
     /// One family's mangle table as `nft -a --debug=netlink list ruleset`

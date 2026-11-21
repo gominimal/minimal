@@ -1691,8 +1691,6 @@ ct_mark_rule_owners() {
             colon = index(line, ": ")
             if (colon == 0) next
             where = substr(line, 1, colon - 1)
-            if (unowned == "" && (where in seen)) next
-            seen[where] = 1
             table = where; chain = ""
             at = index(where, ", chain ")
             if (at > 0) { table = substr(where, 1, at - 1); chain = substr(where, at + 8) }
@@ -1708,6 +1706,12 @@ ct_mark_rule_owners() {
                 if (line ~ /\(writes every bit of the connection mark/ && name == "" && known == "") print line
                 next
             }
+            # One line for each table, chain and explanation: two rules in
+            # one chain that match different ranges, or one range and none,
+            # each get a line, so a rule the unowned pass finds has one too.
+            key = where SUBSEP (name != "" ? "" : known)
+            if (key in seen) next
+            seen[key] = 1
             if (name != "")
                 printf "The rule in %s belongs to %s, by the name of its table or chain.\n", where, name
             else if (known != "") {
