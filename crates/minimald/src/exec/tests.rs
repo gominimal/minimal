@@ -208,7 +208,7 @@ fn the_unanswered_inherit_refusal_names_both_causes_and_the_commands() {
     assert!(msg.contains("a stack provides the task"), "{msg}");
     assert!(
         msg.ends_with(
-            "run `min session destroy dev`, then `min session activate --name dev /home/me/proj`."
+            "run `min box rm --force dev`, then `min -C /home/me/proj session start --name dev`."
         ),
         "names the commands: {msg}"
     );
@@ -220,11 +220,11 @@ fn the_unanswered_inherit_refusal_names_both_causes_and_the_commands() {
     // is quoted so both commands paste as they are.
     let msg = refused.refusal(None, "0b5e", "/home/me/it's mine");
     assert!(
-        msg.contains("run `min session destroy 0b5e`, then "),
+        msg.contains("run `min box rm --force 0b5e`, then "),
         "{msg}"
     );
     assert!(
-        msg.ends_with(r#"`min session activate '/home/me/it'\''s mine'`."#),
+        msg.ends_with(r#"`min -C '/home/me/it'\''s mine' session start`."#),
         "{msg}"
     );
 }
@@ -310,11 +310,9 @@ async fn a_task_run_of_a_registered_box_with_no_box_id_is_refused() {
         refused.to_string().contains("could not confirm session"),
         "{refused}"
     );
-    // The bare command fails: a destroy needs a session or `--all`.
+    // The command names the box it removes, so it pastes as it is.
     assert!(
-        refused
-            .to_string()
-            .contains("`min session destroy <session>`"),
+        refused.to_string().contains("`min box rm --force <box>`"),
         "{refused}"
     );
 }

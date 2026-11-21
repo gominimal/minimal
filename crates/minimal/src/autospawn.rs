@@ -341,8 +341,8 @@ fn wait_for_minimald_unlistening(socket_path: &Path, wait: Duration) -> io::Resu
         }
         if Instant::now() >= deadline {
             return Err(io::Error::other(format!(
-                "the daemon is still listening on {} after {}s; run `min stop` again, \
-                 and if it still listens, end the minimald process",
+                "the daemon is still listening on {} after {}s; run `min host stop <host>` \
+                 again, and if it still listens, end the minimald process",
                 socket_path.display(),
                 wait.as_secs()
             )));
@@ -395,7 +395,7 @@ pub fn ensure_daemon_running(use_minvmd: bool, minimal_dir: Option<&Path>) -> io
 
 /// Whether the daemon the CLI talks to is currently up — the question
 /// [`ensure_daemon_running`] answers before deciding to spawn, exposed for
-/// callers that must *not* spawn. `min stop` is the case: without this it can
+/// callers that must *not* spawn. `min host stop` is the case: without this it can
 /// only discover an already-down daemon by failing to connect to it, which is a
 /// connect error (or, against a stale socket, a timeout) for what is really the
 /// goal state.
@@ -765,7 +765,7 @@ mod tests {
         assert!(is_daemon_running(false, Some(&long)).unwrap());
     }
 
-    /// `min stop` against a native daemon returns only once its socket stops
+    /// `min host stop` against a native daemon returns only once its socket stops
     /// accepting: the wait ends when the listener closes, not before.
     #[cfg(target_os = "linux")]
     #[test]
@@ -824,7 +824,7 @@ mod tests {
             "the error names the cause: {err}"
         );
         assert!(
-            err.to_string().contains("run `min stop` again"),
+            err.to_string().contains("run `min host stop <host>`"),
             "the error names a next step: {err}"
         );
     }

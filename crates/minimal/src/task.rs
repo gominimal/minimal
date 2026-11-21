@@ -1776,12 +1776,8 @@ pub(crate) async fn run_entry(
     let interrupt_guard = crate::arm_activation_interrupt(global, id);
 
     let headless = global.no_input || !crate::can_prompt_interactively();
-    let decision = crate::decide_workspace_upload(
-        &upload_root,
-        false,
-        headless,
-        std::env::home_dir().as_deref(),
-    );
+    let decision =
+        crate::decide_workspace_upload(&upload_root, headless, std::env::home_dir().as_deref());
     // `min task run` has no `--sync` flags, so it warns rather than refuses:
     // an undeclared root starts empty, and a `$HOME` skip names the lifecycle
     // hooks it drops. The box still starts, as it did before the shared gate.

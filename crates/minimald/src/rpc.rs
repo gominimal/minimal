@@ -4006,7 +4006,7 @@ mod create_naming_tests {
         assert_eq!(HeldNameRefusal::EXIT_CODE, 2);
         assert!(error.contains(&holder.to_string()), "{error}");
         assert!(
-            error.contains(&format!("min session rename {holder} <new-name>")),
+            error.contains(&format!("min box rename {holder} <new-name>")),
             "the refusal names the next step: {error}"
         );
         assert_eq!(
