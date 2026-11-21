@@ -26031,3 +26031,64 @@ fn box_run_takes_no_path_flag() {
     };
     assert_eq!(run.entry, "build");
 }
+
+// BCLI-026: `--path` after the entry's name reaches `min box run` as an
+// argument. The run refuses it with exit 2, as for `min task run` (T31), and
+// the daemon has no box after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn box_run_refuses_path_after_the_entry() {
+    use clap::Parser as _;
+
+    let project = tempfile::tempdir().expect("a temp project dir");
+    std::fs::write(
+        project.path().join(mfile::MFILE_NAME),
+        b"[tasks.build]\necho = 'x'\n",
+    )
+    .expect("the project's minimal.toml");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let sock = state.path().join("providers/local-minimald0/ssh.sock");
+    std::fs::create_dir_all(sock.parent().expect("the socket has a dir"))
+        .expect("the daemon's state dir");
+    let server = minimald::test_harness::TestServer::new().await;
+    server.listen_on_uds(&sock).await;
+    let global = GlobalArgs {
+        repo_dir: Some(project.path().to_path_buf()),
+        minimal_dir: Some(state.path().to_path_buf()),
+        no_input: true,
+        ..Default::default()
+    };
+    for argv in [
+        &["min", "box", "run", "build", "--path", "sub/dir"][..],
+        &["min", "box", "run", "build", "--path=sub/dir"],
+    ] {
+        let cli = Cli::try_parse_from(argv).unwrap_or_else(|err| panic!("{argv:?}: {err}"));
+        let Some(Command::Box(BoxArgs {
+            command: BoxCommand::Run(run),
+        })) = cli.command
+        else {
+            panic!("{argv:?} parses as a box run");
+        };
+        let err = task::cmd_box_run(&global, run)
+            .await
+            .expect_err("a box run with --path is refused");
+        let refusal = err
+            .downcast_ref::<task::RunFlagMisplaced>()
+            .unwrap_or_else(|| panic!("{argv:?}: {err:#}"));
+        assert_eq!(
+            refusal.to_string(),
+            "Cannot run build: min box run has no --path flag. Run min -C <dir> box run \
+             build to run the task in the project at <dir>, or put -- between build and \
+             its arguments to pass --path to the task.",
+            "{argv:?}"
+        );
+    }
+    let listed = server
+        .connect()
+        .await
+        .call::<minimald_rpc::ListSessions>(&())
+        .await;
+    assert!(
+        listed.sessions.is_empty(),
+        "the refused runs created no box"
+    );
+}

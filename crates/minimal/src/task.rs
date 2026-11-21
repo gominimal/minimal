@@ -481,10 +481,11 @@ pub(crate) fn misplaced_run_flag<'a>(typed: &[String], args: &'a [String]) -> Op
 
 /// The first task argument that is `--path`, alone or as `--path=<value>`,
 /// before any `--` ([`misplaced_run_flag`] reads `typed` and `args` the
-/// same way). `min task run` takes no `--path` (BCLI-042), but clap reads
-/// every token after the task's name as a task argument, so
-/// `min task run build --path sub/dir` parses. The run refuses it, as the
-/// parser refuses `--path` before the task's name.
+/// same way). Neither `min task run` (BCLI-042) nor `min box run`
+/// (BCLI-026) takes a `--path`, but clap reads every token after the
+/// entry's name as an argument, so `min task run build --path sub/dir`
+/// parses. The run refuses it, as the parser refuses `--path` before the
+/// entry's name.
 pub(crate) fn removed_task_path_flag<'a>(typed: &[String], args: &'a [String]) -> Option<&'a str> {
     let before_args = typed
         .len()
@@ -505,14 +506,14 @@ pub(crate) fn removed_task_path_flag<'a>(typed: &[String], args: &'a [String]) -
 enum MisplacedFlag {
     /// One of the run's own network flags ([`misplaced_run_flag`]).
     Network,
-    /// `--path`, which `min task run` does not take
-    /// ([`removed_task_path_flag`]).
-    RemovedPath,
+    /// `--path`, which neither run verb takes
+    /// ([`removed_task_path_flag`]). It holds the verb's command.
+    RemovedPath(&'static str),
 }
 
 /// The refusal of a run with one of its own network flags among the
-/// task's arguments ([`misplaced_run_flag`]), or of `min task run` with
-/// `--path` among them ([`removed_task_path_flag`]): a usage error, which
+/// task's arguments ([`misplaced_run_flag`]), or of a run with `--path`
+/// among them ([`removed_task_path_flag`]): a usage error, which
 /// `main.rs` ends with [`Self::EXIT_CODE`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunFlagMisplaced {
@@ -539,12 +540,12 @@ impl RunFlagMisplaced {
         }
     }
 
-    /// The refusal of `min task run <entry>` with `arg`, `--path` alone or
-    /// as `--path=<value>`, among its arguments (BCLI-042).
+    /// The refusal of `<verb> <entry>` with `arg`, `--path` alone or as
+    /// `--path=<value>`, among its arguments (BCLI-026, BCLI-042).
     #[must_use]
-    pub fn removed_path(entry: &str, arg: &str) -> Self {
+    pub(crate) fn removed_path(verb: RunVerb, entry: &str, arg: &str) -> Self {
         Self {
-            kind: MisplacedFlag::RemovedPath,
+            kind: MisplacedFlag::RemovedPath(verb.command()),
             ..Self::new(entry, arg)
         }
     }
@@ -561,12 +562,15 @@ impl std::fmt::Display for RunFlagMisplaced {
                  {entry} to set the box's network, or put -- between {entry} and its arguments \
                  to pass it to the task."
             ),
-            MisplacedFlag::RemovedPath => write!(
-                f,
-                "Cannot run {entry}: min task run has no {flag} flag. Run \
-                 min -C <dir> task run {entry} to run the task in the project at <dir>, or put \
-                 -- between {entry} and its arguments to pass {flag} to the task."
-            ),
+            MisplacedFlag::RemovedPath(command) => {
+                let verb = command.strip_prefix("min ").unwrap_or(command);
+                write!(
+                    f,
+                    "Cannot run {entry}: {command} has no {flag} flag. Run \
+                     min -C <dir> {verb} {entry} to run the task in the project at <dir>, or \
+                     put -- between {entry} and its arguments to pass {flag} to the task."
+                )
+            }
         }
     }
 }
@@ -1516,13 +1520,11 @@ pub(crate) async fn run_entry(
     if let Some(arg) = misplaced_run_flag(&typed, &args.args) {
         return Err(RunFlagMisplaced::new(&args.entry, arg).into());
     }
-    // BCLI-042: `min task run` takes no `--path`. One typed after the task's
-    // name parses as a task argument, so the run refuses it here, before any
-    // box exists.
-    if args.verb == RunVerb::Task
-        && let Some(arg) = removed_task_path_flag(&typed, &args.args)
-    {
-        return Err(RunFlagMisplaced::removed_path(&args.entry, arg).into());
+    // BCLI-026, BCLI-042: neither run verb takes a `--path`. One typed after
+    // the entry's name parses as an argument, so the run refuses it here,
+    // before any box exists.
+    if let Some(arg) = removed_task_path_flag(&typed, &args.args) {
+        return Err(RunFlagMisplaced::removed_path(args.verb, &args.entry, arg).into());
     }
     // BCLI-026, BCLI-042: neither run verb takes a `--path`. `-C`/`--repo-dir`
     // names the project, else the cwd.
