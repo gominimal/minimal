@@ -968,6 +968,8 @@ impl BoxActor {
                                     // nothing here. The probe still refuses a
                                     // held port, and the first attach binds
                                     // the forwards or says why it cannot.
+                                    // gominimal/minimal#3716 tracks failing
+                                    // the finalize here instead (NET-121).
                                     Some(Err(e)) => {
                                         tracing::warn!(
                                             session_id = %record.id,
