@@ -933,6 +933,33 @@ impl BoxActor {
         )
     }
 
+    /// Unbinds the declared forwards a native finalize bound for this box
+    /// before any attach, and gives their lease back to the switch. An
+    /// attach that adopted them owns them, and this does nothing then.
+    #[cfg(target_os = "linux")]
+    pub(super) async fn release_activation_forwards(&self) {
+        let released = self
+            .net_switch
+            .lock()
+            .await
+            .release_activation_bind(*self.record.id());
+        let Some((lease, forwards)) = released else {
+            return;
+        };
+        if !forwards.is_empty() {
+            let control = self.switch_control().await;
+            crate::net::policy::release_declared_ingress(&control, &forwards).await;
+        }
+        if let Err(e) = self.net_switch.lock().await.detach(lease).await {
+            tracing::warn!(
+                session_id = %self.record.id(),
+                ip = %lease.ip,
+                error = %e,
+                "giving back the switch lease drawn at the box's activation"
+            );
+        }
+    }
+
     /// Tears down any runtime objects, such as the host or side ops. Shutdown
     /// of these objects is complete once awaited.
     ///
@@ -962,6 +989,10 @@ impl BoxActor {
         // publish asked in the window between this stop and the next launch
         // answers what stopped the box, not an entry whose publication came
         // down with it.
+        // The declared forwards a native finalize bound before any attach
+        // go with the box too, when no attach adopted them.
+        #[cfg(target_os = "linux")]
+        self.release_activation_forwards().await;
         let forwarders = self.live_ingress.take_all();
         self.publications.revoke_all();
         // A declared port bound for this box at a shared-address port's
