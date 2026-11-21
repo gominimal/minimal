@@ -73,18 +73,18 @@ pub enum Command {
     // not remove it.
     Ls(LsArgs),
     // BCLI-042: no bare `min stop`. `min host stop` takes its place.
-    /// Session management subcommands
+    /// Session subcommands: the box commands for session boxes
     #[command(visible_alias = "sessions")]
     Session(SessionArgs),
     /// Loadout management subcommands
     #[command(visible_alias = "loadouts")]
     Loadout(LoadoutArgs),
-    /// Task subcommands: run declared project tasks in ephemeral sessions
+    /// Task subcommands: run the project's tasks, each in a box of its own
     #[command(visible_alias = "tasks")]
     Task(TaskArgs),
     /// Network subcommands: bring a box's services to the laptop
     Net(NetArgs),
-    /// Box subcommands: show what a box will get
+    /// Box subcommands: create, run, inspect, stop and remove boxes
     #[command(visible_alias = "boxes")]
     Box(BoxArgs),
     /// Host subcommands: the daemons on this machine that run boxes
