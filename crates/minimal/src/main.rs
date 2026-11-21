@@ -8,7 +8,6 @@ use std::io::IsTerminal as _;
 use std::process::ExitCode;
 
 use clap::{CommandFactory as _, Parser};
-use minimal::{ExecArgs, PolicyArgs, PolicyOutputFormat};
 use tracing_subscriber::fmt::format::{FormatEvent, Writer};
 use tracing_subscriber::fmt::{FmtContext, FormatFields};
 use tracing_subscriber::{
@@ -263,7 +262,9 @@ fn answer_failure(
 /// more than one host, 4 when the address names no box, 7 when a host did
 /// not answer the lookup), the code a `min box exec` refusal carries
 /// (`minimal::BoxExecRefusal`: 2 for `-t` without a terminal or a box that
-/// is not running, 5 when its spec turns exec off), the code an `--exec
+/// is not running or stopped before the command started, 5 when its spec
+/// turns exec off or its network rules could not be applied to the
+/// command), the code an `--exec
 /// <id>` refusal of `min box stop`, `logs` or `wait` carries
 /// (`minimal::BoxExecIdRefusal`: 2 for text that is not an exec id, 4 for an
 /// exec the box does not have), the code a start
@@ -280,6 +281,11 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     // BEP-008/009/010/017/056: a box spec refused at activation.
     if let Some(refused) = e.downcast_ref::<boxes::core::bep::ActivationRefused>() {
         return refused.exit_code();
+    }
+    // BEP-003 (#3276): a create refusal only the daemon made, such as a
+    // non-GitHub broker grant on a host a proxy serves, keeps its exit code.
+    if let Some(refused) = e.downcast_ref::<minimal::DaemonCreateRefusal>() {
+        return refused.exit_code.max(1);
     }
     // BCLI-004: `min box rm` of a running box without `--force`.
     if e.downcast_ref::<minimal::BoxRunningRefusal>().is_some() {
@@ -526,6 +532,25 @@ fn machine_mode_answer(e: &anyhow::Error) -> MachineModeAnswer {
             hint,
         ));
     }
+    // #3276: the same, for a refusal only the daemon made. The daemon's
+    // reply carries the defined error and its next step.
+    // A code this build does not define answers `unspecified` below.
+    if let Some(refused) = e.downcast_ref::<minimal::DaemonCreateRefusal>()
+        && let Some(code) = refused.code.as_deref().and_then(|code| {
+            [
+                boxes::core::bep::GATEHOUSE_UNENROLLED_NODE,
+                boxes::core::bep::GITHUB_SIGN_IN_REQUIRED,
+            ]
+            .into_iter()
+            .find(|known| *known == code)
+        })
+    {
+        return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
+            code,
+            format!("{e:#}"),
+            refused.hint.clone(),
+        ));
+    }
     // BCLI-020: `min type show` of a name that is no type is `not_found`.
     if e.downcast_ref::<minimal::BoxTypeNotFound>().is_some() {
         return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
@@ -592,27 +617,17 @@ impl std::io::Write for DashLog {
 
 /// Whether the command's stdout is a data contract that tracing must not
 /// pollute, so its logs go to stderr instead. The `completions` handlers emit a
-/// shell shim on stdout, `session exec` carries only the exec'd
-/// command's output, `box exec` carries the command's output or its exec
-/// id, and `task run` / `session run` stream the task's stdout —
+/// shell shim on stdout, `box exec` carries the command's output or its exec
+/// id, and `task run` / `box run` stream the task's stdout —
 /// a log line in any of them would be read as content. A bare `min` (no subcommand) is
 /// one too: its non-TTY twin promises an empty stdout to pipelines, and its
-/// interactive activate path prints only the session id there. So is
-/// `session policy -o json`, whose stdout is one document a script parses.
+/// interactive activate path prints only the session id there.
 fn stdout_is_data_contract(command: &Option<minimal::Command>) -> bool {
     matches!(
         command,
         None | Some(
             minimal::Command::CompleteSessionStr(_)
                 | minimal::Command::Completions(_)
-                | minimal::Command::Session(minimal::SessionArgs {
-                    command: minimal::SessionCommand::Exec(ExecArgs { .. })
-                        | minimal::SessionCommand::Run(_)
-                        | minimal::SessionCommand::Policy(PolicyArgs {
-                            output: Some(PolicyOutputFormat::Json),
-                            ..
-                        }),
-                })
                 | minimal::Command::Task(minimal::TaskArgs {
                     command: minimal::TaskCommand::Run(_),
                 })
@@ -695,7 +710,7 @@ impl tracing::field::Visit for MessageVisitor {
 
 /// Whether a run is under the machine output mode: the command's `-o`, the
 /// flag the architecture's machine-output contract hangs on — `json` for
-/// `min session policy -o json` and `jsonl` for `min box audit -o jsonl`.
+/// `min box show -o json` and `jsonl` for `min box audit -o jsonl`.
 /// `false` for every text run, and for a command that has not taken a
 /// machine `-o` yet, which is the same thing to the error path: its failure
 /// is a plain-text line. The error path keys on this, so a command joins
@@ -703,9 +718,6 @@ impl tracing::field::Visit for MessageVisitor {
 /// error path changes.
 fn machine_output_mode(cli: &minimal::Cli) -> bool {
     match &cli.command {
-        Some(minimal::Command::Session(minimal::SessionArgs {
-            command: minimal::SessionCommand::Policy(PolicyArgs { output, .. }),
-        })) => output.is_some(),
         // Architecture line 379: a `-o jsonl` failure is one `min/v1/error`
         // object too.
         Some(minimal::Command::Box(minimal::BoxArgs {
@@ -725,6 +737,11 @@ fn machine_output_mode(cli: &minimal::Cli) -> bool {
         // `min/v1/error` object.
         Some(minimal::Command::Box(minimal::BoxArgs {
             command: minimal::BoxCommand::Show(args),
+        })) => args.output.is_some(),
+        // BCLI-013, BCLI-033: a `min box wait -o json` failure, a
+        // `wait_timeout` among them, is one `min/v1/error` object.
+        Some(minimal::Command::Box(minimal::BoxArgs {
+            command: minimal::BoxCommand::Wait(args),
         })) => args.output.is_some(),
         // BCLI-019, BCLI-020: `min type list|show -o json|yaml|toml`.
         Some(minimal::Command::Type(minimal::TypeArgs {
@@ -818,19 +835,6 @@ mod tests {
         assert!(stdout_is_data_contract(&None));
     }
 
-    /// `min session run` streams the task's stdout over the exec channel, so
-    /// tracing must route to stderr like the other stdout contracts.
-    #[test]
-    fn session_run_is_a_stdout_contract() {
-        let cmd = Some(Command::Session(minimal::SessionArgs {
-            command: minimal::SessionCommand::Run(minimal::SessionRunArgs {
-                session: "web".to_string(),
-                task: "build".to_string(),
-            }),
-        }));
-        assert!(stdout_is_data_contract(&cmd));
-    }
-
     /// `min task run` streams the task's stdout, so tracing must route to
     /// stderr there like the other stdout contracts.
     #[test]
@@ -838,7 +842,6 @@ mod tests {
         let cmd = Some(Command::Task(minimal::TaskArgs {
             command: minimal::TaskCommand::Run(minimal::TaskRunArgs {
                 task: "build".to_string(),
-                path: None,
                 network: None,
                 egress: minimal::EgressArgs::default(),
                 other: minimal::BoxOverrideArgs::default(),
@@ -947,27 +950,6 @@ mod tests {
         );
     }
 
-    /// `min session policy -o json` writes one document a script parses, so
-    /// its tracing must route to stderr — and the text rendering, whose
-    /// stdout is for a person, must not be caught by the same gate.
-    #[test]
-    fn session_policy_json_is_a_stdout_contract() {
-        let cmd = Some(Command::Session(minimal::SessionArgs {
-            command: minimal::SessionCommand::Policy(PolicyArgs {
-                session: "web".to_string(),
-                output: Some(PolicyOutputFormat::Json),
-            }),
-        }));
-        assert!(stdout_is_data_contract(&cmd));
-        let cmd = Some(Command::Session(minimal::SessionArgs {
-            command: minimal::SessionCommand::Policy(PolicyArgs {
-                session: "web".to_string(),
-                output: None,
-            }),
-        }));
-        assert!(!stdout_is_data_contract(&cmd));
-    }
-
     /// The error path's key: a `-o json` run is a machine-output run, a text
     /// run is not, and a command that has not taken `-o json` yet is not
     /// either — the same three-way split the subscriber gate makes, read
@@ -1022,6 +1004,37 @@ mod tests {
 
     // BEP-003, Gatehouse §6.2: a refused grant box reads as its defined
     // error under `-o json`, with the refusal's next step as the hint.
+    // #3276: a create refusal only the daemon made exits with the code the
+    // daemon gave it, and `-o json` answers with its defined error.
+    #[test]
+    fn daemon_only_broker_refusal_exits_5_with_its_code() {
+        let refused = |code: Option<&str>| {
+            anyhow::Error::new(minimal::DaemonCreateRefusal {
+                message: "Cannot create the box.".to_string(),
+                code: code.map(str::to_string),
+                exit_code: 5,
+                hint: "remove aws from the secrets".to_string(),
+            })
+        };
+        let err = refused(Some("gatehouse_unenrolled_node"));
+        assert_eq!(failure_exit_code(&err), 5);
+        match machine_mode_answer(&err) {
+            MachineModeAnswer::Object(failure) => {
+                assert_eq!(failure.code(), "gatehouse_unenrolled_node");
+                assert_eq!(failure.hint(), "remove aws from the secrets");
+                assert_eq!(failure.message(), "Cannot create the box.");
+            }
+            other => panic!("a refusal is an object, got {other:?}"),
+        }
+        // A code this build does not define keeps the exit code.
+        let err = refused(Some("a_code_from_a_newer_daemon"));
+        assert_eq!(failure_exit_code(&err), 5);
+        match machine_mode_answer(&err) {
+            MachineModeAnswer::Object(failure) => assert_eq!(failure.code(), "unspecified"),
+            other => panic!("a refusal is an object, got {other:?}"),
+        }
+    }
+
     #[test]
     fn machine_mode_names_the_grant_refusal_code() {
         use boxes::core::bep::{ActivationRefused, BepRefusal, ProxyAbsence};
@@ -1153,28 +1166,6 @@ mod tests {
 
     #[test]
     fn machine_output_mode_keys_on_the_output_flag() {
-        let cli = minimal::Cli {
-            global_args: minimal::GlobalArgs::default(),
-            command: Some(Command::Session(minimal::SessionArgs {
-                command: minimal::SessionCommand::Policy(PolicyArgs {
-                    session: "web".to_string(),
-                    output: Some(PolicyOutputFormat::Json),
-                }),
-            })),
-        };
-        assert!(machine_output_mode(&cli));
-
-        let cli = minimal::Cli {
-            global_args: minimal::GlobalArgs::default(),
-            command: Some(Command::Session(minimal::SessionArgs {
-                command: minimal::SessionCommand::Policy(PolicyArgs {
-                    session: "web".to_string(),
-                    output: None,
-                }),
-            })),
-        };
-        assert!(!machine_output_mode(&cli));
-
         let cli = minimal::Cli {
             global_args: minimal::GlobalArgs::default(),
             command: None,
@@ -1537,7 +1528,25 @@ mod tests {
                 },
                 5,
             ),
-            (minimal::BoxExecRefusal::SpecUnreadable { target }, 5),
+            (
+                minimal::BoxExecRefusal::SpecUnreadable {
+                    target: target.clone(),
+                },
+                5,
+            ),
+            (
+                minimal::BoxExecRefusal::StoppedBeforeStart {
+                    target: target.clone(),
+                },
+                2,
+            ),
+            (
+                minimal::BoxExecRefusal::NetworkRulesNotApplied {
+                    target,
+                    cause: "Permission denied (os error 13)".to_string(),
+                },
+                5,
+            ),
         ] {
             assert_eq!(failure_exit_code(&anyhow::Error::new(refusal)), code);
         }

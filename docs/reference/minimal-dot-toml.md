@@ -112,6 +112,30 @@ key is set in more than one place, the lists combine, and the more specific
 place sets every other value: the entry over `[defaults.<type>]`, and
 `[defaults.<type>]` over `[defaults]`.
 
+The `env_vars` table is the exception, and it merges by variable name. Each
+name keeps the value of the most specific place that sets it, and a name that
+only a less specific place sets stays. A [loadout](./loadouts.md#env_vars)
+adds the names in its own `[env_vars]` table.
+
+```toml
+[defaults.env_vars]
+RUST_LOG = "info"
+
+[defaults.session.env_vars]
+RUST_LOG = "debug"   # sessions get debug, and every other entry gets info
+
+[tasks.test]
+exec = "cargo test"
+env_vars.RUST_BACKTRACE = "1"   # this task gets RUST_LOG too
+```
+
+`env_vars` is the only key that sets variables, in `minimal.toml` and in a
+loadout file. A table that sets `vars` or `vars_lenient` fails with exit
+code 3, and the error names the file, the table and the key. Move the
+variables to `env_vars`. A name in `env_vars` holds only ASCII letters,
+digits and `_`, and does not start with a digit. Any other name fails with
+exit code 3 in the same way.
+
 ```toml
 [defaults.task]
 state_key = "<state key>"  # optional
@@ -128,7 +152,7 @@ set `state_key`.
 
 Contributes to [sessions](../concepts/sessions.md) started
 on this project (`min session start`). It carries the same primitives as a
-[loadout](./loadouts.md) (packages, vars, patches, lifecycle hooks), scoped to
+[loadout](./loadouts.md) (packages, environment variables, patches, lifecycle hooks), scoped to
 the project rather than the developer: where a loadout says "what this
 developer wants everywhere", the session block says "what every session
 working on this codebase needs". There is at most one per `minimal.toml`, and
@@ -145,7 +169,7 @@ patches = [
     { dest = ".psqlrc",            source = "config/psqlrc" },
 ]
 
-[defaults.session.vars]
+[defaults.session.env_vars]
 # Applies uniformly to every developer's session.
 RUST_LOG         = "info"
 CARGO_TERM_COLOR = "always"
@@ -162,7 +186,7 @@ on_activate = { type = "inline", value = "cargo check --workspace >/dev/null 2>&
 
 - **`packages`**: Packages brought into every session on this project,
   alongside whatever the developer's loadouts contribute.
-- **`vars`**: Environment variables. A string sets a fixed value;
+- **`env_vars`**: Environment variables. A string sets a fixed value;
   `{ inherit = true }` passes the developer's own value through. Here that
   inheritance is **required**: if the developer's environment does not have
   the variable set, activation fails rather than proceeding without it.
@@ -216,8 +240,8 @@ disagree about everything else:
 
 | Surface | Host variable unset | `default = "..."` |
 |---|---|---|
-| This file's `[defaults.session.vars]` (and `[[defaults.session.vars_lenient]]`) | Activation fails: `could not resolve pending var <NAME>` | Supported; the default is used |
-| A loadout's [`[vars]`](./loadouts.md#vars) and [`[[vars_lenient]]`](./loadouts.md#vars_lenient) | Dropped, with a warning on the terminal; activation continues | Supported; the default is used |
+| This file's `env_vars`, such as `[defaults.session.env_vars]` | Activation fails: `could not resolve pending var <NAME>` | Supported; the default is used |
+| A loadout's [`[env_vars]`](./loadouts.md#env_vars) | Dropped, with a warning on the terminal; activation continues | Supported; the default is used |
 | A task's [`env_vars`](./tasks.md#env_vars) | The run fails before the session is built | Rejected when the file is parsed — a task's `inherit` takes no `default` |
 
 Two things narrow the task row. An `echo` task never builds an environment,
@@ -260,7 +284,7 @@ table declares it, and `self` cannot name an entry. A file that breaks one
 of these rules fails to load with exit code 3.
 
 An entry writes its settings as flat keys, such as `timeout`, `pty_enabled`,
-`on_oom`, and the `[machine]` table. `packages`, `patches`, `vars`, and
+`on_oom`, and the `[machine]` table. `packages`, `patches`, `env_vars`, and
 `lifecycle_hooks` mean the same in an entry as in
 [`[defaults.session]`](#session).
 
@@ -314,7 +338,7 @@ arch = "<arch>"                 # optional; e.g. "amd64", "arm64"
 path = "<path>"                 # raw-file only; required there, invalid for oci-image
 entrypoint = "<cmd>"            # oci-image only; string or list of strings
 cmd = ["<arg>", ...]            # oci-image only; string or list of strings
-vars = { KEY = "value" }        # oci-image only; alias: `env_vars`
+env_vars = { KEY = "value" }    # oci-image only
 ```
 
 #### Output types
@@ -332,9 +356,9 @@ vars = { KEY = "value" }        # oci-image only; alias: `env_vars`
 - **`path`**: _(`raw-file` only)_ Path, relative to the package file tree, of the single file to extract. Required for `raw-file` outputs; supplying it on an `oci-image` output is an error.
 - **`entrypoint`**: _(`oci-image` only)_ OCI image entrypoint. May be a string (`"/app/server"`) or a list (`["/bin/sh", "-c"]`).
 - **`cmd`**: _(`oci-image` only)_ OCI image default command. Same string-or-list shape as `entrypoint`.
-- **`vars`** (alias: `env_vars`): _(`oci-image` only)_ Environment variables baked into the image as a `KEY = "value"` table.
+- **`env_vars`**: _(`oci-image` only)_ Environment variables baked into the image as a `KEY = "value"` table.
 
-Setting an `oci-image`-only field (`entrypoint`, `cmd`, `vars`) on a `raw-file` output, or setting `path` on an `oci-image` output, is rejected when the `minimal.toml` is parsed.
+Setting an `oci-image`-only field (`entrypoint`, `cmd`, `env_vars`) on a `raw-file` output, or setting `path` on an `oci-image` output, is rejected when the `minimal.toml` is parsed.
 
 #### Examples
 
@@ -357,7 +381,7 @@ type = "oci-image"
 arch = "arm64"
 packages = ["base", "openssl"]
 entrypoint = "/app/server"
-vars = { PORT = "8080" }
+env_vars = { PORT = "8080" }
 ```
 
 ```sh

@@ -2009,6 +2009,19 @@ fn proxy_root_certificate(certificate: Option<&str>) -> bool {
     certificate.is_some_and(crate::env::is_one_certificate)
 }
 
+/// The exit code of a create that the admission check of BOX-160 refused:
+/// the error carries a [`RootConstraintRefusal`] or an
+/// [`UnknownRootRefusal`]. `None` for any other error.
+pub(crate) fn admission_refusal(error: &std::io::Error) -> Option<u8> {
+    let inner = error.get_ref()?;
+    let code = if let Some(refusal) = inner.downcast_ref::<RootConstraintRefusal>() {
+        refusal.exit_code()
+    } else {
+        inner.downcast_ref::<UnknownRootRefusal>()?.exit_code()
+    };
+    u8::try_from(code).ok()
+}
+
 /// The un-enrolled refusal an error from a create carries, if any.
 pub(crate) fn unenrolled_refusal(
     error: &std::io::Error,
@@ -4581,8 +4594,6 @@ impl BoxManager {
                     exit_code = refusal.exit_code(),
                     "refused a create: the box spec carries a value its type's built-in root excludes"
                 );
-                // The reply carries the refusal's text but not its code,
-                // so `min` exits 1 and not 3 (#3313).
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     refusal,
@@ -4598,8 +4609,6 @@ impl BoxManager {
                     builtin_type = refusal.builtin_type,
                     "refused a create: the box spec does not name its type's built-in root"
                 );
-                // The reply carries the refusal's text but not its code,
-                // so `min` exits 1 and not 3 (#3313).
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     refusal,

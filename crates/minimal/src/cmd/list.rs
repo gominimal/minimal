@@ -52,7 +52,7 @@ pub(crate) async fn cmd_bare(global: &GlobalArgs) -> Result<(), anyhow::Error> {
         // Two ways to land on create-and-attach: no sessions exist at all
         // (first run), or the ambiguity picker's `+ Create a new session`
         // row was chosen. Both activate for the cwd exactly as
-        // `min session activate --attach .` would (default sync, autogen
+        // `min session start` would (default sync, autogen
         // name) — but with the scaffold offer suppressed, unlike the same
         // picker row reached through `min session attach`: the one
         // keystroke into a session must not detour into config authoring.
@@ -64,9 +64,9 @@ pub(crate) async fn cmd_bare(global: &GlobalArgs) -> Result<(), anyhow::Error> {
 }
 
 /// The `ActivateArgs` a bare `min` activates with when no sessions exist:
-/// exactly `min session activate --attach .` — default sync, autogen name,
+/// the flags a session start takes by default — default sync, autogen name,
 /// default network — leaving the path to the `-C`/cwd resolution
-/// [`cmd_activate`] already performs for a missing path argument.
+/// `activate_box` already performs for a missing path argument.
 pub(crate) fn bare_activate_args() -> ActivateArgs {
     ActivateArgs {
         name: None,
@@ -181,10 +181,8 @@ pub(crate) fn render_bare_status(
     out.push_str(&format!("  blueprint: {blueprint}\n"));
     out.push_str("Next:\n");
     match cwd_matches.first() {
-        Some(e) => {
-            out.push_str(&format!("  min session run {} <task>\n", entry_handle(e)));
-        }
-        None => out.push_str("  min session activate --attach .\n"),
+        Some(_) => out.push_str("  min task run <task>\n"),
+        None => out.push_str("  min session start\n"),
     }
     out.push_str("  min ls --json\n");
     out

@@ -265,12 +265,12 @@ arm64, and its VM test checks that the start phase is exported at READY.
     spends the whole 200 ms, so each command pays about 200 ms (review S19).
     See Open questions.
 - **TEL-011** IF the collector is unreachable THEN THE SYSTEM SHALL complete
-  `min stop` within the daemon shutdown bound (runtime 2 s, then flush 5 s).
+  `min host stop` within the daemon shutdown bound (runtime 2 s, then flush 5 s).
   tier:     T0
   verify:   cargo nextest run -p minimald --test otel_shutdown_integration a_silent_collector_does_not_hold_the_daemons_exit
   test:     crates/minimald/tests/otel_shutdown_integration.rs::a_silent_collector_does_not_hold_the_daemons_exit
-            (the real daemon's exit after it answers `Shutdown`; `min stop` itself
-            returns at the answer)
+            (the real daemon's exit after it answers `Shutdown`, which
+            `min host stop` sends; BCLI-042 removed bare `min stop`)
   lab:      719
 - **TEL-012** THE SYSTEM SHALL never print the OpenTelemetry SDK's own errors on
   a console or in a file log the user reads.

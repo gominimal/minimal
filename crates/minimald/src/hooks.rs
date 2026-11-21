@@ -126,6 +126,18 @@ pub(crate) struct InjectedCommands {
     /// filter itself or it could open sockets — `AF_VSOCK` to the host
     /// included — from inside a sealed box.
     pub(crate) seal_none_box: bool,
+    /// The box's id, which the `host_ip` cohort records an injected
+    /// process under (BEP-018).
+    pub(crate) box_id: String,
+    /// The box's classifier leaf, which the hook joins before it joins the
+    /// namespaces, so it never runs in the daemon's own leaf (NET-079).
+    /// `None` for a box this host placed in no leaf.
+    pub(crate) leaf: Option<sandbox::config::ClassifierLeaf>,
+    /// Whether the box runs with host-address enforcement.
+    pub(crate) host_ip_enforced: bool,
+    /// The `host_ip` cohort the hook is checked against (BEP-018): the
+    /// daemon's one outside tests.
+    pub(crate) cohort: &'static std::sync::Mutex<crate::net::classifier::CohortQuic443>,
 }
 
 impl BoxCommands for InjectedCommands {
@@ -145,7 +157,14 @@ impl BoxCommands for InjectedCommands {
         } else {
             injection
         };
-        injection.command().map_err(std::io::Error::other)
+        crate::box_runtime::placed_injection_command(
+            injection,
+            &self.box_id,
+            self.leaf.as_ref(),
+            self.host_ip_enforced,
+            self.cohort,
+        )
+        .map_err(std::io::Error::other)
     }
 }
 
@@ -1779,7 +1798,10 @@ mod tests {
 
     /// The injected argv of a hook, as strings, so a test can ask what the
     /// shim was told to do.
-    async fn injected_argv(seal_none_box: bool) -> Vec<String> {
+    async fn injected_argv(
+        seal_none_box: bool,
+        leaf: Option<sandbox::config::ClassifierLeaf>,
+    ) -> Vec<String> {
         // A plain host process shares every namespace with us, so the join set
         // is empty and nothing privileged is asked of the runner.
         let mut hold = std::process::Command::new("/bin/sleep")
@@ -1791,6 +1813,10 @@ mod tests {
             cwd: String::new(),
             vars: BTreeMap::new(),
             seal_none_box,
+            box_id: "b".to_string(),
+            leaf,
+            host_ip_enforced: false,
+            cohort: crate::net::classifier::cohort_quic443(),
         };
         let built = commands
             .command("/bin/true", &[], BTreeMap::new())
@@ -1798,10 +1824,21 @@ mod tests {
             .expect("building the injected hook command");
         let _ = hold.kill();
         let _ = hold.wait();
-        built
+        argv_of(&built)
+    }
+
+    /// The argv of `command`, as strings.
+    fn argv_of(command: &std::process::Command) -> Vec<String> {
+        command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect()
+    }
+
+    /// The leaf `argv` tells the shim to join, if any.
+    fn leaf_on(argv: &[String]) -> Option<&str> {
+        let at = argv.iter().position(|arg| arg == "--classifier-leaf")?;
+        argv.get(at + 1).map(String::as_str)
     }
 
     /// A hook on a `--network none` session joins the session's namespaces
@@ -1812,7 +1849,7 @@ mod tests {
     #[tokio::test]
     async fn a_none_box_hook_injection_carries_the_socket_seal() {
         assert!(
-            injected_argv(true)
+            injected_argv(true, None)
                 .await
                 .contains(&"--seal-none-box".to_string()),
             "a sealing session must pass --seal-none-box to the hook's shim",
@@ -1825,10 +1862,100 @@ mod tests {
     #[tokio::test]
     async fn a_networked_session_hook_injection_is_not_sealed() {
         assert!(
-            !injected_argv(false)
+            !injected_argv(false, None)
                 .await
                 .contains(&"--seal-none-box".to_string()),
             "only a none box may pass --seal-none-box to the hook's shim",
         );
+    }
+
+    /// NET-079: a hook joins the box's classifier leaf before it joins the
+    /// namespaces, as an exec does, so the hook's process never runs in the
+    /// daemon's own leaf. The leaf travels on the shim's argv.
+    #[tokio::test]
+    async fn a_hook_injection_joins_the_box_leaf() {
+        let leaf =
+            sandbox::config::ClassifierLeaf::new("/sys/fs/cgroup/minimald.slice/boxes/deny/b");
+        let argv = injected_argv(false, Some(leaf.clone())).await;
+        assert_eq!(
+            leaf_on(&argv),
+            Some(leaf.dir().to_string_lossy().as_ref()),
+            "a placed box's hook names its leaf to the shim: {argv:?}"
+        );
+    }
+
+    /// BEP-018: a hook into a host-address box takes the `host_ip` cohort's
+    /// UDP 443 check, as an exec does. While the cohort blocks, the hook
+    /// joins the blocked leaf, and once it spawns its shim is recorded under
+    /// the box, so it goes home with the box's own processes when the block
+    /// lifts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hook_into_a_host_address_box_takes_the_udp_443_check() {
+        use crate::net::classifier::{CohortQuic443, StandinMoves, quic443_blocked_leaf};
+        use sandbox::config::ClassifierLeaf;
+
+        let tree = tempfile::tempdir().expect("a stand-in classifier tree");
+        let blocked = quic443_blocked_leaf(tree.path());
+        std::fs::create_dir_all(&blocked).expect("the stand-in blocked leaf");
+        let own = ClassifierLeaf::new(tree.path().join("b"));
+        let moves = StandinMoves::default();
+        let cohort: &'static std::sync::Mutex<CohortQuic443> =
+            Box::leak(Box::new(std::sync::Mutex::new(CohortQuic443::default())));
+        {
+            let mut guard = cohort.lock().unwrap();
+            guard.learn_blocked_leaf(blocked.clone());
+            guard
+                .admit("b", Some(own.dir().to_path_buf()), false, &moves)
+                .expect("the box joins the cohort");
+            guard
+                .admit("grant", None, true, &moves)
+                .expect("a blocking box joins the cohort");
+        }
+
+        let mut hold = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawning a stand-in session leader");
+        let commands = InjectedCommands {
+            leader_pid: hold.id(),
+            cwd: String::new(),
+            vars: BTreeMap::new(),
+            seal_none_box: false,
+            box_id: "b".to_string(),
+            leaf: Some(own.clone()),
+            host_ip_enforced: true,
+            cohort,
+        };
+        let mut built = commands
+            .command("/bin/true", &[], BTreeMap::new())
+            .await
+            .expect("building the injected hook command");
+        let argv = argv_of(&built);
+        assert_eq!(
+            leaf_on(&argv),
+            Some(blocked.to_string_lossy().as_ref()),
+            "a hook injected while the cohort blocks joins the blocked leaf: {argv:?}"
+        );
+
+        // The shim here is this test binary, which refuses the shim's
+        // arguments and exits. Its pid still reaches the check.
+        let mut shim = built
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawning the hook's shim");
+        let pid = i32::try_from(shim.id()).expect("a pid");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !cohort.lock().unwrap().records("b", pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the hook's shim is recorded under the box"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let _ = shim.wait();
+        let _ = hold.kill();
+        let _ = hold.wait();
     }
 }

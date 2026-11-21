@@ -706,6 +706,40 @@ async fn ls_raw_with_sessions() {
 
 // --- activate + ls ---
 
+/// `min -C <project> session start --detach --name <name>` with
+/// `overrides`: the start that took the place of `min session activate`
+/// (BCLI-042).
+async fn start_session(
+    global: &GlobalArgs,
+    project: &std::path::Path,
+    name: &str,
+    overrides: StartOverrideArgs,
+) -> anyhow::Result<()> {
+    let global = GlobalArgs {
+        repo_dir: Some(project.to_path_buf()),
+        ..global.clone()
+    };
+    cmd_session_start(
+        &global,
+        SessionStartArgs {
+            entry: None,
+            name: Some(name.to_string()),
+            new: false,
+            detach: true,
+            overrides,
+        },
+    )
+    .await
+}
+
+/// The overrides of a start with `--network none`.
+fn no_net() -> StartOverrideArgs {
+    StartOverrideArgs {
+        network: Some(CliNetworkMode::NoNet),
+        ..StartOverrideArgs::default()
+    }
+}
+
 #[tokio::test]
 async fn activate_creates_session() {
     let (daemon, args) = setup().await;
@@ -722,23 +756,9 @@ async fn activate_creates_session() {
     )
     .unwrap();
 
-    let activate_args = ActivateArgs {
-        name: Some("test-session".to_string()),
-        path: Some(project.path().to_string_lossy().to_string()),
-        sync: Some(SyncMode::Tarball),
-        network: Some(CliNetworkMode::NoNet),
-        ingress: vec![],
-        dynamic_ingress: None,
-        dynamic_range: None,
-        egress: minimal::EgressArgs::default(),
-        credentialed_upstream: false,
-        loadout: vec![],
-        no_loadouts: false,
-        no_hooks: false,
-        no_prompt: false,
-        attach: false,
-    };
-    cmd_activate(&args, activate_args).await.unwrap();
+    start_session(&args, project.path(), "test-session", no_net())
+        .await
+        .unwrap();
 
     // Verify the session was created via TestClient.
     let mut client = daemon.server.connect().await;
@@ -769,23 +789,9 @@ async fn activate_uploads_project_files() {
     std::fs::create_dir_all(project.path().join("subdir")).unwrap();
     std::fs::write(project.path().join("subdir/nested.txt"), "nested").unwrap();
 
-    let activate_args = ActivateArgs {
-        name: Some("upload-test".to_string()),
-        path: Some(project.path().to_string_lossy().to_string()),
-        sync: Some(SyncMode::Tarball),
-        network: Some(CliNetworkMode::NoNet),
-        ingress: vec![],
-        dynamic_ingress: None,
-        dynamic_range: None,
-        egress: minimal::EgressArgs::default(),
-        credentialed_upstream: false,
-        loadout: vec![],
-        no_loadouts: false,
-        no_hooks: false,
-        no_prompt: false,
-        attach: false,
-    };
-    cmd_activate(&args, activate_args).await.unwrap();
+    start_session(&args, project.path(), "upload-test", no_net())
+        .await
+        .unwrap();
 
     // Look up the session and verify the uploaded files landed in the
     // session's workspace directory by reading them back over SFTP. The
@@ -906,8 +912,8 @@ async fn upload_workspace_files_surfaces_daemon_unpack_error() {
 
 // --- attach (smart resolution) ---
 
-/// `min session activate` with no positional path but `-C/--repo-dir` set uploads
-/// from the repo-dir directory, not the process cwd (#873).
+/// `min -C <dir> session start` uploads from the `-C/--repo-dir` directory,
+/// not the process cwd (#873).
 #[tokio::test]
 async fn activate_uses_repo_dir_when_no_positional_path() {
     let (daemon, mut global) = setup().await;
@@ -923,23 +929,18 @@ async fn activate_uses_repo_dir_when_no_positional_path() {
 
     global.repo_dir = Some(project.path().to_path_buf());
 
-    let activate_args = ActivateArgs {
-        name: Some("repo-dir-test".to_string()),
-        path: None,
-        sync: Some(SyncMode::Tarball),
-        network: Some(CliNetworkMode::NoNet),
-        ingress: vec![],
-        dynamic_ingress: None,
-        dynamic_range: None,
-        egress: minimal::EgressArgs::default(),
-        credentialed_upstream: false,
-        loadout: vec![],
-        no_loadouts: false,
-        no_hooks: false,
-        no_prompt: false,
-        attach: false,
-    };
-    cmd_activate(&global, activate_args).await.unwrap();
+    cmd_session_start(
+        &global,
+        SessionStartArgs {
+            entry: None,
+            name: Some("repo-dir-test".to_string()),
+            new: false,
+            detach: true,
+            overrides: no_net(),
+        },
+    )
+    .await
+    .unwrap();
 
     let mut client = daemon.server.connect().await;
     use minimald_rpc::ListSessions;
@@ -964,7 +965,7 @@ async fn activate_uses_repo_dir_when_no_positional_path() {
 
 // --- dynamic ingress declaration (NET-043/NET-044) ---
 
-/// NET-043: `min session create` carries the box's dynamic ingress stance
+/// NET-043: `min session start` carries the box's dynamic ingress stance
 /// into the create request's `IngressPolicy`. `--dynamic-ingress allow
 /// --dynamic-range 8000-8443` reaches the record the daemon holds as
 /// exactly that — mode and range — and the stance alone makes the ingress
@@ -994,27 +995,18 @@ async fn create_carries_dynamic_ingress() {
             "# test minimal.toml\n[stack]\nuse = \"shell\"\n",
         )
         .unwrap();
-        cmd_activate(
-            &args,
-            ActivateArgs {
-                name: Some(name.to_string()),
-                path: Some(project.path().to_string_lossy().to_string()),
-                sync: Some(SyncMode::Tarball),
-                network: Some(CliNetworkMode::OwnIp),
-                ingress: vec![],
+        let overrides = StartOverrideArgs {
+            network: Some(CliNetworkMode::OwnIp),
+            other: BoxOverrideArgs {
                 dynamic_ingress,
                 dynamic_range,
-                egress: minimal::EgressArgs::default(),
-                credentialed_upstream: false,
-                loadout: vec![],
-                no_loadouts: false,
-                no_hooks: false,
-                no_prompt: false,
-                attach: false,
+                ..BoxOverrideArgs::default()
             },
-        )
-        .await
-        .unwrap_or_else(|error| panic!("activating {name} must succeed: {error:#}"));
+            ..StartOverrideArgs::default()
+        };
+        start_session(&args, project.path(), name, overrides)
+            .await
+            .unwrap_or_else(|error| panic!("activating {name} must succeed: {error:#}"));
     }
 
     let mut client = connect_daemon(&args).await.unwrap();
@@ -1108,14 +1100,15 @@ async fn create_rejects_bad_dynamic_range() {
         (&["--dynamic-range", "8000-8443"][..], "--dynamic-ingress"),
     ] {
         let mut argv = vec![
-            "session",
-            "activate",
+            "-C",
             project_path,
+            "session",
+            "start",
+            "--detach",
             "--name",
             "bad-range",
             "--network",
             "own_ip",
-            "--no-input",
         ];
         argv.extend(extra.iter().copied());
         let out = run_min(&args, &argv).await;
@@ -1307,7 +1300,7 @@ async fn policy_shows_resolved_dynamic_ingress() {
 /// exec` then fails — and the error must name the directory the user ran
 /// from rather than the daemon-side step that broke (#581).
 ///
-/// Driven through the compiled binary, not `cmd_activate`: the contract
+/// Driven through the compiled binary, not `cmd_session_start`: the contract
 /// under test is what reaches the process's stdout. The composition is
 /// broken by a project var inheriting a name no environment defines — the
 /// daemon routes it back for gating and resolving it fails, which is the
@@ -1323,7 +1316,7 @@ async fn activate_prints_no_session_id_when_composition_fails() {
     std::fs::create_dir(project.path().join(".git")).unwrap();
     std::fs::write(
         project.path().join("minimal.toml"),
-        "[session.vars]\nMIN_UNRESOLVABLE_INHERIT_581 = { inherit = true }\n",
+        "[defaults.session.env_vars]\nMIN_UNRESOLVABLE_INHERIT_581 = { inherit = true }\n",
     )
     .unwrap();
     let project_canon = project.path().canonicalize().unwrap();
@@ -1336,10 +1329,9 @@ async fn activate_prints_no_session_id_when_composition_fails() {
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .arg("--no-input")
-        .args(["session", "activate"])
-        .arg(&project_canon)
-        .args(["--name", "composition-failure", "--sync", "tarball"])
-        .arg("--no-prompt")
+        .args(["-C".as_ref(), project_canon.as_os_str()])
+        .args(["session", "start", "--detach"])
+        .args(["--name", "composition-failure"])
         .output()
         .await
         .expect("the min binary should be invocable");
@@ -1392,10 +1384,9 @@ async fn refused_activation(verdict: minimald::server::UsernsRestriction) -> Str
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .arg("--no-input")
-        .args(["session", "activate"])
-        .arg(&project_canon)
-        .args(["--name", "refused-sandbox", "--sync", "tarball"])
-        .arg("--no-prompt")
+        .args(["-C".as_ref(), project_canon.as_os_str()])
+        .args(["session", "start", "--detach"])
+        .args(["--name", "refused-sandbox"])
         .output()
         .await
         .expect("the min binary should be invocable");
@@ -1470,7 +1461,8 @@ async fn activate_refusal_names_finalize_install_for_apparmor_restriction() {
              unprivileged user namespaces), so no box can start here yet.\n\
              Finish the install to allow it for Minimal only: min finalize-install   \
              (see what it changes first: min finalize-install --show). The profile takes \
-             effect when the daemon next starts: run min stop, then your command again.\n\
+             effect when the daemon next starts: run min host stop <host>, then your command \
+             again.\n\
              A daemon built from source is not covered: attach the profile to this binary \
              instead, from a checkout: sudo scripts/install-apparmor-profile.sh --path {bin}, \
              then the same restart."
@@ -1539,8 +1531,8 @@ async fn refused_task_run(verdict: minimald::server::UsernsRestriction) -> Strin
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .arg("--no-input")
+        .args(["-C".as_ref(), project_canon.as_os_str()])
         .args(["task", "run", "e2e-echo"])
-        .args(["--path".as_ref(), project_canon.as_os_str()])
         .output()
         .await
         .expect("the min binary should be invocable");
@@ -1597,7 +1589,7 @@ async fn task_run_prints_the_user_namespace_refusal_verbatim() {
              unprivileged user namespaces), so no box can start here yet.\n\
              Finish the install to allow it for Minimal only: min finalize-install   (see what \
              it changes first: min finalize-install --show). The profile takes effect when the \
-             daemon next starts: run min stop, then your command again.\n\
+             daemon next starts: run min host stop <host>, then your command again.\n\
              A daemon built from source is not covered: attach the profile to this binary \
              instead, from a checkout: sudo scripts/install-apparmor-profile.sh --path {bin}, \
              then the same restart."
@@ -1660,205 +1652,75 @@ async fn loadout_list_warning_goes_to_stderr_not_stdout() {
     );
 }
 
-// --- destroy ---
+// --- box rm (BCLI-042 removed `min session destroy`) ---
 
 #[tokio::test]
-async fn destroy_removes_session() {
+async fn box_rm_removes_session() {
     let (daemon, mut args) = setup().await;
-    // Pin the gate headless. It reads `no_input || !stdin.is_terminal()`, and
-    // stdin here is whatever the runner handed us: `/dev/null` under nextest
-    // and CI, but a live terminal under a bare `cargo test` — where the gate
-    // would prompt and the test would sit waiting for a keystroke instead.
+    // Pin the prompt headless: stdin here is whatever the runner handed us.
     args.no_input = true;
-
-    // Create a session via TestClient.
     let session_id = create_session(&daemon, "doomed").await;
 
-    // The session has no running host, so its at-risk state is unknowable,
-    // and the gate is headless, so the destroy must refuse without --force,
-    // naming the escape hatch.
-    let err = cmd_destroy(
-        &args,
-        DestroyArgs {
-            session: Some(session_id.to_string()),
-            all: false,
-            force: false,
-        },
-    )
-    .await
-    .unwrap_err()
-    .to_string();
-    assert!(err.contains("--force"), "refusal must name --force: {err}");
+    // --force removes the box, by id.
+    let target = session_id.to_string();
+    let out = run_min(&args, &["box", "rm", "--force", &target]).await;
+    assert!(
+        out.status.success(),
+        "min box rm --force: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
-    // The refusal must leave the session untouched.
     let mut client = daemon.server.connect().await;
     use minimald_rpc::ListSessions;
     let resp = client.call::<ListSessions>(&()).await;
-    assert_eq!(resp.sessions.len(), 1, "refusal must not destroy anything");
-
-    // --force skips the gate and destroys it.
-    cmd_destroy(
-        &args,
-        DestroyArgs {
-            session: Some(session_id.to_string()),
-            all: false,
-            force: true,
-        },
-    )
-    .await
-    .unwrap();
-
-    // Verify the session is gone.
-    let resp = client.call::<ListSessions>(&()).await;
-    assert!(resp.sessions.is_empty());
+    assert!(resp.sessions.is_empty(), "the box is gone");
 }
 
 #[tokio::test]
-async fn destroy_by_name() {
+async fn box_rm_by_name() {
     let (daemon, mut args) = setup().await;
-    // Headless by construction, not by whatever stdin the runner gave us —
-    // see `destroy_removes_session`.
     args.no_input = true;
     let _ = create_session(&daemon, "by-name").await;
 
-    // Name resolution precedes the gate: the headless refusal (unknowable
-    // at-risk state, no input) proves the name resolved...
-    let err = cmd_destroy(
-        &args,
-        DestroyArgs {
-            session: Some("by-name".to_string()),
-            all: false,
-            force: false,
-        },
-    )
-    .await
-    .unwrap_err()
-    .to_string();
-    assert!(err.contains("--force"), "refusal must name --force: {err}");
-
-    // ...and --force destroys by name.
-    cmd_destroy(
-        &args,
-        DestroyArgs {
-            session: Some("by-name".to_string()),
-            all: false,
-            force: true,
-        },
-    )
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn destroy_unknown_session_fails() {
-    let (_daemon, args) = setup().await;
-    let result = cmd_destroy(
-        &args,
-        DestroyArgs {
-            session: Some("nonexistent".to_string()),
-            all: false,
-            force: false,
-        },
-    )
-    .await;
-    assert!(result.is_err());
-}
-
-#[tokio::test]
-async fn destroy_all_removes_every_session() {
-    let (daemon, args) = setup().await;
-    let _ = create_session(&daemon, "first").await;
-    let _ = create_session(&daemon, "second").await;
-
-    cmd_destroy(
-        &args,
-        DestroyArgs {
-            session: None,
-            all: true,
-            force: true,
-        },
-    )
-    .await
-    .unwrap();
+    let out = run_min(&args, &["box", "rm", "--force", "by-name"]).await;
+    assert!(
+        out.status.success(),
+        "min box rm --force: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let mut client = daemon.server.connect().await;
     use minimald_rpc::ListSessions;
     let resp = client.call::<ListSessions>(&()).await;
-    assert!(resp.sessions.is_empty());
+    assert!(resp.sessions.is_empty(), "the box is gone");
 }
 
 #[tokio::test]
-async fn destroy_all_succeeds_when_there_are_no_sessions() {
+async fn box_rm_unknown_box_fails() {
     let (_daemon, args) = setup().await;
-
-    cmd_destroy(
-        &args,
-        DestroyArgs {
-            session: None,
-            all: true,
-            force: true,
-        },
-    )
-    .await
-    .unwrap();
+    let out = run_min(&args, &["box", "rm", "nonexistent"]).await;
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "a box that is not there exits 4: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
-// --- stop ---
+// --- box rename (BCLI-042 removed `min session rename`) ---
 
 #[tokio::test]
-async fn stop_succeeds_when_no_sessions() {
-    let (_daemon, args) = setup().await;
-    cmd_stop(&args, StopArgs { force: false }).await.unwrap();
-}
-
-#[tokio::test]
-async fn stop_succeeds_with_idle_session() {
-    let (daemon, args) = setup().await;
-    let session_id = create_session(&daemon, "idle").await;
-    daemon.server.bring_session_up(session_id).await;
-
-    // An idle session (actor up, but no shell hosted and no create flow in
-    // flight) does not block an unforced stop; its record survives for the
-    // next daemon start.
-    cmd_stop(&args, StopArgs { force: false }).await.unwrap();
-}
-
-#[tokio::test]
-async fn stop_refuses_with_pending_session() {
-    let (daemon, args) = setup().await;
-    // A Pending session (mid create flow, awaiting the client's verdict) is
-    // busy: an unforced stop must refuse rather than strand the flow.
-    let _id = create_pending_session(&daemon, "mid-create").await;
-
-    let result = cmd_stop(&args, StopArgs { force: false }).await;
-    assert!(result.is_err());
-}
-
-#[tokio::test]
-async fn stop_force_succeeds_with_live_session() {
-    let (daemon, args) = setup().await;
-    let session_id = create_session(&daemon, "active").await;
-    daemon.server.bring_session_up(session_id).await;
-
-    cmd_stop(&args, StopArgs { force: true }).await.unwrap();
-}
-
-// --- rename ---
-
-#[tokio::test]
-async fn rename_session() {
+async fn box_rename_session() {
     let (daemon, args) = setup().await;
     let session_id = create_session(&daemon, "old-name").await;
 
-    cmd_rename(
-        &args,
-        RenameArgs {
-            session: session_id.to_string(),
-            new_name: "new-name".to_string(),
-        },
-    )
-    .await
-    .unwrap();
+    let target = session_id.to_string();
+    let out = run_min(&args, &["box", "rename", &target, "new-name"]).await;
+    assert!(
+        out.status.success(),
+        "min box rename: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // Verify the rename via TestClient.
     let mut client = daemon.server.connect().await;
@@ -1870,53 +1732,37 @@ async fn rename_session() {
 }
 
 #[tokio::test]
-async fn rename_by_name() {
+async fn box_rename_by_name() {
     let (daemon, args) = setup().await;
-    let _ = create_session(&daemon, "before").await;
+    let session_id = create_session(&daemon, "before").await;
 
-    cmd_rename(
-        &args,
-        RenameArgs {
-            session: "before".to_string(),
-            new_name: "after".to_string(),
-        },
-    )
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn rename_to_self_is_an_error() {
-    let (daemon, args) = setup().await;
-    let session_id = create_session(&daemon, "same-name").await;
-
-    let err = cmd_rename(
-        &args,
-        RenameArgs {
-            session: session_id.to_string(),
-            new_name: "same-name".to_string(),
-        },
-    )
-    .await
-    .unwrap_err();
-
+    let out = run_min(&args, &["box", "rename", "before", "after"]).await;
     assert!(
-        err.to_string().contains("session is already named"),
-        "expected a rename-to-self error, got: {err}"
+        out.status.success(),
+        "min box rename: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
+
+    let mut client = daemon.server.connect().await;
+    use minimald_rpc::{GetSessionRecord, GetSessionRecordRequest};
+    let resp = client
+        .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(session_id))
+        .await;
+    assert_eq!(resp.record.unwrap().name.as_deref(), Some("after"));
 }
 
-// --- session policy ---
+// --- box show --network (BCLI-042 removed `min session policy`) ---
 
 #[tokio::test]
-async fn session_policy_succeeds() {
+async fn box_show_network_succeeds() {
     let (daemon, args) = setup().await;
     let session_id = create_session(&daemon, "policy-test").await;
 
-    cmd_session_policy(
+    cmd_box_show(
         &args,
-        PolicyArgs {
-            session: session_id.to_string(),
+        BoxShowArgs {
+            target: session_id.to_string(),
+            network: true,
             output: None,
         },
     )
@@ -2156,44 +2002,28 @@ fn policy_json_distinguishes_unavailable_live_rows_from_none_published() {
     );
 }
 
-/// A `-o json` run that fails answers with the mode's error contract, not a
-/// plain-text line: the failure crosses to `main` as the typed
-/// `MachineModeFailure` — the generic payload every `-o json` command fails
-/// into, which `main`'s machine-mode error emitter (keyed on the output
-/// mode, shared by every command that takes `-o json`) writes as the one
-/// `min/v1/error` object on stderr, its one-object shape pinned by `main`'s
-/// own unit test. A missing session carries the architecture's `not_found`
-/// code — never a policy-specific spelling — with the kind of thing that
-/// was missing, a session, in the message and the hint.
+/// `min box show <box> --network -o json` of a box that is not there
+/// fails with the address refusal, which `main` ends with exit 4.
 #[tokio::test]
-async fn policy_json_failure_answers_with_the_error_contract() {
+async fn box_show_network_json_of_a_missing_box_is_refused() {
     let (_daemon, args) = setup().await;
-    let err = cmd_session_policy(
+    let err = cmd_box_show(
         &args,
-        PolicyArgs {
-            session: "no-such-session".to_string(),
-            output: Some(PolicyOutputFormat::Json),
+        BoxShowArgs {
+            target: "no-such-box".to_string(),
+            network: true,
+            output: Some(BoxShowOutputFormat::Json),
         },
     )
     .await
     .unwrap_err();
-    let failure = err
-        .downcast_ref::<MachineModeFailure>()
-        .expect("the failure crosses as the payload the emitter writes, not a message");
-    assert_eq!(
-        failure.code(),
-        "not_found",
-        "a missing session is the architecture's not-found code: {err:#}"
+    assert!(
+        err.downcast_ref::<BoxAddressRefusal>().is_some(),
+        "a box that is not there is the address refusal: {err:#}"
     );
     assert!(
-        failure.message().contains("session"),
-        "the message names the kind of thing that was missing: {}",
-        failure.message()
-    );
-    assert!(
-        failure.hint().contains("session"),
-        "the hint names the kind of thing that was missing: {}",
-        failure.hint()
+        err.to_string().contains("no-such-box"),
+        "the refusal names the box: {err}"
     );
 }
 
@@ -2543,7 +2373,7 @@ async fn policy_shows_deny_all_default() {
 async fn deny_all_egress_flag_declares_every_allow_list_empty() {
     let (_daemon, args) = setup().await;
 
-    // The project dir ritual every `cmd_activate` test carries: a minimal.toml
+    // The project dir ritual every session start test carries: a minimal.toml
     // so the missing-mfile prompt doesn't fire, a `.git` root so the non-VCS
     // upload confirmation short-circuits.
     let project = tempfile::TempDir::new().unwrap();
@@ -2554,26 +2384,17 @@ async fn deny_all_egress_flag_declares_every_allow_list_empty() {
     )
     .unwrap();
 
-    cmd_activate(
+    start_session(
         &args,
-        ActivateArgs {
-            name: Some("flag-declared-deny-all".to_string()),
-            path: Some(project.path().to_string_lossy().to_string()),
-            sync: Some(SyncMode::Tarball),
+        project.path(),
+        "flag-declared-deny-all",
+        StartOverrideArgs {
             network: Some(CliNetworkMode::HostNet),
-            ingress: vec![],
-            dynamic_ingress: None,
-            dynamic_range: None,
             egress: minimal::EgressArgs {
                 deny_all_egress: true,
                 ..minimal::EgressArgs::default()
             },
-            credentialed_upstream: false,
-            loadout: vec![],
-            no_loadouts: false,
-            no_hooks: false,
-            no_prompt: true,
-            attach: false,
+            ..StartOverrideArgs::default()
         },
     )
     .await
@@ -2646,20 +2467,13 @@ async fn empty_egress_flag_value_is_a_validation_error() {
         "# test minimal.toml\n[stack]\nuse = \"shell\"\n",
     )
     .unwrap();
-    let project_path = project.path().to_string_lossy().to_string();
 
     let activate_args = |allow_subnets: Vec<String>,
                          allow_dns_hosts: Vec<String>,
                          allow_protocols: Vec<String>,
                          deny_subnets: Vec<String>| {
-        ActivateArgs {
-            name: Some("empty-egress-value".to_string()),
-            path: Some(project_path.clone()),
-            sync: Some(SyncMode::Tarball),
+        StartOverrideArgs {
             network: Some(CliNetworkMode::HostNet),
-            ingress: vec![],
-            dynamic_ingress: None,
-            dynamic_range: None,
             egress: minimal::EgressArgs {
                 allow_subnets,
                 allow_dns_hosts,
@@ -2667,19 +2481,16 @@ async fn empty_egress_flag_value_is_a_validation_error() {
                 deny_subnets,
                 deny_all_egress: false,
             },
-            credentialed_upstream: false,
-            loadout: vec![],
-            no_loadouts: false,
-            no_hooks: false,
-            no_prompt: true,
-            attach: false,
+            ..StartOverrideArgs::default()
         }
     };
 
     // `--allow-subnets ""`: an invalid CIDR, named by the daemon's typed
     // validation rather than dropped into an empty allow list.
-    let err = cmd_activate(
+    let err = start_session(
         &args,
+        project.path(),
+        "empty-egress-value",
         activate_args(vec![String::new()], vec![], vec![], vec![]),
     )
     .await
@@ -2695,8 +2506,10 @@ async fn empty_egress_flag_value_is_a_validation_error() {
     );
 
     // `--deny-subnets ""`: the same check on the denied dimension.
-    let err = cmd_activate(
+    let err = start_session(
         &args,
+        project.path(),
+        "empty-egress-value",
         activate_args(vec![], vec![], vec![], vec![String::new()]),
     )
     .await
@@ -2713,8 +2526,10 @@ async fn empty_egress_flag_value_is_a_validation_error() {
 
     // `--allow-protocols ""`: refused by the CLI's own parser, before any
     // declaration is built.
-    let err = cmd_activate(
+    let err = start_session(
         &args,
+        project.path(),
+        "empty-egress-value",
         activate_args(vec![], vec![], vec![String::new()], vec![]),
     )
     .await
@@ -2727,8 +2542,10 @@ async fn empty_egress_flag_value_is_a_validation_error() {
 
     // `--allow-dns-hosts ""`: not a DNS hostname, so the daemon's typed
     // validation names the entry rather than dropping it into an empty list.
-    let err = cmd_activate(
+    let err = start_session(
         &args,
+        project.path(),
+        "empty-egress-value",
         activate_args(vec![], vec![String::new()], vec![], vec![]),
     )
     .await
@@ -3193,14 +3010,13 @@ async fn deny_all_in_force_note_printed() {
     .unwrap();
     let activate = |name: &'static str, extra: &'static [&'static str]| {
         let mut argv = vec![
-            "session",
-            "activate",
+            "-C",
             project.path().to_str().unwrap(),
+            "session",
+            "start",
+            "--detach",
             "--name",
             name,
-            "--sync",
-            "tarball",
-            "--no-prompt",
         ];
         argv.extend_from_slice(extra);
         argv
@@ -3322,30 +3138,6 @@ async fn setup_opted_out() -> (
 }
 
 // --- session hooks ---
-
-/// `min session hooks` names the session it could not find, like every other
-/// session command: the error is `No session found matching '<name>'` rather
-/// than the daemon's bare `no session found`.
-#[tokio::test]
-async fn session_hooks_missing_session_names_the_lookup() {
-    let (_daemon, args) = setup().await;
-
-    let err = cmd_session_hooks(
-        &args,
-        HooksArgs {
-            session: "nosuch".to_string(),
-            json: false,
-        },
-    )
-    .await
-    .unwrap_err();
-
-    assert_eq!(
-        err.to_string(),
-        "No session found matching 'nosuch'",
-        "a missing session must be named in the error"
-    );
-}
 
 // --- hostname routing warning (NET-020/NET-021/NET-022) ---
 //
@@ -3479,14 +3271,13 @@ async fn listener_failure_reported_with_remedy() {
     let activate_stderr = run_min_stderr(
         &args,
         &[
-            "session",
-            "activate",
+            "-C",
             project.path().to_str().unwrap(),
+            "session",
+            "start",
+            "--detach",
             "--name",
             "remedy-report",
-            "--sync",
-            "tarball",
-            "--no-prompt",
         ],
     )
     .await;
@@ -3754,14 +3545,13 @@ async fn activate_and_ls_report_native_surface() {
     let activate_stderr = run_min_stderr(
         &args,
         &[
-            "session",
-            "activate",
+            "-C",
             project.path().to_str().unwrap(),
+            "session",
+            "start",
+            "--detach",
             "--name",
             "native-surface",
-            "--sync",
-            "tarball",
-            "--no-prompt",
         ],
     )
     .await;
@@ -4569,41 +4359,6 @@ fn session_list_decodes_without_mtls_field() {
 
 // --- helpers ---
 
-/// Creates a session whose workspace mfile declares a `[session.vars]`
-/// entry, which the daemon must route back to the client for gating — so
-/// configuring its loadout returns `Pending` and the session actor parks in
-/// its Draft state awaiting a verdict. Returns its ID.
-async fn create_pending_session(daemon: &common::TestDaemon, name: &str) -> SessionId {
-    let mut client = daemon.server.connect().await;
-    let project_path =
-        camino::Utf8PathBuf::from_path_buf(std::env::current_dir().unwrap()).unwrap();
-    use minimald_rpc::{
-        ConfigureLoadout, ConfigureLoadoutRequest, ConfigureLoadoutResponse, CreateSession,
-        CreateSessionRequest,
-    };
-    let request = CreateSessionRequest::new(
-        name,
-        paths::HostAbsPath::try_new(project_path).unwrap(),
-        boxes::NetworkMode::NoNet,
-        Default::default(),
-    );
-    let id = client.call::<CreateSession>(&request).await.unwrap().id;
-    daemon
-        .server
-        .seed_workspace_mfile(id, "[session.vars]\nRUST_LOG = \"info\"\n")
-        .await;
-    let resp = client
-        .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
-            session_id: id,
-            contribution: Default::default(),
-        })
-        .await;
-    match resp {
-        minimald_rpc::Errorable::Ok(ConfigureLoadoutResponse::Pending { .. }) => id,
-        other => panic!("expected a Pending loadout, got {other:?}"),
-    }
-}
-
 async fn create_session(daemon: &common::TestDaemon, name: &str) -> SessionId {
     let project_path =
         camino::Utf8PathBuf::from_path_buf(std::env::current_dir().unwrap()).unwrap();
@@ -4646,8 +4401,8 @@ async fn create_session_with(
     };
     let request = CreateSessionRequest::new(name, project_path, network, policy);
     let id = match client.call::<CreateSession>(&request).await {
-        minimald_rpc::Errorable::Ok(r) => r.id,
-        minimald_rpc::Errorable::Err { error } => {
+        minimald_rpc::CreateSessionReply::Ok(r) => r.id,
+        minimald_rpc::CreateSessionReply::Err { error, .. } => {
             panic!("CreateSession failed: {error}")
         }
     };
@@ -4882,7 +4637,7 @@ async fn net_forward_survives_a_refused_box_port() {
     echo.abort();
 }
 
-/// The forward closes with its session (NET-105): once `min session destroy`
+/// The forward closes with its session (NET-105): once `min box rm --force`
 /// takes the session down, the forward's future ends on its own — the
 /// listener goes with it rather than outliving the session it forwards for.
 #[tokio::test]
@@ -4918,16 +4673,12 @@ async fn net_forward_closes_with_session() {
     assert_eq!(echoed, *b"ping");
     drop(conn);
 
-    cmd_destroy(
-        &args,
-        DestroyArgs {
-            session: Some("web".to_string()),
-            all: false,
-            force: true,
-        },
-    )
-    .await
-    .unwrap();
+    let out = run_min(&args, &["box", "rm", "--force", "web"]).await;
+    assert!(
+        out.status.success(),
+        "min box rm --force: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     tokio::time::timeout(std::time::Duration::from_secs(5), forward)
         .await
@@ -5166,9 +4917,9 @@ async fn activate_own_ip_on_vm_host<G>(
         .args(["--minimal-dir".as_ref(), state.path().as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .args(["--provider", "local-minvmd", "--no-input"])
-        .args(["session", "activate"])
-        .arg(project.path())
-        .args(["--name", "web", "--network", "own_ip", "--no-prompt"])
+        .args(["-C".as_ref(), project.path().as_os_str()])
+        .args(["session", "start", "--detach"])
+        .args(["--name", "web", "--network", "own_ip"])
         .output()
         .await
         .expect("the min binary should be invocable")

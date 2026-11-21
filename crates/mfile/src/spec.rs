@@ -112,7 +112,7 @@ pub struct BoxSpec {
     /// no field above types, such as `io.exec_enabled` or
     /// `network.dynamic_ingress`. Each value is kept as it was written,
     /// by its dotted path, and a section with no typed keys, such as
-    /// `nesting`, is kept whole. A newer client can store such a key, and
+    /// `nesting` or `secrets`, is kept whole. A newer client can store such a key, and
     /// the box still resumes from its stored spec.
     pub kept_keys: std::collections::BTreeMap<String, StoredExport>,
 }
@@ -594,6 +594,11 @@ struct SpecDoc {
     /// The `[nesting]` section, kept whole. Absent when the spec sets none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     nesting: Option<StoredExport>,
+    /// The `[secrets]` section of the expanded spec, kept whole, with the
+    /// `upstream` and `inject` the client's store rules wrote (BOX-071).
+    /// Absent when the spec sets none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    secrets: Option<StoredExport>,
 }
 
 /// Declares the fields of a `Doc*` table that keep a schema key as it was
@@ -901,6 +906,7 @@ impl From<BoxSpec> for SpecDoc {
             lifecycle_hooks: spec.lifecycle_hooks,
             file_exports: spec.file_exports,
             nesting: kept.remove("nesting"),
+            secrets: kept.remove("secrets"),
         }
     }
 }
@@ -917,6 +923,9 @@ impl From<SpecDoc> for BoxSpec {
         doc.network.put_kept(&mut kept);
         if let Some(nesting) = doc.nesting {
             kept.insert("nesting".to_owned(), nesting);
+        }
+        if let Some(secrets) = doc.secrets {
+            kept.insert("secrets".to_owned(), secrets);
         }
         let hooks_on_resume = doc.execution.as_ref().is_some_and(|e| e.hooks_on_resume);
         let timeout = doc.execution.as_ref().and_then(|e| e.timeout);

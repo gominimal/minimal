@@ -191,34 +191,39 @@ fn shows_native_boxes_notice(command: Option<&Command>) -> bool {
     needs_provider(command)
         && !matches!(
             command,
-            Some(
-                Command::Proxy(_)
-                    | Command::CompleteSessionStr(_)
-                    | Command::Spin(_)
-                    | Command::DebugAnswererCommand
-            )
+            Some(Command::Proxy(_) | Command::CompleteSessionStr(_))
         )
+        && !is_debug_helper(command)
+}
+
+/// Whether `command` is one of the helpers only a debug build has: the
+/// spinner demo and the answerer-command probe. A release build has neither
+/// variant, so the match is compiled only where they exist.
+#[cfg(debug_assertions)]
+fn is_debug_helper(command: Option<&Command>) -> bool {
+    matches!(
+        command,
+        Some(Command::Spin(_) | Command::DebugAnswererCommand)
+    )
+}
+
+/// A release build has no debug helper to match.
+#[cfg(not(debug_assertions))]
+fn is_debug_helper(_command: Option<&Command>) -> bool {
+    false
 }
 
 /// The verb a run dispatches, as the user typed it (`box show`,
-/// `session policy`), for the root span's `verb` field.
+/// `session list`), for the root span's `verb` field.
 fn command_verb(command: Option<&Command>) -> &'static str {
     match command {
         None => "min",
         Some(Command::Ls(_)) => "ls",
-        Some(Command::Stop(_)) => "stop",
         Some(Command::Session(SessionArgs { command })) => match command {
             SessionCommand::List(_) => "session list",
-            SessionCommand::Activate(_) => "session activate",
             SessionCommand::Start(_) => "session start",
             SessionCommand::Attach(_) => "session attach",
-            SessionCommand::Exec(_) => "session exec",
-            SessionCommand::Run(_) => "session run",
-            SessionCommand::Destroy(_) => "session destroy",
-            SessionCommand::Rename(_) => "session rename",
-            SessionCommand::Policy(_) => "session policy",
             SessionCommand::SetupZed(_) => "session setup-zed",
-            SessionCommand::Hooks(_) => "session hooks",
             SessionCommand::Logs(_) => "session logs",
             SessionCommand::Stop(_) => "session stop",
             SessionCommand::Rm(_) => "session rm",
@@ -485,22 +490,14 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         // `cmd_bare`.
         None => cmd_bare(&cli.global_args).await,
         Some(Command::Ls(args)) => cmd_ls(&cli.global_args, args).await,
-        Some(Command::Stop(args)) => cmd_stop(&cli.global_args, args).await,
         Some(Command::Session(SessionArgs { command })) => match command {
             SessionCommand::List(args) => {
                 let session = boxes::SESSION_BOX_TYPE;
                 cmd_typed_box_list(&cli.global_args, args, session, "session list").await
             }
-            SessionCommand::Activate(args) => cmd_activate(&cli.global_args, args).await,
             SessionCommand::Start(args) => cmd_session_start(&cli.global_args, args).await,
             SessionCommand::Attach(args) => cmd_attach(&cli.global_args, args).await,
-            SessionCommand::Exec(args) => cmd_exec(&cli.global_args, args).await,
-            SessionCommand::Run(args) => cmd_session_run(&cli.global_args, args).await,
-            SessionCommand::Destroy(args) => cmd_destroy(&cli.global_args, args).await,
-            SessionCommand::Rename(args) => cmd_rename(&cli.global_args, args).await,
-            SessionCommand::Policy(args) => cmd_session_policy(&cli.global_args, args).await,
             SessionCommand::SetupZed(args) => cmd_session_setup_zed(&cli.global_args, args).await,
-            SessionCommand::Hooks(args) => cmd_session_hooks(&cli.global_args, args).await,
             SessionCommand::Logs(args) => {
                 let session = Some(boxes::SESSION_BOX_TYPE);
                 cmd_box_logs(&cli.global_args, args, session, "session logs").await
@@ -720,35 +717,11 @@ impl From<SessionLookup> for minimald_rpc::GetSessionPolicyRequest {
     }
 }
 
-impl From<SessionLookup> for minimald_rpc::GetSessionHooksRequest {
-    fn from(l: SessionLookup) -> Self {
-        match l {
-            SessionLookup::Id(id) => Self::Id(id),
-            SessionLookup::Name(n) => Self::Name(n),
-        }
-    }
-}
-
-/// Resolve a session by UUID, unique id prefix, or session name, returning
-/// its record.
+/// Resolve a session by UUID, unique id prefix, or session name, for the
+/// paths that must refuse a version-skewed daemon: the lookup, with the
+/// build it reports asserted before the record is used for anything.
 ///
-/// Used by commands that need the full record before proceeding (destroy,
-/// rename). If the string parses as a UUID, the session
-/// is looked up by ID; otherwise by name, then by unique id prefix (see
-/// [`get_session_record`]). Bails if no session matches.
-pub(crate) async fn resolve_session(
-    client: &mut client::Client,
-    session: &str,
-) -> Result<boxes::Record, anyhow::Error> {
-    let resp = get_session_record(client, session).await?;
-    named_record(resp.record, session)
-}
-
-/// [`resolve_session`] for the paths that must refuse a version-skewed daemon:
-/// the same lookup, with the build it reports asserted before the record is
-/// used for anything.
-///
-/// The lookup is the first RPC `min session attach`, `min session exec`, and
+/// The lookup is the first RPC `min session attach` and
 /// `min session setup-zed` make, so the gate rides on
 /// its reply rather than on a `GetVersion` sent ahead of it — an activation
 /// must not pay a round trip for a check the calls it already makes can carry
@@ -763,7 +736,7 @@ pub(crate) async fn resolve_session_version_gated(
     named_record(resp.record, session)
 }
 
-/// The `GetSessionRecord` round trip both resolvers share.
+/// The `GetSessionRecord` round trip the resolvers share.
 ///
 /// A name lookup that finds no record falls back to matching `session` as an
 /// id prefix (see [`match_id_prefix`]), so the short id `min ls` prints
@@ -1020,41 +993,6 @@ fn several_vms(global: &GlobalArgs) -> bool {
         .is_ok_and(|vms| vms.len() > 1)
 }
 
-/// Resolve `name` to its record and a client connected to the VM that owns
-/// it, for the commands that act on a named box over the daemon's RPCs
-/// rather than an ssh hand-off: `min session policy` and `min session
-/// destroy` (NET-058). The selected VM's `client` is asked first. A hit
-/// there is refused when another VM also holds the name
-/// ([`ensure_selected_holds_box_alone`]). When its daemon does not know the
-/// name, [`resolve_box_on_another_vm`] finds the
-/// owning VM, and the client returned is connected to that VM's socket.
-/// `example` is the command the user ran, for the not-found refusal.
-pub(crate) async fn resolve_box_on_any_vm(
-    global: &GlobalArgs,
-    mut client: client::Client,
-    name: &str,
-    example: &str,
-) -> Result<(client::Client, boxes::Record), anyhow::Error> {
-    match resolve_session(&mut client, name).await {
-        Ok(record) => {
-            ensure_selected_holds_box_alone(global, name, &record).await?;
-            Ok((client, record))
-        }
-        Err(selected) => {
-            let resolved = resolve_box_on_another_vm(global, name, example, selected).await?;
-            let mut client = client::Client::connect(&resolved.sock)
-                .await
-                .with_context(|| {
-                    format!("Failed to connect to the daemon of VM {}", resolved.vm)
-                })?;
-            // Gated as `connect_daemon` gates the selected VM: a destroy is
-            // a mutation, and this is the connection it runs over.
-            ensure_version_match(&mut client).await?;
-            Ok((client, resolved.record))
-        }
-    }
-}
-
 /// `ListSessions` with the daemon's build asserted off the same reply, for the
 /// paths that go on to attach or activate. See
 /// [`resolve_session_version_gated`] for why the gate rides here rather than on
@@ -1259,13 +1197,13 @@ pub(crate) async fn send_abort(client: &mut client::Client, session_id: boxes::S
         Ok(minimald_rpc::Errorable::Err { error }) => {
             eprintln!(
                 "warning: could not cancel the unfinished session {session_id}: {error}; \
-                 run `min session destroy {session_id}` to remove it"
+                 run `min box rm --force {session_id}` to remove it"
             );
         }
         Err(e) => {
             eprintln!(
                 "warning: could not cancel the unfinished session {session_id}: {e}; \
-                 run `min session destroy {session_id}` to remove it"
+                 run `min box rm --force {session_id}` to remove it"
             );
         }
     }
@@ -1282,7 +1220,7 @@ pub(crate) async fn send_abort(client: &mut client::Client, session_id: boxes::S
 /// a VM whose bridge accepted but whose guest never answered) can
 /// make the RPC hang indefinitely, which would swallow the
 /// operator-visible primary error we're supposed to be racing
-/// back to `cmd_activate`.
+/// back to `activate_box`.
 ///
 /// With `only_if_unfinalized` (the cleanup after an activation the client
 /// gave up on) the daemon keeps a session that finished after all
@@ -1311,20 +1249,20 @@ pub(crate) async fn best_effort_destroy(
         Ok(Ok(minimald_rpc::Errorable::Err { error })) => {
             eprintln!(
                 "warning: could not remove the unfinished session {session_id}: {error}; \
-                 run `min session destroy {session_id}` to remove it"
+                 run `min box rm --force {session_id}` to remove it"
             );
         }
         Ok(Err(e)) => {
             eprintln!(
                 "warning: could not remove the unfinished session {session_id}: {e}; \
-                 run `min session destroy {session_id}` to remove it"
+                 run `min box rm --force {session_id}` to remove it"
             );
         }
         Err(_) => {
             eprintln!(
                 "warning: could not remove the unfinished session {session_id}: the \
                  daemon did not answer within {DESTROY_TIMEOUT:?}; the session may \
-                 still exist; run `min session destroy {session_id}` to remove it",
+                 still exist; run `min box rm --force {session_id}` to remove it",
             );
         }
     }
@@ -1418,14 +1356,14 @@ async fn cleanup_after_failed_finalize(
         Some(Ok(minimald_rpc::Errorable::Err { error })) => {
             eprintln!(
                 "warning: could not remove the unfinished session {session_id}: {error}; \
-                 check `min ls`, and run `min session destroy {session_id}` to remove it"
+                 check `min ls`, and run `min box rm --force {session_id}` to remove it"
             );
             CleanupOutcome::Unknown
         }
         Some(Err(e)) => {
             eprintln!(
                 "warning: could not remove the unfinished session {session_id}: {e}; \
-                 check `min ls`, and run `min session destroy {session_id}` to remove it"
+                 check `min ls`, and run `min box rm --force {session_id}` to remove it"
             );
             CleanupOutcome::Unknown
         }
@@ -1433,7 +1371,7 @@ async fn cleanup_after_failed_finalize(
             eprintln!(
                 "warning: stopped waiting for session {session_id}; the daemon is still \
                  finishing or removing it. `min ls` shows which once it is done, and `min \
-                 session destroy {session_id}` removes it if it is still there"
+                 box rm --force {session_id}` removes it if it is still there"
             );
             CleanupOutcome::Unknown
         }

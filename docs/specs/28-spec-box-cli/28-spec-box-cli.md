@@ -139,6 +139,9 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     <!-- event-driven; the architecture's `min box wait` paragraph: many clients, and a parent through `--parent`, can wait on one box, so a wait that ends it competes with the others; a script that must stop the box stops it by its id on the `wait_timeout` error -->
     tier:   T0
     verify: cargo nextest run -p minimal box_wait_timeout_flag_leaves_box_unchanged
+  - WHEN `min box wait <box> -o json` sees the box end THE SYSTEM SHALL write one `min/v1/wait` object to stdout. For each box it waited on, the object SHALL give the box's id and name, the `state`, `reason`, `exit_code` and `signal` its record keeps, and the `code` the wait returns for it. Without `-o`, the wait SHALL write nothing to stdout.
+    tier:   T0
+    verify: cargo nextest run -p minimal box_wait_json_lists_how_the_box_ended
 
 - **BCLI-014** IF a box ends with `exited.reason = "timeout"` THEN THE SYSTEM SHALL emit a machine-mode error with `code = "timeout"` and return 124 from `min task run`, `min box run` and `min box wait`.
   <!-- the CLI half; the timeout reason is BOX-037's. `min box run` and `min box wait` follow the architecture's exit-code table (L370, L377) -->
@@ -404,7 +407,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     tier:   T0
     verify: cargo nextest run -p minimal session_attach_without_address_unreachable_host_exit7
 
-- **BCLI-033** THE SYSTEM SHALL emit every object in `-o json` and `-o jsonl` output with a `schema` field `min/v1/<type>`, the types being `box`, `event`, `error`, `type`, `host`, `provider`, `spec` and `exec` (the exec listing in `box show`).
+- **BCLI-033** THE SYSTEM SHALL emit every object in `-o json` and `-o jsonl` output with a `schema` field `min/v1/<type>`, the types being `box`, `event`, `error`, `type`, `host`, `provider`, `spec`, `exec` (the exec listing in `box show`) and `wait` (how the boxes of `box wait` ended).
   <!-- bound to every object, as the architecture's Output conventions (L381) and design principle 4 (L334) state -->
   tier:     T0
   verify:   cargo nextest run -p minimal json_output_schema_per_object
