@@ -789,7 +789,7 @@ box that holds it returns to `running`. These terms follow the decision in
     verify: cargo nextest run -p minvmd a_hash_outside_the_table_opens_no_grant
     verify: cargo nextest run -p minimald install_through_minenv_sock_takes_the_same_lookup
     <!-- event-driven; the owner's ruling on [arch#167](https://github.com/gominimal/arch/issues/167), rules 2 and 4. The lookup is the same at a box's first launch and for `min add` in a running box, and its output is hardlinked as `install` does. -->
-  - WHILE the requesting box's network mode is `none` THE SYSTEM SHALL open no grant for its builds, whatever its table holds, and SHALL give each of its builds no network, as NET-169 states.
+  - WHILE a box has the network mode `none` THE SYSTEM SHALL refuse every grant for its builds, whatever its table holds.
     tier:   T0
     verify: cargo nextest run -p minimald a_none_box_build_opens_no_grant
     <!-- state-driven; `min` files a table for every box, whatever its mode, so the refusal is the daemon's: a build in a `none` box never asks the host side, and a registry package that declares `needs.internet` gets no network there either. -->
