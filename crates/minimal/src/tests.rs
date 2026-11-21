@@ -16915,7 +16915,7 @@ echo = "ok"
         ("check", "task")
     );
     // A task's own vars have the task shape, so a task entry sends none.
-    assert_eq!(task.vars, None);
+    assert_eq!(task.env_vars, None);
     // `--no-hooks` sends no hook list, so the daemon's own stays cleared.
     let no_hooks = crate::session_box_entry(root, None, false)
         .unwrap()
@@ -20168,7 +20168,26 @@ fn concept_and_reference_docs_use_no_removed_session_verb() {
     for page in PAGES {
         let text = std::fs::read_to_string(root.join(page))
             .unwrap_or_else(|e| panic!("{page} must be readable: {e}"));
-        for (n, line) in text.lines().enumerate() {
+        // BCLI-044: the one migration note in docs/concepts/sessions.md (the
+        // `## ` section that names `local-minimald`) names the old spellings
+        // on purpose. Every other line of every page must not.
+        let lines: Vec<&str> = text.lines().collect();
+        let mut in_note = vec![false; lines.len()];
+        let mut start = 0;
+        while start < lines.len() {
+            let end = (start + 1..lines.len())
+                .find(|&i| lines[i].starts_with("## "))
+                .unwrap_or(lines.len());
+            let is_note = *page == "docs/concepts/sessions.md"
+                && lines[start].starts_with("## ")
+                && names_local_minimald_alias(&lines[start..end].join("\n"));
+            in_note[start..end].fill(is_note);
+            start = end;
+        }
+        for (n, line) in lines.iter().enumerate() {
+            if in_note[n] {
+                continue;
+            }
             let mut hits: Vec<String> = REMOVED_SESSION_VERBS
                 .iter()
                 .map(|verb| format!("min session {verb}"))
@@ -26090,5 +26109,538 @@ async fn box_run_refuses_path_after_the_entry() {
     assert!(
         listed.sessions.is_empty(),
         "the refused runs created no box"
+    );
+}
+
+/// The `min box` verbs BCLI-026 names, in the architecture's order.
+const BOX_VERBS: [&str; 17] = [
+    "start", "run", "list", "show", "spec", "stop", "rm", "prune", "resume", "rename", "restart",
+    "logs", "wait", "events", "cp", "exec", "attach",
+];
+
+/// The type-noun verbs BCLI-030 names: the `min box` forms, filtered to
+/// boxes of that type.
+const TYPE_NOUN_VERBS: [(&str, &[&str]); 2] = [
+    (
+        "session",
+        &["list", "start", "attach", "logs", "stop", "rm"],
+    ),
+    ("task", &["run", "list", "logs", "stop", "rm"]),
+];
+
+/// One `min <noun> <verb>` of the command model, unbuilt, so its arguments
+/// are its own and not the propagated globals.
+fn model_verb(noun: &str, verb: &str) -> clap::Command {
+    use clap::CommandFactory as _;
+    Cli::command()
+        .find_subcommand(noun)
+        .unwrap_or_else(|| panic!("`min {noun}` is in the command model"))
+        .find_subcommand(verb)
+        .unwrap_or_else(|| panic!("`min {noun} {verb}` is in the command model"))
+        .clone()
+}
+
+/// The visible long flags of one verb, as `--<long>`.
+fn visible_long_flags(cmd: &clap::Command) -> Vec<String> {
+    cmd.get_arguments()
+        .filter(|arg| !arg.is_hide_set())
+        .filter_map(|arg| arg.get_long().map(|long| format!("--{long}")))
+        .collect()
+}
+
+/// The help that `min <argv> --help` prints, rendered from the command model.
+fn rendered_help(argv: &[&str]) -> String {
+    use clap::Parser as _;
+    let mut full = vec!["min"];
+    full.extend_from_slice(argv);
+    full.push("--help");
+    let err = Cli::try_parse_from(&full)
+        .map(|_| ())
+        .expect_err("--help ends the parse");
+    assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp, "{full:?}");
+    err.to_string()
+}
+
+/// The values the shell completion offers for the last word of `words`,
+/// from the same command model as the help (BCLI-028).
+fn completion_values(words: &[&str]) -> Vec<String> {
+    use clap::CommandFactory as _;
+    let mut args: Vec<std::ffi::OsString> = vec!["min".into()];
+    args.extend(words.iter().map(std::ffi::OsString::from));
+    let index = args.len() - 1;
+    clap_complete::engine::complete(&mut Cli::command(), args, index, None)
+        .expect("completion runs over the command model")
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+        .collect()
+}
+
+// BCLI-026: every `min box` verb parses with the flags the spec delivers.
+// This test pins those delivered flags plus `DEFERRED_ARCH_FLAGS`, the
+// architecture flags that the model does not have yet. It does not pin every
+// flag of architecture lines 488 and 493. The flags of the Non-goals stay
+// out of the model.
+#[test]
+fn box_verbs_exist_with_arch_flags() {
+    use clap::Parser as _;
+
+    // The architecture's flags that are not in the model yet, each with the
+    // issue that delivers it. When one of them lands, this test fails until
+    // the flag moves from this table to `expected`.
+    const DEFERRED_ARCH_FLAGS: [(&str, &str, &str); 5] = [
+        (
+            "run",
+            "--name",
+            "https://github.com/gominimal/minimal/issues/3196",
+        ),
+        (
+            "run",
+            "--ingress",
+            "https://github.com/gominimal/minimal/issues/3163",
+        ),
+        (
+            "run",
+            "--loadout",
+            "https://github.com/gominimal/minimal/issues/3237",
+        ),
+        (
+            "list",
+            "--type",
+            "https://github.com/gominimal/minimal/issues/3714",
+        ),
+        (
+            "list",
+            "--parent",
+            "https://github.com/gominimal/minimal/issues/3714",
+        ),
+    ];
+
+    let expected: [(&str, &[&str]); 17] = [
+        (
+            "start",
+            &[
+                "--name",
+                "--new",
+                "--detach",
+                "--network",
+                "--ingress",
+                "--loadout",
+                "--no-loadouts",
+                "--no-hooks",
+                "--allow-subnets",
+                "--deny-all-egress",
+            ],
+        ),
+        (
+            "run",
+            &["--detach", "--network", "--no-loadouts", "--no-hooks"],
+        ),
+        ("list", &["--all", "--output"]),
+        ("show", &["--network", "--output"]),
+        ("spec", &["--output", "--network", "--loadout"]),
+        ("stop", &["--force", "--exec"]),
+        ("rm", &["--force"]),
+        ("prune", &["--older-than", "--parent", "--yes", "--dry-run"]),
+        ("resume", &[]),
+        ("rename", &[]),
+        ("restart", &[]),
+        ("logs", &["--follow", "--raw", "--exec"]),
+        ("wait", &["--timeout", "--exec", "--output"]),
+        ("events", &["--parent", "--output", "--follow"]),
+        ("cp", &[]),
+        ("exec", &["--tty", "--detach", "--timeout"]),
+        ("attach", &["--exec"]),
+    ];
+    assert_eq!(
+        expected.map(|(verb, _)| verb),
+        BOX_VERBS,
+        "the table covers every verb BCLI-026 names"
+    );
+    for (verb, flags) in expected {
+        let have = visible_long_flags(&model_verb("box", verb));
+        for flag in flags {
+            assert!(
+                have.iter().any(|h| h == flag),
+                "`min box {verb}` takes {flag}, got {have:?}"
+            );
+        }
+    }
+
+    // Each verb parses a command line that uses its flags.
+    for argv in [
+        &["box", "start", "web", "--name", "w", "--new", "--detach"][..],
+        &[
+            "box",
+            "start",
+            "--network",
+            "own_ip",
+            "--ingress",
+            "8080:80",
+            "--loadout",
+            "x",
+            "--no-hooks",
+        ],
+        &["box", "start"],
+        &[
+            "box",
+            "run",
+            "build",
+            "--detach",
+            "--network",
+            "none",
+            "--no-loadouts",
+            "--",
+            "a",
+        ],
+        &["box", "list", "--all", "-o", "json"],
+        &["box", "show", "web", "--network", "-o", "json"],
+        &["box", "spec", "web", "-o", "yaml"],
+        &["box", "spec"],
+        &["box", "stop", "web", "--force"],
+        &["box", "stop", "web", "--exec", "e1"],
+        &["box", "rm", "web", "--force"],
+        &[
+            "box",
+            "prune",
+            "--older-than",
+            "7d",
+            "--parent",
+            "p",
+            "--yes",
+            "--dry-run",
+        ],
+        &["box", "resume", "web"],
+        &["box", "rename", "web", "api"],
+        &["box", "restart", "web"],
+        &["box", "logs", "web", "-f", "--raw"],
+        &["box", "logs", "web", "--exec", "e1"],
+        &["box", "wait", "web", "--timeout", "30s", "-o", "json"],
+        &["box", "wait", "web", "--exec", "e1"],
+        &["box", "events", "web", "-o", "jsonl", "-f"],
+        &["box", "events", "--parent", "p"],
+        &["box", "cp", "web:/etc/hosts", "."],
+        &[
+            "box",
+            "exec",
+            "web",
+            "-t",
+            "--timeout",
+            "5m",
+            "--",
+            "ls",
+            "-l",
+        ],
+        &["box", "exec", "web", "--detach", "--", "ls"],
+        &["box", "attach"],
+        &["box", "attach", "web", "--exec", "e1"],
+        &["boxes", "list"],
+    ] {
+        let mut full = vec!["min"];
+        full.extend_from_slice(argv);
+        if let Err(err) = Cli::try_parse_from(&full) {
+            panic!("`min {}` parses: {err}", argv.join(" "));
+        }
+    }
+
+    // The type nouns keep their filtered forms.
+    for (noun, verbs) in TYPE_NOUN_VERBS {
+        for verb in verbs {
+            let _ = model_verb(noun, verb);
+        }
+    }
+
+    // The Non-goals' flags are not in the model.
+    for (verb, absent) in [
+        ("list", "--using"),
+        ("list", "--all-providers"),
+        ("wait", "--parent"),
+        ("wait", "--any"),
+    ] {
+        let have = visible_long_flags(&model_verb("box", verb));
+        assert!(
+            !have.iter().any(|h| h == absent),
+            "`min box {verb}` has no {absent}"
+        );
+    }
+    // The deferred architecture flags are not in the model yet.
+    for (verb, flag, issue) in DEFERRED_ARCH_FLAGS {
+        let have = visible_long_flags(&model_verb("box", verb));
+        assert!(
+            !have.iter().any(|h| h == flag),
+            "`min box {verb}` now has {flag}: move it from DEFERRED_ARCH_FLAGS \
+             to the expected flags ({issue})"
+        );
+    }
+    // `min box attach --exec` needs a box.
+    assert!(Cli::try_parse_from(["min", "box", "attach", "--exec", "e1"]).is_err());
+}
+
+// BCLI-028: `--help` at every level and the shell completions come from
+// one command model, so both list the same verbs and the same flags.
+#[test]
+fn help_and_completions_from_one_model() {
+    use clap::CommandFactory as _;
+
+    let cli = Cli::command();
+    for noun in ["box", "session", "task"] {
+        let help = rendered_help(&[noun]);
+        let offered = completion_values(&[noun, ""]);
+        let model = cli.find_subcommand(noun).expect("noun in the model");
+        let visible: Vec<_> = model
+            .get_subcommands()
+            .filter(|verb| !verb.is_hide_set())
+            .collect();
+        assert!(!visible.is_empty(), "`min {noun}` has verbs");
+        for verb in &visible {
+            let name = verb.get_name();
+            let about = verb
+                .get_about()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            assert!(
+                !about.trim().is_empty(),
+                "`min {noun} {name}` has a line on what it does"
+            );
+            assert!(
+                help.lines()
+                    .any(|line| line.trim_start().starts_with(&format!("{name} "))),
+                "`min {noun} --help` lists {name}:\n{help}"
+            );
+            assert!(
+                offered.iter().any(|value| value == name),
+                "the completion of `min {noun} ` offers {name}, got {offered:?}"
+            );
+
+            let verb_help = rendered_help(&[noun, name]);
+            let flag_offers = completion_values(&[noun, name, "--"]);
+            for flag in visible_long_flags(verb) {
+                assert!(
+                    verb_help.contains(&flag),
+                    "`min {noun} {name} --help` lists {flag}:\n{verb_help}"
+                );
+                assert!(
+                    flag_offers.contains(&flag),
+                    "the completion of `min {noun} {name} --` offers {flag}, got {flag_offers:?}"
+                );
+            }
+        }
+        // A hidden verb is in neither.
+        for verb in model.get_subcommands().filter(|verb| verb.is_hide_set()) {
+            let name = verb.get_name();
+            assert!(
+                !offered.iter().any(|value| value == name),
+                "the completion hides {name}"
+            );
+            assert!(
+                !help
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(&format!("{name} "))),
+                "`min {noun} --help` hides {name}"
+            );
+        }
+    }
+    // Every box verb BCLI-026 names is one of the verbs both list.
+    let offered = completion_values(&["box", ""]);
+    for verb in BOX_VERBS {
+        assert!(offered.iter().any(|value| value == verb), "box {verb}");
+    }
+}
+
+/// One section of the CLI reference: the text from a `### ` heading that
+/// names `` `<noun> <verb>` `` to the next `### ` heading.
+fn reference_section<'a>(reference: &'a str, noun: &str, verb: &str) -> Option<&'a str> {
+    let wanted = format!("`{noun} {verb}`");
+    let mut start = None;
+    let mut offset = 0;
+    for line in reference.split_inclusive('\n') {
+        if line.starts_with("### ") || line.starts_with("## ") {
+            if let Some(begin) = start {
+                return Some(&reference[begin..offset]);
+            }
+            if line.starts_with("### ") && line.contains(&wanted) {
+                start = Some(offset);
+            }
+        }
+        offset += line.len();
+    }
+    start.map(|begin| &reference[begin..])
+}
+
+/// Whether `text` names `flag` as a whole word: `--all` does not match
+/// inside `--all-providers`.
+fn names_flag(text: &str, flag: &str) -> bool {
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    text.match_indices(flag).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + flag.len()..].chars().next();
+        !before.is_some_and(is_word) && !after.is_some_and(is_word)
+    })
+}
+
+#[test]
+fn names_flag_matches_whole_words_only() {
+    assert!(names_flag("use `--all` here", "--all"));
+    assert!(names_flag("--all <name>", "--all"));
+    assert!(!names_flag("use `--all-providers`", "--all"));
+    assert!(!names_flag("x--all", "--all"));
+}
+
+// BCLI-044: the CLI reference documents every verb that BCLI-026 and
+// BCLI-030 name, and each flag the command model gives it. A flag that the
+// verb shares with `min session start` can be documented there, when the
+// verb's section points to it.
+#[test]
+fn cli_reference_documents_box_grammar() {
+    let reference = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/reference/cli-min.md"),
+    )
+    .expect("the min CLI reference must be readable at docs/reference/cli-min.md");
+    let session_start = reference_section(&reference, "session", "start")
+        .expect("the reference documents `session start`");
+
+    let mut verbs: Vec<(&str, &str)> = BOX_VERBS.iter().map(|verb| ("box", *verb)).collect();
+    for (noun, list) in TYPE_NOUN_VERBS {
+        verbs.extend(list.iter().map(|verb| (noun, *verb)));
+    }
+    let mut missing = Vec::new();
+    for (noun, verb) in verbs {
+        let Some(section) = reference_section(&reference, noun, verb) else {
+            missing.push(format!("min {noun} {verb}: no section"));
+            continue;
+        };
+        let points_to_start = section.contains("session start");
+        for flag in visible_long_flags(&model_verb(noun, verb)) {
+            let documented =
+                names_flag(section, &flag) || (points_to_start && names_flag(session_start, &flag));
+            if !documented {
+                missing.push(format!("min {noun} {verb}: {flag}"));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "the CLI reference does not document:\n{}",
+        missing.join("\n")
+    );
+}
+
+/// Whether `text` names the `local-minimald` provider alias, and not the
+/// `local-minimald<N>` state directory of a host.
+fn names_local_minimald_alias(text: &str) -> bool {
+    text.match_indices("local-minimald").any(|(at, word)| {
+        !matches!(
+            text[at + word.len()..].chars().next(),
+            Some(c) if c.is_ascii_digit() || c == '<' || c == '/'
+        )
+    })
+}
+
+// BCLI-044: the `local-minimald` alias, its replacement `local` and its
+// removal in 0.9 appear in one migration note only, in `docs/reference`
+// and `docs/concepts` together.
+#[test]
+fn docs_name_aliases_only_in_one_migration_note() {
+    let docs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs");
+    let mut notes = Vec::new();
+    for dir in ["reference", "concepts"] {
+        let mut stack = vec![docs.join(dir)];
+        while let Some(path) = stack.pop() {
+            if path.is_dir() {
+                for entry in std::fs::read_dir(&path).expect("docs dir readable") {
+                    stack.push(entry.expect("docs entry").path());
+                }
+                continue;
+            }
+            if path.extension().is_none_or(|ext| ext != "md") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("doc readable");
+            // One note is one `## ` section.
+            for section in text.split("\n## ") {
+                if names_local_minimald_alias(section) {
+                    notes.push((path.clone(), section.to_owned()));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        notes.len(),
+        1,
+        "one migration note names local-minimald, found {:?}",
+        notes.iter().map(|(path, _)| path).collect::<Vec<_>>()
+    );
+    let (path, note) = &notes[0];
+    assert!(
+        path.ends_with("concepts/sessions.md"),
+        "the note is in docs/concepts/sessions.md, not {}",
+        path.display()
+    );
+    assert!(
+        note.contains("--provider local") && note.contains("0.9"),
+        "the note names the replacement `local` and the removal in 0.9:\n{note}"
+    );
+    for old in [
+        "min session activate",
+        "min session destroy",
+        "min session exec",
+        "min session rename",
+        "min session policy",
+        "min session hooks",
+        "min session run",
+        "--path",
+        "min stop",
+    ] {
+        assert!(note.contains(old), "the note names {old}");
+    }
+}
+
+// BCLI-043: `min session setup-zed` stays hidden, with the arguments it
+// had: the session, `--settings <FILE>` and `--print`.
+#[test]
+fn setup_zed_unchanged() {
+    use clap::Parser as _;
+
+    let setup_zed = model_verb("session", "setup-zed");
+    assert!(setup_zed.is_hide_set(), "setup-zed stays hidden");
+    let mut args: Vec<String> = setup_zed
+        .get_arguments()
+        .map(|arg| arg.get_id().to_string())
+        .collect();
+    args.sort();
+    assert_eq!(args, ["print", "session", "settings"]);
+
+    let parsed = Cli::try_parse_from([
+        "min",
+        "session",
+        "setup-zed",
+        "my-box",
+        "--settings",
+        "/tmp/s.json",
+        "--print",
+    ])
+    .expect("setup-zed parses");
+    let Some(Command::Session(SessionArgs {
+        command: SessionCommand::SetupZed(zed),
+    })) = parsed.command
+    else {
+        panic!("setup-zed parses into its own command");
+    };
+    assert_eq!(zed.session, "my-box");
+    assert_eq!(
+        zed.settings.as_deref(),
+        Some(std::path::Path::new("/tmp/s.json"))
+    );
+    assert!(zed.print);
+
+    let help = rendered_help(&["session", "setup-zed"]);
+    assert!(
+        help.contains("Register a session as an SSH remote in Zed's settings"),
+        "{help}"
+    );
+    assert!(!rendered_help(&["session"]).contains("setup-zed"));
+    assert!(
+        !completion_values(&["session", ""])
+            .iter()
+            .any(|v| v == "setup-zed")
     );
 }

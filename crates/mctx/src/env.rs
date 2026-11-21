@@ -258,6 +258,7 @@ impl EnvChannel<'_> {
             std::fs::create_dir_all(&output_base).ok();
 
             let cache = build_ctx.local_cache();
+            let (classifier_leaf, box_network) = patched_build_egress(&build_ctx);
             let (stdout_writer, stderr_writer) = StreamWriter::pair(stream);
             let res = op::PatchedBuild {
                 spec: &bsr,
@@ -265,10 +266,8 @@ impl EnvChannel<'_> {
                 stdout_writer: Some(Box::new(stdout_writer)),
                 stderr_writer: Some(Box::new(stderr_writer)),
                 remote_cache: remote_cache.as_ref(),
-                // NET-155: a client-side patched build runs for no box, so it
-                // stays the caller's own traffic.
-                classifier_leaf: None,
-                box_network: None,
+                classifier_leaf,
+                box_network,
             }
             .run(&op::Options {
                 cache,
@@ -654,6 +653,23 @@ pub struct EnvArgs<'a> {
     pub classifier_leaf: Option<sandbox::config::ClassifierLeaf>,
     /// The operation tracker to use downstream, if applicable.
     pub ot: Option<OpTracker>,
+}
+
+/// The classifier leaf and the box network a `min patched-pkg` build runs
+/// on, from the context of the box it runs for. The build takes the box's
+/// leaf, or the box's network when the box has no leaf, as the session
+/// channel in `minimald` does. A context made for no box gives neither, so
+/// the build stays its caller's own traffic.
+pub(crate) fn patched_build_egress(
+    ctx: &Context,
+) -> (
+    Option<sandbox::config::ClassifierLeaf>,
+    Option<op::BuildNetwork>,
+) {
+    match ctx.classifier_leaf() {
+        Some(leaf) => (Some(leaf.clone()), None),
+        None => (None, ctx.box_network().cloned()),
+    }
 }
 
 /// Places the sandbox `config` in `leaf`, the classifier leaf of the box a
