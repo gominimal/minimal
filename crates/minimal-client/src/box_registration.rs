@@ -490,6 +490,14 @@ pub async fn register_box_with_vm_host(
                  answerer release reply; the registration did not happen"
             )
         }
+        minimald_rpc::BoxControlReply::BuildGrantOpened(_)
+        | minimald_rpc::BoxControlReply::NoBuildGrant { .. }
+        | minimald_rpc::BoxControlReply::BuildTable { .. } => {
+            anyhow::bail!(
+                "the VM host daemon answered the box registration with a build grant's \
+                 reply; the registration did not happen"
+            )
+        }
         other @ (minimald_rpc::BoxControlReply::AsksSubscribed { .. }
         | minimald_rpc::BoxControlReply::PendingAskOffer(_)
         | minimald_rpc::BoxControlReply::PendingAskDismissed { .. }
@@ -1027,6 +1035,7 @@ async fn register_box_at(
             minimald_rpc::TASK_SLOTS_PER_BOX
         },
         host_ip,
+        stays_detached: false,
     };
     let registration = tokio::time::timeout(
         BOX_CONTROL_TIMEOUT,
@@ -1615,6 +1624,7 @@ mod tests {
                 hold: false,
                 task_slots: 0,
                 host_ip: true,
+                stays_detached: false,
             };
             let outcome = register_box_with_vm_host(&sock_path, request).await;
             daemon.await.unwrap();

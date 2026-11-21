@@ -863,6 +863,145 @@ pub struct RegisterBoxRequest {
     /// own-address registration.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub host_ip: bool,
+    /// Whether the row stays when no relay carries it (NET-169): a
+    /// host-address box's build row has no box attached to it between
+    /// builds, so the box's retirement withdraws it instead of the detach
+    /// grace.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stays_detached: bool,
+}
+
+/// What the build of one spec hash may reach (NET-167, NET-168): one entry of
+/// a box's [`BuildGrantTable`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BuildGrant {
+    /// The declared source URLs, each in the form it is fetched in.
+    pub sources: Vec<String>,
+    /// The build steps get open internet. Otherwise only the source fetch
+    /// runs on a network.
+    pub internet: bool,
+}
+
+/// A box's build grant table, by spec hash in hex (NET-165). `min` makes it at
+/// the box's creation, from the commits the box's spec pinned.
+pub type BuildGrantTable = std::collections::BTreeMap<String, BuildGrant>;
+
+/// What an internet grant never reaches (NET-168): the private ranges of
+/// RFC 1918, where a person's own network sits, the shared address space
+/// the switch's subnet, its box leases and its host alias are carved from,
+/// and link-local space. The resolver stays reachable: a box's own
+/// resolution is admitted ahead of its deny rules.
+pub const BUILD_BOX_INTERNET_DENY: [&str; 5] = [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "100.64.0.0/10",
+    "169.254.0.0/16",
+];
+
+/// The egress of a build box reaching `hosts`, or the public internet
+/// (NET-167, NET-168).
+///
+/// The internet branch, `0.0.0.0/0` less [`BUILD_BOX_INTERNET_DENY`], is an
+/// interim (design §7.1 and §8): it lasts until per-package host lists
+/// replace it (design §12 item 15), and then a build that declares `needs`
+/// gets its package's listed hosts instead. The flip is tracked in
+/// [gominimal/arch#158](https://github.com/gominimal/arch/issues/158).
+#[must_use]
+pub fn build_box_egress(
+    hosts: &std::collections::BTreeSet<String>,
+    internet: bool,
+) -> EgressPolicy {
+    if internet {
+        EgressPolicy {
+            allow_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+            allow_dns_hosts: Some(Vec::new()),
+            allow_protocols: None,
+            deny_subnets: Some(
+                BUILD_BOX_INTERNET_DENY
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            ),
+        }
+    } else {
+        EgressPolicy {
+            allow_subnets: Some(Vec::new()),
+            allow_dns_hosts: Some(hosts.iter().cloned().collect()),
+            allow_protocols: None,
+            deny_subnets: None,
+        }
+    }
+}
+
+/// How long the in-VM daemon waits for its ask for a build grant
+/// ([`BoxControlRequest::OpenBuildGrant`]) to be answered. The VM host daemon
+/// opens no grant it could only answer later than this, because the asker
+/// has given up and could never close it.
+pub const BUILD_GRANT_ASK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `min` files a box's build grant table with the host-side creator
+/// ([`BoxControlRequest::FileBuildTable`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileBuildTableRequest {
+    /// The box the table belongs to.
+    pub session_id: SessionId,
+    /// The table.
+    pub table: BuildGrantTable,
+}
+
+/// The guest asks for the build of one spec hash
+/// ([`BoxControlRequest::OpenBuildGrant`]). It names a hash and nothing else:
+/// never a host and never a rule.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenBuildGrantRequest {
+    /// The box the build runs for.
+    pub session_id: SessionId,
+    /// The spec hash, in hex.
+    pub spec_hash: String,
+}
+
+/// A grant the host-side creator opened: the build box's own row.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenedBuildGrant {
+    /// The row's name, which a close presents.
+    pub grant_row: String,
+    /// The addresses the build box attaches at.
+    pub task_addresses: Vec<std::net::Ipv4Addr>,
+    /// What the row admits, which the guest's own gate applies too.
+    pub egress: EgressPolicy,
+    /// The build steps may use the network, so the grant outlives the fetch.
+    pub internet: bool,
+}
+
+/// The guest ends a grant before its deadline
+/// ([`BoxControlRequest::CloseBuildGrant`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CloseBuildGrantRequest {
+    /// The row a grant opened.
+    pub grant_row: String,
+}
+
+/// The guest says a box is gone, so its table ends
+/// ([`BoxControlRequest::DropBuildTable`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DropBuildTableRequest {
+    /// The box.
+    pub session_id: SessionId,
+}
+
+/// The name of the row a host-address box's builds attach under (NET-169).
+#[must_use]
+pub fn requester_build_row_name(session_id: SessionId) -> String {
+    format!("build-{session_id}")
+}
+
+/// The box whose builds attach under the row `name`
+/// ([`requester_build_row_name`]), or `None` when `name` is no such row's.
+#[must_use]
+pub fn requester_build_row_session(name: &str) -> Option<SessionId> {
+    let id = SessionId::parse_str(name.strip_prefix("build-")?).ok()?;
+    (requester_build_row_name(id) == name).then_some(id)
 }
 
 /// The one line a held registration's client writes on the lease
@@ -1030,6 +1169,14 @@ pub struct RowStandingRequest {
         with = "boxes::box_id_hex::option"
     )]
     pub box_id: Option<BoxId>,
+    /// The box whose build row the address is a task address of (NET-169):
+    /// a host-address box, whose own record names no row. The row is
+    /// answered as standing only when the box's build row
+    /// ([`requester_build_row_name`]) stands and the address is one of its
+    /// task rows. A host that predates this field reads it as no box id and
+    /// answers no row, fail-closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_row_of: Option<SessionId>,
 }
 
 /// The in-VM daemon's ask for the id of a box it is about to create
@@ -1743,6 +1890,22 @@ pub enum BoxControlRequest {
     /// only, whose owner-only file mode is its access control. The
     /// subscription lives exactly as long as the connection it arrived on.
     SubscribeAsks(SubscribeAsksRequest),
+    /// File a box's build grant table (NET-165): `min` hands the host-side
+    /// creator the table at the box's creation. Served on the host's control
+    /// socket only, answered with [`BoxControlReply::BuildTable`].
+    FileBuildTable(FileBuildTableRequest),
+    /// The in-VM daemon's ask for the build of one spec hash (NET-165): the
+    /// host finds the hash in the box's table and opens a row of the build
+    /// box's own under a host-side deadline. Answered with
+    /// [`BoxControlReply::BuildGrantOpened`], or
+    /// [`BoxControlReply::NoBuildGrant`] for a hash the table does not hold.
+    OpenBuildGrant(OpenBuildGrantRequest),
+    /// The in-VM daemon's signal that a grant can end before its deadline.
+    /// Nothing extends a grant. Answered with [`BoxControlReply::BuildTable`].
+    CloseBuildGrant(CloseBuildGrantRequest),
+    /// The in-VM daemon's signal that a box is gone: its table ends. Answered
+    /// with [`BoxControlReply::BuildTable`].
+    DropBuildTable(DropBuildTableRequest),
     /// Read one box's row by name — the read-only row verb: the row's
     /// switch address, its derived egress allow-list, and its declared and
     /// runtime-admitted ports, or [`BoxControlReply::NoRow`] when no live
@@ -2171,6 +2334,21 @@ pub enum BoxControlReply {
         /// What the daemon did, as its log line said it.
         detail: String,
     },
+    /// A grant opened for a spec hash (NET-165). `grant_row` is required —
+    /// the marker that keeps this document from decoding as any other reply.
+    BuildGrantOpened(Box<OpenedBuildGrant>),
+    /// The spec hash is not in the box's table, so the build follows the
+    /// box's own rules (NET-169). `no_build_grant` is the marker.
+    NoBuildGrant {
+        /// The marker: always `true`.
+        no_build_grant: bool,
+    },
+    /// The answer of the verbs that change a table or end a grant.
+    /// `build_table` is the marker.
+    BuildTable {
+        /// The marker: always `true`.
+        build_table: bool,
+    },
     /// The row-standing read's answer: whether the host holds a row at the
     /// switch address asked about. `row_standing` is required — the marker
     /// that keeps this document from decoding as any other reply.
@@ -2594,6 +2772,37 @@ impl CreateSessionReply {
 /// So the client creates the session, populates its workspace, and
 /// only then configures the loadout.
 pub struct ConfigureLoadout;
+
+/// An RPC that tells the daemon what `min` prepared for a box's builds
+/// (NET-165): the task addresses of the box's own build row, and on a host
+/// with no VM the box's build grant table. On a VM-backed host the table goes
+/// to the VM host daemon and never to the guest.
+pub struct PrepareBuildBoxes;
+
+/// The request for a [`PrepareBuildBoxes`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrepareBuildBoxesRequest {
+    /// The box the builds run for.
+    pub session_id: SessionId,
+    /// The task addresses of the box's own build row. A host-address box has
+    /// none of its own, so `min` registers this row for its builds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_addresses: Vec<std::net::Ipv4Addr>,
+    /// The box's build grant table, on a host with no VM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table: Option<BuildGrantTable>,
+}
+
+/// The response for a [`PrepareBuildBoxes`] RPC.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PrepareBuildBoxesResponse {}
+
+impl OneshotSshRpc for PrepareBuildBoxes {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "PrepareBuildBoxes");
+    type Request<'a> = PrepareBuildBoxesRequest;
+    type Response = Errorable<PrepareBuildBoxesResponse>;
+}
 
 /// The request for a [`ConfigureLoadout`] RPC.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3099,6 +3308,27 @@ pub struct BoxListingEntry {
     /// spec, and a daemon that predates the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifetime: Option<String>,
+    /// The build boxes running for this box now (NET-171).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub build_boxes: Vec<RunningBuildBox>,
+}
+
+/// A build box running for a box (NET-171). It keeps no record (BOX-210), so
+/// a client sees it only here, while it runs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunningBuildBox {
+    /// The package it builds.
+    pub package: String,
+    /// What it may reach. `None` allows everything.
+    pub egress: Option<boxes::EgressPolicy>,
+    /// The host side granted it its reach (NET-165). Otherwise it follows
+    /// the requesting box's rules (NET-169).
+    pub granted: bool,
+    /// Its network has ended: what is left of the build runs with no
+    /// address, whatever `egress` says. Distinct from `egress: None`, which
+    /// allows everything.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_network: bool,
 }
 
 /// The response for a [`ListBoxes`] RPC.
@@ -4453,6 +4683,7 @@ mod box_listing_tests {
             signal: None,
             pty_enabled: true,
             lifetime: None,
+            build_boxes: Vec::new(),
         }
     }
 

@@ -3371,6 +3371,8 @@ pub(crate) enum ActivationStep {
     UploadFiles,
     /// The loadout composition and its gating.
     ComposeLoadout,
+    /// The box's packages, each in its build box (NET-165).
+    PrepareBuildBoxes,
     /// The patch upload and the finalize that makes the session active.
     Finalize,
     /// The `host_ip` name hold on the VM host daemon.
@@ -3380,7 +3382,7 @@ pub(crate) enum ActivationStep {
 impl ActivationStep {
     /// Every step, in the order [`activate_box`] runs them.
     #[cfg(test)]
-    pub(crate) const ORDER: [Self; 14] = [
+    pub(crate) const ORDER: [Self; 15] = [
         Self::CheckArguments,
         Self::CheckProject,
         Self::StartDaemon,
@@ -3393,6 +3395,7 @@ impl ActivationStep {
         Self::ReportStart,
         Self::UploadFiles,
         Self::ComposeLoadout,
+        Self::PrepareBuildBoxes,
         Self::Finalize,
         Self::HoldName,
     ];
@@ -3412,6 +3415,7 @@ impl ActivationStep {
             Self::ReportStart => "report_start",
             Self::UploadFiles => "upload_files",
             Self::ComposeLoadout => "compose_loadout",
+            Self::PrepareBuildBoxes => "prepare_build_boxes",
             Self::Finalize => "finalize",
             Self::HoldName => "hold_name",
         }
@@ -4036,6 +4040,79 @@ pub(crate) fn subnet_notices(args: &crate::EgressArgs) -> Vec<String> {
     let mut lines = notices("--allow-subnets", &args.allow_subnets);
     lines.extend(notices("--deny-subnets", &args.deny_subnets));
     lines
+}
+
+/// Registers the row a host-address box's own builds attach under, on a
+/// VM-backed host, and returns its task addresses (NET-169). The box shares
+/// the node's address, so nothing else gives a build of its an address the
+/// host's gate can hold to the box's rules. A box that admits nothing has no
+/// row: its builds that need the network are refused. The registration is
+/// the client's, on the host's socket, and the box's retirement withdraws
+/// it. A failure leaves the box with no row, and those builds refused.
+pub(crate) async fn hold_requester_build_row(
+    control_sock: Option<&std::path::Path>,
+    session_id: boxes::SessionId,
+    network: boxes::NetworkMode,
+    declared: Option<&boxes::EgressPolicy>,
+    opt_out: bool,
+) -> Vec<std::net::Ipv4Addr> {
+    let Some(sock) = control_sock else {
+        return Vec::new();
+    };
+    if network != boxes::NetworkMode::HostNet {
+        return Vec::new();
+    }
+    let egress =
+        match boxes::effective_egress(declared, network, boxes::EGRESS_DEFAULT_PHASE, opt_out) {
+            boxes::EffectiveEgress::DenyAll => return Vec::new(),
+            boxes::EffectiveEgress::Declared(section) if section.admits_nothing() => {
+                return Vec::new();
+            }
+            boxes::EffectiveEgress::Declared(section) => section,
+            // The box's own rules, which allow everything: an internet grant
+            // is narrower than that (NET-168), so it is not this row's.
+            boxes::EffectiveEgress::AllowAll => boxes::EgressPolicy {
+                allow_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+                allow_dns_hosts: Some(Vec::new()),
+                allow_protocols: None,
+                deny_subnets: None,
+            },
+        };
+    let request = minimald_rpc::RegisterBoxRequest {
+        name: minimald_rpc::requester_build_row_name(session_id),
+        ingress_ports: Vec::new(),
+        egress: Some(egress),
+        credentialed_upstream: None,
+        dynamic_ingress: None,
+        dynamic_allowed_range: None,
+        hold: false,
+        task_slots: minimald_rpc::TASK_SLOTS_PER_BOX,
+        host_ip: false,
+        stays_detached: true,
+    };
+    let registration = tokio::time::timeout(
+        minimal_client::box_registration::BOX_CONTROL_TIMEOUT,
+        minimal_client::box_registration::register_box_with_vm_host(sock, request),
+    )
+    .await;
+    match registration {
+        Ok(Ok(registered)) => registered.task_addresses,
+        Ok(Err(error)) => {
+            tracing::info!(
+                error = %format!("{error:#}"),
+                "could not register the row of the box's builds"
+            );
+            Vec::new()
+        }
+        Err(_elapsed) => {
+            tracing::info!(
+                timeout = ?minimal_client::box_registration::BOX_CONTROL_TIMEOUT,
+                "the VM host daemon did not answer the registration of the row of the box's \
+                 builds in time"
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// The `--ingress` mappings and the egress flags of an activation, parsed
@@ -5357,6 +5434,34 @@ pub(crate) async fn activate_box(
             // squash the lint without dropping the useful name.
             let _ = initial_policy;
             Ok::<_, anyhow::Error>(collected_patches)
+        })
+        .await?;
+
+    // NET-165: the box's table goes to the host side now, before any process
+    // of the box exists. A failure stops nothing here: the box's builds follow
+    // its own rules, and a refusal is said when one needs more.
+    ActivationStep::PrepareBuildBoxes
+        .run(async {
+            let task_addresses = hold_requester_build_row(
+                control_sock.as_deref(),
+                id,
+                request.config.network,
+                request.config.policy.egress.as_ref(),
+                created.deny_all_opt_out == Some(true),
+            )
+            .await;
+            prepare_build_boxes(
+                &mut client,
+                BuildBoxActivation {
+                    global,
+                    session_id: id,
+                    project_dir: abs_path.as_utf8_path().as_std_path().to_path_buf(),
+                    control_sock: control_sock.clone(),
+                    task_addresses,
+                },
+            )
+            .await;
+            Ok::<_, anyhow::Error>(())
         })
         .await?;
 

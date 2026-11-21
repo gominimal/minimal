@@ -272,11 +272,19 @@ pub(crate) async fn shut_down_host_daemon(
         }
         return Ok(());
     }
+    // Stopped is written by the VM host daemon under its lifecycle lock,
+    // before it exits. Waiting for the process to go too means a
+    // `minvmd status` right after this stop finds the lock free.
     let stopped = || async {
         let dir = vm_dir.clone();
-        tokio::task::spawn_blocking(move || wait_for_vm_stopped_at(&dir, HOST_STOP_RELEASE_WAIT))
-            .await
-            .unwrap_or(false)
+        tokio::task::spawn_blocking(move || {
+            wait_for_vm_stopped_at(&dir, HOST_STOP_RELEASE_WAIT)
+                && minvmd::state::StateDir::new(dir).is_ok_and(|state_dir| {
+                    wait_for_alive_lock_released(&state_dir, HOST_STOP_RELEASE_WAIT).is_ok()
+                })
+        })
+        .await
+        .unwrap_or(false)
     };
     match resp {
         Ok(ShutdownResponse::ShuttingDown) => {

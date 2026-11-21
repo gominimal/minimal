@@ -2179,6 +2179,7 @@ fn reap_and_prune_requests_round_trip() {
         signal: Some(15),
         pty_enabled: false,
         lifetime: None,
+        build_boxes: Vec::new(),
     };
     let reap = ReapBoxResponse {
         reaped: entry.clone(),
@@ -2231,6 +2232,7 @@ fn preview_prune_and_show_disk_round_trip() {
         signal: None,
         pty_enabled: true,
         lifetime: None,
+        build_boxes: Vec::new(),
     };
     let preview = PreviewPruneResponse {
         matched: vec![
@@ -2400,6 +2402,61 @@ fn retire_without_an_end_is_refused_at_decode() {
         }
         other => panic!("decoded as {other:?}"),
     }
+}
+
+/// NET-167: a build box's egress is its hosts and nothing else. NET-168: a
+/// build with the internet has it, and no host list.
+#[test]
+fn build_box_egress_is_its_hosts_or_the_internet() {
+    let declared = build_box_egress(&["example.org".to_string()].into(), false);
+    assert_eq!(
+        declared.allow_dns_hosts,
+        Some(vec!["example.org".to_string()])
+    );
+    assert_eq!(declared.allow_subnets, Some(Vec::new()));
+    let internet = build_box_egress(&std::collections::BTreeSet::new(), true);
+    assert_eq!(internet.allow_subnets, Some(vec!["0.0.0.0/0".to_string()]));
+    assert_eq!(internet.allow_dns_hosts, Some(Vec::new()));
+    assert_eq!(
+        internet.deny_subnets,
+        Some(
+            [
+                "10.0.0.0/8",
+                "172.16.0.0/12",
+                "192.168.0.0/16",
+                "100.64.0.0/10",
+                "169.254.0.0/16"
+            ]
+            .map(String::from)
+            .to_vec()
+        ),
+        "an internet grant reaches no private, shared or link-local space"
+    );
+    assert_eq!(declared.deny_subnets, None);
+}
+
+/// NET-169: a requester row's name gives back its box, and no other row's
+/// name does.
+#[test]
+fn a_requester_row_name_names_its_box() {
+    let id = SessionId::mint();
+    let row = requester_build_row_name(id);
+    assert_eq!(requester_build_row_session(&row), Some(id));
+    assert_eq!(requester_build_row_session(&format!("{row}-1")), None);
+    assert_eq!(requester_build_row_session("build-web"), None);
+    assert_eq!(requester_build_row_session(&id.to_string()), None);
+}
+
+/// A daemon's refusal of a box's table decodes as a refusal. The response
+/// has no fields, so `deny_unknown_fields` is what tells the two apart.
+#[test]
+fn a_prepare_error_does_not_decode_as_success() {
+    let refused: Errorable<PrepareBuildBoxesResponse> =
+        serde_json_lenient::from_str(r#"{"error":"no such box"}"#).expect("an error decodes");
+    assert!(matches!(refused, Errorable::Err { .. }));
+    let prepared: Errorable<PrepareBuildBoxesResponse> =
+        serde_json_lenient::from_str("{}").expect("a success decodes");
+    assert_eq!(prepared, Errorable::Ok(PrepareBuildBoxesResponse {}));
 }
 
 /// BOX-074: the `GetVersion` reply carries the daemon's expander version,

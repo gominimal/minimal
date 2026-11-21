@@ -9366,6 +9366,7 @@ fn address_entry(id: &str, name: &str, state: &str) -> minimald_rpc::BoxListingE
         signal: None,
         pty_enabled: true,
         lifetime: None,
+        build_boxes: Vec::new(),
     }
 }
 
@@ -13942,6 +13943,7 @@ fn fake_listed(id: boxes::BoxId, parent: Option<boxes::BoxId>) -> minimald_rpc::
         signal: None,
         pty_enabled: false,
         lifetime: None,
+        build_boxes: Vec::new(),
     }
 }
 
@@ -17830,6 +17832,7 @@ async fn box_show_network_renders_effective_policy() {
         record.network,
         None,
         &live,
+        &[],
         paths::HostKind::Minimald,
     )
     .expect("the render");
