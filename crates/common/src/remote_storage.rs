@@ -359,6 +359,8 @@ type PinnedName = (String, Vec<std::net::SocketAddr>);
 fn probe_client(pinned: Option<&PinnedName>) -> reqwest::Result<reqwest::Client> {
     let builder = crate::fetchers::web_client_builder()
         .redirect(reqwest::redirect::Policy::none())
+        // A proxy would resolve each hop again and undo the pin.
+        .no_proxy()
         .timeout(PROBE_TIMEOUT);
     match pinned {
         Some((name, addresses)) => builder.resolve_to_addrs(name, addresses),
@@ -799,28 +801,48 @@ mod connect_tests {
         assert_eq!(taken.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    /// NET-167: a redirect is followed only to an `http` or `https` URL on
-    /// the public internet. A hop to a loopback literal, to a name that
-    /// resolves to loopback, or to another scheme adds no host, and its
-    /// address is never probed. The declared source stays.
+    /// NET-167: a source is probed only at a public `http` or `https`
+    /// address. A declared source on loopback adds no host and is never
+    /// probed from the host.
+    #[tokio::test]
+    async fn a_declared_source_off_the_public_internet_adds_no_host() {
+        let (port, taken) = redirecting_server(vec![String::new()]).await;
+        let hosts = source_hosts(&[format!("http://127.0.0.1:{port}/one")]).await;
+        assert!(hosts.is_empty(), "{hosts:?}");
+        assert_eq!(taken.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let hosts = source_hosts(&[format!("http://localhost:{port}/one")]).await;
+        assert!(hosts.is_empty(), "{hosts:?}");
+        assert_eq!(taken.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// NET-167: a redirect is followed only to an `http` or `https` URL at
+    /// an address the walk admits. A hop to another address, to a name that
+    /// resolves off the public internet, or to another scheme adds no host,
+    /// and its address is never probed. The declared source stays.
     #[tokio::test]
     async fn a_redirect_off_the_public_internet_adds_no_host() {
-        for target in ["http://127.0.0.2:{port}/two", "http://localhost:{port}/two"] {
-            let (port, taken) = redirecting_server(vec![String::new()]).await;
-            let location = target.replace("{port}", &port.to_string());
-            let (first, _) = redirecting_server(vec![location.clone()]).await;
-            let hosts = source_hosts(&[format!("http://127.0.0.1:{first}/one")]).await;
-            assert_eq!(
-                hosts.into_iter().collect::<Vec<_>>(),
-                ["127.0.0.1"],
-                "{location}"
-            );
-            assert_eq!(
-                taken.load(std::sync::atomic::Ordering::SeqCst),
-                0,
-                "{location} was probed"
-            );
+        fn only_127_0_0_1(ip: std::net::IpAddr) -> bool {
+            ip == std::net::IpAddr::from([127, 0, 0, 1])
         }
+        let (port, taken) = redirecting_server(vec![String::new()]).await;
+        let location = format!("http://127.0.0.2:{port}/two");
+        let (first, _) = redirecting_server(vec![location.clone()]).await;
+        let hosts =
+            source_hosts_admitting(&[format!("http://127.0.0.1:{first}/one")], only_127_0_0_1)
+                .await;
+        assert_eq!(hosts.into_iter().collect::<Vec<_>>(), ["127.0.0.1"]);
+        assert_eq!(
+            taken.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "{location} was probed"
+        );
+        let localhost = reqwest::Url::parse(&format!("http://localhost:{port}/two")).unwrap();
+        assert!(
+            redirect_addresses(&localhost, is_public_address)
+                .await
+                .is_none()
+        );
+
         let (first, _) = redirecting_server(vec!["file:///etc/passwd".to_string()]).await;
         let hosts =
             source_hosts_admitting(&[format!("http://127.0.0.1:{first}/one")], |_| true).await;
