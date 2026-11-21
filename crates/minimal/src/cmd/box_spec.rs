@@ -1154,6 +1154,7 @@ fn expand_entry(
             .collect(),
     );
     let mut ingress_sources = vec![COMMAND_LINE.to_owned()];
+    let mut none_flag_cleared = false;
     let (mode, mode_source, egress, ingress) = if box_type == boxes::TASK_BOX_TYPE {
         let project_egress = super::box_verbs::task_project_egress(&root, &entry.name)?;
         let flags = super::box_verbs::flag_egress(&overrides.egress)?;
@@ -1178,6 +1179,12 @@ fn expand_entry(
         activate.egress.clone_from(&overrides.egress);
         let (port_mappings, flags) = super::box_verbs::flag_network_overrides(&activate)?;
         let mut project_egress = super::box_verbs::project_egress(&root, Some(&entry.name))?;
+        // gominimal/arch#200: as the start does, `--network none` drops the
+        // entry's `network.egress` and `network.ingress`.
+        none_flag_cleared = super::box_verbs::clear_file_network_on_none_flag(
+            &mut project_egress,
+            overrides.network,
+        );
         // #3238: as `min box start` sends them, the entry's `network.mode`
         // applies when no `--network` replaces it, and each `--ingress` adds
         // a mapping after the entry's `network.ingress`.
@@ -1240,6 +1247,10 @@ fn expand_entry(
             network.remove("egress");
             sources.remove("network.egress");
         }
+    }
+    if none_flag_cleared && ingress.is_none() {
+        network.remove("ingress");
+        sources.remove("network.ingress");
     }
     if let Some(ingress) = ingress {
         network.insert(

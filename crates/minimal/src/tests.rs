@@ -19517,6 +19517,92 @@ fn box_spec_keeps_earlier_network_egress_ingress_refusal_names_each_table() {
     );
 }
 
+/// A project whose session entry inherits `egress` and `ingress` from
+/// `[defaults.network]`, for the `--network none` cases.
+const NETWORK_NONE_FLAG_FILE: &str = "[defaults.network]\n\
+     mode = \"own_ip\"\n\
+     egress = { allow_dns_hosts = [\"a.example\"] }\n\
+     ingress = [{ port = 8080 }]\n\n\
+     [sessions.default]\n\
+     packages = [\"git\"]\n";
+
+// gominimal/arch#200: `min box spec <entry> --network none` drops the
+// entry's inherited `egress` and `ingress`, as a layer's `mode = "none"`
+// does, and renders without a refusal.
+#[tokio::test]
+async fn network_none_flag_drops_file_egress_and_ingress_in_box_spec() {
+    let (_project, global) = spec_project(NETWORK_NONE_FLAG_FILE);
+
+    let toml = box_spec_text(&global, &["min", "box", "spec", "default"])
+        .await
+        .expect("the entry renders");
+    let parsed: toml::Table = toml::from_str(&toml).expect("the render is TOML");
+    let network = parsed["network"].as_table().expect("a network table");
+    assert!(network.contains_key("egress"), "{toml}");
+    assert!(network.contains_key("ingress"), "{toml}");
+
+    let toml = box_spec_text(
+        &global,
+        &["min", "box", "spec", "default", "--network", "none"],
+    )
+    .await
+    .expect("the entry renders with --network none");
+    let parsed: toml::Table = toml::from_str(&toml).expect("the render is TOML");
+    let network = parsed["network"].as_table().expect("a network table");
+    assert_eq!(network["mode"].as_str(), Some("none"), "{toml}");
+    assert!(!network.contains_key("egress"), "{toml}");
+    assert!(!network.contains_key("ingress"), "{toml}");
+    assert!(!toml.contains("# network.egress:"), "{toml}");
+    assert!(!toml.contains("# network.ingress:"), "{toml}");
+
+    let json = box_spec_text(
+        &global,
+        &[
+            "min",
+            "box",
+            "spec",
+            "default",
+            "--network",
+            "none",
+            "-o",
+            "json",
+        ],
+    )
+    .await
+    .expect("the entry renders as JSON");
+    let doc: serde_json_lenient::Value = serde_json_lenient::from_str(&json).expect("JSON");
+    let network = &doc["spec"]["network"];
+    assert_eq!(network["mode"], "none", "{json}");
+    assert!(network.get("egress").is_none(), "{json}");
+    assert!(network.get("ingress").is_none(), "{json}");
+}
+
+// gominimal/arch#200: `min session start --network none` creates the box
+// with neither the `egress` nor the `ingress` that the entry inherits.
+#[test]
+fn network_none_flag_drops_file_egress_and_ingress_on_start() {
+    let (project, _global) = spec_project(NETWORK_NONE_FLAG_FILE);
+    let root = camino::Utf8Path::from_path(project.path()).unwrap();
+    let options = ActivationOptions::default();
+
+    let request = planned_session_request(&ActivateArgs::unflagged(), &options, root);
+    assert!(request.config.policy.egress.is_some());
+    assert!(request.config.policy.ingress.is_some());
+
+    let mut args = ActivateArgs::unflagged();
+    args.network = Some(crate::cli::CliNetworkMode::NoNet);
+    let request = planned_session_request_checked(&args, &options, root)
+        .expect("--network none is not refused");
+    assert_eq!(request.config.network, boxes::NetworkMode::NoNet);
+    assert_eq!(request.config.policy.egress, None);
+    assert_eq!(request.config.policy.ingress, None);
+    let sent: mfile::spec::BoxSpec =
+        serde_json_lenient::from_value(request.spec.clone().unwrap()).unwrap();
+    assert_eq!(sent.network.mode, boxes::NetworkMode::NoNet);
+    assert_eq!(sent.network.policy.egress, None);
+    assert_eq!(sent.network.policy.ingress, None);
+}
+
 // D3598: bare `min box spec` reads the expanded session entry, so a
 // `[defaults.network.bep]` steering mode reaches its steering row, the same
 // value that `min box spec default` shows.

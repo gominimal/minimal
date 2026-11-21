@@ -152,6 +152,7 @@ pub(crate) fn session_box_network(
     project: &mut ProjectEgress,
     flag_mappings: Vec<boxes::PortMapping>,
 ) -> anyhow::Result<(crate::cli::CliNetworkMode, Vec<boxes::PortMapping>)> {
+    clear_file_network_on_none_flag(project, args.network);
     let file_ingress = project.ingress.take();
     let network_flagged = args.network.is_some();
     let network = args
@@ -182,6 +183,30 @@ pub(crate) fn session_box_network(
         "the session box takes the entry's network.ingress and the --ingress mappings"
     );
     Ok((network, union_ingress(file_mappings, flag_mappings)))
+}
+
+/// `--network none` clears the `network.egress` and `network.ingress` that
+/// the entry's layers set, as a layer's `mode = "none"` clears the ones it
+/// inherits (gominimal/arch#200). The other network flags change only the
+/// key they name. Returns whether the flag cleared them.
+pub(crate) fn clear_file_network_on_none_flag(
+    project: &mut ProjectEgress,
+    network: Option<crate::cli::CliNetworkMode>,
+) -> bool {
+    if network != Some(crate::cli::CliNetworkMode::NoNet) {
+        return false;
+    }
+    if project.policy.is_some() || project.ingress.is_some() {
+        tracing::debug!(
+            egress_layer = ?project.layer.as_ref().filter(|_| project.policy.is_some()),
+            ingress_layer = ?project.ingress_layer,
+            "--network none clears the entry's network.egress and network.ingress"
+        );
+    }
+    project.policy = None;
+    project.ingress = None;
+    project.ingress_layer = None;
+    true
 }
 
 /// The entry's `network.ingress` mappings followed by the `--ingress`
