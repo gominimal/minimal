@@ -18299,3 +18299,51 @@ fn a_scaffold_over_a_link_out_of_the_workspace_is_refused() {
     assert_eq!(std::fs::read_to_string(&outside).unwrap(), "# outside\n");
     assert_eq!(std::fs::read_link(&link).unwrap(), outside);
 }
+
+/// NET-079: a daemon-side task of a host-address box runs in the leaf its
+/// launch placed the box in, the deny leaf of a deny-all box and the allow
+/// leaf of an allowed one. A box with no leaf has none.
+#[test]
+fn a_daemon_side_task_runs_in_the_box_leaf() {
+    use sandbox::config::Verdict;
+
+    let tree = tempfile::tempdir().unwrap();
+    let root = tree.path();
+    assert_eq!(super::setup::box_task_leaf(root, "sealed"), None);
+
+    let deny_dir = sandbox::classifier::box_leaf(root, "sealed", Verdict::Deny);
+    std::fs::create_dir_all(&deny_dir).unwrap();
+    let allow_dir = sandbox::classifier::box_leaf(root, "open", Verdict::Allow);
+    std::fs::create_dir_all(&allow_dir).unwrap();
+
+    let sealed = super::setup::box_task_leaf(root, "sealed").expect("the deny-all box's leaf");
+    assert_eq!(sealed.dir(), deny_dir);
+    assert!(sealed.is_deny());
+    let open = super::setup::box_task_leaf(root, "open").expect("the allowed box's leaf");
+    assert_eq!(open.dir(), allow_dir);
+    assert!(!open.is_deny());
+}
+
+/// NET-079: a task of a box whose launch placed it in a classifier leaf is
+/// refused when the task's context has no leaf, so it never runs outside
+/// the box's egress verdict. A box that was never placed runs its task.
+#[test]
+fn a_daemon_side_task_of_a_placed_box_without_its_leaf_is_refused() {
+    let refusal =
+        crate::exec::task_leaf_refusal(Some(boxes::HostIpEnforcement::PerBox), "sealed", false)
+            .expect_err("a placed box with no leaf has its task refused");
+    assert_eq!(refusal.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        refusal.to_string(),
+        "the task for box sealed did not start: box sealed runs under \
+         egress rules, and its shell is not running to apply them to the \
+         task. Run `min session attach sealed` to start its shell, then \
+         run the task again."
+    );
+    crate::exec::task_leaf_refusal(Some(boxes::HostIpEnforcement::PerBox), "sealed", true)
+        .expect("a placed box with its leaf runs its task");
+    for enforcement in [None, Some(boxes::HostIpEnforcement::None)] {
+        crate::exec::task_leaf_refusal(enforcement, "plain", false)
+            .expect("a box that was never placed runs its task without a leaf");
+    }
+}

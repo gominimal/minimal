@@ -1051,7 +1051,23 @@ impl BoxActor {
             ));
         }
 
-        self.build_context(scaffold_if_missing).await
+        let ctx = self.build_context(scaffold_if_missing).await?;
+        // NET-079: a task env this context makes runs in the box's leaf
+        // while the box has one, so a daemon-side task run follows the box's
+        // egress verdict, as an in-box one does. The leaf places task envs
+        // only: package builds take their build box from `build_boxes`. The
+        // lookup does not refuse: a relaunch asks for this context before
+        // its launch creates the leaf again. The task path refuses a placed
+        // box whose leaf is gone (`exec::task_leaf_refusal`).
+        Ok(
+            match box_task_leaf(
+                std::path::Path::new(sandbox::classifier::TREE_ROOT),
+                &record.id.to_string(),
+            ) {
+                Some(leaf) => ctx.with_classifier_leaf(leaf),
+                None => ctx,
+            },
+        )
     }
 
     /// The mctx [`Config`] rooted at this session's workspace, shared by the
@@ -1373,4 +1389,38 @@ impl BoxActor {
             }
         }
     }
+}
+
+/// The classifier leaf a task of the box `box_id` runs in (NET-079): the
+/// leaf the box's launch placed it in, under `root`, or `None` when it has
+/// none. The launch places a box in exactly one subtree, so the leaf is the
+/// one of the two that exists.
+pub(crate) fn box_task_leaf(
+    root: &std::path::Path,
+    box_id: &str,
+) -> Option<sandbox::config::ClassifierLeaf> {
+    [
+        sandbox::config::Verdict::Deny,
+        sandbox::config::Verdict::Allow,
+    ]
+    .into_iter()
+    .map(|verdict| sandbox::config::ClassifierLeaf::under(root, box_id, verdict))
+    .find(|leaf| leaf.dir().is_dir())
+}
+
+/// The refusal for a task of the box `box_name` when its launch placed it in
+/// a classifier leaf and that leaf is gone (NET-079).
+///
+/// Only an Active box reaches this refusal: `context()` refuses a stopped or
+/// exited box first. An Active placed box loses its leaf when its shell ends
+/// (the host's teardown removes the leaf). An attach with no running shell
+/// starts a new one, and that launch places the box in a leaf again, so the
+/// attach is the next step.
+pub(crate) fn placed_box_task_refusal(box_name: &str) -> String {
+    format!(
+        "the task for box {box_name} did not start: box {box_name} runs under \
+         egress rules, and its shell is not running to apply them to the task. \
+         Run `min session attach {box_name}` to start its shell, then run the \
+         task again."
+    )
 }

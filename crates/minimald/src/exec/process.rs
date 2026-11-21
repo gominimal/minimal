@@ -322,6 +322,28 @@ pub(super) fn parse_task_args(
         .map_err(|e| e.to_string())
 }
 
+/// Refuses a task (NET-079) when the box's launch placed it in a classifier
+/// leaf (`enforcement` is [`boxes::HostIpEnforcement::PerBox`]) and the
+/// task's context has no leaf. Such a task would run outside the box's
+/// egress verdict. A box that was never placed runs its task as before.
+pub(crate) fn task_leaf_refusal(
+    enforcement: Option<boxes::HostIpEnforcement>,
+    box_name: &str,
+    has_leaf: bool,
+) -> io::Result<()> {
+    if enforcement == Some(boxes::HostIpEnforcement::PerBox) && !has_leaf {
+        tracing::warn!(
+            box_name = %box_name,
+            "refusing a task of a placed box whose classifier leaf is missing",
+        );
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            crate::box_actor::placed_box_task_refusal(box_name),
+        ));
+    }
+    Ok(())
+}
+
 /// Applies the client's resolution of a task's `env_vars` over the task's
 /// own declarations: the names the client dropped go, then the values it
 /// resolved are set.
@@ -447,6 +469,20 @@ pub(super) async fn task_producer(
             // sandbox path's tail so the bridge sees a clean end-of-stream.
             let _ = req_rx.recv().await;
             return Ok(());
+        }
+
+        // NET-079: a task of a box whose launch placed it in a classifier
+        // leaf runs in that leaf. A placed box whose leaf is gone has its
+        // task refused here, never run outside the box's egress verdict. The
+        // context lookup does not refuse, because a relaunch uses it too.
+        {
+            let record = session.record().await?;
+            let box_name = record.name.clone().unwrap_or_else(|| record.id.to_string());
+            task_leaf_refusal(
+                record.host_ip_enforcement,
+                &box_name,
+                ctx.classifier_leaf().is_some(),
+            )?;
         }
 
         // `graph_from_all_packages` is CPU-heavy (nickel evaluation,
