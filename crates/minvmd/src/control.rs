@@ -2512,15 +2512,6 @@ fn allocate_box_address_keeping(
     })
 }
 
-/// Serves a renamed session's rename of its box (#1116): the registry
-/// re-keys the row, its task rows and its creation to the new name
-/// ([`BoxRegistry::rename_client_box`]) and pings the table, so the zone
-/// answers the box's address under the new name and nothing under the old
-/// one. The answerer's book follows on the publish the ping sets off: the
-/// row carries the same address under the new name, and the book records
-/// the address against the name the row now has. Answered with the pair
-/// echoed; a refusal is an error sentence and moves nothing. One info line
-/// names both names and the pair.
 /// Release the declared forwards of the stopped box the request's pair and
 /// id prove (NET-121), and build the reply: the pair echoed back once every
 /// forward is unbound, or when no row stands at the pair, and the reason
@@ -2584,6 +2575,15 @@ fn release_box_forwards(
     BoxControlReply::Error { error }
 }
 
+/// Serves a renamed session's rename of its box (#1116): the registry
+/// re-keys the row, its task rows and its creation to the new name
+/// ([`BoxRegistry::rename_client_box`]) and pings the table, so the zone
+/// answers the box's address under the new name and nothing under the old
+/// one. The answerer's book follows on the publish the ping sets off: the
+/// row carries the same address under the new name, and the book records
+/// the address against the name the row now has. Answered with the pair
+/// echoed; a refusal is an error sentence and moves nothing. One info line
+/// names both names and the pair.
 fn rename_box(boxes: &BoxRegistry, request: &RenameBoxRequest) -> BoxControlReply {
     match boxes.rename_client_box(
         &request.new_name,
