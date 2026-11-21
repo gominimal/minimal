@@ -479,12 +479,7 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
 /// `url` without its credentials, its query and its fragment, or `None`
 /// when it is not a URL.
 pub(crate) fn stripped_url(url: &str) -> Option<String> {
-    let mut parsed = url::Url::parse(url).ok()?;
-    let _ = parsed.set_username("");
-    let _ = parsed.set_password(None);
-    parsed.set_query(None);
-    parsed.set_fragment(None);
-    Some(parsed.to_string())
+    common::stripped_url(url)
 }
 
 /// `text` with each URL in it stripped as `stripped_url` strips one. A URL

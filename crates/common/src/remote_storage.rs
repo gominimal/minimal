@@ -142,6 +142,17 @@ impl FetchBackend for BoundedStorage<'_> {
     }
 }
 
+/// `url` without its credentials, its query and its fragment, or `None`
+/// when it is not a URL.
+pub fn stripped_url(url: &str) -> Option<String> {
+    let mut parsed = url::Url::parse(url).ok()?;
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    Some(parsed.to_string())
+}
+
 #[derive(Debug, Clone)]
 pub struct RemoteStorage {
     client: Storage,
@@ -190,7 +201,10 @@ impl RemoteStorage {
     /// The host name is asked of the placement's name servers, from a UDP
     /// socket created in the same place, so those rules decide the name
     /// query too. A cgroup uses the `nameserver` lines of `/etc/resolv.conf`.
-    #[tracing::instrument]
+    // The span records the URL without its credentials, query and
+    // fragment, so a signed or authenticated source URL keeps its secrets
+    // out of the trace.
+    #[tracing::instrument(skip(url), fields(url = stripped_url(url)))]
     pub async fn download_web_with_verification_and_caching(
         &self,
         url: &str,
@@ -256,7 +270,7 @@ impl RemoteStorage {
     /// with a placement. It returns the file and whether the download asked
     /// for a connection. `false` says that the download cache served the
     /// file and no connection opened.
-    #[tracing::instrument]
+    #[tracing::instrument(skip(url), fields(url = stripped_url(url)))]
     pub async fn download_web_placed(
         &self,
         url: &str,
@@ -2283,5 +2297,111 @@ mod connect_tests {
         let clients = google_cloud_storage::Error::timeout("the client's own deadline");
         let text = clients.to_string();
         assert_eq!(gcs_failure(clients, bound).to_string(), text);
+    }
+}
+
+#[cfg(test)]
+mod span_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+
+    /// Records every span field as `span.field=value`.
+    #[derive(Default)]
+    struct Fields(Arc<Mutex<Vec<String>>>);
+
+    struct Collect<'a>(&'a str, &'a mut Vec<String>);
+
+    impl Visit for Collect<'_> {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.1
+                .push(format!("{}.{}={:?}", self.0, field.name(), value));
+        }
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.1
+                .push(format!("{}.{}={}", self.0, field.name(), value));
+        }
+    }
+
+    impl tracing::Subscriber for Fields {
+        fn register_callsite(
+            &self,
+            _: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::always()
+        }
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, span: &Attributes<'_>) -> Id {
+            let mut seen = self.0.lock().unwrap();
+            span.record(&mut Collect(span.metadata().name(), &mut seen));
+            Id::from_u64(seen.len() as u64 + 1)
+        }
+        fn record(&self, _: &Id, values: &Record<'_>) {
+            values.record(&mut Collect("record", &mut self.0.lock().unwrap()));
+        }
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {}
+        fn enter(&self, _: &Id) {}
+        fn exit(&self, _: &Id) {}
+    }
+
+    /// A source URL with credentials and a signed query shows in the
+    /// download_web spans as scheme, host and path only.
+    #[tokio::test]
+    async fn download_web_spans_record_a_stripped_url() {
+        let closed = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = closed.local_addr().unwrap();
+        drop(closed);
+        let url = format!(
+            "https://user:hunter2@{addr}/pkg.tar.gz?X-Goog-Signature=s3cr3ttoken#fragsecret"
+        );
+        let shown = format!("https://{addr}/pkg.tar.gz");
+        assert_eq!(stripped_url(&url).as_deref(), Some(shown.as_str()));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = RemoteStorage::new(tmp.path().to_path_buf(), false)
+            .await
+            .unwrap();
+        let sha = "0".repeat(64);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let _guard =
+            tracing::dispatcher::set_default(&tracing::Dispatch::new(Fields(seen.clone())));
+
+        storage
+            .download_web_with_verification_and_caching(&url, &sha, None, &OpTracker::new_root())
+            .await
+            .expect_err("the port is closed");
+        storage
+            .download_web_placed(
+                &url,
+                &sha,
+                &Placement::Refused("no network in this test"),
+                &OpTracker::new_root(),
+            )
+            .await
+            .expect_err("the placement refuses");
+
+        let seen = seen.lock().unwrap().join("\n");
+        for span in [
+            "download_web_with_verification_and_caching",
+            "download_web_placed",
+        ] {
+            let field = format!("{span}.url={shown}");
+            assert!(seen.contains(&field), "{field} in {seen}");
+        }
+        for secret in [
+            "hunter2",
+            "s3cr3ttoken",
+            "X-Goog-Signature",
+            "fragsecret",
+            "user:",
+        ] {
+            assert!(!seen.contains(secret), "{secret} in {seen}");
+        }
     }
 }
