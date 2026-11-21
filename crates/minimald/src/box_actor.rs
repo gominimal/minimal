@@ -1733,7 +1733,7 @@ impl BoxActor {
             std::io::ErrorKind::AlreadyExists,
             format!(
                 "The running session `{holder}` holds the name `{name}`. Rename it \
-                 with `min session rename {holder_id} <new-name>`{then}."
+                 with `min box rename {holder_id} <new-name>`{then}."
             ),
         ))
     }

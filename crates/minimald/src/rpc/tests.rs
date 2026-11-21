@@ -4303,7 +4303,7 @@ async fn create_session_errors_if_name_not_unique() {
     assert!(error.contains("`my-session`"), "{error}");
     assert!(error.contains(&id.to_string()), "{error}");
     assert!(
-        error.contains(&format!("min session rename {id} <new-name>")),
+        error.contains(&format!("min box rename {id} <new-name>")),
         "{error}"
     );
 }

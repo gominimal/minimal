@@ -2085,7 +2085,7 @@ pub mod box_name {
                 } => write!(
                     f,
                     "The running session `{holder_name}` ({holder}) holds the name `{name}`. \
-                     Rename it with `min session rename {holder} <new-name>`, \
+                     Rename it with `min box rename {holder} <new-name>`, \
                      or choose another name."
                 ),
                 Self::Reserved => write!(
