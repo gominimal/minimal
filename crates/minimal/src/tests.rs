@@ -26550,3 +26550,85 @@ fn setup_zed_unchanged() {
             .any(|v| v == "setup-zed")
     );
 }
+
+/// BCLI-034: every refusal that carries its own exit code carries the one
+/// the exit-code table gives its outcome: 2 for a usage or state error, 3
+/// for a project file or a spec that does not load, 4 for a thing not
+/// found, and 124 for a timeout. `main.rs`'s `exit_code_table` pins how
+/// each one reaches the process exit status.
+#[test]
+fn exit_code_table_refusal_codes() {
+    const USAGE: u8 = 2;
+    const CONFIG: u8 = 3;
+    const NOT_FOUND: u8 = 4;
+    const TIMEOUT: u8 = 124;
+    for (outcome, code, row) in [
+        ("rm of a running box", BoxRunningRefusal::EXIT_CODE, USAGE),
+        (
+            "rename to a refused name",
+            BoxRenameRefusal::EXIT_CODE,
+            USAGE,
+        ),
+        ("prune off a terminal", PruneNeedsYes::EXIT_CODE, USAGE),
+        ("network flag refused", NetworkFlagRefusal::EXIT_CODE, USAGE),
+        (
+            "session entry undecided",
+            SessionEntryUndecided::EXIT_CODE,
+            USAGE,
+        ),
+        (
+            "start needs a terminal",
+            StartNeedsTerminal::EXIT_CODE,
+            USAGE,
+        ),
+        ("start name held", StartNameHeld::EXIT_CODE, USAGE),
+        (
+            "create name held",
+            minimald_rpc::HeldNameRefusal::EXIT_CODE,
+            USAGE,
+        ),
+        (
+            "run flag misplaced",
+            task::RunFlagMisplaced::EXIT_CODE,
+            USAGE,
+        ),
+        (
+            "run needs a terminal",
+            task::RunNeedsTerminal::EXIT_CODE,
+            USAGE,
+        ),
+        (
+            "task network unapplied",
+            TaskNetworkUnapplied::EXIT_CODE,
+            CONFIG,
+        ),
+        ("spec file invalid", SpecFileInvalid::EXIT_CODE, CONFIG),
+        ("box types invalid", BoxTypesInvalid::EXIT_CODE, CONFIG),
+        (
+            "task file invalid",
+            task::TaskFileInvalid::EXIT_CODE,
+            CONFIG,
+        ),
+        ("box type not found", BoxTypeNotFound::EXIT_CODE, NOT_FOUND),
+        (
+            "project file not found",
+            task::ProjectFileNotFound::EXIT_CODE,
+            NOT_FOUND,
+        ),
+        ("task not found", task::TaskNotFound::EXIT_CODE, NOT_FOUND),
+        (
+            "loadout not found",
+            loadouts::LoadoutNotFound::EXIT_CODE,
+            NOT_FOUND,
+        ),
+        (
+            "local host not found",
+            hosts::LocalHostNotFound::EXIT_CODE,
+            NOT_FOUND,
+        ),
+        ("box timed out", BoxTimedOut::EXIT_CODE, TIMEOUT),
+        ("exec timed out", BoxExecTimedOut::EXIT_CODE, TIMEOUT),
+    ] {
+        assert_eq!(code, row, "{outcome}");
+    }
+}

@@ -63,9 +63,8 @@ async fn run() -> ExitCode {
 
     // Publish `--vm` before any path resolution, so the socket, the state dir,
     // and any autospawn all name the same VM (NET-052).
-    if let Err(e) = cli.global_args.publish_vm_name() {
-        eprintln!("error: {e:#}");
-        return ExitCode::FAILURE;
+    if let Some(code) = answer_vm_name(&cli.global_args, &mut std::io::stderr()) {
+        return code;
     }
 
     // OTel export (opt-in: MINIMAL_TELEMETRY=1 plus an OTLP endpoint; see
@@ -170,6 +169,27 @@ async fn run() -> ExitCode {
     }
     ExitCode::SUCCESS
 }
+
+/// Publish `--vm` before the command runs. A name the naming rule refuses
+/// is a usage error, so it ends with exit 2, as a command line `min` cannot
+/// parse does (BCLI-034). The text is unchanged. `None` means the run goes
+/// on.
+#[expect(
+    clippy::let_underscore_must_use,
+    reason = "a closed stderr has no reader left to tell; the exit status is \
+              the failure's answer either way"
+)]
+fn answer_vm_name(
+    global_args: &minimal::GlobalArgs,
+    stderr: &mut dyn std::io::Write,
+) -> Option<ExitCode> {
+    let e = global_args.publish_vm_name().err()?;
+    let _ = writeln!(stderr, "error: {e:#}");
+    Some(ExitCode::from(USAGE_EXIT_CODE))
+}
+
+/// The exit code of a usage error in the architecture's exit-code table.
+const USAGE_EXIT_CODE: u8 = 2;
 
 /// How a failed run ends: the exit code, and what goes to `stderr`. The run's
 /// stdout is not a parameter, so a failure writes nothing there.
@@ -2033,5 +2053,112 @@ mod tests {
 
         let other = anyhow::anyhow!("something else");
         assert!(!is_broken_pipe(&other));
+    }
+
+    /// BCLI-034: each error kind ends with the exit code the exit-code
+    /// table gives it, and the machine-mode object names the same kind.
+    /// The [proposed] rows (8, `insufficient_resources`, and 5's provider
+    /// quota) are outside the requirement, so they are not pinned here.
+    #[test]
+    fn exit_code_table() {
+        let address = |s: &str| s.to_owned();
+        let daemon = |code: &str, exit_code: u8| {
+            anyhow::Error::new(minimal::DaemonCreateRefusal {
+                message: "Cannot create the box.".to_string(),
+                code: Some(code.to_string()),
+                exit_code,
+                hint: String::new(),
+            })
+        };
+        let rows: Vec<(anyhow::Error, &str, u8)> = vec![
+            (
+                anyhow::Error::from(minimal::BoxAddressRefusal::Ambiguous {
+                    name: address("web"),
+                    candidates: Vec::new(),
+                }),
+                "ambiguous",
+                2,
+            ),
+            (
+                anyhow::Error::from(minimal::BoxAddressRefusal::NotFound {
+                    address: address("web"),
+                }),
+                "not_found",
+                4,
+            ),
+            (
+                minimal_client::box_registration::HostUnreachable::error("no answer"),
+                "host_unreachable",
+                7,
+            ),
+            (
+                daemon(boxes::core::bep::GITHUB_SIGN_IN_REQUIRED, 3),
+                "github_sign_in_required",
+                3,
+            ),
+            (
+                daemon(boxes::core::bep::GATEHOUSE_UNENROLLED_NODE, 5),
+                "gatehouse_unenrolled_node",
+                5,
+            ),
+            (
+                anyhow::Error::new(minimal::BoxTimedOut::ended("web")),
+                "timeout",
+                124,
+            ),
+            (
+                anyhow::Error::new(minimal::BoxExecTimedOut::exec("web", 30)),
+                "timeout",
+                124,
+            ),
+            (
+                anyhow::Error::new(minimal::BoxTimedOut::waited(
+                    Some("web"),
+                    "0190a3c4-0000-7000-8000-000000000000",
+                    "30s",
+                )),
+                "wait_timeout",
+                124,
+            ),
+            (
+                anyhow::Error::new(std::io::Error::other("no space left on device"))
+                    .context(minimal::OutputWriteError),
+                "output_failed",
+                1,
+            ),
+            (anyhow::anyhow!("something else"), "unspecified", 1),
+        ];
+        for (err, kind, exit) in rows {
+            assert_eq!(failure_exit_code(&err), exit, "{err:#}");
+            let MachineModeAnswer::Object(failure) = machine_mode_answer(&err) else {
+                panic!("a failure is an error object: {err:#}");
+            };
+            assert_eq!(failure.code(), kind, "{err:#}");
+            // Both output modes end with the same code.
+            for machine in [false, true] {
+                assert_eq!(
+                    answer_failure(&err, machine, false, None, &mut Vec::new()),
+                    ExitCode::from(exit),
+                    "{err:#}"
+                );
+            }
+        }
+    }
+
+    /// BCLI-034: a `--vm` name the naming rule refuses is a usage error. It
+    /// ends with 2 before the command runs, and keeps its text.
+    #[test]
+    fn exit_code_table_invalid_vm_name_is_usage() {
+        let cli = minimal::Cli::try_parse_from(["min", "--vm=-bad", "version"])
+            .expect("the flag parses, and the name is checked after");
+        let mut stderr = Vec::new();
+        assert_eq!(
+            answer_vm_name(&cli.global_args, &mut stderr),
+            Some(ExitCode::from(2))
+        );
+        let text = String::from_utf8(stderr).unwrap();
+        assert!(text.starts_with("error: --vm: "), "{text}");
+        let cli = minimal::Cli::try_parse_from(["min", "version"]).unwrap();
+        assert_eq!(answer_vm_name(&cli.global_args, &mut Vec::new()), None);
     }
 }
