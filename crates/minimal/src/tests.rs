@@ -25607,6 +25607,41 @@ async fn daemon_only_broker_refusal_exits_5() {
     assert_eq!(plain.to_string(), refused.message);
 }
 
+// #3313: a spec that breaks its built-in root's constraints, and that the
+// client check lets through, is refused at the daemon's admission
+// (BOX-160). The refusal reaches `min` with its exit code, so the command
+// exits 3 with the daemon's text, not 1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_only_admission_refusal_exits_3() {
+    let server = minimald::test_harness::TestServer::new().await;
+    let mut daemon = server.connect().await;
+    let mut request = minimald::test_harness::create_session_req("rooted", "/tmp");
+    request.config.creating_verb = minimald_rpc::CreatingVerb::Session;
+    let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+    spec.pty_enabled = false;
+    request.spec = Some(serde_json_lenient::to_value(&spec).expect("a spec serializes"));
+
+    let error = match daemon.call::<minimald_rpc::CreateSession>(&request).await {
+        minimald_rpc::CreateSessionReply::Err {
+            error,
+            code,
+            exit_code,
+            hint,
+        } => crate::create_refusal(error, code, exit_code, hint),
+        minimald_rpc::CreateSessionReply::Ok(created) => {
+            panic!("the daemon refuses the spec, not {created:?}")
+        }
+    };
+    let refused = error
+        .downcast_ref::<crate::DaemonCreateRefusal>()
+        .unwrap_or_else(|| panic!("the refusal keeps its exit code: {error:#}"));
+    assert_eq!(refused.exit_code, 3, "{error:#}");
+    assert_eq!(refused.code, None, "{error:#}");
+    let text = error.to_string();
+    assert!(text.contains("`io.pty_enabled`"), "{text}");
+    assert!(text.contains("No box was created."), "{text}");
+}
+
 /// NET-138: an interactive attach that the in-VM daemon refuses because the
 /// VM host withdrew the box's row ends with its own status. The client then
 /// asks the VM host for the row back with a resume, presenting the record's
