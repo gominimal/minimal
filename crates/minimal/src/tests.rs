@@ -26416,8 +26416,8 @@ fn cli_reference_documents_box_grammar() {
         };
         let points_to_start = section.contains("session start");
         for flag in visible_long_flags(&model_verb(noun, verb)) {
-            let documented = names_flag(section, &flag)
-                || (points_to_start && names_flag(session_start, &flag));
+            let documented =
+                names_flag(section, &flag) || (points_to_start && names_flag(session_start, &flag));
             if !documented {
                 missing.push(format!("min {noun} {verb}: {flag}"));
             }
