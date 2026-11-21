@@ -1531,7 +1531,8 @@ fn oversized_listen_notice(request: &BoxControlRequest, line: &str) -> Option<Bo
 /// own services, read from this daemon's own configuration and never from
 /// a guest report: the vsock ports it bridges (the in-VM daemon's RPC
 /// bridge, the boot marker, the timekeep bridge, the report door and the
-/// telemetry port), the zone answerer's port, the range probe's port, and
+/// telemetry port), the zone answerer's port (the default or the operator's
+/// pin, [`crate::net::answerer::hook_port`]), the range probe's port, and
 /// the node row's admitted ports, which hold the hostname proxy's port the
 /// host assigned before boot.
 pub(crate) fn guest_infrastructure_ports(boxes: &BoxRegistry) -> std::collections::BTreeSet<u16> {
@@ -1546,7 +1547,7 @@ pub(crate) fn guest_infrastructure_ports(boxes: &BoxRegistry) -> std::collection
         .into_iter()
         .filter_map(|port| u16::try_from(port).ok())
         .collect();
-    ports.insert(crate::net::answerer::DEFAULT_ANSWERER_PORT);
+    ports.insert(crate::net::answerer::hook_port());
     ports.insert(switch::loopback::RANGE_PROBE_PORT);
     if let Some(node) = boxes.table().by_source(boxes.subnet().daemon_ip().octets()) {
         ports.extend(node.admitted_ports().iter().copied());

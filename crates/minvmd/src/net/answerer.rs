@@ -120,6 +120,88 @@ const COMPONENT: &str = "zone-answerer";
 /// answerer port — which the guest now binds nothing on — still is).
 pub const DEFAULT_ANSWERER_PORT: u16 = 7656;
 
+/// The environment variable the operator pins this daemon's answerer hook
+/// port with, read by `minvmd run` when it starts: the VM-backed
+/// counterpart of `minimald run --zone-answerer-port`. It is an env var
+/// beside `MINVMD_NODE_PROXY_PORT` because the supervisor's ports are set
+/// that way, not by `minvmd config set` (which holds the VM's sizing).
+/// Unset is [`DEFAULT_ANSWERER_PORT`]. As on the native daemon there is no
+/// select-when-busy and no off: the port is the one a host resolver is
+/// routed to, so `0` is refused rather than read as "any port". A pin moves
+/// only this daemon's bind and the ports it reserves for the answerer; an
+/// installed DNS service keeps its own port, and a daemon that finds a
+/// channel publishes there whatever its pin.
+pub const ANSWERER_PORT_ENV: &str = "MINVMD_ZONE_ANSWERER_PORT";
+
+/// The hook port this process resolved at start ([`configure_hook_port`]).
+static HOOK_PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+
+/// Decodes the answerer's hook port from the raw value of
+/// [`ANSWERER_PORT_ENV`]: absent is [`DEFAULT_ANSWERER_PORT`], and a value
+/// that is not a port from 1 to 65535 is an error naming the variable and
+/// the value.
+///
+/// # Errors
+///
+/// Returns the message to fail the start with when `raw` is not a port.
+pub fn hook_port_from_raw(raw: Option<&str>) -> Result<u16, String> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_ANSWERER_PORT);
+    };
+    match raw.trim().parse::<u16>() {
+        Ok(0) => Err(format!(
+            "environment variable {ANSWERER_PORT_ENV} carries {raw:?}: 0 is not a port to pin; \
+             the zone answerer's port is the one the host's resolver is pointed at, so it is \
+             never picked at random. Set a port from 1 to 65535, or unset the variable to use \
+             {DEFAULT_ANSWERER_PORT}"
+        )),
+        Ok(port) => Ok(port),
+        Err(_) => Err(format!(
+            "environment variable {ANSWERER_PORT_ENV} carries {raw:?}, which is not a port"
+        )),
+    }
+}
+
+/// Resolves the answerer's hook port from this process's environment and
+/// records it as the one every reader in this process uses
+/// ([`hook_port`]). The supervisor calls it once, before anything reads
+/// the port: the proxy draw that skips it, the answerer's bind, and the
+/// listener sets that refuse it.
+///
+/// # Errors
+///
+/// Returns the message to fail the start with when the variable is set to
+/// something that is not a port, or when this process already resolved a
+/// different port.
+pub fn configure_hook_port() -> Result<u16, String> {
+    let port = hook_port_from_raw(std::env::var(ANSWERER_PORT_ENV).ok().as_deref())?;
+    let recorded = *HOOK_PORT.get_or_init(|| port);
+    if recorded != port {
+        return Err(format!(
+            "the zone answerer's port was already resolved as {recorded} in this process; \
+             {ANSWERER_PORT_ENV} now carries {port}"
+        ));
+    }
+    if port != DEFAULT_ANSWERER_PORT {
+        tracing::info!(
+            component = COMPONENT,
+            port,
+            env = ANSWERER_PORT_ENV,
+            "the zone answerer's hook port is pinned by the environment"
+        );
+    }
+    Ok(port)
+}
+
+/// The answerer's hook port in this process: the port
+/// [`configure_hook_port`] resolved, or [`DEFAULT_ANSWERER_PORT`] in a
+/// process that never resolved one (the unit tests, and the CLI that links
+/// this crate).
+#[must_use]
+pub fn hook_port() -> u16 {
+    HOOK_PORT.get().copied().unwrap_or(DEFAULT_ANSWERER_PORT)
+}
+
 /// The interim answerer channel socket's file name inside a state dir's
 /// host dir. Deliberately beside [`crate::control`]'s
 /// `control.sock` rather than in the `paths` crate: this name only means
@@ -6633,6 +6715,131 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// With `MINVMD_ZONE_ANSWERER_PORT` unset the hook port is the
+    /// documented default, and a process that never resolved one (this
+    /// test binary) reads the default too.
+    #[test]
+    fn hook_port_is_the_default_when_unpinned() {
+        assert_eq!(hook_port_from_raw(None), Ok(DEFAULT_ANSWERER_PORT));
+        assert_eq!(DEFAULT_ANSWERER_PORT, 7656, "the documented default");
+        assert_eq!(
+            hook_port(),
+            DEFAULT_ANSWERER_PORT,
+            "a process that resolved no pin reads the default"
+        );
+    }
+
+    /// A pin is the port the answerer binds, read as written (surrounding
+    /// whitespace aside), at either end of the port range.
+    #[test]
+    fn hook_port_takes_the_operators_pin() {
+        assert_eq!(hook_port_from_raw(Some("17656")), Ok(17656));
+        assert_eq!(hook_port_from_raw(Some(" 17656\n")), Ok(17656));
+        assert_eq!(hook_port_from_raw(Some("1")), Ok(1));
+        assert_eq!(hook_port_from_raw(Some("65535")), Ok(65535));
+        assert_eq!(
+            hook_port_from_raw(Some("7656")),
+            Ok(DEFAULT_ANSWERER_PORT),
+            "pinning the default is the default"
+        );
+    }
+
+    /// A value that is not a port fails the start with a message naming the
+    /// variable and the value, `0` included: there is no "off" and no
+    /// OS-picked answerer port, because no resolver would be told about it.
+    #[test]
+    fn hook_port_refuses_a_value_that_is_not_a_port() {
+        for raw in ["no-port-here", "", "65536", "-1", "7656x", "0"] {
+            let err =
+                hook_port_from_raw(Some(raw)).expect_err("a value that is not a port is refused");
+            assert!(
+                err.contains(ANSWERER_PORT_ENV) && err.contains(&format!("{raw:?}")),
+                "the refusal names the variable and the value {raw:?}, got: {err}"
+            );
+        }
+        let zero = hook_port_from_raw(Some("0")).expect_err("0 is refused");
+        assert!(
+            zero.contains("0 is not a port to pin") && zero.contains("7656"),
+            "the refusal of 0 says why and names the default, got: {zero}"
+        );
+    }
+
+    /// Two answerers on different pinned hook ports both bind and both
+    /// answer — the shape of a VM host daemon pinned off the default beside
+    /// another answerer that holds its own port with its own channel (a
+    /// native daemon's, say). Each acquisition runs exactly as `run` starts
+    /// it, over its own interim channel, and each reports holding its own
+    /// port and answers its own box's name there.
+    #[test]
+    fn two_answerers_on_different_pinned_ports_both_hold() {
+        // Both probes are held until both ports are read, so the OS cannot
+        // hand the same port twice.
+        let a_probe_sock =
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("the first probe binds loopback");
+        let b_probe_sock =
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("the second probe binds loopback");
+        let a_port = a_probe_sock
+            .local_addr()
+            .expect("the probe names its port")
+            .port();
+        let b_port = b_probe_sock
+            .local_addr()
+            .expect("the probe names its port")
+            .port();
+        drop((a_probe_sock, b_probe_sock));
+        assert_ne!(a_port, b_port, "the two pins differ");
+
+        let a_dir = tempfile::TempDir::new().expect("a temp dir for the first channel");
+        let b_dir = tempfile::TempDir::new().expect("a temp dir for the second channel");
+        let (a_registry, a_web) = named_box_registry("web-a", 9);
+        let (b_registry, b_web) = named_box_registry("web-b", 10);
+        let a_status = AnswererStatus::starting();
+        let a_probe = a_status.clone();
+        let a_channel = a_dir.path().join(CHANNEL_SOCK_FILE);
+        std::thread::Builder::new()
+            .name("test-zone-pinned-a".to_string())
+            .spawn(move || acquire_loop_at(a_registry, a_port, a_channel, a_status))
+            .expect("the first daemon's thread spawns");
+        let b_status = AnswererStatus::starting();
+        let b_probe = b_status.clone();
+        let b_channel = b_dir.path().join(CHANNEL_SOCK_FILE);
+        std::thread::Builder::new()
+            .name("test-zone-pinned-b".to_string())
+            .spawn(move || acquire_loop_at(b_registry, b_port, b_channel, b_status))
+            .expect("the second daemon's thread spawns");
+
+        assert_eq!(
+            await_status(
+                || a_probe.get(),
+                "the first daemon never said what the machine's answerer is"
+            ),
+            ZoneAnswererStatus::Holder { port: a_port },
+            "the first daemon holds its own pinned port"
+        );
+        assert_eq!(
+            await_status(
+                || b_probe.get(),
+                "the second daemon never said what the machine's answerer is"
+            ),
+            ZoneAnswererStatus::Holder { port: b_port },
+            "the second daemon holds its own pinned port"
+        );
+        let reply = await_answer(
+            || query(a_port, "web-a.min.internal.", RecordType::A),
+            "the first daemon's pinned port never answered",
+        );
+        assert_eq!(a_answer(&reply), a_web, "the first pin answers its own box");
+        let reply = await_answer(
+            || query(b_port, "web-b.min.internal.", RecordType::A),
+            "the second daemon's pinned port never answered",
+        );
+        assert_eq!(
+            a_answer(&reply),
+            b_web,
+            "the second pin answers its own box"
+        );
     }
 
     /// The channel paths a test acquisition decides over, all in `dir`: the
