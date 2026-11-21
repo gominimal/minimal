@@ -259,6 +259,10 @@ fn every_daemon_connection_is_classified() {
             // the same ride-along shape `resolve_session_version_gated` uses.
             "attach.rs::box_record_on = gated",
             "cmd/admin.rs::cmd_version = ungated",
+            // Not a daemon connection: `min box audit` reads the audit
+            // records from the Box Egress Proxy over its control socket. The
+            // proxy is not the daemon, and the read builds nothing.
+            "cmd/box_audit.rs::open = ungated",
             // A box address reaches every local host, split as `min box
             // list` splits it: the selected host is the one this process
             // ensured, so it keeps the gate. The others are probed ungated,
@@ -372,6 +376,9 @@ fn every_daemon_connection_is_classified() {
             "tests.rs::an_identity_with_no_root_validity_mints_nothing = ungated",
             "tests.rs::attach_fall_through_hands_off_the_owning_vm = gated",
             "tests.rs::attach_refuses_a_box_name_two_vms_know = gated",
+            // Test-only: the audit read test serves its own proxy control
+            // socket, so no daemon is involved.
+            "tests.rs::box_audit_reads_over_the_proxy_socket = ungated",
             "tests.rs::exec_fall_through_hands_off_the_owning_vm = gated",
             "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy = ungated",
             "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy = ungated",
@@ -7122,6 +7129,100 @@ mod mint_tests {
         assert_eq!(
             crate::cmd::grant_box_facts(&[], None, boxes::NetworkMode::NoNet).unwrap(),
             None
+        );
+    }
+    // BEP-042: un-enrolled, `min box audit <box-id>` reads the records that
+    // `bep serve` wrote for the box over the proxy's control socket. The
+    // box is in no listing, as after a reap. The command is given the
+    // socket only, never the log's directory, so it opens no log file.
+    #[test]
+    fn box_audit_reads_over_the_proxy_socket() {
+        use bep::audit::{AuditLog, Rotation};
+
+        use crate::cmd::box_audit;
+        use crate::{BoxAuditArgs, BoxAuditOutputFormat};
+
+        const OTHER_HEX: &str = "0193f0c17a2b7c3d8e4fa0b1c2d3e4f6";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/control.sock");
+        let audit = dir.path().join("audit");
+        let log = AuditLog::open_dir(&audit, Rotation::default()).unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let control = runtime
+            .block_on(async {
+                Control::bind(&path, Registry::default(), BoxRegistry::default()).map(|control| {
+                    control
+                        .with_audit(Arc::new(std::sync::Mutex::new(log)))
+                        .with_audit_dir(&audit)
+                })
+            })
+            .unwrap();
+        runtime.spawn(control.run());
+
+        // The proxy writes the records, as at the box's mints.
+        let mut client = ControlClient::connect(&path).unwrap();
+        client.record_mint(BOX_HEX, "github:one").unwrap();
+        client.record_mint(OTHER_HEX, "github:other").unwrap();
+        client.record_mint(BOX_HEX, "github:two").unwrap();
+        drop(client);
+
+        let read = |output: Option<BoxAuditOutputFormat>| {
+            let args = BoxAuditArgs {
+                target: Some(BOX_ID.to_owned()),
+                parent: None,
+                output,
+                follow: false,
+            };
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            box_audit::run(&args, &[], false, &path, &mut out, &mut err, || false).unwrap();
+            (
+                String::from_utf8(out).unwrap(),
+                String::from_utf8(err).unwrap(),
+            )
+        };
+        let (out, err) = read(None);
+        assert!(err.is_empty(), "{err}");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "{out}");
+        assert!(lines[0].starts_with("mint  admit"), "{out}");
+        assert!(lines[0].contains("github:one"), "{out}");
+        assert!(lines[1].contains("github:two"), "{out}");
+        assert!(!out.contains("github:other"), "{out}");
+
+        // -o jsonl gives the proxy's lines as its log holds them.
+        let (out, _) = read(Some(BoxAuditOutputFormat::Jsonl));
+        let segments = bep::audit::segments(&audit).unwrap();
+        let on_disk: String = segments
+            .iter()
+            .map(|segment| std::fs::read_to_string(segment).unwrap())
+            .collect();
+        let expected: Vec<&str> = on_disk
+            .lines()
+            .filter(|line| line.contains(&format!("\"subject\":\"{BOX_HEX}\"")))
+            .collect();
+        assert_eq!(out.lines().collect::<Vec<_>>(), expected);
+
+        // With the proxy gone, the command says so and reads no file.
+        drop(runtime);
+        let args = BoxAuditArgs {
+            target: Some(BOX_ID.to_owned()),
+            parent: None,
+            output: None,
+            follow: false,
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let error =
+            box_audit::run(&args, &[], false, &path, &mut out, &mut err, || false).unwrap_err();
+        assert!(out.is_empty());
+        assert!(
+            error
+                .to_string()
+                .starts_with("Cannot read the audit log: the Box Egress Proxy does not answer on "),
+            "{error}"
         );
     }
 }
