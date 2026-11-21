@@ -803,8 +803,8 @@ mod tests {
     }
 
     /// NET-078/NET-133: a host-address box still delivers as the cohort. The
-    /// host's own address outside the box host — the cohort address
-    /// host-address boxes arrive from — is a row like a box's when the host
+    /// subnet's cohort address, which a guest SNATs host-address boxes'
+    /// connections to, is a row like a box's when the host
     /// published one there: its registration issues the cohort's attachment,
     /// the pool grows it a share like any box row's, and a delivered
     /// connection from it carries the cohort's own id, which is the shape
@@ -816,7 +816,7 @@ mod tests {
 
         let subnet = SwitchSubnet::default();
         let proxy_ip = subnet.box_egress_proxy_address();
-        let cohort_ip = subnet.host_alias();
+        let cohort_ip = subnet.host_ip_cohort_address();
         let attachments = Attachments::new();
         let registry = crate::box_registry::BoxRegistry::new(subnet)
             .feeding_proxy_attachments(attachments.clone());

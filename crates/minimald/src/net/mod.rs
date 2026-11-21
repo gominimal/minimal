@@ -1309,21 +1309,25 @@ mod tests {
 
     #[test]
     fn allocator_exhausts_a_tiny_subnet() {
-        // /29 => 8 addresses; network, gateway, proxy, daemon, host-alias and
-        // broadcast reserved, leaving two allocatable hosts (.2 and .3). The
-        // run's ends are the switch crate's, read rather than restated: the
-        // run splits at its midpoint, so this daemon's reserve is .2 alone
-        // and the host's hand-out run is .3 — exhaustion is explicit on each
-        // side while every address is held.
-        let subnet = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 29).unwrap();
+        // /28 => 16 addresses; network, gateway, host_ip cohort, proxy,
+        // daemon, host-alias and broadcast reserved, leaving nine allocatable
+        // hosts (.2 to .10). The run's ends are the switch crate's, read
+        // rather than restated: the run splits at its midpoint, so this
+        // daemon's reserve is .2 to .5 and the host's hand-out run is .6 to
+        // .10 — exhaustion is explicit on each side while every address is
+        // held.
+        let subnet = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 28).unwrap();
         let first = Ipv4Addr::from(subnet.first_ptask());
         let last = Ipv4Addr::from(subnet.last_ptask());
         assert_eq!(
             (first, last),
-            (Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 3))
+            (Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 10))
         );
         let mut a = IpAllocator::new(subnet);
         assert_eq!(a.allocate().unwrap().ip, first);
+        for _ in 0..3 {
+            a.allocate().unwrap();
+        }
         assert!(matches!(a.allocate(), Err(NetError::SubnetExhausted(_))));
         // The reserve bounds only the daemon's draws: the run's remainder is
         // still there for the host's hand-outs, none of them ever drawn.
@@ -1332,7 +1336,12 @@ mod tests {
             a.hand(last),
             Err(NetError::HandedAddressCollision { .. })
         ));
-        // The address above the run is the proxy's, outside the plan's run.
+        // The addresses above the run are the cohort's and the proxy's,
+        // outside the plan's run.
+        assert!(matches!(
+            a.hand(subnet.host_ip_cohort_address()),
+            Err(NetError::HandedAddressOutsidePlan { .. })
+        ));
         assert!(matches!(
             a.hand(subnet.box_egress_proxy_address()),
             Err(NetError::HandedAddressOutsidePlan { .. })
@@ -1352,28 +1361,28 @@ mod tests {
             (reserve_first, reserve_last),
             (
                 u32::from(Ipv4Addr::new(100, 64, 0, 2)),
-                u32::from(Ipv4Addr::new(100, 64, 127, 254)),
+                u32::from(Ipv4Addr::new(100, 64, 127, 253)),
             ),
             "the reserve is the run's lower half, starting at the first PTask address"
         );
         assert_eq!(
             reserve_last + 1,
-            u32::from(Ipv4Addr::new(100, 64, 127, 255)),
+            u32::from(Ipv4Addr::new(100, 64, 127, 254)),
             "the host's hand-out run starts immediately above the reserve"
         );
         assert!(
             subnet.first_ptask() <= reserve_first && reserve_last < subnet.last_ptask(),
             "both sub-runs are inside the plan's PTask run, and neither is empty"
         );
-        // A tiny subnet splits in half, so both sides keep at least one
-        // address: a /29's two PTask addresses give the reserve .2 and the
-        // hand-out run .3.
-        let tiny = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 29).unwrap();
+        // A small subnet splits in half, so both sides keep addresses: a
+        // /28's nine PTask addresses give the reserve .2 to .5 and the
+        // hand-out run .6 to .10.
+        let tiny = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 28).unwrap();
         assert_eq!(
             self_allocation_run(tiny),
             (
                 u32::from(Ipv4Addr::new(10, 0, 0, 2)),
-                u32::from(Ipv4Addr::new(10, 0, 0, 2)),
+                u32::from(Ipv4Addr::new(10, 0, 0, 5)),
             )
         );
     }
@@ -1713,7 +1722,7 @@ mod tests {
     }
 
     /// A native daemon's switch: a /24 inside the default /16, whose
-    /// self-allocation reserve is `.2..=.126`.
+    /// self-allocation reserve is `.2..=.125`.
     fn native_slash24() -> SwitchSubnet {
         SwitchSubnet::new(Ipv4Addr::new(100, 64, 37, 0), 24).unwrap()
     }
@@ -1734,12 +1743,12 @@ mod tests {
             (Ipv4Addr::from(first), Ipv4Addr::from(last)),
             (
                 Ipv4Addr::new(100, 64, 37, 2),
-                Ipv4Addr::new(100, 64, 37, 126)
+                Ipv4Addr::new(100, 64, 37, 125)
             ),
-            "125 addresses: the reserve that used to be a lifetime cap"
+            "124 addresses: the reserve that used to be a lifetime cap"
         );
-        // One launch every 3 s: the reserve's 125 addresses cover the
-        // 300 s quarantine at any pace slower than one per 2.4 s.
+        // One launch every 3 s: the reserve's 124 addresses cover the
+        // 300 s quarantine at any pace slower than one per 2.5 s.
         let step = Duration::from_secs(3);
         let mut a = IpAllocator::new(subnet);
         let mut now = Instant::now();
@@ -1767,12 +1776,15 @@ mod tests {
 
     #[test]
     fn a_rehanded_address_carries_a_new_epoch_and_its_old_lease_ends_nothing() {
-        // A /29's reserve is one address, so every draw after the first is
-        // a re-hand of it.
-        let subnet = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 29).unwrap();
+        // A /28's reserve is four addresses. The other three stay held, so
+        // every draw after the first is a re-hand of it.
+        let subnet = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 28).unwrap();
         let mut a = IpAllocator::new(subnet);
         let t0 = Instant::now();
         let old = a.allocate_at(t0, |_| false).unwrap();
+        let held: Vec<PtaskLease> =
+            std::iter::from_fn(|| a.allocate_at(t0, |_| false).ok()).collect();
+        assert_eq!(held.len(), 3);
         assert!(a.release_at(old, t0));
         let new = a.allocate_at(t0 + REUSE_QUARANTINE, |_| false).unwrap();
         assert_eq!((new.ip, new.mac), (old.ip, old.mac), "the same address");
@@ -1782,6 +1794,9 @@ mod tests {
         // release ends nothing, and the static-lease table keeps the new
         // holder's row.
         assert!(!a.release_at(old, t0 + REUSE_QUARANTINE));
+        for lease in held {
+            assert!(a.release_at(lease, t0 + REUSE_QUARANTINE));
+        }
         assert_eq!(a.leases(), &[new]);
         assert!(a.release_at(new, t0 + REUSE_QUARANTINE));
         assert!(a.leases().is_empty());
@@ -1789,10 +1804,14 @@ mod tests {
 
     #[test]
     fn no_rehand_inside_the_quarantine_or_while_referenced() {
-        let subnet = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 29).unwrap();
+        // A /28's reserve is four addresses, and the other three stay held.
+        let subnet = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 28).unwrap();
         let mut a = IpAllocator::new(subnet);
         let t0 = Instant::now();
         let lease = a.allocate_at(t0, |_| false).unwrap();
+        let held: Vec<PtaskLease> =
+            std::iter::from_fn(|| a.allocate_at(t0, |_| false).ok()).collect();
+        assert_eq!(held.len(), 3);
         // Held: nothing to hand.
         assert!(matches!(
             a.allocate_at(t0 + REUSE_QUARANTINE, |_| false),
@@ -1823,7 +1842,7 @@ mod tests {
         let t0 = Instant::now();
         let drawn: Vec<PtaskLease> =
             std::iter::from_fn(|| a.allocate_at(t0, |_| false).ok()).collect();
-        assert_eq!(drawn.len(), 125, "the never-drawn addresses go first");
+        assert_eq!(drawn.len(), 124, "the never-drawn addresses go first");
         // Released out of address order, a second apart.
         for (offset, index) in [7usize, 3, 5].into_iter().enumerate() {
             let at = t0 + Duration::from_secs(offset as u64);

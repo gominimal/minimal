@@ -268,7 +268,7 @@ impl SwitchSubnet {
     /// # Errors
     ///
     /// Returns [`InvalidPrefix`] for a prefix outside `8..=29`. A prefix narrower
-    /// than /29 has no room for the reserved network/gateway/proxy/daemon/
+    /// than /29 has no room for the reserved network/gateway/cohort/proxy/daemon/
     /// host-alias/broadcast addresses plus a PTask address. A prefix wider than /8 lets the high octet
     /// vary, which [`MacAddr::for_switch_ip`] does not fold into the derived MAC,
     /// so two addresses differing only in that octet would collide.
@@ -399,10 +399,23 @@ impl SwitchSubnet {
         u32::from(self.network()) + 2
     }
 
+    /// The address the `host_ip` cohort leaves a microVM guest as (the
+    /// address below [`Self::box_egress_proxy_address`], `broadcast - 4`,
+    /// `100.64.255.251` on the default subnet). The guest's classifier SNATs
+    /// a host-address box's connections to it, and the daemon's own to
+    /// [`Self::daemon_ip`], so the VM host's gate tells the two apart by the
+    /// source address alone. Reserved, never handed to a PTask, and kept out
+    /// of gvproxy's NAT/virtual-IP tables like the proxy address.
+    #[must_use]
+    pub fn host_ip_cohort_address(self) -> Ipv4Addr {
+        Ipv4Addr::from(u32::from(self.box_egress_proxy_address()) - 1)
+    }
+
     /// The last address that may be allocated to a PTask: the address below
-    /// the lowest reserved one, [`Self::box_egress_proxy_address`]
-    /// (`broadcast - 4`), leaving the proxy at `broadcast - 3`, the daemon at
-    /// `broadcast - 2` and the host alias at `broadcast - 1` reserved.
+    /// the lowest reserved one, [`Self::host_ip_cohort_address`]
+    /// (`broadcast - 5`), leaving the cohort address at `broadcast - 4`, the
+    /// proxy at `broadcast - 3`, the daemon at `broadcast - 2` and the host
+    /// alias at `broadcast - 1` reserved.
     ///
     /// This is the one place the lease run's end is derived; every consumer
     /// — the daemon's lease book and its self-allocation reserve, the VM
@@ -410,7 +423,7 @@ impl SwitchSubnet {
     /// from here rather than computing an offset of its own.
     #[must_use]
     pub fn last_ptask(self) -> u32 {
-        u32::from(self.box_egress_proxy_address()) - 1
+        u32::from(self.host_ip_cohort_address()) - 1
     }
 }
 
@@ -741,7 +754,7 @@ mod tests {
     /// seeds leases only inside that run while naming none of the reserved
     /// addresses above it except the host alias. The reserved addresses sit
     /// above the run in a fixed order: last PTask, proxy, daemon, host alias,
-    /// broadcast.
+    /// broadcast. The cohort address sits between the run and the proxy.
     #[test]
     fn lease_run_gate_run_and_rendered_pool_agree() {
         for net in [
@@ -755,7 +768,13 @@ mod tests {
             let alias = u32::from(net.host_alias());
             let broadcast = u32::from(net.broadcast());
             assert!(!run.is_empty(), "{net}: the PTask run holds an address");
-            assert_eq!(*run.end() + 1, proxy, "{net}: the run ends below the proxy");
+            let cohort = u32::from(net.host_ip_cohort_address());
+            assert_eq!(
+                *run.end() + 1,
+                cohort,
+                "{net}: the run ends below the cohort address"
+            );
+            assert_eq!(cohort + 1, proxy, "{net}: the cohort sits below the proxy");
             assert_eq!(proxy + 1, daemon, "{net}: the proxy sits below the daemon");
             assert_eq!(
                 daemon + 1,
@@ -791,9 +810,45 @@ mod tests {
             )));
             assert!(yaml.contains(&format!("\"{last}\": \"{}\"", MacAddr::for_switch_ip(last))));
             assert!(!yaml.contains(&net.box_egress_proxy_address().to_string()));
+            assert!(!yaml.contains(&net.host_ip_cohort_address().to_string()));
             assert!(!yaml.contains(&net.daemon_ip().to_string()));
             assert!(yaml.contains(&format!("\"{}\": \"127.0.0.1\"", net.host_alias())));
             assert!(yaml.contains(&format!("- \"{}\"", net.host_alias())));
+        }
+    }
+
+    /// The `host_ip` cohort's own address sits directly below the Box
+    /// Egress Proxy, `100.64.255.251` on the default subnet, distinct from
+    /// the daemon's `100.64.255.253`. No lease takes it: the PTask run ends
+    /// below it on every subnet size.
+    #[test]
+    fn host_ip_cohort_address_sits_below_the_proxy_outside_the_lease_run() {
+        let net = SwitchSubnet::default();
+        assert_eq!(
+            net.host_ip_cohort_address(),
+            Ipv4Addr::new(100, 64, 255, 251)
+        );
+        assert_eq!(net.daemon_ip(), Ipv4Addr::new(100, 64, 255, 253));
+        assert_ne!(net.host_ip_cohort_address(), net.daemon_ip());
+        for net in [
+            SwitchSubnet::default(),
+            SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 29).unwrap(),
+            SwitchSubnet::new(Ipv4Addr::new(10, 1, 0, 0), 24).unwrap(),
+        ] {
+            let cohort = u32::from(net.host_ip_cohort_address());
+            assert_eq!(cohort + 1, u32::from(net.box_egress_proxy_address()));
+            assert!(
+                net.last_ptask() < cohort,
+                "{net}: no lease takes the cohort"
+            );
+            assert!(
+                net.first_ptask() <= net.last_ptask(),
+                "{net}: the run holds one"
+            );
+            assert!(
+                cohort > u32::from(net.gateway()),
+                "{net}: inside the subnet"
+            );
         }
     }
 

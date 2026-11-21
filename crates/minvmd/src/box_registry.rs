@@ -7077,12 +7077,14 @@ impl BoxRegistry {
             boxes::EffectiveEgress::DenyAll => Some(EgressPolicy::deny_all()),
             boxes::EffectiveEgress::AllowAll => None,
         };
-        let node = self.subnet.daemon_ip().octets();
+        // NET-078: a host-address box leaves the guest as the cohort's own
+        // address, so its rules hold that address as their source.
+        let cohort = self.subnet.host_ip_cohort_address().octets();
         let resolver = self.subnet.dns_server().octets();
         HostIpBoxRules {
             session_id,
             credentialed_upstream,
-            egress: EgressRules::from_policy(policy.as_ref(), resolver, node),
+            egress: EgressRules::from_policy(policy.as_ref(), resolver, cohort),
             dns_hosts: policy
                 .as_ref()
                 .and_then(|policy| policy.allow_dns_hosts.clone())
@@ -8591,7 +8593,7 @@ struct HostIpBoxes {
     admitted_at: BTreeMap<boxes::SessionId, u64>,
     /// The record the host-side DNS admission table pins the resident
     /// boxes' declared names under: every resident box's DNS hosts and
-    /// allowed subnets, keyed to the node's own address. `None` when no
+    /// allowed subnets, keyed to the cohort's own address. `None` when no
     /// resident box declared a DNS host, so nothing can pin for them.
     /// Rebuilt on every change, so a pin taken for a box that left never
     /// outlives the record it was taken under.
@@ -8621,7 +8623,10 @@ impl HostIpBoxes {
         if dns_hosts.is_empty() {
             return None;
         }
-        let node = subnet.daemon_ip();
+        // NET-138: the cohort's record is keyed to the cohort's own address,
+        // which the guest SNATs the cohort's connections to. The node row
+        // stays keyed to the daemon address.
+        let node = subnet.host_ip_cohort_address();
         let policy = EgressPolicy {
             allow_subnets: Some(allow_subnets.clone()),
             allow_dns_hosts: Some(dns_hosts.clone()),
@@ -9002,7 +9007,7 @@ impl BoxTable {
     }
 
     /// The record the resident `host_ip` boxes' declared names pin under in
-    /// the DNS admission table, keyed to the node's own address. `None`
+    /// the DNS admission table, keyed to the cohort's own address. `None`
     /// when no resident box declared a DNS host.
     #[must_use]
     pub fn host_ip_cohort(&self) -> Option<Arc<BoxRecord>> {
@@ -9107,9 +9112,9 @@ impl BoxTable {
 /// The guest node namespace's row is not one of them, so it buys no
 /// share (see the [`BepBoxSource`](switch::bep_host::BepBoxSource)
 /// impl) — and it holds no attachment either, so a delivery from it
-/// names nothing, until the `host_ip` cohort's lane opens. The resident
-/// host-address boxes send from the node address. While one of them
-/// declares a credentialed upstream, the node address is the cohort's
+/// names nothing. The resident host-address boxes send from the cohort
+/// address ([`SwitchSubnet::host_ip_cohort_address`]). While one of them
+/// declares a credentialed upstream, the cohort address is the cohort's
 /// source: it holds a share, and a delivered connection from it carries
 /// the reserved cohort id (BEP-084).
 pub struct RegisteredBoxes {
@@ -9161,7 +9166,7 @@ impl switch::bep_host::BepBoxSource for RegisteredBoxes {
         // aborts what it accepts from it rather than deliver a
         // connection it cannot attribute.
         //
-        // BEP-084: the node address is the `host_ip` cohort's, shared by
+        // BEP-084: the cohort address is the `host_ip` cohort's, shared by
         // every resident host-address box. While a lane member is
         // resident it answers the reserved cohort id, never a member's.
         if self.cohort_source() == Some(source) {
@@ -9180,7 +9185,7 @@ impl switch::bep_host::BepBoxSource for RegisteredBoxes {
             .host_ip_boxes()
             .iter()
             .any(|rules| rules.declares_credentialed_upstream())
-            .then(|| self.table.subnet().daemon_ip())
+            .then(|| self.table.subnet().host_ip_cohort_address())
     }
 }
 
@@ -9510,7 +9515,7 @@ mod tests {
             .expect("the default plan has hand-out addresses");
         assert_eq!(
             first.switch_addr(),
-            Ipv4Addr::new(100, 64, 127, 255),
+            Ipv4Addr::new(100, 64, 127, 254),
             "the first box takes the hand-out run's first address, above the \
              daemon's reserve"
         );
@@ -9539,7 +9544,7 @@ mod tests {
             .expect("the carved subnet has hand-out addresses");
         assert_eq!(
             first.switch_addr(),
-            Ipv4Addr::new(100, 64, 1, 127),
+            Ipv4Addr::new(100, 64, 1, 126),
             "the carved /24's hand-out run also starts above its reserve"
         );
         for index in 1..32 {
