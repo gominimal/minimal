@@ -27652,8 +27652,13 @@ proof_listen_published_port_reaches_peer_and_host() {
     done
     if [ -z "$lp_vm_line" ]; then
       echo "::error::the VM host daemon's host audit carries no admission line for box $lp_target_name port $lp_listen_port with source listen — the listen's publish was never audited on the host (T84, NET-046)"
-      grep -F "\"box\":\"$lp_target_name\"" "$lp_vm_audit" 2>/dev/null | sed 's/^/  /' \
-        || echo "(no host audit line for $lp_target_name in $lp_vm_audit)"
+      local lp_vm_box_lines
+      lp_vm_box_lines="$(grep -F "\"box\":\"$lp_target_name\"" "$lp_vm_audit" 2>/dev/null || true)"
+      if [ -n "$lp_vm_box_lines" ]; then
+        printf '%s\n' "$lp_vm_box_lines" | sed 's/^/  /'
+      else
+        echo "(no host audit line for $lp_target_name in $lp_vm_audit)"
+      fi
       fail
     fi
     echo "host audit: $lp_vm_line (the listen's admission in the owner-only host audit, T84, NET-046)"
