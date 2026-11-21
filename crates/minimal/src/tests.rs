@@ -26372,6 +26372,25 @@ fn reference_section<'a>(reference: &'a str, noun: &str, verb: &str) -> Option<&
     start.map(|begin| &reference[begin..])
 }
 
+/// Whether `text` names `flag` as a whole word: `--all` does not match
+/// inside `--all-providers`.
+fn names_flag(text: &str, flag: &str) -> bool {
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    text.match_indices(flag).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + flag.len()..].chars().next();
+        !before.is_some_and(is_word) && !after.is_some_and(is_word)
+    })
+}
+
+#[test]
+fn names_flag_matches_whole_words_only() {
+    assert!(names_flag("use `--all` here", "--all"));
+    assert!(names_flag("--all <name>", "--all"));
+    assert!(!names_flag("use `--all-providers`", "--all"));
+    assert!(!names_flag("x--all", "--all"));
+}
+
 // BCLI-044: the CLI reference documents every verb that BCLI-026 and
 // BCLI-030 name, and each flag the command model gives it. A flag that the
 // verb shares with `min session start` can be documented there, when the
@@ -26397,8 +26416,8 @@ fn cli_reference_documents_box_grammar() {
         };
         let points_to_start = section.contains("session start");
         for flag in visible_long_flags(&model_verb(noun, verb)) {
-            let documented =
-                section.contains(&flag) || (points_to_start && session_start.contains(&flag));
+            let documented = names_flag(section, &flag)
+                || (points_to_start && names_flag(session_start, &flag));
             if !documented {
                 missing.push(format!("min {noun} {verb}: {flag}"));
             }
