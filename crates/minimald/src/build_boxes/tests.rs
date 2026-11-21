@@ -338,6 +338,19 @@ fn a_build_without_its_own_network_stack_is_refused() {
     );
 }
 
+/// NET-169: a host-address box created before build rows has no task
+/// addresses, so its network build is refused with the step that gives it
+/// a row, never attached at no address.
+#[test]
+fn a_host_address_box_with_no_build_row_is_refused() {
+    assert_eq!(
+        super::no_build_row_refusal("web"),
+        "the build needs the network, and box web has no addresses for its builds: it was \
+         created by an earlier version of min. Remove it with `min session rm web` and \
+         start it again with `min session start`, then run the build again."
+    );
+}
+
 /// NET-155: `__build-fetch` takes a hash and a file, and says so. Its URL
 /// is never an argument.
 #[test]

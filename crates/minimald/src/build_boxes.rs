@@ -458,6 +458,18 @@ impl op::BuildBoxes for BoxBuildBoxes {
     }
 }
 
+/// The refusal of a network build in the host-address box `box_name` on a
+/// VM-backed host when the box has no build row (NET-169): a box created
+/// before its builds had addresses of their own. Its builds that need the
+/// network need the box created again.
+fn no_build_row_refusal(box_name: &str) -> String {
+    format!(
+        "the build needs the network, and box {box_name} has no addresses for its builds: \
+         it was created by an earlier version of min. Remove it with `min session rm \
+         {box_name}` and start it again with `min session start`, then run the build again."
+    )
+}
+
 /// What a build box's network needs on a host with no VM and is missing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MissingStack {
@@ -557,6 +569,16 @@ impl std::fmt::Debug for RequesterBuildNetwork {
 impl sandbox::Network for RequesterBuildNetwork {
     fn plan(&self) -> sandbox::PlanFuture<'_> {
         Box::pin(async move {
+            let on_vm =
+                self.switch.lock().await.transport() != crate::net::SwitchTransport::LocalSpawn;
+            if on_vm
+                && self.record.network == boxes::NetworkMode::HostNet
+                && self.record.task_addresses.is_empty()
+            {
+                return Err(sandbox::NetworkError::new(std::io::Error::other(
+                    no_build_row_refusal(&record_name(&self.record)),
+                )));
+            }
             crate::exec::ensure_task_rows_stand(&self.record, &self.switch)
                 .await
                 .map_err(sandbox::NetworkError::new)?;
