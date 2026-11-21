@@ -277,8 +277,9 @@ const MAX_REDIRECTS: usize = 10;
 /// How long one redirect probe waits for a response's head.
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How long [`source_hosts`] follows redirects in all. A build waits on it to
-/// open its grant, and gives up on the answer at 60 seconds.
+/// How long [`source_hosts`] probes in all, every request and name lookup
+/// included. A build waits on it to open its grant, and gives up on the
+/// answer at 60 seconds.
 const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The hosts a build box's fetch of `sources` reaches (NET-167): each declared
@@ -286,35 +287,41 @@ const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 /// that decides what a redirect widens. It reads response heads only. A hop it
 /// cannot reach adds nothing: the fetch then fails and names that host.
 ///
-/// A redirect is followed only to an `http` or `https` URL whose host is on
-/// the public internet. A hop to any other scheme, or to a loopback, private,
-/// link-local or other non-public address, by literal or by the addresses its
-/// name resolves to, ends that source's walk and adds nothing. The probe of a
-/// hop connects to the addresses checked, never to a later answer for its name.
+/// A source, and each redirect, is followed only to an `http` or `https` URL
+/// whose host is on the public internet. A declared source off it, or whose
+/// name does not resolve, adds no host and is never probed. A hop to any other scheme, or to a loopback,
+/// private, link-local or other non-public address, by literal or by the
+/// addresses its name resolves to, ends that source's walk and adds nothing.
+/// Each probe connects to the addresses checked, never to a later answer for
+/// its name. Every request and every name lookup ends within
+/// [`PROBE_BUDGET`] of the first.
 pub async fn source_hosts(sources: &[String]) -> std::collections::BTreeSet<String> {
     source_hosts_admitting(sources, is_public_address).await
 }
 
-/// [`source_hosts`], following a redirect only to addresses `admits` admits.
+/// [`source_hosts`], following a source or a redirect only to addresses
+/// `admits` admits.
 async fn source_hosts_admitting(
     sources: &[String],
     admits: fn(std::net::IpAddr) -> bool,
 ) -> std::collections::BTreeSet<String> {
     let mut hosts = std::collections::BTreeSet::new();
-    let started = std::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + PROBE_BUDGET;
     for source in sources {
         let Ok(mut at) = reqwest::Url::parse(source) else {
             continue;
         };
-        hosts.extend(at.host_str().map(str::to_ascii_lowercase));
-        let Ok(mut probe) = probe_client(None) else {
+        let Ok(Some(pinned)) = tokio::time::timeout_at(deadline, redirect_addresses(&at, admits)).await
+        else {
             continue;
         };
+        let Ok(mut probe) = probe_client(pinned.as_ref()) else {
+            continue;
+        };
+        hosts.extend(at.host_str().map(str::to_ascii_lowercase));
         for _ in 0..MAX_REDIRECTS {
-            if started.elapsed() >= PROBE_BUDGET {
-                break;
-            }
-            let Ok(response) = probe.get(at.clone()).send().await else {
+            let Ok(Ok(response)) = tokio::time::timeout_at(deadline, probe.get(at.clone()).send()).await
+            else {
                 break;
             };
             let next = response
@@ -326,7 +333,9 @@ async fn source_hosts_admitting(
             // Dropping the response closes the connection, so no body is read.
             drop(response);
             let Some(next) = next else { break };
-            let Some(pinned) = redirect_addresses(&next, admits).await else {
+            let Ok(Some(pinned)) =
+                tokio::time::timeout_at(deadline, redirect_addresses(&next, admits)).await
+            else {
                 break;
             };
             let Ok(next_probe) = probe_client(pinned.as_ref()) else {

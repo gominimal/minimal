@@ -191,7 +191,7 @@ impl Shared {
                         inner: crate::net::provider::task_network_for(
                             boxes::NetworkMode::OwnIp,
                             &switch,
-                            &format!("{}-build", record_name(&record)),
+                            &gate_name(&record_name(&record)),
                             egress
                                 .clone()
                                 .map(|section| boxes::BoxPolicy::new(Some(section), None)),
@@ -240,6 +240,13 @@ impl Shared {
     }
 }
 
+/// The name a build box's network carries in its gate and its log lines,
+/// for the build of `of`. A box name is a DNS label, so this name, with its
+/// `:`, is never a box's and never matches one.
+fn gate_name(of: &str) -> String {
+    format!("build:{of}")
+}
+
 fn record_name(record: &boxes::Record) -> String {
     record.name.clone().unwrap_or_else(|| record.id.to_string())
 }
@@ -268,7 +275,7 @@ impl BoxReach {
         addresses: Vec<std::net::Ipv4Addr>,
     ) -> op::BuildNetwork {
         let switch = Arc::clone(&self.shared.switch);
-        let name = format!("{}-build", self.package);
+        let name = gate_name(&self.package);
         op::BuildNetwork::new(move || {
             crate::net::provider::task_network_for(
                 boxes::NetworkMode::OwnIp,
@@ -286,9 +293,11 @@ impl BoxReach {
 impl op::BuildReach for BoxReach {
     fn open(&self) -> op::ReachFuture<'_, Option<op::BuildNetwork>> {
         Box::pin(async move {
+            // A `none` box's builds get no network, grant or not, so its
+            // builds never ask the host side (NET-165, NET-169).
             let answer = match &self.spec_hash {
-                Some(spec_hash) => self.shared.ask_host(spec_hash).await,
-                None => None,
+                Some(spec_hash) if !self.has_no_network() => self.shared.ask_host(spec_hash).await,
+                _ => None,
             };
             let Some((granted, addresses)) = answer else {
                 let network = self.shared.requester_network();

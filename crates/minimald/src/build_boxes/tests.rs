@@ -140,6 +140,25 @@ async fn install_through_minenv_sock_takes_the_same_lookup() {
     assert!(patched.network().await.is_none());
 }
 
+/// NET-165, NET-169: a `none` box's builds get no network, even for a spec
+/// hash its table grants the internet. The build never asks for the grant.
+#[tokio::test]
+async fn a_none_box_build_opens_no_grant() {
+    let state = tempfile::tempdir().unwrap();
+    let none = boxes_of(boxes::NetworkMode::NoNet, None, state.path());
+    super::file_table(state.path(), boxes::SessionId::nil(), &table_of(&hash(1))).unwrap();
+
+    let build_box = none.build_box("pkg", Vec::new(), &hash(1), true);
+    assert!(
+        build_box.network().await.is_none(),
+        "a none box's registry build opened a granted network"
+    );
+    assert_eq!(
+        build_box.needs_network().to_string(),
+        format!("other: {}", op::NEEDS_NETWORK)
+    );
+}
+
 /// NET-166: a grant reaches its spec hash and no other build, whatever the
 /// package's name. An ended table grants nothing.
 #[tokio::test]

@@ -789,6 +789,10 @@ box that holds it returns to `running`. These terms follow the decision in
     verify: cargo nextest run -p minvmd a_hash_outside_the_table_opens_no_grant
     verify: cargo nextest run -p minimald install_through_minenv_sock_takes_the_same_lookup
     <!-- event-driven; the owner's ruling on [arch#167](https://github.com/gominimal/arch/issues/167), rules 2 and 4. The lookup is the same at a box's first launch and for `min add` in a running box, and its output is hardlinked as `install` does. -->
+  - WHILE the requesting box's network mode is `none` THE SYSTEM SHALL open no grant for its builds, whatever its table holds, and SHALL give each of its builds no network, as NET-169 states.
+    tier:   T0
+    verify: cargo nextest run -p minimald a_none_box_build_opens_no_grant
+    <!-- state-driven; `min` files a table for every box, whatever its mode, so the refusal is the daemon's: a build in a `none` box never asks the host side, and a registry package that declares `needs.internet` gets no network there either. -->
   - WHERE the host is VM-backed, THE SYSTEM SHALL take a box's table only from the client on the host's control socket, and IF the in-VM daemon names a package, a host or an egress rule for a build box THEN THE SYSTEM SHALL keep it out of the table.
     tier:   T0
     verify: cargo nextest run -p minvmd build_box_row_never_sourced_from_guest
@@ -832,7 +836,7 @@ box that holds it returns to `running`. These terms follow the decision in
   tier:     T0
   verify:   cargo nextest run -p minimald workspace_build_box_follows_the_requester
   verify:   cargo nextest run -p minimald install_through_minenv_sock_takes_the_same_lookup
-  <!-- event-driven; rule 5 of the ruling: a package written in the workspace, a patched build, and a spec the box changed take this path. A build a box asks for gets the box's own rules, in a build box, and a `none` box's build gets no network. The rules are the requesting box's effective egress (NET-074). On a VM-backed host the build attaches at a task address of the box (NET-138); a host-address box registers one such row set at activation with its own effective egress, retired with its residency, so its build has an address of its own. Never node-plane identity (NET-078). -->
+  <!-- event-driven; rule 5 of the ruling: a package written in the workspace, a patched build, and a spec the box changed take this path. A build a box asks for gets the box's own rules, in a build box, and a `none` box's build gets no network, whether its table holds the build's spec hash or not (NET-165). The rules are the requesting box's effective egress (NET-074). On a VM-backed host the build attaches at a task address of the box (NET-138); a host-address box registers one such row set at activation with its own effective egress, retired with its residency, so its build has an address of its own. Never node-plane identity (NET-078). -->
   - IF a build box on the requesting box's rules is deny-all or the requesting box's network mode is `none`, and the package needs the network, THEN THE SYSTEM SHALL refuse the build as NET-155 states.
     tier:   T0
     verify: cargo nextest run -p minimald workspace_build_refused_in_deny_all_box
