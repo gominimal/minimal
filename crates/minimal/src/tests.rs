@@ -26081,11 +26081,45 @@ fn completion_values(words: &[&str]) -> Vec<String> {
         .collect()
 }
 
-// BCLI-026: every `min box` verb parses with the flags the spec delivers,
-// and the flags of the Non-goals stay out of the model.
+// BCLI-026: every `min box` verb parses with the flags the spec delivers.
+// This test pins those delivered flags plus `DEFERRED_ARCH_FLAGS`, the
+// architecture flags that the model does not have yet. It does not pin every
+// flag of architecture lines 488 and 493. The flags of the Non-goals stay
+// out of the model.
 #[test]
 fn box_verbs_exist_with_arch_flags() {
     use clap::Parser as _;
+
+    // The architecture's flags that are not in the model yet, each with the
+    // issue that delivers it. When one of them lands, this test fails until
+    // the flag moves from this table to `expected`.
+    const DEFERRED_ARCH_FLAGS: [(&str, &str, &str); 5] = [
+        (
+            "run",
+            "--name",
+            "https://github.com/gominimal/minimal/issues/3196",
+        ),
+        (
+            "run",
+            "--ingress",
+            "https://github.com/gominimal/minimal/issues/3163",
+        ),
+        (
+            "run",
+            "--loadout",
+            "https://github.com/gominimal/minimal/issues/3237",
+        ),
+        (
+            "list",
+            "--type",
+            "https://github.com/gominimal/minimal/issues/3714",
+        ),
+        (
+            "list",
+            "--parent",
+            "https://github.com/gominimal/minimal/issues/3714",
+        ),
+    ];
 
     let expected: [(&str, &[&str]); 17] = [
         (
@@ -26232,6 +26266,15 @@ fn box_verbs_exist_with_arch_flags() {
         assert!(
             !have.iter().any(|h| h == absent),
             "`min box {verb}` has no {absent}"
+        );
+    }
+    // The deferred architecture flags are not in the model yet.
+    for (verb, flag, issue) in DEFERRED_ARCH_FLAGS {
+        let have = visible_long_flags(&model_verb("box", verb));
+        assert!(
+            !have.iter().any(|h| h == flag),
+            "`min box {verb}` now has {flag}: move it from DEFERRED_ARCH_FLAGS \
+             to the expected flags ({issue})"
         );
     }
     // `min box attach --exec` needs a box.

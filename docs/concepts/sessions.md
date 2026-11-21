@@ -121,9 +121,9 @@ Starting an entry whose name a running session already holds does not reuse
 that session: `min session start` refuses, and creates nothing. Attach to the
 existing session when you mean to rejoin it. Pass `--new` or `--name <NAME>`
 when you want a second session from the same entry. Once two sessions share a
-project directory, a bare `min session attach` there opens a picker to choose
-between them (and fails when `--no-input` is set or stdin/stdout is not a
-terminal).
+project directory, a bare `min session attach` there cannot choose between
+them. When more than one session can match, the command lists them and exits
+with code 2.
 
 ## How a session is composed
 

@@ -330,8 +330,8 @@ Attaches to an existing session, identified by UUID, unique id prefix, or
 session name. An exact session name wins over an id prefix. A prefix that
 matches more than one session fails with an error that names the candidates.
 When `SESSION` is omitted, `min session attach` resolves a session from the
-current working directory (or the only existing session) and opens an
-interactive picker if the choice is ambiguous (`--no-input` errors instead).
+current working directory (or the only existing session). When more than one
+session can match, the command lists them and exits with code 2.
 
 `min session attach` exits 0 when you detach or the session's shell exits.
 It prints a one-line notice and exits 254 when the daemon ends the attach.
