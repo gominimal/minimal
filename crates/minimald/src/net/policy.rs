@@ -219,6 +219,16 @@ impl PortForwarder {
         }
     }
 
+    /// The same forward, carrying `gate`. A native box's first attach adopts
+    /// the forwards its finalize bound with no gate, and gives them the gate
+    /// of its relay, so a revocation ends their connections as it ends the
+    /// ones of a forward the attach bound itself.
+    #[must_use]
+    pub(crate) fn with_gate(mut self, gate: Option<Arc<super::switch::BoxGate>>) -> Self {
+        self.gate = gate;
+        self
+    }
+
     /// Marks the forward unbound: the switch dropped it, so its port is no
     /// longer one of Minimal's listeners.
     fn mark_unbound(&self) {
@@ -492,20 +502,26 @@ pub async fn apply_ingress_naming_holders(
     .await
 }
 
-/// Binds the declared forwards of a box on a VM-backed host when finalize
-/// publishes it, before the record goes `Active` (NET-121, NET-144, design
-/// §7.1: the bind succeeds before the name is published). On a VM-backed
-/// host the forwarder binds on the host OS, so the daemon cannot probe the
-/// ports itself ([`host_ports_in_use`]). It binds them, toward the
-/// `switch_address` the VM host handed the box, and a held port fails with
-/// the same typed refusal the native probe gives. A failure rolls back as
-/// [`apply_ingress`] does.
+/// Binds the declared forwards of a box when finalize publishes it, before
+/// the record goes `Active` (NET-121, NET-144, design §7.1: the bind
+/// succeeds before the name is published), so a program on the host reaches
+/// the box's declared ports before any attach. It binds them toward
+/// `switch_address`, and a held port fails with the typed refusal. A failure
+/// rolls back as [`apply_ingress`] does.
 ///
-/// The bound forwards stay on the host. The box's first attach posts the
-/// same exposes again, and the host's switch answers each one that the
-/// listener is already bound, which the attach takes as bound. The host
+/// On a VM-backed host `switch_address` is the address the VM host handed
+/// the box, and the bound forwards stay on the host. The box's first attach
+/// posts the same exposes again, and the host's switch answers each one that
+/// the listener is already bound, which the attach takes as bound. The host
 /// unbinds the forwards when it withdraws the box's row, as it does for
 /// every declared forward ([`release_declared_ingress`]).
+///
+/// On a native host `control` reaches the switch this daemon spawned, and
+/// `switch_address` is the lease the daemon drew for the box at its
+/// activation ([`super::SwitchClient::draw_for_activation`]). The caller
+/// keeps the returned forwarders on the switch. The box's first attach takes
+/// the same lease and adopts them, and binds nothing again. The box's stop
+/// unbinds them when no attach adopted them.
 ///
 /// # Errors
 ///
@@ -674,7 +690,9 @@ fn is_address_in_use(error: &io::Error) -> bool {
 /// names it. A bind that fails for any reason other than `EADDRINUSE`
 /// reports nothing: the spawn's own apply says that failure. Call this only
 /// when the box's forwards are not bound, or it finds the box's own
-/// forwards.
+/// forwards. A native finalize binds the forwards at publish
+/// ([`bind_declared_at_publish`]), and probes with this only when its switch
+/// cannot start, so the first attach binds them.
 #[must_use]
 pub fn host_ports_in_use(
     control: &ControlChannel,

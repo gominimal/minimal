@@ -55,7 +55,7 @@ use std::collections::BTreeMap;
 use nutype::nutype;
 
 use crate::core::lifecyclehook::LifecycleHook;
-use crate::core::primitives::{LenientVarEntry, Patch, Patches, StrictVarName, VarName, VarValue};
+use crate::core::primitives::{Patch, Patches, StrictVarName, VarName, VarValue};
 
 /// A loadout's identifier — trimmed, and usable as a single path
 /// component that stays put: non-empty, free of path separators and
@@ -135,37 +135,30 @@ pub struct LoadoutFile {
     vars_lenient: Option<toml::Value>,
 }
 
-/// A loadout's `[env_vars]` table, split by the shape of each name.
+/// A loadout's `[env_vars]` table: the one table of its variables.
 ///
-/// The file writes one table of name to value (BOX-205). A strict POSIX
-/// name (`[A-Z_][A-Z0-9_]*`) reads into `strict`, and any other name the
-/// kernel accepts into `lenient`. A name the kernel does not accept is
-/// kept in `unusable`, so the table writes back whole and the expansion
+/// The file writes one table of name to value (BOX-205). A POSIX name
+/// (`[A-Za-z_][A-Za-z0-9_]*`) reads into `strict`. Any other name is kept
+/// in `unusable`, so the table writes back whole and the expansion
 /// refuses it (BOX-207). Such a name never reaches a box.
 #[derive(Clone, Debug, Default, PartialEq)]
 struct EnvVars {
     strict: BTreeMap<StrictVarName, VarValue>,
-    lenient: Vec<LenientVarEntry>,
     unusable: BTreeMap<String, VarValue>,
 }
 
 impl EnvVars {
     fn is_empty(&self) -> bool {
-        self.strict.is_empty() && self.lenient.is_empty() && self.unusable.is_empty()
+        self.strict.is_empty() && self.unusable.is_empty()
     }
 }
 
 impl serde::Serialize for EnvVars {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
-        let mut map = serializer.serialize_map(Some(
-            self.strict.len() + self.lenient.len() + self.unusable.len(),
-        ))?;
+        let mut map = serializer.serialize_map(Some(self.strict.len() + self.unusable.len()))?;
         for (name, value) in &self.strict {
             map.serialize_entry(name.as_ref(), value)?;
-        }
-        for entry in &self.lenient {
-            map.serialize_entry(entry.name().as_ref(), entry.value())?;
         }
         for (name, value) in &self.unusable {
             map.serialize_entry(name, value)?;
@@ -183,12 +176,9 @@ impl<'de> serde::Deserialize<'de> for EnvVars {
                 Ok(strict) => {
                     vars.strict.insert(strict, value);
                 }
-                Err(_) => match LenientVarEntry::try_new(name.as_str(), value.clone()) {
-                    Ok(entry) => vars.lenient.push(entry),
-                    Err(_) => {
-                        vars.unusable.insert(name, value);
-                    }
-                },
+                Err(_) => {
+                    vars.unusable.insert(name, value);
+                }
             }
         }
         Ok(vars)
@@ -312,14 +302,6 @@ impl Loadout {
         new
     }
 
-    /// Append a lenient-name variable.
-    #[must_use]
-    pub fn with_var_lenient(self, entry: LenientVarEntry) -> Self {
-        let mut new = self;
-        new.file.env_vars.lenient.push(entry);
-        new
-    }
-
     /// Append a patch.
     #[must_use]
     pub fn with_patch(mut self, patch: Patch) -> Self {
@@ -381,17 +363,11 @@ impl Loadout {
         &self.file.packages
     }
 
-    /// The variables of `[env_vars]` with strict POSIX names.
+    /// The variables of `[env_vars]`, each once. A name that is not
+    /// POSIX-shaped is not among them: the expansion refuses it.
     #[must_use]
     pub fn vars(&self) -> &BTreeMap<StrictVarName, VarValue> {
         &self.file.env_vars.strict
-    }
-
-    /// The variables of `[env_vars]` with any other name the kernel
-    /// accepts.
-    #[must_use]
-    pub fn vars_lenient(&self) -> &[LenientVarEntry] {
-        &self.file.env_vars.lenient
     }
 
     /// The retired variable keys, `vars` and `vars_lenient`, that the file
@@ -419,31 +395,15 @@ impl Loadout {
         self
     }
 
-    /// Iterate over every variable this loadout declares — strict and
-    /// lenient unified into a single stream of
-    /// `(`[`VarName`]`, &`[`VarValue`]`)` pairs.
-    ///
-    /// Hides the wire-form asymmetry between [`Self::vars`] and
-    /// [`Self::vars_lenient`]; callers that simply want "all variables
-    /// to apply" should reach for this rather than merging the two
-    /// fields themselves.
-    ///
-    /// Iteration order is strict-first (in [`StrictVarName`] order via
-    /// the underlying [`BTreeMap`]), then lenient (in declaration order).
+    /// Iterate over every variable of `[env_vars]` as
+    /// `(`[`VarName`]`, &`[`VarValue`]`)` pairs, in [`StrictVarName`]
+    /// order. The same variables as [`Self::vars`].
     pub fn all_vars(&self) -> impl Iterator<Item = (VarName, &VarValue)> {
-        let strict = self
-            .file
+        self.file
             .env_vars
             .strict
             .iter()
-            .map(|(n, v)| (VarName::Strict(n.clone()), v));
-        let lenient = self
-            .file
-            .env_vars
-            .lenient
-            .iter()
-            .map(|e| (VarName::Lenient(e.name().clone()), e.value()));
-        strict.chain(lenient)
+            .map(|(n, v)| (VarName::Strict(n.clone()), v))
     }
 
     /// Patches contributed by this loadout.
@@ -502,22 +462,6 @@ impl crate::core::compose::Composable for Loadout {
         // A name in `unusable` never reaches a box: the expansion refuses
         // it (BOX-207).
         for (name, value) in self.file.env_vars.strict {
-            if let Some(resolved) =
-                resolve_var_declaration(&loadout_name, name.as_ref(), value, env)?
-            {
-                let name_str = name.into_inner();
-                contribution.push_var(crate::core::source::ProvenancedVar::new(
-                    crate::core::primitives::ResolvedVar::from_env_value_or_literal(
-                        name_str,
-                        resolved.value,
-                        resolved.carries_user_data,
-                    ),
-                    source.clone(),
-                ));
-            }
-        }
-        for entry in self.file.env_vars.lenient {
-            let (name, value) = entry.into_parts();
             if let Some(resolved) =
                 resolve_var_declaration(&loadout_name, name.as_ref(), value, env)?
             {
@@ -639,7 +583,7 @@ fn resolve_var_declaration(
 mod tests {
     use super::*;
     use crate::core::lifecyclehook::HookScript;
-    use crate::core::primitives::{LenientVarName, PatchDest};
+    use crate::core::primitives::PatchDest;
 
     // BOX-172: the loader keeps a `loadout_mode` key, whatever its value,
     // so the expansion can refuse it rather than drop it.
@@ -696,54 +640,43 @@ mod tests {
         assert_eq!(l.follow_symlinks(), Some(true));
     }
 
+    // T136: a loadout holds one variable table. `env_vars` names that
+    // are POSIX-shaped, lower-case included, are its variables, each
+    // once, and `all_vars` yields the same set as `vars`.
     #[test]
-    fn all_vars_yields_strict_then_lenient() {
+    fn loadout_env_vars_hold_one_table() {
         let src = r#"
             name = "dev"
 
             [env_vars]
             EDITOR = "vim"
             LANG = { inherit = true, default = "C" }
-            weird-thing = "x"
+            http_proxy = "http://proxy:3128"
         "#;
         let l: Loadout = toml::from_str(src).unwrap();
+        let names: Vec<&str> = l.vars().keys().map(AsRef::as_ref).collect();
+        assert_eq!(names, ["EDITOR", "LANG", "http_proxy"]);
         let collected: Vec<_> = l
             .all_vars()
             .map(|(n, v)| (n.as_str().to_owned(), v.clone()))
             .collect();
-        assert_eq!(collected.len(), 3);
-
-        // BTreeMap order on the strict side: EDITOR before LANG.
-        assert_eq!(collected[0].0, "EDITOR");
+        assert_eq!(collected.len(), 3, "each variable once");
+        assert!(collected.iter().all(|(n, _)| names.contains(&n.as_str())));
         assert!(matches!(collected[0].1, VarValue::Specified { .. }));
-        assert_eq!(collected[1].0, "LANG");
         assert!(matches!(
             collected[1].1,
             VarValue::InheritWithDefault { .. }
         ));
+        assert!(l.all_vars().all(|(n, _)| matches!(n, VarName::Strict(_))));
 
-        // Lenient comes after strict, in declaration order.
-        assert_eq!(collected[2].0, "weird-thing");
+        // The table writes back as one table, with nothing else beside it.
+        let table = toml::Table::try_from(&l).unwrap();
+        let written: Vec<&String> = table["env_vars"].as_table().unwrap().keys().collect();
+        assert_eq!(written, ["EDITOR", "LANG", "http_proxy"]);
     }
 
-    #[test]
-    fn all_vars_distinguishes_strict_from_lenient() {
-        let src = r#"
-            name = "dev"
-
-            [env_vars]
-            EDITOR = "vim"
-            "my.editor" = "emacs"   # not strict POSIX: the lenient list
-        "#;
-        let l: Loadout = toml::from_str(src).unwrap();
-        let collected: Vec<_> = l.all_vars().collect();
-        assert!(matches!(collected[0].0, VarName::Strict(_)));
-        assert!(matches!(collected[1].0, VarName::Lenient(_)));
-    }
-
-    // BOX-205, BOX-206: a loadout file sets its variables in one
-    // `[env_vars]` table. A name that is not strict POSIX goes on the
-    // lenient list, a name the kernel does not accept is kept for the
+    // BOX-205, BOX-206, BOX-207: a loadout file sets its variables in one
+    // `[env_vars]` table. A name that is not POSIX-shaped is kept for the
     // expansion to refuse, and a raw `vars` or `vars_lenient` key is kept
     // for the expansion to refuse too.
     #[test]
@@ -759,9 +692,7 @@ mod tests {
         let file: LoadoutFile = toml::from_str(src).unwrap();
         let l = file.into_loadout(LoadoutName::try_new("ed").unwrap());
         let strict: Vec<&str> = l.vars().keys().map(AsRef::as_ref).collect();
-        assert_eq!(strict, ["EDITOR"]);
-        let lenient: Vec<&str> = l.vars_lenient().iter().map(|e| e.name().as_ref()).collect();
-        assert_eq!(lenient, ["my.var", "my_var", "vars"]);
+        assert_eq!(strict, ["EDITOR", "my_var", "vars"]);
         assert_eq!(l.retired_var_keys().count(), 0, "a variable named vars");
         // The table writes back whole, so the expansion sees every name.
         let table = toml::Table::try_from(&l).unwrap();
@@ -881,23 +812,6 @@ mod tests {
     }
 
     #[test]
-    fn lenient_var_entry_round_trips_through_toml() {
-        let src = r#"
-            name = "dev"
-
-            [env_vars]
-            weird-thing = "x"
-        "#;
-        let l: Loadout = toml::from_str(src).unwrap();
-        let entry = &l.vars_lenient()[0];
-        assert_eq!(
-            entry.name(),
-            &LenientVarName::try_new("weird-thing").unwrap()
-        );
-        assert!(matches!(entry.value(), VarValue::Specified { value } if value == "x"),);
-    }
-
-    #[test]
     fn builder_surface_assembles_every_field() {
         let hook = LifecycleHook::builder()
             .with_on_activate(HookScript::inline("echo hi"))
@@ -912,15 +826,11 @@ mod tests {
                 StrictVarName::try_new("EDITOR").unwrap(),
                 VarValue::specified("hx"),
             )
-            .with_var_lenient(
-                LenientVarEntry::try_new("weird-thing", VarValue::specified("x")).unwrap(),
-            )
             .with_patch(patch)
             .with_lifecycle_hook(hook);
 
         assert_eq!(l.packages(), &["helix", "zellij"]);
         assert_eq!(l.vars().len(), 1);
-        assert_eq!(l.vars_lenient().len(), 1);
         assert_eq!(l.patches().len(), 1);
         assert_eq!(l.lifecycle_hooks().len(), 1);
     }
@@ -937,7 +847,7 @@ mod tests {
 
     #[test]
     fn full_loadout_round_trips_through_toml() {
-        // Exercise every field at once: packages, both strict and lenient
+        // Exercise every field at once: packages, upper- and lower-case
         // vars, patches with multiple source shapes, and a lifecycle hook.
         let src = r#"
             name        = "dev"
@@ -953,7 +863,7 @@ mod tests {
             [env_vars]
             EDITOR      = "hx"
             LANG        = { inherit = true, default = "C" }
-            weird-thing = "x"
+            http_proxy  = "x"
 
             [[lifecycle_hooks]]
             on_activate = { type = "inline", value = "echo hi" }
@@ -968,8 +878,7 @@ mod tests {
         // Row 2 (`source = ["b1", "b2"]`) fans out into two patches, so the
         // three rows yield four Patch entries.
         assert_eq!(parsed.patches().len(), 4);
-        assert_eq!(parsed.vars().len(), 2);
-        assert_eq!(parsed.vars_lenient().len(), 1);
+        assert_eq!(parsed.vars().len(), 3);
         assert_eq!(parsed.lifecycle_hooks().len(), 1);
 
         // The original-vs-parsed equality check would require Loadout: Eq,

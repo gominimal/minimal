@@ -225,6 +225,7 @@ fn composition_to_wire(
 ) -> WireContribution {
     let (vars, patches, packages, lifecycle_hooks) = composition.into_parts();
     WireContribution {
+        // The loadouts' variables, carried on the wire as `env_vars`.
         vars: vars.into_iter().map(Into::into).collect(),
         patches: patches.into_iter().map(Into::into).collect(),
         lifecycle_hooks: lifecycle_hooks.into_iter().map(Into::into).collect(),
@@ -248,19 +249,31 @@ mod tests {
     }
 
     /// User-origin vars survive into the wire form with their resolved
-    /// values intact.
+    /// values intact, under `env_vars`, a lower-case name included.
     #[test]
     fn vars_serialize_into_wire_form() {
         let mut composer = UserComposer::new();
         composer
-            .add(loadout_named("dev").with_var(
-                StrictVarName::try_new("EDITOR").unwrap(),
-                VarValue::specified("hx"),
-            ))
+            .add(
+                loadout_named("dev")
+                    .with_var(
+                        StrictVarName::try_new("EDITOR").unwrap(),
+                        VarValue::specified("hx"),
+                    )
+                    .with_var(
+                        StrictVarName::try_new("http_proxy").unwrap(),
+                        VarValue::specified("http://proxy:3128"),
+                    ),
+            )
             .unwrap();
-        let (wire, _) = composer
+        let (mut wire, _) = composer
             .compose(UserPolicy::empty(), ComposeOptions::default())
             .unwrap();
+        let json = serde_json_lenient::to_value(&wire).unwrap();
+        assert_eq!(json["env_vars"].as_array().map(Vec::len), Some(2));
+        assert!(json.get("vars").is_none(), "got: {json}");
+        assert!(wire.vars.iter().any(|v| v.var.name == "http_proxy"));
+        wire.vars.retain(|v| v.var.name == "EDITOR");
         assert_eq!(wire.vars.len(), 1);
         assert_eq!(wire.vars[0].var.name, "EDITOR");
         assert_eq!(wire.vars[0].var.value, "hx");
