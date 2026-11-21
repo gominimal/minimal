@@ -415,7 +415,7 @@ impl std::fmt::Display for HeldNameRefusal {
             f,
             "A running session named `{holder_name}` ({holder}) already exists, so a new \
              box cannot take the name `{name}`. Rename it with \
-             `min session rename {holder} <new-name>`, or choose another name."
+             `min box rename {holder} <new-name>`, or choose another name."
         )
     }
 }
