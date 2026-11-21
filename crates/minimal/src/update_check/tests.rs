@@ -570,6 +570,8 @@ fn a_pinned_install_is_never_told_and_the_notice_waits_for_a_plain_command() {
     );
     assert!(leaves_the_notice_visible(&Some(crate::cli::Command::Dirs)));
     assert!(!leaves_the_notice_visible(&Some(crate::cli::Command::Dash)));
+    // A debug-only command: a release build of the tests has no such name.
+    #[cfg(debug_assertions)]
     assert!(!leaves_the_notice_visible(&Some(
         crate::cli::Command::DebugAnswererCommand
     )));
