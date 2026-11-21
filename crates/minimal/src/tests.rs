@@ -2508,7 +2508,6 @@ async fn run_pty_entry_exit2_hints_start_new() {
             &global,
             BoxRunArgs {
                 entry: "default".into(),
-                path: None,
                 detach: false,
                 network: None,
                 egress: EgressArgs::default(),
@@ -2607,7 +2606,6 @@ fn run_and_start_new_request_fresh_instance() {
     });
     let box_run = task::RunEntry::from(BoxRunArgs {
         entry: "build".into(),
-        path: None,
         detach: false,
         network: Some(CliNetworkMode::OwnIp),
         egress,
@@ -2969,7 +2967,6 @@ async fn unattached_start_closes_stdin_and_hints_run_logs_wait() {
         task::RunEntry {
             verb: task::RunVerb::Box,
             entry: "build".into(),
-            path: None,
             detach: true,
             args: vec![],
             network: None,
@@ -25997,4 +25994,40 @@ fn row_not_back_names_the_box_that_holds_the_name() {
          now. Give that box another name with `min box rename Web <new-name>`, then run \
          `min box attach web` again."
     );
+}
+
+// BCLI-026: `min box run` takes no `--path`, with no alias. The global `-C`
+// names the project, as for `min task run` (BCLI-042).
+#[test]
+fn box_run_takes_no_path_flag() {
+    use clap::Parser as _;
+    use clap::error::ErrorKind;
+
+    assert!(
+        !verb_long_flags(&["box", "run"]).contains("--path"),
+        "no `min box run --path`"
+    );
+    for argv in [
+        &["min", "box", "run", "--path", "sub/dir", "build"][..],
+        &["min", "box", "run", "--path=sub/dir", "build"],
+    ] {
+        let Err(err) = Cli::try_parse_from(argv) else {
+            panic!("{argv:?}: `min box run --path` is refused");
+        };
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument, "{argv:?}: {err}");
+    }
+
+    let cli = Cli::try_parse_from(["min", "-C", "sub/dir", "box", "run", "build"])
+        .expect("`min -C <dir> box run` parses");
+    assert_eq!(
+        cli.global_args.repo_dir,
+        Some(std::path::PathBuf::from("sub/dir"))
+    );
+    let Some(Command::Box(BoxArgs {
+        command: BoxCommand::Run(run),
+    })) = cli.command
+    else {
+        panic!("`min -C <dir> box run build` parses as a box run");
+    };
+    assert_eq!(run.entry, "build");
 }
