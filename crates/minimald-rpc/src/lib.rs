@@ -886,13 +886,26 @@ pub struct BuildGrant {
 /// the box's creation, from the commits the box's spec pinned.
 pub type BuildGrantTable = std::collections::BTreeMap<String, BuildGrant>;
 
-/// The egress of a build box reaching `hosts`, or the internet (NET-167,
-/// NET-168).
+/// What an internet grant never reaches (NET-168): the private ranges of
+/// RFC 1918, where a person's own network sits, the shared address space
+/// the switch's subnet, its box leases and its host alias are carved from,
+/// and link-local space. The resolver stays reachable: a box's own
+/// resolution is admitted ahead of its deny rules.
+pub const BUILD_BOX_INTERNET_DENY: [&str; 5] = [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "100.64.0.0/10",
+    "169.254.0.0/16",
+];
+
+/// The egress of a build box reaching `hosts`, or the public internet
+/// (NET-167, NET-168).
 ///
-/// The internet branch, `0.0.0.0/0`, is an interim (design §7.1 and §8): it
-/// lasts until per-package host lists replace it (design §12 item 15), and
-/// then a build that declares `needs` gets its package's listed hosts
-/// instead. The flip is tracked in
+/// The internet branch, `0.0.0.0/0` less [`BUILD_BOX_INTERNET_DENY`], is an
+/// interim (design §7.1 and §8): it lasts until per-package host lists
+/// replace it (design §12 item 15), and then a build that declares `needs`
+/// gets its package's listed hosts instead. The flip is tracked in
 /// [gominimal/arch#158](https://github.com/gominimal/arch/issues/158).
 #[must_use]
 pub fn build_box_egress(
@@ -904,7 +917,12 @@ pub fn build_box_egress(
             allow_subnets: Some(vec!["0.0.0.0/0".to_string()]),
             allow_dns_hosts: Some(Vec::new()),
             allow_protocols: None,
-            deny_subnets: None,
+            deny_subnets: Some(
+                BUILD_BOX_INTERNET_DENY
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            ),
         }
     } else {
         EgressPolicy {
@@ -976,6 +994,14 @@ pub struct DropBuildTableRequest {
 #[must_use]
 pub fn requester_build_row_name(session_id: SessionId) -> String {
     format!("build-{session_id}")
+}
+
+/// The box whose builds attach under the row `name`
+/// ([`requester_build_row_name`]), or `None` when `name` is no such row's.
+#[must_use]
+pub fn requester_build_row_session(name: &str) -> Option<SessionId> {
+    let id = SessionId::parse_str(name.strip_prefix("build-")?).ok()?;
+    (requester_build_row_name(id) == name).then_some(id)
 }
 
 /// The one line a held registration's client writes on the lease

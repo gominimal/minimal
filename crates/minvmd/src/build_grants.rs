@@ -65,11 +65,27 @@ struct OpenGrant {
     session_id: boxes::SessionId,
     deadline: Instant,
     withdrawal: WithdrawBoxRequest,
+    /// The change it opened at ([`State::changes`]).
+    opened_at: u64,
 }
 
-#[derive(Debug, Default)]
+/// The changes to the tables and the grants so far, at one moment. Take it
+/// before reading the in-VM daemon's list, and hand it to
+/// [`BuildGrants::end_absent`] with that list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct BuildGrantMark(u64);
+
+#[derive(Debug)]
 struct State {
     tables: BTreeMap<boxes::SessionId, BuildGrantTable>,
+    /// The change each box's table was last filed at.
+    filed_at: BTreeMap<boxes::SessionId, u64>,
+    /// Counts filings and grant opens, for [`BuildGrantMark`].
+    changes: u64,
+    /// This process's own part of every grant's row name, so a row named
+    /// before a restart, which the guest can still close, never names a
+    /// grant this process opened.
+    nonce: String,
     open: BTreeMap<String, OpenGrant>,
     /// The rows [`BuildGrants::next_row`] named whose registration has not
     /// ended yet, by row, with the box each is for. They count toward the
@@ -84,6 +100,25 @@ struct State {
     ended: BTreeSet<boxes::SessionId>,
     /// The ids in `ended`, oldest first, so the oldest leaves at the bound.
     ended_order: VecDeque<boxes::SessionId>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        // The last group of a fresh id is its random part.
+        let minted = boxes::SessionId::mint().to_string();
+        let nonce = minted.rsplit('-').next().unwrap_or(&minted).to_string();
+        Self {
+            tables: BTreeMap::new(),
+            filed_at: BTreeMap::new(),
+            changes: 0,
+            nonce,
+            open: BTreeMap::new(),
+            reserved: BTreeMap::new(),
+            opened: 0,
+            ended: BTreeSet::new(),
+            ended_order: VecDeque::new(),
+        }
+    }
 }
 
 impl State {
@@ -121,6 +156,8 @@ impl BuildGrants {
     /// set aside, this process persists no table, so the file stays as it is.
     pub(crate) fn persisting_to(mut self, path: PathBuf) -> Self {
         match read_tables_file(&path) {
+            // A reloaded table counts as filed before any mark, so the
+            // second good list that leaves its box out ends it.
             Ok(tables) => self.lock().tables = tables,
             Err(why) => {
                 if !set_aside_tables_file(&path, &why) {
@@ -176,6 +213,9 @@ impl BuildGrants {
                 return false;
             }
             state.tables.entry(session_id).or_default().extend(table);
+            state.changes += 1;
+            let at = state.changes;
+            state.filed_at.insert(session_id, at);
             true
         });
     }
@@ -202,7 +242,83 @@ impl BuildGrants {
                 .filter_map(|row| state.open.remove(row))
                 .map(|grant| grant.withdrawal)
                 .collect();
+            state.filed_at.remove(&session_id);
             state.tables.remove(&session_id).is_some()
+        });
+        withdrawals
+    }
+
+    /// The changes so far ([`BuildGrantMark`]).
+    pub(crate) fn mark(&self) -> BuildGrantMark {
+        BuildGrantMark(self.lock().changes)
+    }
+
+    /// Whether any table or grant stands, so a reconcile has something to
+    /// end.
+    pub(crate) fn holds_any(&self) -> bool {
+        let state = self.lock();
+        !state.tables.is_empty() || !state.open.is_empty()
+    }
+
+    /// Ends what stands for boxes the in-VM daemon's list `listed` leaves
+    /// out, handing back the withdrawals of the grants it ends. `listed` was
+    /// read after `mark`. A grant opened at or before `mark` ends: its box
+    /// asked for it, so a list that leaves the box out is one the box left,
+    /// or one a restarted guest daemon wrote after its builds died. A table
+    /// ends when it was last filed at or before `previous`, the mark of the
+    /// good list read before this one: `min` files a table before the box
+    /// exists in the guest, so a table is only read as left over once a
+    /// whole list read went by after its filing.
+    ///
+    /// The guest controls its list, so a false absence can end a box's
+    /// table and grants while it runs. That only takes network away from
+    /// its builds, which then follow the box's own rules.
+    pub(crate) fn end_absent(
+        &self,
+        listed: &BTreeSet<boxes::SessionId>,
+        mark: BuildGrantMark,
+        previous: Option<BuildGrantMark>,
+    ) -> Vec<WithdrawBoxRequest> {
+        let mut withdrawals = Vec::new();
+        self.change_tables(|state| {
+            let ended: Vec<String> = state
+                .open
+                .iter()
+                .filter(|(_, grant)| {
+                    !listed.contains(&grant.session_id) && grant.opened_at <= mark.0
+                })
+                .map(|(row, _)| row.clone())
+                .collect();
+            withdrawals = ended
+                .iter()
+                .filter_map(|row| state.open.remove(row))
+                .map(|grant| grant.withdrawal)
+                .collect();
+            let Some(previous) = previous else {
+                return false;
+            };
+            let left: Vec<boxes::SessionId> = state
+                .tables
+                .keys()
+                .filter(|session| !listed.contains(session))
+                .filter(|session| {
+                    state
+                        .filed_at
+                        .get(session)
+                        .is_none_or(|at| *at <= previous.0)
+                })
+                .copied()
+                .collect();
+            for session in &left {
+                tracing::info!(
+                    session = %session,
+                    "ended the build table of a box the VM no longer lists"
+                );
+                state.tables.remove(session);
+                state.filed_at.remove(session);
+                state.note_ended(*session);
+            }
+            !left.is_empty()
         });
         withdrawals
     }
@@ -225,7 +341,7 @@ impl BuildGrants {
             return None;
         }
         state.opened += 1;
-        let row = format!("build-{session_id}-{}", state.opened);
+        let row = format!("build-{session_id}-{}-{}", state.nonce, state.opened);
         state.reserved.insert(row.clone(), session_id);
         Some(row)
     }
@@ -243,12 +359,15 @@ impl BuildGrants {
         let Some(session_id) = state.reserved.remove(&withdrawal.name) else {
             return false;
         };
+        state.changes += 1;
+        let opened_at = state.changes;
         state.open.insert(
             withdrawal.name.clone(),
             OpenGrant {
                 session_id,
                 deadline,
                 withdrawal,
+                opened_at,
             },
         );
         true
@@ -554,5 +673,79 @@ mod tests {
         grants.file(id, table("aa", false));
         let reloaded = BuildGrants::default().persisting_to(path);
         assert!(reloaded.lookup(id, "aa").is_some());
+    }
+
+    /// NET-165: a process names its grant rows apart from every other
+    /// process's, so a close the guest sends for a row named before a
+    /// restart ends no grant this process opened.
+    #[test]
+    fn a_restarted_process_names_its_grant_rows_apart() {
+        let id = boxes::SessionId::mint();
+        let before = BuildGrants::default();
+        before.file(id, table("aa", false));
+        let after = BuildGrants::default();
+        after.file(id, table("aa", false));
+        let far = Instant::now() + BUILD_GRANT_DEADLINE;
+        let stale = before.next_row(id).expect("room under the cap");
+        let fresh = after.next_row(id).expect("room under the cap");
+        assert_ne!(stale, fresh);
+        assert!(after.opened(withdrawal(&fresh), far));
+        assert!(after.take(&stale).is_none(), "the stale close ends nothing");
+        assert_eq!(after.take(&fresh), Some(withdrawal(&fresh)));
+    }
+
+    /// NET-165: a good guest list ends the grants of every box it leaves
+    /// out, as after a guest daemon's restart. A box it lists keeps its
+    /// grant, and so does a grant opened after the list's mark.
+    #[test]
+    fn a_guest_list_ends_the_grants_of_the_boxes_it_leaves_out() {
+        let grants = BuildGrants::default();
+        let (gone, live) = (boxes::SessionId::mint(), boxes::SessionId::mint());
+        grants.file(gone, table("aa", true));
+        grants.file(live, table("aa", true));
+        let far = Instant::now() + BUILD_GRANT_DEADLINE;
+        let stale = grants.next_row(gone).expect("room under the cap");
+        assert!(grants.opened(withdrawal(&stale), far));
+        let kept = grants.next_row(live).expect("room under the cap");
+        assert!(grants.opened(withdrawal(&kept), far));
+        let mark = grants.mark();
+        let late = grants.next_row(gone).expect("room under the cap");
+        assert!(grants.opened(withdrawal(&late), far));
+
+        let listed = BTreeSet::from([live]);
+        assert_eq!(grants.end_absent(&listed, mark, None), [withdrawal(&stale)]);
+        assert!(grants.take(&kept).is_some(), "a listed box keeps its grant");
+        assert!(
+            grants.take(&late).is_some(),
+            "a grant newer than the list stays"
+        );
+        assert!(
+            grants.lookup(gone, "aa").is_some(),
+            "a table waits for a whole list read after its filing"
+        );
+    }
+
+    /// NET-165: a box's table, its end signal lost, ends once a whole good
+    /// list read went by after its filing and the next list leaves the box
+    /// out. A table filed during that read stays, because its box can
+    /// still be starting.
+    #[test]
+    fn a_table_of_a_box_the_guest_list_leaves_out_ends() {
+        let grants = BuildGrants::default();
+        let (gone, starting) = (boxes::SessionId::mint(), boxes::SessionId::mint());
+        grants.file(gone, table("aa", false));
+        let first = grants.mark();
+        let none = BTreeSet::new();
+        assert!(grants.end_absent(&none, first, None).is_empty());
+        assert!(grants.lookup(gone, "aa").is_some());
+        grants.file(starting, table("aa", false));
+        let second = grants.mark();
+        assert!(grants.end_absent(&none, second, Some(first)).is_empty());
+        assert!(
+            grants.lookup(gone, "aa").is_none(),
+            "the left-over table ended"
+        );
+        assert!(grants.lookup(starting, "aa").is_some());
+        assert!(grants.holds_any());
     }
 }

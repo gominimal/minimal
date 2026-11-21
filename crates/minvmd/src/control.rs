@@ -1079,9 +1079,13 @@ impl HostIpReconcileNudge {
 ///
 /// The same list ends the requester build row of a box it no longer
 /// names (NET-169, [`BoxRegistry::requester_rows_without_a_box`]): the
-/// box's retirement normally withdraws it, and its creator may never send
-/// one. Each withdrawal takes its turn in an order of the thread's own,
-/// as each door's do.
+/// box's destroy normally withdraws it, and its creator may never send
+/// one. The box's table and grants end with that row. The list also ends
+/// the grants and the tables of boxes it leaves out
+/// ([`crate::build_grants::BuildGrants::end_absent`]), so a guest daemon
+/// that restarted mid-build, or a box whose end signal was lost, leaves no
+/// grant or table standing. Each withdrawal takes its turn in an order of
+/// the thread's own, as each door's do.
 fn spawn_host_ip_reconcile(
     boxes: BoxRegistry,
     guest_rpc_sock: PathBuf,
@@ -1090,29 +1094,46 @@ fn spawn_host_ip_reconcile(
 ) -> std::io::Result<HostIpReconcileNudge> {
     let order = Arc::new(ApplyOrder::default());
     let rows = boxes.clone();
+    let grants = boxes.clone();
+    let (grants_order, grants_answerer, grants_audit) =
+        (Arc::clone(&order), answerer.clone(), audit_path.clone());
     spawn_host_ip_reconcile_with(
         boxes,
         HOST_IP_RECONCILE_INTERVAL,
         move || read_guest_box_states(&guest_rpc_sock),
         move |name| {
             order.apply(|| withdraw_requester_row(&rows, &answerer, &audit_path, name));
+            if let Some(session_id) = minimald_rpc::requester_build_row_session(name) {
+                for withdrawal in rows.build_grants().drop_table(session_id) {
+                    order.apply(|| withdraw_grant_row(&rows, &answerer, &audit_path, withdrawal));
+                }
+            }
+        },
+        move |withdrawals| {
+            for withdrawal in withdrawals {
+                grants_order.apply(|| {
+                    withdraw_grant_row(&grants, &grants_answerer, &grants_audit, withdrawal)
+                });
+            }
         },
     )
 }
 
 /// [`spawn_host_ip_reconcile`] with its timer and its session-list read
 /// given, so a test can drive the thread without an in-VM daemon.
-fn spawn_host_ip_reconcile_with<R, W>(
+fn spawn_host_ip_reconcile_with<R, W, G>(
     boxes: BoxRegistry,
     interval: Duration,
     mut read_guest: R,
     mut withdraw_row: W,
+    mut end_grants: G,
 ) -> std::io::Result<HostIpReconcileNudge>
 where
     R: FnMut() -> anyhow::Result<std::collections::BTreeMap<boxes::SessionId, boxes::BoxState>>
         + Send
         + 'static,
     W: FnMut(&str) + Send + 'static,
+    G: FnMut(Vec<WithdrawBoxRequest>) + Send + 'static,
 {
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
@@ -1122,6 +1143,8 @@ where
             let mut failing = false;
             // The mark the last pass that read the list took.
             let mut previous: Option<crate::box_registry::HostIpAdmitMark> = None;
+            // The build grants' mark the last pass that read the list took.
+            let mut previous_grants: Option<crate::build_grants::BuildGrantMark> = None;
             // A pass dropped a box a client admitted since the pass before
             // it, which can be a resume still starting in the guest. One
             // more pass runs soon, so a resumed box rejoins without waiting
@@ -1148,17 +1171,34 @@ where
                 }
                 while receiver.try_recv().is_ok() {}
                 last = Some(std::time::Instant::now());
-                if !boxes.holds_host_ip_boxes() {
+                if !boxes.holds_host_ip_boxes() && !boxes.build_grants().holds_any() {
                     continue;
                 }
                 // Taken before the read, so a box a client admits while the
                 // list is in flight is not dropped on a list that predates it.
                 let mark = boxes.host_ip_admit_mark();
+                let grants_mark = boxes.build_grants().mark();
                 let since = previous;
                 match read_guest() {
                     Ok(guest) => {
                         failing = false;
                         previous = Some(mark);
+                        let listed: std::collections::BTreeSet<boxes::SessionId> =
+                            guest.keys().copied().collect();
+                        let ended = boxes.build_grants().end_absent(
+                            &listed,
+                            grants_mark,
+                            previous_grants,
+                        );
+                        previous_grants = Some(grants_mark);
+                        if !ended.is_empty() {
+                            tracing::info!(
+                                grants = ended.len(),
+                                trigger = %trigger,
+                                "ending the build grants of boxes the VM no longer lists"
+                            );
+                            end_grants(ended);
+                        }
                         let outcome = boxes.reconcile_host_ip_boxes(&guest, mark, trigger);
                         follow_up = !outcome.dropped.is_empty()
                             && since.is_none_or(|since| {
@@ -1467,18 +1507,19 @@ fn serve_request(
             let box_name = no_switch_box_name(boxes, request.session_id)
                 .unwrap_or_else(|| request.session_id.to_string());
             boxes.retire_host_ip_box(request.session_id, request.end);
-            // The row its builds attach under goes with it (NET-169), in its
-            // turn as any withdrawal, and its published address returns to
-            // the range unless a live row or a registration owns it.
-            order.apply(|| {
-                let name = minimald_rpc::requester_build_row_name(request.session_id);
-                withdraw_requester_row(boxes, answerer, audit_path, &name);
-            });
-            // A destroyed box's table ends with it, and so does every grant
-            // still open for it, as the guest's own drop ends them: that
-            // drop may never have arrived. A stopped box keeps its table,
-            // for its builds when it starts again.
+            // A destroyed box's row, the one its builds attach under, goes
+            // with it (NET-169), in its turn as any withdrawal, and its
+            // published address returns to the range unless a live row or a
+            // registration owns it. Its table ends with it too, and so does
+            // every grant still open for it, as the guest's own drop ends
+            // them: that drop may never have arrived. A stopped box keeps
+            // its row and its table, for its builds when it starts again:
+            // nothing registers the row again at a start.
             if request.end == minimald_rpc::HostIpBoxEnd::Destroyed {
+                order.apply(|| {
+                    let name = minimald_rpc::requester_build_row_name(request.session_id);
+                    withdraw_requester_row(boxes, answerer, audit_path, &name);
+                });
                 for withdrawal in boxes.build_grants().drop_table(request.session_id) {
                     order.apply(|| withdraw_grant_row(boxes, answerer, audit_path, withdrawal));
                 }
@@ -9600,6 +9641,61 @@ mod tests {
         );
     }
 
+    /// NET-169: a stopped `host_ip` box keeps the row its builds attach
+    /// under, because nothing registers it again when the box starts. A
+    /// destroyed box's row goes with it.
+    #[test]
+    fn a_stopped_host_ip_box_keeps_its_build_row() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let register = |session_id| {
+            let name = minimald_rpc::requester_build_row_name(session_id);
+            let reply = control(
+                &sock_path,
+                &BoxControlRequest::Register(RegisterBoxRequest {
+                    name: name.clone(),
+                    ingress_ports: Vec::new(),
+                    egress: None,
+                    credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
+                    hold: false,
+                    task_slots: minimald_rpc::TASK_SLOTS_PER_BOX,
+                    host_ip: false,
+                    stays_detached: true,
+                }),
+            )
+            .expect("the register is answered");
+            assert!(matches!(reply, BoxControlReply::Registered(_)), "{reply:?}");
+            name
+        };
+        let retire = |session_id, end| {
+            control(
+                &sock_path,
+                &BoxControlRequest::RetireHostIpBox(minimald_rpc::RetireHostIpBoxRequest {
+                    session_id,
+                    end,
+                }),
+            )
+            .expect("the retire is answered");
+        };
+
+        let stopped = boxes::SessionId::mint();
+        let stopped_row = register(stopped);
+        retire(stopped, minimald_rpc::HostIpBoxEnd::Stopped);
+        assert!(
+            registry.row_by_name(&stopped_row).is_some(),
+            "a stop withdrew the requester row"
+        );
+
+        let destroyed = boxes::SessionId::mint();
+        let destroyed_row = register(destroyed);
+        retire(destroyed, minimald_rpc::HostIpBoxEnd::Destroyed);
+        assert!(registry.row_by_name(&destroyed_row).is_none());
+        assert!(registry.row_by_name(&stopped_row).is_some());
+    }
+
     /// NET-165: a grant that opens after its asker stopped waiting ends at
     /// once, so no row stands that nobody could close.
     #[test]
@@ -9609,7 +9705,16 @@ mod tests {
             spawn_server(dir.path()).expect("server binds");
         let session_id = boxes::SessionId::mint();
         let first = open_a_grant(&sock_path, session_id);
-        assert_eq!(first.grant_row, format!("build-{session_id}-1"));
+        assert!(
+            first.grant_row.starts_with(&format!("build-{session_id}-"))
+                && first.grant_row.ends_with("-1"),
+            "{}",
+            first.grant_row
+        );
+        let second = format!(
+            "{}2",
+            first.grant_row.strip_suffix('1').expect("the first grant")
+        );
         let Some(asked_at) =
             std::time::Instant::now().checked_sub(minimald_rpc::BUILD_GRANT_ASK_DEADLINE)
         else {
@@ -9631,9 +9736,7 @@ mod tests {
             "{reply:?}"
         );
         assert!(
-            registry
-                .row_by_name(&format!("build-{session_id}-2"))
-                .is_none(),
+            registry.row_by_name(&second).is_none(),
             "its row is withdrawn"
         );
     }
@@ -10619,6 +10722,7 @@ mod tests {
             NOT_SOON,
             scripted_guest_reader(calls_tx, answers_rx),
             |_: &str| {},
+            |_| {},
         )
         .expect("the reconcile thread starts");
         nudge.nudge();
@@ -10670,6 +10774,7 @@ mod tests {
             Duration::from_millis(50),
             scripted_guest_reader(calls_tx, answers_rx),
             |_: &str| {},
+            |_| {},
         )
         .expect("the reconcile thread starts");
         calls
@@ -10721,6 +10826,7 @@ mod tests {
             move |name: &str| {
                 rows.withdraw_build_row(name);
             },
+            |_| {},
         )
         .expect("the reconcile thread starts");
         nudge.nudge();
@@ -10745,6 +10851,79 @@ mod tests {
         drop(answers);
     }
 
+    /// NET-165: a good list ends the grants of the boxes it leaves out, as
+    /// the first list after a guest daemon's restart does, and a table once
+    /// a whole list read went by after its filing. A box the list names keeps
+    /// both. The thread runs for the tables alone, with no `host_ip` box.
+    #[test]
+    fn host_ip_reconcile_thread_ends_the_grants_and_tables_of_boxes_the_guest_dropped() {
+        const NOT_SOON: Duration = Duration::from_secs(3600);
+        let read_timeout = Duration::from_secs(10);
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let (gone, live) = (reconcile_session(1), reconcile_session(2));
+        let stale = open_a_grant(&sock_path, gone);
+        let kept = open_a_grant(&sock_path, live);
+        assert!(!registry.holds_host_ip_boxes());
+        let (calls_tx, calls) = std::sync::mpsc::channel();
+        let (answers, answers_rx) = std::sync::mpsc::channel();
+        let (ended_tx, ended) = std::sync::mpsc::channel();
+        let nudge = spawn_host_ip_reconcile_with(
+            registry.clone(),
+            NOT_SOON,
+            scripted_guest_reader(calls_tx, answers_rx),
+            |_: &str| {},
+            move |withdrawals| {
+                ended_tx.send(withdrawals).expect("the test waits");
+            },
+        )
+        .expect("the reconcile thread starts");
+        let listed = || {
+            Ok(std::collections::BTreeMap::from([(
+                live,
+                boxes::BoxState::Active,
+            )]))
+        };
+
+        nudge.nudge();
+        calls
+            .recv_timeout(read_timeout)
+            .expect("a nudge reads the session list");
+        answers.send(listed()).expect("the reader waits");
+        let withdrawals = ended
+            .recv_timeout(read_timeout)
+            .expect("the dropped box's grant ends");
+        assert_eq!(
+            withdrawals
+                .iter()
+                .map(|withdrawal| withdrawal.name.as_str())
+                .collect::<Vec<_>>(),
+            [stale.grant_row.as_str()]
+        );
+        assert!(registry.build_grants().take(&kept.grant_row).is_some());
+        assert!(
+            registry.build_grants().lookup(gone, "aa").is_some(),
+            "one list read is not yet a whole one after the filing"
+        );
+
+        nudge.nudge();
+        calls
+            .recv_timeout(read_timeout)
+            .expect("a second nudge reads again");
+        answers.send(listed()).expect("the reader waits");
+        let deadline = std::time::Instant::now() + read_timeout;
+        while registry.build_grants().lookup(gone, "aa").is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the table of the box the guest dropped stayed"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(registry.build_grants().lookup(live, "aa").is_some());
+        drop(answers);
+    }
+
     /// NET-085: a pass that drops a box a client admitted since the pass
     /// before it runs one more pass after the least gap, with no nudge and
     /// the timer far away. A resumed box then rejoins soon. A drop of a box
@@ -10763,6 +10942,7 @@ mod tests {
             NOT_SOON,
             scripted_guest_reader(calls_tx, answers_rx),
             |_: &str| {},
+            |_| {},
         )
         .expect("the reconcile thread starts");
         nudge.nudge();
@@ -10835,6 +11015,7 @@ mod tests {
             NOT_SOON,
             scripted_guest_reader(calls_tx, answers_rx),
             |_: &str| {},
+            |_| {},
         )
         .expect("the reconcile thread starts");
         nudge.nudge();

@@ -2417,6 +2417,34 @@ fn build_box_egress_is_its_hosts_or_the_internet() {
     let internet = build_box_egress(&std::collections::BTreeSet::new(), true);
     assert_eq!(internet.allow_subnets, Some(vec!["0.0.0.0/0".to_string()]));
     assert_eq!(internet.allow_dns_hosts, Some(Vec::new()));
+    assert_eq!(
+        internet.deny_subnets,
+        Some(
+            [
+                "10.0.0.0/8",
+                "172.16.0.0/12",
+                "192.168.0.0/16",
+                "100.64.0.0/10",
+                "169.254.0.0/16"
+            ]
+            .map(String::from)
+            .to_vec()
+        ),
+        "an internet grant reaches no private, shared or link-local space"
+    );
+    assert_eq!(declared.deny_subnets, None);
+}
+
+/// NET-169: a requester row's name gives back its box, and no other row's
+/// name does.
+#[test]
+fn a_requester_row_name_names_its_box() {
+    let id = SessionId::mint();
+    let row = requester_build_row_name(id);
+    assert_eq!(requester_build_row_session(&row), Some(id));
+    assert_eq!(requester_build_row_session(&format!("{row}-1")), None);
+    assert_eq!(requester_build_row_session("build-web"), None);
+    assert_eq!(requester_build_row_session(&id.to_string()), None);
 }
 
 /// A daemon's refusal of a box's table decodes as a refusal. The response

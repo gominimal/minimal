@@ -4208,13 +4208,19 @@ impl BoxRegistry {
             creation.build_row = build_rows.get(&creation.id()).copied();
             // A grant's row outlives its grant only in the file: the grant,
             // its deadline and its withdrawal lived in the previous process.
-            // Its creation is not reloaded, so no row admits its egress and
-            // none of its addresses stays held, and the write below drops it.
+            // Its creation is not reloaded, so no row admits its egress, and
+            // the write below drops it. A fetch the guest still runs can
+            // still send from its addresses, so they go back to the book in
+            // quarantine, as a withdrawn row's do, never straight to a new
+            // box.
             if creation.build_row == Some(BuildRow::Grant) {
+                if self.take_creation_addrs(&creation, now).is_ok() {
+                    self.give_back_creation_addrs(&creation);
+                }
                 tracing::info!(
                     row = %creation.name,
                     "retired a build grant's row left from before this start; its grant \
-                     ended with the previous process"
+                     ended with the previous process, and its addresses are quarantined"
                 );
                 continue;
             }
@@ -4417,15 +4423,26 @@ impl BoxRegistry {
             .collect();
         rows.build_rows.extend(leaving);
         let write_rows = |rows: &BuildRowsFile| {
-            if let Err(error) = write_registry_file(&rows_path, rows) {
+            let written = write_registry_file(&rows_path, rows);
+            if let Err(error) = &written {
                 tracing::warn!(
                     path = %rows_path.display(),
                     %error,
-                    "could not persist the build rows; a restart reloads them as boxes"
+                    "could not persist the build rows"
                 );
             }
+            written.is_ok()
         };
-        write_rows(&rows);
+        // Without the kinds on disk, a registry file that gained a build row
+        // would reload it as a box. The registry file stays as it was.
+        if !write_rows(&rows) {
+            tracing::warn!(
+                path = %path.display(),
+                "did not persist the box registry, because the build rows could not be \
+                 persisted; its rows since the last write will not survive this process"
+            );
+            return;
+        }
         if let Err(error) = write_registry_file(path, &file) {
             tracing::warn!(
                 path = %path.display(),
@@ -4436,6 +4453,8 @@ impl BoxRegistry {
         }
         if rows.build_rows.len() > held {
             rows.build_rows.truncate(held);
+            // A failure leaves kinds the registry file no longer holds,
+            // which reload nothing.
             write_rows(&rows);
         }
     }
@@ -5537,6 +5556,20 @@ impl BoxRegistry {
             build_row,
             ..Creation::new(&spec, switch_addr, loopback_addr, task_addrs.clone(), id)
         };
+        // A requester row's admit is counted before its creation is visible,
+        // so a reconcile that sees the creation also sees it newer than any
+        // list read before it ([`Self::requester_rows_without_a_box`]).
+        let requester_key =
+            (build_row == Some(BuildRow::Requester)).then(|| canonical_box_name(&spec.name));
+        if let Some(key) = &requester_key {
+            let mut resident = self
+                .host_ip_boxes
+                .write()
+                .expect("the resident host_ip boxes' lock is never held across a panic");
+            resident.admits += 1;
+            let admit = resident.admits;
+            resident.requester_rows_at.insert(key.clone(), admit);
+        }
         let registration =
             self.client_registration(spec, switch_addr, loopback_addr, task_addrs.clone(), id);
         // A refusal after the draw publishes no row, so no frame of the box
@@ -5547,19 +5580,15 @@ impl BoxRegistry {
                 if build_row.is_some() {
                     record.hold_as_build_row();
                 }
-                if build_row == Some(BuildRow::Requester) {
-                    let mut resident = self
-                        .host_ip_boxes
-                        .write()
-                        .expect("the resident host_ip boxes' lock is never held across a panic");
-                    resident.admits += 1;
-                    let admit = resident.admits;
-                    resident
-                        .requester_rows_at
-                        .insert(canonical_box_name(&record.name()), admit);
-                }
             })
             .inspect_err(|_| {
+                if let Some(key) = &requester_key {
+                    self.host_ip_boxes
+                        .write()
+                        .expect("the resident host_ip boxes' lock is never held across a panic")
+                        .requester_rows_at
+                        .remove(key);
+                }
                 for &addr in std::iter::once(&switch_addr).chain(&task_addrs) {
                     self.give_back_switch_addr(addr, false, id);
                 }
@@ -7852,9 +7881,11 @@ impl BoxRegistry {
             .host_ip_boxes
             .write()
             .expect("the resident host_ip boxes' lock is never held across a panic");
+        // An admit newer than the mark can be a registration whose creation
+        // is not visible yet: it stays.
         resident
             .requester_rows_at
-            .retain(|name, _| rows.contains_key(name));
+            .retain(|name, admit| rows.contains_key(name) || *admit > mark.0);
         rows.into_iter()
             .filter(|(key, _)| !listed.contains(key))
             .filter(|(key, _)| {
@@ -10733,13 +10764,20 @@ mod tests {
         let after = persisted_registry(&dir);
         assert!(after.row_by_name("build-web-1").is_none(), "no grant row");
         assert_eq!(after.live_switch_addrs(), 1, "only the requester row's");
+        assert!(
+            after
+                .returned_switch_addrs()
+                .contains(&(grant.switch_addr(), false)),
+            "the grant row's address is quarantined: {:?}",
+            after.returned_switch_addrs()
+        );
         let next = after
             .register_client_box(client_spec("api"))
             .expect("the plan has an address for another box");
-        assert_eq!(
+        assert_ne!(
             next.switch_addr(),
             grant.switch_addr(),
-            "the grant row's address is free again"
+            "a fetch from before the restart can still send from the grant row's address"
         );
 
         after.advance_clock(RESUME_ATTACH_BOUND);
