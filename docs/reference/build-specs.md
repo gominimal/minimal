@@ -137,6 +137,11 @@ Where the package comes from decides what its build box can reach:
 | From an `[upstream]` or a sideload, at the pin `minimal.toml` held when `min` created the box | The hosts of its declared sources and the public internet hosts they redirect to, for the fetch alone. With `needs.dns` or `needs.internet`, on the package or in its dependencies, the public internet. A build box never reaches your local network, another box or the host. |
 | Written in the project, patched, or changed inside the box | The box's own rules. A box that admits nothing refuses a build that needs the network. |
 
+On a Linux host with no VM, `minimald` makes the network of a build box with
+`/dev/net/tun` and its own network switch. Without them, a build that needs the network
+fails, and so does the fetch of a source that is not in the download cache. The
+message names what is missing. A build box never uses the host's network.
+
 A build box does not reach a declared source on a loopback, private or
 link-local address. In a box started with `--network none`, no build box has a
 network, wherever the package comes from.

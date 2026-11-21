@@ -320,6 +320,24 @@ async fn an_unreadable_table_grants_nothing() {
     assert!(build_box.network().await.is_some());
 }
 
+/// NET-155: on a host with no VM, a build box's network needs /dev/net/tun
+/// and the daemon's network switch. A build never falls back to the host's
+/// network: it is refused, naming what is missing and the next step.
+#[test]
+fn a_build_without_its_own_network_stack_is_refused() {
+    assert_eq!(
+        super::own_stack_refusal(super::MissingStack::Tun, ""),
+        "the build needs a network of its own, and this host has no /dev/net/tun to make \
+         one. Load the tun module with `sudo modprobe tun`, then run the build again."
+    );
+    assert_eq!(
+        super::own_stack_refusal(super::MissingStack::Switch, "no switch binary"),
+        "the build needs a network of its own, and the network switch of minimald gave it \
+         no address: no switch binary. Run `min bug` to collect a report of the daemon's \
+         logs."
+    );
+}
+
 /// NET-155: `__build-fetch` takes a hash and a file, and says so. Its URL
 /// is never an argument.
 #[test]

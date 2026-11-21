@@ -201,16 +201,19 @@ impl Shared {
                 let switch = Arc::clone(&self.switch);
                 Some(op::BuildNetwork::new(BUILD_SLOTS, move || {
                     Arc::new(RequesterBuildNetwork {
-                        inner: crate::net::provider::task_network_for(
-                            boxes::NetworkMode::OwnIp,
+                        inner: on_own_stack(
                             &switch,
-                            &gate_name(&record_name(&record)),
-                            egress
-                                .clone()
-                                .map(|section| boxes::BoxPolicy::new(Some(section), None)),
-                            record.task_addresses.clone(),
-                            None,
-                            None,
+                            crate::net::provider::task_network_for(
+                                boxes::NetworkMode::OwnIp,
+                                &switch,
+                                &gate_name(&record_name(&record)),
+                                egress
+                                    .clone()
+                                    .map(|section| boxes::BoxPolicy::new(Some(section), None)),
+                                record.task_addresses.clone(),
+                                None,
+                                None,
+                            ),
                         ),
                         record: record.clone(),
                         switch: Arc::clone(&switch),
@@ -290,14 +293,17 @@ impl BoxReach {
         let switch = Arc::clone(&self.shared.switch);
         let name = gate_name(&self.package);
         op::BuildNetwork::new(BUILD_SLOTS, move || {
-            crate::net::provider::task_network_for(
-                boxes::NetworkMode::OwnIp,
+            on_own_stack(
                 &switch,
-                &name,
-                Some(boxes::BoxPolicy::new(Some(egress.clone()), None)),
-                addresses.clone(),
-                None,
-                None,
+                crate::net::provider::task_network_for(
+                    boxes::NetworkMode::OwnIp,
+                    &switch,
+                    &name,
+                    Some(boxes::BoxPolicy::new(Some(egress.clone()), None)),
+                    addresses.clone(),
+                    None,
+                    None,
+                ),
             )
         })
     }
@@ -449,6 +455,85 @@ impl op::BuildBoxes for BoxBuildBoxes {
                 all.remove(&box_id);
             }
         }
+    }
+}
+
+/// What a build box's network needs on a host with no VM and is missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissingStack {
+    /// The host has no `/dev/net/tun`, so no network device can be made.
+    Tun,
+    /// The daemon's network switch gave the build no address.
+    Switch,
+}
+
+/// The refusal of a build box's network on a host with no VM (NET-155): the
+/// build box's network is its own, and on this host the daemon makes it with
+/// `/dev/net/tun` and its own network switch. A build never falls back to the
+/// host's network, so what is missing is named here, with the next step.
+fn own_stack_refusal(missing: MissingStack, error: &str) -> String {
+    match missing {
+        MissingStack::Tun => "the build needs a network of its own, and this host has no \
+             /dev/net/tun to make one. Load the tun module with `sudo modprobe tun`, then \
+             run the build again."
+            .to_string(),
+        MissingStack::Switch => format!(
+            "the build needs a network of its own, and the network switch of minimald gave \
+             it no address: {error}. Run `min bug` to collect a report of the daemon's logs."
+        ),
+    }
+}
+
+/// `inner`, refused with [`own_stack_refusal`] on a host with no VM when
+/// what it needs there is missing.
+fn on_own_stack(
+    switch: &Arc<Mutex<crate::net::SwitchClient>>,
+    inner: Arc<dyn sandbox::Network>,
+) -> Arc<dyn sandbox::Network> {
+    Arc::new(OwnStackNetwork {
+        switch: Arc::clone(switch),
+        inner,
+    })
+}
+
+struct OwnStackNetwork {
+    switch: Arc<Mutex<crate::net::SwitchClient>>,
+    inner: Arc<dyn sandbox::Network>,
+}
+
+impl std::fmt::Debug for OwnStackNetwork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnStackNetwork").finish_non_exhaustive()
+    }
+}
+
+impl sandbox::Network for OwnStackNetwork {
+    fn plan(&self) -> sandbox::PlanFuture<'_> {
+        Box::pin(async move {
+            let native =
+                self.switch.lock().await.transport() == crate::net::SwitchTransport::LocalSpawn;
+            if !native {
+                return self.inner.plan().await;
+            }
+            let refuse = |missing, error: &str| {
+                sandbox::NetworkError::new(std::io::Error::other(own_stack_refusal(missing, error)))
+            };
+            if !std::path::Path::new("/dev/net/tun").exists() {
+                return Err(refuse(MissingStack::Tun, ""));
+            }
+            self.inner
+                .plan()
+                .await
+                .map_err(|error| refuse(MissingStack::Switch, &error.to_string()))
+        })
+    }
+
+    fn attach(&self, spawned: sandbox::Spawned) -> sandbox::AttachFuture<'_> {
+        self.inner.attach(spawned)
+    }
+
+    fn abandon(&self) -> sandbox::AbandonFuture<'_> {
+        self.inner.abandon()
     }
 }
 
