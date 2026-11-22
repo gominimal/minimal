@@ -101,6 +101,7 @@ use boxes::core::zone_answer::{self, ZoneRow, ZoneView};
 use switch::loopback::RangeProbe;
 
 use crate::box_registry::{BoxRegistry, canonical_box_name, is_host_answerable};
+use crate::cmd::PortPinRefusal;
 
 /// The `component` field every answerer log line carries — the same one the
 /// native daemon's answerer logs under, because it is the same zone service
@@ -136,29 +137,33 @@ pub const ANSWERER_PORT_ENV: &str = "MINVMD_ZONE_ANSWERER_PORT";
 /// The hook port this process resolved at start ([`configure_hook_port`]).
 static HOOK_PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
 
+/// The message a value of [`ANSWERER_PORT_ENV`] that is not a port fails
+/// the start with: the value as the environment holds it, what is wrong
+/// with it, and the next step.
+fn hook_port_refusal(shown: impl std::fmt::Debug, refusal: PortPinRefusal) -> String {
+    let what = match refusal {
+        PortPinRefusal::NotAPort => "a port",
+        PortPinRefusal::Zero => "a port minvmd can answer box names on",
+    };
+    format!(
+        "{ANSWERER_PORT_ENV} is set to {shown:?}, which is not {what}. Set it to a port from 1 \
+         to 65535, or unset it to use {DEFAULT_ANSWERER_PORT}."
+    )
+}
+
 /// Decodes the answerer's hook port from the raw value of
-/// [`ANSWERER_PORT_ENV`]: absent is [`DEFAULT_ANSWERER_PORT`], and a value
-/// that is not a port from 1 to 65535 is an error naming the variable and
-/// the value.
+/// [`ANSWERER_PORT_ENV`], with the decode `MINVMD_NODE_PROXY_PORT` shares
+/// (`crate::cmd::port_pin_from_raw`): absent is [`DEFAULT_ANSWERER_PORT`],
+/// and a value that is not a port from 1 to 65535 is an error naming the
+/// variable and the value.
 ///
 /// # Errors
 ///
 /// Returns the message to fail the start with when `raw` is not a port.
 pub fn hook_port_from_raw(raw: Option<&str>) -> Result<u16, String> {
-    let Some(raw) = raw else {
-        return Ok(DEFAULT_ANSWERER_PORT);
-    };
-    match raw.trim().parse::<u16>() {
-        Ok(0) => Err(format!(
-            "environment variable {ANSWERER_PORT_ENV} carries {raw:?}: 0 is not a port to pin; \
-             the zone answerer's port is the one the host's resolver is pointed at, so it is \
-             never picked at random. Set a port from 1 to 65535, or unset the variable to use \
-             {DEFAULT_ANSWERER_PORT}"
-        )),
-        Ok(port) => Ok(port),
-        Err(_) => Err(format!(
-            "environment variable {ANSWERER_PORT_ENV} carries {raw:?}, which is not a port"
-        )),
+    match crate::cmd::port_pin_from_raw(raw) {
+        Ok(port) => Ok(port.unwrap_or(DEFAULT_ANSWERER_PORT)),
+        Err(refusal) => Err(hook_port_refusal(raw.unwrap_or_default(), refusal)),
     }
 }
 
@@ -174,9 +179,7 @@ pub fn hook_port_from_os(raw: Option<&std::ffi::OsStr>) -> Result<u16, String> {
         None => hook_port_from_raw(None),
         Some(raw) => match raw.to_str() {
             Some(text) => hook_port_from_raw(Some(text)),
-            None => Err(format!(
-                "environment variable {ANSWERER_PORT_ENV} carries {raw:?}, which is not a port"
-            )),
+            None => Err(hook_port_refusal(raw, PortPinRefusal::NotAPort)),
         },
     }
 }
@@ -185,22 +188,16 @@ pub fn hook_port_from_os(raw: Option<&std::ffi::OsStr>) -> Result<u16, String> {
 /// records it as the one every reader in this process uses
 /// ([`hook_port`]). The supervisor calls it once, before anything reads
 /// the port: the proxy draw that skips it, the answerer's bind, and the
-/// listener sets that refuse it.
+/// listener sets that refuse it. A second call keeps the port the first
+/// one recorded.
 ///
 /// # Errors
 ///
 /// Returns the message to fail the start with when the variable is set to
-/// something that is not a port, or when this process already resolved a
-/// different port.
+/// something that is not a port.
 pub fn configure_hook_port() -> Result<u16, String> {
-    let port = hook_port_from_os(std::env::var_os(ANSWERER_PORT_ENV).as_deref())?;
-    let recorded = *HOOK_PORT.get_or_init(|| port);
-    if recorded != port {
-        return Err(format!(
-            "the zone answerer's port was already resolved as {recorded} in this process; \
-             {ANSWERER_PORT_ENV} now carries {port}"
-        ));
-    }
+    let resolved = hook_port_from_os(std::env::var_os(ANSWERER_PORT_ENV).as_deref())?;
+    let port = *HOOK_PORT.get_or_init(|| resolved);
     if port != DEFAULT_ANSWERER_PORT {
         tracing::info!(
             component = COMPONENT,
@@ -6767,7 +6764,8 @@ mod tests {
 
     /// A value that is not a port fails the start with a message naming the
     /// variable and the value, `0` included: there is no "off" and no
-    /// OS-picked answerer port, because no resolver would be told about it.
+    /// OS-picked answerer port. Each message is short sentences, and ends
+    /// with the next step.
     #[test]
     fn hook_port_refuses_a_value_that_is_not_a_port() {
         for raw in ["no-port-here", "", "65536", "-1", "7656x", "0"] {
@@ -6777,17 +6775,28 @@ mod tests {
                 err.contains(ANSWERER_PORT_ENV) && err.contains(&format!("{raw:?}")),
                 "the refusal names the variable and the value {raw:?}, got: {err}"
             );
+            assert!(
+                err.ends_with(
+                    ". Set it to a port from 1 to 65535, or unset it to use 7656."
+                ),
+                "the refusal ends with the next step, got: {err}"
+            );
         }
-        let zero = hook_port_from_raw(Some("0")).expect_err("0 is refused");
-        assert!(
-            zero.contains("0 is not a port to pin") && zero.contains("7656"),
-            "the refusal of 0 says why and names the default, got: {zero}"
+        assert_eq!(
+            hook_port_from_raw(Some("abc")).expect_err("a word is refused"),
+            "MINVMD_ZONE_ANSWERER_PORT is set to \"abc\", which is not a port. Set it to a port \
+             from 1 to 65535, or unset it to use 7656."
+        );
+        assert_eq!(
+            hook_port_from_raw(Some("0")).expect_err("0 is refused"),
+            "MINVMD_ZONE_ANSWERER_PORT is set to \"0\", which is not a port minvmd can answer \
+             box names on. Set it to a port from 1 to 65535, or unset it to use 7656."
         );
     }
 
     /// A value that is not Unicode is refused like any other value that is
-    /// not a port, with the variable named. It never falls back to the
-    /// default: only an absent variable does.
+    /// not a port, in the same words, with the variable named. It never
+    /// falls back to the default: only an absent variable does.
     #[cfg(unix)]
     #[test]
     fn hook_port_refuses_a_value_that_is_not_unicode() {
@@ -6797,8 +6806,12 @@ mod tests {
         let raw = OsStr::from_bytes(b"76\xff56");
         let err = hook_port_from_os(Some(raw)).expect_err("a value that is not Unicode is refused");
         assert!(
-            err.contains(ANSWERER_PORT_ENV) && err.contains("which is not a port"),
-            "the refusal names the variable, got: {err}"
+            err.starts_with("MINVMD_ZONE_ANSWERER_PORT is set to \"76")
+                && err.ends_with(
+                    "56\", which is not a port. Set it to a port from 1 to 65535, or unset it \
+                     to use 7656."
+                ),
+            "the refusal names the variable and ends with the next step, got: {err}"
         );
         assert_eq!(hook_port_from_os(None), Ok(DEFAULT_ANSWERER_PORT));
         assert_eq!(hook_port_from_os(Some(OsStr::new("17656"))), Ok(17656));

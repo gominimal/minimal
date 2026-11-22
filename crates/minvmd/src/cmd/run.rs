@@ -3161,19 +3161,20 @@ pub(crate) fn proxy_reclaim_publisher(
 /// different from the one the operator pinned.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn node_port_override(name: &'static str) -> Result<Option<u16>> {
-    let Some(raw) = std::env::var(name).ok() else {
-        return Ok(None);
-    };
-    match raw.trim().parse::<u16>() {
-        Ok(0) => Err(anyhow::anyhow!(
-            "environment variable {name} carries {raw:?}: 0 is not a port to pin; \
-             unset the variable to let the assignment pick one"
-        )),
-        Ok(port) => Ok(Some(port)),
-        Err(_) => Err(anyhow::anyhow!(
-            "environment variable {name} carries {raw:?}, which is not a port"
-        )),
-    }
+    use crate::cmd::PortPinRefusal;
+    let raw = std::env::var(name).ok();
+    crate::cmd::port_pin_from_raw(raw.as_deref()).map_err(|refusal| {
+        let raw = raw.as_deref().unwrap_or_default();
+        match refusal {
+            PortPinRefusal::Zero => anyhow::anyhow!(
+                "environment variable {name} carries {raw:?}: 0 is not a port to pin; \
+                 unset the variable to let the assignment pick one"
+            ),
+            PortPinRefusal::NotAPort => anyhow::anyhow!(
+                "environment variable {name} carries {raw:?}, which is not a port"
+            ),
+        }
+    })
 }
 
 /// How long [`loopback_answers`] waits before deciding no listener is
