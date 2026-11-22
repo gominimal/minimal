@@ -6,7 +6,7 @@
 # docs/ci-strategy.md §6 that a single-session proof and an N-serial soak
 # (scripts/soak-session-e2e.sh loops session-e2e.sh one-at-a-time) never touch.
 #
-# The N activates fire in parallel from a cold state, so the FIRST auto-spawns
+# The N starts fire in parallel from a cold state, so the FIRST auto-spawns
 # the daemon while the rest race to connect during its bring-up — deliberately
 # maximizing the boot/first-connect raciness a serial run cannot surface.
 #
@@ -17,6 +17,9 @@
 # Usage: scripts/stress-session-e2e.sh [N]   (N defaults to 5)
 set -uo pipefail # not -e: capture failures so we can dump diagnostics
 
+command -v jq >/dev/null 2>&1 \
+  || { echo "::error::jq is not on PATH; the teardown check reads 'min box list -o json' with it" >&2; exit 2; }
+
 N="${1:-5}"
 case "$N" in
   '' | *[!0-9]*) echo "N must be a positive integer, got: '$N'" >&2; exit 2 ;;
@@ -25,9 +28,10 @@ esac
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 E2E_VM="${E2E_VM:-}"
 # Resolve + seed a SMALL pinned project to activate, exactly as session-e2e.sh
-# does: `min session activate` uploads the dir, so it must carry a pinned [upstream] +
-# a light `shell` stack and stay small. All N activates share this one dir (each
-# still mints a distinct session); a dir we create is removed wholesale on exit.
+# does: `min session start` uploads the dir, so it must carry a pinned [upstream] +
+# a light `shell` stack and stay small. All N starts share this one dir (each
+# still mints a distinct box, under its own --name); a dir we create is removed
+# wholesale on exit.
 SEED_DIR=""
 if [ -z "${E2E_PROJECT_DIR:-}" ] || { [ -n "$E2E_VM" ] && [ "${E2E_PROJECT_DIR:-}" = "/tmp" ]; }; then
   SEED_DIR="$(mktemp -d /tmp/mnl-stress-project.XXXXXX)"
@@ -74,8 +78,16 @@ mnl() {
   min ${E2E_MINIMAL_ARGS:-} "$@"
 }
 
+# The hosts `min host list` shows as running, one per line. A lane's
+# E2E_MINIMAL_ARGS picks the provider: `local-minvmd` on a VM lane, else `local`.
+running_hosts() {
+  mnl host list 2>/dev/null | awk -v p="$1" '(p == "" || $2 == p) && $3 == "running" { print $1 }'
+}
+
 teardown() {
-  mnl stop --force >/dev/null 2>&1 || true
+  for h in $(running_hosts ""); do
+    mnl host stop "$h" --force >/dev/null 2>&1 || true
+  done
   if [ -n "$E2E_VM" ]; then
     minvmd stop >/dev/null 2>&1 || true
   fi
@@ -103,11 +115,13 @@ is_uuid() {
 
 echo "::group::mint $N sessions concurrently (cold start)"
 # Fire all N in parallel; each writes its session id (last stdout line) to a
-# per-worker file. The first activate auto-spawns the daemon; the rest race in.
+# per-worker file. The first start auto-spawns the daemon; the rest race in.
+# --detach makes `min session start` print the box id and return; a distinct
+# --name per worker keeps the N starts from refusing each other's held name.
 pids=""
 for i in $(seq 1 "$N"); do
   (
-    out="$(cd "$PROJECT_DIR" && mnl session activate . 2>"$WORK/activate.$i.err")"
+    out="$(cd "$PROJECT_DIR" && mnl session start --detach --name "stress-$i" 2>"$WORK/activate.$i.err")"
     printf '%s\n' "$out" | tail -n1 | tr -d '\r' > "$WORK/activate.$i.out"
   ) &
   pids="$pids $!"
@@ -123,7 +137,7 @@ count=0
 for i in $(seq 1 "$N"); do
   sid="$(cat "$WORK/activate.$i.out" 2>/dev/null || true)"
   if ! is_uuid "$sid"; then
-    echo "::error::concurrent activate #$i did not print a session UUID (got: '$sid')"
+    echo "::error::concurrent start #$i did not print a session UUID (got: '$sid')"
     worker_fail=1
     continue
   fi
@@ -145,28 +159,47 @@ done
 listed="$(printf '%s\n' "$listing" | grep -Ecx '[0-9a-f-]{36}' || true)"
 echo "all $N sessions listed (min ls --raw reports $listed)"
 
-# Bulk teardown: one `min stop --force` must take the whole daemon (and, on a VM
-# lane, the guest) down cleanly despite N live sessions.
-mnl stop --force >/dev/null 2>&1 || { echo "::error::'min stop --force' failed under load"; fail; }
+# Bulk teardown: one `min host stop <host> --force` must stop every box, then
+# take the daemon (and, on a VM lane, the guest) down cleanly despite N live
+# sessions.
+if [ -n "$E2E_VM" ]; then host_provider=local-minvmd; else host_provider=local; fi
+host="$(running_hosts "$host_provider" | head -n1)"
+if [ -z "$host" ]; then
+  echo "::error::'min host list' shows no running $host_provider host"
+  mnl host list 2>&1 || true
+  fail
+fi
+mnl host stop "$host" --force >/dev/null 2>&1 \
+  || { echo "::error::'min host stop $host --force' failed under load"; fail; }
 if [ -n "$E2E_VM" ]; then
   minvmd status >/dev/null 2>&1
   rc=$?
   case "$rc" in
     1) ;; # stopped
-    0) echo "::error::VM still running after 'min stop --force' with $N sessions"; fail ;;
+    0) echo "::error::VM still running after 'min host stop $host --force' with $N sessions"; fail ;;
     *) echo "::error::'minvmd status' failed with exit $rc"; fail ;;
   esac
 fi
 
 # And the daemon comes back cleanly: the next command autospawns a fresh one
-# that lists ZERO sessions (the concurrent set was torn down, not orphaned).
-if ! after="$(mnl ls --raw)"; then
-  echo "::error::failed to list sessions after teardown (daemon did not restart cleanly)"
+# in which no minted box still runs (the concurrent set was stopped, not
+# orphaned). `min host stop` keeps the box records, so every minted box must
+# still be listed, and none of them in the running state.
+if ! after="$(mnl box list --all -o json)"; then
+  echo "::error::failed to list boxes after teardown (daemon did not restart cleanly)"
   fail
 fi
-if [ -n "$(printf '%s' "$after" | tr -d '[:space:]')" ]; then
-  echo "::error::sessions survived 'min stop --force': '$after'"
-  fail
-fi
+for sid in $sids; do
+  if ! state="$(printf '%s\n' "$after" | jq -er --arg id "$sid" '.[] | select(.id == $id) | .state')"; then
+    echo "::error::box $sid is missing from 'min box list --all' after 'min host stop $host --force'"
+    printf '%s\n' "$after"
+    fail
+  fi
+  if [ "$state" = running ]; then
+    echo "::error::box $sid still running after 'min host stop $host --force'"
+    printf '%s\n' "$after"
+    fail
+  fi
+done
 
-echo "session stress OK ($N concurrent sessions minted, listed, and torn down)"
+echo "session stress OK ($N concurrent sessions minted, listed, and stopped)"

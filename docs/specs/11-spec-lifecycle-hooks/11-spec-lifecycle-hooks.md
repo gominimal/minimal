@@ -243,7 +243,7 @@ attachable. The sandbox has not been built at that point — the daemon builds
 it lazily on first attach — so finalization builds it. That is the same
 cache-backed package resolution the first attach would perform, so the attach
 that follows is not slower for it. Setup work, and its failures, land at
-`min session activate`. The finalize response carries one entry per hook that
+`min session start`. The finalize response carries one entry per hook that
 ran, so the client can report it: an activate hook is headless, and without
 that the only trace is the daemon log.
 
@@ -315,19 +315,18 @@ The launch of a sandbox for a teardown hook is bounded the same way.
 
 ### Disabling and listing
 
-Hooks are disabled per session with `min session activate --no-hooks`. The
+Hooks are disabled per session with `min session start --no-hooks`. The
 flag is persisted on the session record, not only applied to the composition,
 because attach, detach, and destroy fire from processes that never saw the
 original command. The client also omits hooks from what it composes and
 uploads, so such a session has no scripts staged for it at all.
 
-`min session hooks <session>` lists every hook composed into a session: the
-transition, the description, whether it is inline or external, and the loadout
-or project that declared it. It is served from the daemon's persisted
-composition snapshot, so it works after a daemon restart and without an
-attached session, and it reads that snapshot from the store rather than
-through the session's actor — a report has no business starting the thing it
-reports on.
+`min box spec <box-id>` lists every hook in the spec that a box stored: one
+line for each transition of each hook, with its command, its description and
+the loadout or project that declared it. It reads the stored spec, so it works
+after a daemon restart and without an attached session. It starts no box, as a
+report has no business starting the thing it reports on. BCLI-042 removed the
+earlier spelling, `min session hooks <session>`, with no alias.
 
 ### User policy
 
@@ -357,7 +356,7 @@ TOML round-trips for all four transitions, rejection of hooks with no scripts,
 and each path rule.
 
 Composition tests cover the ordering guarantee in both directions and confirm
-that a session activated with hooks disabled composes none.
+that a session started with hooks disabled composes none.
 
 Daemon tests cover the activate, detach, and destroy trigger points against a
 mock sandbox: that hooks dispatch at the right moment, that a failing activate

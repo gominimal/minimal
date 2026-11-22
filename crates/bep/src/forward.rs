@@ -46,7 +46,7 @@ use crate::audit::{Decision, Kind, Mapping, Outcome};
 use crate::handle::{Inject, parse_authority};
 use crate::http::{self, CloseReason, Forwarded, Parse, Request};
 use crate::inject::{self, INJECTION_INVALID};
-use crate::proxy::{AuditWriter, absolute_form, respond};
+use crate::proxy::{AuditWriter, absolute_form, respond, respond_json};
 use crate::redeem::{self, Authority, Check, Plain, RequestAuthority};
 use crate::seal;
 use crate::store::{ReadError, ValueReader};
@@ -819,6 +819,9 @@ pub struct Refusal {
     /// Whether an earlier request of the flow went upstream. Its response
     /// goes to the box before the refusal does.
     pub after_forwarded: bool,
+    /// Whether the answer's body is a JSON document, for a client that
+    /// parses JSON errors, such as `gh`.
+    pub json: bool,
 }
 
 /// How the request half ended.
@@ -986,6 +989,19 @@ impl Flow {
                 Err(marker)
             }
         }
+    }
+
+    /// Whether a refusal of `request` answers in JSON: the request accepts
+    /// `application/json`, or it goes to the GitHub API, whose clients
+    /// parse a JSON error body.
+    fn wants_json(&self, request: &Request) -> bool {
+        self.authority.host.eq_ignore_ascii_case("api.github.com")
+            || request.headers.iter().any(|header| {
+                header.name == "accept"
+                    && String::from_utf8_lossy(&header.value)
+                        .to_ascii_lowercase()
+                        .contains("application/json")
+            })
     }
 
     fn authority_text(&self) -> String {
@@ -1301,6 +1317,7 @@ pub fn forward_requests<R: Read, W: Write>(
                     marker,
                     body: flow.refusal_body(marker),
                     after_forwarded: forwarded_any,
+                    json: flow.wants_json(&request),
                 });
             }
         };
@@ -1437,6 +1454,11 @@ pub async fn relay_responses<R, W>(
         refusal = Some(got);
     }
     match refusal {
+        Some(refusal) if refusal.json => {
+            // The GitHub error shape: `gh` prints `message` and the status.
+            let body = serde_json::json!({ "message": refusal.body }).to_string();
+            respond_json(client, 403, "Forbidden", &body).await;
+        }
         Some(refusal) => respond(client, 403, "Forbidden", &refusal.body).await,
         None => {
             let _ = client.shutdown().await;
@@ -2629,6 +2651,7 @@ mod tests {
                 marker: Check::Undecryptable.marker(),
                 body: "refused".to_owned(),
                 after_forwarded: false,
+                json: false,
             })
             .unwrap();
             up_far.shutdown().await.unwrap();
@@ -2640,6 +2663,93 @@ mod tests {
             let mut out = String::new();
             client_far.read_to_string(&mut out).await.unwrap();
             assert!(out.starts_with("HTTP/1.1 403 Forbidden"), "{out}");
+        }
+    }
+
+    /// Sends one request with two sealed `Authorization` headers to `host`,
+    /// which the decision refuses, and gives what the box reads back.
+    async fn refused_answer(host: &str, accept: &str) -> String {
+        let sealed = sealed_text();
+        let request = format!(
+            "GET /user HTTP/1.1\r\nHost: {host}\r\n{accept}authorization: Bearer {sealed}\r\nauthorization: Bearer {sealed}\r\n\r\n"
+        );
+        let (_, audit) = memory_audit();
+        let flow = plain_flow(host, audit);
+        let mut box_side = std::io::Cursor::new(request.into_bytes());
+        let mut sent = Vec::new();
+        let HalfEnd::Refused(refused) = forward_requests(&flow, &mut box_side, &mut sent) else {
+            panic!("the request was not refused");
+        };
+        let (tx, rx) = oneshot::channel();
+        tx.send(refused).unwrap();
+        let (mut up, up_far) = tokio::io::duplex(1024);
+        drop(up_far);
+        let (mut client, mut client_far) = tokio::io::duplex(8192);
+        relay_responses(&mut up, &mut client, flow.responses(), rx).await;
+        drop(client);
+        let mut out = String::new();
+        client_far.read_to_string(&mut out).await.unwrap();
+        out
+    }
+
+    // A refusal to `gh`, or to any client that accepts JSON, is the GitHub
+    // error shape, so the client prints the refusal sentence.
+    #[tokio::test]
+    async fn refusal_to_json_client_is_github_shaped_json() {
+        for (host, accept) in [
+            ("api.github.com", ""),
+            ("api.github.com", "Accept: */*\r\n"),
+            (
+                "example.com",
+                "Accept: application/vnd.github+json, application/json\r\n",
+            ),
+        ] {
+            let out = refused_answer(host, accept).await;
+            let (head, body) = out.split_once("\r\n\r\n").unwrap();
+            assert!(head.starts_with("HTTP/1.1 403 Forbidden"), "{out}");
+            assert!(
+                head.contains("content-type: application/json; charset=utf-8"),
+                "{out}"
+            );
+            let length: usize = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: "))
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(length, body.len(), "{out}");
+            let doc: serde_json::Value = serde_json::from_str(body).unwrap();
+            let message = doc["message"].as_str().unwrap();
+            assert!(
+                message.starts_with(&format!(
+                    "The Box Egress Proxy refused the request to {host}:443, because"
+                )),
+                "{message}"
+            );
+        }
+    }
+
+    // A refusal to a client that does not ask for JSON stays plain text.
+    #[tokio::test]
+    async fn refusal_to_plain_client_stays_text_plain() {
+        for accept in ["", "Accept: */*\r\n", "Accept: text/html\r\n"] {
+            let out = refused_answer("example.com", accept).await;
+            let (head, body) = out.split_once("\r\n\r\n").unwrap();
+            assert!(head.starts_with("HTTP/1.1 403 Forbidden"), "{out}");
+            assert!(
+                head.contains("content-type: text/plain; charset=utf-8"),
+                "{out}"
+            );
+            assert!(
+                body.starts_with(
+                    "The Box Egress Proxy refused the request to example.com:443, because"
+                ),
+                "{body}"
+            );
+            assert!(
+                serde_json::from_str::<serde_json::Value>(body).is_err(),
+                "{body}"
+            );
         }
     }
 

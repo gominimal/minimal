@@ -779,6 +779,35 @@ struct Seen {
 /// An attach the daemon ended exits non-zero, so a script can tell it from
 /// one the user ended. A detach and a session process that exited are the
 /// user's own ends and stay 0; a shed keeps ssh's 255.
+/// A takeover and a daemon shutdown leave the unwind codes on the terminal
+/// and nothing else. The client prints the one line that names the cause,
+/// so a line from the binding is a second line (#3035).
+#[tokio::test]
+async fn takeover_and_shutdown_write_no_disconnecting_line() {
+    let codes = b"\x1b[?1000l".to_vec();
+    for (farewell, reason) in [
+        (
+            Farewell::Superceded(codes.clone()),
+            MainloopExitReason::Superceded,
+        ),
+        (
+            Farewell::DaemonShutdown(codes.clone()),
+            MainloopExitReason::Shutdown,
+        ),
+    ] {
+        let mut written = Vec::new();
+        let ended = Binding::render_farewell(farewell, &mut written).await;
+        assert_eq!(ended, reason);
+        assert_eq!(ended.exit_status(), DAEMON_ENDED_EXIT_STATUS);
+        assert_eq!(
+            written,
+            codes,
+            "{reason:?} writes only the unwind codes, not {:?}",
+            String::from_utf8_lossy(&written)
+        );
+    }
+}
+
 #[test]
 fn daemon_ended_attaches_report_a_non_zero_exit_status() {
     for reason in [
@@ -1152,6 +1181,116 @@ async fn an_unrequested_kill_still_warns_abnormal() {
             && line.contains("session process reaped after pty/step error")
             && line.contains("abnormal=true"),
         "an unrequested SIGKILL reaps as an abnormal warn: {line}",
+    );
+}
+
+/// The level a box's exit is logged at. A box the daemon killed reaps with
+/// the same SIGKILL account an out-of-memory kill gives, so only the kill
+/// the daemon sent turns it into a debug line; the same account with no kill
+/// sent stays a warning, and so does a non-zero exit the command made itself.
+#[test]
+fn a_box_the_daemon_killed_logs_its_exit_at_debug() {
+    let sigkill = signalled("container received signal SIGKILL");
+    assert_eq!(exit_log_level(&sigkill, true), tracing::Level::DEBUG);
+    assert_eq!(exit_log_level(&sigkill, false), tracing::Level::WARN);
+    assert_eq!(exit_log_level(&exited(1), false), tracing::Level::WARN);
+    // The command exited before the kill reached it: its own failure.
+    assert_eq!(exit_log_level(&exited(1), true), tracing::Level::WARN);
+    assert_eq!(exit_log_level(&exited(0), false), tracing::Level::INFO);
+    assert_eq!(exit_log_level(&exited(0), true), tracing::Level::INFO);
+}
+
+/// The kill flag the level rests on is set by the process handle's own
+/// `kill` and by nothing else: a process killed through the handle reaps as
+/// a debug exit, the same process killed from outside reaps as a warning.
+#[test]
+fn only_a_kill_through_the_handle_marks_the_exit_as_requested() {
+    let spawn = || {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("failed to spawn sleep");
+        MockProcess::new(MockBackend { child })
+    };
+
+    let mut requested = spawn();
+    requested.kill().expect("kill through the handle");
+    requested.wait().expect("reap the killed process");
+    let reason = requested.exit_reason().expect("reaped");
+    assert_eq!(
+        exit_log_level(&reason, requested.killed),
+        tracing::Level::DEBUG
+    );
+
+    let mut unrequested = spawn();
+    let pid = libc::pid_t::try_from(unrequested.container_pid()).expect("pid fits in pid_t");
+    // SAFETY: `kill` takes plain integers; `pid` is the child this test
+    // spawned, which has not been reaped yet.
+    let rc = unsafe { libc::kill(pid, libc::SIGKILL) };
+    assert_eq!(rc, 0, "failed to SIGKILL the child");
+    unrequested.wait().expect("reap the killed process");
+    let reason = unrequested.exit_reason().expect("reaped");
+    assert!(
+        reason.is_abnormal(),
+        "a SIGKILL is an abnormal end: {reason:?}"
+    );
+    assert_eq!(
+        exit_log_level(&reason, unrequested.killed),
+        tracing::Level::WARN
+    );
+}
+
+/// A process an outside SIGKILL already ended, but that nobody has reaped,
+/// still accepts a kill(2). A kill through the handle then finds the exit
+/// first, records it as unrequested and sends nothing, so the exit stays a
+/// warning rather than reading as one the daemon asked for.
+#[test]
+fn a_kill_after_an_unreaped_outside_kill_leaves_the_exit_unrequested() {
+    let child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("failed to spawn sleep");
+    let mut process = MockProcess::new(MockBackend { child });
+    let pid = libc::pid_t::try_from(process.container_pid()).expect("pid fits in pid_t");
+    // SAFETY: `kill` takes plain integers; `pid` is the child this test
+    // spawned, which has not been reaped yet.
+    let rc = unsafe { libc::kill(pid, libc::SIGKILL) };
+    assert_eq!(rc, 0, "failed to SIGKILL the child");
+
+    // Wait for the death without reaping it (`WNOWAIT`), so the child is a
+    // zombie when the handle's kill runs: the state the kill must not mistake
+    // for a live process.
+    // SAFETY: `siginfo_t` is a plain C struct, valid when all zeros.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a live `siginfo_t` the call writes through, and `pid`
+    // is this test's own unreaped child.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            libc::id_t::try_from(pid).expect("pid fits in id_t"),
+            &raw mut info,
+            libc::WEXITED | libc::WNOWAIT,
+        )
+    };
+    assert_eq!(rc, 0, "failed to wait for the child's death");
+    assert!(
+        process.exit_reason().is_none(),
+        "the death is not reaped yet"
+    );
+
+    process.kill().expect("a kill through the handle");
+    assert!(!process.killed, "a process already ended was not killed");
+    let reason = process
+        .exit_reason()
+        .expect("the kill reaps an exit it finds");
+    assert!(
+        reason.is_abnormal(),
+        "a SIGKILL is an abnormal end: {reason:?}"
+    );
+    process.wait().expect("the reap returns the cached status");
+    assert_eq!(
+        exit_log_level(&reason, process.killed),
+        tracing::Level::WARN
     );
 }
 
@@ -5070,18 +5209,18 @@ async fn expose_ask_superseded_mid_dialog_is_the_daemons_refusal() {
         "an ask nobody answered asks the switch nothing"
     );
 
-    // The first channel saw the supersede itself — its farewell and a close
-    // — so the refusal above is the one a teardown mid-dialog answers with.
+    // The first channel saw the supersede itself — the daemon-ended status
+    // and a close — so the refusal above is the one a teardown mid-dialog
+    // answers with. The binding writes no line of its own for a takeover:
+    // the client names the cause.
     let (mut superseded, mut closed) = (false, false);
     let mut seen = Vec::new();
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             match channel.wait().await {
-                Some(russh::ChannelMsg::Data { data }) => {
-                    seen.extend_from_slice(&data);
-                    if String::from_utf8_lossy(&seen)
-                        .contains("session attached to from a different connection")
-                    {
+                Some(russh::ChannelMsg::Data { data }) => seen.extend_from_slice(&data),
+                Some(russh::ChannelMsg::ExitStatus { exit_status }) => {
+                    if exit_status == DAEMON_ENDED_EXIT_STATUS {
                         superseded = true;
                     }
                 }
@@ -5097,7 +5236,12 @@ async fn expose_ask_superseded_mid_dialog_is_the_daemons_refusal() {
     .expect("the superseded binding's channel should close within the bound");
     assert!(
         superseded,
-        "the first client saw its supersede farewell: {}",
+        "the first client saw the daemon-ended status: {}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(
+        !String::from_utf8_lossy(&seen).contains("Disconnecting"),
+        "a takeover writes no Disconnecting line into the PTY: {}",
         String::from_utf8_lossy(&seen)
     );
     assert!(closed, "the channel should close after the supersede");
@@ -7781,6 +7925,144 @@ fn launcher_starts_session_and_task_entrypoints_from_spec_without_logging_args()
     assert_eq!(LaunchEntrypoint::Shell.arg_count(), 0);
 }
 
+/// What [`LaunchSpans`] saw of one `box.launch` span: its status code, its
+/// status description, and whether it has closed.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct LaunchSpanSeen {
+    code: Option<String>,
+    description: Option<String>,
+    closed: bool,
+}
+
+/// Records each `box.launch` span's status fields, each kept apart, and its
+/// close, in the order the spans are created.
+#[derive(Clone, Default)]
+struct LaunchSpans(std::sync::Arc<std::sync::Mutex<LaunchSpanLog>>);
+
+#[derive(Default)]
+struct LaunchSpanLog {
+    spans: Vec<LaunchSpanSeen>,
+    /// The index in `spans` of each `box.launch` span, by id.
+    by_id: std::collections::HashMap<u64, usize>,
+}
+
+impl LaunchSpans {
+    fn all(&self) -> Vec<LaunchSpanSeen> {
+        self.0.lock().unwrap().spans.clone()
+    }
+}
+
+#[derive(Default)]
+struct LaunchStatusFields {
+    code: Option<String>,
+    description: Option<String>,
+}
+
+impl tracing::field::Visit for LaunchStatusFields {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        match field.name() {
+            "otel.status_code" => self.code = Some(value.to_owned()),
+            "otel.status_description" => self.description = Some(value.to_owned()),
+            _ => {}
+        }
+    }
+
+    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+}
+
+impl<S> tracing_subscriber::Layer<S> for LaunchSpans
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        _: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if attrs.metadata().name() == "box.launch" {
+            let mut log = self.0.lock().unwrap();
+            let at = log.spans.len();
+            log.spans.push(LaunchSpanSeen::default());
+            log.by_id.insert(id.into_u64(), at);
+        }
+    }
+
+    fn on_record(
+        &self,
+        id: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        _: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut fields = LaunchStatusFields::default();
+        values.record(&mut fields);
+        let mut log = self.0.lock().unwrap();
+        if let Some(&at) = log.by_id.get(&id.into_u64()) {
+            let seen = &mut log.spans[at];
+            if fields.code.is_some() {
+                seen.code = fields.code;
+            }
+            if fields.description.is_some() {
+                seen.description = fields.description;
+            }
+        }
+    }
+
+    fn on_close(&self, id: tracing::span::Id, _: tracing_subscriber::layer::Context<'_, S>) {
+        let mut log = self.0.lock().unwrap();
+        if let Some(at) = log.by_id.remove(&id.into_u64()) {
+            log.spans[at].closed = true;
+        }
+    }
+}
+
+// gominimal/minimal#3223: a failed launch marks its `box.launch` span with
+// the ERROR code and says why in the status description; a launch that
+// succeeds sets neither. Either way the span has closed by the time the
+// launch's result is back, so its duration is the launch's alone and not the
+// binding setup and attach hooks the caller runs next.
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_launch_marks_and_explains_its_span_and_the_span_closes_with_the_launch() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let spans = LaunchSpans::default();
+    let _guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(spans.clone()));
+    let entrypoint = LaunchEntrypoint::Shell;
+
+    let ok = launch_in_span(
+        launch_span(boxes::SessionId::nil(), "dev", &entrypoint),
+        async { Ok::<_, io::Error>(7) },
+    )
+    .await;
+    assert_eq!(ok.unwrap(), 7);
+    assert_eq!(
+        spans.all(),
+        [LaunchSpanSeen {
+            code: None,
+            description: None,
+            closed: true,
+        }],
+        "a launch that succeeds sets no status and its span has closed"
+    );
+
+    let failed = launch_in_span(
+        launch_span(boxes::SessionId::nil(), "dev", &entrypoint),
+        async { Err::<(), _>(io::Error::other("no such file: /usr/bin/bash")) },
+    )
+    .await;
+    let err = failed.expect_err("the launch's error goes up unchanged");
+    assert_eq!(err.to_string(), "no such file: /usr/bin/bash");
+    assert_eq!(
+        spans.all()[1],
+        LaunchSpanSeen {
+            code: Some("ERROR".to_owned()),
+            description: Some("no such file: /usr/bin/bash".to_owned()),
+            closed: true,
+        },
+        "a failed launch's span carries the code and the reason, and has closed"
+    );
+}
+
 // T42, T43: one launcher reads the box's first process from its spec. A
 // session's spec starts its login shell. A task's spec starts its argv,
 // except on a launch minted only for hooks, which holds the shell.
@@ -8968,4 +9250,438 @@ async fn task_box_exits_with_code_and_output_after_client_drop() {
         log.contains("reading a box's log") && log.contains(&id.to_string()),
         "the daemon log names the read of the box's output: {log}"
     );
+}
+
+/// What the client end of an attach saw until its channel closed: the
+/// terminal bytes, and the exit status the binding reported.
+async fn drain_attach(channel: &mut russh::Channel<russh::client::Msg>) -> (String, Option<u32>) {
+    let mut seen = Vec::new();
+    let mut exit_status = None;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Data { data } => seen.extend_from_slice(&data),
+                russh::ChannelMsg::ExitStatus { exit_status: s } => exit_status = Some(s),
+                russh::ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the attach must end, not wait on a prompt");
+    (String::from_utf8_lossy(&seen).into_owned(), exit_status)
+}
+
+/// BCLI-068: a stop, a restart or a removal while a client is attached ends the
+/// attach from the daemon's side. The box's entrypoint does not end the box
+/// here, so a shell that exits on its own raises the shell-exit prompt. A
+/// stop signals that same shell, and a removal kills it, but the host knows
+/// of the stop or removal first: the binding raises no prompt, writes no
+/// "Disconnecting - …" line, and ends with the daemon-ended status, 254.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_while_attached_ends_binding_without_shell_exit_prompt() {
+    for end in [BoxEnd::Stop, BoxEnd::Restart, BoxEnd::Removal] {
+        let (host, handle) = Host::build(
+            MockLauncher::default(),
+            HostParams {
+                name: "test-session".to_string(),
+                username: "user".to_string(),
+                paths: test_paths(),
+                sz: DEFAULT_SIZE,
+                channel: None,
+                control: None,
+                delta: None,
+                archives_dir: std::env::temp_dir(),
+                holds_host_row: false,
+                ends_with_entrypoint: false,
+                session_id: boxes::SessionId::nil(),
+                composition: None,
+                connection_env: ConnectionEnv::new(),
+                #[cfg(target_os = "linux")]
+                name_marker: None,
+            },
+        )
+        .await
+        .expect("failed to build host");
+        let task = crate::traced::spawn(host.mainloop());
+        let (mut channel, _client) = ssh_attach(&handle).await;
+
+        // The binding relays: the shell answers a line.
+        channel.make_writer().write_all(b"hello\n").await.unwrap();
+        let mut seen = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !String::from_utf8_lossy(&seen).contains("got:hello") {
+                match channel.wait().await {
+                    Some(russh::ChannelMsg::Data { data }) => seen.extend_from_slice(&data),
+                    Some(_) => {}
+                    None => panic!("the channel closed before the shell answered"),
+                }
+            }
+        })
+        .await
+        .expect("the attached client reads the shell's answer");
+
+        // The stop or removal tells the host first, as `BoxActor` does,
+        // then ends the shell as each one does.
+        handle.announce_end(end).await;
+        match end {
+            BoxEnd::Stop | BoxEnd::Restart => {
+                let pid = handle
+                    .get_attrs()
+                    .await
+                    .expect("the host answers")
+                    .container_pid
+                    .expect("the mock names its process");
+                let pid = i32::try_from(pid).expect("a pid fits an i32");
+                // SAFETY: a plain kill(2) on the mock shell this test started.
+                assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+            }
+            BoxEnd::Removal => handle
+                .kill(false)
+                .await
+                .expect("kill should reach the host"),
+        }
+
+        let (text, exit_status) = drain_attach(&mut channel).await;
+        assert!(
+            !text.contains(SHELL_EXIT_PROMPT),
+            "{end:?}: no shell-exit prompt: {text:?}"
+        );
+        assert!(
+            !text.contains("Disconnecting"),
+            "{end:?}: the binding writes no line of its own: {text:?}"
+        );
+        assert_eq!(
+            exit_status,
+            Some(DAEMON_ENDED_EXIT_STATUS),
+            "{end:?}: the attach ends with 254: {text:?}"
+        );
+        assert_eq!(DAEMON_ENDED_EXIT_STATUS, 254);
+        let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
+    }
+}
+
+/// NET-079: an exec into a host-address box with a classifier leaf and a
+/// hook into it both join that leaf. The exec's command is the one the
+/// host builds for every injection, and the hook's commands carry the
+/// host's leaf and its host-address enforcement, so the hook takes the
+/// `host_ip` cohort's UDP 443 check as the exec does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_exec_and_a_hook_into_a_placed_box_join_its_leaf() {
+    let (mut host, _handle) = Host::build(
+        MockLauncher::with_host_ip_enforcement(minimald_rpc::HostIpEnforcement::PerBox),
+        HostParams {
+            name: "test-session".to_string(),
+            username: "user".to_string(),
+            paths: test_paths(),
+            sz: DEFAULT_SIZE,
+            channel: None,
+            control: None,
+            delta: None,
+            archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
+            ends_with_entrypoint: false,
+            session_id: boxes::SessionId::nil(),
+            composition: None,
+            connection_env: ConnectionEnv::new(),
+            #[cfg(target_os = "linux")]
+            name_marker: None,
+        },
+    )
+    .await
+    .expect("failed to build host");
+    let leaf = sandbox::config::ClassifierLeaf::new("/sys/fs/cgroup/minimald.slice/boxes/allow/b");
+    host.leaf = Some(leaf.clone());
+
+    // A plain host process shares every namespace with us, so the join set
+    // is empty and nothing privileged is asked of the runner.
+    let mut hold = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawning a stand-in session leader");
+    let exec = host
+        .injected_command(crate::nsenter::Injection::new(
+            hold.id(),
+            "/bin/true",
+            Vec::<String>::new(),
+        ))
+        .expect("building the exec's command");
+    let hook = host.hook_commands(hold.id());
+    let _ = hold.kill();
+    let _ = hold.wait();
+
+    let argv: Vec<String> = exec
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let at = argv
+        .iter()
+        .position(|arg| arg == "--classifier-leaf")
+        .unwrap_or_else(|| panic!("an exec names the box's leaf to the shim: {argv:?}"));
+    assert_eq!(argv[at + 1], leaf.dir().to_string_lossy());
+
+    assert_eq!(hook.leaf, Some(leaf), "a hook joins the box's leaf");
+    assert!(
+        hook.host_ip_enforced,
+        "a hook into a host-address box takes the UDP 443 check"
+    );
+    assert_eq!(hook.box_id, host.session_id.to_string());
+}
+
+/// BCLI-068: the stop half of `min box restart` records the `restart`
+/// ending reason on its `exited` event before the restart starts the box
+/// again. A client whose attach the restart ended can read the box
+/// `stopped` between the stop and the start. The event then already names
+/// the restart. A start that fails leaves the box stopped with that event
+/// last. A start that succeeds writes `started` after it. A plain stop
+/// records no such reason. The binding ends a restarted attach with 254, as
+/// it does for a stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_records_restart_reason_before_start() {
+    use crate::box_actor::{STOPPED_BY, STOPPED_BY_RESTART};
+    use boxes::core::record::RecordState;
+    use boxes::events::{BoxEvent, BoxEventType};
+
+    const GRACE: Duration = Duration::from_secs(2);
+
+    assert_eq!(
+        MainloopExitReason::BoxEnded(BoxEnd::Restart).exit_status(),
+        DAEMON_ENDED_EXIT_STATUS
+    );
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+    spec.lifetime = mfile::spec::Lifetime::UntilStopped;
+    spec.pty_enabled = true;
+    let mut req = crate::test_harness::create_session_req("restart-reason", "/uwu");
+    req.spec = Some(serde_json_lenient::to_value(&spec).expect("a spec serializes"));
+    let id = client
+        .call::<minimald_rpc::CreateSession>(&req)
+        .await
+        .unwrap()
+        .id;
+    crate::test_harness::unwrap_ready(
+        client
+            .call::<minimald_rpc::ConfigureLoadout>(&minimald_rpc::ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    match client
+        .call::<minimald_rpc::FinalizeSession>(&minimald_rpc::FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
+        .await
+    {
+        minimald_rpc::Errorable::Ok(_) => {}
+        minimald_rpc::Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+    }
+
+    let manager = server.state.sessions_manager().await;
+    let events = || async { manager.box_events(id).await.unwrap().read_new().unwrap() };
+    let record_state = || async {
+        manager
+            .get_record(crate::box_manager::BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the box keeps its record")
+            .state()
+            .unwrap()
+    };
+    // The client reads these exact strings (`ends_of` in `min`, pinned by
+    // `attach_ended_by_restart_names_restart_exit254`). Pin the wire text here
+    // too, so a change on either side fails a test.
+    assert_eq!((STOPPED_BY, STOPPED_BY_RESTART), ("stopped_by", "restart"));
+    let by_restart =
+        |event: &BoxEvent| event.data.get("stopped_by").and_then(|v| v.as_str()) == Some("restart");
+    manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves")
+        .ensure_host("tester".to_string())
+        .await
+        .expect("a running box launches a headless host");
+
+    // The start fails: what the stop half recorded is all there is, so it
+    // was recorded before the start.
+    let before = events().await.len();
+    crate::box_actor::restart_launch_seam::fail_next(id);
+    match manager.restart_box_with_grace(id, GRACE).await {
+        Err(crate::box_actor::RestartError::Failed(_)) => {}
+        other => panic!("the restart's start did not fail: {other:?}"),
+    }
+    let RecordState::Stopped(_) = record_state().await else {
+        panic!("a failed start leaves the box stopped");
+    };
+    let added = events().await.split_off(before);
+    let kinds: Vec<_> = added.iter().map(|event| event.kind).collect();
+    assert_eq!(kinds, [BoxEventType::Exited], "{added:?}");
+    assert_eq!(added[0].data["reason"], "stopped", "{added:?}");
+    assert!(
+        by_restart(&added[0]),
+        "the stop half names the restart: {added:?}"
+    );
+
+    // The actor ended with the failed start. The next restart starts the
+    // box from stopped, and so has no stop half.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let restarted = loop {
+        match manager.restart_box_with_grace(id, GRACE).await {
+            Err(crate::box_actor::RestartError::Failed(error))
+                if error
+                    .to_string()
+                    .contains("ended before its restart finished")
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            other => break other,
+        }
+    };
+    assert!(!restarted.expect("the box starts from stopped"));
+    assert_eq!(record_state().await, RecordState::Running);
+
+    // A restart of the running box records the restart, then `started`.
+    let before = events().await.len();
+    assert!(
+        manager
+            .restart_box_with_grace(id, GRACE)
+            .await
+            .expect("the running box restarts"),
+        "the restart stopped a running box"
+    );
+    assert_eq!(record_state().await, RecordState::Running);
+    let added = events().await.split_off(before);
+    let exited = added
+        .iter()
+        .position(|event| event.kind == BoxEventType::Exited)
+        .unwrap_or_else(|| panic!("the stop half recorded its end: {added:?}"));
+    let started = added
+        .iter()
+        .rposition(|event| event.kind == BoxEventType::Started)
+        .unwrap_or_else(|| panic!("the start recorded `started`: {added:?}"));
+    assert!(exited < started, "{added:?}");
+    assert!(by_restart(&added[exited]), "{added:?}");
+
+    // A plain stop names no restart.
+    let before = events().await.len();
+    manager
+        .stop_box_with_grace(id, false, GRACE)
+        .await
+        .expect("the box stops");
+    let added = events().await.split_off(before);
+    let exited: Vec<_> = added
+        .iter()
+        .filter(|event| event.kind == BoxEventType::Exited)
+        .collect();
+    assert_eq!(exited.len(), 1, "{added:?}");
+    assert_eq!(exited[0].data["reason"], "stopped", "{added:?}");
+    assert!(exited[0].data.get(STOPPED_BY).is_none(), "{added:?}");
+}
+
+/// NET-079: the supervisor's placement is confirmed by the leaf's own
+/// members, never assumed from the write. A pid counts only as a whole line,
+/// so a pid that shares digits with a member is not taken for it.
+#[test]
+fn a_supervisor_placement_is_confirmed_by_the_leafs_members() {
+    assert!(super::leaf_lists_pid("41\n4242\n", 4242).is_ok());
+    assert!(super::leaf_lists_pid("4242", 4242).is_ok());
+    for members in ["", "424\n", "42420\n", "14242\n"] {
+        assert!(
+            super::leaf_lists_pid(members, 4242).is_err(),
+            "{members:?} does not list 4242"
+        );
+    }
+}
+
+/// NET-079: a supervisor the daemon could not write into its leaf is an
+/// error, which the launch turns into a refused start. A stand-in leaf with
+/// no `cgroup.procs` refuses the write the way a removed leaf does.
+#[test]
+fn a_supervisor_placement_the_leaf_refuses_is_an_error() {
+    let dir = tempfile::tempdir().expect("a stand-in tree");
+    let leaf = sandbox::config::ClassifierLeaf::new(dir.path().join("boxes/deny/b1"));
+    let err = super::place_box_processes(&leaf, std::process::id())
+        .expect_err("no cgroup.procs to write the supervisor into");
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+/// The text a launch fails with when its supervisor could not be placed:
+/// what failed, the cause the placement's error names, and one command.
+#[test]
+fn the_supervisor_placement_refusal_says_the_box_did_not_start() {
+    let refusal = |cause: std::io::Error| super::supervisor_placement_refusal(&cause).to_string();
+    let head = "the box did not start: Minimal could not move the box's supervisor \
+                process into the cgroup that decides the box's network access.";
+    let tail = "If it keeps failing, run `min bug` to collect a diagnostic bundle.";
+    assert_eq!(
+        refusal(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        format!("{head} The cgroup no longer exists. {tail}")
+    );
+    assert_eq!(
+        refusal(std::io::Error::from_raw_os_error(libc::EACCES)),
+        format!("{head} The kernel refused the move. {tail}")
+    );
+    assert_eq!(
+        refusal(super::leaf_lists_pid("41\n", 4242).expect_err("4242 is not listed")),
+        format!(
+            "{head} The move failed: the cgroup does not list process 4242 after the move. {tail}"
+        )
+    );
+}
+
+/// An abandoned launch kills its box's processes, not only the supervisor.
+/// A program that has not armed `PR_SET_PDEATHSIG` yet outlives a killed
+/// supervisor and would exec once its start gate is gone. The stand-in
+/// supervisor's child here never arms it, so only `kill_abandoned_box`
+/// ends it.
+#[test]
+fn an_abandoned_launch_kills_the_program_the_supervisor_forked() {
+    use std::io::BufRead as _;
+    let mut supervisor = std::process::Command::new("sh")
+        .args(["-c", "sleep 600 & echo $!; wait"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("a stand-in supervisor");
+    let mut line = String::new();
+    std::io::BufReader::new(supervisor.stdout.take().expect("piped stdout"))
+        .read_line(&mut line)
+        .expect("the program's pid");
+    let program: i32 = line.trim().parse().expect("a pid");
+    let program_ends = |within: Duration| {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            // Gone, or a zombie its parent has not reaped: either has ended.
+            let ended =
+                std::fs::read_to_string(format!("/proc/{program}/stat")).map_or(true, |stat| {
+                    stat.rsplit_once(')')
+                        .and_then(|(_, rest)| rest.split_whitespace().next())
+                        .is_some_and(|state| matches!(state, "Z" | "X"))
+                });
+            if ended || std::time::Instant::now() >= deadline {
+                return ended;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    assert!(
+        !program_ends(Duration::ZERO),
+        "the program runs before the kill"
+    );
+
+    super::kill_abandoned_box(supervisor.id());
+
+    let ended = program_ends(Duration::from_secs(10));
+    let _ = supervisor.kill();
+    let _ = supervisor.wait();
+    if !ended {
+        // SAFETY: kill(2) reads no memory of ours.
+        unsafe { libc::kill(program, libc::SIGKILL) };
+    }
+    assert!(ended, "the program the supervisor forked is killed with it");
 }

@@ -366,6 +366,30 @@ resolve_prefix() {
     esac
 }
 
+# The data/state/cache directory the runtime itself writes, which --purge
+# removes alongside the resolve_prefix one. Mirrors crates/paths
+# (minimal_data_dir, minimal_state_dir, minimal_cache_dir): an XDG variable
+# counts only when it is an absolute path, as the XDG spec says and the runtime
+# does, and the macOS cache is ~/Library/Caches/minimal whatever XDG_CACHE_HOME
+# says, because the runtime takes it from the platform cache directory.
+runtime_dir() {
+    case "$1" in
+        data)  _rd_xdg="${XDG_DATA_HOME:-}";  _rd_home="$HOME/.local/share" ;;
+        state) _rd_xdg="${XDG_STATE_HOME:-}"; _rd_home="$HOME/.local/state" ;;
+        cache)
+            if [ "$os" = darwin ]; then
+                printf '%s\n' "$HOME/Library/Caches/minimal"
+                return 0
+            fi
+            _rd_xdg="${XDG_CACHE_HOME:-}"; _rd_home="$HOME/.cache" ;;
+        *)     die "unknown runtime dir token: $1" ;;
+    esac
+    case "$_rd_xdg" in
+        /*) printf '%s\n' "$_rd_xdg/minimal" ;;
+        *)  printf '%s\n' "$_rd_home/minimal" ;;
+    esac
+}
+
 # The bin prefix, resolved once. Needed early: the pre-upgrade daemon stop
 # runs the `min` already installed there, before the component loop
 # replaces it.
@@ -480,8 +504,10 @@ maybe_remove_finalize_install() {
         # Minimal.app is the app bundle the service's program is installed
         # in, a directory (so the remedy removes it, and only it and the
         # .old a replaced bundle leaves, with -r); the bare minzoned is where
-        # an install from before the bundle put the program.
-        _ns_files="/etc/resolver/min.internal /Library/LaunchDaemons/dev.gominimal.zone.plist /Library/PrivilegedHelperTools/Minimal.app /Library/PrivilegedHelperTools/Minimal.app.old /Library/PrivilegedHelperTools/minzoned /Library/LaunchDaemons/dev.minimal.local-range.plist /Library/PrivilegedHelperTools/dev.minimal.local-range"
+        # an install from before the bundle put the program. The logcap
+        # plist and /private/var/log/minimal are the service's log and the
+        # unit that caps its size; the log directory goes with -r too.
+        _ns_files="/etc/resolver/min.internal /Library/LaunchDaemons/dev.gominimal.zone.plist /Library/PrivilegedHelperTools/Minimal.app /Library/PrivilegedHelperTools/Minimal.app.old /Library/PrivilegedHelperTools/minzoned /Library/LaunchDaemons/dev.minimal.local-range.plist /Library/PrivilegedHelperTools/dev.minimal.local-range /Library/LaunchDaemons/dev.gominimal.zone.logcap.plist /private/var/log/minimal/minzoned.log /private/var/log/minimal"
         _ns_paths="$_ns_files"
         _ns_chan="$_fi_root/Library/Application Support/minimal/run/answerer.sock"
     else
@@ -495,13 +521,17 @@ maybe_remove_finalize_install() {
     _ns_rm_r=
     for _ns_p in $_ns_files; do
         case "$_ns_p" in
-            */Minimal.app|*/Minimal.app.old) _ns_rm_r="$_ns_rm_r $(shq "$_fi_root$_ns_p")" ;;
+            */Minimal.app|*/Minimal.app.old|*/var/log/minimal) _ns_rm_r="$_ns_rm_r $(shq "$_fi_root$_ns_p")" ;;
             *) _ns_rm="$_ns_rm $(shq "$_fi_root$_ns_p")" ;;
         esac
     done
     _ns_rm="$_ns_rm $(shq "$_ns_chan")"
     if [ "$os" = darwin ]; then
-        _ns_undo="sudo launchctl bootout system/dev.gominimal.zone; sudo launchctl bootout system/dev.minimal.local-range; sudo rm -f$_ns_rm; sudo rm -rf$_ns_rm_r; sudo rmdir $(shq "${_ns_chan%/*}") $(shq "$_fi_root/Library/Application Support/minimal") 2>/dev/null || true"
+        # The local range unit added 127.0.64.1-254 to lo0. The aliases go
+        # with it, unless a VM is running: its boxes use them. pgrep -q and
+        # bare names keep the line free of unquoted paths. /etc/resolver and
+        # /Library/PrivilegedHelperTools go only when empty (rmdir).
+        _ns_undo="sudo launchctl bootout system/dev.gominimal.zone; sudo launchctl bootout system/dev.minimal.local-range; sudo launchctl bootout system/dev.gominimal.zone.logcap; sudo rm -f$_ns_rm; sudo rm -rf$_ns_rm_r; if pgrep -qx minvmd; then echo 'note: the loopback IPs boxes use stay on lo0 while a VM is running. Stop every VM, then run this line again.' >&2; else i=1; while [ \$i -le 254 ]; do sudo ifconfig lo0 -alias 127.0.64.\$i 2>/dev/null; i=\$((i + 1)); done; fi; sudo rmdir $(shq "${_ns_chan%/*}") $(shq "$_fi_root/Library/Application Support/minimal") $(shq "$_fi_root/etc/resolver") $(shq "$_fi_root/Library/PrivilegedHelperTools") 2>/dev/null || true"
     else
         _ns_undo="sudo systemctl disable --now minzoned.socket minzoned.service; sudo rm -f$_ns_rm; sudo systemctl daemon-reload; sudo systemctl reset-failed minzoned.socket minzoned.service; [ ! -e $(shq "$_fi_root/sys/class/net/minzone0") ] || { sudo resolvectl revert minzone0; sudo ip link del minzone0; }; sudo rmdir $(shq "${_ns_chan%/*}") $(shq "$_lib_dir") 2>/dev/null || true"
     fi
@@ -509,6 +539,7 @@ maybe_remove_finalize_install() {
     # --undo` removes; the manual remedy, one root command line per item.
     _fi_list=
     _fi_owned=
+    _fi_dns=
     _fi_undo=
     _aa_unowned=
     _qb_found=
@@ -516,6 +547,7 @@ maybe_remove_finalize_install() {
         if [ -e "$_fi_root$_ns_p" ]; then
             _fi_list="the host DNS setup ($_ns_p)"
             _fi_owned=1
+            _fi_dns=1
             _fi_undo="      $_ns_undo"
             break
         fi
@@ -645,6 +677,9 @@ maybe_remove_finalize_install() {
     if [ -n "$_fi_owned" ]; then
         say "  \`min finalize-install --undo\` removes what min finalize-install installed, while min"
         say "  is installed. With min gone, remove everything listed with:"
+        if [ "$os" = darwin ] && [ -n "$_fi_dns" ]; then
+            say "  The DNS service (launchd job dev.gominimal.zone) keeps running until these commands run."
+        fi
     else
         say "  it was installed separately with root; remove it too with:"
     fi
@@ -816,16 +851,28 @@ do_uninstall() {
 
     # --purge additionally deletes the minimal-owned trees wholesale (build
     # cache included); they live at fixed .../minimal paths the tool owns. It
-    # never removes files outside those roots.
+    # never removes files outside those roots. Each tree is purged both where
+    # the installer resolves it and where the runtime writes it (runtime_dir):
+    # on macOS the runtime's cache is ~/Library/Caches/minimal, not the
+    # installer's XDG path. Only an absolute .../minimal path is purged, so a
+    # relative XDG value never resolves against the current directory.
     if [ "$uninstall_purge" -eq 1 ]; then
         for p in data state cache; do
-            d="$(resolve_prefix "$p")"
-            [ -d "$d" ] || continue
-            if [ "$dry_run" -eq 1 ]; then
-                say "  would purge $d"
-            else
-                rm -rf "$d"
-            fi
+            _pg_inst="$(resolve_prefix "$p")"
+            _pg_run="$(runtime_dir "$p")"
+            [ "$_pg_run" != "$_pg_inst" ] || _pg_run=
+            for d in "$_pg_inst" "$_pg_run"; do
+                case "$d" in
+                    /*/minimal) ;;
+                    *) continue ;;
+                esac
+                [ -d "$d" ] || continue
+                if [ "$dry_run" -eq 1 ]; then
+                    say "  would purge $d"
+                else
+                    rm -rf "$d"
+                fi
+            done
         done
     fi
 
@@ -899,6 +946,89 @@ do_uninstall() {
 # this inside the component loop).
 sessions_live_msg='daemon has active sessions'
 
+# A `min` from this release on has no bare `min stop`: `min host stop <host>`
+# stops each running box on that host, then its daemon. It refuses nothing, so
+# min_stop makes its own running-box check before a graceful stop, and refuses
+# with $sessions_live_msg as bare `min stop` did. A listing that fails proves
+# nothing, so it refuses too, with $boxes_unknown_msg. A box list fails on a
+# version skew, which is the post-swap case, so a failed listing never ends a
+# box without consent. A listing that could not reach a host exits 0 but
+# leaves that host's boxes out, so it counts as a failed listing. A failed
+# `min host list` names no host to stop, so min_stop refuses with
+# $hosts_unknown_msg, with or without --force. An older `min`, without
+# `min host stop`, still gets bare `min stop`.
+boxes_unknown_msg='daemon did not list its boxes'
+hosts_unknown_msg='min host list failed'
+# What `min box list` prints on stderr for a host it could not reach.
+host_unreached_msg='its boxes are not listed'
+
+# Succeeds when the `min` on disk has `min host stop`.
+min_has_host_stop() {
+    "$bindir/min" host stop --help >/dev/null 2>&1 </dev/null
+}
+
+# The local hosts that are not stopped, one name per line. A row of `min host
+# list` is `HOST PROVIDER STATE`. The header and the notes after the rows do
+# not name a provider, and the box `min` runs in (local-box) is never stopped.
+# Fails when `min host list` fails.
+live_hosts() {
+    _hl="$("$bindir/min" host list 2>/dev/null </dev/null)" || return 1
+    printf '%s\n' "$_hl" \
+        | awk 'NR > 1 && $2 ~ /^local(-minvmd)?$/ && $3 != "stopped" { print $1 }'
+}
+
+# min_stop [--force]: stop the daemons the `min` on disk talks to. Its output
+# and exit status are those of the stop, as bare `min stop` gave them.
+min_stop() {
+    if ! min_has_host_stop; then
+        "$bindir/min" stop "$@" </dev/null
+        return
+    fi
+    if ! _hosts="$(live_hosts)"; then
+        echo "$hosts_unknown_msg" >&2
+        return 1
+    fi
+    [ -n "$_hosts" ] || return 0
+    if [ "${1:-}" != --force ]; then
+        # stderr rides with the JSON, so a host the listing did not reach
+        # shows up beside the rows.
+        if ! _boxes="$("$bindir/min" box list --all -o json 2>&1 </dev/null)"; then
+            echo "$boxes_unknown_msg" >&2
+            return 1
+        fi
+        case "$_boxes" in
+            *"$host_unreached_msg"*)
+                echo "$boxes_unknown_msg" >&2
+                return 1
+                ;;
+        esac
+        if printf '%s\n' "$_boxes" | grep -qE '"state": *"running"'; then
+            echo "$sessions_live_msg" >&2
+            return 1
+        fi
+    fi
+    _rc=0
+    for _h in $_hosts; do
+        "$bindir/min" host stop "$@" "$_h" </dev/null || _rc=1
+    done
+    return "$_rc"
+}
+
+# The stop command to name in advice, with --force when $1 is --force. A
+# `min` with `min host stop` names the host when one host runs.
+stop_command() {
+    if min_has_host_stop; then
+        _sh="$(live_hosts)" || _sh=
+        case "$_sh" in
+            ""|*"
+"*) _sh='<host>' ;;
+        esac
+        printf 'min host stop%s %s' "${1:+ $1}" "$_sh"
+    else
+        printf '%s stop%s' "$_stale_min" "${1:+ $1}"
+    fi
+}
+
 # Ask, on the CONTROLLING TERMINAL, whether to end the live sessions. Under
 # `curl … | sh` stdin is the script pipe, so reading the answer from it would
 # consume the script; /dev/tty is the only sound source (overridable so the
@@ -908,12 +1038,22 @@ sessions_live_msg='daemon has active sessions'
 # upgrade must not proceed. The argument names the calling stop: `pre` (the
 # default) may tell the user to rerun with --force-stop, which works before
 # the swaps; `post` runs after them, where a rerun replaces nothing and could
-# never reach this stop, so it must not suggest one.
+# never reach this stop, so it must not suggest one. The second argument is
+# what the refused stop printed.
 confirm_force_stop() {
     _tty="${MINIMAL_OVERRIDE_TTY:-/dev/tty}"
+    _ends='them'
     say ""
-    say "warning: the running daemon has active sessions:"
-    "$bindir/min" ls >&2 </dev/null || true
+    case "${2:-}" in
+        *"$boxes_unknown_msg"*)
+            say "warning: the running daemon did not list its boxes, so this run cannot tell if a box runs."
+            _ends='every box that runs'
+            ;;
+        *)
+            say "warning: the running daemon has active sessions:"
+            "$bindir/min" ls >&2 </dev/null || true
+            ;;
+    esac
     say ""
     if ! (exec <"$_tty") 2>/dev/null; then
         if [ "${1:-pre}" = post ]; then
@@ -924,7 +1064,7 @@ confirm_force_stop() {
         fi
         return 1
     fi
-    printf 'Stopping the daemon ends them. Continue? [y/N] ' >&2
+    printf 'Stopping the daemon ends %s. Continue? [y/N] ' "$_ends" >&2
     _ans=
     read -r _ans <"$_tty" || _ans=
     case "$_ans" in
@@ -947,23 +1087,49 @@ stop_running_daemon() {
     daemon_stop_tried=1
     [ "$force_stop" -eq 0 ] || daemon_stop_consent=1
     [ -x "$bindir/min" ] || return 0
+    # A `min` that reads MIN_PROVIDER refuses a value that names no provider.
+    # One that does not predates it, and ran the native daemon on Linux.
+    if [ "$os" = linux ] && ! MIN_PROVIDER=min-installer-probe "$bindir/min" version </dev/null 2>&1 \
+        | grep -qF 'MIN_PROVIDER=min-installer-probe names no provider'; then
+        stale_provider=local
+    fi
 
     if [ "$force_stop" -eq 0 ]; then
         # Stopped gracefully (or there was nothing to stop): done, no --force.
-        if _stop_out="$("$bindir/min" stop 2>&1 </dev/null)"; then
+        if _stop_out="$(min_stop 2>&1)"; then
             return 0
         fi
         case "$_stop_out" in
-            *"$sessions_live_msg"*)
+            *"$sessions_live_msg"*|*"$boxes_unknown_msg"*)
                 pre_swap_sessions="$("$bindir/min" ls --raw 2>/dev/null </dev/null)" \
                     || pre_swap_sessions=
-                confirm_force_stop || return 1
+                confirm_force_stop pre "$_stop_out" || return 1
                 daemon_stop_consent=1
+                ;;
+            *"$hosts_unknown_msg"*)
+                hosts_unknown_refusal
+                return 1
                 ;;
         esac
         # Any other failure falls through to the force stop, silent as before.
     fi
-    "$bindir/min" stop --force >/dev/null 2>&1 </dev/null || true
+    if ! _stop_out="$(min_stop --force 2>&1)"; then
+        case "$_stop_out" in
+            *"$hosts_unknown_msg"*)
+                hosts_unknown_refusal
+                return 1
+                ;;
+        esac
+    fi
+    return 0
+}
+
+# Why the pre-swap stop refuses when `min host list` fails: with no host
+# list, this run cannot find the daemon to stop.
+hosts_unknown_refusal() {
+    say ""
+    say "warning: 'min host list' failed, so this run cannot find the daemon to stop."
+    say "run '$bindir/min host list' to see why."
 }
 
 # Dispatch uninstall before any target/manifest work. resolve_prefix and
@@ -1089,28 +1255,50 @@ installed=0 skipped=0
 # on the terminal, as the pre-swap stop does. Declined, or with no terminal to
 # ask on, it leaves the daemon running and says how to stop it: the swaps are
 # done, so the install itself still succeeds.
+#
+# The new `min` must reach the daemon the old one ran. On Linux a `min` from
+# before MIN_PROVIDER always ran the native daemon, and a new `min` with no
+# flag runs the VM where /dev/kvm opens. So when the pre-swap stop found such
+# an old `min` (stale_provider=local), this stop runs with MIN_PROVIDER=local,
+# in a subshell so nothing after it inherits the variable, and its advice names
+# `--provider local`.
 stale_stop_tried=0
+stale_provider=
 stop_stale_daemon() {
     [ "$stale_stop_tried" -eq 0 ] || return 0
     stale_stop_tried=1
     [ -x "$bindir/min" ] || return 0
+    if [ -n "$stale_provider" ]; then
+        (MIN_PROVIDER="$stale_provider"; export MIN_PROVIDER; stop_stale_daemon_now)
+    else
+        stop_stale_daemon_now
+    fi
+}
+
+stop_stale_daemon_now() {
+    _stale_min="min${stale_provider:+ --provider $stale_provider}"
     _vout="$("$bindir/min" version 2>&1 </dev/null)" || _vout=
     _cv="$(printf '%s\n' "$_vout" | sed -n 's/^Client: minimal //p')"
     _sv="$(printf '%s\n' "$_vout" | sed -n 's/^Server: minimald //p')"
     [ -n "$_cv" ] && [ -n "$_sv" ] && [ "$_cv" != "$_sv" ] || return 0
     say "stopping a daemon still running from build $_sv"
     if [ "$force_stop" -eq 0 ] && { [ "$daemon_stop_consent" -eq 0 ] || ! sessions_seen_pre_swap; }; then
-        if _stop_out="$("$bindir/min" stop 2>&1 </dev/null)"; then
+        if _stop_out="$(min_stop 2>&1)"; then
             return 0
         fi
         case "$_stop_out" in
-            *"$sessions_live_msg"*)
-                if confirm_force_stop post; then
+            *"$sessions_live_msg"*|*"$boxes_unknown_msg"*)
+                if confirm_force_stop post "$_stop_out"; then
                     force_stop_stale "$_sv"
                     return 0
                 fi
-                say "the daemon has active sessions, so it is still running build $_sv."
-                say "run 'min stop' after those sessions end, or 'min stop --force' to end them now."
+                case "$_stop_out" in
+                    *"$boxes_unknown_msg"*)
+                        say "the daemon did not list its boxes, so it is still running build $_sv." ;;
+                    *)
+                        say "the daemon has active sessions, so it is still running build $_sv." ;;
+                esac
+                say "run '$(stop_command)' after those sessions end, or '$(stop_command --force)' to end them now."
                 return 0
                 ;;
         esac
@@ -1134,8 +1322,8 @@ sessions_seen_pre_swap() {
 # stop is reported rather than left looking like success: a daemon of the old
 # build may still be serving, and the user is told how to stop it.
 force_stop_stale() {
-    "$bindir/min" stop --force >/dev/null 2>&1 </dev/null && return 0
-    say "the daemon on build $1 may still be running; run 'min stop --force'"
+    min_stop --force >/dev/null 2>&1 && return 0
+    say "the daemon on build $1 may still be running; run '$(stop_command --force)'"
 }
 
 # Set once the pre-swap stop has run and the first executable is about to be
@@ -1790,15 +1978,44 @@ say "  ${dim}docs.minimal.dev   $sep   discord.com/invite/qgX8sm6X7G$rst"
 # so it lists every field the request sends, as the CLI's own disclosure
 # does, and names the switch. A channel install is told when its channel
 # moves on; a pinned (--version) one is counted but never told, since no
-# channel pointer applies to it.
+# channel pointer applies to it. A pinned release older than 0.7.4 has no
+# check and sends nothing. The card knows the pinned version, so it says
+# which of the two this install is; only for a version it cannot place (a
+# pre-release, a nightly, a name that is not X.Y.Z) does it give the range.
+pinned_reports="unknown"
 if [ "$version_set" -eq 1 ]; then
-    say "  ${dim}min reports this install once a day (no release notices for --version), sending its channel$rst"
-    say "  ${dim}(pinned), version, OS, architecture, install method and a random install id to update.minimal.dev.$rst"
-else
-    say "  ${dim}min checks once a day for a newer $target release, sending its channel, version, OS,$rst"
-    say "  ${dim}architecture, install method and a random install id to update.minimal.dev.$rst"
+    case "${VERSION#v}" in
+        *[!0-9.]*|.*|*.|*..*) ;;
+        *.*.*.*) ;;
+        *.*.*)
+            pin_major="${VERSION#v}"; pin_major="${pin_major%%.*}"
+            pin_rest="${VERSION#v}"; pin_rest="${pin_rest#*.}"
+            pin_minor="${pin_rest%%.*}"; pin_patch="${pin_rest#*.}"
+            if [ "$pin_major" -gt 0 ] \
+                || { [ "$pin_major" -eq 0 ] && [ "$pin_minor" -gt 7 ]; } \
+                || { [ "$pin_major" -eq 0 ] && [ "$pin_minor" -eq 7 ] && [ "$pin_patch" -ge 4 ]; }; then
+                pinned_reports="yes"
+            else
+                pinned_reports="no"
+            fi ;;
+    esac
 fi
-say "  ${dim}Off: MINIMAL_TELEMETRY=0$rst"
+if [ "$version_set" -eq 1 ] && [ "$pinned_reports" = "no" ]; then
+    say "  ${dim}min $VERSION does not check for updates and sends nothing. Releases from 0.7.4 on report an$rst"
+    say "  ${dim}install once a day.$rst"
+else
+    if [ "$version_set" -eq 1 ] && [ "$pinned_reports" = "yes" ]; then
+        say "  ${dim}min reports this install once a day (no release notices for --version), sending the channel$rst"
+        say "  ${dim}(pinned), version, OS, architecture, install method and a random install id to update.minimal.dev.$rst"
+    elif [ "$version_set" -eq 1 ]; then
+        say "  ${dim}min 0.7.4 and later report this install once a day (no release notices for --version), sending the channel$rst"
+        say "  ${dim}(pinned), version, OS, architecture, install method and a random install id to update.minimal.dev.$rst"
+    else
+        say "  ${dim}min checks once a day for a newer $target release, sending its channel, version, OS,$rst"
+        say "  ${dim}architecture, install method and a random install id to update.minimal.dev.$rst"
+    fi
+    say "  ${dim}Off: MINIMAL_TELEMETRY=0$rst"
+fi
 say "  ${dim}docs.minimal.dev/reference/telemetry#update-check$rst"
 say ""
 }

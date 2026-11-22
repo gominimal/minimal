@@ -10,7 +10,7 @@
 # Build shape (extracted from those jobs; do not recollapse without cutting
 # the release profile's link-time memory first):
 #   - ONE cargo invocation per package (mip, minimal, minimald, minvmd,
-#     minzoned), not one combined build. `[profile.release]` is fat LTO with
+#     minzoned, bep), not one combined build. `[profile.release]` is fat LTO with
 #     codegen-units = 1, so a combined build lets cargo schedule all the final
 #     LTO links concurrently — the peak that SIGTERMed the arm64 release job
 #     (exit 143). Sequential invocations share dependency artifacts through
@@ -138,6 +138,15 @@ esac
 # that keeps a release build from growing them back.
 cargo build --release --locked --target "$TARGET" --package minzoned
 
+# bep, the Box Egress Proxy: minvmd starts it from beside its own binary,
+# so the release ships it next to minvmd. On Linux it keeps its keys in the
+# TPM or Secret Service. The Linux release jobs ship this build. The macOS
+# release builds bep in a step of its own, because bep ships there inside a
+# signed bundle, so a non-Linux target skips it.
+case "$TARGET" in
+    *-linux-*) cargo build --release --locked --target "$TARGET" --package bep --bin bep ;;
+esac
+
 # THE link gate on what this script just built (the rule
 # scripts/check-zoned-links.sh documents): the answerer runs as a root
 # host service that every process on the machine resolves through, so a
@@ -198,4 +207,4 @@ else
     echo "dist-build: completions -> $COMPLETIONS_DIR"
 fi
 
-echo "dist-build: $TARGET built -> $BIN_DIR (mip, min, minimald, minvmd, minzoned)"
+echo "dist-build: $TARGET built -> $BIN_DIR (mip, min, minimald, minvmd, minzoned; bep on Linux)"

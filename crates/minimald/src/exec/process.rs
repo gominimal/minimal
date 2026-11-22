@@ -148,9 +148,10 @@ impl TaskExec {
 /// build ships, while the tests pass the phase by name so each arm's posture
 /// stays proven — and `deny_all_opt_out` is the daemon's opt-out (NET-077),
 /// read through the session handle so a task resolves its egress exactly as
-/// the launcher did. It carries no classifier decision either (NET-079):
-/// a task places no leaf in the cohort's subtrees, so no per-box verdict
-/// is its plan's to follow.
+/// the launcher did.
+///
+/// This is the network of a task with no box leaf. A task of a host-address
+/// box that the host placed in a leaf takes [`task_network_in_box_leaf`].
 ///
 /// A gate is attached only where that egress has rules to enforce: the
 /// deny-all section the in-force default resolves an absent declaration to,
@@ -166,6 +167,29 @@ pub(crate) fn task_network(
     phase: boxes::EgressDefaultPhase,
     deny_all_opt_out: bool,
 ) -> std::sync::Arc<dyn sandbox::Network> {
+    task_network_in_box_leaf(record, switch, phase, deny_all_opt_out, None)
+}
+
+/// [`task_network`] for a task that runs in `box_leaf`, the classifier leaf
+/// of its box (NET-079). A host-address task joins the existing leaf of its
+/// box, so its plan follows the verdict of that leaf, not the plan of a task
+/// with no leaf. The leaf names the verdict the box launch decided. A deny
+/// leaf also gives the decision the launch planned over, with the carve-out
+/// its tree records now ([`crate::net::classifier::task_box_decision`]). So
+/// the plan of the task refuses a stale carve-out, the same as the launch.
+/// `None`, or any mode but `host_ip`, is the plain [`task_network`].
+pub(crate) fn task_network_in_box_leaf(
+    record: &boxes::Record,
+    switch: &std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
+    phase: boxes::EgressDefaultPhase,
+    deny_all_opt_out: bool,
+    box_leaf: Option<&sandbox::config::ClassifierLeaf>,
+) -> std::sync::Arc<dyn sandbox::Network> {
+    let placed = crate::net::classifier::task_box_leaf(record.network, box_leaf);
+    let box_decision = placed
+        .as_ref()
+        .and_then(|(leaf, _)| crate::net::classifier::task_box_decision(leaf));
+    let box_verdict = placed.map(|(_, verdict)| verdict);
     let id = record.id.to_string();
     let session = record.name.as_deref().unwrap_or(&id);
     let egress = crate::box_actor::effective_egress_section(
@@ -187,10 +211,10 @@ pub(crate) fn task_network(
         // carrying the box's id and egress, so no daemon-side draw happens
         // once a control socket exists. A native daemon, whose record holds
         // none, draws from its reserve (`crate::net::self_allocation_run`);
-        // an in-VM one refuses the draw (`SwitchClient::attach`). There is
-        // no classifier decision to carry (NET-079): a task places no leaf
-        // in the cohort's subtrees.
+        // an in-VM one refuses the draw (`SwitchClient::attach`).
         record.task_addresses.clone(),
+        box_verdict,
+        box_decision,
     )
 }
 
@@ -492,11 +516,14 @@ pub(super) async fn task_producer(
         })?;
         let switch = session.net_switch().await?;
         ensure_task_rows_stand(&record, &switch).await?;
-        let network = task_network(
+        // NET-079: a host-address task runs in the leaf of its box, so its
+        // plan follows the verdict of that leaf.
+        let network = task_network_in_box_leaf(
             &record,
             &switch,
             boxes::EGRESS_DEFAULT_PHASE,
             session.deny_all_opt_out().await?,
+            ctx.classifier_leaf(),
         );
         // A task's `~/` resolves against the session's home, the same
         // directory the interactive session sees at `/home`. The daemon's own
@@ -759,12 +786,14 @@ impl Process for HakoniwaProcess {
                 // signal death), so a SIGKILL reports 137 rather than 1. The
                 // `exit_code` field is `None` for signals and would collapse
                 // to 1 downstream; `code` is what the session path reports too.
+                // A SIGKILL that ends the container itself arrives as 125, and
+                // [`task_exit_code`] turns it into 137 as well.
                 Ok(Ok(status)) => {
                     self.failure = sandbox_failure(&status, self.killed);
                     if let Some(reason) = &self.failure {
                         tracing::warn!(pid = self.pid, %reason, "task: the sandbox failed");
                     }
-                    WaitState::Exited(Some(status.code))
+                    WaitState::Exited(Some(task_exit_code(&status)))
                 }
                 Ok(Err(_)) | Err(_) => WaitState::Failed,
             };
@@ -808,8 +837,26 @@ pub(super) const SANDBOX_FAILURE_CODE: i32 = 125;
 
 /// hakoniwa's reason for a container that a SIGKILL ended. It reports that
 /// as [`SANDBOX_FAILURE_CODE`] with no inner exit code, the same shape as a
-/// sandbox failure, whether or not the command had started.
+/// sandbox failure, whether or not the command had started; the task reports
+/// 137 for it ([`task_exit_code`]).
 pub(super) const CONTAINER_SIGKILL_REASON: &str = "container received signal SIGKILL";
+
+/// The exit status a task reports for hakoniwa's account of its end: the
+/// shell-convention `code`, except that a container a SIGKILL ended reports
+/// 137 (`128 + SIGKILL`), as a command a SIGKILL ended does, rather than
+/// hakoniwa's 125. The daemon kills a task that way, and a status under 128
+/// would read as the command's own failure. A command that exits 125 itself
+/// carries its own exit code and keeps 125, and so does a sandbox failure.
+pub(super) fn task_exit_code(status: &hakoniwa::ExitStatus) -> i32 {
+    if status.code == SANDBOX_FAILURE_CODE
+        && status.exit_code.is_none()
+        && status.reason == CONTAINER_SIGKILL_REASON
+    {
+        128 + libc::SIGKILL
+    } else {
+        status.code
+    }
+}
 
 /// The reason a task's sandbox failed, or `None` for any other end of the
 /// task. hakoniwa reports a sandbox failure as code 125 with no inner

@@ -1,10 +1,10 @@
-//! Dynamic shell completion of session identifiers.
+//! Dynamic shell completion of box identifiers.
 //!
-//! Every session argument in the CLI takes "a UUID or a session name", and
+//! Every argument that names a box takes "a UUID or a box name", and
 //! both are known only at runtime — nothing a statically generated completion
 //! script can enumerate. Two entry points share the one implementation here:
 //!
-//! - [`complete_session_arg`], attached to each session argument via
+//! - [`complete_box_arg`], attached to each box argument via
 //!   [`ArgValueCompleter`] and reached when a shell runs
 //!   `COMPLETE=<shell> min -- <words>` (see `CompleteEnv` in `main.rs`).
 //! - `min complete-session-str [<prefix>]`, a hidden subcommand printing the
@@ -51,15 +51,15 @@ pub struct SessionCandidate {
     pub description: Option<String>,
 }
 
-/// The [`ArgValueCompleter`] to attach to a session argument.
+/// The [`ArgValueCompleter`] to attach to an argument that names a box.
 ///
-/// A function rather than a closure so every session argument shares one
+/// A function rather than a closure so every box argument shares one
 /// implementation and the `#[arg(add = ...)]` attributes stay one line each.
-pub fn session_completer() -> ArgValueCompleter {
-    ArgValueCompleter::new(complete_session_arg)
+pub fn box_completer() -> ArgValueCompleter {
+    ArgValueCompleter::new(complete_box_arg)
 }
 
-/// Complete a session argument whose typed-so-far value is `current`.
+/// Complete a box argument whose typed-so-far value is `current`.
 ///
 /// Runs on the shell's completion path, which is synchronous and — because
 /// `CompleteEnv` is invoked before the CLI's runtime exists — has no reactor
@@ -68,10 +68,15 @@ pub fn session_completer() -> ArgValueCompleter {
 ///
 /// A non-UTF-8 prefix cannot prefix-match a name or a UUID, so it yields
 /// nothing rather than lossily converting into a match the user did not type.
-pub fn complete_session_arg(current: &OsStr) -> Vec<CompletionCandidate> {
+pub fn complete_box_arg(current: &OsStr) -> Vec<CompletionCandidate> {
     let Some(prefix) = current.to_str() else {
         return Vec::new();
     };
+
+    #[cfg(test)]
+    if let Some(sessions) = test_boxes::get() {
+        return to_completion(candidates_from(&sessions, prefix));
+    }
 
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -82,14 +87,58 @@ pub fn complete_session_arg(current: &OsStr) -> Vec<CompletionCandidate> {
 
     // The completer has no access to the rest of the command line: clap hands
     // a value completer the current word and nothing else, so a `--provider`
-    // or `--minimal-dir` earlier in the line cannot be honoured here.
-    let global = GlobalArgs::default();
-    let candidates = runtime.block_on(session_candidates(&global, prefix));
+    // or `--minimal-dir` earlier in the line cannot be honoured here. The
+    // flagless default provider is, so the candidates come from the host a
+    // flagless command would use. A default that does not resolve offers
+    // nothing rather than a guess.
+    let mut global = GlobalArgs::default();
+    if crate::hosts::resolve_default_provider(&mut global).is_err() {
+        return Vec::new();
+    }
+    crate::hosts::read_provider_alias(&mut global);
+    to_completion(runtime.block_on(session_candidates(&global, prefix)))
+}
 
+/// Convert the candidates into the form clap hands to the shell.
+fn to_completion(candidates: Vec<SessionCandidate>) -> Vec<CompletionCandidate> {
     candidates
         .into_iter()
         .map(|c| CompletionCandidate::new(c.value).help(c.description.map(Into::into)))
         .collect()
+}
+
+/// A fixed box list that [`complete_box_arg`] reads in place of the daemon,
+/// so a test can drive the real completer without a daemon and without
+/// reaching one that runs on the developer's host. Thread-local, so tests
+/// that run in parallel threads do not see each other's list.
+#[cfg(test)]
+pub(crate) mod test_boxes {
+    use std::cell::RefCell;
+
+    use minimald_rpc::ListSessionsEntry;
+
+    thread_local! {
+        static BOXES: RefCell<Option<Vec<ListSessionsEntry>>> = const { RefCell::new(None) };
+    }
+
+    /// Clears the fixed list when dropped.
+    pub(crate) struct Guard(());
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            BOXES.with(|b| *b.borrow_mut() = None);
+        }
+    }
+
+    /// Serve `boxes` to every completion on this thread until the guard drops.
+    pub(crate) fn set(boxes: Vec<ListSessionsEntry>) -> Guard {
+        BOXES.with(|b| *b.borrow_mut() = Some(boxes));
+        Guard(())
+    }
+
+    pub(super) fn get() -> Option<Vec<ListSessionsEntry>> {
+        BOXES.with(|b| b.borrow().clone())
+    }
 }
 
 /// The candidates for `prefix`, or an empty list when the daemon cannot be

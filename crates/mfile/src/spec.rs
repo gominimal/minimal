@@ -32,6 +32,7 @@
 //! Box Type, `[defaults]`, `[upstream]` and loadouts. The interim ends when
 //! that expander lands, writes this file, and bumps [`BOX_SPEC_VERSION`].
 
+use crate::expand::{ExpansionReport, Layer, Origin, ValueOrigin};
 use crate::{Session, Task};
 
 /// The version of the Box Spec shape that [`BoxSpec`] serializes.
@@ -99,6 +100,57 @@ pub struct BoxSpec {
     /// with no `minimal.toml`, or a spec stored before the key existed. The
     /// daemon then composes the project's hooks as before.
     pub lifecycle_hooks: Option<Vec<SpecHook>>,
+    /// The expanded spec's `[[file_exports]]` items, as the client stored
+    /// them (BOX-203, BOX-204). Serialized as the top-level `file_exports`
+    /// list, and left out when `None`.
+    ///
+    /// The client reads these items and copies the exports when the box
+    /// ends. The daemon only keeps them, so a box that declares exports
+    /// can resume from its stored spec.
+    pub file_exports: Option<Vec<StoredExport>>,
+    /// The keys of a stored spec that the schema of a spec names, but that
+    /// no field above types, such as `io.exec_enabled` or
+    /// `network.dynamic_ingress`. Each value is kept as it was written,
+    /// by its dotted path, and a section with no typed keys, such as
+    /// `nesting` or `secrets`, is kept whole. A newer client can store such a key, and
+    /// the box still resumes from its stored spec.
+    pub kept_keys: std::collections::BTreeMap<String, StoredExport>,
+}
+
+/// One `[[file_exports]]` item of a stored spec, kept as it was written:
+/// a path string, or a table with a `path` key.
+///
+/// Equality is total: two floats are equal when their bits are equal. A
+/// hand-edited stored spec can hold a TOML `nan`, and such an item is
+/// still equal to itself.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct StoredExport(pub toml::Value);
+
+impl PartialEq for StoredExport {
+    fn eq(&self, other: &Self) -> bool {
+        toml_value_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for StoredExport {}
+
+/// Equality on two TOML values that compares floats by their bits, so it
+/// is reflexive for NaN.
+fn toml_value_eq(a: &toml::Value, b: &toml::Value) -> bool {
+    use toml::Value;
+    match (a, b) {
+        (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| toml_value_eq(a, b))
+        }
+        (Value::Table(a), Value::Table(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .all(|(key, a)| b.get(key).is_some_and(|b| toml_value_eq(a, b)))
+        }
+        _ => a == b,
+    }
 }
 
 /// What a box runs as its first process: the program its launch starts.
@@ -149,6 +201,11 @@ pub enum Lifetime {
     UntilStopped,
 }
 
+impl Lifetime {
+    /// The values `lifetime` accepts, as a project writes them.
+    pub const ACCEPTED: &'static [&'static str] = &["until_complete", "until_stopped"];
+}
+
 /// The lifetime a v0 spec stored without `box.lifetime` reads as.
 fn until_complete() -> Lifetime {
     Lifetime::UntilComplete
@@ -170,6 +227,11 @@ pub struct SpecNetwork {
     pub mode: boxes::NetworkMode,
     /// The egress and ingress policy the creating command resolved.
     pub policy: boxes::BoxPolicy,
+    /// The entry's `network.vpn_network_names`, in the order it lists
+    /// them, then each name a `--vpn-network-names` flag adds (BCLI-024).
+    /// Serialized as `vpn_network_names`, and left out when empty. The
+    /// daemon keeps the list and does not enforce it (BOX-076).
+    pub vpn_network_names: Vec<String>,
 }
 
 /// What the creating command's flags set on the spec. This is the last
@@ -203,13 +265,47 @@ impl BoxSpec {
     #[must_use]
     pub fn for_session(session: Option<&Session>, flags: SpecFlags) -> Self {
         let packages = session.map_or(&[][..], |s| s.packages.as_slice());
+        let extra = session.map(|s| settings_of(&s.extra));
         Self::build(
             boxes::SESSION_BOX_TYPE,
             DEFAULT_SESSION_ENTRY,
             packages,
             true,
             Entrypoint::Shell,
-            session.map(|s| &s.extra),
+            extra.as_ref().map(|t| (t, None)),
+            flags,
+        )
+    }
+
+    /// The spec of a session box from the session entry `entry`, expanded
+    /// over its layers into `expanded` (BOX-064). The spec takes the
+    /// entry's packages, lifetime, timeout and `hooks_on_resume` from the
+    /// expansion, and each value the flags set from `flags`.
+    ///
+    /// `report` is the expansion's record of the layer that set each key.
+    /// `type_chain` names the types of the entry's type chain, the root
+    /// first, as [`crate::expand::Layers::type_defaults`] orders them.
+    /// A setting that the expansion keeps both flat and under its section
+    /// takes the form that the later layer set. Within the type chain's
+    /// defaults, the more derived type is the later layer. The packages
+    /// take both lists, in that order, without duplicates.
+    #[must_use]
+    pub fn for_session_entry(
+        entry: &str,
+        expanded: &toml::Table,
+        report: &ExpansionReport,
+        type_chain: &[String],
+        flags: SpecFlags,
+    ) -> Self {
+        let ranking = Ranking { report, type_chain };
+        let packages = layered_packages(expanded, ranking);
+        Self::build(
+            boxes::SESSION_BOX_TYPE,
+            entry,
+            &packages,
+            true,
+            Entrypoint::Shell,
+            Some((expanded, Some(ranking))),
             flags,
         )
     }
@@ -230,7 +326,7 @@ impl BoxSpec {
             &task.packages,
             false,
             Entrypoint::for_task(name),
-            Some(&task.extra),
+            Some((&settings_of(&task.extra), None)),
             flags,
         ))
     }
@@ -241,13 +337,26 @@ impl BoxSpec {
         packages: &[String],
         pty_enabled: bool,
         entrypoint: Entrypoint,
-        extra: Option<&std::collections::HashMap<String, toml::Value>>,
+        // The entry's settings table, and the ranking of the expansion's
+        // origins for an expanded one.
+        extra: Option<(&toml::Table, Option<Ranking<'_>>)>,
         flags: SpecFlags,
     ) -> Self {
         // The entry's own keys that its table keeps among the ones it does
         // not read itself.
-        let hooks_on_resume = extra.is_some_and(hooks_on_resume);
-        let timeout = extra.and_then(entry_timeout);
+        let hooks_on_resume = extra.is_some_and(|(t, ranking)| hooks_on_resume(t, ranking));
+        let timeout = extra.and_then(|(t, ranking)| entry_timeout(t, ranking));
+        // Only an expanded entry carries a ranking, and only the expansion
+        // refuses a bad lifetime. A task or a `[session]` table keeps the
+        // `until_complete` that the shipped `session` and `task` types
+        // declare, as does a spec that sets no lifetime.
+        let lifetime = extra
+            .and_then(|(t, ranking)| ranking.map(|r| (t, r)))
+            .and_then(|(t, ranking)| entry_lifetime(t, ranking))
+            .unwrap_or(Lifetime::UntilComplete);
+        // BOX-203: the entry's exports, for the command that waits for the
+        // box to copy them when it ends.
+        let file_exports = extra.and_then(|(t, _)| crate::expand::stored_file_exports(t));
         let mut seen = std::collections::BTreeSet::new();
         let packages = packages
             .iter()
@@ -262,17 +371,20 @@ impl BoxSpec {
             packages,
             pty_enabled,
             entrypoint,
-            // The shipped `session` and `task` types both end their run
-            // when the entrypoint returns.
-            lifetime: Lifetime::UntilComplete,
+            lifetime,
             hooks_enabled: flags.hooks_enabled,
             hooks_on_resume,
             timeout,
             network: SpecNetwork {
                 mode: flags.network,
                 policy: flags.policy,
+                vpn_network_names: extra
+                    .map(|(t, _)| entry_vpn_network_names(t))
+                    .unwrap_or_default(),
             },
             lifecycle_hooks: None,
+            file_exports,
+            kept_keys: std::collections::BTreeMap::new(),
         }
     }
 
@@ -284,23 +396,165 @@ impl BoxSpec {
     }
 }
 
+/// The names an entry's `[network]` table lists in `vpn_network_names`
+/// (BCLI-024), each once, in the order the entry lists them. Empty when the
+/// entry sets none. The expansion refuses a value that is not a list of
+/// strings (see [`check_section`]), and a value that is not a string is
+/// left out here.
+#[must_use]
+pub fn entry_vpn_network_names(extra: &toml::Table) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let listed = extra
+        .get("network")
+        .and_then(|network| network.get("vpn_network_names"))
+        .and_then(toml::Value::as_array);
+    for name in listed.into_iter().flatten().filter_map(toml::Value::as_str) {
+        if !names.iter().any(|kept| kept == name) {
+            names.push(name.to_owned());
+        }
+    }
+    names
+}
+
 /// Whether an entry's own table sets `hooks_on_resume = true` (BOX-028).
 /// The entry tables keep the key among the ones they do not read
 /// themselves, so it is read from there.
-fn hooks_on_resume(extra: &std::collections::HashMap<String, toml::Value>) -> bool {
-    extra
-        .get("hooks_on_resume")
+fn hooks_on_resume(extra: &toml::Table, ranking: Option<Ranking<'_>>) -> bool {
+    later_value(extra, ranking, "hooks_on_resume", "execution")
         .and_then(toml::Value::as_bool)
         .unwrap_or(false)
+}
+
+/// An expanded entry's own `lifetime`, from `lifetime` or `box.lifetime`.
+/// `None` when the entry sets none. The expansion refuses a value that is
+/// not one of [`Lifetime::ACCEPTED`] (see [`check_section`]), so only an
+/// expanded entry reaches here. [`BoxSpec::build`] never reads the lifetime
+/// of a task or a `[session]` table, which no check refuses.
+fn entry_lifetime(extra: &toml::Table, ranking: Ranking<'_>) -> Option<Lifetime> {
+    later_value(extra, Some(ranking), "lifetime", "box")
+        .and_then(|value| value.clone().try_into().ok())
+}
+
+/// The value of the setting `key`, written flat or under `section` with
+/// the same name. The expansion keeps the two forms as two top-level keys.
+/// The form that the later origin in `ranking` set wins, as for
+/// `loadout_mode` in [`crate::expand`]. Without a ranking, or when one
+/// layer sets both, the flat key wins.
+fn later_value<'a>(
+    table: &'a toml::Table,
+    ranking: Option<Ranking<'_>>,
+    key: &str,
+    section: &str,
+) -> Option<&'a toml::Value> {
+    let flat = table.get(key);
+    let nested = table
+        .get(section)
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get(key));
+    match (flat, nested) {
+        (Some(f), Some(n)) => {
+            let rank = |k: &str| ranking.and_then(|r| r.key(k));
+            match (rank(key), rank(section)) {
+                (Some(f_at), Some(n_at)) if n_at > f_at => Some(n),
+                _ => Some(f),
+            }
+        }
+        (f, n) => f.or(n),
+    }
+}
+
+/// How the stored spec orders the origins of an expansion's values: by
+/// layer, and within [`Layer::TypeDefaults`] by the type's position in
+/// the type chain, the root first. So a derived type's setting comes
+/// after its parent's, as the expansion's `loadout_mode` orders them.
+#[derive(Debug, Clone, Copy)]
+struct Ranking<'a> {
+    /// The expansion's record of the origin of each top-level key.
+    report: &'a ExpansionReport,
+    /// The entry's type chain, the root first.
+    type_chain: &'a [String],
+}
+
+impl Ranking<'_> {
+    /// The rank of `origin`. A later origin has a greater rank. An origin
+    /// outside the type chain's defaults, or of a type the chain does not
+    /// name, takes position 0 in its layer.
+    fn of(self, origin: &Origin) -> (Layer, usize) {
+        let at = origin
+            .box_type
+            .as_deref()
+            .and_then(|t| self.type_chain.iter().position(|c| c == t))
+            .unwrap_or(0);
+        (origin.layer, at)
+    }
+
+    /// The rank of the origin of the top-level key `key`, or of a list's
+    /// first item. `None` when the report does not name the key.
+    fn key(self, key: &str) -> Option<(Layer, usize)> {
+        Some(self.of(self.report.values.get(key)?.first()?))
+    }
+}
+
+/// The expanded spec's packages: the flat `packages` and the
+/// `install.packages` of its `[install]` section, merged in the order of
+/// the origins that set them, without duplicates. The fold already unions
+/// each form across its layers, and the report keeps the origin of each
+/// flat item and of the `install` table.
+fn layered_packages(expanded: &toml::Table, ranking: Ranking<'_>) -> Vec<String> {
+    let strings = |value: Option<&toml::Value>| -> Vec<String> {
+        value
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(toml::Value::as_str)
+            .map(str::to_owned)
+            .collect()
+    };
+    let flat = strings(expanded.get("packages"));
+    let flat_layers: Vec<Option<(Layer, usize)>> = match ranking.report.values.get("packages") {
+        Some(ValueOrigin::List(origins)) => origins.iter().map(|o| Some(ranking.of(o))).collect(),
+        Some(ValueOrigin::Value(o)) => vec![Some(ranking.of(o)); flat.len()],
+        None => Vec::new(),
+    };
+    let nested = strings(
+        expanded
+            .get("install")
+            .and_then(toml::Value::as_table)
+            .and_then(|t| t.get("packages")),
+    );
+    let nested_layer = ranking.key("install");
+    let mut items: Vec<(Option<(Layer, usize)>, String)> = flat
+        .into_iter()
+        .enumerate()
+        .map(|(i, p)| (flat_layers.get(i).copied().flatten(), p))
+        .chain(nested.into_iter().map(|p| (nested_layer, p)))
+        .collect();
+    // A stable sort keeps each form's own order, and the flat items first
+    // within one layer.
+    items.sort_by_key(|(layer, _)| *layer);
+    let mut seen = std::collections::BTreeSet::new();
+    items
+        .into_iter()
+        .map(|(_, p)| p)
+        .filter(|p| seen.insert(p.clone()))
+        .collect()
+}
+
+/// The keys an entry table keeps among the ones it does not read itself,
+/// as one table.
+fn settings_of(extra: &std::collections::HashMap<String, toml::Value>) -> toml::Table {
+    extra
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
 }
 
 /// The entry's own `timeout` in whole seconds, read through
 /// [`crate::duration::spec_timeout`]: `None` when the entry sets none or
 /// sets zero. [`crate::File::validate`] refuses a bad value before a spec
 /// is built, so a bad value here reads as `None`.
-fn entry_timeout(extra: &std::collections::HashMap<String, toml::Value>) -> Option<u64> {
-    extra
-        .get("timeout")
+fn entry_timeout(extra: &toml::Table, ranking: Option<Ranking<'_>>) -> Option<u64> {
+    later_value(extra, ranking, "timeout", "execution")
         .and_then(|value| crate::duration::spec_timeout(value).ok().flatten())
 }
 
@@ -334,6 +588,48 @@ struct SpecDoc {
     /// Absent from a spec that carries no hook list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lifecycle_hooks: Option<Vec<SpecHook>>,
+    /// Absent from a spec that declares no exports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_exports: Option<Vec<StoredExport>>,
+    /// The `[nesting]` section, kept whole. Absent when the spec sets none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nesting: Option<StoredExport>,
+    /// The `[secrets]` section of the expanded spec, kept whole, with the
+    /// `upstream` and `inject` the client's store rules wrote (BOX-071).
+    /// Absent when the spec sets none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    secrets: Option<StoredExport>,
+}
+
+/// Declares the fields of a `Doc*` table that keep a schema key as it was
+/// written ([`BoxSpec::kept_keys`]), and the two functions that move them
+/// to and from the kept map, by the dotted path `<section>.<key>`.
+macro_rules! kept_fields {
+    ($doc:ident, $section:literal, [$($key:ident),* $(,)?]) => {
+        impl $doc {
+            /// Moves each kept key of this table into `kept`.
+            fn put_kept(
+                &mut self,
+                kept: &mut std::collections::BTreeMap<String, StoredExport>,
+            ) {
+                $(
+                    if let Some(value) = self.$key.take() {
+                        kept.insert(concat!($section, ".", stringify!($key)).to_owned(), value);
+                    }
+                )*
+            }
+
+            /// Takes each kept key of this table out of `kept`.
+            fn take_kept(
+                &mut self,
+                kept: &mut std::collections::BTreeMap<String, StoredExport>,
+            ) {
+                $(
+                    self.$key = kept.remove(concat!($section, ".", stringify!($key)));
+                )*
+            }
+        }
+    };
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -347,13 +643,38 @@ struct DocBox {
     /// `until_complete`.
     #[serde(default = "until_complete")]
     lifetime: Lifetime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    loadout_mode: Option<StoredExport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    volumes: Option<StoredExport>,
 }
+
+kept_fields!(DocBox, "box", [loadout_mode, volumes]);
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DocIo {
     pty_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exec_enabled: Option<StoredExport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stderr_mimetype: Option<StoredExport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stdin_mimetype: Option<StoredExport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stdout_mimetype: Option<StoredExport>,
 }
+
+kept_fields!(
+    DocIo,
+    "io",
+    [
+        exec_enabled,
+        stderr_mimetype,
+        stdin_mimetype,
+        stdout_mimetype
+    ]
+);
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -363,16 +684,40 @@ struct DocExecution {
     /// Absent from a spec that does not set it, which reads as `false`.
     #[serde(default, skip_serializing_if = "is_false")]
     hooks_on_resume: bool,
-    /// Absent from a spec that sets no timeout.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Absent from a spec that sets no timeout. A read also takes a
+    /// duration string, as the schema of a spec allows.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "stored_timeout"
+    )]
     timeout: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    on_oom: Option<StoredExport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    restart: Option<StoredExport>,
+}
+
+kept_fields!(DocExecution, "execution", [on_oom, restart]);
+
+/// A stored `execution.timeout`: whole seconds, or a duration string that
+/// [`crate::duration::spec_timeout`] reads.
+fn stored_timeout<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    let value = <toml::Value as serde::Deserialize>::deserialize(deserializer)?;
+    crate::duration::spec_timeout(&value).map_err(serde::de::Error::custom)
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DocInstall {
     packages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    raw_packages: Option<StoredExport>,
 }
+
+kept_fields!(DocInstall, "install", [raw_packages]);
 
 /// The `[network]` table. The policy's own keys are `egress`, `ingress`,
 /// and `credentialed_upstream` and `quic443` when it sets them, so it is
@@ -382,12 +727,98 @@ struct DocInstall {
 /// the same v0 exception as on [`SpecNetwork`]: `ingress` keeps the
 /// [`boxes::IngressPolicy`] shape, and `credentialed_upstream` is declared
 /// here. #2410 ends the interim.
+///
+/// The other keys of [`NETWORK_KEYS`] are kept as they were written,
+/// except the flat egress keys. Canonicalisation moves each one to its
+/// nested `egress.*` key before a spec is stored, and a resume reads only
+/// the policy. So a stored flat key is refused, never kept: a kept deny
+/// that no resume applies is a deny the box runs without.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct DocNetwork {
     #[serde(with = "mode_word")]
     mode: boxes::NetworkMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dynamic_ingress: Option<StoredExport>,
+    #[serde(default, skip_serializing, deserialize_with = "refuse_flat_allow_dns")]
+    #[expect(dead_code, reason = "present only to refuse the key on a read")]
+    egress_allow_dns: Option<()>,
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "refuse_flat_allow_subnets"
+    )]
+    #[expect(dead_code, reason = "present only to refuse the key on a read")]
+    egress_allow_subnets: Option<()>,
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "refuse_flat_deny_subnets"
+    )]
+    #[expect(dead_code, reason = "present only to refuse the key on a read")]
+    egress_deny_subnets: Option<()>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "lenient_names"
+    )]
+    vpn_network_names: Vec<String>,
     #[serde(flatten)]
     policy: boxes::BoxPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bep: Option<StoredExport>,
+}
+
+kept_fields!(DocNetwork, "network", [dynamic_ingress, bep,]);
+
+/// Reads a stored spec's `network.vpn_network_names` leniently: the string
+/// items of a list, in order. A hand-edited stored spec can hold another
+/// shape. That value reads as no names, and the box still resumes from its
+/// stored spec.
+fn lenient_names<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <toml::Value as serde::Deserialize>::deserialize(deserializer)?;
+    let names = match value {
+        toml::Value::Array(items) => items
+            .into_iter()
+            .filter_map(|item| match item {
+                toml::Value::String(name) => Some(name),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    Ok(names)
+}
+
+/// Refuses the flat `[network]` egress key `flat` in a stored spec, and
+/// names the nested `egress.*` key that a stored spec carries in its place.
+fn refuse_flat_egress<E: serde::de::Error>(flat: &str) -> E {
+    let nested = crate::network::FLAT_EGRESS_KEYS
+        .iter()
+        .find(|(key, _)| *key == flat)
+        .map_or(flat, |(_, nested)| nested);
+    E::custom(format!(
+        "a stored spec does not carry `network.{flat}`. \
+         Write it as `network.egress.{nested}`."
+    ))
+}
+
+fn refuse_flat_allow_dns<'de, D: serde::Deserializer<'de>>(_: D) -> Result<Option<()>, D::Error> {
+    Err(refuse_flat_egress("egress_allow_dns"))
+}
+
+fn refuse_flat_allow_subnets<'de, D: serde::Deserializer<'de>>(
+    _: D,
+) -> Result<Option<()>, D::Error> {
+    Err(refuse_flat_egress("egress_allow_subnets"))
+}
+
+fn refuse_flat_deny_subnets<'de, D: serde::Deserializer<'de>>(
+    _: D,
+) -> Result<Option<()>, D::Error> {
+    Err(refuse_flat_egress("egress_deny_subnets"))
 }
 
 /// The `mode` key in its spec word, [`boxes::NetworkMode::word`], not the
@@ -419,40 +850,83 @@ mod mode_word {
 
 impl From<BoxSpec> for SpecDoc {
     fn from(spec: BoxSpec) -> Self {
+        let mut kept = spec.kept_keys;
+        let mut box_table = DocBox {
+            box_type: spec.box_type,
+            name: spec.name,
+            lifetime: spec.lifetime,
+            loadout_mode: None,
+            volumes: None,
+        };
+        box_table.take_kept(&mut kept);
+        let mut io = DocIo {
+            pty_enabled: spec.pty_enabled,
+            exec_enabled: None,
+            stderr_mimetype: None,
+            stdin_mimetype: None,
+            stdout_mimetype: None,
+        };
+        io.take_kept(&mut kept);
+        let mut execution = DocExecution {
+            exec: match spec.entrypoint {
+                Entrypoint::Shell => None,
+                Entrypoint::Exec(argv) => Some(argv),
+            },
+            hooks_on_resume: spec.hooks_on_resume,
+            timeout: spec.timeout,
+            on_oom: None,
+            restart: None,
+        };
+        execution.take_kept(&mut kept);
+        let mut install = DocInstall {
+            packages: spec.packages,
+            raw_packages: None,
+        };
+        install.take_kept(&mut kept);
+        let mut network = DocNetwork {
+            mode: spec.network.mode,
+            dynamic_ingress: None,
+            egress_allow_dns: None,
+            egress_allow_subnets: None,
+            egress_deny_subnets: None,
+            vpn_network_names: spec.network.vpn_network_names,
+            policy: spec.network.policy,
+            bep: None,
+        };
+        network.take_kept(&mut kept);
         Self {
             v: spec.v,
             entry: spec.entry,
             hooks_enabled: spec.hooks_enabled,
-            box_table: DocBox {
-                box_type: spec.box_type,
-                name: spec.name,
-                lifetime: spec.lifetime,
-            },
-            io: DocIo {
-                pty_enabled: spec.pty_enabled,
-            },
-            execution: Some(DocExecution {
-                exec: match spec.entrypoint {
-                    Entrypoint::Shell => None,
-                    Entrypoint::Exec(argv) => Some(argv),
-                },
-                hooks_on_resume: spec.hooks_on_resume,
-                timeout: spec.timeout,
-            }),
-            install: DocInstall {
-                packages: spec.packages,
-            },
-            network: DocNetwork {
-                mode: spec.network.mode,
-                policy: spec.network.policy,
-            },
+            box_table,
+            io,
+            execution: Some(execution),
+            install,
+            network,
             lifecycle_hooks: spec.lifecycle_hooks,
+            file_exports: spec.file_exports,
+            nesting: kept.remove("nesting"),
+            secrets: kept.remove("secrets"),
         }
     }
 }
 
 impl From<SpecDoc> for BoxSpec {
-    fn from(doc: SpecDoc) -> Self {
+    fn from(mut doc: SpecDoc) -> Self {
+        let mut kept = std::collections::BTreeMap::new();
+        doc.box_table.put_kept(&mut kept);
+        doc.io.put_kept(&mut kept);
+        if let Some(execution) = doc.execution.as_mut() {
+            execution.put_kept(&mut kept);
+        }
+        doc.install.put_kept(&mut kept);
+        doc.network.put_kept(&mut kept);
+        if let Some(nesting) = doc.nesting {
+            kept.insert("nesting".to_owned(), nesting);
+        }
+        if let Some(secrets) = doc.secrets {
+            kept.insert("secrets".to_owned(), secrets);
+        }
         let hooks_on_resume = doc.execution.as_ref().is_some_and(|e| e.hooks_on_resume);
         let timeout = doc.execution.as_ref().and_then(|e| e.timeout);
         let entrypoint = match doc.execution {
@@ -475,8 +949,11 @@ impl From<SpecDoc> for BoxSpec {
             network: SpecNetwork {
                 mode: doc.network.mode,
                 policy: doc.network.policy,
+                vpn_network_names: doc.network.vpn_network_names,
             },
             lifecycle_hooks: doc.lifecycle_hooks,
+            file_exports: doc.file_exports,
+            kept_keys: kept,
         }
     }
 }
@@ -494,6 +971,8 @@ enum KeyShape {
     StrOrInt,
     StrList,
     StrOrStrList,
+    /// A string that is one of the listed values.
+    Word(&'static [&'static str]),
     /// A table whose keys are the ones listed.
     Keys(&'static [SectionKey]),
     /// Any value. Another check owns the value's shape, so this schema
@@ -510,7 +989,7 @@ impl KeyShape {
     /// [`crate::expand`]'s top-level check.
     const fn words(self) -> &'static str {
         match self {
-            KeyShape::Str => "a string",
+            KeyShape::Str | KeyShape::Word(_) => "a string",
             KeyShape::Bool => "true or false",
             KeyShape::Int => "a whole number",
             KeyShape::StrOrInt => "a string or a whole number",
@@ -527,7 +1006,7 @@ impl KeyShape {
     fn mismatch(self, value: &toml::Value) -> Option<&'static str> {
         use toml::Value as V;
         let fits = match (self, value) {
-            (KeyShape::Str | KeyShape::StrOrInt, V::String(_))
+            (KeyShape::Str | KeyShape::Word(_) | KeyShape::StrOrInt, V::String(_))
             | (KeyShape::Bool, V::Boolean(_))
             | (KeyShape::Int | KeyShape::StrOrInt, V::Integer(_))
             | (KeyShape::StrOrStrList, V::String(_))
@@ -560,7 +1039,7 @@ const fn value_words(value: &toml::Value) -> &'static str {
 
 /// `[box]`: the box's type, name, lifetime, loadout mode and volumes.
 const BOX_KEYS: &[SectionKey] = &[
-    ("lifetime", KeyShape::Str),
+    ("lifetime", KeyShape::Word(Lifetime::ACCEPTED)),
     ("loadout_mode", KeyShape::Str),
     ("name", KeyShape::Str),
     ("type", KeyShape::Str),
@@ -689,6 +1168,20 @@ pub struct SectionProblem {
 /// A [`SectionProblem`] for the first key that is not a key of its
 /// section, or whose value has the wrong shape.
 pub fn check_section(key: &str, value: &toml::Value) -> Result<(), SectionProblem> {
+    // A flat setting that a section also carries, such as `lifetime`,
+    // takes the same values as the section's key.
+    if let Some(section) = flat_key_section(key) {
+        let shape = SECTIONS.iter().find_map(|(k, shape)| match shape {
+            KeyShape::Keys(keys) if *k == section => {
+                keys.iter().find(|(name, _)| *name == key).map(|(_, s)| *s)
+            }
+            _ => None,
+        });
+        if let Some(shape) = shape {
+            check_word(key, shape, value)?;
+        }
+        return Ok(());
+    }
     let Some((_, KeyShape::Keys(keys))) = SECTIONS.iter().find(|(k, _)| *k == key) else {
         return Ok(());
     };
@@ -723,6 +1216,7 @@ fn check_table(
                 },
             });
         }
+        check_word(&key, *shape, value)?;
         match (shape, value) {
             (KeyShape::Keys(inner), toml::Value::Table(inner_table)) => {
                 check_table(&key, inner_table, inner)?;
@@ -734,6 +1228,25 @@ fn check_table(
         }
     }
     Ok(())
+}
+
+/// Refuses a string that a [`KeyShape::Word`] key does not accept, such
+/// as `lifetime = "until-stopped"`. Any other shape or value passes.
+fn check_word(key: &str, shape: KeyShape, value: &toml::Value) -> Result<(), SectionProblem> {
+    match (shape, value) {
+        (KeyShape::Word(accepted), toml::Value::String(found))
+            if !accepted.contains(&found.as_str()) =>
+        {
+            Err(SectionProblem {
+                key: key.to_owned(),
+                problem: crate::SpecKeyProblem::UnknownValue {
+                    found: found.clone(),
+                    accepted,
+                },
+            })
+        }
+        _ => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -911,6 +1424,168 @@ mod tests {
         assert!(SpecHook::from_value(&bare).is_err());
     }
 
+    // BOX-203, BOX-204: a stored spec that declares exports reads back,
+    // so a box with exports can resume. Its items stay as they were
+    // written, and every other unknown key is still refused.
+    #[test]
+    fn stored_spec_with_file_exports_round_trips() {
+        let spec = BoxSpec::for_session(None, SpecFlags::default());
+        let table = toml::Table::try_from(&spec).unwrap();
+        assert!(!table.contains_key("file_exports"));
+
+        let mut stored = table.clone();
+        let items: toml::Value = toml::from_str::<toml::Table>(
+            r#"
+            items = ["dist/a.txt", { path = "out/b.txt" }, { path = "./reports", note = "kept" }]
+            "#,
+        )
+        .unwrap()["items"]
+            .clone();
+        stored.insert("file_exports".to_owned(), items.clone());
+
+        let read: BoxSpec = stored.clone().try_into().unwrap();
+        let kept: Vec<toml::Value> = read
+            .file_exports
+            .clone()
+            .expect("the stored items read back")
+            .into_iter()
+            .map(|item| item.0)
+            .collect();
+        assert_eq!(toml::Value::Array(kept), items);
+
+        let written = toml::Table::try_from(&read).unwrap();
+        assert_eq!(written, stored, "a read and a write keep the stored spec");
+        let again: BoxSpec = written.try_into().unwrap();
+        assert_eq!(again, read);
+
+        let nan = StoredExport(toml::Value::Float(f64::NAN));
+        assert_eq!(nan, nan.clone(), "an item with a NaN float equals itself");
+        assert_ne!(nan, StoredExport(toml::Value::Float(0.0)));
+
+        let mut unknown = stored;
+        unknown.insert("file_imports".to_owned(), toml::Value::Array(Vec::new()));
+        let refused = unknown.try_into::<BoxSpec>().unwrap_err();
+        assert!(refused.to_string().contains("file_imports"), "{refused}");
+    }
+
+    /// A value that fits `shape`, for a key the stored spec does not set.
+    fn sample(shape: KeyShape) -> toml::Value {
+        match shape {
+            KeyShape::Str => "corp".into(),
+            KeyShape::Bool => false.into(),
+            KeyShape::Int | KeyShape::StrOrInt => 3.into(),
+            KeyShape::StrList | KeyShape::StrOrStrList => vec![toml::Value::from("corp")].into(),
+            KeyShape::Word(words) => words[0].into(),
+            KeyShape::Keys(keys) | KeyShape::Owned(keys) => toml::Value::Table(
+                keys.iter()
+                    .map(|(key, shape)| ((*key).to_owned(), sample(*shape)))
+                    .collect(),
+            ),
+        }
+    }
+
+    // A stored spec that carries every key the schema of a spec names reads
+    // back, so a box whose spec a newer client wrote can resume. A read and
+    // a write keep each key the typed spec does not read.
+    #[test]
+    fn stored_spec_with_every_expansion_key_reads_back() {
+        let spec = BoxSpec::for_session(None, SpecFlags::default());
+        let mut stored = toml::Table::try_from(&spec).unwrap();
+        for (section, shape) in SECTIONS {
+            let KeyShape::Keys(keys) = shape else {
+                continue;
+            };
+            let table = stored
+                .entry((*section).to_owned())
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                .as_table_mut()
+                .unwrap();
+            for (key, shape) in *keys {
+                // A stored spec never carries a flat egress key. The test
+                // below checks that a read refuses one.
+                if *section == "network"
+                    && crate::network::FLAT_EGRESS_KEYS
+                        .iter()
+                        .any(|(flat, _)| flat == key)
+                {
+                    continue;
+                }
+                // A sample does not replace a key that the typed spec
+                // wrote, such as `mode`.
+                table
+                    .entry((*key).to_owned())
+                    .or_insert_with(|| sample(*shape));
+            }
+        }
+        // The typed keys that `for_session` leaves out, in a shape that
+        // the typed spec reads.
+        stored["execution"]["exec"] = vec![toml::Value::from("make")].into();
+        stored["execution"]["timeout"] = 30.into();
+        stored["execution"]["hooks_on_resume"] = true.into();
+        stored["network"]["egress"] = sample(KeyShape::Keys(EGRESS_KEYS));
+        stored["network"]["egress"]["allow_protocols"] = vec![toml::Value::from("tcp")].into();
+        stored["network"]["quic443"] = "block".into();
+        // The typed policy reads `ingress` in its own shape, and a session
+        // spec sets none.
+        stored["network"].as_table_mut().unwrap().remove("ingress");
+
+        let read: BoxSpec = stored.clone().try_into().unwrap();
+        assert_eq!(read.entrypoint, Entrypoint::Exec(vec!["make".to_owned()]));
+        assert_eq!(read.timeout, Some(30));
+        assert_eq!(
+            read.kept_keys.get("io.exec_enabled"),
+            Some(&StoredExport(false.into()))
+        );
+        assert_eq!(read.network.vpn_network_names, ["corp"]);
+        assert!(!read.kept_keys.contains_key("network.vpn_network_names"));
+        assert!(read.kept_keys.contains_key("nesting"));
+
+        let written = toml::Table::try_from(&read).unwrap();
+        assert_eq!(written, stored, "a read and a write keep the stored spec");
+        let again: BoxSpec = written.try_into().unwrap();
+        assert_eq!(again, read);
+
+        // The stored spec also reads back from its text.
+        let text = toml::to_string(&stored).unwrap();
+        assert_eq!(toml::from_str::<BoxSpec>(&text).unwrap(), read);
+
+        // A duration string is a timeout that the schema allows.
+        let mut duration = stored.clone();
+        duration["execution"]["timeout"] = "2m".into();
+        let read: BoxSpec = duration.try_into().unwrap();
+        assert_eq!(read.timeout, Some(120));
+
+        // A flat egress key is refused, and the error names its nested key.
+        for (flat, nested) in crate::network::FLAT_EGRESS_KEYS {
+            let mut legacy = stored.clone();
+            legacy["network"].as_table_mut().unwrap().insert(
+                flat.to_owned(),
+                vec![toml::Value::from("10.0.0.0/8")].into(),
+            );
+            let refused = legacy.try_into::<BoxSpec>().unwrap_err().to_string();
+            assert!(
+                refused.contains(&format!("network.egress.{nested}")),
+                "{flat}: {refused}"
+            );
+        }
+
+        // A key that no schema of a spec names is still refused. The
+        // `[network]` table flattens the policy in, so it does not refuse
+        // a key, as before.
+        for section in ["box", "io", "execution", "install"] {
+            let mut unknown = stored.clone();
+            unknown[section]
+                .as_table_mut()
+                .unwrap()
+                .insert("not_a_key".to_owned(), true.into());
+            let refused = unknown.try_into::<BoxSpec>().unwrap_err();
+            assert!(
+                refused.to_string().contains("not_a_key"),
+                "{section}: {refused}"
+            );
+        }
+    }
+
     // BOX-068: the first spec comes from the `[session]` table or a task,
     // with the flags as the last layer.
     #[test]
@@ -958,8 +1633,11 @@ mod tests {
                 network: SpecNetwork {
                     mode: boxes::NetworkMode::OwnIp,
                     policy: policy.clone(),
+                    vpn_network_names: Vec::new(),
                 },
                 lifecycle_hooks: None,
+                file_exports: None,
+                kept_keys: std::collections::BTreeMap::new(),
             }
         );
 
@@ -1095,13 +1773,15 @@ mod tests {
             assert_eq!(&toml::from_str::<BoxSpec>(&text).unwrap(), spec, "{text}");
         }
 
-        // An unknown `[execution]` key is refused, as in every other table.
+        // An `[execution]` key that no schema of a spec names is refused,
+        // as in every other table. `restart` is a schema key, so it is kept.
         let mut value: toml::Value = toml::from_str(&toml::to_string(&lint).unwrap()).unwrap();
         value["execution"]
             .as_table_mut()
             .unwrap()
-            .insert("restart".to_string(), true.into());
-        assert!(toml::from_str::<BoxSpec>(&toml::to_string(&value).unwrap()).is_err());
+            .insert("retries".to_string(), true.into());
+        let refused = toml::from_str::<BoxSpec>(&toml::to_string(&value).unwrap()).unwrap_err();
+        assert!(refused.to_string().contains("retries"), "{refused}");
     }
 
     // BOX-028: an entry that sets `hooks_on_resume = true` carries the key
@@ -1236,6 +1916,293 @@ mod tests {
         assert_eq!(toml::from_str::<BoxSpec>(&text).unwrap(), spec);
     }
 
+    // BCLI-029: a session entry's spec takes its lifetime from the
+    // expansion, so `until_stopped` reaches the stored spec, and an entry
+    // BOX-203: a session entry's `[[file_exports]]` items, its own and the
+    // ones `[defaults]` declares, reach the stored spec as written.
+    #[test]
+    fn for_session_entry_stores_file_exports() {
+        let file = r#"
+            [defaults]
+            file_exports = [{ path = "shared.txt" }]
+
+            [sessions.dev]
+            packages = ["git"]
+
+            [[sessions.dev.file_exports]]
+            path = "notes.md"
+
+            [sessions.plain]
+        "#;
+        let dev = expand_in(file, "dev").expect("dev expands");
+        let spec =
+            BoxSpec::for_session_entry("dev", &dev.spec, &dev.report, &[], SpecFlags::default());
+        let paths: Vec<_> = spec
+            .file_exports
+            .as_ref()
+            .expect("the spec stores the exports")
+            .iter()
+            .filter_map(|item| crate::expand::file_export_path(&item.0))
+            .collect();
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        assert!(paths.contains(&"notes.md"), "{paths:?}");
+        assert!(paths.contains(&"shared.txt"), "{paths:?}");
+
+        // The stored bytes carry the list as the top-level `file_exports`.
+        let stored = toml::Table::try_from(&spec).unwrap();
+        assert_eq!(
+            stored["file_exports"].as_array().map(Vec::len),
+            Some(2),
+            "{stored:?}"
+        );
+
+        // An entry with no exports stores no list.
+        let plain = expand_in(file, "plain").expect("plain expands");
+        let mut plain_spec = plain.spec.clone();
+        plain_spec.remove("file_exports");
+        let spec = BoxSpec::for_session_entry(
+            "plain",
+            &plain_spec,
+            &plain.report,
+            &[],
+            SpecFlags::default(),
+        );
+        assert_eq!(spec.file_exports, None);
+    }
+
+    // BOX-203: a task's `[[file_exports]]` items reach its stored spec, and
+    // a task with none stores no list.
+    #[test]
+    fn for_task_stores_file_exports() {
+        let file: crate::File = toml::from_str(
+            r#"
+            [tasks.build]
+            exec = ["make"]
+
+            [[tasks.build.file_exports]]
+            path = "dist/out.txt"
+
+            [tasks.plain]
+            exec = ["true"]
+            "#,
+        )
+        .unwrap();
+        let build = BoxSpec::for_task("build", &file.tasks["build"], SpecFlags::default()).unwrap();
+        let exports = build.file_exports.as_ref().expect("the spec stores them");
+        assert_eq!(exports.len(), 1, "{exports:?}");
+        assert_eq!(
+            crate::expand::file_export_path(&exports[0].0),
+            Some("dist/out.txt")
+        );
+        let plain = BoxSpec::for_task("plain", &file.tasks["plain"], SpecFlags::default()).unwrap();
+        assert_eq!(plain.file_exports, None);
+    }
+
+    // that sets none keeps `until_complete`.
+    #[test]
+    fn box_spec_takes_lifetime_from_expansion() {
+        let file = r#"
+            [sessions.dev]
+            packages = ["git"]
+
+            [sessions.dev.box]
+            lifetime = "until_stopped"
+
+            [sessions.plain]
+            packages = ["ripgrep"]
+        "#;
+        let dev = expand_in(file, "dev").expect("dev expands");
+        let spec =
+            BoxSpec::for_session_entry("dev", &dev.spec, &dev.report, &[], SpecFlags::default());
+        assert_eq!(spec.lifetime, Lifetime::UntilStopped, "{:?}", dev.spec);
+        assert_eq!(spec.entry, "dev");
+        assert_eq!(spec.packages, vec!["git".to_string()]);
+        assert_eq!(spec.box_type, boxes::SESSION_BOX_TYPE);
+        assert!(spec.pty_enabled);
+        let text = toml::to_string(&spec).unwrap();
+        let value: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(
+            value["box"]["lifetime"].as_str(),
+            Some("until_stopped"),
+            "{text}"
+        );
+
+        let plain = expand_in(file, "plain").expect("plain expands");
+        let spec = BoxSpec::for_session_entry(
+            "plain",
+            &plain.spec,
+            &plain.report,
+            &[],
+            SpecFlags::default(),
+        );
+        assert_eq!(spec.lifetime, Lifetime::UntilComplete, "{:?}", plain.spec);
+        assert_eq!(spec.packages, vec!["ripgrep".to_string()]);
+
+        // The flat key reads the same as the `box` table's.
+        let flat: toml::Table = toml::from_str(r#"lifetime = "until_stopped""#).unwrap();
+        let spec = BoxSpec::for_session_entry(
+            "dev",
+            &flat,
+            &ExpansionReport::default(),
+            &[],
+            SpecFlags::default(),
+        );
+        assert_eq!(spec.lifetime, Lifetime::UntilStopped);
+
+        // A task and a `[session]` table are not expanded, so no check
+        // refuses their lifetime. Their spec keeps `until_complete`.
+        let file: crate::File = toml::from_str(
+            r#"
+            [session]
+            lifetime = "until_stopped"
+
+            [tasks.lint]
+            exec = ["true"]
+            lifetime = "until_stopped"
+            "#,
+        )
+        .unwrap();
+        let session = BoxSpec::for_session(file.session.as_ref(), SpecFlags::default());
+        assert_eq!(session.lifetime, Lifetime::UntilComplete);
+        let lint = BoxSpec::for_task("lint", &file.tasks["lint"], SpecFlags::default()).unwrap();
+        assert_eq!(lint.lifetime, Lifetime::UntilComplete);
+    }
+
+    // BCLI-029: within one type chain, a derived type's `[box] lifetime`
+    // beats the flat `lifetime` of the type it extends. Both are type
+    // defaults, so the type's position in the chain breaks the tie.
+    #[test]
+    fn box_spec_takes_lifetime_from_expansion_derived_type_wins() {
+        let file = r#"
+            [box_types.a]
+            extends = "session"
+            defaults = { lifetime = "until_complete" }
+
+            [box_types.b]
+            extends = "a"
+            defaults = { box = { lifetime = "until_stopped" } }
+
+            [boxes.dev]
+            type = "b"
+        "#;
+        let (dev, chain) = expand_typed(file, "dev");
+        assert_eq!(chain, ["session", "a", "b"]);
+        let spec =
+            BoxSpec::for_session_entry("dev", &dev.spec, &dev.report, &chain, SpecFlags::default());
+        assert_eq!(spec.lifetime, Lifetime::UntilStopped, "{:?}", dev.spec);
+    }
+
+    // BCLI-029: the entry's `[box] lifetime` beats a flat `lifetime` that
+    // a default sets. The later layer wins, whichever form each one uses.
+    #[test]
+    fn box_spec_takes_lifetime_from_expansion_later_layer_wins() {
+        let file = r#"
+            [defaults.session]
+            lifetime = "until_complete"
+
+            [sessions.dev.box]
+            lifetime = "until_stopped"
+        "#;
+        let dev = expand_in(file, "dev").expect("dev expands");
+        let spec =
+            BoxSpec::for_session_entry("dev", &dev.spec, &dev.report, &[], SpecFlags::default());
+        assert_eq!(spec.lifetime, Lifetime::UntilStopped, "{:?}", dev.spec);
+
+        // The other way round: the entry's flat key beats a default's
+        // `[box]` key.
+        let file = r#"
+            [defaults.session.box]
+            lifetime = "until_stopped"
+
+            [sessions.dev]
+            lifetime = "until_complete"
+        "#;
+        let dev = expand_in(file, "dev").expect("dev expands");
+        let spec =
+            BoxSpec::for_session_entry("dev", &dev.spec, &dev.report, &[], SpecFlags::default());
+        assert_eq!(spec.lifetime, Lifetime::UntilComplete, "{:?}", dev.spec);
+    }
+
+    // BCLI-029: the stored packages union the flat `packages` and the
+    // `[install] packages` of every layer, in layer order, once each.
+    #[test]
+    fn box_spec_takes_lifetime_from_expansion_unions_packages() {
+        let file = r#"
+            [defaults]
+            packages = ["a", "c"]
+
+            [sessions.dev.install]
+            packages = ["b", "a"]
+        "#;
+        let dev = expand_in(file, "dev").expect("dev expands");
+        let spec =
+            BoxSpec::for_session_entry("dev", &dev.spec, &dev.report, &[], SpecFlags::default());
+        assert_eq!(spec.packages, ["a", "c", "b"], "{:?}", dev.spec);
+    }
+
+    // BCLI-029: the expansion refuses a lifetime that is not one of the
+    // accepted values, flat or under `[box]`, so no box silently stores
+    // `until_complete` for a typo.
+    #[test]
+    fn box_spec_takes_lifetime_from_expansion_refuses_unknown_value() {
+        for (file, key) in [
+            ("[sessions.dev]\nlifetime = \"until-stopped\"\n", "lifetime"),
+            (
+                "[sessions.dev.box]\nlifetime = \"forever\"\n",
+                "box.lifetime",
+            ),
+        ] {
+            let err = expand_in(file, "dev").expect_err("a bad lifetime is refused");
+            match &err {
+                crate::Error::InvalidSpecKey {
+                    key: got,
+                    problem: crate::SpecKeyProblem::UnknownValue { accepted, .. },
+                    ..
+                } => {
+                    assert_eq!(got, key, "{err}");
+                    assert_eq!(*accepted, Lifetime::ACCEPTED);
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
+            let text = err.to_string();
+            assert!(
+                text.contains("`until_complete` or `until_stopped`"),
+                "{text}"
+            );
+        }
+    }
+
+    /// Expands the entry `name` of `file` over its type chain and the
+    /// file's `[defaults]`. Returns the expansion and the chain's type
+    /// names, the root first.
+    fn expand_typed(file: &str, name: &str) -> (crate::expand::Expansion, Vec<String>) {
+        let entries = crate::entry::read_entries(file.as_bytes()).expect("entries read");
+        let entry = entries
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("entry {name} read"));
+        let doc: toml::Table = toml::from_str(file).expect("test TOML parses");
+        let types = crate::box_types::BoxTypes::from_file(&doc).expect("the types resolve");
+        let resolved = types
+            .resolve_entry(entry)
+            .expect("the entry's type resolves");
+        let defaults = doc
+            .get("defaults")
+            .and_then(toml::Value::as_table)
+            .cloned()
+            .unwrap_or_default();
+        let project_types = types.project().keys().cloned().collect();
+        let layers = crate::expand::Layers {
+            type_defaults: resolved.defaults.clone(),
+            type_constraints: resolved.constraints.clone(),
+            ..crate::expand::Layers::default()
+        }
+        .with_file_defaults(&defaults, entry.box_type.as_deref(), &project_types);
+        let expansion = crate::expand::expand(entry, &layers).expect("the entry expands");
+        let chain = resolved.defaults.iter().map(|(t, _)| t.clone()).collect();
+        (expansion, chain)
+    }
+
     /// Expands the entry `name` of `file`, with the file's `[defaults]`.
     fn expand_in(file: &str, name: &str) -> Result<crate::expand::Expansion, crate::Error> {
         let entries = crate::entry::read_entries(file.as_bytes()).expect("entries read");
@@ -1255,6 +2222,76 @@ mod tests {
             &std::collections::BTreeSet::new(),
         );
         crate::expand::expand(entry, &layers)
+    }
+
+    // BCLI-024: an entry's `network.vpn_network_names` reach the typed spec
+    // and its stored bytes, on a session entry and on a task. A stored spec
+    // reads the list back into the typed field, and an entry that sets none
+    // stores no key.
+    #[test]
+    fn spec_keeps_vpn_network_names() {
+        let file = r#"
+            [sessions.dev.network]
+            vpn_network_names = ["corp", "lab", "corp"]
+
+            [sessions.plain]
+        "#;
+        let dev = expand_in(file, "dev").expect("dev expands");
+        let spec =
+            BoxSpec::for_session_entry("dev", &dev.spec, &dev.report, &[], SpecFlags::default());
+        assert_eq!(spec.network.vpn_network_names, ["corp", "lab"]);
+
+        let stored = toml::Table::try_from(&spec).unwrap();
+        assert_eq!(
+            stored["network"]["vpn_network_names"],
+            toml::Value::from(vec!["corp", "lab"]),
+            "{stored:?}"
+        );
+        let read: BoxSpec = stored.try_into().unwrap();
+        assert_eq!(read, spec, "a stored spec reads the list back");
+        assert!(read.kept_keys.is_empty(), "{:?}", read.kept_keys);
+
+        let plain = expand_in(file, "plain").expect("plain expands");
+        let spec = BoxSpec::for_session_entry(
+            "plain",
+            &plain.spec,
+            &plain.report,
+            &[],
+            SpecFlags::default(),
+        );
+        assert!(spec.network.vpn_network_names.is_empty());
+        let stored = toml::Table::try_from(&spec).unwrap();
+        assert!(
+            stored["network"].get("vpn_network_names").is_none(),
+            "{stored:?}"
+        );
+
+        // A hand-edited stored spec with another shape still reads: the
+        // string items of a list are kept, and any other value is no names.
+        let mut odd = toml::Table::try_from(&spec).unwrap();
+        odd["network"].as_table_mut().unwrap().insert(
+            "vpn_network_names".to_owned(),
+            vec![toml::Value::from("corp"), toml::Value::from(7)].into(),
+        );
+        let read: BoxSpec = odd.clone().try_into().unwrap();
+        assert_eq!(read.network.vpn_network_names, ["corp"]);
+        odd["network"]["vpn_network_names"] = "corp".into();
+        let read: BoxSpec = odd.try_into().unwrap();
+        assert!(read.network.vpn_network_names.is_empty());
+
+        let task_file: crate::File = toml::from_str(
+            r#"
+            [tasks.build]
+            exec = ["make"]
+
+            [tasks.build.network]
+            vpn_network_names = ["corp"]
+            "#,
+        )
+        .unwrap();
+        let build =
+            BoxSpec::for_task("build", &task_file.tasks["build"], SpecFlags::default()).unwrap();
+        assert_eq!(build.network.vpn_network_names, ["corp"]);
     }
 
     // BOX-076: every Box Spec section expands with its keys, and

@@ -1,7 +1,9 @@
 //! Box Types: the built-in types and the project's `[box_types.<name>]`.
 //!
 //! A project type names its parent with `extends`, and can carry
-//! `defaults` and `constraints` tables. Every project type resolves,
+//! `defaults` and `constraints` tables and a `description` string. Any
+//! other key of `[box_types.<name>]` fails with exit 3 and names the type,
+//! the key and the keys the table takes. Every project type resolves,
 //! through its chain of `extends`, to one built-in type: its built-in root
 //! (BOX-059). [`BoxTypes::from_file`] resolves every project type of a file
 //! at once, so a file with a broken type fails as a whole.
@@ -27,6 +29,22 @@ use crate::error::EntryHeader;
 
 /// The top-level table that declares the project's Box Types.
 pub const BOX_TYPES_TABLE: &str = "box_types";
+
+/// The keys a `[box_types.<name>]` table takes, in the order a message
+/// names them. `description` is prose for people: the expansion reads
+/// nothing from it.
+pub const TYPE_KEYS: [&str; 4] = ["extends", "defaults", "constraints", "description"];
+
+/// [`TYPE_KEYS`] as the refusal of an unknown key names them, in their
+/// order: "`extends`, `defaults`, `constraints` and `description`".
+fn type_keys_in_words() -> String {
+    let named: Vec<String> = TYPE_KEYS.iter().map(|k| format!("`{k}`")).collect();
+    match named.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+        None => String::new(),
+    }
+}
 
 /// The built-in Box Types. Each one is its own built-in root.
 pub const BUILTIN_BOX_TYPES: [&str; 6] = [
@@ -111,6 +129,9 @@ pub enum BoxTypeError {
         key: &'static str,
         expected: &'static str,
     },
+    /// A `[box_types.<name>]` sets a key that is not one of
+    /// [`TYPE_KEYS`]. Carries the type and the key.
+    UnknownKey { name: String, key: String },
     /// A project type has no `extends`.
     MissingExtends(String),
     /// A project type takes the name of a built-in type.
@@ -203,6 +224,13 @@ impl fmt::Display for BoxTypeError {
             } => write!(
                 f,
                 "`{key}` in `[{BOX_TYPES_TABLE}.{name}]` is not {expected}."
+            ),
+            BoxTypeError::UnknownKey { name, key } => write!(
+                f,
+                "`[{BOX_TYPES_TABLE}.{name}]` in minimal.toml sets `{key}`, \
+                 which is not a key of a box type. A box type takes {}. \
+                 Remove the key or correct its name.",
+                type_keys_in_words()
             ),
             BoxTypeError::MissingExtends(name) => write!(
                 f,
@@ -338,8 +366,8 @@ impl BoxTypes {
     /// # Errors
     ///
     /// A [`BoxTypeError`] for the first project type, in name order, that
-    /// has the wrong shape, takes a built-in name, has no `extends`, or
-    /// does not reach a built-in root.
+    /// has the wrong shape or a key a type does not take, takes a built-in
+    /// name, has no `extends`, or does not reach a built-in root.
     pub fn from_file(doc: &toml::Table) -> Result<Self, BoxTypeError> {
         let Some(value) = doc.get(BOX_TYPES_TABLE) else {
             return Ok(Self::default());
@@ -640,6 +668,18 @@ fn read_type(name: &str, value: &toml::Value) -> Result<ProjectType, BoxTypeErro
     let table = value
         .as_table()
         .ok_or_else(|| BoxTypeError::NotATable(Some(name.to_owned())))?;
+    // The first unknown key in name order, so the message does not depend
+    // on the order of the file.
+    if let Some(key) = table
+        .keys()
+        .filter(|k| !TYPE_KEYS.contains(&k.as_str()))
+        .min()
+    {
+        return Err(BoxTypeError::UnknownKey {
+            name: name.to_owned(),
+            key: key.clone(),
+        });
+    }
     let extends = match table.get("extends") {
         None => return Err(BoxTypeError::MissingExtends(name.to_owned())),
         Some(toml::Value::String(s)) => s.clone(),
@@ -651,6 +691,16 @@ fn read_type(name: &str, value: &toml::Value) -> Result<ProjectType, BoxTypeErro
             });
         }
     };
+    if !matches!(
+        table.get("description"),
+        None | Some(toml::Value::String(_))
+    ) {
+        return Err(BoxTypeError::WrongShape {
+            name: name.to_owned(),
+            key: "description",
+            expected: "a string",
+        });
+    }
     let sub_table = |key: &'static str| match table.get(key) {
         None => Ok(toml::Table::new()),
         Some(toml::Value::Table(t)) => Ok(t.clone()),
@@ -877,6 +927,85 @@ mod tests {
             assert_eq!(err.to_string(), msg);
             assert_eq!(err.exit_code(), 3);
         }
+    }
+
+    // gominimal/inbox#1237: a key that a type does not take fails with
+    // exit 3, naming the type, the key and the four keys a type takes, as
+    // an unknown key of an entry does. A type with all four keys resolves.
+    #[test]
+    fn box_type_unknown_key_exit3_names_type_key_and_keys() {
+        let t = types(
+            r#"
+            [box_types.ci]
+            description = "Bounded CI run"
+            extends = "task"
+            defaults = { timeout = "10m" }
+            constraints = { pty_enabled = false }
+            "#,
+        )
+        .expect("a type with all four keys resolves");
+        let ci = t.resolve("ci").expect("resolves");
+        assert_eq!(ci.root, "task");
+        assert_eq!(ci.defaults[1].1["timeout"].as_str(), Some("10m"));
+        assert_eq!(ci.constraints[1].1["pty_enabled"].as_bool(), Some(false));
+
+        // The issue's mistyped `defaults`: refused, not passed over.
+        let err = types("[box_types.ci]\nextends = \"task\"\ndefault = { timeout = \"10m\" }\n")
+            .expect_err("an unknown key fails");
+        assert_eq!(
+            err,
+            BoxTypeError::UnknownKey {
+                name: "ci".to_owned(),
+                key: "default".to_owned(),
+            }
+        );
+        assert_eq!(err.exit_code(), 3);
+        assert_eq!(
+            err.to_string(),
+            "`[box_types.ci]` in minimal.toml sets `default`, \
+             which is not a key of a box type. A box type takes `extends`, \
+             `defaults`, `constraints` and `description`. \
+             Remove the key or correct its name."
+        );
+
+        // A mistyped `extends` is named as the unknown key, and the first
+        // unknown key in name order is the one named.
+        let err = types("[box_types.ci]\nextend = \"task\"\nzzz = 1\n").expect_err("fails");
+        assert_eq!(
+            err,
+            BoxTypeError::UnknownKey {
+                name: "ci".to_owned(),
+                key: "extend".to_owned(),
+            }
+        );
+
+        let err = types("[box_types.ci]\nextends = \"task\"\ndescription = 1\n")
+            .expect_err("a description that is not a string fails");
+        assert_eq!(
+            err.to_string(),
+            "`description` in `[box_types.ci]` is not a string."
+        );
+        assert_eq!(err.exit_code(), 3);
+    }
+
+    /// The refusal of an unknown key names every key of [`TYPE_KEYS`], so a
+    /// key added there is named in the message too, and names no other.
+    #[test]
+    fn unknown_key_message_names_every_type_key() {
+        let msg = BoxTypeError::UnknownKey {
+            name: "ci".to_owned(),
+            key: "zzz".to_owned(),
+        }
+        .to_string();
+        for key in TYPE_KEYS {
+            assert!(msg.contains(&format!("`{key}`")), "{key} missing: {msg}");
+        }
+        let takes = msg
+            .split("A box type takes ")
+            .nth(1)
+            .and_then(|rest| rest.split(". ").next())
+            .expect("the message lists the keys");
+        assert_eq!(takes.matches('`').count(), 2 * TYPE_KEYS.len(), "{msg}");
     }
 
     /// A type graph with one defect, and the type the error must name.

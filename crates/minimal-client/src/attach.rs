@@ -837,6 +837,21 @@ pub fn withdraw_box_row_beside(
     withdraw_box_row_at(&control_sock, box_name, addresses, box_id);
 }
 
+/// The prefix minvmd puts on its refusal to give a box an address
+/// (`allocate_box_address_keeping` in `crates/minvmd/src/control.rs`). The
+/// reason after it comes from the zone answerer's allocator. It says why the
+/// box has no address: no DNS service for box names (it names
+/// `min finalize-install --show`), a full or quarantined box range, or a
+/// range bind check that failed. Some reasons name a step and some only state
+/// the situation. Each is plain text for the user, and a box without an
+/// address cannot go on, so a resume that it refuses fails the attach
+/// (NET-138).
+///
+/// This copies minvmd's literal, because minvmd's text is not in a crate
+/// that this one shares. A test in `box_registration` reads minvmd's source
+/// and fails when the two drift apart.
+pub const NO_ADDRESS_REFUSAL: &str = "could not give the box an address: ";
+
 /// Asks the VM host daemon whose control socket is `control_sock` for box
 /// `box_name`'s host row back (NET-138), before an attach or an exec runs
 /// in a box whose row may have been withdrawn while nothing carried its
@@ -847,29 +862,123 @@ pub fn withdraw_box_row_beside(
 /// keeps the one that stands. `box_id` narrows the proof to one creation,
 /// where the caller holds it.
 ///
-/// Blocking. A resume the daemon answers without the row — a daemon that
-/// predates the verb or holds no registration of the box — is a warn
-/// line, and the attach goes ahead: the in-VM daemon still refuses to
-/// relaunch a box whose row is gone. Returns whether the daemon answered
-/// with the row.
+/// Blocking. Any other reply is a warn line, and the attach goes ahead: a
+/// different pair, a refusal other than [`NO_ADDRESS_REFUSAL`], or the
+/// refusal of a daemon that predates the verb and cannot parse it. The
+/// in-VM daemon still refuses to relaunch a box whose row is gone. Returns
+/// whether the daemon answered with the row.
 ///
 /// # Errors
 ///
 /// [`crate::box_registration::HostUnreachable`] when the daemon cannot be
 /// reached at all (#1790): the caller fails closed on it.
+/// [`crate::box_registration::HostRefusal`] when the daemon refused to give
+/// the box an address ([`NO_ADDRESS_REFUSAL`]). It carries the daemon's
+/// reason after that prefix, for example the text that names
+/// `min finalize-install --show` when the VM cannot reach the DNS service
+/// for box names.
 pub fn resume_box_row_at(
     control_sock: &Path,
     box_name: &str,
     addresses: boxes::BoxAddresses,
     box_id: Option<minimald_rpc::BoxId>,
 ) -> anyhow::Result<bool> {
+    let failure = match resume_box_row_answer(
+        control_sock,
+        box_name,
+        addresses,
+        box_id,
+        BOX_CONTROL_THREAD_BOUND,
+    )? {
+        Ok(()) => return Ok(true),
+        Err(RowNotResumed::Refused(error)) => format!("the daemon refused it: {error}"),
+        Err(RowNotResumed::Failed(failure)) => failure,
+    };
+    tracing::warn!(
+        box = %box_name,
+        "the box's host row could not be resumed ({failure})"
+    );
+    Ok(false)
+}
+
+/// Whether the VM host daemon whose control socket is `control_sock` holds
+/// box `box_name`'s own row (NET-138): a row under the name that carries
+/// `box_id`, or, for a creator that holds no id, the switch address of
+/// `addresses`. A row another box holds under the name is not this box's.
+/// `None` when the daemon answers something that is neither a row nor the
+/// absence of one. Blocking.
+///
+/// # Errors
+///
+/// [`crate::box_registration::HostUnreachable`] when the daemon cannot be
+/// reached.
+pub fn box_row_stands_at(
+    control_sock: &Path,
+    box_name: &str,
+    addresses: boxes::BoxAddresses,
+    box_id: Option<minimald_rpc::BoxId>,
+) -> anyhow::Result<Option<bool>> {
+    let request = minimald_rpc::BoxControlRequest::ReadRow(minimald_rpc::ReadRowRequest {
+        name: box_name.to_string(),
+    });
+    match host_control_within(control_sock, &request, BOX_CONTROL_THREAD_BOUND) {
+        Ok((minimald_rpc::BoxControlReply::Row(row), _)) => Ok(Some(match box_id {
+            Some(box_id) => row.box_id == box_id,
+            None => row.switch_address == addresses.switch_address,
+        })),
+        Ok((minimald_rpc::BoxControlReply::NoRow { .. }, _)) => Ok(Some(false)),
+        Ok((other, _)) => {
+            tracing::warn!(box = %box_name, "the box's row read was answered with {other:?}");
+            Ok(None)
+        }
+        Err(error)
+            if error
+                .downcast_ref::<crate::box_registration::HostUnreachable>()
+                .is_some() =>
+        {
+            Err(error)
+        }
+        Err(error) => {
+            tracing::warn!(box = %box_name, "the box's row could not be read ({error:#})");
+            Ok(None)
+        }
+    }
+}
+
+/// Why a resume did not give a box its row back ([`resume_box_row_answer`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowNotResumed {
+    /// The VM host daemon refused the resume, with this reason.
+    Refused(String),
+    /// Anything else, as a whole clause: another pair, another verb's
+    /// reply, or an exchange that failed short of an unreachable daemon.
+    Failed(String),
+}
+
+/// The exchange behind [`resume_box_row_at`], answering why the row did not
+/// come back rather than warning: `Ok(Ok(()))` when the daemon answered
+/// with the box's row at the presented pair, which stands or which the
+/// daemon reinstated from its own record of the box's creation, under the
+/// same box id. The exchange is bounded by `timeout`.
+///
+/// # Errors
+///
+/// As [`resume_box_row_at`]: an unreachable daemon, and the refusal to give
+/// the box an address ([`NO_ADDRESS_REFUSAL`]).
+pub fn resume_box_row_answer(
+    control_sock: &Path,
+    box_name: &str,
+    addresses: boxes::BoxAddresses,
+    box_id: Option<minimald_rpc::BoxId>,
+    timeout: std::time::Duration,
+) -> anyhow::Result<Result<(), RowNotResumed>> {
     let request = minimald_rpc::BoxControlRequest::ResumeBox(minimald_rpc::ResumeBoxRequest {
         name: box_name.to_string(),
         switch_address: addresses.switch_address,
         loopback_address: addresses.loopback_address,
         box_id,
     });
-    let failure = match host_control_within(control_sock, &request, BOX_CONTROL_THREAD_BOUND) {
+    let failure = match host_control_within(control_sock, &request, timeout) {
         Ok((minimald_rpc::BoxControlReply::Registered(row), _))
             if row.switch_address == addresses.switch_address
                 && row.loopback_address == addresses.loopback_address =>
@@ -879,14 +988,28 @@ pub fn resume_box_row_at(
                 switch_address = %row.switch_address,
                 "the box's host row stands"
             );
-            return Ok(true);
+            return Ok(Ok(()));
         }
         Ok((minimald_rpc::BoxControlReply::Registered(row), _)) => format!(
             "the daemon answered with a different address pair, switch address {}",
             row.switch_address
         ),
+        // Only the no-address refusal fails the attach: its reason is plain
+        // text for the user. minvmd's other refusals carry internal text, and a daemon
+        // that predates the verb refuses a request it cannot parse. Those
+        // stay a warn line, and the in-VM daemon's own row check names the
+        // next step.
         Ok((minimald_rpc::BoxControlReply::Error { error }, _)) => {
-            format!("the daemon refused it: {error}")
+            match error.strip_prefix(NO_ADDRESS_REFUSAL) {
+                Some(reason) => {
+                    tracing::debug!(
+                        box = %box_name,
+                        "the VM host daemon refused the box's host row resume ({error})"
+                    );
+                    return Err(crate::box_registration::HostRefusal::error(reason));
+                }
+                None => return Ok(Err(RowNotResumed::Refused(error))),
+            }
         }
         Ok((other, _)) => format!("another verb's reply: {other:?}"),
         Err(error)
@@ -898,11 +1021,7 @@ pub fn resume_box_row_at(
         }
         Err(error) => format!("{error:#}"),
     };
-    tracing::warn!(
-        box = %box_name,
-        "the box's host row could not be resumed ({failure})"
-    );
-    Ok(false)
+    Ok(Err(RowNotResumed::Failed(failure)))
 }
 
 impl HostAsks {

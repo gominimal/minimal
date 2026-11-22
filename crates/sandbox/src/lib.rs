@@ -261,7 +261,7 @@ impl<C: Channel> Sandbox<C> {
             let layer = match i {
                 config::SandboxMapped::Dir(p) => p.as_path(),
                 config::SandboxMapped::TempDir(td) => td.path(),
-                config::SandboxMapped::File(p) | config::SandboxMapped::FileCopy(p) => {
+                config::SandboxMapped::File(p) | config::SandboxMapped::FileCopy { src: p, .. } => {
                     return Err(Error::MappedFile(p.clone()));
                 }
             };
@@ -334,13 +334,8 @@ impl<C: Channel> Sandbox<C> {
                             }
                             .map_err(|e| Error::IO("hardlinking input file", dest.clone(), e))?;
                         }
-                        config::SandboxMapped::FileCopy(p) => {
-                            let dest = b.join(p.file_name().unwrap());
-                            if !copy_input_file(p, &dest)
-                                .map_err(|e| Error::IO("copying input file", dest.clone(), e))?
-                            {
-                                log_input_collision("copying", p, &dest);
-                            }
+                        config::SandboxMapped::FileCopy { src, name } => {
+                            stage_file_copy(&b, src, name)?;
                         }
                         config::SandboxMapped::Dir(p) => hardlink_dir_contents(p, &b)?,
                         config::SandboxMapped::TempDir(td) => hardlink_dir_contents(td.path(), &b)?,
@@ -1683,6 +1678,9 @@ fn exec_box_program(
         // cover never came would keep the tree bind, writable, in its mount
         // namespace.
         let mut refused: Option<String> = None;
+        // Whether the first cgroup2 mount was refused with EBUSY: the one
+        // refusal the retry over the fallback below is for.
+        let mut refused_busy = false;
         if force_cover_fallback {
             // The test knob: the fallback branch, deterministically.
             refused = Some("forced".to_string());
@@ -1701,6 +1699,7 @@ fn exec_box_program(
             } == -1
             {
                 let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                refused_busy = errno == libc::EBUSY;
                 refused = Some(format!("errno {errno}"));
             } else {
                 write_closure_report(closure_report, &format!("cover cgroup2{devpts_refused}"));
@@ -1731,6 +1730,41 @@ fn exec_box_program(
                     &std::io::Error::last_os_error(),
                     closure_report,
                 );
+            }
+            // One more attempt at the design's cover, over the fallback,
+            // made only when the first mount was refused with EBUSY: that
+            // refusal comes from the launch's own bind, not from a cause
+            // a second mount would share. cgroup2 has one superblock per
+            // hierarchy, and `do_add_mount` refuses a fresh mount of the
+            // same superblock at a mountpoint its bind already covers —
+            // which the launch's own read-write bind of the classifier
+            // tree is, since the tree lives on the host's cgroup2, the
+            // same superblock a new mount would reuse. A tmpfs on top
+            // breaks that cover: the mountpoint is now the fallback's own
+            // superblock, so the cgroup2 mount grafts cleanly under it
+            // and the box reads its `memory.max` where a runtime looks —
+            // the bind, and the fallback beneath the new mount, stay
+            // hidden. A refusal here leaves the recorded fallback standing
+            // untouched, as the only cover the box got. Any other errno, and
+            // the forced knob, never reach this, so the fallback they get is
+            // the one the report names and the knob's tests assert on.
+            //
+            // SAFETY: `mount(2)` exactly as the refused attempt above —
+            // same source, target, and flags — only with the fallback
+            // mounted over the bind first. Async-signal-safe.
+            if refused_busy
+                && unsafe {
+                    libc::mount(
+                        c"cgroup2".as_ptr(),
+                        target.as_ptr(),
+                        c"cgroup2".as_ptr(),
+                        libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                        std::ptr::null(),
+                    )
+                } == 0
+            {
+                write_closure_report(closure_report, &format!("cover cgroup2{devpts_refused}"));
+                set_box_cover_marker("cgroup2");
             }
         }
     }
@@ -3013,6 +3047,37 @@ fn booted_with_systemd() -> bool {
         .unwrap_or_default()
 }
 
+/// Stages one copied input in the working directory `build_dir`: the bytes
+/// and mode of `src`, under `name`.
+///
+/// The copy takes the declared name, not the name of `src`: a package file
+/// reached through a link is read from its target but keeps the name its
+/// build refers to it by. `name` must be one file name. A name with a
+/// separator, `.`, `..` or nothing in it is refused, so a copy cannot be put
+/// outside `build_dir`. An entry already at the name is left as it is.
+fn stage_file_copy(build_dir: &Path, src: &Path, name: &std::ffi::OsStr) -> Result<(), Error> {
+    let dest = build_dir.join(name);
+    let mut parts = Path::new(name).components();
+    let one_name = matches!(
+        (parts.next(), parts.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    );
+    if !one_name {
+        return Err(Error::IO(
+            "copying input file",
+            dest,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the name to copy it under is not one file name",
+            ),
+        ));
+    }
+    if !copy_input_file(src, &dest).map_err(|e| Error::IO("copying input file", dest.clone(), e))? {
+        log_input_collision("copying", src, &dest);
+    }
+    Ok(())
+}
+
 /// Copy `src` to `dest` as a new file with `src`'s permission bits. Returns
 /// `false`, touching nothing, when `dest` already exists: two inputs with one
 /// basename keep the first, as a hardlinked `File` input does. `fs::copy`
@@ -3100,25 +3165,42 @@ fn log_rootfs_collisions(c: &common::LinkCollisions, layers: &[PathBuf], rootfs:
 /// the assembled one (the link pass hardlinks, so the winner's file and
 /// the rootfs path are one). A symlink is made anew in the rootfs, not
 /// linked, so it shares no inode with its layer: its winner is the first
-/// layer whose link points where the placed one does. `None` when no
-/// layer matches, as for a file the assembly copied across filesystems.
+/// layer whose link points where the placed one does.
+///
+/// A file the assembly copied (the cache and the rootfs on different
+/// filesystems) has an inode of its own, so no layer matches it that way.
+/// The first-linked file stays, so its winner is the first layer, in link
+/// order, that ships the path, and that layer is named only when the link
+/// pass's own comparison calls its file the same as the placed one. `None`
+/// otherwise: the placed file came from somewhere other than `layers`, or
+/// the two have equal sizes above the compare limit
+/// ([`common::LinkCollision::Unchecked`]), which proves nothing about who
+/// placed it, so no layer is named rather than a possibly wrong one.
 fn collision_winner<'a>(rootfs: &Path, layers: &'a [PathBuf], rel: &Path) -> Option<&'a Path> {
     use std::os::unix::fs::MetadataExt as _;
-    let placed = fs::symlink_metadata(rootfs.join(rel)).ok()?;
+    let at = rootfs.join(rel);
+    let placed = fs::symlink_metadata(&at).ok()?;
     if placed.is_symlink() {
-        let target = fs::read_link(rootfs.join(rel)).ok()?;
+        let target = fs::read_link(&at).ok()?;
         return layers
             .iter()
             .find(|layer| fs::read_link(layer.join(rel)).is_ok_and(|t| t == target))
             .map(PathBuf::as_path);
     }
-    layers
+    let linked = layers.iter().find(|layer| {
+        fs::symlink_metadata(layer.join(rel))
+            .is_ok_and(|m| m.dev() == placed.dev() && m.ino() == placed.ino())
+    });
+    if let Some(layer) = linked {
+        return Some(layer.as_path());
+    }
+    let first = layers
         .iter()
-        .find(|layer| {
-            fs::symlink_metadata(layer.join(rel))
-                .is_ok_and(|m| m.dev() == placed.dev() && m.ino() == placed.ino())
-        })
-        .map(PathBuf::as_path)
+        .find(|layer| fs::symlink_metadata(layer.join(rel)).is_ok())?;
+    let shipped = first.join(rel);
+    let is_the_copy = fs::symlink_metadata(&shipped).is_ok_and(|m| m.is_file())
+        && common::link_collision(&shipped, &at) == common::LinkCollision::Same;
+    is_the_copy.then_some(first.as_path())
 }
 
 /// Logs a working input that was not placed at `dest` because something is
@@ -3311,7 +3393,8 @@ impl UsernsRestriction {
                 format!(
                     "Finish the install to allow it for Minimal only: min finalize-install   (see \
                      what it changes first: min finalize-install --show). The profile takes effect \
-                     when the daemon next starts: run min stop, then your command again.\n\
+                     when the daemon next starts: run min host stop <host>, then your command \
+                     again.\n\
                      A daemon built from source is not covered: attach the profile to this \
                      binary instead, from a checkout: sudo scripts/install-apparmor-profile.sh \
                      --path {bin}, then the same restart."
@@ -4438,6 +4521,81 @@ mod tests {
         );
     }
 
+    /// With the cache and the rootfs on different filesystems the link pass
+    /// copies, and a copy has an inode of its own: the winner is then the
+    /// first layer, in link order, that ships the path, named when its file
+    /// is the placed one's bytes. A placed file that is not that layer's has
+    /// no winner among the layers.
+    #[test]
+    fn collision_winner_of_a_copied_file_is_the_first_layer_that_ships_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rel = std::path::Path::new("usr/share/man/man1/node.1");
+        let [a, b, c] = ["a", "b", "c"].map(|name| tmp.path().join(name));
+        let rootfs = tmp.path().join("rootfs");
+        for dir in [&b, &c, &rootfs] {
+            std::fs::create_dir_all(dir.join(rel.parent().unwrap())).unwrap();
+        }
+        // `a` does not ship the path; `b` ships it first, `c` after it
+        std::fs::create_dir_all(a.join("usr")).unwrap();
+        std::fs::write(b.join(rel), b".TH NODE 1 22").unwrap();
+        std::fs::write(c.join(rel), b".TH NODE 1 20, another").unwrap();
+        // the cross-filesystem branch of the link pass: a copy, not a link
+        std::fs::copy(b.join(rel), rootfs.join(rel)).unwrap();
+        let layers = [a.clone(), b.clone(), c.clone()];
+        assert_eq!(
+            super::collision_winner(&rootfs, &layers, rel),
+            Some(b.as_path()),
+            "the first layer to ship the path is the one whose copy stays"
+        );
+
+        // the same bytes in a later layer do not make it the winner
+        std::fs::write(c.join(rel), b".TH NODE 1 22").unwrap();
+        assert_eq!(
+            super::collision_winner(&rootfs, &layers, rel),
+            Some(b.as_path())
+        );
+
+        // what stands in the rootfs is not the first shipper's file
+        std::fs::write(rootfs.join(rel), b"placed by something else").unwrap();
+        assert_eq!(super::collision_winner(&rootfs, &layers, rel), None);
+    }
+
+    /// A copied file above the compare limit, of the same size as the first
+    /// shipper's, is only `Unchecked` by the link pass's comparison: equal
+    /// sizes prove nothing about who placed it, so no layer is named.
+    #[test]
+    fn collision_winner_of_an_unchecked_copy_names_no_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rel = std::path::Path::new("usr/lib/libbig.so");
+        let [a, b] = ["a", "b"].map(|name| tmp.path().join(name));
+        let rootfs = tmp.path().join("rootfs");
+        for dir in [&a, &b, &rootfs] {
+            std::fs::create_dir_all(dir.join(rel.parent().unwrap())).unwrap();
+        }
+        // sparse files well above the compare limit, so the test writes no
+        // more than a few bytes: `a` ships zeros, `b` ships the path too, and
+        // the placed file is another source's, of equal size, other bytes
+        let size = 64 << 20;
+        std::fs::write(rootfs.join(rel), b"another source").unwrap();
+        for dir in [&a, &b, &rootfs] {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(dir.join(rel))
+                .unwrap()
+                .set_len(size)
+                .unwrap();
+        }
+        assert_eq!(
+            common::link_collision(&a.join(rel), &rootfs.join(rel)),
+            common::LinkCollision::Unchecked,
+            "the comparison must reach the unchecked branch"
+        );
+        let layers = [a.clone(), b.clone()];
+        assert_eq!(super::collision_winner(&rootfs, &layers, rel), None);
+    }
+
     /// Two layers ship one path as symlinks to different targets. The link
     /// pass makes the rootfs symlink anew rather than linking it, so no
     /// layer shares its inode: the winner is the layer whose link points
@@ -4496,6 +4654,52 @@ mod tests {
         }
     }
 
+    /// A copied input is staged under the name it is given, not under the name
+    /// of the file its bytes come from. Without that, a package file declared
+    /// as `link.patch` and read from `files/a.patch` would be staged as
+    /// `a.patch`, and the build that names `link.patch` would not find it.
+    #[test]
+    fn stage_file_copy_uses_the_given_name_not_the_source_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("a.patch");
+        fs::write(&src, b"payload").unwrap();
+        let build = tmp.path().join("build");
+        fs::create_dir(&build).unwrap();
+        stage_file_copy(&build, &src, std::ffi::OsStr::new("link.patch")).unwrap();
+        assert_eq!(fs::read(build.join("link.patch")).unwrap(), b"payload");
+        assert!(
+            !build.join("a.patch").exists(),
+            "staged under the source's name"
+        );
+        // The control: a copy given the source's own name is staged under it.
+        stage_file_copy(&build, &src, std::ffi::OsStr::new("a.patch")).unwrap();
+        assert_eq!(fs::read(build.join("a.patch")).unwrap(), b"payload");
+    }
+
+    /// A name that is not one file name is refused, and nothing is written: a
+    /// copy cannot be put outside the working directory.
+    #[test]
+    fn stage_file_copy_refuses_a_name_that_is_not_one_file_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("a.patch");
+        fs::write(&src, b"payload").unwrap();
+        let build = tmp.path().join("build");
+        fs::create_dir(&build).unwrap();
+        for name in ["../out.patch", "sub/out.patch", "/out.patch", "..", ".", ""] {
+            let refused = stage_file_copy(&build, &src, std::ffi::OsStr::new(name));
+            assert!(
+                matches!(refused, Err(Error::IO("copying input file", _, _))),
+                "{name:?} was not refused: {refused:?}"
+            );
+        }
+        assert!(!tmp.path().join("out.patch").exists());
+        assert_eq!(
+            fs::read_dir(&build).unwrap().count(),
+            0,
+            "something was staged"
+        );
+    }
+
     /// A copied input is a new file with the source's bytes and mode.
     #[test]
     fn copy_input_file_copies_bytes_and_mode() {
@@ -4542,7 +4746,7 @@ mod tests {
             remedy,
             "Finish the install to allow it for Minimal only: min finalize-install   (see what \
              it changes first: min finalize-install --show). The profile takes effect when the \
-             daemon next starts: run min stop, then your command again.\n\
+             daemon next starts: run min host stop <host>, then your command again.\n\
              A daemon built from source is not covered: attach the profile to this binary \
              instead, from a checkout: sudo scripts/install-apparmor-profile.sh --path \
              /home/me/src/minimal/target/debug/minimald, then the same restart."

@@ -181,31 +181,6 @@ pub(crate) async fn box_via_ssh(
     config_dir: Option<&std::path::Path>,
     host_asks_for: Option<&str>,
 ) -> Result<(), anyhow::Error> {
-    box_via_ssh_with(kind, sock, id, wire, config_dir, host_asks_for, None).await
-}
-
-/// [`box_via_ssh`] for `min session run`: the exec `wire` of a task, with
-/// the task's `env_vars` resolved by this client
-/// ([`minimal_client::attach::task_run_command`]) (inbox#778).
-pub(crate) async fn task_via_ssh(
-    kind: paths::HostKind,
-    sock: &std::path::Path,
-    id: boxes::SessionId,
-    wire: String,
-    task_env: &minimald_rpc::taskenv::TaskEnv,
-) -> Result<(), anyhow::Error> {
-    box_via_ssh_with(kind, sock, id, Some(wire), None, None, Some(task_env)).await
-}
-
-async fn box_via_ssh_with(
-    kind: paths::HostKind,
-    sock: &std::path::Path,
-    id: boxes::SessionId,
-    wire: Option<String>,
-    config_dir: Option<&std::path::Path>,
-    host_asks_for: Option<&str>,
-    task_env: Option<&minimald_rpc::taskenv::TaskEnv>,
-) -> Result<(), anyhow::Error> {
     // The command itself lives in minimal-client, shared with the dash TUI's
     // suspend-attach-resume flow. The interactive path resolves the
     // session-key config from `config_dir` and forwards it per channel. The
@@ -215,17 +190,8 @@ async fn box_via_ssh_with(
     } else {
         None
     };
-    let mut ssh = match (task_env, wire.as_deref()) {
-        (Some(task_env), Some(wire)) => {
-            minimal_client::attach::task_run_command(sock, id, wire, task_env)?
-        }
-        _ => minimal_client::attach::attach_command(
-            sock,
-            id,
-            wire.as_deref(),
-            session_keys.as_ref(),
-        )?,
-    };
+    let mut ssh =
+        minimal_client::attach::attach_command(sock, id, wire.as_deref(), session_keys.as_ref())?;
 
     // The session's record, read before the attach or the exec on a
     // VM-backed host — one with a VM host daemon's control socket beside
@@ -248,8 +214,9 @@ async fn box_via_ssh_with(
         None => None,
     };
     // A VM host that cannot be reached fails the attach or the exec
-    // closed (#1790); one that answers late or refuses is a warn line, and
-    // the attach or the exec goes on (NET-138).
+    // closed (#1790). One that refuses fails it with its own reason, which
+    // `main` prints before any terminal is taken, so it stays on screen.
+    // One that answers late is a warn line, and the attach goes on (NET-138).
     resume_box_row(sock, record.as_ref()).await?;
     // The name hold a `host_ip` session without a row depends on may not
     // have survived a VM host daemon restart; re-make it before the
@@ -262,45 +229,71 @@ async fn box_via_ssh_with(
         // it, read before the attach: an attach that ends in a daemon-side
         // destroy leaves no record to read them from, and the row is still
         // this client's to withdraw. The id proves a box renamed since its
-        // registration (#1116); it goes only with a pair.
+        // registration (#1116); it goes only with a pair. A retried attach
+        // keeps them: the row comes back under the same id and pair.
         let box_row = match host_asks_for {
-            Some(_) => {
-                record.and_then(|record| record.box_addresses.map(|pair| (pair, record.box_id)))
-            }
+            Some(_) => record
+                .as_ref()
+                .and_then(|record| record.box_addresses.map(|pair| (pair, record.box_id))),
             None => None,
         };
         let box_addresses = box_row.map(|(pair, _)| pair);
-        let host_asks = host_asks_target(
-            control_sock_beside(sock),
-            host_asks_for,
-            box_addresses,
-            record_unreadable,
-        );
-        // The relay blocks its thread until ssh exits, so it runs off the
-        // runtime's workers.
-        let code = tokio::task::spawn_blocking(move || {
-            interactive_attach(
-                ssh,
-                stdin_is_tty,
-                crate::attach::TerminalUnwind::arm,
-                |ssh| {
-                    // A terminal the relay could not take was never changed,
-                    // so a failure here owes it nothing; the marker tells
-                    // `interactive_attach` so.
-                    let real = minimal_client::tty_relay::RealTty::acquire()
-                        .context(crate::attach::TerminalNotTaken)?;
-                    mark_relay_not_started(
-                        subscribe_host_asks(host_asks)
-                            .map(minimal_client::attach::HostAsks::into_hook),
-                        |hook| {
-                            minimal_client::attach::run_interactive_attach_on(ssh, real, Some(hook))
-                        },
-                    )
-                },
-            )
-        })
-        .await
-        .context("the interactive attach's thread failed")??;
+        let mut first = Some(ssh);
+        let code = attach_retrying_row_ended(
+            || {
+                let ssh = match first.take() {
+                    Some(ssh) => Ok(ssh),
+                    None => minimal_client::attach::attach_command(
+                        sock,
+                        id,
+                        None,
+                        session_keys.as_ref(),
+                    ),
+                };
+                let host_asks = host_asks_target(
+                    control_sock_beside(sock),
+                    host_asks_for,
+                    box_addresses,
+                    record_unreadable,
+                );
+                async move {
+                    let ssh = ssh?;
+                    // The relay blocks its thread until ssh exits, so it
+                    // runs off the runtime's workers.
+                    tokio::task::spawn_blocking(move || {
+                        interactive_attach(
+                            ssh,
+                            stdin_is_tty,
+                            crate::attach::TerminalUnwind::arm,
+                            |ssh| {
+                                // A terminal the relay could not take was
+                                // never changed, so a failure here owes it
+                                // nothing; the marker tells
+                                // `interactive_attach` so.
+                                let real = minimal_client::tty_relay::RealTty::acquire()
+                                    .context(crate::attach::TerminalNotTaken)?;
+                                mark_relay_not_started(
+                                    subscribe_host_asks(host_asks)
+                                        .map(minimal_client::attach::HostAsks::into_hook),
+                                    |hook| {
+                                        minimal_client::attach::run_interactive_attach_on(
+                                            ssh,
+                                            real,
+                                            Some(hook),
+                                        )
+                                    },
+                                )
+                            },
+                        )
+                    })
+                    .await
+                    .context("the interactive attach's thread failed")?
+                }
+            },
+            || minimal_client::box_registration::box_row_withdrawn(sock, record.as_ref()),
+            || resume_after_row_ended(sock, record.as_ref()),
+        )
+        .await?;
         // The attach may have ended in the shell-exit prompt's Delete, a
         // destroy made daemon-side: withdraw the row an own-address box
         // registered, or release the name a `host_ip` box held.
@@ -366,6 +359,151 @@ async fn box_via_ssh_with(
     kill_ssh(&mut child).await;
     Err(Handoff::Exit(128 + signo).into())
 }
+
+/// The exit status an interactive attach ends with when the in-VM daemon
+/// refused it because the VM host withdrew the box's row (NET-138). The
+/// daemon sends it only on an interactive attach's channel: an exec
+/// channel (`min session exec`, `min session run`, `min box exec`) ends
+/// the same refusal with 1, and a forward's channel does not open. The
+/// interactive attach reads it as a refusal only when the VM host holds no
+/// row of the box's own ([`attach_retrying_row_ended`]), and then `min`
+/// exits with [`ROW_ENDED_REFUSED`], or with 2 when another box holds the
+/// box's name ([`RowNotBack::NameHeld`]). `min` exits with 253 when the box's
+/// shell exited with it, and also when the session's record could not be
+/// read: no row is then checked, so a refusal cannot be told from the
+/// shell's own status. The dashboard's attach reads it the same way.
+pub(crate) const ROW_ENDED_ATTACH: i32 = 253;
+const _: () = assert!(ROW_ENDED_ATTACH as u32 == minimald_rpc::ATTACH_ROW_ENDED_EXIT_STATUS);
+
+/// The status `min` exits with when an interactive attach was refused
+/// because the box's row ended and no retry attached the box: 1, the
+/// status of any other refused attach. The daemon's row-ended status
+/// ([`ROW_ENDED_ATTACH`]) is not in `min`'s exit table.
+pub(crate) const ROW_ENDED_REFUSED: i32 = 1;
+
+/// Runs an interactive attach with `attach` (NET-138). An attach that ends
+/// with [`ROW_ENDED_ATTACH`] is read as the in-VM daemon's refusal only
+/// when `row_ended` says the VM host holds no row of the box's own:
+/// otherwise it is the status the box's shell exited with, and `min` exits
+/// with it. On the refusal, `resume` asks for the row back, and once it
+/// says the row is back, `attach` runs one more time. A refusal that is not
+/// followed by an attach ends with [`ROW_ENDED_REFUSED`]. Returns the
+/// status `min` exits with.
+///
+/// # Errors
+///
+/// An attach that could not run, a row read that could not reach the VM
+/// host, and `resume`'s error: the row did not come back, and the error
+/// says why and what to do.
+pub(crate) async fn attach_retrying_row_ended<A, AF, E, EF, R, RF>(
+    mut attach: A,
+    mut row_ended: E,
+    resume: R,
+) -> anyhow::Result<i32>
+where
+    A: FnMut() -> AF,
+    AF: std::future::Future<Output = anyhow::Result<i32>>,
+    E: FnMut() -> EF,
+    EF: std::future::Future<Output = anyhow::Result<bool>>,
+    R: FnOnce() -> RF,
+    RF: std::future::Future<Output = anyhow::Result<bool>>,
+{
+    let code = attach().await?;
+    if code != ROW_ENDED_ATTACH || !row_ended().await? {
+        return Ok(code);
+    }
+    if !resume().await? {
+        return Ok(ROW_ENDED_REFUSED);
+    }
+    let code = attach().await?;
+    if code == ROW_ENDED_ATTACH && row_ended().await? {
+        return Ok(ROW_ENDED_REFUSED);
+    }
+    Ok(code)
+}
+
+/// Asks the VM host for the row of the session's box back after an attach
+/// found it withdrawn ([`minimal_client::box_registration::resume_box_row_after_row_ended`]).
+/// `Ok(true)` when the row is back under the same box id, so the attach
+/// runs again. `Ok(false)` when there is no row to ask back: the daemon's
+/// refusal is on the terminal already, and the attach ends with it.
+///
+/// # Errors
+///
+/// [`RowNotBack`] when the row did not come back, and the VM host's own
+/// errors: it cannot be reached, or it refuses to give the box an address.
+pub(crate) async fn resume_after_row_ended(
+    sock: &std::path::Path,
+    record: Option<&boxes::Record>,
+) -> anyhow::Result<bool> {
+    use minimal_client::box_registration::RowEndedResume;
+    let answer =
+        minimal_client::box_registration::resume_box_row_after_row_ended(sock, record).await?;
+    let name = record
+        .and_then(|record| record.name.clone())
+        .unwrap_or_default();
+    match answer {
+        RowEndedResume::NothingToResume => Ok(false),
+        RowEndedResume::Back => Ok(true),
+        RowEndedResume::NameHeld { held } => Err(RowNotBack::NameHeld { name, held }.into()),
+        RowEndedResume::NotBack(why) => {
+            tracing::info!(box = %name, "the box's row did not come back: {why}");
+            Err(RowNotBack::NotBack { name }.into())
+        }
+    }
+}
+
+/// Why an interactive attach that found its box's row withdrawn could not
+/// get the row back (NET-138). [`RowNotBack::NameHeld`] exits 2, as an
+/// operation a held name does not admit does when the message names the
+/// holder. [`RowNotBack::NotBack`] exits 1, as any other refused attach does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowNotBack {
+    /// Another box holds the box's name now, in the spelling `held`.
+    NameHeld {
+        /// The box's own name.
+        name: String,
+        /// The name in the spelling the other box holds it.
+        held: String,
+    },
+    /// The VM host did not give the row back for another reason.
+    NotBack {
+        /// The box's own name.
+        name: String,
+    },
+}
+
+impl std::fmt::Display for RowNotBack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RowNotBack::NameHeld { name, held } => write!(
+                f,
+                "box {name} cannot get its network addresses back. Another box, {held}, \
+                 holds its name now. Give that box another name with \
+                 `min box rename {held} <new-name>`, then run `min box attach {name}` again."
+            ),
+            RowNotBack::NotBack { name } => write!(
+                f,
+                "box {name} cannot get its network addresses back from the VM host. Run \
+                 `min box attach {name}` again. If it is refused again, remove the box with \
+                 `min box rm --force {name}` and start a new one with `min session start`."
+            ),
+        }
+    }
+}
+
+impl RowNotBack {
+    /// The status the attach ends with: 2 when another box holds the name,
+    /// 1 otherwise.
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            RowNotBack::NameHeld { .. } => 2,
+            RowNotBack::NotBack { .. } => 1,
+        }
+    }
+}
+
+impl std::error::Error for RowNotBack {}
 
 /// Where an interactive attach subscribes to its box's pending asks
 /// (NET-045): the VM host daemon's control socket and the box's name, for a
@@ -495,6 +633,11 @@ pub(crate) fn mark_relay_not_started(
 /// terminal ([`crate::attach::TerminalNotTaken`]) or never started ssh's
 /// session on it ([`crate::attach::RelayNotStarted`]) stands the guard
 /// down, because nothing of the session reached the terminal.
+///
+/// An attach that the daemon refuses prints its refusal through ssh, and
+/// the daemon sends an exit status with it. So ssh does not end with 255,
+/// the guard is stood down, and no blind cursor restore moves the cursor
+/// back over the refusal line.
 pub(crate) fn interactive_attach<W: std::io::Write>(
     ssh: std::process::Command,
     stdin_is_tty: bool,
@@ -1426,7 +1569,8 @@ async fn attach_exec_by_id(
     config_dir: Option<&std::path::Path>,
 ) -> Result<i32, anyhow::Error> {
     // A VM-backed box gets its row and its name hold back first, as
-    // `min box exec` does.
+    // `min box exec` does. A refused resume ends here with the VM host's
+    // reason, before the terminal is taken.
     let record = match control_sock_beside(sock).filter(|control| control.exists()) {
         Some(_) => attached_box_record(sock, id).await.unwrap_or_else(|error| {
             tracing::warn!(
@@ -1489,6 +1633,9 @@ where
         host = %target.host.host,
         outcome = "attaching"
     );
+    // BOX-204: a box that ended before the attach resumes in it. The
+    // attach then copies only a later end, never the end it resumed from.
+    let ends_before = ended_box_end_count(&target).await;
     let code = attach(&target).await.inspect_err(|err| {
         tracing::info!(verb = name, box_id = %target.box_id, outcome = "error", "{err:#}");
     })?;
@@ -1525,6 +1672,7 @@ where
     let mut copied = None;
     if let BoxAfterAttach::Listed(entry) = &ended
         && matches!(entry.state.as_str(), "stopped" | "exited")
+        && ended_again(&target, ends_before).await
     {
         let root = entry.project_root.as_ref();
         let outcomes = copy_box_exports_on_host(
@@ -1539,7 +1687,18 @@ where
         let exited_clean = entry.state == "exited" && entry.exit_code == Some(0);
         copied = Some((exited_clean, outcomes));
     }
-    match attach_ending(&target, code, &after) {
+    // BCLI-068: a box that runs again after the host ended the attach, and
+    // whose count of ends rose, was restarted, not taken by another terminal.
+    // A box that reads stopped was restarted when its new end names the
+    // restart: the read fell between the restart's stop and its start.
+    // Only a 254 reads the ends, since only a 254 can name a restart.
+    let ends_after = if code == DAEMON_ENDED_ATTACH {
+        box_ends_settled(&target, &after, ends_before).await
+    } else {
+        None
+    };
+    let restarted = attach_restart(code, &after, ends_before, ends_after);
+    match box_attach_ending(&target, code, &after, restarted) {
         Ok(mut ending) => {
             if let Some((exited_clean, outcomes)) = &copied {
                 ending.code = exit_code_after_exports(ending.code, *exited_clean, outcomes);
@@ -1563,6 +1722,275 @@ where
             Err(refusal.into())
         }
     }
+}
+
+/// What the attach knew of the box's ends before it started (BOX-204).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EndsBefore {
+    /// The box ran, so any end it reaches is a new end. The count is how
+    /// many times it had ended, `None` when the host did not give it. A
+    /// restart while the attach runs raises it (BCLI-068).
+    Running(Option<u64>),
+    /// The box was stopped or exited, and had ended this many times.
+    Ended(u64),
+    /// The host did not give the box's state or its count of ends.
+    Unread,
+}
+
+/// What the attach knew of the box `target` before it started: running,
+/// ended a number of times, or not read.
+async fn ended_box_end_count(target: &BoxAttachTarget) -> EndsBefore {
+    let BoxAfterAttach::Listed(entry) = box_after_attach(&target.host, target.box_id).await else {
+        tracing::warn!(box_id = %target.box_id, "box ends: the host did not give the box's state");
+        return EndsBefore::Unread;
+    };
+    let running = !matches!(entry.state.as_str(), "stopped" | "exited");
+    let count = box_end_count(target).await;
+    if running {
+        return EndsBefore::Running(count);
+    }
+    count.map_or(EndsBefore::Unread, EndsBefore::Ended)
+}
+
+/// How many times the box `target` ended, `None` when its host does not
+/// give the count.
+async fn box_end_count(target: &BoxAttachTarget) -> Option<u64> {
+    let mut client = box_host_client(&target.host)
+        .await
+        .inspect_err(|e| tracing::warn!(box_id = %target.box_id, "box ends: could not reach the box's host: {e:#}"))
+        .ok()?;
+    box_ends(&mut client, target.box_id)
+        .await
+        .map(|ends| ends.count)
+}
+
+/// The ends on the record of a box after its attach ended, as its `exited`
+/// events give them (BCLI-068).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EndsAfter {
+    /// How many times the box ended: the count of its `exited` events.
+    pub(crate) count: u64,
+    /// Whether the last `exited` event is the stop half of a restart.
+    pub(crate) last_by_restart: bool,
+}
+
+/// The key of an `exited` event's `data` that names the stop half of a
+/// restart, and its value. The daemon writes them (`minimald`'s
+/// `STOPPED_BY` and `STOPPED_BY_RESTART`). The two crates share no type for
+/// them, so the tests on both sides pin the same wire text:
+/// `restart_records_restart_reason_before_start` in `minimald` and
+/// `attach_ended_by_restart_names_restart_exit254` here.
+const STOPPED_BY: &str = "stopped_by";
+const STOPPED_BY_RESTART: &str = "restart";
+
+/// The ends that the kept `events` of a box give.
+pub(crate) fn ends_of(events: &[boxes::events::BoxEvent]) -> EndsAfter {
+    let mut ends = EndsAfter {
+        count: 0,
+        last_by_restart: false,
+    };
+    for event in events {
+        if event.kind == boxes::events::BoxEventType::Exited {
+            ends.count += 1;
+            ends.last_by_restart =
+                event.data.get(STOPPED_BY).and_then(|v| v.as_str()) == Some(STOPPED_BY_RESTART);
+        }
+    }
+    ends
+}
+
+/// The ends of the box `target`, `None` when its host does not give every
+/// event.
+async fn box_ends_after(target: &BoxAttachTarget) -> Option<EndsAfter> {
+    let mut client = box_host_client(&target.host)
+        .await
+        .inspect_err(|e| tracing::warn!(box_id = %target.box_id, "box ends: could not reach the box's host: {e:#}"))
+        .ok()?;
+    read_kept_events(&mut client, target.box_id, &target.label)
+        .await
+        .ok()
+        .map(|events| ends_of(&events))
+}
+
+/// How long the read of a box's ends waits for the `exited` event of a box
+/// that reads `stopped`. A stop writes the stopped record first, and its
+/// `exited` event straight after it.
+const END_EVENT_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The ends of the box `target` after its attach ended, where the settled
+/// read gave `after`. A box that ran before the attach and reads `stopped`
+/// now has a new end. Its `exited` event can land just after the record, so
+/// the read waits up to [`END_EVENT_SETTLE`] for the count to rise.
+async fn box_ends_settled(
+    target: &BoxAttachTarget,
+    after: &BoxAfterAttach,
+    before: EndsBefore,
+) -> Option<EndsAfter> {
+    let stopped = matches!(after, BoxAfterAttach::Listed(entry) if entry.state == "stopped");
+    let EndsBefore::Running(Some(count_before)) = before else {
+        return box_ends_after(target).await;
+    };
+    if !stopped {
+        return box_ends_after(target).await;
+    }
+    let deadline = tokio::time::Instant::now() + END_EVENT_SETTLE;
+    loop {
+        let ends = box_ends_after(target).await;
+        let rose = ends.is_some_and(|ends| ends.count > count_before);
+        if rose || tokio::time::Instant::now() >= deadline {
+            tracing::debug!(
+                box_id = %target.box_id,
+                ends_before = count_before,
+                ends_after = ?ends,
+                "read the ends of the stopped box"
+            );
+            return ends;
+        }
+        tokio::time::sleep(SETTLE_POLL).await;
+    }
+}
+
+/// Whether a box that runs after its attach ended was restarted while the
+/// attach ran (BCLI-068).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoxRestart {
+    /// The box's count of ends rose while the attach ran.
+    Restarted,
+    /// The count did not rise, or the box did not run when the attach
+    /// started.
+    NotRestarted,
+    /// The count before or after the attach was not read, so nothing
+    /// says why the attach ended.
+    Unread,
+}
+
+/// Whether a box that the attach knew as `before` was restarted while the
+/// attach ran: its count of ends rose from `before` to `after`. A count
+/// that was not read, before or after, gives [`BoxRestart::Unread`]
+/// (BCLI-068).
+pub(crate) fn ends_show_restart(before: EndsBefore, after: Option<u64>) -> BoxRestart {
+    match (before, after) {
+        (EndsBefore::Running(Some(before)), Some(after)) if after > before => BoxRestart::Restarted,
+        (EndsBefore::Running(Some(_)), Some(_)) | (EndsBefore::Ended(_), _) => {
+            BoxRestart::NotRestarted
+        }
+        (EndsBefore::Running(_), _) | (EndsBefore::Unread, _) => BoxRestart::Unread,
+    }
+}
+
+/// Whether a box that the attach knew as `before`, and that reads
+/// `stopped` now, was stopped by a restart that has not started it yet: its
+/// count of ends rose to `after`, and its last end names the restart. Any
+/// other read is a stop, since the record says the box was stopped
+/// (BCLI-068).
+pub(crate) fn stop_shows_restart(before: EndsBefore, after: Option<EndsAfter>) -> BoxRestart {
+    match (before, after) {
+        (EndsBefore::Running(Some(before)), Some(after))
+            if after.count > before && after.last_by_restart =>
+        {
+            BoxRestart::Restarted
+        }
+        _ => BoxRestart::NotRestarted,
+    }
+}
+
+/// Whether the attach that ended with ssh's `code` was ended by a restart
+/// of its box. Only a 254 can be a restart. Against a box that the settled
+/// read `after` lists as running, the count of ends decides, from `before`
+/// the attach to `ends_after` it, as [`ends_show_restart`] says. Against a
+/// box that it lists as stopped, the last end decides, as
+/// [`stop_shows_restart`] says (BCLI-068).
+pub(crate) fn attach_restart(
+    code: i32,
+    after: &BoxAfterAttach,
+    before: EndsBefore,
+    ends_after: Option<EndsAfter>,
+) -> BoxRestart {
+    if code != DAEMON_ENDED_ATTACH {
+        return BoxRestart::NotRestarted;
+    }
+    match after {
+        BoxAfterAttach::Listed(entry) if entry.state == "running" => {
+            ends_show_restart(before, ends_after.map(|ends| ends.count))
+        }
+        BoxAfterAttach::Listed(entry) if entry.state == "stopped" => {
+            stop_shows_restart(before, ends_after)
+        }
+        _ => BoxRestart::NotRestarted,
+    }
+}
+
+/// How an attach that ended with ssh's `code` ends the command, as
+/// [`attach_ending`] says, except for a 254 against a box that runs again
+/// or reads `stopped`. A box that was `restarted` ends with 254 and a line
+/// that names the restart, not another terminal or a stop. A running box
+/// whose count of ends was not read ends with 254 and the line for a host
+/// that ended the attach, since nothing says why (BCLI-068).
+pub(crate) fn box_attach_ending(
+    target: &BoxAttachTarget,
+    code: i32,
+    after: &BoxAfterAttach,
+    restarted: BoxRestart,
+) -> Result<AttachEnding, BoxAttachRefusal> {
+    let running = matches!(after, BoxAfterAttach::Listed(entry) if entry.state == "running");
+    let stopped = matches!(after, BoxAfterAttach::Listed(entry) if entry.state == "stopped");
+    if code != DAEMON_ENDED_ATTACH || !(running || stopped) {
+        return attach_ending(target, code, after);
+    }
+    match restarted {
+        BoxRestart::Restarted => {
+            let label = &target.label;
+            Ok(AttachEnding {
+                code: DAEMON_ENDED_ATTACH,
+                notice: Some(format!(
+                    "Detached: {label} was restarted. Run min box attach {label} to attach again."
+                )),
+            })
+        }
+        BoxRestart::NotRestarted => attach_ending(target, code, after),
+        // The stopped record still proves a stop.
+        BoxRestart::Unread if stopped => attach_ending(target, code, after),
+        BoxRestart::Unread => attach_ending(target, code, &BoxAfterAttach::Unread),
+    }
+}
+
+/// Whether a box that the attach knew as `before` ended again, when the
+/// host now gives `after` ends. A box that ran counts as ended again. A
+/// count that is not read, before or after, counts as no new end. Then the
+/// attach copies nothing, and a later `min box wait` can copy that end
+/// (BOX-204).
+pub(crate) fn ends_show_new_end(before: EndsBefore, after: Option<u64>) -> bool {
+    match before {
+        EndsBefore::Running(_) => true,
+        EndsBefore::Ended(before) => after.is_some_and(|after| after > before),
+        EndsBefore::Unread => false,
+    }
+}
+
+/// Whether the box `target`, which the attach knew as `before`, ended
+/// again since. See [`ends_show_new_end`].
+async fn ended_again(target: &BoxAttachTarget, before: EndsBefore) -> bool {
+    if let EndsBefore::Running(_) = before {
+        return true;
+    }
+    let mut after = None;
+    if let EndsBefore::Ended(_) = before
+        && let Ok(mut client) = box_host_client(&target.host).await
+    {
+        after = box_ends(&mut client, target.box_id)
+            .await
+            .map(|ends| ends.count);
+    }
+    let again = ends_show_new_end(before, after);
+    if !again {
+        tracing::info!(
+            box_id = %target.box_id,
+            ends_before = ?before,
+            ends_after = ?after,
+            "file exports: the attach did not see a new end of the box, so it copies nothing"
+        );
+    }
+    again
 }
 
 /// The box an attach of `verb` goes to, among the boxes the verb sees. A

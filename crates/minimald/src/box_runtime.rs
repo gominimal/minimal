@@ -113,6 +113,11 @@ pub(crate) struct Host<P: BoxProcess, G: BoxGuard> {
     /// of [`Host::mainloop`] reads it to tell a requested end from a pty
     /// failure. A pty error stashed before the kill does not hide the kill.
     kill_requested: bool,
+    /// Set when a stop or a removal of the box tells this host it is under
+    /// way ([`Message::BoxEnding`]), before it signals the box's processes.
+    /// The teardown to the attached binding then carries this cause, not a
+    /// process exit, so the binding raises no shell-exit prompt (BCLI-068).
+    box_end: Option<BoxEnd>,
     /// The master-side fd of the Pty. On a host whose entrypoint runs on
     /// pipes, the read end of its stdout pipe (see [`Self::pipes`]).
     master: AsyncFd<std::fs::File>,
@@ -332,6 +337,109 @@ pub(crate) fn injection_leaf(
         }
         _ => (own, false),
     }
+}
+
+/// Builds the command that runs `injection` in the box `box_id`, placed in
+/// the box's classifier leaf `leaf`. Every process the daemon injects into a
+/// box takes this path, an exec and a lifecycle hook alike, so none of them
+/// runs in the daemon's own leaf (NET-079). `host_ip_enforced` says whether
+/// the box runs with host-address enforcement, which is what makes it a
+/// member of the `host_ip` cohort `cohort`: the daemon's one
+/// ([`crate::net::classifier::cohort_quic443`]) outside tests.
+///
+/// # Errors
+///
+/// The injection's own errors; see [`crate::nsenter::Injection::command`].
+pub(crate) fn placed_injection_command(
+    injection: crate::nsenter::Injection,
+    box_id: &str,
+    leaf: Option<&sandbox::config::ClassifierLeaf>,
+    host_ip_enforced: bool,
+    cohort: &'static std::sync::Mutex<crate::net::classifier::CohortQuic443>,
+) -> Result<std::process::Command, crate::nsenter::NsenterError> {
+    // NET-079: the box's leaf, so the injected process joins it in the
+    // shim before it joins the namespaces — the only place the join can
+    // happen from (see [`Injection::with_classifier_leaf`]). BEP-018:
+    // while the `host_ip` cohort blocks UDP 443, the cohort's blocked
+    // leaf instead, so an exec or a hook cannot escape the block.
+    let box_id = box_id.to_string();
+    let (joined_leaf, adopt) = injection_leaf(&box_id, leaf.cloned(), cohort);
+    let injection = match joined_leaf {
+        Some(leaf) => injection.with_classifier_leaf(leaf),
+        None => injection,
+    };
+    let mut command = injection.command()?;
+    // BEP-018: once the shim is in its leaf, the cohort is checked again
+    // under its lock. A shim in the blocked leaf is recorded under this
+    // box, so it and the program it forks go home when the block lifts.
+    // A shim in the box's own leaf moves into the blocked leaf when a
+    // blocking member's admit ran between `injection_leaf` and the join.
+    // A box without host-address enforcement never joins the cohort
+    // (`join_quic443_cohort`), so the check can change nothing for it
+    // and its injection does not wait for the join.
+    let own = leaf
+        .filter(|_| host_ip_enforced)
+        .map(|leaf| leaf.dir().to_path_buf());
+    let session_id = box_id.clone();
+    if let Some(own) = own
+        && let Err(error) = report_spawned_pid(&mut command, move |pid| {
+            // Pinned first: the shim can exit and its pid be reused
+            // while the check waits.
+            // Only `ESRCH` says the shim is gone. After any other pin
+            // error the shim can still run, so `/proc` says whether it
+            // does, and a refusal stops it by its pid. The shim is the
+            // daemon's unreaped child, so its pid is not free for reuse.
+            let pin = pin_pid(pid);
+            let gone = pin
+                .as_ref()
+                .is_err_and(|error| error.raw_os_error() == Some(libc::ESRCH));
+            let shim = pin.ok();
+            let moves = crate::net::classifier::KernelMoves;
+            let blocked = cohort
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .blocked_leaf()
+                .map(std::path::Path::to_path_buf);
+            let mut leaves = vec![own.as_path()];
+            leaves.extend(blocked.as_deref());
+            let alive = || match &shim {
+                Some(shim) => !pinned_exited(shim),
+                None => !gone && proc_alive(pid),
+            };
+            let joined = wait_for_injection_join(pid, &leaves, &moves, alive, INJECTION_JOIN_WAIT);
+            // A shim that is gone cannot join `own` later, so what it
+            // forked before it went is still moved.
+            let joined = joined || !alive();
+            if let Err(refused) =
+                settle_injection(&box_id, pid, adopt, joined, &own, cohort, &moves)
+            {
+                match &shim {
+                    Some(shim) => kill_pinned(shim),
+                    None if !gone => kill_unpinned(pid),
+                    None => {}
+                }
+                let stopped = stop_stranded(&refused.stranded, &own, &moves);
+                tracing::warn!(
+                    box_id,
+                    shim_pid = pid,
+                    pid = refused.pid,
+                    error = %refused.error,
+                    ?stopped,
+                    "cannot move a process injected into a host-address box into the \
+                     UDP 443 blocked leaf; the injection is stopped"
+                );
+            }
+        })
+    {
+        tracing::warn!(
+            %session_id,
+            %error,
+            "cannot check a process injected under the host-address cohort's UDP 443 \
+             block after it joins its leaf; it can escape the block or stay blocked \
+             when the block lifts"
+        );
+    }
+    Ok(command)
 }
 
 /// How long the daemon waits for an injected shim to join its classifier
@@ -675,6 +783,8 @@ pub(crate) fn launch_span(
         session = %session_name,
         entrypoint = entrypoint.log_name(),
         args = entrypoint.arg_count(),
+        otel.status_code = tracing::field::Empty,
+        otel.status_description = tracing::field::Empty,
     );
     tracing::info!(
         parent: &span,
@@ -683,6 +793,25 @@ pub(crate) fn launch_span(
         "launching the box's entrypoint from its spec"
     );
     span
+}
+
+/// Runs a launch inside its `box.launch` span (from [`launch_span`]) and
+/// closes the span when the launch completes. A launch that failed marks the
+/// span and says why in its status (gominimal/minimal#3223) before the error
+/// goes up. The span is taken by value, so no handle outlives the launch: the
+/// span's duration is the launch's, not the binding setup and attach hooks
+/// that follow it.
+pub(crate) async fn launch_in_span<T, E: std::fmt::Display>(
+    span: tracing::Span,
+    launch: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    let launched = tracing::Instrument::instrument(launch, span.clone()).await;
+    if let Err(e) = &launched {
+        span.record("otel.status_code", "ERROR");
+        span.record("otel.status_description", format!("{e:#}").as_str());
+    }
+    drop(span);
+    launched
 }
 
 /// Places the grants' sealed values in a launch's connection layer
@@ -1011,21 +1140,22 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         let injection = crate::nsenter::Injection::new(self.session_leader_pid()?, program, args)
             .with_cwd(environment.cwd)
             .with_env(vars);
-        // NET-079: the box's leaf, so the injected process joins it in the
-        // shim before it joins the namespaces — the only place the join can
-        // happen from (see [`Injection::with_classifier_leaf`]). BEP-018:
-        // while the `host_ip` cohort blocks UDP 443, the cohort's blocked
-        // leaf instead, so an exec or a hook cannot escape the block.
-        let box_id = self.session_id.to_string();
-        let (leaf, adopt) = injection_leaf(
-            &box_id,
-            self.leaf.clone(),
-            crate::net::classifier::cohort_quic443(),
-        );
-        let injection = match leaf {
-            Some(leaf) => injection.with_classifier_leaf(leaf),
-            None => injection,
-        };
+        self.injected_command(injection)
+    }
+
+    /// The command that runs `injection` in this box: sealed as the box's
+    /// launch is, and placed in the box's classifier leaf (NET-079), with
+    /// the `host_ip` cohort's UDP 443 check (BEP-018). Built apart from
+    /// [`Self::command_in_session`] so a test can build it: under test that
+    /// method builds a host-side command instead.
+    ///
+    /// # Errors
+    ///
+    /// The injection's own errors; see [`crate::nsenter::Injection::command`].
+    fn injected_command(
+        &self,
+        injection: crate::nsenter::Injection,
+    ) -> Result<std::process::Command, crate::nsenter::NsenterError> {
         // Every injection is sealed: a none box's full seal is named
         // explicitly, and any other box's confined-families seal is the
         // shim's default — either way the shim reinstalls the filter the
@@ -1035,81 +1165,13 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         } else {
             injection
         };
-        let mut command = injection.command()?;
-        // BEP-018: once the shim is in its leaf, the cohort is checked again
-        // under its lock. A shim in the blocked leaf is recorded under this
-        // box, so it and the program it forks go home when the block lifts.
-        // A shim in the box's own leaf moves into the blocked leaf when a
-        // blocking member's admit ran between `injection_leaf` and the join.
-        // A box without host-address enforcement never joins the cohort
-        // (`join_quic443_cohort`), so the check can change nothing for it
-        // and its injection does not wait for the join.
-        let own = self
-            .leaf
-            .as_ref()
-            .filter(|_| self.attrs.host_ip_enforcement.is_some())
-            .map(|leaf| leaf.dir().to_path_buf());
-        if let Some(own) = own
-            && let Err(error) = report_spawned_pid(&mut command, move |pid| {
-                // Pinned first: the shim can exit and its pid be reused
-                // while the check waits.
-                // Only `ESRCH` says the shim is gone. After any other pin
-                // error the shim can still run, so `/proc` says whether it
-                // does, and a refusal stops it by its pid. The shim is the
-                // daemon's unreaped child, so its pid is not free for reuse.
-                let pin = pin_pid(pid);
-                let gone = pin
-                    .as_ref()
-                    .is_err_and(|error| error.raw_os_error() == Some(libc::ESRCH));
-                let shim = pin.ok();
-                let moves = crate::net::classifier::KernelMoves;
-                let cohort = crate::net::classifier::cohort_quic443();
-                let blocked = cohort
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .blocked_leaf()
-                    .map(std::path::Path::to_path_buf);
-                let mut leaves = vec![own.as_path()];
-                leaves.extend(blocked.as_deref());
-                let alive = || match &shim {
-                    Some(shim) => !pinned_exited(shim),
-                    None => !gone && proc_alive(pid),
-                };
-                let joined =
-                    wait_for_injection_join(pid, &leaves, &moves, alive, INJECTION_JOIN_WAIT);
-                // A shim that is gone cannot join `own` later, so what it
-                // forked before it went is still moved.
-                let joined = joined || !alive();
-                if let Err(refused) =
-                    settle_injection(&box_id, pid, adopt, joined, &own, cohort, &moves)
-                {
-                    match &shim {
-                        Some(shim) => kill_pinned(shim),
-                        None if !gone => kill_unpinned(pid),
-                        None => {}
-                    }
-                    let stopped = stop_stranded(&refused.stranded, &own, &moves);
-                    tracing::warn!(
-                        box_id,
-                        shim_pid = pid,
-                        pid = refused.pid,
-                        error = %refused.error,
-                        ?stopped,
-                        "cannot move a process injected into a host-address box into the \
-                         UDP 443 blocked leaf; the injection is stopped"
-                    );
-                }
-            })
-        {
-            tracing::warn!(
-                session_id = %self.session_id,
-                %error,
-                "cannot check a process injected under the host-address cohort's UDP 443 \
-                 block after it joins its leaf; it can escape the block or stay blocked \
-                 when the block lifts"
-            );
-        }
-        Ok(command)
+        placed_injection_command(
+            injection,
+            &self.session_id.to_string(),
+            self.leaf.as_ref(),
+            self.attrs.host_ip_enforcement.is_some(),
+            crate::net::classifier::cohort_quic443(),
+        )
     }
 
     /// Under test, build a plain host-side command instead of injecting into
@@ -1167,20 +1229,9 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                 return None;
             }
         };
-        let environment = self.guard.command_environment();
         Some(HookPlan {
             event,
-            commands: crate::hooks::InjectedCommands {
-                leader_pid,
-                cwd: environment.cwd,
-                vars: environment.vars,
-                // A hook joins the namespaces rather than being forked from the
-                // filtered shell, so the box's seal has to be handed to it the
-                // same way the interactive attach path hands it to an injected
-                // command: the none box's full seal by flag, the shim's
-                // confined-families default for the rest.
-                seal_none_box: self.seal_injection,
-            },
+            commands: self.hook_commands(leader_pid),
             composition,
             session_id: self.session_id,
             session_name: self.session_name.clone(),
@@ -1188,6 +1239,28 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             workspace: self.workspace_dir.clone(),
             output: crate::hooks::HookOutput::Tty(self.tty_path.clone()),
         })
+    }
+
+    /// How a hook of this box is injected into it, by joining the
+    /// namespaces of `leader_pid`, the box's session leader.
+    fn hook_commands(&self, leader_pid: u32) -> crate::hooks::InjectedCommands {
+        let environment = self.guard.command_environment();
+        crate::hooks::InjectedCommands {
+            leader_pid,
+            cwd: environment.cwd,
+            vars: environment.vars,
+            // A hook joins the namespaces rather than being forked from the
+            // filtered shell, so the box's seal has to be handed to it the
+            // same way the interactive attach path hands it to an injected
+            // command: the none box's full seal by flag, the shim's
+            // confined-families default for the rest.
+            seal_none_box: self.seal_injection,
+            // NET-079: a hook runs in the box's leaf, as an exec does.
+            box_id: self.session_id.to_string(),
+            leaf: self.leaf.clone(),
+            host_ip_enforced: self.attrs.host_ip_enforcement.is_some(),
+            cohort: crate::net::classifier::cohort_quic443(),
+        }
     }
 
     /// Snapshot a plan and run it, if there is anything to run.
@@ -1287,7 +1360,20 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         // One span per launch, naming the entrypoint the launcher read from
         // the box's spec, so the daemon log says what each launch started.
         let entrypoint = launcher.entrypoint()?;
-        let launch_span = launch_span(session_id, &session_name, &entrypoint);
+        // The span closes when the launch completes, marked and explained
+        // if it failed.
+        let launched = launch_in_span(
+            launch_span(session_id, &session_name, &entrypoint),
+            launcher.launch(
+                crate::guest::is_microvm_daemon(),
+                session_id,
+                name,
+                username,
+                paths,
+                sz,
+            ),
+        )
+        .await;
         let Launched {
             master,
             process,
@@ -1300,18 +1386,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             listen_plan,
             start_gate,
             pipes,
-        } = tracing::Instrument::instrument(
-            launcher.launch(
-                crate::guest::is_microvm_daemon(),
-                session_id,
-                name,
-                username,
-                paths,
-                sz,
-            ),
-            launch_span,
-        )
-        .await?;
+        } = launched?;
 
         // The listen-publication watcher (NET-016, NET-017): the plan this
         // launch gathered is the box's whole publication surface — its
@@ -1377,6 +1452,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             process,
             pending_pty_err: None,
             kill_requested: false,
+            box_end: None,
             master,
             pipes,
             output_log,
@@ -1661,6 +1737,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                     killed = true;
                 }
                 Message::TakeEntrypointIo(reply) => self.answer_take_entrypoint_io(reply),
+                Message::BoxEnding(end, reply) => self.record_box_end(end, reply),
                 _ => {}
             }
         }
@@ -1760,16 +1837,24 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
     /// drops, and an mpsc receiver drains its buffer before observing the closed
     /// sender, so the binding sees the teardown before falling through to
     /// `HostGone`.
+    ///
+    /// A stop or a removal recorded in [`Self::box_end`] replaces the
+    /// process exit as the cause: the process ended because the daemon
+    /// signalled it, and the binding raises no shell-exit prompt (BCLI-068).
     fn notify_remote_teardown(&mut self, cause: TeardownCause) {
         // Read off the screen before the binding slot is borrowed: the binding
         // has no view of this host's parser, so the codes that undo whatever
         // input modes the process left behind have to travel with the message.
         let unwind_codes = self.unwind_codes();
-        match self.remote.as_mut() {
-            Some((tx, ..)) => match tx.try_send(BindingMsg::TeardownDueToProcessExit {
+        let msg = match self.box_end {
+            Some(end) => BindingMsg::TeardownDueToBoxEnd(end, unwind_codes),
+            None => BindingMsg::TeardownDueToProcessExit {
                 cause,
                 unwind_codes,
-            }) {
+            },
+        };
+        match self.remote.as_mut() {
+            Some((tx, ..)) => match tx.try_send(msg) {
                 Ok(()) => tracing::debug!(
                     session_id = %self.session_id,
                     "handed the teardown cause to the attached binding",
@@ -1789,6 +1874,24 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                 "session process exited with no binding attached",
             ),
         }
+    }
+
+    /// Records that a stop or a removal of the box is under way, and answers
+    /// the caller once it is recorded (BCLI-068). See [`Self::box_end`].
+    fn record_box_end(&mut self, end: BoxEnd, reply: oneshot::Sender<()>) {
+        tracing::info!(
+            session_id = %self.session_id,
+            session = %self.session_name,
+            ?end,
+            attached = self.remote.is_some(),
+            "the box is being stopped or removed; an attached client is told so at teardown",
+        );
+        self.box_end = Some(end);
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "a caller that went away needs no answer"
+        )]
+        let _ = reply.send(());
     }
 
     /// Snapshots the visible terminal screen into the structured
@@ -1848,16 +1951,21 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                             "session host killed on request",
                         );
                         self.kill_requested = true;
-                        if for_shutdown
+                        // A daemon shutdown says so. A stop or a removal that
+                        // ends in this kill says that instead (BCLI-068), so
+                        // the binding does not report a vanished session.
+                        if (for_shutdown || self.box_end.is_some())
                             && let Some(binding) = self.remote.take() {
                                 // If there was a binding we just swapped out, tell it to
                                 // shut down and wait for it to finish.
                                 let unwind_codes = self.unwind_codes();
-                                retire_binding(
-                                    binding,
-                                    BindingMsg::TeardownDueToDaemonShutdown(unwind_codes),
-                                )
-                                .await;
+                                let msg = match self.box_end {
+                                    Some(end) if !for_shutdown => {
+                                        BindingMsg::TeardownDueToBoxEnd(end, unwind_codes)
+                                    }
+                                    _ => BindingMsg::TeardownDueToDaemonShutdown(unwind_codes),
+                                };
+                                retire_binding(binding, msg).await;
                             }
 
                         if let Err(e) = self.process.kill() {
@@ -1871,6 +1979,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                         // `mainloop` reap via `wait()` and return.
                         return Err(());
                     }
+                    Message::BoxEnding(end, reply) => self.record_box_end(end, reply),
                     Message::Attach(channel, sz, connection, keys) => {
                         self.attach(channel, sz, false, connection, keys).await;
                     }

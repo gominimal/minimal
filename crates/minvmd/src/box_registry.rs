@@ -216,13 +216,29 @@ const HOST_IP_RULES_FILE_VERSION: u32 = 1;
 pub const HELD_NAME_RECONFIRM_BOUND: Duration = RESUME_ATTACH_BOUND;
 
 /// How long a `host_ip` registration name stands while no box is admitted
-/// under its id ([`BoxRegistry::register_host_ip_box`]). A `host_ip`
-/// registration holds no connection, so a creator that dies between its
-/// register and its box's admission leaves the name with nothing to
-/// withdraw it. Past this bound a new registration under the name takes it.
+/// under its id ([`BoxRegistry::register_host_ip_box`]). A held
+/// registration ends at its lease's close: a creator that dies between its
+/// register and its commit frees the name at once
+/// ([`BoxRegistry::withdraw_unadmitted_host_ip_name`]). The bound is for a
+/// name nothing else withdraws: a one-shot registration from a client that
+/// holds no lease, or a committed one whose box was never admitted. Past
+/// this bound a new registration under the name takes it.
 /// The bound is [`RESUME_ATTACH_BOUND`]'s: the in-VM create and the
 /// admission that follows it come inside one slow boot.
 pub const HOST_IP_UNADMITTED_NAME_BOUND: Duration = RESUME_ATTACH_BOUND;
+
+/// What the close of an uncommitted `host_ip` registration lease did with
+/// its name ([`BoxRegistry::withdraw_unadmitted_host_ip_name`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseNameWithdrawal {
+    /// The name was withdrawn: a new registration under it succeeds.
+    Withdrawn,
+    /// A box is admitted under the id, so the name stays with that box.
+    Admitted,
+    /// The name no longer answers the id: the box retired, the creator
+    /// withdrew it, or a later registration took it.
+    NotNamed,
+}
 
 /// One relay's end, as the host reports it: the switch addresses whose
 /// relayed traffic that connection carried, each with the id of the box
@@ -3204,6 +3220,12 @@ pub struct BoxRegistry {
     /// driven without waiting it out.
     #[cfg(test)]
     clock_skew: Arc<Mutex<Duration>>,
+    /// The instant the tests stopped this registry's clock at
+    /// ([`Self::freeze_clock`]), shared by every clone: [`Self::now`] reads
+    /// it in place of the real clock, so only [`Self::advance_clock`] moves
+    /// it.
+    #[cfg(test)]
+    clock_frozen_at: Arc<Mutex<Option<Instant>>>,
     /// The next published loopback address the tests' single-node
     /// allocation hands out, shared the same way. The daemon's addresses
     /// are the answerer's ([`Self::register_client_box_at`]).
@@ -3707,6 +3729,8 @@ impl Clone for BoxRegistry {
             #[cfg(test)]
             clock_skew: Arc::clone(&self.clock_skew),
             #[cfg(test)]
+            clock_frozen_at: Arc::clone(&self.clock_frozen_at),
+            #[cfg(test)]
             next_loopback_addr: Arc::clone(&self.next_loopback_addr),
             loopback_slice: self.loopback_slice,
             attachments: self.attachments.clone(),
@@ -3751,6 +3775,8 @@ impl BoxRegistry {
             switch_book: Arc::new(Mutex::new(SwitchAddressBook::new(subnet))),
             #[cfg(test)]
             clock_skew: Arc::new(Mutex::new(Duration::ZERO)),
+            #[cfg(test)]
+            clock_frozen_at: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             next_loopback_addr: Arc::new(AtomicU32::new(
                 loopback_slice.map_or(0, |slice| box_loopback_run(slice).0),
@@ -4355,7 +4381,8 @@ impl BoxRegistry {
     }
 
     /// The instant the hand-out book draws and returns at: the real clock,
-    /// moved by [`Self::advance_clock`] in tests.
+    /// moved by [`Self::advance_clock`] and stopped by
+    /// [`Self::freeze_clock`] in tests.
     fn now(&self) -> Instant {
         #[cfg(test)]
         {
@@ -4363,7 +4390,12 @@ impl BoxRegistry {
                 .clock_skew
                 .lock()
                 .expect("the test clock's lock is held only across a read or an add");
-            Instant::now()
+            let frozen_at = *self
+                .clock_frozen_at
+                .lock()
+                .expect("the test clock's lock is held only across a read or a set");
+            frozen_at
+                .unwrap_or_else(Instant::now)
                 .checked_add(skew)
                 .expect("a test moves the clock by minutes, never past the clock's range")
         }
@@ -4382,6 +4414,19 @@ impl BoxRegistry {
             .lock()
             .expect("the test clock's lock is held only across a read or an add");
         *skew = skew.saturating_add(by);
+    }
+
+    /// Stops this registry's clock, and every clone's, at the real clock's
+    /// instant now: from then on only [`Self::advance_clock`] moves it, so a
+    /// test drives a grace's boundary without the real clock running past
+    /// it.
+    #[cfg(test)]
+    pub(crate) fn freeze_clock(&self) {
+        let mut frozen_at = self
+            .clock_frozen_at
+            .lock()
+            .expect("the test clock's lock is held only across a read or a set");
+        frozen_at.get_or_insert_with(Instant::now);
     }
 
     fn switch_book(&self) -> MutexGuard<'_, SwitchAddressBook> {
@@ -5135,6 +5180,34 @@ impl BoxRegistry {
         }
         ids.by_name.remove(name);
         true
+    }
+
+    /// Withdraws the `host_ip` registration name `name` while it still
+    /// answers `id` and no box is admitted under `id`: the registration's
+    /// lease closed before its commit, so the creator's activation ended.
+    /// The name of an admitted box stays, because that box is live and its
+    /// retire withdraws the name ([`Self::retire_host_ip_box`]). The id
+    /// stays for the collision check (BEP-082).
+    pub fn withdraw_unadmitted_host_ip_name(&self, name: &str, id: BoxId) -> LeaseNameWithdrawal {
+        // The resident set's read lock is taken before the ids' lock, as
+        // the registration takes them, so an admission cannot land between
+        // the check and the remove.
+        let resident = self
+            .host_ip_boxes
+            .read()
+            .expect("the resident host_ip boxes' lock is never held across a panic");
+        let mut ids = self.host_ip_id_set();
+        if ids.by_name.get(name).map(|named| named.id) != Some(id) {
+            return LeaseNameWithdrawal::NotNamed;
+        }
+        if resident
+            .boxes
+            .contains_key(&boxes::SessionId::from_bytes(id))
+        {
+            return LeaseNameWithdrawal::Admitted;
+        }
+        ids.by_name.remove(name);
+        LeaseNameWithdrawal::Withdrawn
     }
 
     /// [`Self::register_client_box_at`] with the freshly minted `id` it
@@ -11191,6 +11264,62 @@ mod tests {
         wait_until(
             || registry.row_by_name("web").is_none(),
             "the row is withdrawn at its grace's end, not held to the resume bound",
+        );
+    }
+
+    /// NET-138: the resume an attach makes after the in-VM daemon found the
+    /// row withdrawn. The resume before the attach found the detached row
+    /// standing, near its grace's end, and the grace ended before the
+    /// in-VM daemon read the row. The second resume reinstates the same
+    /// creation: the same box id and addresses. The registry keeps that one
+    /// creation, none superseded, so no older creation keeps addresses
+    /// reserved.
+    #[test]
+    fn a_resume_after_the_row_ended_brings_back_the_same_creation() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.spawn_withdrawal_drainer(|_| {});
+        let web = registry
+            .register_client_box_with_task_slots(client_spec("web"), 1)
+            .expect("the plan has addresses for the box and its task");
+        let resume = || {
+            let claim = registry.begin_registration("web");
+            registry.resume_client_box(
+                "web",
+                web.switch_addr(),
+                web.loopback_addr(),
+                Some(web.box_id()),
+                web.loopback_addr(),
+                claim.generation(),
+            )
+        };
+        // The clock moves only when the test moves it, so the two resumes
+        // fall on either side of the grace's end however the test is run.
+        registry.freeze_clock();
+        relay_carried_and_ended(&registry, &[&web]);
+        wait_until(|| web.is_detached(), "the row detaches at its relay's end");
+        registry.advance_clock(DETACH_GRACE.saturating_sub(Duration::from_secs(1)));
+        let standing = resume().expect("the resume before the attach");
+        assert!(Arc::ptr_eq(&standing, &web), "answered as it stands");
+        registry.advance_clock(Duration::from_secs(1));
+        wait_until(
+            || registry.row_by_name("web").is_none(),
+            "the grace ends before the in-VM daemon reads the row",
+        );
+
+        let back = resume().expect("the resume after the attach found the row withdrawn");
+        assert_eq!(back.box_id(), web.box_id(), "the same box id");
+        assert_eq!(back.switch_addr(), web.switch_addr());
+        assert_eq!(back.loopback_addr(), web.loopback_addr());
+        assert_eq!(back.task_addrs(), web.task_addrs());
+        let creations = registry.creations();
+        assert_eq!(
+            creations.all().map(Creation::id).collect::<Vec<_>>(),
+            [web.box_id()],
+            "one creation, the box's own"
+        );
+        assert!(
+            creations.superseded.is_empty(),
+            "no older creation keeps addresses reserved"
         );
     }
 

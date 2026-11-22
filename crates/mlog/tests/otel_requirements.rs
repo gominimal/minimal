@@ -978,15 +978,6 @@ const KNOWN_GAPS: &[KnownGap] = &[
         issue: "minimal#2033",
     },
     KnownGap {
-        id: "TEL-034",
-        covered_by: "the VM tests \
-                     `the_guest_daemons_records_reach_the_host_spool_and_endpoint_over_vsock` and \
-                     `a_boot_and_stop_share_one_trace_with_the_guest_daemon`, gated \
-                     `MINVMD_E2E=1`, so they run on the VM lane only; lab scenarios 715b, \
-                     715f and 715i to 715l",
-        issue: "minimal#2034",
-    },
-    KnownGap {
         id: "TEL-044",
         covered_by: "each collector's scrub by unit tests \
                      (`a_host_bundle_never_carries_a_header_value_or_a_secret_attribute`, \
@@ -1002,23 +993,11 @@ const KNOWN_GAPS: &[KnownGap] = &[
                      `min box spec` is spec 24's future work",
         issue: "minimal#2036",
     },
-    KnownGap {
-        id: "TEL-032 on macOS",
-        covered_by: "unit coverage only (`a_task_that_outlives_ready_does_not_hold_the_start_phase_open`); \
-                     the ready()-phase flush was found missing on macOS 2026-10-05 and no macOS \
-                     lane runs the supervisor",
-        issue: "minimal#2037",
-    },
 ];
 
 #[test]
 fn known_gap_tel_009_a_daemon_keeps_its_own_switches() {
     known_gap("TEL-009");
-}
-
-#[test]
-fn known_gap_tel_034_the_guest_path_runs_on_the_vm_lane_only() {
-    known_gap("TEL-034");
 }
 
 #[test]
@@ -1029,11 +1008,6 @@ fn known_gap_tel_044_the_bug_bundle_carries_the_spools() {
 #[test]
 fn known_gap_tel_047_the_box_spec_shows_traceparent() {
     known_gap("TEL-047");
-}
-
-#[test]
-fn known_gap_tel_032_on_macos_the_ready_phase_flushes() {
-    known_gap("TEL-032 on macOS");
 }
 
 /// Every known gap names a spec id, what covers it today and an issue to

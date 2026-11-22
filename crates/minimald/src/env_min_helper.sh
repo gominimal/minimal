@@ -168,6 +168,9 @@ __min_rpc() {
         exec {sock_out}< <(printf '%s\n' "$request" | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock)
     fi
 
+    # Local, so a `set_env:line:...` writes the shell's `line` and the next
+    # read does not overwrite it.
+    local line
     while IFS= read -r line; do
         local tag="${line%%:*}"
         local rest="${line#*:}"
@@ -211,15 +214,31 @@ __min_rpc() {
             set_env)
                 local varname="${rest%%:*}"
                 local varval="${rest#*:}"
-                declare -gx "$varname=$varval"
-                env_pairs+=("${varname}=${varval}")
+                # The name comes from package metadata, and bash would
+                # evaluate a crafted one (array subscripts in `declare`
+                # run commands). Only export names that are bare
+                # identifiers. `declare -g` writes the global even where
+                # a local of the same name, here or in a caller, would
+                # take a plain assignment. Its value stays literal unless
+                # the global is an array and the value opens with `(`,
+                # which is read as an array list, so that is refused.
+                if [[ ! "$varname" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+                    printf 'min: refusing to export environment variable with an invalid name: %s\n' "$varname" >&2
+                elif [[ "$varval" == \(* ]]; then
+                    printf 'min: refusing to export %s: a value starting with ( would be read as an array\n' "$varname" >&2
+                else
+                    declare -gx -- "${varname}=${varval}"
+                    env_pairs+=("${varname}=${varval}")
+                fi
                 ;;
             stdin)
                 # The task starts: copy this command's stdin to it. The
                 # copy's end closes the connection's sending side, so the
-                # task reads EOF.
+                # task reads EOF. The copy keeps only its stdout as the
+                # sending side, and none of this shell's other copies, so
+                # its exit is the last close socat waits for.
                 if [[ "$forward" -eq 1 && -z "$feeder" ]]; then
-                    cat <&"$stdin_fd" >&"$sock_in" &
+                    cat <&"$stdin_fd" >&"$sock_in" {sock_in}>&- {sock_out}<&- {stdin_fd}<&- &
                     feeder=$!
                     exec {sock_in}>&-
                     sock_in=""
