@@ -110,8 +110,11 @@ where
 
     // Same daemon path as the normal CLI — autospawn if it isn't running,
     // then connect. git invokes the helper without any of our flags, so the
-    // no-flags `GlobalArgs` are the right ones.
-    let global = crate::GlobalArgs::default();
+    // no-flags `GlobalArgs` are the right ones, with the provider every
+    // flagless `min` command resolves.
+    let mut global = crate::GlobalArgs::default();
+    crate::hosts::resolve_default_provider(&mut global)?;
+    crate::hosts::read_provider_alias(&mut global);
     crate::ensure_daemon(&global)?;
     let mut client = crate::connect_daemon(&global).await?;
     let channel = client

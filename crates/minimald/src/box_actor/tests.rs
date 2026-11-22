@@ -4109,6 +4109,163 @@ async fn activation_refused_when_declared_port_is_held_by_a_host_program() {
     );
 }
 
+/// A stand-in for a native host's gvproxy at `sock` that binds a real host
+/// listener for each expose and drops it at the matching unexpose, so a
+/// program on the host can connect to a declared port while the forward
+/// stands. A bind the OS refuses is answered as the real forwarder answers
+/// it. Every request is recorded as `"<request line>\n<body>"`.
+#[cfg(target_os = "linux")]
+fn binding_forwarder(
+    sock: &std::path::Path,
+) -> (
+    tokio::task::JoinHandle<()>,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use tokio::io::AsyncWriteExt;
+    if let Some(parent) = sock.parent() {
+        std::fs::create_dir_all(parent).expect("create the switch state dir");
+    }
+    let listener = tokio::net::UnixListener::bind(sock).expect("bind the control socket");
+    let served = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = served.clone();
+    let server = crate::traced::spawn(async move {
+        let mut bound: std::collections::HashMap<String, std::net::TcpListener> =
+            std::collections::HashMap::new();
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Some(request) = read_control_request(&mut stream).await else {
+                continue;
+            };
+            let local = request
+                .split("\"local\":\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .unwrap_or_default()
+                .to_string();
+            let answer = if request.contains("/services/forwarder/unexpose") {
+                bound.remove(&local);
+                "200 OK\r\nContent-Length: 0\r\n\r\n".to_string()
+            } else if request.contains("/services/forwarder/expose") {
+                match std::net::TcpListener::bind(local.as_str()) {
+                    Ok(held) => {
+                        bound.insert(local, held);
+                        "200 OK\r\nContent-Length: 0\r\n\r\n".to_string()
+                    }
+                    Err(e) => {
+                        let reason = format!("listen tcp {local}: bind: {e}").to_lowercase();
+                        format!(
+                            "500 Internal Server Error\r\nContent-Length: {}\r\n\r\n{reason}",
+                            reason.len()
+                        )
+                    }
+                }
+            } else {
+                "200 OK\r\nContent-Length: 0\r\n\r\n".to_string()
+            };
+            recorded.lock().expect("served lock").push(request);
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "the answer's fate is not what the stand-in records; the request is"
+            )]
+            let _ = stream
+                .write_all(format!("HTTP/1.1 {answer}").as_bytes())
+                .await;
+        }
+    });
+    (server, served)
+}
+
+/// On a native host the finalize binds the box's declared forwards toward a
+/// lease it draws, before the record goes `Active`. A program on the host
+/// connects to the declared port right after the activation returns, before
+/// any attach. The destroy of a box that no attach reached unbinds the port
+/// and gives the lease back.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_native_activation_binds_declared_forwards_before_the_first_attach() {
+    use minimald_rpc::{DestroySession, DestroySessionRequest, Errorable};
+    let server = TestServer::new().await;
+    let manager = server.state.sessions_manager().await;
+    let mut client = server.connect().await;
+    // A native box: nobody hands it a switch address, so the daemon draws.
+    let id = create_own_ip_session(&mut client, "early").await;
+    let switch = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves")
+        .net_switch()
+        .await
+        .unwrap();
+    let sock = {
+        let mut switch = switch.lock().await;
+        switch.serve_externally();
+        switch.control_socket()
+    };
+    let (forwarder, served) = binding_forwarder(&sock);
+
+    finalize_session(&mut client, id).await;
+    let published = manager
+        .hostnames()
+        .read()
+        .expect("registry lock")
+        .published_own_address(id)
+        .expect("the finalize published the box");
+    std::net::TcpStream::connect((published, declared_port()))
+        .expect("a program on the host connects to the declared port before any attach");
+    {
+        let switch = switch.lock().await;
+        assert!(
+            switch.activation_lease(id).is_some(),
+            "the finalize drew the box's lease"
+        );
+        assert_eq!(switch.attached(), 1, "the drawn lease keeps the switch up");
+    }
+    let requests = served.lock().expect("served lock").clone();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.contains("/services/forwarder/expose"))
+            .count(),
+        1,
+        "one expose for the one declared port: {requests:?}"
+    );
+    assert!(
+        requests.iter().all(|request| !request.contains("/connect")),
+        "no attach reached the switch: {requests:?}"
+    );
+
+    match client
+        .call::<DestroySession>(&DestroySessionRequest {
+            id,
+            only_if_unfinalized: false,
+        })
+        .await
+    {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("the destroy failed: {error}"),
+    }
+    let requests = served.lock().expect("served lock").clone();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.contains("/services/forwarder/unexpose")
+                && request.contains(&format!("{published}:{}", declared_port()))),
+        "the destroy unbinds the forward no attach adopted: {requests:?}"
+    );
+    assert!(
+        std::net::TcpStream::connect((published, declared_port())).is_err(),
+        "the declared port is free after the destroy"
+    );
+    let switch = switch.lock().await;
+    assert_eq!(switch.activation_lease(id), None, "the lease went back");
+    assert_eq!(switch.attached(), 0, "nothing holds the switch any more");
+    drop(switch);
+    forwarder.abort();
+}
+
 /// NET-144: at the shared `127.0.0.1` fallback a declared port that another
 /// box already holds fails the second box's activation, naming the box that
 /// holds it, where before the second box yielded the port. The first box
@@ -4844,20 +5001,12 @@ async fn a_box_holding_a_host_row_refuses_remint_after_its_host_loop_ends() {
         "the refusal must be surfaced as an attach error; got: {refusal:?}"
     );
     assert!(
-        refusal.contains("the VM host daemon released this session's network addresses"),
+        refusal.contains("the VM host released this box's network addresses"),
         "the refusal must name the host-row cause; got: {refusal:?}"
     );
     assert!(
-        refusal.contains("min session activate"),
-        "the refusal must name the step that registers a box again; got: {refusal:?}"
-    );
-    assert!(
-        refusal.contains("min session destroy <session>"),
-        "the refusal must name the session argument the destroy step takes; got: {refusal:?}"
-    );
-    assert!(
-        refusal.contains("run the same command again"),
-        "the refusal must name the re-run that resumes the row; got: {refusal:?}"
+        refusal.contains("Run the same command again to ask for them back"),
+        "the refusal names the re-run that asks for the row back; got: {refusal:?}"
     );
     assert_eq!(
         super::launch_publish_seam::observed(id).len(),
@@ -4873,7 +5022,7 @@ async fn assert_attach_refused_rowless(client: &mut TestClient, id: SessionId) {
     let refusal = collect_to_close(&mut channel).await;
     assert!(
         refusal.contains("Cannot attach to the box:")
-            && refusal.contains("the VM host daemon released this session's network addresses"),
+            && refusal.contains("the VM host released this box's network addresses"),
         "the attach must be refused for the ended host-side row; got: {refusal:?}"
     );
 }

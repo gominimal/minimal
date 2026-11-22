@@ -17,7 +17,7 @@ use super::primitives::{
 };
 use crate::SessionId;
 use crate::core::lifecyclehook::LifecycleHook;
-use crate::core::primitives::{LenientVarEntry, Patches, StrictVarName, VarValue};
+use crate::core::primitives::{Patches, StrictVarName, VarValue};
 use std::collections::BTreeMap;
 
 /// Snapshot format version for [`WireComposition`]. Bumped when the
@@ -39,7 +39,9 @@ const LEGACY_COMPOSITION_SNAPSHOT_VERSION: u32 = 1;
 /// already gated by the user policy.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WireContribution {
-    /// Variables that passed the user policy gate.
+    /// Variables that passed the user policy gate: a loadout's
+    /// `env_vars`, carried on the wire under that name.
+    #[serde(rename = "env_vars")]
     pub vars: Vec<WireSessionVar>,
     /// Patch files that passed the user policy gate.
     pub patches: Vec<WireSessionPatch>,
@@ -60,8 +62,8 @@ pub struct WireContribution {
     /// entry, or for a project with no entry tables: the daemon then
     /// composes from the project's `[session]` table alone.
     ///
-    /// Gap: the entry carries only the five composed lists (`packages`,
-    /// `vars`, `vars_lenient`, `patches`, `lifecycle_hooks`), not the
+    /// Gap: the entry carries only the four composed lists (`packages`,
+    /// `env_vars`, `patches`, `lifecycle_hooks`), not the
     /// whole expanded Box Spec. The daemon still reads the project's
     /// `[stack]` itself. Sending and storing the full expanded spec, as
     /// BOX-068 asks, is tracked in gominimal/minimal#3257.
@@ -72,8 +74,8 @@ pub struct WireContribution {
 /// An expanded `minimal.toml` entry, as the client sends it with its
 /// contribution: the lists of the expanded spec that the daemon composes.
 ///
-/// This is not the expanded Box Spec. It carries only five lists
-/// (`packages`, `vars`, `vars_lenient`, `patches`, `lifecycle_hooks`), and
+/// This is not the expanded Box Spec. It carries only four lists
+/// (`packages`, `env_vars`, `patches`, `lifecycle_hooks`), and
 /// the daemon still reads the project's `[stack]` itself. Sending and
 /// storing the full expanded spec (BOX-068) is tracked in
 /// gominimal/minimal#3257.
@@ -95,12 +97,10 @@ pub struct WireBoxEntry {
     /// `packages`, in expansion order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub packages: Option<Vec<String>>,
-    /// `vars`, by name.
+    /// `env_vars`, by name: the one variable table of the expanded entry
+    /// (BOX-205).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vars: Option<BTreeMap<StrictVarName, VarValue>>,
-    /// `vars_lenient`, in expansion order.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vars_lenient: Option<Vec<LenientVarEntry>>,
+    pub env_vars: Option<BTreeMap<StrictVarName, VarValue>>,
     /// `patches`, in expansion order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub patches: Option<Patches>,
@@ -122,8 +122,7 @@ impl WireBoxEntry {
             box_type: box_type.into(),
             project,
             packages: None,
-            vars: None,
-            vars_lenient: None,
+            env_vars: None,
             patches: None,
             lifecycle_hooks: None,
         }
@@ -440,7 +439,7 @@ mod tests {
     /// and old sidecars (composition snapshot) alike.
     #[test]
     fn orientation_field_defaults_when_absent() {
-        let json = r#"{"vars":[],"patches":[],"lifecycle_hooks":[],"requested_packages":[]}"#;
+        let json = r#"{"env_vars":[],"patches":[],"lifecycle_hooks":[],"requested_packages":[]}"#;
         let c: WireContribution = serde_json_lenient::from_str(json).unwrap();
         assert_eq!(c.orientation, WireOrientation::default());
         assert!(
@@ -488,12 +487,50 @@ mod tests {
         let back = round_trip(&c);
         assert_eq!(back, c);
         let back = back.entry.unwrap();
-        assert_eq!(back.vars, None);
+        assert_eq!(back.env_vars, None);
         assert_eq!(back.lifecycle_hooks, Some(Vec::new()));
 
         // A contribution from a client that sends no entry still reads.
-        let json = r#"{"vars":[],"patches":[],"lifecycle_hooks":[],"requested_packages":[]}"#;
+        let json = r#"{"env_vars":[],"patches":[],"lifecycle_hooks":[],"requested_packages":[]}"#;
         let c: WireContribution = serde_json_lenient::from_str(json).unwrap();
         assert_eq!(c.entry, None);
+    }
+
+    // T136: the expanded entry carries one `env_vars` table, lower-case
+    // names included, and a contribution carries its variables under
+    // `env_vars`.
+    #[test]
+    fn wire_box_entry_carries_one_env_vars_table() {
+        let mut entry = WireBoxEntry::new(
+            "default",
+            "session",
+            paths::HostAbsPath::try_new("/work/project").unwrap().into(),
+        );
+        entry.env_vars = Some(BTreeMap::from([
+            (
+                StrictVarName::try_new("EDITOR").unwrap(),
+                VarValue::specified("vi"),
+            ),
+            (
+                StrictVarName::try_new("http_proxy").unwrap(),
+                VarValue::specified("http://proxy:3128"),
+            ),
+        ]));
+        let c = WireContribution {
+            entry: Some(Box::new(entry)),
+            ..WireContribution::default()
+        };
+        let json = serde_json_lenient::to_value(&c).unwrap();
+        assert!(json.get("env_vars").is_some(), "got: {json}");
+        assert!(json.get("vars").is_none(), "got: {json}");
+        let wire_entry = &json["entry"];
+        assert_eq!(wire_entry["env_vars"]["EDITOR"], "vi");
+        assert!(wire_entry["env_vars"].get("http_proxy").is_some());
+        assert!(wire_entry.get("vars").is_none(), "got: {wire_entry}");
+        assert!(
+            wire_entry.get("vars_lenient").is_none(),
+            "got: {wire_entry}"
+        );
+        assert_eq!(round_trip(&c), c);
     }
 }

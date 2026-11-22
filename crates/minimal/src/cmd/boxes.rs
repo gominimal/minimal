@@ -19,8 +19,6 @@ mod events;
 mod exec;
 #[path = "boxes/exports.rs"]
 mod exports;
-#[path = "boxes/hooks.rs"]
-mod hooks;
 #[path = "boxes/lifecycle.rs"]
 mod lifecycle;
 #[path = "boxes/list.rs"]
@@ -36,14 +34,13 @@ mod wait;
 
 pub(crate) use address::*;
 pub use address::{AddressCandidate, BoxAddressRefusal};
-pub use attach::BoxAttachRefusal;
 pub(crate) use attach::*;
+pub use attach::{BoxAttachRefusal, RowNotBack};
 pub use create::*;
 pub use events::BoxFileRefusal;
 pub(crate) use events::*;
 pub(crate) use exec::*;
 pub(crate) use exports::*;
-pub(crate) use hooks::*;
 pub(crate) use lifecycle::*;
 pub use lifecycle::{BoxRenameRefusal, BoxRunningRefusal, PruneNeedsYes};
 pub use list::*;

@@ -67,7 +67,7 @@ min session activate --attach    # creates and enters a session in one step
 
 Profiles have been deprecated:
 
-- `profile.env_vars` → `session.vars`
+- `profile.env_vars` → `defaults.session.env_vars`
 - `profile.packages` → `session.packages`
 
 See [the session configuration reference](../reference/minimal-dot-toml.md#session---what-every-contributors-session-gets-session) for how to define a session.

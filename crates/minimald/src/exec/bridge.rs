@@ -124,7 +124,14 @@ where
 
 /// The line an exec the daemon's shutdown ended leaves on stderr, so the
 /// client is told why its command stopped rather than handed a bare 137.
-pub(super) const SHUTDOWN_NOTICE: &[u8] = b"minimald is shutting down; the command was stopped\n";
+pub(super) const SHUTDOWN_NOTICE: &[u8] =
+    b"the daemon is shutting down, so the command was stopped\n";
+
+/// The line an exec leaves on stderr when the next process of its sequence
+/// fails to spawn.
+pub(super) fn spawn_failed_notice(err: &impl Display) -> String {
+    format!("failed to spawn process: {err}\n")
+}
 
 /// The line an exec the session's destroy ended leaves on stderr, for the
 /// same reason: the client is told why its command stopped, not handed a
@@ -453,12 +460,12 @@ pub(super) fn unstarted_input_notice(bound: HeldBound) -> String {
     let waited = EXEC_INPUT_UNSTARTED.as_secs();
     match bound {
         HeldBound::Exec => format!(
-            "minimald: this command had not started {waited} s after its input reached the {} MiB \
-             minimald holds for one exec, so the exec was ended\n",
+            "this command had not started {waited} s after its input reached the {} MiB \
+             the daemon holds for one exec, so the exec was ended\n",
             mib(EXEC_INPUT_HELD_MAX)
         ),
         HeldBound::Daemon => format!(
-            "minimald: this command had not started {waited} s after unread exec input across \
+            "this command had not started {waited} s after unread exec input across \
              this daemon's execs reached {} MiB, so the exec was ended\n",
             mib(EXEC_INPUT_HELD_DAEMON_MAX)
         ),
@@ -472,12 +479,12 @@ pub(super) fn held_input_notice(bound: HeldBound) -> String {
     let mib = |n: usize| n / (1024 * 1024);
     match bound {
         HeldBound::Exec => format!(
-            "minimald: {} MiB of this command's input was still unread; minimald holds no more \
+            "{} MiB of this command's input was still unread; the daemon holds no more \
              than that for one exec, so the exec was ended\n",
             mib(EXEC_INPUT_HELD_MAX)
         ),
         HeldBound::Daemon => format!(
-            "minimald: unread exec input across this daemon's execs reached {} MiB and stayed \
+            "unread exec input across this daemon's execs reached {} MiB and stayed \
              there, so this exec could take no more of its input and was ended\n",
             mib(EXEC_INPUT_HELD_DAEMON_MAX)
         ),
@@ -1164,9 +1171,7 @@ where
                     %channel_id, error = %err,
                     "exec: failed to spawn next process in sequence; reporting exit 1",
                 );
-                let _ = e
-                    .write_all(format!("minimald: failed to spawn process: {err}\n").as_bytes())
-                    .await;
+                let _ = e.write_all(spawn_failed_notice(&err).as_bytes()).await;
                 last_exit = 1;
                 break;
             }

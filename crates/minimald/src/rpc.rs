@@ -2,13 +2,14 @@ use boxes::SessionId;
 use futures::StreamExt as _;
 use minimald_rpc::{
     AbortSession, AbortSessionResponse, BoxControlReply, BoxControlRequest, CleanCacheRequest,
-    CleanCacheUpdate, CreateSession, DestroySession, DestroySessionResponse, Errorable,
-    FinalizeSession, GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest, GetMeshStatus,
-    GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord, GetSessionRecordRequest,
-    GetSessionRecordResponse, GetSessionScreen, GetVersion, GetVersionResponse, ListSessions,
-    ListSessionsEntry, ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession,
-    RenameSessionResponse, ResourcePool, SessionDelta, SessionDeltaRequest, SessionDeltaResponse,
-    Shutdown, ShutdownRequest, ShutdownResponse, SubmitVerdict,
+    CleanCacheUpdate, CreateSession, CreateSessionReply, DestroySession, DestroySessionResponse,
+    Errorable, FinalizeSession, GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest,
+    GetMeshStatus, GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord,
+    GetSessionRecordRequest, GetSessionRecordResponse, GetSessionScreen, GetVersion,
+    GetVersionResponse, ListSessions, ListSessionsEntry, ListSessionsResponse, OneshotSshRpc,
+    RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, ResourcePool, SessionDelta,
+    SessionDeltaRequest, SessionDeltaResponse, Shutdown, ShutdownRequest, ShutdownResponse,
+    SubmitVerdict,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -456,7 +457,7 @@ async fn serve_create_session(
             if let Some(asserted) = req.must_match_version.as_deref()
                 && let Some(message) = minimald_rpc::version_skew_message(asserted, OWN_VERSION)
             {
-                return Ok(Errorable::Err { error: message });
+                return Ok(CreateSessionReply::refused(message));
             }
 
             // The user-namespace gate (NET-143): a host that refuses the
@@ -473,9 +474,9 @@ async fn serve_create_session(
                     "session create refused: this host refuses the unprivileged user \
                      namespace every session sandbox needs"
                 );
-                return Ok(Errorable::Err {
-                    error: user_namespace_refusal(restriction),
-                });
+                return Ok(CreateSessionReply::refused(user_namespace_refusal(
+                    restriction,
+                )));
             }
 
             let mngr = s.sessions_manager().await;
@@ -518,9 +519,7 @@ async fn serve_create_session(
                 req.config.network,
                 req.config.box_addresses.as_ref(),
             ) {
-                return Ok(Errorable::Err {
-                    error: refused.to_string(),
-                });
+                return Ok(CreateSessionReply::refused(refused.to_string()));
             }
             // The declaration the reply's advisory reads, kept because the
             // manager consumes the config.
@@ -627,7 +626,7 @@ async fn serve_create_session(
                     };
                     let hostname_proxy_port = s.hostname_proxy_port().await;
                     let zone_answerer_port = s.zone_answerer_port().await;
-                    Errorable::Ok(minimald_rpc::CreateSessionResponse {
+                    CreateSessionReply::Ok(minimald_rpc::CreateSessionResponse {
                         id,
                         daemon_version: Some(OWN_VERSION.to_string()),
                         hostname_routing_unavailable: s.proxy_unavailable().await,
@@ -653,8 +652,8 @@ async fn serve_create_session(
                 }
                 // BOX-163: a running box holds the name. The reply names the
                 // holder, so the client can say who holds it and exit 2.
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {
-                    error: match held_name_refusal(&e) {
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    CreateSessionReply::refused(match held_name_refusal(&e) {
                         Some(refusal) => {
                             tracing::info!(
                                 name = %refusal.name,
@@ -667,8 +666,20 @@ async fn serve_create_session(
                             refusal.to_string()
                         }
                         None => "A session with that name already exists".to_string(),
-                    },
-                },
+                    })
+                }
+                // BOX-160: a spec its built-in root excludes, or one that
+                // names no built-in root. The reply carries the refusal's
+                // text and its exit code, so `min` exits 3 as it does for
+                // the same refusal made on the client.
+                Err(e) if crate::box_manager::admission_refusal(&e).is_some() => {
+                    CreateSessionReply::Err {
+                        error: e.to_string(),
+                        code: None,
+                        exit_code: crate::box_manager::admission_refusal(&e),
+                        hint: None,
+                    }
+                }
                 // R2.1: a policy/network-mode mismatch is rejected at
                 // declaration time and surfaced as a clean typed error rather
                 // than a transport failure. NET-079's refusal rides the same
@@ -679,16 +690,16 @@ async fn serve_create_session(
                 // the person who typed the declaration is told which parts
                 // could not be honoured — and what to type instead — rather
                 // than reading a transport failure off the activate.
-                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Errorable::Err {
-                    error: e.to_string(),
-                },
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                    CreateSessionReply::refused(e.to_string())
+                }
                 // BOX-081: a brokered secret on a host with no identity
                 // plane (identity none) that no node-local proxy serves.
                 // That is every brokered secret when no proxy is present,
                 // and every secret that is not a GitHub grant when one is.
-                // The reply carries the refusal's text, so the client reads
-                // the cause and not a closed channel. It does not carry the
-                // refusal code, so `min` exits 1 and not 5 (#3276).
+                // The reply carries the refusal's text, its code and its
+                // exit code, so the client reads the cause and not a closed
+                // channel, and exits as a refusal it made itself would.
                 Err(e) if crate::box_manager::unenrolled_refusal(&e).is_some() => {
                     let refusal = crate::box_manager::unenrolled_refusal(&e)
                         .expect("the guard matched an un-enrolled refusal");
@@ -698,20 +709,35 @@ async fn serve_create_session(
                         exit_code = refusal.exit_code(),
                         "create refused: a brokered secret on a host with no identity plane"
                     );
-                    Errorable::Err {
-                        error: refusal.to_string(),
-                    }
+                    unenrolled_refusal_reply(refusal)
                 }
                 // BOX-002: a create minvmd gave no id is refused with a
                 // reply. The internal arm below closes the channel, and the
                 // client then reads an empty reply with no cause in it.
-                Err(e) if crate::box_manager::BoxIdNotMinted::is(&e) => Errorable::Err {
-                    error: e.to_string(),
-                },
+                Err(e) if crate::box_manager::BoxIdNotMinted::is(&e) => {
+                    CreateSessionReply::refused(e.to_string())
+                }
                 Err(e) => return Err(ConnectionError::Internal(e.to_string())),
             })
         })
         .await
+}
+
+/// The `CreateSession` reply for an activation refused on a host with no
+/// identity plane (BOX-081): its text, the code and next step of the first
+/// refusal that has one, and the exit code the client ends with (#3276).
+fn unenrolled_refusal_reply(refusal: &boxes::core::bep::ActivationRefused) -> CreateSessionReply {
+    let (code, hint) = refusal
+        .refusals
+        .iter()
+        .find_map(|reason| Some((reason.code()?, reason.next_step())))
+        .map_or((None, None), |(code, hint)| (Some(code.to_string()), hint));
+    CreateSessionReply::Err {
+        error: refusal.to_string(),
+        code,
+        exit_code: Some(refusal.exit_code()),
+        hint,
+    }
 }
 
 /// The record-attr key a create strips unconditionally (NET-079): the key
@@ -3911,7 +3937,7 @@ mod trace_tests {
 #[cfg(test)]
 mod create_naming_tests {
     use boxes::SessionId;
-    use minimald_rpc::{CreateSession, CreateSessionRequest, Errorable, HeldNameRefusal};
+    use minimald_rpc::{CreateSession, CreateSessionReply, CreateSessionRequest, HeldNameRefusal};
 
     use crate::box_manager::BoxKeyPredicate;
     use crate::test_harness::{TestClient, TestServer, create_session_req};
@@ -3934,8 +3960,8 @@ mod create_naming_tests {
 
     async fn create(client: &mut TestClient, request: &CreateSessionRequest) -> SessionId {
         match client.call::<CreateSession>(request).await {
-            Errorable::Ok(created) => created.id,
-            Errorable::Err { error } => panic!("the create is refused: {error}"),
+            CreateSessionReply::Ok(created) => created.id,
+            CreateSessionReply::Err { error, .. } => panic!("the create is refused: {error}"),
         }
     }
 
@@ -3964,8 +3990,8 @@ mod create_naming_tests {
             .call::<CreateSession>(&create_session_req("dev", "/tmp"))
             .await
         {
-            Errorable::Err { error } => error,
-            Errorable::Ok(created) => panic!("a held name is not refused: {created:?}"),
+            CreateSessionReply::Err { error, .. } => error,
+            CreateSessionReply::Ok(created) => panic!("a held name is not refused: {created:?}"),
         };
         let refusal = HeldNameRefusal::from_error(&error)
             .unwrap_or_else(|| panic!("the reply names the holder: {error}"));
@@ -4030,7 +4056,7 @@ mod create_naming_tests {
 mod read_log_tests {
     use boxes::SessionId;
     use boxes::store::{BoxDir, LOG_FILE};
-    use minimald_rpc::{CreateSession, Errorable, ReadLogRequest, ReadLogUpdate};
+    use minimald_rpc::{CreateSession, CreateSessionReply, ReadLogRequest, ReadLogUpdate};
     use paths::DaemonAbsPath;
 
     use crate::box_actor::BoxPaths;
@@ -4105,8 +4131,8 @@ mod read_log_tests {
             .call::<CreateSession>(&create_session_req(name, "/tmp"))
             .await
         {
-            Errorable::Ok(created) => created.id,
-            Errorable::Err { error } => panic!("the create is refused: {error}"),
+            CreateSessionReply::Ok(created) => created.id,
+            CreateSessionReply::Err { error, .. } => panic!("the create is refused: {error}"),
         }
     }
 
@@ -4231,5 +4257,98 @@ mod read_log_tests {
         let (updates, err) = read_log(&mut client, unknown).await;
         assert!(updates.is_empty(), "{updates:?}");
         assert!(err.contains(minimald_rpc::UNKNOWN_SESSION_ID_LEAD), "{err}");
+    }
+}
+
+/// BOX-081 over the wire (#3276): on a host with no identity plane that a
+/// node-local proxy serves, a brokered secret with no `github:` scope is
+/// refused by the daemon alone. The reply carries the refusal's code, its
+/// exit code and its next step, so the client exits 5 and not 1.
+#[cfg(test)]
+mod unenrolled_refusal_tests {
+    use minimald_rpc::{CreateSession, CreateSessionReply};
+
+    use crate::test_harness::{TestServer, create_session_req};
+
+    /// One well-formed certificate block: what a serving proxy hands the box.
+    const ROOT_PEM: &str = "-----BEGIN CERTIFICATE-----\nUk9PVA==\n-----END CERTIFICATE-----\n";
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unenrolled_refusal_reply_carries_exit_code() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let mut req = create_session_req("brokered", "/uwu");
+        req.config.name = None;
+        req.config.creating_verb = minimald_rpc::CreatingVerb::Task;
+        req.config.root_certificate = Some(ROOT_PEM.to_string());
+        let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+        spec.box_type = boxes::TASK_BOX_TYPE.to_string();
+        spec.pty_enabled = false;
+        spec.entry = "brokered".to_string();
+        let mut spec = serde_json_lenient::to_value(&spec).expect("a spec serializes");
+        spec.as_object_mut().expect("a spec is an object").insert(
+            "secrets".to_string(),
+            serde_json_lenient::json!({
+                "aws": { "source": "broker", "scopes": ["aws:s3"] },
+            }),
+        );
+        req.spec = Some(spec);
+        match client.call::<CreateSession>(&req).await {
+            CreateSessionReply::Err {
+                error,
+                code,
+                exit_code,
+                hint,
+            } => {
+                assert!(error.contains("aws"), "{error}");
+                assert_eq!(
+                    code.as_deref(),
+                    Some(boxes::core::bep::GATEHOUSE_UNENROLLED_NODE)
+                );
+                assert_eq!(exit_code, Some(boxes::core::bep::UNENROLLED_NODE_EXIT_CODE));
+                assert_eq!(exit_code, Some(5));
+                assert!(hint.is_some_and(|hint| !hint.is_empty()), "{error}");
+            }
+            CreateSessionReply::Ok(reply) => panic!("the create is refused, not {reply:?}"),
+        }
+        let mngr = server.state.sessions_manager().await;
+        assert!(mngr.list_boxes(None).await.unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod admission_refusal_tests {
+    use minimald_rpc::{CreateSession, CreateSessionReply};
+
+    use crate::test_harness::{TestServer, create_session_req};
+
+    // BOX-160: the daemon's admission refusal reaches the client with its
+    // exit code, 3, and not as a bare text refusal that exits 1 (#3313).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admission_refusal_reply_carries_exit_code() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let mut req = create_session_req("rooted", "/uwu");
+        req.config.creating_verb = minimald_rpc::CreatingVerb::Session;
+        let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+        spec.pty_enabled = false;
+        req.spec = Some(serde_json_lenient::to_value(&spec).expect("a spec serializes"));
+        match client.call::<CreateSession>(&req).await {
+            CreateSessionReply::Err {
+                error,
+                code,
+                exit_code,
+                hint,
+            } => {
+                assert!(error.contains("io.pty_enabled"), "{error}");
+                assert!(error.contains("No box was created."), "{error}");
+                assert_eq!(exit_code, Some(3), "{error}");
+                assert_eq!(code, None);
+                assert_eq!(hint, None);
+            }
+            CreateSessionReply::Ok(reply) => panic!("the create is refused, not {reply:?}"),
+        }
+        let mngr = server.state.sessions_manager().await;
+        assert!(mngr.list_boxes(None).await.unwrap().is_empty());
     }
 }

@@ -168,9 +168,16 @@ minvmd-build:
 # what users run. MINVMD_REQUIRE_LIBKRUN makes a missing libkrun.a an error
 # rather than a silent runtime-bailing stub.
 #
-# Build minvmd (debug, static musl against the vendored libkrun.a).
+# bep, the Box Egress Proxy, is built for the same musl target in its own
+# cargo call, so it lands in minvmd-dir beside minvmd. minvmd starts it from
+# its own directory, and the e2e's rt_bep_bin finds it there, so neither
+# needs MINVMD_BEP_BIN. A separate call keeps minvmd's libkrun feature out
+# of bep (cargo unifies features across the packages one build selects).
+#
+# Build minvmd and bep (debug, static musl; minvmd against the vendored libkrun.a).
 [linux]
 minvmd-build: libkrun-static
+    cargo build -p bep --bin bep --locked --target {{musl-target}}
     MINVMD_REQUIRE_LIBKRUN=static LIBKRUN_PREFIX="{{krun-static}}" \
       cargo build -p minvmd --bin minvmd --locked --target {{musl-target}}
 
@@ -865,7 +872,7 @@ up-nodocker: artifacts gvproxy initramfs-nodocker minvmd-build minimal-cli && (_
 
 # Bring the stack up: host-native minimald, no VM (`just up-kvm` for the VM stack).
 [linux]
-up: minimald-build minimal-cli gvproxy && (_smoke "--minimal-dir" native-dir)
+up: minimald-build minimal-cli gvproxy && (_smoke "--provider" "local" "--minimal-dir" native-dir)
     #!/usr/bin/env sh
     set -eu
     sock="{{native-dir}}/providers/local-minimald0/ssh.sock"
@@ -890,7 +897,7 @@ up: minimald-build minimal-cli gvproxy && (_smoke "--minimal-dir" native-dir)
     # `activate` sandbox dies at uid_map EPERM until it's installed.
     just _userns-check || true
     echo "up: host-native minimald at $sock (pid $(cat "$pidf"))"
-    echo "  own-IP demo: min --minimal-dir {{native-dir}} session start --detach --name net1 --network own_ip && min --minimal-dir {{native-dir}} session attach net1"
+    echo "  own-IP demo: min --provider local --minimal-dir {{native-dir}} session start --detach --name net1 --network own_ip && min --provider local --minimal-dir {{native-dir}} session attach net1"
 
 # Bring the stack up: native Linux + one Linux VM over KVM (stop with `just stop`).
 [linux]

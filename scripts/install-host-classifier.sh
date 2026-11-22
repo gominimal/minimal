@@ -25,6 +25,7 @@
 #         [--proxy-lane ADDR:PORT]                      # VM guest only
 #   sudo scripts/install-host-classifier.sh --pid PID
 #   sudo scripts/install-host-classifier.sh --user NAME --place-listener SOCK
+#   sudo scripts/install-host-classifier.sh --user NAME --quic443-helper-only
 #   sudo scripts/install-host-classifier.sh --uninstall
 #        scripts/install-host-classifier.sh --check           # unprivileged
 #        scripts/install-host-classifier.sh --print-ruleset   # unprivileged
@@ -40,6 +41,9 @@
 # socket at SOCK — the daemon's own listener — so a manager-held socket unit
 # the daemon connects to at start (`min finalize-install` installs one)
 # places each daemon the account starts, with no root step per restart.
+# --quic443-helper-only installs the QUIC block helper and its sudoers rule
+# and nothing else: no tree, no table and no ct-mark scan, so a ruleset
+# that refuses the install does not keep the helper out.
 #
 # The install also lays out the cohort's two subtrees, boxes/deny and
 # boxes/allow — a box's declaration, not its session name, decides which
@@ -302,6 +306,7 @@ while [ $# -gt 0 ]; do
         --uninstall) mode=uninstall; shift ;;
         --check)     mode=check; shift ;;
         --print-ruleset) mode=print_ruleset; shift ;;
+        --quic443-helper-only) mode=quic443_helper; shift ;;
         --pid)
             [ $# -ge 2 ] || die "--pid needs a process id"
             case "$2" in ''|*[!0-9]*)
@@ -320,7 +325,7 @@ while [ $# -gt 0 ]; do
         # The header above this line is the usage. Two explicit strips, not
         # 's/^# \?//': \? is a GNU sed extension BSD sed does not know, and this
         # script's own tests run on macOS's /bin/sh too.
-        -h|--help)   sed -n '2,88p' "$0" | sed -e 's/^# //' -e 's/^#//'; exit 0 ;;
+        -h|--help)   sed -n '2,93p' "$0" | sed -e 's/^# //' -e 's/^#//'; exit 0 ;;
         *)           die "unknown argument: $1 (see --help)" ;;
     esac
 done
@@ -1486,7 +1491,20 @@ ct_mark_conflicts_in() {
             if (hit) {
                 comp = where == "" ? "the host ruleset" : where
                 if (chain != "") comp = comp ", chain " chain
-                printf "  %s: %s%s\n", comp, line, whole ? " (writes every bit of the connection mark)" : ""
+                # The packet-mark match of a whole-mark write, read from the
+                # rule before its first `ct mark set`: the packets it writes
+                # the connection mark for. ct_mark_rule_owners reads its mask
+                # back to name a well-known mark range.
+                why = ""
+                if (whole) {
+                    why = " (writes every bit of the connection mark"
+                    head = line
+                    if (index(head, "ct mark set ")) head = substr(head, 1, index(head, "ct mark set ") - 1)
+                    if (match(head, /meta mark (&|and) 0[xX][0-9a-fA-F]+( (!=|==))? 0[xX][0-9a-fA-F]+/))
+                        why = why ", for packets that match " substr(head, RSTART, RLENGTH)
+                    why = why ")"
+                }
+                printf "  %s: %s%s\n", comp, line, why
             }
         }
     '
@@ -1555,6 +1573,160 @@ join_lines() {
 }}$2"
 }
 
+# ct_mark_conflicts_in_listings — the rules of the listings
+# scan_ct_mark_conflicts read that use the bits $cohort_bit and $node_bit,
+# one per line. The scan reads each listing once, so free_ct_mark_mask can
+# test other bits against the same rules.
+ct_mark_conflicts_in_listings() {
+    local family saver saved hits found=""
+    for family in ip ip6; do
+        saver=iptables
+        [ "$family" = ip6 ] && saver=ip6tables
+        if [ "$family" = ip ]; then saved="$scan_nft_ip"; else saved="$scan_nft_ip6"; fi
+        if [ -n "$saved" ]; then
+            hits="$(printf '%s\n' "$saved" | ct_mark_conflicts_in "$saver")"
+            found="$(join_lines "$found" "$hits")"
+        fi
+        if [ "$family" = ip ]; then saved="$scan_legacy_ip"; else saved="$scan_legacy_ip6"; fi
+        if [ -n "$saved" ]; then
+            hits="$(printf '%s\n' "$saved" | ct_mark_conflicts_in "$saver")"
+            found="$(join_lines "$found" "$hits")"
+        fi
+    done
+    hits="$(printf '%s\n' "$scan_annotated" | XT_RULES="$scan_xt_rules" COVERED="$scan_covered" ct_mark_conflicts_in)"
+    join_lines "$hits" "$found"
+}
+
+# free_ct_mark_mask — two contiguous bits that no rule of the scanned
+# listings uses and no range in WELL_KNOWN_MARK_RANGES touches, as a 0x
+# mask on stdout. The highest such pair wins. It fails when no pair is
+# free. The bits the install chose are put back before it returns.
+free_ct_mark_mask() {
+    local k candidate component range taken
+    local chosen_cohort="$cohort_bit" chosen_node="$node_bit"
+    k=30
+    while [ "$k" -ge 0 ]; do
+        candidate=$((3 << k))
+        taken=
+        while read -r component range; do
+            [ -n "$component" ] || continue
+            [ $((candidate & range)) -eq 0 ] || taken=1
+        done <<EOF_RANGES
+$WELL_KNOWN_MARK_RANGES
+EOF_RANGES
+        if [ -z "$taken" ]; then
+            cohort_bit=$((1 << k))
+            node_bit=$((2 << k))
+            if [ -z "$(ct_mark_conflicts_in_listings)" ]; then
+                cohort_bit=$chosen_cohort
+                node_bit=$chosen_node
+                printf '0x%08x\n' "$candidate"
+                return 0
+            fi
+        fi
+        k=$((k - 1))
+    done
+    cohort_bit=$chosen_cohort
+    node_bit=$chosen_node
+    return 1
+}
+
+# ct_mark_rule_owners — for each conflict line on stdin ("  <where>, chain
+# <chain>: <rule>"), one line that names the program whose table or chain
+# name the rule carries, or says that the names match no program this step
+# knows. The names are a convention each program keeps, so the line says
+# the match is by name. A rule no name matches, whose packet-mark match
+# (ct_mark_conflicts_in) has a mask inside a range in
+# WELL_KNOWN_MARK_RANGES, is said to match that range, and the program that
+# uses the range is said to be one that can load it. With
+# "unowned" as $1 it prints only the whole-mark rules that neither a name
+# nor a range ties to a program.
+ct_mark_rule_owners() {
+    RANGES="$WELL_KNOWN_MARK_RANGES" awk -v unowned="${1:-}" '
+        function bit(v, x) { return int(v / x) % 2 == 1 }
+        function hex(s,  i, d, v) {
+            v = 0
+            for (i = 1; i <= length(s); i++) {
+                d = index("0123456789abcdef", tolower(substr(s, i, 1))) - 1
+                if (d < 0) return -1
+                v = v * 16 + d
+            }
+            return v
+        }
+        # The well-known range that holds every bit of the mask m, as
+        # "<component> <range>", or "" for none. A mask with a bit outside
+        # the range, or no bit at all, matches marks the range does not
+        # account for, so it names no range.
+        function range_of(m,  r, f, v, x, inside) {
+            if (m <= 0) return ""
+            for (r = 1; r <= nranges; r++) {
+                if (split(ranges[r], f, " ") != 2) continue
+                v = hex(substr(f[2], 3))
+                inside = 1
+                for (x = 1; x < 4294967296; x *= 2)
+                    if (bit(m, x) && !bit(v, x)) { inside = 0; break }
+                if (inside) return f[1] " " f[2]
+            }
+            return ""
+        }
+        BEGIN { nranges = split(ENVIRON["RANGES"], ranges, "\n") }
+        function owner(table, chain,  t, c) {
+            t = tolower(table); c = tolower(chain)
+            if (t ~ /tailscale/ || c ~ /^ts-/) return "Tailscale"
+            if (t ~ /^kube-proxy$/ || c ~ /^kube-/) return "kube-proxy"
+            if (c ~ /^docker/) return "Docker"
+            if (t == "firewalld" || c ~ /^firewalld/) return "firewalld"
+            if (t == "netavark" || c ~ /^netavark/) return "Podman (netavark)"
+            if (c ~ /^libvirt/) return "libvirt"
+            if (t ~ /^wg[-_]quick/) return "wg-quick"
+            if (c ~ /^cilium/) return "Cilium"
+            if (c ~ /^cali-/) return "Calico"
+            if (c ~ /^ufw/) return "ufw"
+            if (c ~ /^f2b-/) return "fail2ban"
+            if (t == "mullvad") return "Mullvad VPN"
+            return ""
+        }
+        {
+            line = $0
+            sub(/^ +/, "", line)
+            colon = index(line, ": ")
+            if (colon == 0) next
+            where = substr(line, 1, colon - 1)
+            table = where; chain = ""
+            at = index(where, ", chain ")
+            if (at > 0) { table = substr(where, 1, at - 1); chain = substr(where, at + 8) }
+            n = split(table, words, " ")
+            name = owner(words[n], chain)
+            known = ""
+            if (match(line, /for packets that match meta mark (&|and) 0[xX][0-9a-fA-F]+/)) {
+                m = substr(line, RSTART, RLENGTH)
+                sub(/.* /, "", m)
+                known = range_of(hex(substr(m, 3)))
+            }
+            if (unowned != "") {
+                if (line ~ /\(writes every bit of the connection mark/ && name == "" && known == "") print line
+                next
+            }
+            # One line for each table, chain and explanation: two rules in
+            # one chain that match different ranges, or one range and none,
+            # each get a line, so a rule the unowned pass finds has one too.
+            key = where SUBSEP (name != "" ? "" : known)
+            if (key in seen) next
+            seen[key] = 1
+            if (name != "")
+                printf "The rule in %s belongs to %s, by the name of its table or chain.\n", where, name
+            else if (known != "") {
+                split(known, f, " ")
+                # Only the mask ties the rule to the range, so the line
+                # says the program can load it, not that it does, and names
+                # the step for a rule that another program loads.
+                printf "The rule in %s matches the packet-mark bits %s. %s marks connections with these bits, so %s can load this rule. If another program loads it, that program must write only the connection-mark bits it uses.\n", where, f[2], f[1], f[1]
+            } else
+                printf "The rule in %s belongs to a program that this step cannot name from its table and chain.\n", where
+        }
+    '
+}
+
 # scan_ct_mark_conflicts — before loading, the ruleset this host already
 # carries is read for any ct-mark use that touches the bits this install
 # classifies with. The connection mark is a shared namespace: a component
@@ -1601,26 +1773,27 @@ scan_ct_mark_conflicts() {
                 *) annotated="$listing" ;;
             esac ;;
     esac
-    local xt_rules covered="" family saver saved hits
-    xt_rules="$(printf '%s\n' "$annotated" | xt_target_rules_in)"
-    conflicting=""
+    local family saved
+    scan_annotated="$annotated"
+    scan_xt_rules="$(printf '%s\n' "$annotated" | xt_target_rules_in)"
+    scan_covered=""
+    scan_nft_ip=""
+    scan_nft_ip6=""
+    scan_legacy_ip=""
+    scan_legacy_ip6=""
     for family in ip ip6; do
-        saver=iptables
-        [ "$family" = ip6 ] && saver=ip6tables
         if saved="$(nft_backed_save "$family")" && [ -n "$saved" ]; then
-            covered="$(join_lines "$covered" "$(printf '%s\n' "$saved" | nft_save_tables_in "$family")")"
-            hits="$(printf '%s\n' "$saved" | ct_mark_conflicts_in "$saver")"
-            conflicting="$(join_lines "$conflicting" "$hits")"
+            scan_covered="$(join_lines "$scan_covered" "$(printf '%s\n' "$saved" | nft_save_tables_in "$family")")"
+            if [ "$family" = ip ]; then scan_nft_ip="$saved"; else scan_nft_ip6="$saved"; fi
         fi
         if saved="$(legacy_save "$family")" && [ -n "$saved" ]; then
-            hits="$(printf '%s\n' "$saved" | ct_mark_conflicts_in "$saver")"
-            conflicting="$(join_lines "$conflicting" "$hits")"
+            if [ "$family" = ip ]; then scan_legacy_ip="$saved"; else scan_legacy_ip6="$saved"; fi
         fi
     done
-    hits="$(printf '%s\n' "$annotated" | XT_RULES="$xt_rules" COVERED="$covered" ct_mark_conflicts_in)"
-    conflicting="$(join_lines "$hits" "$conflicting")"
+    conflicting="$(ct_mark_conflicts_in_listings)"
     if [ -n "$conflicting" ]; then
         printf 'error: this host already uses the ct-mark bits %s this install classifies with:\n%s\n' "$mask_hex" "$conflicting" >&2
+        printf '%s\n' "$conflicting" | ct_mark_rule_owners >&2
         # A rule that writes every bit overlaps every mask, so no other
         # mask avoids it: the remedy is the rule, not the flag. A CONNMARK
         # whose masks no listing showed may be such a rule, and its remedy
@@ -1628,9 +1801,19 @@ scan_ct_mark_conflicts() {
         case "$conflicting" in
             *"$UNLISTED_CONNMARK"*)
                 die "refusing to install over an iptables CONNMARK rule whose masks this step cannot read, so it may write the bits this install uses. Install iptables with its nf_tables backend, so that iptables-save and ip6tables-save list the rule, then run min finalize-install again." ;;
-            *"(writes every bit of the connection mark)"*)
-                die "refusing to install over a rule that writes every bit of the connection mark: no --ct-mark-mask avoids it. Change that rule to write only the bits it uses, then run min finalize-install again." ;;
+            *"(writes every bit of the connection mark"*)
+                # A rule another program loads is that program's to change,
+                # so the refusal tells the user to change it only when some
+                # whole-mark rule has no known program or mark range.
+                if [ -n "$(printf '%s\n' "$conflicting" | ct_mark_rule_owners unowned)" ]; then
+                    die "refusing to install over a rule that writes every bit of the connection mark: no --ct-mark-mask avoids it. Change that rule to write only the bits it uses, then run min finalize-install again."
+                fi
+                die "refusing to install over a rule that writes every bit of the connection mark: no --ct-mark-mask avoids it. The lines above name the program or the mark range of that rule. When this host's ruleset no longer has the rule, run min finalize-install again." ;;
         esac
+        local free
+        if free="$(free_ct_mark_mask)"; then
+            printf 'No rule this step read uses the bits %s, and no program this step knows marks connections with them. To use them, run: min finalize-install --ct-mark-mask %s\n' "$free" "$free" >&2
+        fi
         die "refusing to install over another ct-mark user. Choose two contiguous bits that no rule above uses and run: $(mask_rerun_hint)"
     fi
 }
@@ -1724,6 +1907,28 @@ if [ "$mode" = uninstall ]; then
         exit 0
     fi
     die "could not remove $tree_root: a live leaf or process still holds it (stop minimald and its sessions first)"
+fi
+
+# --quic443-helper-only: the helper and its sudoers rule alone. The helper
+# reads no ct mark, so the scan that refuses a table over another ct-mark
+# user does not run, and no tree or table is laid out or loaded. The helper
+# names the tree's allow subtree, so the mount is still verified and the
+# paths are derived the way an install derives them.
+if [ "$mode" = quic443_helper ]; then
+    verify_mount
+    resolve_owner
+    compute_cgroup_paths
+    command -v nft >/dev/null 2>&1 ||
+        die "nft is this step's dependency: install it (e.g. apt install nftables) and run this step again"
+    quic443_nft=
+    if [ "$rehearsal" != 1 ] || [ "$quic443_helper_overridden" = 1 ]; then
+        resolve_quic443_nft
+    fi
+    install_quic443_helper
+    if [ "$rehearsal" != 1 ] || [ "$quic443_helper_overridden" = 1 ]; then
+        note "installed $QUIC443_HELPER: account $owner_uid can run it with sudo -n to add or remove one box leaf in $ALLOW_DIR/ in the set that is refused UDP to port 443 ($QUIC443_SUDOERS)"
+    fi
+    exit 0
 fi
 
 verify_mount

@@ -30,11 +30,13 @@ pub(crate) struct SpecInputs<'a> {
     /// The SHA-256 fingerprint of the proxy's root certificate, as colon
     /// separated hex pairs, or `None` when the proxy has not published it.
     pub root_fingerprint: Option<&'a str>,
-    /// `[session.network.bep]`.
+    /// The `network.bep` table of the expanded box entry, with
+    /// `[defaults.network.bep]` and the entry's own table merged in.
     pub bep: &'a BepSettings,
-    /// `[session.network] quic443`, `None` when not declared.
+    /// The `network.quic443` of the expanded box entry, `None` when not
+    /// declared.
     pub quic443: Option<Quic443>,
-    /// `[session.secrets]`.
+    /// The `secrets` table of the expanded box entry.
     pub secrets: &'a SecretGrants,
     /// Whether the client configuration sets the full-breadth
     /// acknowledgement.
@@ -441,8 +443,10 @@ fn project_rows(global: &GlobalArgs, args: &BoxSpecArgs, out: &mut Vec<u8>) -> a
         .repo_dir
         .clone()
         .unwrap_or_else(|| PathBuf::from("."));
-    let session = match mfile::File::from_dir_recursive(&project) {
-        Ok(file) => file.session,
+    // This parse only maps a missing or invalid project file to its
+    // message. The expansion below loads the file again.
+    match mfile::File::from_dir_recursive(&project) {
+        Ok(_) => {}
         Err(mfile::Error::NotFound) => anyhow::bail!(
             "No {} found in {} or its parent directories.",
             mfile::MFILE_NAME,
@@ -452,17 +456,41 @@ fn project_rows(global: &GlobalArgs, args: &BoxSpecArgs, out: &mut Vec<u8>) -> a
             return Err(crate::ProjectFileInvalid { error }.into());
         }
     };
-    let (bep, quic443, secrets) = session.map_or_else(Default::default, |session| {
-        let network = session.network.unwrap_or_default();
-        (
-            network.bep.unwrap_or_default(),
-            network.quic443,
-            session.secrets,
-        )
-    });
+    // The rows read the expanded session entry, the same expansion that
+    // `min box start` grants from, so `[defaults.network.bep]` and the
+    // entry's own tables both reach them.
+    // The expansion records the project root, which must be absolute, so
+    // the default `.` resolves against the working directory first.
+    let absolute = std::path::absolute(&project)
+        .with_context(|| format!("Cannot resolve the project path {}.", project.display()))?;
+    let utf8_project = camino::Utf8Path::from_path(&absolute)
+        .ok_or_else(|| anyhow::anyhow!("The project path {} is not UTF-8.", project.display()))?;
+    let (bep, secrets, quic443) = match crate::project_bep_and_grants(utf8_project, None) {
+        Ok((bep, secrets, _, quic443)) => (bep, secrets, quic443),
+        // A project with several session entries and none named `default`
+        // still gets its preview: the bare form never refuses for that
+        // pick. The rows then read an entry with an empty body, so
+        // `[defaults]` and `[defaults.session]` merge as for any entry.
+        // An entry of a project Box Type, or a `default` entry that is not
+        // a session, keeps the start's refusal: no implicit session entry
+        // applies there.
+        Err(error)
+            if matches!(
+                error.downcast_ref::<crate::SessionEntryUndecided>(),
+                Some(crate::SessionEntryUndecided::NoDefault { .. })
+            ) =>
+        {
+            tracing::debug!(
+                project = %project.display(),
+                error = %error,
+                "min box spec: no single session entry, rendering the merged [defaults] and [defaults.session] tables"
+            );
+            session_defaults_rows(utf8_project)?
+        }
+        Err(error) => return Err(error),
+    };
     tracing::debug!(project = %project.display(), "rendering min box spec");
     let (network, egress) = project_network(&project, args)?;
-    // This path reads `[defaults.session]`, as `min box start` does.
     proxy_rows(
         global,
         &bep,
@@ -474,6 +502,82 @@ fn project_rows(global: &GlobalArgs, args: &BoxSpecArgs, out: &mut Vec<u8>) -> a
         None,
         out,
     )
+}
+
+/// The `network.bep`, `secrets` and `network.quic443` of an entry with an
+/// empty body of the `session` Box Type. The entry expands as `min box
+/// start` expands a picked entry: over `[defaults]`, `[defaults.session]`
+/// and the layers of the `session` type chain (BOX-048, BOX-064). Bare
+/// `min box spec` reads these when the project has no single session entry
+/// to expand.
+fn session_defaults_rows(
+    project: &camino::Utf8Path,
+) -> anyhow::Result<(BepSettings, SecretGrants, Option<Quic443>)> {
+    let format_error = |error| crate::ProjectFileInvalid {
+        error: mfile::Error::Format(error),
+    };
+    let Some((_, bytes)) = project_file_bytes(project.as_std_path())? else {
+        return Ok(Default::default());
+    };
+    let entry = mfile::entry::BoxEntry {
+        name: mfile::entry::DEFAULT_ENTRY_NAME.to_owned(),
+        table: mfile::entry::EntryTable::Sessions,
+        box_type: Some(boxes::SESSION_BOX_TYPE.to_owned()),
+        body: toml::Table::new(),
+        implicit: true,
+    };
+    let expanded = crate::box_entry(
+        project,
+        &bytes,
+        entry,
+        true,
+        &crate::SelectedLoadouts::default(),
+        None,
+    )?;
+    let spec = &expanded.spec;
+    let secrets = spec
+        .get("secrets")
+        .cloned()
+        .map(boxes::core::bep::deserialize_project_secrets)
+        .transpose()
+        .map_err(format_error)?
+        .unwrap_or_default();
+    let network = spec.get("network").and_then(toml::Value::as_table);
+    let bep = network
+        .and_then(|network| network.get("bep"))
+        .cloned()
+        .map(toml::Value::try_into)
+        .transpose()
+        .map_err(format_error)?
+        .unwrap_or_default();
+    let quic443 = network
+        .and_then(|network| network.get("quic443"))
+        .cloned()
+        .map(toml::Value::try_into)
+        .transpose()
+        .map_err(format_error)?;
+    Ok((bep, secrets, quic443))
+}
+
+/// The egress of an entry with an empty body of the `session` Box Type:
+/// the same entry that [`session_defaults_rows`] expands, read over
+/// `[defaults]` and `[defaults.session]`.
+fn session_defaults_egress(project: &Path) -> anyhow::Result<crate::ProjectEgress> {
+    let Some((_, bytes)) = project_file_bytes(project)? else {
+        return Ok(Default::default());
+    };
+    let file: toml::Table =
+        toml::from_slice(&bytes).map_err(|error| crate::ProjectFileInvalid {
+            error: mfile::Error::Format(error),
+        })?;
+    let entry = mfile::entry::BoxEntry {
+        name: mfile::entry::DEFAULT_ENTRY_NAME.to_owned(),
+        table: mfile::entry::EntryTable::Sessions,
+        box_type: Some(boxes::SESSION_BOX_TYPE.to_owned()),
+        body: toml::Table::new(),
+        implicit: true,
+    };
+    super::box_verbs::entry_egress(&file, entry)
 }
 
 /// The network mode and the effective egress that `min box start` gives
@@ -494,7 +598,28 @@ fn project_network(
     let mut activate = crate::ActivateArgs::unflagged();
     activate.network = args.overrides.network;
     let (port_mappings, flags) = super::box_verbs::flag_network_overrides(&activate)?;
-    let mut project_egress = super::box_verbs::project_egress(project, None)?;
+    let mut project_egress = match super::box_verbs::project_egress(project, None) {
+        Ok(project_egress) => project_egress,
+        // The bare form is read-only and never refuses for the session
+        // entry pick (D3598). With several session entries and no
+        // `default`, it previews the egress of the empty-body session entry
+        // that `session_defaults_rows` reads the grants from, so the check
+        // sees the `[defaults.network]` and `[defaults.session.network]`
+        // egress of those grants.
+        Err(error)
+            if matches!(
+                error.downcast_ref::<crate::SessionEntryUndecided>(),
+                Some(crate::SessionEntryUndecided::NoDefault { .. })
+            ) =>
+        {
+            tracing::debug!(
+                error = %error,
+                "min box spec: no single session entry, previewing the egress of the merged [defaults] and [defaults.session] tables"
+            );
+            session_defaults_egress(project.as_std_path())?
+        }
+        Err(error) => return Err(error),
+    };
     let (network, port_mappings) =
         super::box_verbs::session_box_network(&activate, &mut project_egress, port_mappings)?;
     let egress = super::box_verbs::session_effective_egress(
@@ -728,6 +853,45 @@ pub(crate) fn expansion_store_rules(
         .collect()
 }
 
+/// Expands `entry` over `layers` as a create sends it (BOX-071). When the
+/// expanded spec has a `source = "store"` reference and `global` is given,
+/// the client's `[secret-store-rules]` are read once, set as
+/// [`mfile::expand::Layers::store_rules`], and the entry expands again, so
+/// each store reference carries its rule's `upstream` and `inject`.
+///
+/// Returns the expansion and the rules read. The rules are `None` when the
+/// spec has no store reference, or with no `global`.
+///
+/// # Errors
+///
+/// Fails with exit 3 on an entry that does not expand, and on a client
+/// configuration whose store rules do not read.
+pub(crate) fn expand_with_store_rules(
+    global: Option<&GlobalArgs>,
+    entry: &mfile::entry::BoxEntry,
+    layers: &mut mfile::expand::Layers,
+) -> anyhow::Result<(mfile::expand::Expansion, Option<StoreRules>)> {
+    let invalid = |error| crate::ProjectFileInvalid { error };
+    let expansion = mfile::expand::expand(entry, layers).map_err(invalid)?;
+    let Some(global) = global else {
+        return Ok((expansion, None));
+    };
+    let store_ids = store_reference_ids(&expansion.spec);
+    if store_ids.is_empty() {
+        return Ok((expansion, None));
+    }
+    let (_, rules) = crate::config::read_client_config_and_store_rules(global)?;
+    layers.store_rules = expansion_store_rules(&rules);
+    tracing::debug!(
+        entry = %entry.name,
+        store_references = store_ids.len(),
+        store_rules = layers.store_rules.len(),
+        "expanded the entry with the client's secret-store rules"
+    );
+    let expansion = mfile::expand::expand(entry, layers).map_err(invalid)?;
+    Ok((expansion, Some(rules)))
+}
+
 /// An entry's expanded spec, the source of each value, and the proxy rows
 /// of an entry with a credentialed upstream.
 struct EntrySpec {
@@ -847,22 +1011,13 @@ fn expand_entry(
         entry.box_type.as_deref(),
         &project_types,
     );
-    let mut expansion = mfile::expand::expand(entry, &layers).map_err(invalid)?;
     // BOX-071: the client's `[secret-store-rules]` write each store
-    // reference's `upstream` and `inject` into the expanded spec. They are
-    // read once, only for a spec with a store reference, and the proxy rows
-    // below use the same read.
-    // Gap: the v0 spec that a create sends has no `[secrets]` table, so
-    // these values do not reach the daemon yet. #2410 moves the wire to the
-    // expanded spec.
+    // reference's `upstream` and `inject` into the expanded spec, as the
+    // create writes them into the spec it sends. They are read once, only
+    // for a spec with a store reference, and the proxy rows below use the
+    // same read.
+    let (expansion, read_rules) = expand_with_store_rules(Some(global), entry, &mut layers)?;
     let store_ids = store_reference_ids(&expansion.spec);
-    let mut read_rules = None;
-    if !store_ids.is_empty() {
-        let (_, rules) = crate::config::read_client_config_and_store_rules(global)?;
-        layers.store_rules = expansion_store_rules(&rules);
-        expansion = mfile::expand::expand(entry, &layers).map_err(invalid)?;
-        read_rules = Some(rules);
-    }
     let mut spec = expansion.spec;
     let mut sources = std::collections::BTreeMap::new();
     for (key, origin) in &expansion.report.values {
@@ -935,6 +1090,13 @@ fn expand_entry(
             loadout: Some(loadout.name().as_ref().to_owned()),
         })
         .into());
+    }
+    // BOX-206, BOX-207: a loadout that sets `vars` or `vars_lenient`, or a
+    // variable name that is not POSIX-shaped, fails the start, so it fails
+    // the spec the same way.
+    for loadout in &active.loadouts {
+        let layer = crate::loadout_layer(loadout, None)?;
+        mfile::expand::check_loadout_vars(&layer).map_err(invalid)?;
     }
     let loadouts = Some(
         active

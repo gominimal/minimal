@@ -870,11 +870,6 @@ pub fn write_policy_json_noting(
 /// across every machine-output command) and the hint naming the remedy, or
 /// the kind of thing that was missing.
 enum PolicyJsonFailure {
-    /// No daemon to ask: the autospawn, the connection, or an RPC the daemon
-    /// never answered.
-    DaemonUnreachable(String),
-    /// The daemon answered, but nothing matches the selector.
-    SessionNotFound(String),
     /// The session resolved, but its effective policy could not be read.
     PolicyUnavailable(String),
 }
@@ -885,23 +880,6 @@ impl PolicyJsonFailure {
     /// [`MachineModeFailure`]), this walk's kinds mapped onto it.
     fn machine_failure(&self) -> MachineModeFailure {
         match self {
-            Self::DaemonUnreachable(message) => MachineModeFailure::new(
-                "daemon_unreachable",
-                message.clone(),
-                "the daemon may be down or mid-restart; try again, and check \
-                 that --minimal-dir and --vm name the instance you meant"
-                    .to_string(),
-            ),
-            // The architecture's code for a missing thing, with the kind —
-            // a session — in the message (from the shared resolver, which
-            // already names it) and in the hint beside it.
-            Self::SessionNotFound(message) => MachineModeFailure::new(
-                "not_found",
-                message.clone(),
-                "no session by that name or id exists; `min ls` lists the \
-                 sessions there are"
-                    .to_string(),
-            ),
             Self::PolicyUnavailable(message) => MachineModeFailure::new(
                 "policy_unavailable",
                 message.clone(),
@@ -965,40 +943,6 @@ pub(crate) async fn fetch_live_ingress_degrading(
         .unwrap_or_else(|warning| {
             eprintln!("warning: {warning}");
             Vec::new()
-        })
-}
-
-/// The resolve step of the `min session policy -o json` walk: the daemon
-/// and the record the policy rides on, with each failure tagged where the
-/// kinds can be told apart, since the error document's `code` is a
-/// contract.
-async fn box_policy_json_record(
-    global: &GlobalArgs,
-    box_name: &str,
-) -> Result<(client::Client, boxes::Record), PolicyJsonFailure> {
-    ensure_daemon(global)
-        .map_err(|error| PolicyJsonFailure::DaemonUnreachable(format!("{error:#}")))?;
-    let client = connect_daemon(global)
-        .await
-        .map_err(|error| PolicyJsonFailure::DaemonUnreachable(format!("{error:#}")))?;
-
-    // The record the ingress key is gated on, resolved through the same
-    // lookup the text walk uses — on the VM that owns the name (NET-058) —
-    // with the failure kinds told apart where they can be: an RPC the daemon
-    // never answered is no daemon to ask; a lookup that answered with
-    // nothing, or a box on a stopped VM, is the not-found itself.
-    let example = format!("session policy {box_name} -o json");
-    resolve_box_on_any_vm(global, client, box_name, &example)
-        .await
-        .map_err(|error| {
-            if error.downcast_ref::<BoxNotFound>().is_some()
-                || error.downcast_ref::<AmbiguousIdPrefix>().is_some()
-                || error.downcast_ref::<AmbiguousBoxName>().is_some()
-            {
-                PolicyJsonFailure::SessionNotFound(error.to_string())
-            } else {
-                PolicyJsonFailure::DaemonUnreachable(format!("{error:#}"))
-            }
         })
 }
 
@@ -1100,30 +1044,6 @@ pub(crate) async fn write_box_policy_json(
     .context(OutputWriteError)?;
     out.flush().context(OutputWriteError)?;
     Ok(())
-}
-
-/// `min session policy <box> -o json`: resolves the box, then writes the
-/// document [`write_box_policy_json`] writes on stdout.
-pub(crate) async fn box_policy_as_json(
-    global: &GlobalArgs,
-    box_name: &str,
-) -> Result<(), anyhow::Error> {
-    let (mut client, record) = match box_policy_json_record(global, box_name).await {
-        Ok(resolved) => resolved,
-        Err(failure) => return Err(failure.machine_failure().into()),
-    };
-    // BCLI-024: the same document as `min box show <box> --network -o json`,
-    // so it lists the VPN networks the box's stored spec keeps.
-    let vpn_network_names = stored_vpn_network_names(&mut client, record.id).await;
-    let mut out = std::io::stdout();
-    write_box_policy_json(
-        &mut out,
-        &mut client,
-        &record,
-        daemon_host_kind(global),
-        &vpn_network_names,
-    )
-    .await
 }
 
 /// One egress rule row: the CIDR or hostname list, or the default the policy
@@ -2271,42 +2191,11 @@ mod tests {
         );
     }
 
-    /// The walk's failure kinds map onto the machine-mode error payload:
-    /// the architecture's codes — `not_found` for a missing thing, with
-    /// the kind of thing that was missing (a session) in the message and
-    /// the hint, never a policy-specific spelling — beside the message and
-    /// the hint the object carries. The one-object shape the payload
-    /// becomes on stderr is pinned beside the emitter that writes it, in
-    /// `main`'s own tests, since writing it is the emitter's job now.
+    /// The walk's failure maps onto the machine-mode error payload, with
+    /// its own code. The one-object shape the payload becomes on stderr is
+    /// pinned beside the emitter that writes it, in `main`'s own tests.
     #[test]
     fn policy_json_failures_map_to_the_machine_mode_payload() {
-        let missing =
-            PolicyJsonFailure::SessionNotFound("No session found matching 'gone'".to_string())
-                .machine_failure();
-        assert_eq!(
-            missing.code(),
-            "not_found",
-            "a missing session is the architecture's not-found code, not a \
-             policy spelling"
-        );
-        assert!(
-            missing.message().contains("session"),
-            "the message names the kind of thing that was missing: {}",
-            missing.message()
-        );
-        assert!(
-            missing.hint().contains("session"),
-            "the hint names the kind of thing that was missing: {}",
-            missing.hint()
-        );
-
-        // The other two kinds keep their own codes, the same vocabulary.
-        assert_eq!(
-            PolicyJsonFailure::DaemonUnreachable(String::new())
-                .machine_failure()
-                .code(),
-            "daemon_unreachable",
-        );
         assert_eq!(
             PolicyJsonFailure::PolicyUnavailable(String::new())
                 .machine_failure()

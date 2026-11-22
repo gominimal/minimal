@@ -735,9 +735,8 @@ impl BoxRow {
 /// One `CreateSession` exchange, as [`create_registering`] sends it.
 type CreateFuture<'c> = std::pin::Pin<
     Box<
-        dyn std::future::Future<
-                Output = anyhow::Result<Errorable<minimald_rpc::CreateSessionResponse>>,
-            > + Send
+        dyn std::future::Future<Output = anyhow::Result<minimald_rpc::CreateSessionReply>>
+            + Send
             + 'c,
     >,
 >;
@@ -816,7 +815,7 @@ async fn create_registering<C: Send>(
     // from the VM host daemon alone (BOX-002).
     config.box_id = None;
     let created = create(client, config).await;
-    if let Ok(Errorable::Ok(created)) = created {
+    if let Ok(minimald_rpc::CreateSessionReply::Ok(created)) = created {
         return Ok((created, row));
     }
     // A failed create abandons the row its registration bought: no session
@@ -824,9 +823,9 @@ async fn create_registering<C: Send>(
     // holder.
     row.withdraw().await;
     match created {
-        Ok(Errorable::Err { error }) => Err(anyhow::anyhow!(error)),
+        Ok(minimald_rpc::CreateSessionReply::Err { error, .. }) => Err(anyhow::anyhow!(error)),
         Err(error) => Err(error),
-        Ok(Errorable::Ok(_)) => unreachable!("a created box returned above"),
+        Ok(minimald_rpc::CreateSessionReply::Ok(_)) => unreachable!("a created box returned above"),
     }
 }
 
@@ -994,7 +993,7 @@ mod tests {
             &mut sent,
             |sent, config| {
                 sent.push(config);
-                Box::pin(async { Ok(Errorable::Ok(created())) })
+                Box::pin(async { Ok(minimald_rpc::CreateSessionReply::Ok(created())) })
             },
         )
         .await
@@ -1070,7 +1069,7 @@ mod tests {
             &mut sent,
             |sent, config| {
                 sent.push(config);
-                Box::pin(async { Ok(Errorable::Ok(created())) })
+                Box::pin(async { Ok(minimald_rpc::CreateSessionReply::Ok(created())) })
             },
         )
         .await
@@ -1127,9 +1126,9 @@ mod tests {
             &mut (),
             |(), _config| {
                 Box::pin(async {
-                    Ok(Errorable::Err {
-                        error: "the project path is not a directory".to_string(),
-                    })
+                    Ok(minimald_rpc::CreateSessionReply::refused(
+                        "the project path is not a directory",
+                    ))
                 })
             },
         )
@@ -1212,7 +1211,7 @@ mod tests {
             &mut sent,
             |sent, config| {
                 sent.push(config);
-                Box::pin(async { Ok(Errorable::Ok(created())) })
+                Box::pin(async { Ok(minimald_rpc::CreateSessionReply::Ok(created())) })
             },
         )
         .await

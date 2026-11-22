@@ -8,13 +8,16 @@
 //! list before it in layer order, each value once, and any other value
 //! (a scalar or a table) replaces the earlier one wholesale.
 //!
-//! `vars` and `vars_lenient` are the exception (BOX-180). They merge by
-//! variable name, keyed across both tables: a name keeps the value, and
-//! the table, of the most specific layer that sets it. A selected loadout
-//! only adds names. A loadout that gives a set name another resolved value
-//! fails the expansion (BOX-183), and so does one layer that sets a name
-//! twice to different values (BOX-184). An `inherit` value resolves
-//! against [`Layers::host_vars`].
+//! `env_vars` is the exception (BOX-180). Every layer sets its variables
+//! in one `env_vars` table (BOX-205), and the tables merge by variable
+//! name: a name keeps the value of the most specific layer that sets it.
+//! A selected loadout only adds names. A loadout that gives a set name
+//! another resolved value fails the expansion (BOX-183). An `inherit`
+//! value resolves against [`Layers::host_vars`].
+//!
+//! Before the fold, a layer that still sets `vars` or `vars_lenient` as
+//! one of its own keys fails the expansion (BOX-206), and so does an
+//! `env_vars` name that is not POSIX-shaped (BOX-207).
 //!
 //! The fold is a pure function. Its spec is a `toml::Table`, and
 //! [`Expansion::spec_bytes`] writes it with every table in key order, so
@@ -192,9 +195,9 @@ impl ValueOrigin {
 pub struct ExpansionReport {
     /// The origin of each top-level key's value, by key.
     pub values: BTreeMap<String, ValueOrigin>,
-    /// The layer that set each variable of `vars` and `vars_lenient`, by
-    /// variable name (BOX-180).
-    pub vars: BTreeMap<String, Origin>,
+    /// The layer that set each variable of `env_vars`, by variable name
+    /// (BOX-180).
+    pub env_vars: BTreeMap<String, Origin>,
     /// Whether the expanded entry is the implicit default session entry,
     /// which the file does not declare (BOX-165).
     pub implicit: bool,
@@ -217,10 +220,10 @@ pub struct Layers {
     pub defaults: toml::Table,
     /// `[defaults.<type>]` for the entry's type.
     pub defaults_type: toml::Table,
-    /// The layer of each selected loadout, with the loadout's name, in
-    /// selection order. Each one is a layer of its own, so the report and
-    /// each hook's `declared_by` name the loadout (BOX-179).
-    pub loadouts: Vec<(String, toml::Table)>,
+    /// The layer of each selected loadout, with the loadout's name and
+    /// file, in selection order. Each one is a layer of its own, so the
+    /// report and each hook's `declared_by` name the loadout (BOX-179).
+    pub loadouts: Vec<LoadoutLayer>,
     /// The constraints of each type in the entry's type chain, the built-in
     /// root first and the entry's own type last, each with its type name.
     /// The order of [`crate::box_types::ResolvedType::constraints`].
@@ -237,15 +240,39 @@ pub struct Layers {
     pub overrides: toml::Table,
     /// The host's value for each variable that a layer sets to
     /// `{ inherit = true }`, by name. A name the host does not set is not
-    /// here. The merge of `vars` compares resolved values (BOX-183,
-    /// BOX-184), so the client fills this from its environment, for the
-    /// names [`inherited_var_names`] gives.
+    /// here. The merge of `env_vars` compares resolved values (BOX-183),
+    /// so the client fills this from its environment, for the names
+    /// [`inherited_var_names`] gives.
     pub host_vars: BTreeMap<String, String>,
     /// The client's `[secret-store-rules]`, by item identifier. Expansion
     /// writes a rule's `upstream` and `inject` into each `source =
     /// "store"` reference to its item (BOX-071). The client fills this
     /// from its own configuration, never from the project file.
     pub store_rules: BTreeMap<String, StoreRule>,
+}
+
+/// The layer of one selected loadout.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LoadoutLayer {
+    /// The loadout's name.
+    pub name: String,
+    /// The file the loadout was read from. `None` for a loadout that no
+    /// file holds, such as the client's built-in `default`.
+    pub path: Option<std::path::PathBuf>,
+    /// The keys of the loadout that the layer applies.
+    pub table: toml::Table,
+}
+
+impl LoadoutLayer {
+    /// The layer of the loadout `name`, which no file holds.
+    #[must_use]
+    pub fn new(name: impl Into<String>, table: toml::Table) -> Self {
+        Self {
+            name: name.into(),
+            path: None,
+            table,
+        }
+    }
 }
 
 /// One rule of the client's `[secret-store-rules]`, as expansion writes
@@ -385,9 +412,10 @@ pub fn expand(entry: &BoxEntry, layers: &Layers) -> Result<Expansion, Error> {
         LoadoutMode::Open => {
             // BOX-172: a loadout cannot set the mode. The gate read it
             // before this layer, so the loadout's value would do nothing.
-            let in_table = layers.loadouts.iter().find(|(_, t)| {
-                t.contains_key("loadout_mode")
-                    || t.get("box")
+            let in_table = layers.loadouts.iter().find(|l| {
+                l.table.contains_key("loadout_mode")
+                    || l.table
+                        .get("box")
                         .and_then(toml::Value::as_table)
                         .is_some_and(|b| b.contains_key("loadout_mode"))
             });
@@ -396,9 +424,9 @@ pub fn expand(entry: &BoxEntry, layers: &Layers) -> Result<Expansion, Error> {
                     loadout: Some(name.clone()),
                 });
             }
-            if let Some((name, _)) = in_table {
+            if let Some(l) = in_table {
                 return Err(Error::LoadoutSetsLoadoutMode {
-                    loadout: Some(name.clone()),
+                    loadout: Some(l.name.clone()),
                 });
             }
             layers.loadouts.as_slice()
@@ -407,11 +435,14 @@ pub fn expand(entry: &BoxEntry, layers: &Layers) -> Result<Expansion, Error> {
     };
     // BOX-179: one layer for each loadout, so each hook it declares, and
     // each value it sets, carries its name.
-    for (name, table) in loadouts {
-        ordered.push((Origin::loadout(name), table));
+    for l in loadouts {
+        ordered.push((Origin::loadout(&l.name), &l.table));
     }
     ordered.push((Origin::of(Layer::Overrides), &layers.overrides));
     check_project_declarers(entry, &ordered)?;
+    // BOX-206, BOX-207: every layer sets its variables in one `env_vars`
+    // table, under a POSIX-shaped name. Both are checked before the fold.
+    check_var_tables(entry, &ordered, loadouts)?;
     let mut expansion = fold(&ordered);
     merge_vars(entry, &ordered, &layers.host_vars, &mut expansion)?;
     // BOX-071: the store references carry the client's authorities, so
@@ -859,7 +890,7 @@ fn fold(ordered: &[(Origin, &toml::Table)]) -> Expansion {
     let mut ignored_sections = Vec::new();
     for (origin, layer) in ordered {
         for (key, value) in layer.iter() {
-            if VAR_KEYS.contains(&key.as_str()) {
+            if key == ENV_VARS_KEY {
                 continue;
             }
             if IGNORED_SECTIONS.contains(&key.as_str()) {
@@ -958,35 +989,28 @@ fn check_project_declarers(
     Ok(())
 }
 
-/// The keys that hold variables. [`fold`] leaves them out, and
-/// [`merge_vars`] merges them by variable name (BOX-180).
-const VAR_KEYS: [&str; 2] = ["vars", "vars_lenient"];
+/// The key of the table that holds a layer's variables (BOX-205). [`fold`]
+/// leaves it out, and [`merge_vars`] merges it by variable name (BOX-180).
+pub const ENV_VARS_KEY: &str = "env_vars";
 
-/// Which table of the spec holds a variable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VarTable {
-    /// `vars`, a table of name to value.
-    Vars,
-    /// `vars_lenient`, a list of `{ name, value }` tables.
-    Lenient,
-}
+/// The keys that held a layer's variables before `env_vars`. A layer that
+/// sets one as its own key fails the expansion (BOX-206).
+pub const RETIRED_VAR_KEYS: [&str; 2] = ["vars", "vars_lenient"];
 
 /// One variable as the merge holds it.
 #[derive(Debug, Clone)]
 struct MergedVar {
-    table: VarTable,
-    /// For [`VarTable::Vars`], the value. For [`VarTable::Lenient`], the
-    /// whole list item.
-    item: toml::Value,
+    /// The value as the layer writes it.
+    value: toml::Value,
     /// The value, resolved against the host. `None` for an `inherit` that
     /// the host does not set.
     resolved: Option<String>,
     origin: Origin,
 }
 
-/// The names that some layer sets to `{ inherit = true }`, in `vars` or
-/// `vars_lenient`. The client looks each one up in its environment and
-/// puts the values it finds in [`Layers::host_vars`].
+/// The names that some layer sets to `{ inherit = true }` in `env_vars`.
+/// The client looks each one up in its environment and puts the values it
+/// finds in [`Layers::host_vars`].
 #[must_use]
 pub fn inherited_var_names(entry: &BoxEntry, layers: &Layers) -> BTreeSet<String> {
     let tables = layers
@@ -994,16 +1018,12 @@ pub fn inherited_var_names(entry: &BoxEntry, layers: &Layers) -> BTreeSet<String
         .iter()
         .map(|(_, t)| t)
         .chain([&layers.defaults, &layers.defaults_type, &entry.body])
-        .chain(layers.loadouts.iter().map(|(_, t)| t))
+        .chain(layers.loadouts.iter().map(|l| &l.table))
         .chain([&layers.overrides]);
     let mut names = BTreeSet::new();
     for table in tables {
-        for (name, kind, item) in layer_vars(table) {
-            if var_value(kind, item)
-                .and_then(|v| v.get("inherit"))
-                .and_then(toml::Value::as_bool)
-                == Some(true)
-            {
+        for (name, value) in layer_vars(table) {
+            if value.get("inherit").and_then(toml::Value::as_bool) == Some(true) {
                 names.insert(name.to_owned());
             }
         }
@@ -1011,95 +1031,183 @@ pub fn inherited_var_names(entry: &BoxEntry, layers: &Layers) -> BTreeSet<String
     names
 }
 
-/// The variables one layer sets, in the order the layer writes them:
-/// `vars` first, then `vars_lenient`. Each is the name, the table and, for
-/// `vars`, the value, for `vars_lenient` the whole list item. A part of
-/// the wrong shape is not here: [`merge_vars`] keeps it whole, so
-/// [`check_keys`] refuses it. A `vars_lenient` item with no string `name`
-/// is not here either: [`nameless_lenient`] gives those to [`merge_vars`].
-fn layer_vars(layer: &toml::Table) -> Vec<(&str, VarTable, &toml::Value)> {
-    let mut out = Vec::new();
-    if let Some(toml::Value::Table(vars)) = layer.get("vars") {
-        for (name, value) in vars {
-            out.push((name.as_str(), VarTable::Vars, value));
-        }
-    }
-    if let Some(toml::Value::Array(items)) = layer.get("vars_lenient") {
-        for item in items {
-            if let Some(name) = item.get("name").and_then(toml::Value::as_str) {
-                out.push((name, VarTable::Lenient, item));
+/// The variables one layer sets in its `env_vars`, in key order. An
+/// `env_vars` that is not a table sets none here: [`merge_vars`] keeps it
+/// whole, so [`check_keys`] refuses it.
+fn layer_vars(layer: &toml::Table) -> impl Iterator<Item = (&str, &toml::Value)> {
+    layer
+        .get(ENV_VARS_KEY)
+        .and_then(toml::Value::as_table)
+        .into_iter()
+        .flatten()
+        .map(|(name, value)| (name.as_str(), value))
+}
+
+/// Whether `name` is POSIX-shaped (BOX-207): not empty, only ASCII
+/// letters, digits and `_`, and not starting with a digit.
+#[must_use]
+pub fn is_posix_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Where a layer's keys are, as a refusal of its variables names them: the
+/// table, and the file that holds it. The table is `None` for the top level
+/// of a loadout file.
+fn var_place(
+    entry: &BoxEntry,
+    origin: &Origin,
+    loadouts: &[LoadoutLayer],
+) -> (Option<String>, String) {
+    let project = |table: String| (Some(table), crate::MFILE_NAME.to_owned());
+    match origin.layer {
+        Layer::Upstream => project("`[upstream]`".to_owned()),
+        Layer::TypeDefaults => {
+            let name = origin.box_type.as_deref().unwrap_or_default();
+            if BUILTIN_BOX_TYPES.contains(&name) {
+                (None, format!("the built-in `{name}` box type"))
+            } else {
+                project(format!("the `defaults` table of `[box_types.{name}]`"))
             }
         }
+        Layer::Defaults => project("`[defaults]`".to_owned()),
+        Layer::DefaultsType => project(format!(
+            "`[defaults.{}]`",
+            entry.box_type.as_deref().unwrap_or_default()
+        )),
+        Layer::Entry => project(format!("`{}`", EntryHeader(entry.table.key(), &entry.name))),
+        Layer::Loadouts => {
+            let name = origin.loadout.as_deref().unwrap_or_default();
+            let path = loadouts
+                .iter()
+                .find(|l| l.name == name)
+                .and_then(|l| l.path.as_deref());
+            (None, loadout_file(name, path))
+        }
+        Layer::Overrides => (None, "a command-line flag".to_owned()),
     }
-    out
 }
 
-/// The `vars_lenient` items of one layer that have no string `name`.
-/// [`merge_vars`] keeps each one in the spec's list, so the client's
-/// reading of the list refuses it, as it did before the merge by name.
-fn nameless_lenient(layer: &toml::Table) -> impl Iterator<Item = &toml::Value> {
-    let items = match layer.get("vars_lenient") {
-        Some(toml::Value::Array(items)) => items.as_slice(),
-        _ => &[],
-    };
-    items
-        .iter()
-        .filter(|item| item.get("name").and_then(toml::Value::as_str).is_none())
+/// A loadout's file, as a refusal names it: its path, or its name when no
+/// file holds it.
+fn loadout_file(name: &str, path: Option<&std::path::Path>) -> String {
+    match path {
+        Some(path) => format!("the loadout file {}", path.display()),
+        None => format!("the loadout `{name}`"),
+    }
 }
 
-/// The value part of a variable: the value itself for `vars`, and the
-/// `value` key of a `vars_lenient` item.
-fn var_value(table: VarTable, item: &toml::Value) -> Option<&toml::Value> {
-    match table {
-        VarTable::Vars => Some(item),
-        VarTable::Lenient => item.get("value"),
+/// Refuses, in layer order, a layer that sets `vars` or `vars_lenient` as
+/// one of its own keys (BOX-206), and an `env_vars` name that is not
+/// POSIX-shaped (BOX-207).
+///
+/// # Errors
+///
+/// [`Error::RetiredVarKey`] and [`Error::InvalidVarName`], each naming the
+/// file and the table. Both exit 3.
+fn check_var_tables(
+    entry: &BoxEntry,
+    ordered: &[(Origin, &toml::Table)],
+    loadouts: &[LoadoutLayer],
+) -> Result<(), Error> {
+    for (origin, layer) in ordered {
+        check_layer_vars(origin, layer, || var_place(entry, origin, loadouts))?;
     }
+    Ok(())
+}
+
+/// Refuses the layer of one selected loadout as [`expand`] does (BOX-206,
+/// BOX-207), for a caller that applies the loadout with no entry to
+/// expand, such as a start in a folder with no minimal.toml.
+///
+/// # Errors
+///
+/// [`Error::RetiredVarKey`] and [`Error::InvalidVarName`], each naming the
+/// loadout's file. Both exit 3.
+pub fn check_loadout_vars(loadout: &LoadoutLayer) -> Result<(), Error> {
+    check_layer_vars(&Origin::loadout(&loadout.name), &loadout.table, || {
+        (None, loadout_file(&loadout.name, loadout.path.as_deref()))
+    })
+}
+
+/// The checks of [`check_var_tables`] for one layer. `place` gives the
+/// table and the file that a refusal names.
+fn check_layer_vars(
+    origin: &Origin,
+    layer: &toml::Table,
+    place: impl Fn() -> (Option<String>, String),
+) -> Result<(), Error> {
+    if let Some(key) = RETIRED_VAR_KEYS.iter().find(|k| layer.contains_key(**k)) {
+        let (table, file) = place();
+        tracing::debug!(
+            rule = "BOX-206",
+            key = *key,
+            layer = ?origin.layer,
+            loadout = ?origin.loadout,
+            file = %file,
+            "a layer sets a retired variable key"
+        );
+        return Err(Error::RetiredVarKey {
+            key: (*key).to_owned(),
+            table,
+            file,
+        });
+    }
+    if let Some((name, _)) = layer_vars(layer).find(|(name, _)| !is_posix_var_name(name)) {
+        let (table, file) = place();
+        tracing::debug!(
+            rule = "BOX-207",
+            variable = name,
+            layer = ?origin.layer,
+            loadout = ?origin.loadout,
+            file = %file,
+            "a variable name is not POSIX-shaped"
+        );
+        return Err(Error::InvalidVarName {
+            name: name.to_owned(),
+            table,
+            file,
+        });
+    }
+    Ok(())
 }
 
 /// The value of a variable after the host resolves it: a string as it is,
 /// an `inherit` as the host's value or else its `default`. `None` for an
 /// `inherit` with no host value and no default. Any other shape resolves
 /// to its TOML text, so two such values compare as they are written.
-fn resolve_var(
-    name: &str,
-    table: VarTable,
-    item: &toml::Value,
-    host: &BTreeMap<String, String>,
-) -> Option<String> {
-    match var_value(table, item) {
-        Some(toml::Value::String(s)) => Some(s.clone()),
-        Some(toml::Value::Table(t))
-            if t.get("inherit").and_then(toml::Value::as_bool) == Some(true) =>
-        {
+fn resolve_var(name: &str, value: &toml::Value, host: &BTreeMap<String, String>) -> Option<String> {
+    match value {
+        toml::Value::String(s) => Some(s.clone()),
+        toml::Value::Table(t) if t.get("inherit").and_then(toml::Value::as_bool) == Some(true) => {
             host.get(name).cloned().or_else(|| {
                 t.get("default")
                     .and_then(toml::Value::as_str)
                     .map(str::to_owned)
             })
         }
-        Some(other) => Some(other.to_string()),
-        None => None,
+        other => Some(other.to_string()),
     }
 }
 
-/// Merges `vars` and `vars_lenient` of `ordered` by variable name, into
-/// `expansion` (BOX-180).
+/// Merges the `env_vars` of `ordered` by variable name, into `expansion`
+/// (BOX-180).
 ///
-/// A name keeps the value and the table of the latest layer that sets it.
-/// The selected loadouts' layer is the exception: it only adds names. A
-/// loadout value that resolves to the value already set adds nothing, and
-/// a loadout `inherit` that the host does not set is not compared.
+/// A name keeps the value of the latest layer that sets it. The selected
+/// loadouts' layer is the exception: it only adds names. A loadout value
+/// that resolves to the value already set adds nothing, and a loadout
+/// `inherit` that the host does not set is not compared.
 ///
-/// A layer's `vars` that is not a table, or `vars_lenient` that is not a
-/// list, replaces the spec's value whole, so [`check_keys`] refuses it and
-/// names the layer.
+/// A layer's `env_vars` that is not a table replaces the spec's value
+/// whole, so [`check_keys`] refuses it and names the layer.
 ///
 /// # Errors
 ///
 /// [`Error::LoadoutVarConflict`] when a loadout gives a set name another
-/// resolved value, or two loadouts disagree (BOX-183). [`Error::DuplicateVar`]
-/// when one layer, one loadout included, sets a name twice to different
-/// resolved values (BOX-184).
+/// resolved value, or two loadouts disagree (BOX-183).
 fn merge_vars(
     entry: &BoxEntry,
     ordered: &[(Origin, &toml::Table)],
@@ -1107,60 +1215,20 @@ fn merge_vars(
     expansion: &mut Expansion,
 ) -> Result<(), Error> {
     let mut merged: Vec<(String, MergedVar)> = Vec::new();
-    // `vars_lenient` items with no name. The merge has no name to key
-    // them by, so the spec keeps each one, and the client refuses it.
-    let mut nameless: Vec<(toml::Value, Origin)> = Vec::new();
-    // The layer that last set each key, and a key whose value has the
-    // wrong shape, which the spec then carries whole.
-    let mut key_origin: BTreeMap<&str, Origin> = BTreeMap::new();
-    let mut bad_shape: BTreeMap<&str, (toml::Value, Origin)> = BTreeMap::new();
+    // The layer that last set the key, and a value of the wrong shape,
+    // which the spec then carries whole.
+    let mut key_origin: Option<Origin> = None;
+    let mut bad_shape: Option<(toml::Value, Origin)> = None;
     for (origin, layer) in ordered {
         let loadouts = origin.layer == Layer::Loadouts;
-        for key in VAR_KEYS {
-            let Some(value) = layer.get(key) else {
-                continue;
-            };
-            let shaped = match key {
-                "vars" => value.is_table(),
-                _ => value.is_array(),
-            };
-            if shaped {
-                bad_shape.remove(key);
-            } else {
-                bad_shape.insert(key, (value.clone(), origin.clone()));
-            }
-            key_origin.insert(key, origin.clone());
+        if let Some(value) = layer.get(ENV_VARS_KEY) {
+            bad_shape = (!value.is_table()).then(|| (value.clone(), origin.clone()));
+            key_origin = Some(origin.clone());
         }
-        nameless.extend(nameless_lenient(layer).map(|item| (item.clone(), origin.clone())));
-        // BOX-184: one layer has no later layer to settle a name it sets
-        // twice, so two different values for it are refused.
-        let mut this_layer: BTreeMap<&str, Option<String>> = BTreeMap::new();
-        for (name, table, item) in layer_vars(layer) {
-            let resolved = resolve_var(name, table, item, host);
-            if let Some(seen) = this_layer.get(name) {
-                if *seen == resolved {
-                    continue;
-                }
-                let words = layer_words(entry, Some(origin));
-                tracing::debug!(
-                    rule = "BOX-184",
-                    variable = name,
-                    layer = %words,
-                    "one layer sets a variable twice to different values"
-                );
-                // Each loadout is a layer of its own, so this is one
-                // loadout, or one layer of the project, that sets the name
-                // twice.
-                return Err(Error::DuplicateVar {
-                    name: name.to_owned(),
-                    layer: words,
-                });
-            }
-            this_layer.insert(name, resolved.clone());
+        for (name, value) in layer_vars(layer) {
             let new = MergedVar {
-                table,
-                item: item.clone(),
-                resolved,
+                value: value.clone(),
+                resolved: resolve_var(name, value, host),
                 origin: origin.clone(),
             };
             let Some(at) = merged.iter().position(|(n, _)| n == name) else {
@@ -1192,60 +1260,36 @@ fn merge_vars(
             }
         }
     }
-    let mut vars = toml::Table::new();
-    let mut lenient = Vec::new();
-    let mut lenient_origins = Vec::new();
+    let Some(origin) = key_origin else {
+        return Ok(());
+    };
     let report = &mut expansion.report;
+    let mut vars = toml::Table::new();
     for (name, var) in merged {
-        match var.table {
-            VarTable::Vars => {
-                vars.insert(name.clone(), var.item);
-            }
-            VarTable::Lenient => {
-                lenient.push(var.item);
-                lenient_origins.push(var.origin.clone());
-            }
+        vars.insert(name.clone(), var.value);
+        report.env_vars.insert(name, var.origin);
+    }
+    // The names come from several layers, so the key's origin is the layer
+    // of each name, in key order. A value of the wrong shape, or an empty
+    // one, has no names to give a layer, so it keeps the layer that set
+    // the key.
+    let (value, value_origin) = match bad_shape {
+        Some((bad, origin)) => (bad, ValueOrigin::Value(origin)),
+        None => {
+            let origins: Vec<Origin> = vars
+                .keys()
+                .filter_map(|name| report.env_vars.get(name).cloned())
+                .collect();
+            let value_origin = if origins.is_empty() {
+                ValueOrigin::Value(origin)
+            } else {
+                ValueOrigin::List(origins)
+            };
+            (toml::Value::Table(vars), value_origin)
         }
-        report.vars.insert(name, var.origin);
-    }
-    for (item, origin) in nameless {
-        lenient.push(item);
-        lenient_origins.push(origin);
-    }
-    // The names of one key come from several layers, so the key's origin
-    // is the layer of each name: in key order for `vars`, and in item
-    // order for `vars_lenient`.
-    let vars_origins: Vec<Origin> = vars
-        .keys()
-        .filter_map(|name| report.vars.get(name).cloned())
-        .collect();
-    for key in VAR_KEYS {
-        let Some(origin) = key_origin.remove(key) else {
-            continue;
-        };
-        let (value, origin, origins) = match bad_shape.remove(key) {
-            Some((bad, origin)) => (bad, origin, Vec::new()),
-            None if key == "vars" => (
-                toml::Value::Table(std::mem::take(&mut vars)),
-                origin,
-                vars_origins.clone(),
-            ),
-            None => (
-                toml::Value::Array(std::mem::take(&mut lenient)),
-                origin,
-                std::mem::take(&mut lenient_origins),
-            ),
-        };
-        expansion.spec.insert(key.to_owned(), value);
-        // A value of the wrong shape, or an empty one, has no names to
-        // give a layer, so it keeps the layer that set the key.
-        let value_origin = if origins.is_empty() {
-            ValueOrigin::Value(origin)
-        } else {
-            ValueOrigin::List(origins)
-        };
-        report.values.insert(key.to_owned(), value_origin);
-    }
+    };
+    expansion.spec.insert(ENV_VARS_KEY.to_owned(), value);
+    report.values.insert(ENV_VARS_KEY.to_owned(), value_origin);
     Ok(())
 }
 
@@ -1442,8 +1486,6 @@ const SPEC_KEYS: &[(&str, Shape)] = &[
     ("timeout", Shape::Duration),
     ("type", Shape::Str),
     ("upstream", Shape::Table),
-    ("vars", Shape::Table),
-    ("vars_lenient", Shape::List),
     ("volumes", Shape::StrList),
 ];
 
@@ -1595,11 +1637,11 @@ mod tests {
 
     /// The selected loadouts of a test: `t` as the one loadout `l`, or no
     /// loadout when `t` is empty.
-    fn one(t: toml::Table) -> Vec<(String, toml::Table)> {
+    fn one(t: toml::Table) -> Vec<LoadoutLayer> {
         if t.is_empty() {
             Vec::new()
         } else {
-            vec![("l".to_owned(), t)]
+            vec![LoadoutLayer::new("l", t)]
         }
     }
 
@@ -2177,7 +2219,7 @@ mod tests {
         let ok = expand_in(
             "[sessions.dev]\nio = { stdin_mimetype = \"text/plain\" }\n\
              [[sessions.dev.file_imports]]\nsrc = \"a\"\ndst = \"/a\"\n\
-             [[sessions.dev.vars_lenient]]\nname = \"my.var\"\nvalue = \"1\"\n",
+             [sessions.dev.env_vars]\nmy_var = \"1\"\n",
             "dev",
             Layers {
                 type_defaults: vec![(
@@ -3007,20 +3049,13 @@ mod tests {
         table(
             "packages = [\"zellij\"]\n\
              patches = { \"~/.bashrc\" = \"alias l=ls\" }\n\
-             vars = { EDITOR = \"hx\" }\n\
-             vars_lenient = [{ name = \"my.var\", value = \"1\" }]\n\
+             env_vars = { EDITOR = \"hx\" }\n\
              lifecycle_hooks = [{ on = \"start\", run = \"echo hi\" }]\n",
         )
     }
 
     /// The keys of [`whole_loadout`].
-    const LOADOUT_KEYS: [&str; 5] = [
-        "packages",
-        "patches",
-        "vars",
-        "vars_lenient",
-        "lifecycle_hooks",
-    ];
+    const LOADOUT_KEYS: [&str; 4] = ["packages", "patches", "env_vars", "lifecycle_hooks"];
 
     /// Asserts that `expansion` carries no part of [`whole_loadout`].
     fn assert_no_loadout(expansion: &Expansion, what: &str) {
@@ -3048,7 +3083,7 @@ mod tests {
             expansion.spec.get("packages")
         );
         assert_eq!(
-            expansion.spec["vars"]["EDITOR"].as_str(),
+            expansion.spec["env_vars"]["EDITOR"].as_str(),
             Some("hx"),
             "{what}"
         );
@@ -3072,7 +3107,7 @@ mod tests {
     }
 
     // BOX-167: an open entry takes the selected loadout whole: packages,
-    // config-file patches, vars, vars_lenient and lifecycle hooks.
+    // config-file patches, env_vars and lifecycle hooks.
     #[test]
     fn open_spec_applies_whole_loadout() {
         let file = "[sessions.dev]\n\n[tasks.lint]\nloadout_mode = \"open\"\n";
@@ -3459,129 +3494,306 @@ mod tests {
         }
     }
 
-    /// The `vars_lenient` items of `spec`, as `(name, value)` pairs.
-    fn lenient(spec: &toml::Table) -> Vec<(String, toml::Value)> {
-        spec["vars_lenient"]
-            .as_array()
-            .expect("a list")
-            .iter()
-            .map(|item| {
-                (
-                    item["name"].as_str().unwrap().to_owned(),
-                    item["value"].clone(),
-                )
-            })
-            .collect()
-    }
-
-    // BOX-180: `vars` and `vars_lenient` merge by name across both tables.
-    // A name keeps the value, and the table, of the most specific layer up
-    // to the entry, and a loadout adds the names it sets.
+    // BOX-180: `env_vars` merges by name across the layers. A name keeps
+    // the value of the most specific layer up to the entry, and a loadout
+    // adds the names it sets.
     #[test]
-    fn vars_merge_by_name_across_layers() {
+    fn env_vars_merge_by_name_across_layers() {
         let file = r#"
             [defaults]
-            vars = { A = "defaults", B = "defaults", KEEP = "defaults" }
+            env_vars = { A = "defaults", B = "defaults", KEEP = "defaults" }
             [defaults.session]
-            vars_lenient = [{ name = "my.var", value = "1" }]
+            env_vars = { my_var = "1", B = "type" }
             [sessions.dev]
             loadout_mode = "open"
-            vars = { A = "entry" }
-            vars_lenient = [{ name = "B", value = "entry" }]
+            env_vars = { A = "entry" }
         "#;
         let loadouts = r#"
-            vars = { A = "entry", C = "loadout", H = { inherit = true }, GONE = { inherit = true } }
-            vars_lenient = [{ name = "KEEP", value = "defaults" }]
+            env_vars = { A = "entry", C = "loadout", H = { inherit = true }, GONE = { inherit = true } }
         "#;
         let e = expand_in(file, "dev", vars_layers(loadouts, &[("H", "host")]))
             .expect("the entry expands");
-        let vars = e.spec["vars"].as_table().expect("a table");
+        let vars = e.spec["env_vars"].as_table().expect("a table");
         let names: Vec<&str> = vars.keys().map(String::as_str).collect();
-        assert_eq!(names, ["A", "C", "GONE", "H", "KEEP"]);
+        assert_eq!(names, ["A", "B", "C", "GONE", "H", "KEEP", "my_var"]);
         assert_eq!(vars["A"].as_str(), Some("entry"), "the entry wins");
+        assert_eq!(vars["B"].as_str(), Some("type"), "the type table wins");
         assert_eq!(vars["KEEP"].as_str(), Some("defaults"), "defaults kept");
         assert_eq!(vars["C"].as_str(), Some("loadout"), "a loadout adds");
-        assert_eq!(
-            lenient(&e.spec),
-            [
-                ("B".to_owned(), toml::Value::from("entry")),
-                ("my.var".to_owned(), toml::Value::from("1")),
-            ],
-            "B moves to the entry's table, and keeps its first place"
-        );
         // The report keeps the layer of each name.
-        let at = |name: &str| e.report.vars[name].layer;
+        let at = |name: &str| e.report.env_vars[name].layer;
         assert_eq!(
             at("A"),
             Layer::Entry,
             "a loadout's equal value adds nothing"
         );
-        assert_eq!(at("B"), Layer::Entry);
+        assert_eq!(at("B"), Layer::DefaultsType);
         assert_eq!(at("KEEP"), Layer::Defaults);
-        assert_eq!(at("my.var"), Layer::DefaultsType);
+        assert_eq!(at("my_var"), Layer::DefaultsType);
         assert_eq!(at("C"), Layer::Loadouts);
         assert_eq!(at("H"), Layer::Loadouts);
-        // The key's origin names the layer of each name, so a render can
-        // label every layer that the names came from.
-        let layers_of = |key: &str| match &e.report.values[key] {
-            ValueOrigin::List(origins) => origins.iter().map(|o| o.layer).collect::<Vec<_>>(),
-            other => panic!("{key}: {other:?}"),
-        };
-        assert_eq!(
-            layers_of("vars"),
-            [
-                Layer::Entry,
-                Layer::Loadouts,
-                Layer::Loadouts,
-                Layer::Loadouts,
-                Layer::Defaults
-            ]
-        );
-        assert_eq!(
-            layers_of("vars_lenient"),
-            [Layer::Entry, Layer::DefaultsType]
-        );
+        // The key's origin names the layer of each name, in key order, so a
+        // render can label every layer that the names came from.
+        match &e.report.values["env_vars"] {
+            ValueOrigin::List(origins) => assert_eq!(
+                origins.iter().map(|o| o.layer).collect::<Vec<_>>(),
+                [
+                    Layer::Entry,
+                    Layer::DefaultsType,
+                    Layer::Loadouts,
+                    Layer::Loadouts,
+                    Layer::Loadouts,
+                    Layer::Defaults,
+                    Layer::DefaultsType,
+                ]
+            ),
+            other => panic!("{other:?}"),
+        }
         // The merge is the same on every run.
         let again = expand_in(file, "dev", vars_layers(loadouts, &[("H", "host")])).unwrap();
         assert_eq!(e.spec_bytes().unwrap(), again.spec_bytes().unwrap());
         // A sealed entry takes no loadout name.
         let sealed = file.replace("\"open\"", "\"sealed\"");
         let e = expand_in(&sealed, "dev", vars_layers(loadouts, &[])).unwrap();
-        let names: Vec<&String> = e.spec["vars"].as_table().unwrap().keys().collect();
-        assert_eq!(names, ["A", "KEEP"]);
+        let names: Vec<&String> = e.spec["env_vars"].as_table().unwrap().keys().collect();
+        assert_eq!(names, ["A", "B", "KEEP", "my_var"]);
         // A loadout's `inherit` that matches the set value, or that the host
         // does not set, is not a conflict.
-        let loadouts = "vars = { A = { inherit = true }, KEEP = { inherit = true } }";
+        let loadouts = "env_vars = { A = { inherit = true }, KEEP = { inherit = true } }";
         let e = expand_in(file, "dev", vars_layers(loadouts, &[("A", "entry")])).unwrap();
-        assert_eq!(e.spec["vars"]["A"].as_str(), Some("entry"));
-        assert_eq!(e.spec["vars"]["KEEP"].as_str(), Some("defaults"));
+        assert_eq!(e.spec["env_vars"]["A"].as_str(), Some("entry"));
+        assert_eq!(e.spec["env_vars"]["KEEP"].as_str(), Some("defaults"));
         // A name that the entry has only from a type's defaults: the entry
         // still wins over the built-in layer.
         let layers = Layers {
             type_defaults: vec![(
                 "session".to_owned(),
-                table("vars = { T = \"type\", A = \"type\" }"),
+                table("env_vars = { T = \"type\", A = \"type\" }"),
             )],
             ..Layers::default()
         };
         let e = expand_in(file, "dev", layers).unwrap();
-        assert_eq!(e.spec["vars"]["T"].as_str(), Some("type"));
-        assert_eq!(e.spec["vars"]["A"].as_str(), Some("entry"));
-        assert_eq!(e.report.vars["T"], Origin::type_defaults("session"));
-        // A `vars_lenient` item with no name stays in the list, so the
-        // client refuses it, and the merge does not drop it silently.
-        let nameless = file.replace(
-            "[{ name = \"B\", value = \"entry\" }]",
-            "[{ name = \"B\", value = \"entry\" }, { value = \"x\" }]",
-        );
-        let e = expand_in(&nameless, "dev", Layers::default()).unwrap();
-        let items = e.spec["vars_lenient"].as_array().unwrap();
-        assert_eq!(items.len(), 3, "{items:?}");
-        assert!(items.iter().any(|item| item.get("name").is_none()));
-        match &e.report.values["vars_lenient"] {
-            ValueOrigin::List(origins) => assert_eq!(origins.len(), items.len()),
-            other => panic!("{other:?}"),
+        assert_eq!(e.spec["env_vars"]["T"].as_str(), Some("type"));
+        assert_eq!(e.spec["env_vars"]["A"].as_str(), Some("entry"));
+        assert_eq!(e.report.env_vars["T"], Origin::type_defaults("session"));
+        // A task entry merges the same way: its own table no longer
+        // replaces the layers before it.
+        let task = r#"
+            [defaults]
+            env_vars = { D = "defaults", E = "defaults" }
+            [defaults.task]
+            env_vars = { T = "task" }
+            [tasks.lint]
+            exec = "true"
+            env_vars = { E = "entry" }
+        "#;
+        let e = expand_in(task, "lint", Layers::default()).expect("the task expands");
+        let vars = e.spec["env_vars"].as_table().expect("a table");
+        assert_eq!(vars["D"].as_str(), Some("defaults"));
+        assert_eq!(vars["E"].as_str(), Some("entry"));
+        assert_eq!(vars["T"].as_str(), Some("task"));
+    }
+
+    // BOX-205: every layer that minimal.toml or a loadout file supplies
+    // sets its variables in one `env_vars` table: a project Box Type's
+    // defaults, `[defaults]`, `[defaults.<type>]`, the entry, the task
+    // entry included, and each selected loadout.
+    #[test]
+    fn env_vars_read_from_every_layer() {
+        let file = r#"
+            [box_types.web]
+            extends = "session"
+            defaults = { loadout_mode = "open", env_vars = { FROM_TYPE = "1" } }
+            [defaults]
+            env_vars = { FROM_DEFAULTS = "1" }
+            [defaults.web]
+            env_vars = { FROM_DEFAULTS_TYPE = "1" }
+            [boxes.site]
+            type = "web"
+            env_vars = { FROM_ENTRY = "1" }
+        "#;
+        let e = expand_typed_with(file, "site", table("env_vars = { FROM_LOADOUT = \"1\" }"))
+            .expect("the type resolves")
+            .expect("the entry expands");
+        let at = |name: &str| e.report.env_vars[name].clone();
+        assert_eq!(at("FROM_TYPE"), Origin::type_defaults("web"));
+        assert_eq!(at("FROM_DEFAULTS"), Origin::of(Layer::Defaults));
+        assert_eq!(at("FROM_DEFAULTS_TYPE"), Origin::of(Layer::DefaultsType));
+        assert_eq!(at("FROM_ENTRY"), Origin::of(Layer::Entry));
+        assert_eq!(at("FROM_LOADOUT"), Origin::loadout("l"));
+        assert_eq!(e.spec["env_vars"].as_table().map(toml::Table::len), Some(5));
+
+        // The file's own readers take `env_vars` too: the session defaults,
+        // with a name of any case, and a task.
+        let read = crate::File::from_toml_bytes(
+            b"[defaults.session.env_vars]\nA = \"1\"\nmy_var = \"2\"\n\
+              [tasks.lint]\nexec = \"true\"\nenv_vars = { T = \"t\" }\n",
+        )
+        .expect("the file reads");
+        let session = read.session.expect("the session defaults read");
+        // A lower-case POSIX name is a strict name, so both land in `vars`.
+        let strict: Vec<&str> = session.vars.keys().map(AsRef::as_ref).collect();
+        assert_eq!(strict, ["A", "my_var"]);
+        assert!(session.vars_lenient.is_empty());
+        assert!(read.tasks["lint"].vars.contains_key("T"));
+        // A session writes its variables back as one `env_vars` table.
+        let written = toml::Table::try_from(&session).expect("the session writes");
+        let names: Vec<&String> = written["env_vars"].as_table().unwrap().keys().collect();
+        assert_eq!(names, ["A", "my_var"]);
+        assert!(!written.contains_key("vars") && !written.contains_key("vars_lenient"));
+    }
+
+    // BOX-206: a layer that sets `vars` or `vars_lenient` as its own key
+    // fails with exit 3, naming the file, the table and the key, and the
+    // move to `env_vars`.
+    #[test]
+    fn retired_var_keys_refused_exit3() {
+        let project = |table: &str, key: &str| {
+            format!(
+                "{table} in minimal.toml sets `{key}`. This key is no longer read. \
+                 Move its variables to `env_vars` in {table}."
+            )
+        };
+        let cases = [
+            (
+                "the entry",
+                "[sessions.dev]\nvars = { A = \"1\" }\n",
+                "dev",
+                project("`[sessions.dev]`", "vars"),
+            ),
+            (
+                "[defaults]",
+                "[defaults]\nvars_lenient = [{ name = \"my.var\", value = \"1\" }]\n[sessions.dev]\n",
+                "dev",
+                project("`[defaults]`", "vars_lenient"),
+            ),
+            (
+                "[defaults.task]",
+                "[defaults.task]\nvars = { A = \"1\" }\n[tasks.lint]\nexec = \"true\"\n",
+                "lint",
+                project("`[defaults.task]`", "vars"),
+            ),
+            (
+                "a task entry",
+                "[tasks.lint]\nexec = \"true\"\nvars = { A = \"1\" }\n",
+                "lint",
+                project("`[tasks.lint]`", "vars"),
+            ),
+        ];
+        for (what, file, name, msg) in cases {
+            let err = expand_in(file, name, Layers::default()).expect_err(what);
+            assert!(
+                matches!(err, Error::RetiredVarKey { .. }),
+                "{what}: {err:?}"
+            );
+            assert_eq!(err.exit_code(), Some(3), "{what}");
+            assert_eq!(err.to_string(), msg, "{what}");
         }
+
+        // A project Box Type's defaults.
+        let typed = "[box_types.web]\nextends = \"session\"\ndefaults = { vars = { A = \"1\" } }\n\
+                     [boxes.site]\ntype = \"web\"\n";
+        let err = expand_typed_with(typed, "site", toml::Table::new())
+            .expect("the type resolves")
+            .expect_err("the type's defaults set vars");
+        assert_eq!(
+            err.to_string(),
+            project("the `defaults` table of `[box_types.web]`", "vars")
+        );
+
+        // A loadout file, named by its path.
+        let open = "[sessions.dev]\nloadout_mode = \"open\"\n";
+        let path = std::path::PathBuf::from("/home/u/.config/minimal/loadouts/ed.toml");
+        let layers = Layers {
+            loadouts: vec![LoadoutLayer {
+                name: "ed".to_owned(),
+                path: Some(path.clone()),
+                table: table("vars = { EDITOR = \"vi\" }"),
+            }],
+            ..Layers::default()
+        };
+        let err = expand_in(open, "dev", layers.clone()).expect_err("the loadout sets vars");
+        assert_eq!(err.exit_code(), Some(3));
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "the loadout file {} sets `vars` at its top level. This key is no \
+                 longer read. Move its variables to an `[env_vars]` table in that file.",
+                path.display()
+            )
+        );
+        // A sealed entry applies no loadout, so it has nothing to refuse.
+        let sealed = open.replace("\"open\"", "\"sealed\"");
+        expand_in(&sealed, "dev", layers).expect("a sealed entry takes no loadout");
+
+        // A variable named `vars` inside `env_vars` is a variable.
+        let e = expand_in(
+            "[sessions.dev]\nenv_vars = { vars = \"1\", vars_lenient = \"2\" }\n",
+            "dev",
+            Layers::default(),
+        )
+        .expect("the names are variables");
+        assert_eq!(e.spec["env_vars"]["vars"].as_str(), Some("1"));
+
+        // A legacy `[session]` is refused under its own name, before it
+        // reads as `[defaults.session]`.
+        let mut doc = table("[session]\nvars = { A = \"1\" }\n");
+        let err = crate::legacy::canonicalize(&mut doc, "0.8.0-dev.412.gd9915d40")
+            .expect_err("the legacy table sets vars");
+        assert_eq!(err.exit_code(), Some(3));
+        assert_eq!(err.to_string(), project("`[session]`", "vars"));
+    }
+
+    // BOX-207: an `env_vars` name that is empty, holds a character other
+    // than an ASCII letter, a digit or `_`, or starts with a digit fails
+    // with exit 3, naming the variable and the file.
+    #[test]
+    fn non_posix_env_var_name_refused_exit3() {
+        let rule = "A variable name can hold only ASCII letters, digits and `_`, and \
+                    cannot start with a digit. Rename the variable.";
+        for name in ["my.var", "1A", "A-B", "", "É", "A B"] {
+            let file = format!("[sessions.dev]\nenv_vars = {{ {name:?} = \"1\" }}\n");
+            let err = expand_in(&file, "dev", Layers::default()).expect_err(name);
+            assert!(
+                matches!(err, Error::InvalidVarName { .. }),
+                "{name}: {err:?}"
+            );
+            assert_eq!(err.exit_code(), Some(3), "{name}");
+            let variable = if name.is_empty() {
+                "a variable with an empty name".to_owned()
+            } else {
+                format!("the variable `{name}`")
+            };
+            assert_eq!(
+                err.to_string(),
+                format!("`[sessions.dev]` in minimal.toml sets {variable} in `env_vars`. {rule}"),
+                "{name}"
+            );
+        }
+        for name in ["A", "my_var", "_X", "a1", "PATH_2"] {
+            assert!(is_posix_var_name(name), "{name}");
+            let file = format!("[defaults]\nenv_vars = {{ {name} = \"1\" }}\n[sessions.dev]\n");
+            expand_in(&file, "dev", Layers::default()).expect(name);
+        }
+        // A loadout's bad name names the loadout file.
+        let path = std::path::PathBuf::from("/l/ai.toml");
+        let layers = Layers {
+            loadouts: vec![LoadoutLayer {
+                name: "ai".to_owned(),
+                path: Some(path.clone()),
+                table: table("env_vars = { \"my.var\" = \"1\" }"),
+            }],
+            ..Layers::default()
+        };
+        let err = expand_in("[sessions.dev]\nloadout_mode = \"open\"\n", "dev", layers)
+            .expect_err("the loadout's name");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "the loadout file {} sets the variable `my.var` in `env_vars`. {rule}",
+                path.display()
+            )
+        );
     }
 
     // BOX-183: a loadout that gives a set name another resolved value fails
@@ -3591,10 +3803,10 @@ mod tests {
     fn conflicting_loadout_var_refused_exit3() {
         let file = r#"
             [defaults]
-            vars = { D = "defaults" }
+            env_vars = { D = "defaults" }
             [sessions.dev]
             loadout_mode = "open"
-            vars = { A = "entry", I = { inherit = true } }
+            env_vars = { A = "entry", I = { inherit = true } }
         "#;
         let conflict = |name: &str, first: &str, second: &str| {
             format!(
@@ -3608,25 +3820,25 @@ mod tests {
         let cases = [
             (
                 "a literal against the entry",
-                "vars = { A = \"loadout\" }",
+                "env_vars = { A = \"loadout\" }",
                 vec![],
                 conflict("A", "`[sessions.dev]` in minimal.toml", "the loadout `l`"),
             ),
             (
-                "a lenient item against [defaults]",
-                "vars_lenient = [{ name = \"D\", value = \"loadout\" }]",
+                "a literal against [defaults]",
+                "env_vars = { D = \"loadout\" }",
                 vec![],
                 conflict("D", "`[defaults]` in minimal.toml", "the loadout `l`"),
             ),
             (
                 "a literal against the entry's resolved inherit",
-                "vars = { I = \"loadout\" }",
+                "env_vars = { I = \"loadout\" }",
                 vec![("I", "host")],
                 conflict("I", "`[sessions.dev]` in minimal.toml", "the loadout `l`"),
             ),
             (
                 "an inherit that resolves to another value",
-                "vars = { A = { inherit = true } }",
+                "env_vars = { A = { inherit = true } }",
                 vec![("A", "host")],
                 conflict("A", "`[sessions.dev]` in minimal.toml", "the loadout `l`"),
             ),
@@ -3640,15 +3852,11 @@ mod tests {
             assert_eq!(err.exit_code(), Some(3), "{what}");
             assert_eq!(err.to_string(), msg, "{what}");
         }
-        // Two loadouts that disagree name both loadouts. One loadout that
-        // sets a name twice is one layer, so BOX-184 names that loadout.
+        // Two loadouts that disagree name both loadouts.
         let mut two = vars_layers("", &[]);
         two.loadouts = vec![
-            ("rust".to_owned(), table("vars = { N = \"one\" }")),
-            (
-                "ai".to_owned(),
-                table("vars_lenient = [{ name = \"N\", value = \"two\" }]"),
-            ),
+            LoadoutLayer::new("rust", table("env_vars = { N = \"one\" }")),
+            LoadoutLayer::new("ai", table("env_vars = { N = \"two\" }")),
         ];
         let err = expand_in(file, "dev", two).expect_err("two loadouts disagree");
         assert_eq!(err.exit_code(), Some(3));
@@ -3656,24 +3864,18 @@ mod tests {
             err.to_string(),
             conflict("N", "the loadout `rust`", "the loadout `ai`")
         );
-        let twice = "vars = { N = \"one\" }\nvars_lenient = [{ name = \"N\", value = \"two\" }]";
-        let err = expand_in(file, "dev", vars_layers(twice, &[])).expect_err("one loadout, twice");
-        assert!(
-            matches!(&err, Error::DuplicateVar { layer, .. } if layer == "the loadout `l`"),
-            "{err:?}"
-        );
         // The same values pass, and a sealed entry checks nothing.
         expand_in(
             file,
             "dev",
-            vars_layers("vars = { I = \"host\" }", &[("I", "host")]),
+            vars_layers("env_vars = { I = \"host\" }", &[("I", "host")]),
         )
         .expect("the same resolved value is one variable");
         let sealed = file.replace("\"open\"", "\"sealed\"");
         expand_in(
             &sealed,
             "dev",
-            vars_layers("vars = { A = \"loadout\" }", &[]),
+            vars_layers("env_vars = { A = \"loadout\" }", &[]),
         )
         .expect("a sealed entry takes no loadout");
     }
@@ -3699,8 +3901,8 @@ mod tests {
         };
         let layers = Layers {
             loadouts: vec![
-                ("rust".to_owned(), table(&hook("echo rust"))),
-                ("ai".to_owned(), table(&hook("echo entry"))),
+                LoadoutLayer::new("rust", table(&hook("echo rust"))),
+                LoadoutLayer::new("ai", table(&hook("echo entry"))),
             ],
             ..Layers::default()
         };
@@ -3804,8 +4006,8 @@ mod tests {
         );
 
         let loadout = Layers {
-            loadouts: vec![(
-                "rust".to_owned(),
+            loadouts: vec![LoadoutLayer::new(
+                "rust",
                 table(
                     "lifecycle_hooks = [{ declared_by = { kind = \"project\" }, on_activate = { type = \"inline\", value = \"echo rust\" } }]",
                 ),
@@ -3820,52 +4022,6 @@ mod tests {
                 name: "rust".to_owned()
             })
         );
-    }
-
-    // BOX-184: one layer that sets a name twice, in `vars_lenient` or in
-    // both tables, to different values fails with exit 3, naming the
-    // variable and the layer. The same value twice is one variable.
-    #[test]
-    fn duplicate_var_in_one_layer_refused_exit3() {
-        let cases = [
-            (
-                "both tables of the entry",
-                "[sessions.dev]\nvars = { A = \"1\" }\nvars_lenient = [{ name = \"A\", value = \"2\" }]\n",
-                "A",
-                "`[sessions.dev]` in minimal.toml",
-            ),
-            (
-                "vars_lenient of [defaults]",
-                "[defaults]\nvars_lenient = [{ name = \"my.var\", value = \"1\" }, { name = \"my.var\", value = \"2\" }]\n[sessions.dev]\n",
-                "my.var",
-                "`[defaults]` in minimal.toml",
-            ),
-            (
-                "an inherit and a literal in [defaults.session]",
-                "[defaults.session]\nvars = { H = { inherit = true } }\nvars_lenient = [{ name = \"H\", value = \"literal\" }]\n[sessions.dev]\n",
-                "H",
-                "`[defaults.session]` in minimal.toml",
-            ),
-        ];
-        for (what, file, name, layer) in cases {
-            let err = expand_in(file, "dev", vars_layers("", &[("H", "host")])).expect_err(what);
-            assert!(matches!(err, Error::DuplicateVar { .. }), "{what}: {err:?}");
-            assert_eq!(err.exit_code(), Some(3), "{what}");
-            assert_eq!(
-                err.to_string(),
-                format!(
-                    "{layer} sets the variable `{name}` twice, to different values. \
-                     Remove one of the two settings."
-                ),
-                "{what}"
-            );
-        }
-        // The same resolved value twice is one variable, kept once.
-        let file = "[sessions.dev]\nvars = { A = \"1\", H = { inherit = true } }\n\
-                    vars_lenient = [{ name = \"A\", value = \"1\" }, { name = \"H\", value = \"host\" }]\n";
-        let e = expand_in(file, "dev", vars_layers("", &[("H", "host")])).expect("one variable");
-        assert_eq!(e.spec["vars"]["A"].as_str(), Some("1"));
-        assert!(lenient(&e.spec).is_empty(), "{:?}", e.spec);
     }
 
     /// Expands the entry `name` of `file` over its type chain, with the

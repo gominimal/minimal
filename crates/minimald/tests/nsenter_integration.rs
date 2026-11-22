@@ -21,6 +21,9 @@
 //! `CONFIG_PROC_CHILDREN`, `setns` pidfd support (Linux 5.8+), and
 //! util-linux's `ipcmk` and `ipcs` on the host for the IPC proof:
 //! `MINIMALD_NSENTER_TEST=1 cargo test -p minimald --test nsenter_integration -- --include-ignored`
+//!
+//! The leaf-join proofs at the end run ungated: the shim refuses before it
+//! joins any namespace, so they unshare nothing.
 #![cfg(target_os = "linux")]
 
 use std::collections::BTreeMap;
@@ -520,4 +523,61 @@ fn tty_exec_pty_is_controlling_terminal_and_a_stop_ends_its_jobs() {
         !alive,
         "the background job outlived the stop of its tty exec"
     );
+}
+
+/// Runs `/bin/sh -c 'echo ran'` through the real shim, told to join the
+/// classifier leaf `leaf` first, with this test process as the box: it
+/// shares every namespace with us, so the shim has nothing to unshare and
+/// the run needs no gate. Returns the exit code, stdout and stderr.
+fn inject_with_leaf(leaf: &std::path::Path) -> (Option<i32>, String, String) {
+    let output = Injection::new(std::process::id(), "/bin/sh", ["-c", "echo ran"])
+        .with_shim(shim())
+        .with_classifier_leaf(sandbox::config::ClassifierLeaf::new(leaf))
+        .command()
+        .expect("building the injected command")
+        .output()
+        .expect("running the injected command");
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// NET-079: an injected process that cannot join its box's leaf never
+/// runs, whatever the box's declaration. A `cgroup.procs` that is a
+/// directory stands in for one the kernel refuses: a deny-all box's leaf
+/// and an allow-all box's both stop the shim before the program starts,
+/// with one line and exit 5, never the 1 a failed command leaves with.
+#[test]
+fn an_injection_that_cannot_join_its_box_leaf_is_refused_for_every_verdict() {
+    let tree = tempfile::tempdir().expect("a stand-in classifier tree");
+    for verdict in ["deny", "allow"] {
+        let dir = tree.path().join("boxes").join(verdict).join("b");
+        std::fs::create_dir_all(dir.join("cgroup.procs")).expect("the stand-in leaf");
+
+        let (code, stdout, stderr) = inject_with_leaf(&dir);
+
+        assert_eq!(code, Some(5), "a {verdict} leaf: {stderr}");
+        assert_eq!(stdout, "", "the program never ran in a {verdict} box");
+        assert!(
+            stderr.starts_with(minimald_rpc::exec::INJECTION_UNPLACED_TEXT),
+            "a {verdict} leaf: {stderr}"
+        );
+        assert_eq!(stderr.lines().count(), 1, "one line: {stderr}");
+    }
+}
+
+/// An injection that races the box's stop finds the box's leaf gone, and
+/// says the box stopped, with the exit code of a box that is not running.
+#[test]
+fn an_injection_whose_box_leaf_is_gone_says_the_box_stopped() {
+    let tree = tempfile::tempdir().expect("a stand-in classifier tree");
+    let gone = tree.path().join("boxes").join("allow").join("b");
+
+    let (code, stdout, stderr) = inject_with_leaf(&gone);
+
+    assert_eq!(code, Some(2), "{stderr}");
+    assert_eq!(stdout, "", "the program never ran");
+    assert_eq!(stderr, "The box stopped before the command started.\n");
 }
