@@ -229,8 +229,7 @@ pub fn hook_port() -> u16 {
 /// open) hold every one of them, so a pin adds a port to those sets and
 /// takes none out. One port when `hook` is the default.
 pub fn answerer_host_ports(hook: u16) -> impl Iterator<Item = u16> {
-    std::iter::once(DEFAULT_ANSWERER_PORT)
-        .chain((hook != DEFAULT_ANSWERER_PORT).then_some(hook))
+    std::iter::once(DEFAULT_ANSWERER_PORT).chain((hook != DEFAULT_ANSWERER_PORT).then_some(hook))
 }
 
 /// The interim answerer channel socket's file name inside a state dir's
@@ -6834,9 +6833,7 @@ mod tests {
                 "the refusal names the variable and the value {raw:?}, got: {err}"
             );
             assert!(
-                err.ends_with(
-                    ". Set it to a port from 1 to 65535, or unset it to use 7656."
-                ),
+                err.ends_with(". Set it to a port from 1 to 65535, or unset it to use 7656."),
                 "the refusal ends with the next step, got: {err}"
             );
         }

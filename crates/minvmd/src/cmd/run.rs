@@ -3177,9 +3177,9 @@ fn node_port_override(name: &'static str) -> Result<Option<u16>> {
                 "environment variable {name} carries {raw:?}: 0 is not a port to pin; \
                  unset the variable to let the assignment pick one"
             ),
-            PortPinRefusal::NotAPort => anyhow::anyhow!(
-                "environment variable {name} carries {raw:?}, which is not a port"
-            ),
+            PortPinRefusal::NotAPort => {
+                anyhow::anyhow!("environment variable {name} carries {raw:?}, which is not a port")
+            }
         }
     })
 }
