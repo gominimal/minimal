@@ -3430,13 +3430,16 @@ fn acquire_loop(registry: BoxRegistry, port: u16, status: AnswererStatus) {
         marker: resolve_install_marker(),
         release_window: RELEASE_WINDOW,
     };
-    acquire(registry, port, &paths, &node_id(), &status);
+    acquire(
+        registry,
+        port,
+        DEFAULT_ANSWERER_PORT,
+        &paths,
+        &node_id(),
+        &status,
+    );
 }
 
-/// The acquisition over one channel, for the tests that drive it on a
-/// temporary channel: `channel` is the interim's, and no service is
-/// installed (the marker and the global channel are paths nothing holds),
-/// so the decision is the interim's publish-or-host alone.
 /// Makes the dir a test's interim channel sits in mode 0700, the per-user
 /// run dir's mode [`prepare_interim_dir`] requires.
 #[cfg(test)]
@@ -3447,6 +3450,12 @@ fn private_test_dir(sock: &Path) {
     }
 }
 
+/// The acquisition over one channel, for the tests that drive it on a
+/// temporary channel: `channel` is the interim's, and no service is
+/// installed (the marker and the global channel are paths nothing holds),
+/// so the decision is the interim's publish-or-host alone. A service the
+/// test runs behind `channel` binds `port` itself, so `port` is also the
+/// service's port.
 #[cfg(test)]
 fn acquire_loop_at(registry: BoxRegistry, port: u16, channel: PathBuf, status: AnswererStatus) {
     // The interim's dir must be the operator's alone; a test's temp dir is
@@ -3459,7 +3468,14 @@ fn acquire_loop_at(registry: BoxRegistry, port: u16, channel: PathBuf, status: A
         interim: channel,
         release_window: RELEASE_WINDOW,
     };
-    acquire(registry, port, &paths, crate::state::vm_name(), &status);
+    acquire(
+        registry,
+        port,
+        port,
+        &paths,
+        crate::state::vm_name(),
+        &status,
+    );
 }
 
 /// [`acquire_loop_at`] as the node `node`, for the tests that run two
@@ -3479,7 +3495,7 @@ fn acquire_loop_as(
         interim: channel,
         release_window: RELEASE_WINDOW,
     };
-    acquire(registry, port, &paths, node, &status);
+    acquire(registry, port, port, &paths, node, &status);
 }
 
 /// What woke the acquisition's wait ([`wait_for_wake`]): a table change (a
@@ -3664,9 +3680,16 @@ fn warn_refused(node: &str, refused: Vec<RefusedRow>) {
 /// moment the answerer's end of the connection closes it reconnects with
 /// backoff and re-publishes, so a service restart is a short absence
 /// window and never a session restart.
+///
+/// `port` is this daemon's hook port, the one it binds when it hosts the
+/// answerer; `service_port` is the one the installed service binds
+/// ([`DEFAULT_ANSWERER_PORT`] in production, whatever `port` is). The
+/// status names the port of the answerer that holds this table's rows:
+/// `service_port` once the service took them, `port` otherwise.
 fn acquire(
     registry: BoxRegistry,
     port: u16,
+    service_port: u16,
     paths: &ChannelPaths,
     node: &str,
     status: &AnswererStatus,
@@ -3691,8 +3714,9 @@ fn acquire(
     // answering, doubling to the re-check cadence.
     let mut retry = CHANNEL_RETRY;
     // The status a held connection reports: which answerer took the rows,
-    // as the last publish's hello ack named it.
+    // as the last publish's hello ack named it, and the port it answers on.
     let mut held_status = ZoneAnswererStatus::Registered { port };
+    let mut held_port = port;
     loop {
         // ── the publish arm, a held connection: re-publish the whole
         // table, idempotent. A send that fails is the connection's end —
@@ -3709,14 +3733,14 @@ fn acquire(
                         &commands,
                         registration,
                         status,
-                        port,
+                        held_port,
                         &mut erroring,
                     );
                 }
                 Err(error) => {
                     surface_error(
                         status,
-                        port,
+                        held_port,
                         &mut erroring,
                         &format!("the answerer channel connection failed: {error}"),
                     );
@@ -3747,29 +3771,31 @@ fn acquire(
             Ok(published) => {
                 retry = CHANNEL_RETRY;
                 erroring = false;
-                held_status = registered_status(&published.holder, port);
+                held_port = holder_port(&published.holder, port, service_port);
+                held_status = registered_status(&published.holder, held_port);
                 status.set(held_status.clone());
                 warn_refused(node, published.refused);
                 if !published_once {
                     published_once = true;
-                    announce_publish(&published.holder, port, channel, node);
+                    announce_publish(&published.holder, held_port, channel, node);
                 }
                 held = wait_out_wake(
                     &mut pings,
                     &commands,
                     published.registration,
                     status,
-                    port,
+                    held_port,
                     &mut erroring,
                 );
                 continue;
             }
             // The service is installed and its channel did not answer: an
-            // error, never a reason to host.
+            // error, never a reason to host. The port held with nothing
+            // answering is the service's, not this daemon's pin.
             Err(error) if installed => {
                 surface_error(
                     status,
-                    port,
+                    service_port,
                     &mut erroring,
                     &format!(
                         "the answerer service is installed ({}) but its channel {} did not \
@@ -3829,7 +3855,8 @@ fn acquire(
                     while pings.try_recv().is_ok() {}
                     erroring = false;
                     retry = CHANNEL_RETRY;
-                    held_status = registered_status(&published.holder, port);
+                    held_port = holder_port(&published.holder, port, service_port);
+                    held_status = registered_status(&published.holder, held_port);
                     status.set(held_status.clone());
                     warn_refused(node, published.refused);
                     held = wait_out_wake(
@@ -3837,7 +3864,7 @@ fn acquire(
                         &commands,
                         published.registration,
                         status,
-                        port,
+                        held_port,
                         &mut erroring,
                     );
                 }
@@ -3865,12 +3892,13 @@ fn acquire(
                     Ok((published, queued)) => {
                         retry = CHANNEL_RETRY;
                         erroring = false;
-                        held_status = registered_status(&published.holder, port);
+                        held_port = holder_port(&published.holder, port, service_port);
+                        held_status = registered_status(&published.holder, held_port);
                         status.set(held_status.clone());
                         warn_refused(node, published.refused);
                         if !published_once {
                             published_once = true;
-                            announce_publish(&published.holder, port, &paths.interim, node);
+                            announce_publish(&published.holder, held_port, &paths.interim, node);
                         }
                         let mut registration = published.registration;
                         let mut alive = true;
@@ -3884,7 +3912,7 @@ fn acquire(
                         if !alive {
                             surface_error(
                                 status,
-                                port,
+                                held_port,
                                 &mut erroring,
                                 "the answerer channel failed while serving a box address \
                                  request",
@@ -3896,7 +3924,7 @@ fn acquire(
                             &commands,
                             registration,
                             status,
-                            port,
+                            held_port,
                             &mut erroring,
                         );
                     }
@@ -3988,9 +4016,24 @@ fn await_holder_channel(
     }
 }
 
+/// The port the answerer a publish reached answers on, by the holder its
+/// hello ack named: the installed service's `service_port`, which its
+/// socket unit names whatever this daemon's pin is, or, for another VM
+/// host daemon hosting the interim, this daemon's own `port`. The ack
+/// carries no port, so an interim holder pinned to another port is
+/// reported at this daemon's.
+fn holder_port(holder: &str, port: u16, service_port: u16) -> u16 {
+    if holder == SERVICE_HOLDER {
+        service_port
+    } else {
+        port
+    }
+}
+
 /// The status a node that published its rows reports, by the holder its
 /// hello ack named: the manager-held service, or another VM host daemon
-/// hosting the single-operator interim.
+/// hosting the single-operator interim. `port` is the holder's
+/// ([`holder_port`]).
 fn registered_status(holder: &str, port: u16) -> ZoneAnswererStatus {
     if holder == SERVICE_HOLDER {
         ZoneAnswererStatus::ManagerHeld { port }
@@ -6817,6 +6860,95 @@ mod tests {
         assert_eq!(hook_port_from_os(Some(OsStr::new("17656"))), Ok(17656));
     }
 
+    /// A daemon pinned off the service's port that publishes to the
+    /// installed service reports the service's port, not its pin: the
+    /// service binds the port its socket unit names whatever the pin is, so
+    /// `min ls` names, and the names check asks, the port that answers. The
+    /// acquisition runs as `run` starts it with the service installed: the
+    /// marker present, the publish over the machine-global channel.
+    #[test]
+    fn a_pinned_daemon_reports_the_services_port() {
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
+        let (service_port, channel, listener, channel_listener) = service_sockets(&dir);
+        let (stop, _handle) = start_service(listener, channel_listener);
+        // The service's listener holds its port while the pin is drawn, so
+        // the two differ.
+        let pin = free_port();
+        assert_ne!(pin, service_port, "the pin differs from the service's port");
+        private_test_dir(&channel);
+        let marker = dir.path().join("installed.marker");
+        std::fs::write(&marker, b"").expect("the marker is written");
+        let paths = ChannelPaths {
+            global: channel,
+            interim: dir.path().join("no-interim.sock"),
+            marker,
+            release_window: RELEASE_WINDOW,
+        };
+        let (registry, web) = web_registry();
+        let status = AnswererStatus::starting();
+        let probe = status.clone();
+        std::thread::Builder::new()
+            .name("test-zone-pinned-client".to_string())
+            .spawn(move || acquire(registry, pin, service_port, &paths, "node-pinned", &status))
+            .expect("the daemon's thread spawns");
+
+        assert_eq!(
+            await_status(
+                || probe.get(),
+                "the pinned daemon never said what the machine's answerer is"
+            ),
+            ZoneAnswererStatus::ManagerHeld { port: service_port },
+            "a pinned daemon that publishes to the service reports the service's port"
+        );
+        let reply = await_answer(
+            || query(service_port, "web.min.internal.", RecordType::A),
+            "the pinned daemon's name never answered through the service",
+        );
+        assert_eq!(
+            a_answer(&reply),
+            web,
+            "the name answers at the service's port"
+        );
+        stop.store(true, Ordering::SeqCst);
+    }
+
+    /// A pinned daemon whose installed service's channel does not answer
+    /// names the service's port as held with nothing answering, not its
+    /// pin: the CLI reads that state at the service's port as the service
+    /// failing, and offers its reinstall.
+    #[test]
+    fn a_pinned_daemon_names_the_services_port_when_its_channel_fails() {
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channels");
+        let paths = test_paths(&dir, RELEASE_WINDOW);
+        drop(UnixListener::bind(&paths.global).expect("the refusing socket binds"));
+        std::fs::write(&paths.marker, b"").expect("the marker is written");
+        let pin = free_port();
+        assert_ne!(pin, DEFAULT_ANSWERER_PORT, "the pin is off the default");
+        let (registry, _) = web_registry();
+        let status = AnswererStatus::starting();
+        let probe = status.clone();
+        std::thread::Builder::new()
+            .name("test-zone-pinned-refused".to_string())
+            .spawn(move || {
+                acquire(
+                    registry,
+                    pin,
+                    DEFAULT_ANSWERER_PORT,
+                    &paths,
+                    "node-pinned",
+                    &status,
+                );
+            })
+            .expect("the daemon's thread spawns");
+        await_status_is(
+            &probe,
+            ZoneAnswererStatus::PortHeldNoChannel {
+                port: DEFAULT_ANSWERER_PORT,
+            },
+            "a pinned daemon named its pin for the installed service's failure",
+        );
+    }
+
     /// Two answerers on different pinned hook ports both bind and both
     /// answer — the shape of a VM host daemon pinned off the default beside
     /// another answerer that holds its own port with its own channel (a
@@ -6924,7 +7056,7 @@ mod tests {
         let node = node.to_string();
         std::thread::Builder::new()
             .name("test-zone-daemon".to_string())
-            .spawn(move || acquire(registry, port, &paths, &node, &status))
+            .spawn(move || acquire(registry, port, port, &paths, &node, &status))
             .expect("the daemon's thread spawns");
         probe
     }
@@ -7924,7 +8056,7 @@ mod tests {
             .name("test-zone-daemon".to_string())
             .spawn(move || {
                 tracing::dispatcher::with_default(&dispatch, || {
-                    acquire(registry, port, &daemon_paths, "node-a", &status);
+                    acquire(registry, port, port, &daemon_paths, "node-a", &status);
                 });
             })
             .expect("the daemon's thread spawns");
