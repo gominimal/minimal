@@ -8,11 +8,16 @@
 //! `op::materialize`) and the span it was emitted in; [`FillBody`], the
 //! logger's first processor, then gives the record the body
 //! `<target>::<span name> failed: <error>`, or `<target>: <error>` when there
-//! is no span or the span is from another target. The span is the one the
-//! event was emitted in even when the export filter hides it. The rule
-//! is structural, so it applies at every level (`err(level = "warn")` makes
-//! the same record at WARN). The `error` attribute is kept as it is; a record
-//! with a message, or with no string `error` attribute, is not touched.
+//! is no span or the span is from another target. For a contextual event the
+//! span is the subscriber's current one, so it is the span the event was
+//! emitted in even when the export filter hides it, provided another layer
+//! admitted that span; when none did, the span was never created, and a
+//! current span the caller entered is named in its place if it has the
+//! event's target. An explicit `parent:` is named only when the export filter
+//! admits it; a parent it hides names no span. The rule is structural, so it
+//! applies at every level (`err(level = "warn")` makes the same record at
+//! WARN). The `error` attribute is kept as it is; a record with a message, or
+//! with no string `error` attribute, is not touched.
 
 use std::cell::Cell;
 use std::time::Duration;
