@@ -77,6 +77,7 @@ pub enum WireError {
     ChecksumMismatch,
     UnsupportedVersion(u32),
     FileHashMismatch { filename: String },
+    LocalFileName { filename: String },
     RecordTooLarge { len: u64, max: u64 },
 }
 
@@ -109,6 +110,10 @@ impl fmt::Display for WireError {
             Self::FileHashMismatch { filename } => {
                 write!(f, "blake3 hash mismatch for file {filename:?}")
             }
+            Self::LocalFileName { filename } => write!(
+                f,
+                "local file name {filename:?} must be a relative path to a file, with no \"..\""
+            ),
             Self::RecordTooLarge { len, max } => {
                 write!(f, "record length {len} exceeds maximum {max}")
             }
@@ -678,7 +683,9 @@ fn materialize_local_file(
         || file_header.filename.ends_with('/')
         || file_header.filename.ends_with("/.")
     {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "unsafe local file name").into());
+        return Err(WireError::LocalFileName {
+            filename: file_header.filename.clone(),
+        });
     }
     // A local input declared in a subdirectory of its package (`files/a.patch`)
     // keeps that relative name on the wire; create its directories under
@@ -1265,17 +1272,39 @@ mod tests {
         ] {
             let mut td = None;
             let mut counter = 0;
+            let err = materialize_local_file(
+                &local_file_payload(name, b"x"),
+                &mut td,
+                &mut counter,
+                None,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{name:?} was accepted"));
             assert!(
-                materialize_local_file(
-                    &local_file_payload(name, b"x"),
-                    &mut td,
-                    &mut counter,
-                    None
-                )
-                .is_err(),
-                "{name:?} was accepted"
+                matches!(&err, WireError::LocalFileName { filename } if filename == name),
+                "{name:?}: {err:?}"
+            );
+            // The message shows the name, escaped, so a reader can find the input.
+            assert!(
+                err.to_string().contains(&format!("{name:?}")),
+                "{name:?}: {err}"
             );
         }
+        // A name from the wire may hold control characters; the message escapes them.
+        let err = materialize_local_file(
+            &local_file_payload("files/\x1b[2J/", b"x"),
+            &mut None,
+            &mut 0,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            concat!(
+                r#"local file name "files/\u{1b}[2J/" "#,
+                r#"must be a relative path to a file, with no "..""#,
+            )
+        );
         for name in [
             "a.patch",
             "files/a.patch",
