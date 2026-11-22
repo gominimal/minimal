@@ -773,6 +773,43 @@ fn logs_only_installs_no_tracer() {
     assert!(log_bodies(&lines).contains(&"logs-only-event".to_owned()));
 }
 
+/// gominimal/minimal#3223, through the stack `init` and `log_layer` build:
+/// the event of a failing `#[instrument(err)]` function, which has an `error`
+/// field and no message, is spooled with the body `<target>::<span> failed:
+/// <error>`. That takes both halves of the wiring, the `BodyFromError` wrap
+/// in `log_layer` and the `FillBody` processor `init` puts first on the
+/// logger; without either the record is spooled with no body.
+#[test]
+fn an_instrumented_failure_is_spooled_with_a_body() {
+    let tmp = private_tempdir();
+    child(
+        "helper_instrumented_failure",
+        &[
+            ("MINIMAL_TELEMETRY", "1"),
+            ("MINIMAL_OTEL_SPOOL_DIR", to_str(tmp.path())),
+        ],
+    );
+    let lines = spool(tmp.path());
+    let failed: Vec<&J> = logs(&lines)
+        .into_iter()
+        .map(|(_, _, r)| r)
+        .filter(|r| {
+            r["attributes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|a| a["key"] == "error" && a["value"]["stringValue"] == "disk full")
+        })
+        .collect();
+    assert_eq!(failed.len(), 1, "one record carries the error: {lines:?}");
+    let want = format!("{}::fails_to_write failed: disk full", module_path!());
+    assert_eq!(
+        failed[0]["body"]["stringValue"].as_str(),
+        Some(want.as_str()),
+        "{lines:?}"
+    );
+}
+
 /// TEL-010: a CLI that leaves through
 /// `process::exit` flushes from the atexit hook within its bound, against a
 /// collector that accepts and never answers, and the span is spooled.
@@ -1384,6 +1421,21 @@ fn helper_logs_only() {
         println!("MARK align {}", if a.is_some() { "Some" } else { "None" });
         span.in_scope(|| tracing::info!("logs-only-event"));
     });
+}
+
+/// Fails the #3223 way: `err` logs the error as the event's only field.
+#[tracing::instrument(err)]
+fn fails_to_write() -> Result<(), String> {
+    Err("disk full".to_owned())
+}
+
+/// One call of [`fails_to_write`] under [`installed`].
+#[test]
+fn helper_instrumented_failure() {
+    if !in_child() {
+        return;
+    }
+    tracing::subscriber::with_default(installed(), || assert!(fails_to_write().is_err()));
 }
 
 /// The CLI's exit path: one span, the CLI exit bound, then `process::exit`
