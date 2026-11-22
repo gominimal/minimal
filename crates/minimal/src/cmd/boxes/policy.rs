@@ -479,44 +479,6 @@ pub fn write_unaudited_listen_ports(
 /// held beside the emitter that writes it, in `main`.
 pub const POLICY_JSON_SCHEMA: &str = "min/v1/session-policy";
 
-/// The `[network]` section a box was created with (BCLI-025), from the
-/// network mode and the policy its record stores: the values the creating
-/// command's override flags left after they applied (BCLI-024). These are
-/// the values the create request stamped into the box's spec
-/// ([`crate::spec_flags`]), so the section is written through the spec's
-/// own serializer, key for key as the stored spec holds it.
-///
-/// It is the stored declaration, not the policy the gate enforces:
-/// `min session policy` renders that one ([`format_policy`]).
-///
-/// # Errors
-///
-/// Fails when the section cannot be encoded as TOML or `out` fails.
-pub fn write_stored_network(
-    out: &mut impl std::io::Write,
-    network: boxes::NetworkMode,
-    policy: &boxes::BoxPolicy,
-) -> Result<(), anyhow::Error> {
-    let spec = mfile::spec::BoxSpec::for_session(
-        None,
-        mfile::spec::SpecFlags {
-            network,
-            policy: policy.clone(),
-            hooks_enabled: true,
-        },
-    );
-    let mut document =
-        toml::Table::try_from(&spec).context("Cannot encode the box's network section")?;
-    let section = document
-        .remove("network")
-        .context("The box's spec has no network section")?;
-    let mut table = toml::Table::new();
-    table.insert("network".to_owned(), section);
-    let text = toml::to_string(&table).context("Cannot encode the box's network section")?;
-    out.write_all(text.as_bytes())?;
-    Ok(())
-}
-
 /// The ingress block as the document carries it: the declared policy, or
 /// `deny_all` where the text rendering writes that reading — the same
 /// decision its "deny-all" line makes, so the document never claims rules
@@ -712,6 +674,10 @@ struct PolicyJson<'a> {
     /// predates the fact, or a facts fetch that failed, also leaves.
     #[serde(skip_serializing_if = "no_shared_port_collisions")]
     shared_port_collisions: &'a [minimald_rpc::SharedPortCollision],
+    /// BCLI-024: the VPN networks the box's stored spec keeps, in its
+    /// order. Absent when the box keeps no names.
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    vpn_network_names: &'a [String],
 }
 
 /// Serde helper: leave [`PolicyJson::shared_port_collisions`] out when empty.
@@ -787,6 +753,7 @@ pub fn write_policy_json(
         live,
         shared_port_collisions,
         &[],
+        &[],
     )
 }
 
@@ -806,6 +773,7 @@ pub fn write_policy_json_noting(
     live: Result<Vec<minimald_rpc::LiveMapping>, String>,
     shared_port_collisions: &[minimald_rpc::SharedPortCollision],
     unaudited_listen_ports: &[u16],
+    vpn_network_names: &[String],
 ) -> Result<(), anyhow::Error> {
     // A none box has no policy to describe; the text rendering's one-line
     // note is prose for a person, so the document carries the schema, the
@@ -825,6 +793,7 @@ pub fn write_policy_json_noting(
             live_ingress: None,
             unaudited_listen_ports: &[],
             shared_port_collisions: &[],
+            vpn_network_names,
         }
     } else {
         // The baseline set is a switch-fabric surface, held to the same
@@ -886,6 +855,7 @@ pub fn write_policy_json_noting(
             } else {
                 shared_port_collisions
             },
+            vpn_network_names,
         }
     };
     let encoded =
@@ -900,11 +870,6 @@ pub fn write_policy_json_noting(
 /// across every machine-output command) and the hint naming the remedy, or
 /// the kind of thing that was missing.
 enum PolicyJsonFailure {
-    /// No daemon to ask: the autospawn, the connection, or an RPC the daemon
-    /// never answered.
-    DaemonUnreachable(String),
-    /// The daemon answered, but nothing matches the selector.
-    SessionNotFound(String),
     /// The session resolved, but its effective policy could not be read.
     PolicyUnavailable(String),
 }
@@ -915,23 +880,6 @@ impl PolicyJsonFailure {
     /// [`MachineModeFailure`]), this walk's kinds mapped onto it.
     fn machine_failure(&self) -> MachineModeFailure {
         match self {
-            Self::DaemonUnreachable(message) => MachineModeFailure::new(
-                "daemon_unreachable",
-                message.clone(),
-                "the daemon may be down or mid-restart; try again, and check \
-                 that --minimal-dir and --vm name the instance you meant"
-                    .to_string(),
-            ),
-            // The architecture's code for a missing thing, with the kind —
-            // a session — in the message (from the shared resolver, which
-            // already names it) and in the hint beside it.
-            Self::SessionNotFound(message) => MachineModeFailure::new(
-                "not_found",
-                message.clone(),
-                "no session by that name or id exists; `min ls` lists the \
-                 sessions there are"
-                    .to_string(),
-            ),
             Self::PolicyUnavailable(message) => MachineModeFailure::new(
                 "policy_unavailable",
                 message.clone(),
@@ -998,20 +946,17 @@ pub(crate) async fn fetch_live_ingress_degrading(
         })
 }
 
-/// The walk behind the JSON rendering: the same three steps as the text
-/// walk — resolve the record, read the effective policy, list the live
-/// mappings — with each failure tagged where the kinds can be told apart,
-/// since the error document's `code` is a contract. The live fetch comes
-/// back as its own result rather than degraded here, because the two
-/// renderings degrade differently (see [`fetch_live_ingress`]): the
-/// document says the unknown itself, so nothing is printed for it on a
-/// stderr the error object has alone.
+/// The read step behind the JSON rendering, for the box `record` names on
+/// the host `client` talks to: the effective policy, the live mappings and
+/// the runtime facts. The live fetch comes back as its own result rather
+/// than degraded here, because the two renderings degrade differently (see
+/// [`fetch_live_ingress`]): the document says the unknown itself, so
+/// nothing is printed for it on a stderr the error object has alone.
 async fn box_policy_json_inputs(
-    global: &GlobalArgs,
-    box_name: &str,
+    client: &mut client::Client,
+    record: &boxes::Record,
 ) -> Result<
     (
-        boxes::Record,
         boxes::EffectiveBoxPolicy,
         Result<Vec<minimald_rpc::LiveMapping>, String>,
         Vec<u16>,
@@ -1019,30 +964,6 @@ async fn box_policy_json_inputs(
     ),
     PolicyJsonFailure,
 > {
-    ensure_daemon(global)
-        .map_err(|error| PolicyJsonFailure::DaemonUnreachable(format!("{error:#}")))?;
-    let client = connect_daemon(global)
-        .await
-        .map_err(|error| PolicyJsonFailure::DaemonUnreachable(format!("{error:#}")))?;
-
-    // The record the ingress key is gated on, resolved through the same
-    // lookup the text walk uses — on the VM that owns the name (NET-058) —
-    // with the failure kinds told apart where they can be: an RPC the daemon
-    // never answered is no daemon to ask; a lookup that answered with
-    // nothing, or a box on a stopped VM, is the not-found itself.
-    let example = format!("session policy {box_name} -o json");
-    let (mut client, record) = resolve_box_on_any_vm(global, client, box_name, &example)
-        .await
-        .map_err(|error| {
-            if error.downcast_ref::<BoxNotFound>().is_some()
-                || error.downcast_ref::<AmbiguousIdPrefix>().is_some()
-                || error.downcast_ref::<AmbiguousBoxName>().is_some()
-            {
-                PolicyJsonFailure::SessionNotFound(error.to_string())
-            } else {
-                PolicyJsonFailure::DaemonUnreachable(format!("{error:#}"))
-            }
-        })?;
     // By the resolved id, as the text walk does.
     let box_id = &record.id.to_string();
 
@@ -1056,7 +977,7 @@ async fn box_policy_json_inputs(
         .await
         .map_err(|error| PolicyJsonFailure::PolicyUnavailable(format!("{error:#}")))?;
 
-    let live = fetch_live_ingress(&mut client, box_id).await;
+    let live = fetch_live_ingress(client, box_id).await;
     // The listen publishes the audit log refused (NET-046) and the yielded
     // shared-address ports (NET-129), from the runtime facts the text walk
     // reads them from. Optional facts: a daemon that cannot answer — an older
@@ -1077,45 +998,40 @@ async fn box_policy_json_inputs(
     };
 
     match resp {
-        minimald_rpc::Errorable::Ok(policy) => Ok((
-            record,
-            policy,
-            live,
-            unaudited_listen_ports,
-            shared_port_collisions,
-        )),
+        minimald_rpc::Errorable::Ok(policy) => {
+            Ok((policy, live, unaudited_listen_ports, shared_port_collisions))
+        }
         minimald_rpc::Errorable::Err { error } => {
             Err(PolicyJsonFailure::PolicyUnavailable(error.to_string()))
         }
     }
 }
 
-/// The `-o json` rendering: the walk's inputs as one `min/v1/session-policy`
-/// document on stdout, or the failure's one `min/v1/error` object on stderr
-/// and a non-zero exit — never a document beside a plain-text error line,
-/// so a client parses exactly one thing. The walk never writes the object
-/// itself: it fails into the generic [`MachineModeFailure`] payload, which
-/// `main`'s machine-mode error emitter — keyed on the output mode, shared
-/// by every command that takes `-o json` — writes, so the error path is
-/// one mechanism rather than a per-command one.
-pub(crate) async fn box_policy_as_json(
-    global: &GlobalArgs,
-    box_name: &str,
+/// Writes the `-o json` rendering of the box `record` names on the host
+/// `client` talks to, a host of `host_kind`: one `min/v1/session-policy`
+/// document on `out`. A failure is the generic [`MachineModeFailure`]
+/// payload, which `main`'s machine-mode error emitter — keyed on the output
+/// mode, shared by every command that takes `-o json` — writes as the one
+/// `min/v1/error` object, so a client never sees a document beside a
+/// plain-text error line.
+pub(crate) async fn write_box_policy_json(
+    out: &mut impl std::io::Write,
+    client: &mut client::Client,
+    record: &boxes::Record,
+    host_kind: paths::HostKind,
+    vpn_network_names: &[String],
 ) -> Result<(), anyhow::Error> {
-    let (record, policy, live, unaudited_listen_ports, shared_port_collisions) =
-        match box_policy_json_inputs(global, box_name).await {
-            Ok(inputs) => inputs,
-            Err(failure) => return Err(failure.machine_failure().into()),
-        };
+    let (policy, live, unaudited_listen_ports, shared_port_collisions) =
+        box_policy_json_inputs(client, record)
+            .await
+            .map_err(|failure| failure.machine_failure())?;
     // The fabric the baseline set builds from — keyed the same way the text
-    // rendering keys it (see the comment in [`cmd_session_policy`]): the
-    // backend this command actually talks to, with no fabric named for the
-    // native daemon's per-daemon switch.
-    let host_kind = daemon_host_kind(global);
+    // rendering keys it (see [`write_box_network`]): the backend this
+    // command actually talks to, with no fabric named for the native
+    // daemon's per-daemon switch.
     let fabric = (host_kind == paths::HostKind::Minvmd).then_some(switch::SwitchSubnet::default());
-    let mut out = std::io::stdout();
     write_policy_json_noting(
-        &mut out,
+        out,
         &policy,
         record.network,
         host_kind,
@@ -1123,6 +1039,7 @@ pub(crate) async fn box_policy_as_json(
         live,
         &shared_port_collisions,
         &unaudited_listen_ports,
+        vpn_network_names,
     )
     .context(OutputWriteError)?;
     out.flush().context(OutputWriteError)?;
@@ -1709,6 +1626,7 @@ mod tests {
                 Ok(Vec::new()),
                 &[],
                 &[],
+                &[],
             )
             .unwrap();
             serde_json_lenient::from_slice::<serde_json_lenient::Value>(&out).unwrap()
@@ -2060,6 +1978,7 @@ mod tests {
                 Ok(Vec::new()),
                 &[],
                 ports,
+                &[],
             )
             .unwrap();
             serde_json_lenient::from_slice::<serde_json_lenient::Value>(&out).unwrap()
@@ -2272,42 +2191,11 @@ mod tests {
         );
     }
 
-    /// The walk's failure kinds map onto the machine-mode error payload:
-    /// the architecture's codes — `not_found` for a missing thing, with
-    /// the kind of thing that was missing (a session) in the message and
-    /// the hint, never a policy-specific spelling — beside the message and
-    /// the hint the object carries. The one-object shape the payload
-    /// becomes on stderr is pinned beside the emitter that writes it, in
-    /// `main`'s own tests, since writing it is the emitter's job now.
+    /// The walk's failure maps onto the machine-mode error payload, with
+    /// its own code. The one-object shape the payload becomes on stderr is
+    /// pinned beside the emitter that writes it, in `main`'s own tests.
     #[test]
     fn policy_json_failures_map_to_the_machine_mode_payload() {
-        let missing =
-            PolicyJsonFailure::SessionNotFound("No session found matching 'gone'".to_string())
-                .machine_failure();
-        assert_eq!(
-            missing.code(),
-            "not_found",
-            "a missing session is the architecture's not-found code, not a \
-             policy spelling"
-        );
-        assert!(
-            missing.message().contains("session"),
-            "the message names the kind of thing that was missing: {}",
-            missing.message()
-        );
-        assert!(
-            missing.hint().contains("session"),
-            "the hint names the kind of thing that was missing: {}",
-            missing.hint()
-        );
-
-        // The other two kinds keep their own codes, the same vocabulary.
-        assert_eq!(
-            PolicyJsonFailure::DaemonUnreachable(String::new())
-                .machine_failure()
-                .code(),
-            "daemon_unreachable",
-        );
         assert_eq!(
             PolicyJsonFailure::PolicyUnavailable(String::new())
                 .machine_failure()

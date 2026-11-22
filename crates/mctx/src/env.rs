@@ -258,6 +258,7 @@ impl EnvChannel<'_> {
             std::fs::create_dir_all(&output_base).ok();
 
             let cache = build_ctx.local_cache();
+            let (classifier_leaf, box_network) = patched_build_egress(&build_ctx);
             let (stdout_writer, stderr_writer) = StreamWriter::pair(stream);
             let res = op::PatchedBuild {
                 spec: &bsr,
@@ -265,10 +266,8 @@ impl EnvChannel<'_> {
                 stdout_writer: Some(Box::new(stdout_writer)),
                 stderr_writer: Some(Box::new(stderr_writer)),
                 remote_cache: remote_cache.as_ref(),
-                // NET-155: a client-side patched build runs for no box, so it
-                // stays the caller's own traffic.
-                classifier_leaf: None,
-                box_network: None,
+                classifier_leaf,
+                box_network,
             }
             .run(&op::Options {
                 cache,
@@ -647,8 +646,44 @@ pub struct EnvArgs<'a> {
     /// resolver the sandbox gets, and does any post-spawn wiring; see
     /// [`sandbox::Network`].
     pub network: std::sync::Arc<dyn sandbox::Network>,
+    /// The classifier leaf of the box the environment runs for, if any. A
+    /// task of a host-address box runs in its box's leaf, so the box's
+    /// egress verdict decides the task's connections. `None` runs the
+    /// sandbox as its caller's own traffic.
+    pub classifier_leaf: Option<sandbox::config::ClassifierLeaf>,
     /// The operation tracker to use downstream, if applicable.
     pub ot: Option<OpTracker>,
+}
+
+/// The classifier leaf and the box network a `min patched-pkg` build runs
+/// on, from the context of the box it runs for. The build takes the box's
+/// leaf, or the box's network when the box has no leaf, as the session
+/// channel in `minimald` does. A context made for no box gives neither, so
+/// the build stays its caller's own traffic.
+pub(crate) fn patched_build_egress(
+    ctx: &Context,
+) -> (
+    Option<sandbox::config::ClassifierLeaf>,
+    Option<op::BuildNetwork>,
+) {
+    match ctx.classifier_leaf() {
+        Some(leaf) => (Some(leaf.clone()), None),
+        None => (None, ctx.box_network().cloned()),
+    }
+}
+
+/// Places the sandbox `config` in `leaf`, the classifier leaf of the box a
+/// task runs for. The sandbox's pre-exec closure joins every invocation to
+/// the leaf, so the task gets its box's egress. No leaf leaves `config` as
+/// it is.
+pub(crate) fn place_in_classifier_leaf(
+    config: sandbox::config::Config,
+    leaf: Option<sandbox::config::ClassifierLeaf>,
+) -> sandbox::config::Config {
+    match leaf {
+        Some(leaf) => config.with_classifier_leaf(leaf),
+        None => config,
+    }
 }
 
 /// Returns a clone of `task` with every action string interpolated against
@@ -1360,6 +1395,7 @@ impl<'a> Env<'a> {
             // own DNS need does not enter into it.
             .with_network(args.network)
             .with_env_vars(pkg_env_vars.into_iter());
+        config = place_in_classifier_leaf(config, args.classifier_leaf);
         if let Some(id) = ctx.daemon_id() {
             config = config.with_daemon_id(id);
         }

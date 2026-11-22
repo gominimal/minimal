@@ -1770,10 +1770,10 @@ fn root_constraint_refusal(
 }
 
 /// The admission check of BOX-160 for a start from a box's stored spec
-/// (BOX-025, BOX-176): the stored bytes go through
-/// [`root_constraint_refusal`], the check a create of the same spec meets,
-/// with the record's type in the place of the creating verb's. A start is
-/// refused wherever a create of that spec would be.
+/// (BOX-025, BOX-176): `spec`, the stored spec as its caller parsed it,
+/// goes through [`root_constraint_refusal`], the check a create of the
+/// same spec meets, with the record's type in the place of the creating
+/// verb's. A start is refused wherever a create of that spec would be.
 ///
 /// # Errors
 ///
@@ -1781,17 +1781,10 @@ fn root_constraint_refusal(
 /// from it rather than a create. A create refuses it with exit 3, and so
 /// does the start.
 pub(crate) fn stored_spec_root_refusal(
-    stored: &[u8],
+    spec: &serde_json_lenient::Value,
     record_type: &str,
 ) -> Result<(), std::io::Error> {
-    let refused = |why: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, why);
-    let spec =
-        serde_json_lenient::from_slice::<serde_json_lenient::Value>(stored).map_err(|e| {
-            refused(format!(
-                "The settings it was created with cannot be read: {e}."
-            ))
-        })?;
-    let why = match root_constraint_refusal(&spec, record_type) {
+    let why = match root_constraint_refusal(spec, record_type) {
         Ok(()) => return Ok(()),
         Err(AdmissionRootRefusal::Constraint(refusal)) => format!(
             "The settings it was created with set `{key}` to `{value}`, and a {kind} \
@@ -1810,13 +1803,23 @@ pub(crate) fn stored_spec_root_refusal(
              `{key}` to `{value}`, and the built-in type `{builtin_type}` is its own root."
         ),
         Err(AdmissionRootRefusal::UnknownRoot(UnknownRootRefusal { key, value, .. })) => {
-            format!(
-                "The settings it was created with set `{key}` to `{value}`, which names no \
-                 built-in type."
-            )
+            // As the create's refusal words it: a `type.root` that is not
+            // a built-in type, or a project type that does not name the
+            // built-in type it extends.
+            if key == "type.root" {
+                format!(
+                    "The settings it was created with set `type.root` to `{value}`, which is \
+                     not a built-in type."
+                )
+            } else {
+                format!(
+                    "The settings it was created with set `box.type` to `{value}`, but they \
+                     do not name the built-in type that `{value}` extends."
+                )
+            }
         }
     };
-    Err(refused(why))
+    Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, why))
 }
 
 /// Checks `spec` against the constraints of the built-in `root`, for a
@@ -2004,6 +2007,19 @@ fn unenrolled_broker_refusal(
 /// a node-local proxy serves no other brokered secret.
 fn proxy_root_certificate(certificate: Option<&str>) -> bool {
     certificate.is_some_and(crate::env::is_one_certificate)
+}
+
+/// The exit code of a create that the admission check of BOX-160 refused:
+/// the error carries a [`RootConstraintRefusal`] or an
+/// [`UnknownRootRefusal`]. `None` for any other error.
+pub(crate) fn admission_refusal(error: &std::io::Error) -> Option<u8> {
+    let inner = error.get_ref()?;
+    let code = if let Some(refusal) = inner.downcast_ref::<RootConstraintRefusal>() {
+        refusal.exit_code()
+    } else {
+        inner.downcast_ref::<UnknownRootRefusal>()?.exit_code()
+    };
+    u8::try_from(code).ok()
 }
 
 /// The un-enrolled refusal an error from a create carries, if any.
@@ -4578,8 +4594,6 @@ impl BoxManager {
                     exit_code = refusal.exit_code(),
                     "refused a create: the box spec carries a value its type's built-in root excludes"
                 );
-                // The reply carries the refusal's text but not its code,
-                // so `min` exits 1 and not 3 (#3313).
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     refusal,
@@ -4595,8 +4609,6 @@ impl BoxManager {
                     builtin_type = refusal.builtin_type,
                     "refused a create: the box spec does not name its type's built-in root"
                 );
-                // The reply carries the refusal's text but not its code,
-                // so `min` exits 1 and not 3 (#3313).
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     refusal,

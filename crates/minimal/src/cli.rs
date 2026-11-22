@@ -1,6 +1,6 @@
 //! `clap` argument definitions for the `min` CLI.
 
-use clap::{ArgGroup, Args, Subcommand, ValueEnum};
+use clap::{Args, Subcommand, ValueEnum};
 // Re-exported so the crate-root glob (`pub use cli::*`) keeps `Parser` in scope
 // for tests that call `Cli::try_parse_from`, exactly as the old single-module
 // layout did.
@@ -72,24 +72,19 @@ pub enum Command {
     // (BCLI-030) and takes the `min box list` flags. Not an oversight — do
     // not remove it.
     Ls(LsArgs),
-    /// Shut down the minimald daemon
-    //
-    // Stays top-level: it acts on the daemon backend, not on any session, and
-    // it is the daemon-lifecycle command people reach for. Documented as a
-    // deliberate exception in docs/reference/cli.md.
-    Stop(StopArgs),
-    /// Session management subcommands
+    // BCLI-042: no bare `min stop`. `min host stop` takes its place.
+    /// Session subcommands: the box commands for session boxes
     #[command(visible_alias = "sessions")]
     Session(SessionArgs),
     /// Loadout management subcommands
     #[command(visible_alias = "loadouts")]
     Loadout(LoadoutArgs),
-    /// Task subcommands: run declared project tasks in ephemeral sessions
+    /// Task subcommands: run the project's tasks, each in a box of its own
     #[command(visible_alias = "tasks")]
     Task(TaskArgs),
     /// Network subcommands: bring a box's services to the laptop
     Net(NetArgs),
-    /// Box subcommands: show what a box will get
+    /// Box subcommands: create, run, inspect, stop and remove boxes
     #[command(visible_alias = "boxes")]
     Box(BoxArgs),
     /// Host subcommands: the daemons on this machine that run boxes
@@ -163,8 +158,8 @@ pub enum Command {
     /// standard library is embedded in the `min` binary and is only refreshed
     /// or verified locally — its commit is not re-pinned. This leaves
     /// `minimal.toml` modified in your working tree (a diff to commit),
-    /// and the next `min session activate` materializes the new closure, which
-    /// can take several minutes on the first activate.
+    /// and the next `min session start` materializes the new closure, which
+    /// can take several minutes on the first start.
     ///
     /// This does not update the `min` binary itself; reinstall it with the
     /// installer to do that.
@@ -181,7 +176,7 @@ pub enum Command {
     /// Demo the client's activity spinner (development aid).
     ///
     /// Draws the same build-hold-fade spinner used by the file-upload
-    /// phases of `min session activate` so you can eyeball timing and layout
+    /// phases of `min session start` so you can eyeball timing and layout
     /// without triggering a real upload. Stops after `--seconds` or
     /// on Ctrl-C, whichever comes first. Debug builds only.
     #[cfg(debug_assertions)]
@@ -235,8 +230,8 @@ pub enum SessionCommand {
     /// project
     #[command(visible_alias = "ls")]
     List(BoxListArgs),
-    /// Activate (create) a new session
-    Activate(ActivateArgs),
+    // BCLI-042: no `activate`, `destroy`, `exec`, `rename`, `policy`,
+    // `hooks` or `run` here. They fail as unknown commands.
     /// Create a box from a session entry of the project and attach this
     /// terminal to it. `--detach` creates the box, prints its id and returns
     Start(SessionStartArgs),
@@ -244,21 +239,6 @@ pub enum SessionCommand {
     /// attach to this project's running session box that has a terminal,
     /// else to its only stopped or exited one, which starts again
     Attach(AttachArgs),
-    /// Execute a command in an existing session
-    Exec(ExecArgs),
-    /// Run a declared task in an existing session
-    ///
-    /// The task runs in the named session's context, serviced by the daemon —
-    /// the counterpart to `min task run <task>`, which composes a task session
-    /// of its own instead of reusing one you already have.
-    Run(SessionRunArgs),
-    /// Destroy (terminate) a session
-    Destroy(DestroyArgs),
-    /// Rename an existing session
-    Rename(RenameArgs),
-    /// Print the effective networking policy for a session, as text or as
-    /// one JSON document (`-o json`)
-    Policy(PolicyArgs),
     /// Register a session as an SSH remote in Zed's settings
     ///
     /// Upserts an entry into the `ssh_connections` array of Zed's
@@ -280,9 +260,6 @@ pub enum SessionCommand {
     #[command(name = "setup-zed", verbatim_doc_comment)]
     #[command(hide = true)]
     SetupZed(SetupZedArgs),
-    /// List the lifecycle hooks composed into a session, and where each
-    /// was declared
-    Hooks(HooksArgs),
     /// Show what a session's terminal printed, from its start. `-f` keeps
     /// showing new output until the session is removed or the command is
     /// interrupted
@@ -311,62 +288,6 @@ pub struct SetupZedArgs {
     pub print: bool,
 }
 
-/// Args for `min session hooks`.
-#[derive(Debug, Args)]
-pub struct HooksArgs {
-    /// Session identifier (UUID, unique id prefix, or session name)
-    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
-    pub session: String,
-    /// Emit the raw JSON the daemon returned instead of a table
-    #[arg(long)]
-    pub json: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct ExecArgs {
-    /// Session identifier (UUID, unique id prefix, or session name).
-    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
-    pub session: String,
-    /// Command to execute in the session context
-    ///
-    /// A single argument is a shell command, run by the session's shell with
-    /// its pipes, globs and `$VAR` intact: `min session exec s 'echo $PWD'`.
-    /// Several arguments are an argv, quoted so the session sees exactly the
-    /// words you typed: `min session exec s sh -c 'echo A B'`.
-    #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
-    pub command: Vec<String>,
-}
-
-#[derive(Debug, Args)]
-pub struct SessionRunArgs {
-    /// Session identifier (UUID, unique id prefix, or session name).
-    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
-    pub session: String,
-    /// Name of a task declared in the session project's minimal.toml
-    pub task: String,
-}
-
-#[derive(Debug, Args)]
-pub struct PolicyArgs {
-    /// Session identifier (UUID, unique id prefix, or session name)
-    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
-    pub session: String,
-    /// Write one JSON document instead of text (the default)
-    #[arg(short = 'o', long = "output", value_enum)]
-    pub output: Option<PolicyOutputFormat>,
-}
-
-/// The rendering `min session policy` writes. One value today — `json`, the
-/// machine-readable shape — beside the text default; an `output` enum rather
-/// than a bare `--json` flag so a second format lands beside the first
-/// instead of accreting flags.
-#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
-pub enum PolicyOutputFormat {
-    /// One JSON document, `min/v1/session-policy`, with each live mapping's
-    /// `pending` state carried
-    Json,
-}
-
 /// The typed failure a machine-output run fails its walk into: the
 /// `code`, `message` and `hint` of the one `min/v1/error` object the CLI's
 /// `main` writes on stderr when the run ends non-zero. Keyed on the output
@@ -384,7 +305,7 @@ pub struct MachineModeFailure {
     /// The failure's kind: a name a script branches on — the
     /// architecture's codes, `not_found` for a missing thing (with the
     /// kind of thing that was missing in the message and the hint),
-    /// `daemon_unreachable`, `policy_unavailable` — never a single
+    /// `policy_unavailable` — never a single
     /// command's own spelling.
     code: &'static str,
     message: String,
@@ -485,7 +406,7 @@ pub enum BoxCommand {
     List(BoxListArgs),
     /// Show one box: its id, name, type, parent, project, state, how it
     /// ended, the identity it runs under, and its provider and host.
-    /// `--network` shows the box's network section in its place
+    /// `--network` shows the box's effective network policy in its place
     Show(BoxShowArgs),
     /// Stop a running box and keep it: its record, its events and its
     /// files stay until `min box rm` removes them. `--force` kills every
@@ -767,14 +688,17 @@ pub struct BoxShowArgs {
     /// prints them
     #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: String,
-    /// Show only the box's `[network]` section, as the box was created
-    /// with it: its network mode, ingress and egress, with the flags of
-    /// the command that created it applied
+    /// Show the box's effective network policy in place of the box: the
+    /// ingress and egress rules in force, and the ports the box published
+    /// while it runs. With `-o json`, write it as one JSON document. `-o
+    /// yaml` is not available with this flag
     #[arg(long)]
     pub network: bool,
     /// Write the box and its running commands in this format instead of
-    /// text
-    #[arg(short = 'o', long = "output", value_enum, conflicts_with = "network")]
+    /// text. With `--network`, only `json` is available
+    // BCLI-025: `--network` takes `-o json`, and `cmd_box_show` refuses
+    // `-o yaml` with it as a usage error.
+    #[arg(short = 'o', long = "output", value_enum)]
     pub output: Option<BoxShowOutputFormat>,
 }
 
@@ -868,6 +792,19 @@ pub struct BoxWaitArgs {
     /// running or ended
     #[arg(long = "exec", value_name = "EXEC_ID")]
     pub exec: Option<String>,
+    /// When the box ends, write how it ended in this format on stdout
+    // BCLI-013, BCLI-033: one `min/v1/wait` object. An exec has no such
+    // object, so `--exec` refuses the flag.
+    #[arg(short = 'o', long = "output", value_enum, conflicts_with = "exec")]
+    pub output: Option<BoxWaitOutputFormat>,
+}
+
+/// The formats `min box wait` writes, beside text.
+// BCLI-033: the format carries one `min/v1/wait` object.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum BoxWaitOutputFormat {
+    /// JSON: one object that lists how the box ended
+    Json,
 }
 
 // BOX-149 (BCLI-053): `min box exec <box> [-t|--detach] [--timeout <d>] -- <cmd>`.
@@ -897,8 +834,10 @@ pub struct BoxExecArgs {
 }
 
 /// Why `min box exec` ran no command in the box: `-t` without a terminal
-/// (exit 2), the box is not running (BOX-149, exit 2), or its spec turns
-/// exec off (BOX-153, exit 5). `target` is the box as the user named it.
+/// (exit 2), the box is not running or stopped before the command started
+/// (BOX-149, exit 2), its spec turns exec off (BOX-153, exit 5), or the
+/// box's network rules could not be applied to the command (NET-079, exit
+/// 5). `target` is the box as the user named it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BoxExecRefusal {
     /// `-t` ran with a stdin that is not a terminal, so nothing started.
@@ -924,6 +863,20 @@ pub enum BoxExecRefusal {
         /// The box as the user named it.
         target: String,
     },
+    /// The box stopped after the exec reached it, before the command
+    /// started. Exit 2.
+    StoppedBeforeStart {
+        /// The box as the user named it.
+        target: String,
+    },
+    /// The box's host could not apply the box's network rules to the
+    /// command, so the command never started. Exit 5.
+    NetworkRulesNotApplied {
+        /// The box as the user named it.
+        target: String,
+        /// The error the host met, as the daemon's injection reported it.
+        cause: String,
+    },
 }
 
 impl BoxExecRefusal {
@@ -932,8 +885,12 @@ impl BoxExecRefusal {
     #[must_use]
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::NoTerminal { .. } | Self::NotRunning { .. } => 2,
-            Self::ExecDisabled { .. } | Self::SpecUnreadable { .. } => 5,
+            Self::NoTerminal { .. } | Self::NotRunning { .. } | Self::StoppedBeforeStart { .. } => {
+                2
+            }
+            Self::ExecDisabled { .. }
+            | Self::SpecUnreadable { .. }
+            | Self::NetworkRulesNotApplied { .. } => 5,
         }
     }
 
@@ -945,6 +902,8 @@ impl BoxExecRefusal {
             Self::NotRunning { .. } => "not running",
             Self::ExecDisabled { .. } => "exec disabled",
             Self::SpecUnreadable { .. } => "spec unreadable",
+            Self::StoppedBeforeStart { .. } => "stopped before start",
+            Self::NetworkRulesNotApplied { .. } => "network rules not applied",
         }
     }
 }
@@ -970,6 +929,15 @@ impl std::fmt::Display for BoxExecRefusal {
             Self::SpecUnreadable { target } => write!(
                 f,
                 "{target} does not allow exec: its spec cannot be read, so exec stays off."
+            ),
+            Self::StoppedBeforeStart { target } => {
+                write!(f, "{target} stopped before the command started.")
+            }
+            Self::NetworkRulesNotApplied { target, cause } => write!(
+                f,
+                "Did not run the command in {target}: the host could not apply the \
+                 box's network rules to it: {cause}. If it keeps failing, run \
+                 `min bug` to collect a diagnostic bundle."
             ),
         }
     }
@@ -1250,7 +1218,7 @@ pub enum TaskCommand {
     /// Run a declared task in a task box
     ///
     /// Creates a box for the project (named `<task>-<n>`), uploads the
-    /// project like `min session activate`, runs the task inside it, and
+    /// project like `min session start`, runs the task inside it, and
     /// exits with the task's exit code.
     ///
     /// The task runs without a terminal. A piped or redirected stdin goes to
@@ -1311,12 +1279,7 @@ pub enum TaskCommand {
 pub struct TaskRunArgs {
     /// Name of a task declared in the project's minimal.toml
     pub task: String,
-    /// Project path. Defaults to the directory set by `-C`/`--repo-dir`,
-    /// or the current working directory when neither is given. A named
-    /// option rather than a positional so that every positional after the
-    /// task name is a task argument, never a project path.
-    #[arg(long)]
-    pub path: Option<String>,
+    // BCLI-042: no `--path`. The global `-C <dir>` names the project.
     // The same values and parser as `min session activate --network`, with
     // help worded for a task box. With no flag, the box takes the task's
     // `network.mode` from minimal.toml, else `NETWORK_DEFAULT`.
@@ -1613,10 +1576,12 @@ pub struct GlobalArgs {
     pub config_dir: Option<PathBuf>,
     /// Select the daemon backend that hosts sessions.
     ///
-    /// On Linux, `local` (the default) runs minimald on the host;
-    /// `local-minvmd` runs it inside the minvmd microVM. No effect on macOS,
-    /// where minvmd is the only backend. `min provider list --all` lists the
-    /// providers on this machine.
+    /// On Linux, `local` runs minimald on the host and `local-minvmd` runs it
+    /// inside the minvmd microVM. Without this flag, `min` uses
+    /// `MIN_PROVIDER`, then the `provider` key of config.toml, then
+    /// `local-minvmd` where /dev/kvm opens for you and `local` where it does
+    /// not. No effect on macOS, where minvmd is the only backend. `min
+    /// provider list --all` lists the providers on this machine.
     #[arg(long, global = true, value_name = "PROVIDER")]
     pub provider: Option<Provider>,
     /// Skip interactive prompts that need a terminal.
@@ -1640,8 +1605,9 @@ pub struct GlobalArgs {
 }
 
 impl GlobalArgs {
-    /// Whether the minvmd microVM backend (DM1) is selected via
-    /// `--provider local-minvmd`.
+    /// Whether the minvmd microVM backend (DM1) is selected: by
+    /// `--provider local-minvmd`, or by the default a flagless command
+    /// resolves at dispatch ([`crate::hosts::resolve_default_provider`]).
     pub fn use_minvmd(&self) -> bool {
         matches!(self.provider, Some(Provider::LocalMinvmd))
     }
@@ -1802,8 +1768,8 @@ pub struct EgressArgs {
     /// `--network own_ip` and `--network host_ip`, and only `own_ip`
     /// enforces these rules: a `host_ip` box is refused at creation or, on
     /// a host that cannot filter it, runs with the rules unenforced.
-    /// `--network none` rejects every egress flag. `min session policy`
-    /// shows the rules a box ended up with.
+    /// `--network none` rejects every egress flag. `min box show <box>
+    /// --network` shows the rules a box ended up with.
     #[arg(long = "allow-subnets", value_name = "CIDR")]
     pub allow_subnets: Vec<String>,
     /// Allow outbound traffic to this DNS hostname, e.g. `github.com`.
@@ -1842,14 +1808,19 @@ pub struct EgressArgs {
 
 /// Which daemon backend (box host) serves sessions, as `--provider` names it.
 ///
-/// On Linux the default is the host-native daemon (DM2); `local-minvmd` runs
-/// `minimald` inside the minvmd microVM (DM1) instead. On macOS minvmd is the
-/// only backend, so the choice has no effect there.
+/// On Linux `local` is the host-native daemon (DM2) and `local-minvmd` runs
+/// `minimald` inside the minvmd microVM (DM1). A command without
+/// `--provider` takes `MIN_PROVIDER`, then the `provider` key of
+/// `config.toml`, then `local-minvmd` where `/dev/kvm` opens for reading and
+/// writing and `local` otherwise ([`crate::hosts::resolve_default_provider`]).
+/// On macOS minvmd is the only backend, so the choice has no effect there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Provider {
-    /// Linux: run minimald natively on the host (the default).
+    /// Linux: run minimald natively on the host (the default where
+    /// /dev/kvm does not open).
     Local,
-    /// Run minimald inside the minvmd microVM.
+    /// Run minimald inside the minvmd microVM (the Linux default where
+    /// /dev/kvm opens).
     LocalMinvmd,
     /// The old name of `local`.
     // BCLI-046: read as `local` for one release, with a hint on stderr
@@ -2218,20 +2189,6 @@ pub struct LsArgs {
 }
 
 #[derive(Debug, Args)]
-#[command(group(ArgGroup::new("target").args(["session", "all"]).required(true).multiple(false)))]
-pub struct DestroyArgs {
-    /// Session identifier (UUID, unique id prefix, or session name)
-    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
-    pub session: Option<String>,
-    /// Destroy all sessions
-    #[arg(long)]
-    pub all: bool,
-    /// Skip the destroy confirmation, and treat a session that is already destroyed as success
-    #[arg(long, short)]
-    pub force: bool,
-}
-
-#[derive(Debug, Args)]
 pub struct NetArgs {
     #[command(subcommand)]
     pub command: NetCommand,
@@ -2283,24 +2240,6 @@ pub struct FinalizeInstallArgs {
         conflicts_with = "undo"
     )]
     pub ct_mark_mask: Option<u32>,
-}
-
-#[derive(Debug, Args)]
-pub struct StopArgs {
-    /// Force shutdown even if a session is mid-create or still holds a host handle (even a dead one).
-    /// On a VM backend whose in-guest daemon does not answer, stops the VM from the host;
-    /// data not yet flushed inside the VM can then be lost
-    #[arg(long, short, default_value_t = false)]
-    pub force: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct RenameArgs {
-    /// Session identifier (UUID, unique id prefix, or session name)
-    #[arg(add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
-    pub session: String,
-    /// New name for the session
-    pub new_name: String,
 }
 
 #[derive(Debug, Args)]

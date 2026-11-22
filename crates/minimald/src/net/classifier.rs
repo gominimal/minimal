@@ -81,6 +81,40 @@ use sandbox::config::Verdict;
 /// deny-all box to them would admit it to everything upstream.
 pub const ANSWERER_ADDRESS: Ipv4Addr = Ipv4Addr::LOCALHOST;
 
+/// The leaf a task of a box runs in (NET-079), and the verdict its plan
+/// follows. A task of a host-address box shares the namespace of its box, so
+/// the task joins the box's own existing leaf: the packet filter then decides
+/// the task's connections on the box's verdict, the same as for a process the
+/// box itself starts. A task places no leaf of its own. `None` for every
+/// other mode, and for a box the host placed in no leaf.
+pub(crate) fn task_box_leaf(
+    mode: boxes::NetworkMode,
+    box_leaf: Option<&sandbox::config::ClassifierLeaf>,
+) -> Option<(sandbox::config::ClassifierLeaf, Verdict)> {
+    if mode != boxes::NetworkMode::HostNet {
+        return None;
+    }
+    let leaf = box_leaf?.clone();
+    let verdict = if leaf.is_deny() {
+        Verdict::Deny
+    } else {
+        Verdict::Allow
+    };
+    Some((leaf, verdict))
+}
+
+/// The decision a task in `leaf`, the existing leaf of its box, plans over
+/// (NET-079). A native deny leaf of a running box exists only when its launch
+/// decided per box: a launch that did not is refused, or places no leaf. So
+/// the task carries a decided decision with the carve-out the tree records
+/// now, and its plan repeats the stale carve-out check of the box launch. The
+/// task does not probe the table again. `None` for an allow leaf, whose plan
+/// makes no such check.
+pub(crate) fn task_box_decision(leaf: &sandbox::config::ClassifierLeaf) -> Option<Decision> {
+    leaf.is_deny()
+        .then(|| Decision::decided().with_carve_out(recorded_carve_out(&leaf.tree_root())))
+}
+
 /// Which cohort subtree `declaration` places a box's leaf in (NET-079): the
 /// deny subtree is for the declaration that admits no destination — the one
 /// shape `boxes::EgressPolicy::deny_all` materializes, every `allow_*`
@@ -1381,6 +1415,15 @@ impl CohortQuic443 {
                 "cannot move a process injected into a host-address box back to its own leaf"
             ),
         }
+    }
+
+    /// Whether `pid` is recorded under `box_id`, to go home with the box
+    /// when the block lifts.
+    #[cfg(test)]
+    pub(crate) fn records(&self, box_id: &str, pid: i32) -> bool {
+        self.moved
+            .get(box_id)
+            .is_some_and(|pids| pids.contains(&pid))
     }
 
     /// [`Self::join`], and the move that keeps the rule in step with it:
@@ -9589,7 +9632,7 @@ mod tests {
                 "the refusal says why no mask avoids it: {text}"
             );
             assert!(
-                text.contains("then run min finalize-install again."),
+                text.contains("run min finalize-install again."),
                 "the refusal names the command to run once the rule is changed: {text}"
             );
             assert!(
@@ -9652,6 +9695,191 @@ mod tests {
             installed.status.success(),
             "a masked writer of other bits does not block the install: {}",
             said(&installed)
+        );
+    }
+
+    /// Two ct-mark users of the install's bits: firewalld's, by its table
+    /// name, over bit 0x10000000, and one in a table no program is known
+    /// by, over bit 0x80000000. The highest pair neither one uses is
+    /// 0x60000000.
+    const OWNED_AND_UNKNOWN_CT_MARK_USERS: &str = "table inet firewalld {\n\
+         \tchain mangle_PREROUTING {\n\
+         \t\ttype filter hook prerouting priority mangle; policy accept;\n\
+         \t\tmeta l4proto tcp ct mark set ct mark | 0x10000000\n\
+         \t}\n\
+         }\n\
+         table inet edge_marks {\n\
+         \tchain tag {\n\
+         \t\ttype filter hook output priority mangle; policy accept;\n\
+         \t\tudp dport 53 ct mark set ct mark | 0x80000000\n\
+         \t}\n\
+         }\n";
+
+    /// A refusal over another ct-mark user names the program each rule
+    /// belongs to, when its table or chain name says, and the highest two
+    /// contiguous bits that no rule uses as the --ct-mark-mask to run
+    /// with. An install with that mask goes ahead over the same rules.
+    #[test]
+    fn install_refusal_names_rule_owner_and_free_mask() {
+        let mount = standin_mount();
+        let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+        host_ruleset_tools(tools.path(), OWNED_AND_UNKNOWN_CT_MARK_USERS, "");
+        let refused = run_install_with(&mount, &[], tools.path());
+        let text = said(&refused);
+        assert!(
+            !refused.status.success(),
+            "the install refuses over a user of its bits: {text}"
+        );
+        assert!(
+            text.contains(
+                "The rule in table inet firewalld, chain mangle_PREROUTING belongs to \
+                 firewalld, by the name of its table or chain.\n"
+            ),
+            "the refusal names the program the rule belongs to: {text}"
+        );
+        assert!(
+            !text.contains("table inet edge_marks"),
+            "a rule that uses none of the default bits is not named: {text}"
+        );
+        assert!(
+            text.contains(
+                "No rule this step read uses the bits 0x60000000, and no program this step \
+                 knows marks connections with them. To use them, run: min finalize-install \
+                 --ct-mark-mask 0x60000000\n"
+            ),
+            "the refusal names a free mask: {text}"
+        );
+        assert!(
+            text.contains("refusing to install over another ct-mark user"),
+            "the refusal still ends with its reason: {text}"
+        );
+
+        // Under another mask, the rule over those bits is named, and one
+        // in a table no program is known by is said to be so.
+        let mount_both = standin_mount();
+        let refused_both =
+            run_install_with(&mount_both, &["--ct-mark-mask", "0x18000000"], tools.path());
+        let both = said(&refused_both);
+        assert!(!refused_both.status.success(), "{both}");
+        assert!(
+            both.contains("belongs to firewalld"),
+            "the firewalld rule uses bit 0x10000000: {both}"
+        );
+        let mount_unknown = standin_mount();
+        let refused_unknown = run_install_with(
+            &mount_unknown,
+            &["--ct-mark-mask", "0xc0000000"],
+            tools.path(),
+        );
+        let unknown = said(&refused_unknown);
+        assert!(!refused_unknown.status.success(), "{unknown}");
+        assert!(
+            unknown.contains(
+                "The rule in table inet edge_marks, chain tag belongs to a program that this \
+                 step cannot name from its table and chain.\n"
+            ),
+            "a rule in a table no program is known by is said to be so: {unknown}"
+        );
+        assert!(
+            unknown.contains("--ct-mark-mask 0x60000000\n"),
+            "the free mask is the same whichever mask was refused: {unknown}"
+        );
+
+        // The named mask installs over the same rules.
+        let mount = standin_mount();
+        let installed = run_install_with(&mount, &["--ct-mark-mask", "0x60000000"], tools.path());
+        assert!(
+            installed.status.success(),
+            "the free mask installs: {}",
+            said(&installed)
+        );
+
+        // A rule that writes every bit leaves no mask free, so none is named.
+        let mount = standin_mount();
+        let whole = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+        host_ruleset_tools(
+            whole.path(),
+            "table inet wg_quick {\n\tchain postmangle {\n\t\tmeta l4proto udp ct mark set meta mark\n\t}\n}\n",
+            "",
+        );
+        let refused = run_install_with(&mount, &[], whole.path());
+        let text = said(&refused);
+        assert!(!refused.status.success(), "{text}");
+        assert!(
+            text.contains("The rule in table inet wg_quick, chain postmangle belongs to wg-quick"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("No rule on this host uses the bits"),
+            "no mask avoids a whole-mark writer: {text}"
+        );
+    }
+
+    /// The helper-only mode installs the QUIC block helper and its sudoers
+    /// rule over a ruleset the full install refuses: it reads no ct mark,
+    /// so the scan does not run, and it lays out no tree and loads no
+    /// table.
+    #[test]
+    fn quic443_helper_only_installs_over_ct_mark_conflict() {
+        let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+        host_ruleset_tools(tools.path(), OWNED_AND_UNKNOWN_CT_MARK_USERS, "");
+        let scratch = tempfile::tempdir().expect("a dir for the helper");
+        let helper = scratch.path().join("lib/quic443-leaf");
+        let sudoers = scratch.path().join("sudoers.d/minimal-quic443-leaf");
+        let (uid, gid) = delegated_owner();
+        let run = |mount: &StandinMount, flags: &[&str]| {
+            step_command(mount, flags, Some(tools.path()))
+                .env("SUDO_UID", uid.to_string())
+                .env("SUDO_GID", gid.to_string())
+                .env("MINIMAL_OVERRIDE_QUIC443_HELPER", &helper)
+                .env("MINIMAL_OVERRIDE_QUIC443_SUDOERS", &sudoers)
+                .output()
+                .expect("running the step")
+        };
+
+        let mount = standin_mount();
+        let refused = run(&mount, &[]);
+        assert!(
+            !refused.status.success(),
+            "the full install refuses over the conflict: {}",
+            said(&refused)
+        );
+        assert!(
+            !helper.exists() && !sudoers.exists(),
+            "a refused full install writes no helper"
+        );
+
+        let installed = run(&mount, &["--quic443-helper-only"]);
+        let text = said(&installed);
+        assert!(
+            installed.status.success(),
+            "the helper-only mode installs over the conflict: {text}"
+        );
+        assert!(
+            !text.contains("ct-mark"),
+            "the helper-only mode does not scan the ct mark: {text}"
+        );
+        assert!(
+            text.contains(&format!("installed {}", helper.display())),
+            "the mode says what it installed: {text}"
+        );
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&helper)
+                .expect("the helper is installed")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o755, "the helper is executable");
+        }
+        let rule = std::fs::read_to_string(&sudoers).expect("the sudoers rule is installed");
+        assert!(
+            rule.contains(&format!("#{uid} ALL=(root) NOPASSWD: {}", helper.display())),
+            "the rule lets the delegated account run the helper: {rule}"
+        );
+        assert!(
+            !mount.root.join(sandbox::classifier::TABLE_MARKER).exists()
+                && !mount.root.join("boxes").exists(),
+            "the helper-only mode lays out no tree and writes no marker: {text}"
         );
     }
 
@@ -9774,6 +10002,168 @@ mod tests {
                 "`ct mark set {value}` writes every bit: {text}"
             );
         }
+    }
+
+    /// Tailscale's connmark save in its nftables mode, in the ip and ip6
+    /// mangle tables: a native `ct mark set meta mark & 0x00ff0000`, which
+    /// replaces the whole connection mark, under the packet-mark match
+    /// `meta mark & 0x00ff0000 != 0x00000000`. Neither the table nor the
+    /// chain carries a name that ties it to Tailscale.
+    const TAILSCALE_NFT_MODE_CONNMARK: &str = "table ip mangle {\n\
+         \tchain OUTPUT {\n\
+         \t\ttype route hook output priority mangle; policy accept;\n\
+         \t\tct state new meta mark & 0x00ff0000 != 0x00000000 ct mark set meta mark & 0x00ff0000\n\
+         \t}\n\
+         }\n\
+         table ip6 mangle {\n\
+         \tchain OUTPUT {\n\
+         \t\ttype route hook output priority mangle; policy accept;\n\
+         \t\tct state new meta mark & 0x00ff0000 != 0x00000000 ct mark set meta mark & 0x00ff0000\n\
+         \t}\n\
+         }\n";
+
+    /// NET-079: Tailscale's nftables-mode connmark save writes every bit of
+    /// the connection mark, so the install refuses it under every mask. The
+    /// refusal names the packet-mark match, says that its bits are the range
+    /// Tailscale marks connections with, so Tailscale can load the rule. It
+    /// does not tell the user to change the rule.
+    #[test]
+    fn install_refuses_tailscale_nft_mode_connmark_with_its_match() {
+        for mask in [None, Some("0x0c000000")] {
+            let mount = standin_mount();
+            let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+            host_ruleset_tools(tools.path(), TAILSCALE_NFT_MODE_CONNMARK, "");
+            let flags: Vec<&str> = mask.map(|m| vec!["--ct-mark-mask", m]).unwrap_or_default();
+            let refused = run_install_with(&mount, &flags, tools.path());
+            let text = said(&refused);
+            assert!(
+                !refused.status.success(),
+                "the install refuses under mask {mask:?}: {text}"
+            );
+            for family in ["ip", "ip6"] {
+                assert!(
+                    text.contains(&format!(
+                        "table {family} mangle, chain OUTPUT: ct state new meta mark & 0x00ff0000 \
+                         != 0x00000000 ct mark set meta mark & 0x00ff0000 (writes every bit of the \
+                         connection mark, for packets that match meta mark & 0x00ff0000 != \
+                         0x00000000)\n"
+                    )),
+                    "the refusal names the {family} rule and its packet-mark match: {text}"
+                );
+                assert!(
+                    text.contains(&format!(
+                        "The rule in table {family} mangle, chain OUTPUT matches the packet-mark \
+                         bits 0x00ff0000. Tailscale marks connections with these bits, so \
+                         Tailscale can load this rule. If another program loads it, that \
+                         program must write only the connection-mark bits it uses.\n"
+                    )),
+                    "the refusal names the mark range the {family} rule matches: {text}"
+                );
+            }
+            assert!(
+                !text.contains("Change that rule"),
+                "the refusal does not tell the user to change Tailscale's rule: {text}"
+            );
+            assert!(
+                text.contains(
+                    "no --ct-mark-mask avoids it. The lines above name the program or the mark \
+                     range of that rule. When this host's ruleset no longer has the rule, run \
+                     min finalize-install again.\n"
+                ),
+                "the refusal says what to wait for and the command to run: {text}"
+            );
+            assert!(
+                !mount.root.join(sandbox::classifier::TABLE_MARKER).exists(),
+                "a refused install writes no marker: {text}"
+            );
+        }
+
+        // The same write with no packet-mark match, in a table no program
+        // is known by, is still the user's rule to change.
+        let mount = standin_mount();
+        let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+        host_ruleset_tools(
+            tools.path(),
+            "table inet other {\n\tchain c {\n\t\tct mark set meta mark & 0x00ff0000\n\t}\n}\n",
+            "",
+        );
+        let refused = run_install_with(&mount, &[], tools.path());
+        let text = said(&refused);
+        assert!(!refused.status.success(), "{text}");
+        assert!(
+            text.contains("(writes every bit of the connection mark)\n")
+                && text.contains("Change that rule to write only the bits it uses"),
+            "a whole-mark rule no program or range accounts for is the user's to change: {text}"
+        );
+
+        // A packet-mark match whose mask has bits outside every well-known
+        // range names no range, and the rule is still the user's to change.
+        let mount = standin_mount();
+        let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+        host_ruleset_tools(
+            tools.path(),
+            "table inet other {\n\tchain c {\n\t\tmeta mark & 0xffffffff != 0x00000000 \
+             ct mark set meta mark & 0x00ff0000\n\t}\n}\n",
+            "",
+        );
+        let refused = run_install_with(&mount, &[], tools.path());
+        let text = said(&refused);
+        assert!(!refused.status.success(), "{text}");
+        assert!(
+            text.contains("for packets that match meta mark & 0xffffffff != 0x00000000)\n")
+                && !text.contains("Tailscale marks connections with these bits")
+                && text.contains("Change that rule to write only the bits it uses"),
+            "a match mask wider than a well-known range names no range: {text}"
+        );
+
+        // A one-bit packet-mark match outside every well-known range names
+        // no range either, and the rule is still the user's to change.
+        let mount = standin_mount();
+        let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+        host_ruleset_tools(
+            tools.path(),
+            "table inet other {\n\tchain c {\n\t\tmeta mark & 0x01000000 != 0x00000000 \
+             ct mark set meta mark & 0x00ff0000\n\t}\n}\n",
+            "",
+        );
+        let refused = run_install_with(&mount, &[], tools.path());
+        let text = said(&refused);
+        assert!(!refused.status.success(), "{text}");
+        assert!(
+            text.contains("for packets that match meta mark & 0x01000000 != 0x00000000)\n")
+                && !text.contains("Tailscale marks connections with these bits")
+                && !text.contains("kube-proxy marks connections with these bits")
+                && text.contains("Change that rule to write only the bits it uses"),
+            "a one-bit match mask outside every well-known range names no range: {text}"
+        );
+
+        // One chain with a rule in a well-known range and then a rule in
+        // none: each rule gets its own line, so the rule the user is told
+        // to change is one the lines above name.
+        let mount = standin_mount();
+        let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+        host_ruleset_tools(
+            tools.path(),
+            "table inet other {\n\tchain c {\n\t\tmeta mark & 0x00ff0000 != 0x00000000 \
+             ct mark set meta mark & 0x00ff0000\n\t\tmeta mark & 0x01000000 != 0x00000000 \
+             ct mark set meta mark & 0x00ff0000\n\t}\n}\n",
+            "",
+        );
+        let refused = run_install_with(&mount, &[], tools.path());
+        let text = said(&refused);
+        assert!(!refused.status.success(), "{text}");
+        assert!(
+            text.contains(
+                "The rule in table inet other, chain c matches the packet-mark bits \
+                 0x00ff0000. Tailscale marks connections with these bits, so Tailscale can \
+                 load this rule. If another program loads it, that program must write only \
+                 the connection-mark bits it uses.\n"
+            ) && text.contains(
+                "The rule in table inet other, chain c belongs to a program that this step \
+                 cannot name from its table and chain.\n"
+            ) && text.contains("Change that rule to write only the bits it uses"),
+            "each rule in one chain gets the line that explains it: {text}"
+        );
     }
 
     /// One family's mangle table as `nft -a --debug=netlink list ruleset`

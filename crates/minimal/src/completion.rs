@@ -87,8 +87,15 @@ pub fn complete_box_arg(current: &OsStr) -> Vec<CompletionCandidate> {
 
     // The completer has no access to the rest of the command line: clap hands
     // a value completer the current word and nothing else, so a `--provider`
-    // or `--minimal-dir` earlier in the line cannot be honoured here.
-    let global = GlobalArgs::default();
+    // or `--minimal-dir` earlier in the line cannot be honoured here. The
+    // flagless default provider is, so the candidates come from the host a
+    // flagless command would use. A default that does not resolve offers
+    // nothing rather than a guess.
+    let mut global = GlobalArgs::default();
+    if crate::hosts::resolve_default_provider(&mut global).is_err() {
+        return Vec::new();
+    }
+    crate::hosts::read_provider_alias(&mut global);
     to_completion(runtime.block_on(session_candidates(&global, prefix)))
 }
 

@@ -65,6 +65,8 @@ async fn run_min_env(
             command.env_remove(&k);
         }
     }
+    // The native test daemon, whatever /dev/kvm allows on this host.
+    command.env("MIN_PROVIDER", "local");
     command.envs(env.iter().copied());
     let t = Instant::now();
     let out = command.output().await.unwrap();
@@ -604,6 +606,8 @@ async fn run_min_tty(
         quote(minimal_dir.to_str().unwrap()),
         "--config-dir".to_owned(),
         quote(config_dir.path().to_str().unwrap()),
+        "--provider".to_owned(),
+        "local".to_owned(),
     ];
     line.extend(extra.iter().map(|a| quote(a)));
     let mut command = tokio::process::Command::new("script");
@@ -644,10 +648,10 @@ struct VerbRun {
     cmd: Option<SentSpan>,
 }
 
-/// The four session verbs, each run as its own `min` with `env` and a
-/// spool of its own: `min session exec`, `min session run`, `min session
-/// attach` (its shell fed on stdin) and `min task run` (a task session of
-/// its own).
+/// The three verbs, each run as its own `min` with `env` and a spool of
+/// its own: `min box exec`, `min session attach` (its shell fed on stdin)
+/// and `min task run` (a task box of its own). `min session run` is gone
+/// (BCLI-042), and no box verb runs a task in an existing box.
 async fn run_the_verbs(
     daemon: &common::TestDaemon,
     args: &GlobalArgs,
@@ -661,7 +665,7 @@ async fn run_the_verbs(
     std::fs::write(project.path().join("minimal.toml"), TP_TASK_MFILE).unwrap();
     let project_dir = project.path().to_str().unwrap().to_owned();
     let mut runs = Vec::new();
-    for verb in ["exec", "run", "attach", "task run"] {
+    for verb in ["exec", "attach", "task run"] {
         let spool = private_tempdir();
         let mut env: Vec<(&str, &str)> = env
             .iter()
@@ -671,14 +675,13 @@ async fn run_the_verbs(
         env.push(("MINIMAL_OTEL_SPOOL_DIR", spool.path().to_str().unwrap()));
         let out = match verb {
             "exec" => {
-                run_min_env(args, &env, &["session", "exec", &session, TP_SHELL])
-                    .await
-                    .0
-            }
-            "run" => {
-                run_min_env(args, &env, &["session", "run", &session, "tp"])
-                    .await
-                    .0
+                run_min_env(
+                    args,
+                    &env,
+                    &["box", "exec", &session, "--", "sh", "-c", TP_SHELL],
+                )
+                .await
+                .0
             }
             "attach" => {
                 run_min_tty(
@@ -707,8 +710,7 @@ async fn run_the_verbs(
 /// `command` field where the verb names one.
 fn daemon_request(verb: &str) -> (&'static str, Option<&'static str>) {
     match verb {
-        "exec" => ("exec", Some("min://shell ")),
-        "run" => ("exec", Some("min://task/run tp")),
+        "exec" => ("exec", None),
         // The task box's entrypoint runs the task, so the run owns no
         // box and sends no `--owns-box` (T43).
         "task run" => ("exec", Some("min://task/run tp")),
@@ -730,11 +732,11 @@ fn request_span<'a>(
     })
 }
 
-/// Plan T11 (spec 25 TEL-021, TEL-022, TEL-025, TEL-045): run `min session
-/// exec`, `min session run`, `min session attach` and `min task run` with
-/// telemetry on inside a caller's trace. Each `min`'s `cmd` span joins
+/// Plan T11 (spec 25 TEL-021, TEL-022, TEL-025, TEL-045): run `min box
+/// exec`, `min session attach` and `min task run` with telemetry on inside
+/// a caller's trace. Each `min`'s `cmd` span joins
 /// that trace at the collector and in the spool alike, and the daemon's
-/// span for each verb's request (`exec` for exec, run and task run,
+/// span for each verb's request (`exec` for exec and task run,
 /// `attach` for attach) is that `cmd` span's child in the same trace. A
 /// nested `min` given the `TRACEPARENT` that names the exec's daemon span
 /// (what the daemon hands the box once that span is exported, TEL-023)
@@ -864,7 +866,7 @@ async fn exec_run_attach_and_task_run_share_the_commands_trace() {
     let marked = loop {
         let marked = log.find("exec", "telemetry", "opt-out").len()
             + log.find("attach", "telemetry", "opt-out").len();
-        if marked - marked_before >= 4 || std::time::Instant::now() >= deadline {
+        if marked - marked_before >= 3 || std::time::Instant::now() >= deadline {
             break marked;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -875,7 +877,7 @@ async fn exec_run_attach_and_task_run_share_the_commands_trace() {
     );
     assert_eq!(
         marked - marked_before,
-        4,
+        3,
         "each verb's daemon span is marked opted out"
     );
 }

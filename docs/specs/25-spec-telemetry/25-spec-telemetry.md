@@ -123,7 +123,7 @@ workflow is a maintainer-owned change (gominimal/minimal#2075). A test marked
 "known gap" runs no product code. It names one gap, what covers it today
 and its issue, and fails on request (`TEST_KNOWN_GAPS=1`) so a lane can
 list the gaps. It is removed when the requirement gets a real test. These
-are the known gaps on 2026-10-07, each with an issue to follow. TEL-009
+are the known gaps today, each with an issue to follow. TEL-009
 has lab scenario 785 only. TEL-044 has unit tests for its
 scrub and lab scenario 782 for the whole path. TEL-047 has
 no check, because nothing reports a box's injected environment yet
@@ -132,7 +132,8 @@ no check, because nothing reports a box's injected environment yet
 traced command ran through `minvmd` to `vm.boot` with `libkrun`, and the
 boot line was byte-identical with telemetry off. That run found a TEL-032
 bug, a task that held the start phase open past READY, which is fixed and
-has a unit test. No repeatable macOS VM lane exists yet (minimal#2037).
+has a unit test. The macOS CI workflow's end-to-end job now boots VMs on
+arm64, and its VM test checks that the start phase is exported at READY.
 
 ### Opt-in and switches (Story 3)
 
@@ -264,12 +265,12 @@ has a unit test. No repeatable macOS VM lane exists yet (minimal#2037).
     spends the whole 200 ms, so each command pays about 200 ms (review S19).
     See Open questions.
 - **TEL-011** IF the collector is unreachable THEN THE SYSTEM SHALL complete
-  `min stop` within the daemon shutdown bound (runtime 2 s, then flush 5 s).
+  `min host stop` within the daemon shutdown bound (runtime 2 s, then flush 5 s).
   tier:     T0
   verify:   cargo nextest run -p minimald --test otel_shutdown_integration a_silent_collector_does_not_hold_the_daemons_exit
   test:     crates/minimald/tests/otel_shutdown_integration.rs::a_silent_collector_does_not_hold_the_daemons_exit
-            (the real daemon's exit after it answers `Shutdown`; `min stop` itself
-            returns at the answer)
+            (the real daemon's exit after it answers `Shutdown`, which
+            `min host stop` sends; BCLI-042 removed bare `min stop`)
   lab:      719
 - **TEL-012** THE SYSTEM SHALL never print the OpenTelemetry SDK's own errors on
   a console or in a file log the user reads.
@@ -541,6 +542,7 @@ has a unit test. No repeatable macOS VM lane exists yet (minimal#2037).
             crates/minvmd/tests/otel_integration.rs::a_minvmd_root_span_is_a_child_of_the_callers_traceparent;
             crates/minvmd/tests/otel_integration.rs::without_a_traceparent_minvmd_starts_its_own_trace;
             crates/minvmd/tests/otel_integration.rs::a_stop_is_a_vm_stop_span_under_the_minvmd_root;
+            crates/minvmd/tests/otel_integration.rs::a_boot_and_stop_share_one_trace_with_the_guest_daemon;
             crates/minvmd/src/rpc_client.rs::guest_shutdown_opens_before_the_guest_is_dialed
   lab:      715 (boot), 715c (stop)
 - **TEL-033** WHILE telemetry is enabled on the host THE SYSTEM SHALL put on the
@@ -942,9 +944,9 @@ id.
 Platforms. The same code runs on Linux (native `minimald`, and `minvmd` with
 KVM) and on macOS (`minvmd` with the Hypervisor framework, and the daemon as
 the guest's `/init`). The lab proves every requirement above on Linux, on
-four distributions with Cloud Hypervisor guests. macOS has unit tests and
-one manual end-to-end run on arm64 (2026-10-05). It has no repeatable VM
-lane until gominimal/minimal#2037 adds one.
+four distributions with Cloud Hypervisor guests. macOS has unit tests, one
+manual end-to-end run on arm64 (2026-10-05), and the VM tests the macOS CI
+workflow runs on arm64 with `libkrun`.
 
 The bounds below are the whole cost telemetry can add to a process when the
 collector is down, slow or unreachable. Each bound names the constant it

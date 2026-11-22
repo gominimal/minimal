@@ -422,16 +422,33 @@ mod tests {
     }
 
     /// Writes an entry into the daemon's local cache under `hash`. No read is
-    /// ever recorded against it, so a clean sees it as cold.
+    /// ever recorded against it, and its write time is past the clean's
+    /// cutoff: the metadata says twice [`UNUSED_FOR`] ago, and its directory's
+    /// mtime, which a clean judges it by, is rewound just past the cutoff. An
+    /// unread entry written after the cutoff stays.
     fn write_entry(cache: &mctx::Cache, hash: &SpecHash) {
+        let written = std::time::SystemTime::now()
+            .checked_sub(2 * UNUSED_FOR)
+            .unwrap();
         let w = cache.write_dir(hash).unwrap();
         w.open_write("f").unwrap().write_all(b"x").unwrap();
         w.finalize(EntryMeta {
             inner: MetaInner::Spec("test".to_string()),
             fetched: false,
+            epoch_millis: written
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
             ..Default::default()
         })
         .unwrap();
+        let cold = std::time::SystemTime::now()
+            .checked_sub(UNUSED_FOR + Duration::from_secs(60))
+            .unwrap();
+        std::fs::File::open(cache.entry_path(hash))
+            .unwrap()
+            .set_modified(cold)
+            .unwrap();
     }
 
     /// A clean reclaims cold cache entries but not the ones a live session

@@ -461,7 +461,7 @@ The `host_ip` lane on a VM host
   tier:     T0
   verify:   cargo nextest run -p boxes credentialed_upstream_in_effect_by_mode_and_host
   verify:   cargo nextest run -p minimal detail_pane_shows_a_host_ip_lane_in_effect_on_a_vm_host
-  <!-- ubiquitous; the one decision that BEP-012's proxy variables, the `min session policy` row, the `min dash` detail pane and the `--credentialed-upstream` help text read -->
+  <!-- ubiquitous; the one decision that BEP-012's proxy variables, the `min box show <box> --network` row, the `min dash` detail pane and the `--credentialed-upstream` help text read -->
 
 - **BEP-086** WHERE a `host_ip` box on a VM host declares a credentialed upstream and its steering is `dns` or `both` THE SYSTEM SHALL answer that box's lookups of its steered names with the proxy's address.
   tier:     T0
@@ -788,7 +788,7 @@ Review, audit and revocation
     verify: cargo nextest run -p minimal box_audit_self_unenrolled_refused_with_error
     <!-- no `identity.sock` un-enrolled; the architecture leaves the in-box read path for `self` to the local implementation -->
 
-- **BEP-043** WHEN a live box is destroyed, by `min session destroy`, a stop-and-remove of the box, or a type-noun alias of either, THE SYSTEM SHALL record a revocation naming the box's id and refuse redemption of every sealed value naming that box within 60 seconds.
+- **BEP-043** WHEN a live box is destroyed, by `min box rm --force`, a stop-and-remove of the box, or a type-noun alias of either, THE SYSTEM SHALL record a revocation naming the box's id and refuse redemption of every sealed value naming that box within 60 seconds.
   tier:     T0
   verify:   ./scripts/session-e2e.sh bep_destroyed_box_values_refused_within_60s
   <!-- Gatehouse §6.10 v1.24: destroying a live box is the mode's one revocation event; reaping a stopped box's retained record later is not one, and a stopped box's values are refused by attribution once its attachment is withdrawn (BEP-020, NET-133) -->

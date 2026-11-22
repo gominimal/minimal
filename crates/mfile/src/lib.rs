@@ -491,7 +491,7 @@ impl Eq for Stack {}
 ///     { dest = "~/.psqlrc",            source = "config/psqlrc" },
 /// ]
 ///
-/// [session.vars]
+/// [session.env_vars]
 /// # Applies uniformly to every developer's session.
 /// RUST_LOG          = "info"
 /// CARGO_TERM_COLOR  = "always"
@@ -503,48 +503,124 @@ impl Eq for Stack {}
 /// [[session.lifecycle_hooks]]
 /// on_activate = { type = "inline", value = "cargo check --workspace >/dev/null 2>&1 || true" }
 /// ```
+///
+/// The variables are one `env_vars` table (BOX-205). A name in it that is
+/// strict POSIX (`[A-Z_][A-Z0-9_]*`) reads into [`Session::vars`], and any
+/// other name the kernel accepts into [`Session::vars_lenient`]. The
+/// expansion refuses a name that is not POSIX-shaped (BOX-207), so reading
+/// one here does not fail the file. A `vars` or `vars_lenient` key stays
+/// in [`Session::extra`], where the expansion refuses it (BOX-206).
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(from = "SessionTable", into = "SessionTable")]
 pub struct Session {
     /// Packages to bring into the session, alongside the client's
     /// loadout packages.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub packages: Vec<String>,
-    /// Variables with POSIX-shaped names — the common case.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    /// The variables of `env_vars` with strict POSIX names.
     pub vars: BTreeMap<boxes::core::primitives::StrictVarName, boxes::core::primitives::VarValue>,
-    /// Variables with Linux-permissive names — explicit opt-in for
-    /// the rare case a non-POSIX name is necessary.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// The variables of `env_vars` with any other name the kernel accepts.
     pub vars_lenient: Vec<boxes::core::primitives::LenientVarEntry>,
     /// Patches contributed by this project.
-    #[serde(
-        default,
-        skip_serializing_if = "boxes::core::primitives::Patches::is_empty"
-    )]
     pub patches: boxes::core::primitives::Patches,
     /// Scripts run at session-level transition points, in
     /// declaration order (concatenated with any hooks from the
     /// client's loadout).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lifecycle_hooks: Vec<boxes::core::lifecyclehook::LifecycleHook>,
     /// `[session.network]`: the box's network settings this file owns.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<SessionNetwork>,
     /// `[session.secrets.<VAR>]`: the credential grants, by the environment
     /// variable each one lands in. A project cannot set
     /// `acknowledge_full_breadth_unenrolled` here: the reader ignores it with
     /// a warning, because only the client configuration accepts full
     /// breadth (BEP-057).
+    pub secrets: boxes::core::bep::SecretGrants,
+
+    /// Any fields which are not understood by this version of minimal.
+    pub extra: HashMap<String, toml::Value>,
+}
+
+/// [`Session`] as the file writes it: one `env_vars` table, by name.
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
+struct SessionTable {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    packages: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    env_vars: BTreeMap<String, boxes::core::primitives::VarValue>,
+    #[serde(
+        default,
+        skip_serializing_if = "boxes::core::primitives::Patches::is_empty"
+    )]
+    patches: boxes::core::primitives::Patches,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    lifecycle_hooks: Vec<boxes::core::lifecyclehook::LifecycleHook>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    network: Option<SessionNetwork>,
     #[serde(
         default,
         skip_serializing_if = "BTreeMap::is_empty",
         deserialize_with = "boxes::core::bep::deserialize_project_secrets"
     )]
-    pub secrets: boxes::core::bep::SecretGrants,
-
-    /// Any fields which are not understood by this version of minimal.
+    secrets: boxes::core::bep::SecretGrants,
     #[serde(flatten)]
-    pub extra: HashMap<String, toml::Value>,
+    extra: HashMap<String, toml::Value>,
+}
+
+impl From<SessionTable> for Session {
+    fn from(table: SessionTable) -> Self {
+        use boxes::core::primitives::{LenientVarEntry, StrictVarName};
+        let mut vars = BTreeMap::new();
+        let mut vars_lenient = Vec::new();
+        for (name, value) in table.env_vars {
+            match StrictVarName::try_new(name.clone()) {
+                Ok(strict) => {
+                    vars.insert(strict, value);
+                }
+                Err(_) => match LenientVarEntry::try_new(name.as_str(), value) {
+                    Ok(entry) => vars_lenient.push(entry),
+                    // The expansion refuses the name (BOX-207). The session
+                    // has no place to keep it.
+                    Err(_) => tracing::debug!(
+                        rule = "BOX-207",
+                        variable = %name,
+                        "dropped a variable name the kernel does not accept"
+                    ),
+                },
+            }
+        }
+        Self {
+            packages: table.packages,
+            vars,
+            vars_lenient,
+            patches: table.patches,
+            lifecycle_hooks: table.lifecycle_hooks,
+            network: table.network,
+            secrets: table.secrets,
+            extra: table.extra,
+        }
+    }
+}
+
+impl From<Session> for SessionTable {
+    fn from(session: Session) -> Self {
+        let env_vars = session
+            .vars
+            .into_iter()
+            .map(|(name, value)| (name.into_inner(), value))
+            .chain(session.vars_lenient.into_iter().map(|entry| {
+                let (name, value) = entry.into_parts();
+                (name.into_inner(), value)
+            }))
+            .collect();
+        Self {
+            packages: session.packages,
+            env_vars,
+            patches: session.patches,
+            lifecycle_hooks: session.lifecycle_hooks,
+            network: session.network,
+            secrets: session.secrets,
+            extra: session.extra,
+        }
+    }
 }
 
 /// The `[session.network]` table: the UDP 443 stance and the Box Egress
@@ -1016,9 +1092,19 @@ pub struct File {
 }
 
 /// The entry keys that `[session]` and a task keep among their unknown
-/// fields but that a box spec reads (BOX-049), so they are not reported
-/// as unknown.
-const SPEC_READ_ENTRY_KEYS: &[&str] = &["timeout"];
+/// fields but that a box spec reads (BOX-049, BOX-203), so they are not
+/// reported as unknown. A task's `secrets` table is read by the entry
+/// expansion and reaches the box's spec (#3650).
+///
+/// An entry's `network` table is read by the minimal crate's task reader.
+/// That reader applies the table's `mode`, `egress` and
+/// `vpn_network_names` to a task box and refuses the other sub-keys (`quic443`, `bep`, `ingress`, …), which a
+/// task box does not apply. The sub-keys are not checked here: which ones
+/// a box reads differs per box type, and the minimal crate owns that
+/// knowledge. The projection of a `[network]` table onto a given box
+/// type's settings belongs in the BOX spec, not here. That refusal is
+/// interim (#3671): it goes when a task box applies those sub-keys.
+const SPEC_READ_ENTRY_KEYS: &[&str] = &["network", "timeout", "file_exports", "secrets"];
 
 /// An entry's unknown fields, in key order, less the ones a box spec reads.
 fn unknown_entry_keys(extra: &HashMap<String, toml::Value>) -> Vec<&str> {
@@ -1026,6 +1112,9 @@ fn unknown_entry_keys(extra: &HashMap<String, toml::Value>) -> Vec<&str> {
         .keys()
         .map(String::as_str)
         .filter(|key| !SPEC_READ_ENTRY_KEYS.contains(key))
+        // BOX-206: the expansion refuses a retired variable key, so it is
+        // not reported as unknown.
+        .filter(|key| !expand::RETIRED_VAR_KEYS.contains(key))
         .collect();
     keys.sort_unstable();
     keys
@@ -1395,11 +1484,12 @@ impl File {
 
     /// Loads the minimal file from `dir` as the package graph reads a
     /// layer: [`Self::from_dir`] without the interactive-task refusal
-    /// (BOX-054). The graph reads only a layer's `[upstream]`, `[params]`
-    /// and `[stdlib]`, and never runs its tasks. An upstream package
-    /// repository can still declare `interactive = true` tasks, and the
-    /// user cannot fix that file. The project's own file gets the refusal
-    /// when it loads through [`Self::from_dir`].
+    /// (BOX-054) and without the refusal of a `state_key` that is not one
+    /// directory name. The graph reads only a layer's `[upstream]`,
+    /// `[params]` and `[stdlib]`, and never runs its tasks. An upstream
+    /// package repository can still declare `interactive = true` tasks or
+    /// such a key, and the user cannot fix that file. The project's own file
+    /// gets both refusals when it loads through [`Self::from_dir`].
     pub fn from_dir_for_graph<P: AsRef<Path>>(dir: P) -> Result<Self, Error> {
         Self::load_dir(dir.as_ref(), TaskCheck::Skip)
     }
@@ -2537,7 +2627,9 @@ impl File {
                 let type_defaults = value.is_table()
                     && (expand::BUILTIN_BOX_TYPES.contains(&key.as_str())
                         || project_types.contains(key.as_str()));
-                !type_defaults && !expand::is_spec_key(key)
+                !type_defaults
+                    && !expand::is_spec_key(key)
+                    && !expand::RETIRED_VAR_KEYS.contains(&key.as_str())
             })
             .map(|(key, _)| key.as_str())
             .collect();
@@ -2726,8 +2818,10 @@ impl File {
             Err("it contains '/'".to_string())
         } else if component.contains('\0') {
             Err("it contains a NUL byte".to_string())
-        } else if component == "." || component == ".." {
-            Err(format!("it is {component:?}"))
+        } else if component == "." {
+            Err("it names the current directory".to_string())
+        } else if component == ".." {
+            Err("it names the parent directory".to_string())
         } else {
             Ok(())
         }
@@ -4093,7 +4187,7 @@ mod tests {
             Path::new("/home/user/project"),
         )
         .unwrap_err();
-        assert_eq!(err, "it is \"..\"");
+        assert_eq!(err, "it names the parent directory");
     }
 
     /// A state directory replaced by a symlink pointing outside the state
@@ -4262,7 +4356,7 @@ mod tests {
                 { dest = "~/.psqlrc",            source = "config/psqlrc" },
             ]
 
-            [session.vars]
+            [session.env_vars]
             RUST_LOG         = "info"
             CARGO_TERM_COLOR = "always"
             DATABASE_URL     = { inherit = true, default = "postgres://localhost/dev" }
@@ -4660,6 +4754,30 @@ mod tests {
         assert_eq!(file.defaults.state_key.as_deref(), Some("dev"));
     }
 
+    /// For `.` and `..` the refusal says what the key names, so the value is
+    /// not printed a second time as its own reason.
+    #[test]
+    fn a_dot_state_key_is_refused_with_what_it_names() {
+        let dir = tempdir().unwrap();
+        for (key, names) in [(".", "the current"), ("..", "the parent")] {
+            std::fs::write(
+                dir.path().join(MFILE_NAME),
+                format!("[tasks.build]\nexec = \"true\"\nstate_key = {key:?}\n"),
+            )
+            .unwrap();
+            let err = File::from_dir(dir.path()).expect_err(key);
+            assert_eq!(err.exit_code(), Some(3), "{err}");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "`[tasks.build]` in minimal.toml sets `state_key` to {key:?}, and it names \
+                     {names} directory. A state key is one directory name, such as \"dev\": not \
+                     `.` or `..`, and with no `/` or NUL byte."
+                )
+            );
+        }
+    }
+
     /// The package graph reads an upstream layer without the state-key check:
     /// the layer's tasks never run, so its keys are never used, and the user
     /// cannot fix that file.
@@ -4768,6 +4886,62 @@ mod tests {
         }
     }
 
+    /// BOX-203: `[[file_exports]]` on a task is a box setting, so the load
+    /// does not report it as an unknown field.
+    #[test]
+    fn file_exports_entry_key_is_not_reported_unknown() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MFILE_NAME),
+            "[tasks.build]\nexec = [\"make\"]\n\n[[tasks.build.file_exports]]\npath = \"out.txt\"\n",
+        )
+        .unwrap();
+
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        File::from_dir(dir.path()).expect("file_exports on a task loads");
+        drop(guard);
+
+        let out = capture.contents();
+        assert!(!out.contains("unknown fields"), "{out}");
+    }
+
+    /// #3650: a task's `[tasks.<name>.secrets]` table reaches the box's
+    /// spec through the entry expansion, so the load does not report it as
+    /// an unknown field.
+    #[test]
+    fn secrets_entry_key_is_not_reported_unknown() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MFILE_NAME),
+            "[tasks.ci]\nexec = [\"true\"]\n\n[tasks.ci.secrets.GH_TOKEN]\nsource = \"broker\"\n",
+        )
+        .unwrap();
+
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        File::from_dir(dir.path()).expect("secrets on a task loads");
+        drop(guard);
+
+        let out = capture.contents();
+        assert!(!out.contains("unknown fields"), "{out}");
+
+        // Another unknown key in the same task is still reported, alone.
+        let task: Task = toml::from_str(
+            "exec = [\"true\"]\ncolour = 1\n[secrets.GH_TOKEN]\nsource = \"broker\"\n",
+        )
+        .unwrap();
+        assert_eq!(unknown_entry_keys(&task.extra), ["colour"]);
+    }
+
     /// BOX-049: `timeout` in `[session]` or a task is a box setting, so the
     /// load does not report it as an unknown field.
     #[test]
@@ -4794,6 +4968,37 @@ mod tests {
 
         // Another unknown key in the same entry is still reported, alone.
         let task: Task = toml::from_str("exec = [\"true\"]\ntimeout = 90\ncolour = 1\n").unwrap();
+        assert_eq!(unknown_entry_keys(&task.extra), ["colour"]);
+    }
+
+    /// A task's `network` table is a box setting the spec reads, so the
+    /// load does not report it as an unknown field.
+    #[test]
+    fn task_network_table_is_not_reported_unknown() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MFILE_NAME),
+            "[tasks.reach]\nbash = \"curl\"\n\n[tasks.reach.network]\nmode = \"own_ip\"\n",
+        )
+        .unwrap();
+
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        File::from_dir(dir.path()).expect("a task network table loads");
+        drop(guard);
+
+        let out = capture.contents();
+        assert!(!out.contains("unknown fields"), "{out}");
+        assert!(!out.contains("update to a newer version"), "{out}");
+
+        // Another unknown key in the same task is still reported, alone.
+        let task: Task =
+            toml::from_str("bash = \"curl\"\ncolour = 1\n\n[network]\nmode = \"own_ip\"\n")
+                .unwrap();
         assert_eq!(unknown_entry_keys(&task.extra), ["colour"]);
     }
 
@@ -6245,5 +6450,113 @@ bash = \"true\"
         })
         .unwrap_err();
         assert!(matches!(err, Error::IO(..)), "error: {err:?}");
+    }
+
+    /// The toml examples of a reference page, each with the line its
+    /// fence opens on. A block whose first line names `user_policy.toml`
+    /// is left out: that file's `[vars]` is a policy section, not a layer.
+    fn reference_doc_toml_examples(page: &str) -> Vec<(usize, String)> {
+        let path = format!("{}/../../docs/reference/{page}", env!("CARGO_MANIFEST_DIR"));
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let mut blocks = Vec::new();
+        let mut open: Option<(usize, String)> = None;
+        for (index, line) in text.lines().enumerate() {
+            let fence = line.trim_start();
+            match open.take() {
+                None if fence == "```toml" => open = Some((index + 1, String::new())),
+                None => {}
+                Some(block) if fence.starts_with("```") => blocks.push(block),
+                Some((at, mut body)) => {
+                    // An example nested in a list item is indented.
+                    let indent = line.len() - fence.len();
+                    body.push_str(if indent >= 2 {
+                        &line[2.min(indent)..]
+                    } else {
+                        line
+                    });
+                    body.push('\n');
+                    open = Some((at, body));
+                }
+            }
+        }
+        assert!(open.is_none(), "{page}: a toml example is not closed");
+        blocks
+            .into_iter()
+            .filter(|(_, body)| !body.trim_start().starts_with("# user_policy.toml"))
+            .collect()
+    }
+
+    /// The dotted paths of every `vars` or `vars_lenient` key in `value`.
+    /// A key inside an `env_vars` table is a variable name, not a table.
+    fn retired_var_keys(value: &toml::Value, at: &str, found: &mut Vec<String>) {
+        let toml::Value::Table(table) = value else {
+            if let toml::Value::Array(items) = value {
+                for item in items {
+                    retired_var_keys(item, at, found);
+                }
+            }
+            return;
+        };
+        for (key, child) in table {
+            let path = if at.is_empty() {
+                key.clone()
+            } else {
+                format!("{at}.{key}")
+            };
+            if key == "vars" || key == "vars_lenient" {
+                found.push(path.clone());
+            }
+            if key != "env_vars" {
+                retired_var_keys(child, &path, found);
+            }
+        }
+    }
+
+    /// A schema sketch made into toml: each `<placeholder>` becomes its
+    /// bare name and each `, ...` list tail goes away. Anything else that
+    /// does not parse stays an error.
+    fn fill_sketch_placeholders(body: &str) -> String {
+        let mut filled = String::new();
+        let mut rest = body.replace(", ...", "");
+        while let Some(open) = rest.find('<') {
+            let Some(len) = rest[open..].find('>') else {
+                break;
+            };
+            let name = &rest[open + 1..open + len];
+            if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == ' ') {
+                break;
+            }
+            filled.push_str(&rest[..open]);
+            filled.push_str(&name.replace(' ', "_"));
+            rest = rest[open + len + 1..].to_owned();
+        }
+        filled.push_str(&rest);
+        filled
+    }
+
+    // BOX-205, BOX-206: the reference pages set variables in `env_vars`
+    // only. Every example parses, or is a schema sketch with placeholders.
+    #[test]
+    fn reference_doc_examples_use_env_vars() {
+        let mut checked = 0;
+        for page in ["loadouts.md", "minimal-dot-toml.md", "tasks.md"] {
+            let examples = reference_doc_toml_examples(page);
+            assert!(!examples.is_empty(), "{page}: no toml examples");
+            for (line, body) in examples {
+                // A schema sketch with `<placeholder>` values is not toml
+                // until its placeholders are filled in. It must parse then.
+                let value = toml::from_str::<toml::Value>(&body)
+                    .or_else(|_| toml::from_str(&fill_sketch_placeholders(&body)))
+                    .unwrap_or_else(|e| panic!("{page}:{line}: the example does not parse: {e}"));
+                let mut found = Vec::new();
+                retired_var_keys(&value, "", &mut found);
+                assert!(
+                    found.is_empty(),
+                    "{page}:{line}: the example sets {found:?}, not env_vars"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0);
     }
 }

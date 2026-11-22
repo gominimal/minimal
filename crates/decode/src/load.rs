@@ -240,9 +240,12 @@ fn unescape_import(raw: &str) -> String {
 /// Packages import their siblings as `../<name>/build.ncl`, so `..` itself
 /// is not refused: where the path lands is what counts.
 ///
-/// The scan is lexical and can miss an import (see [Loader::new], whose check
-/// after loading backs it up), and it can over-match: an `import "…"` inside
-/// a comment or a string is checked too.
+/// The scan is lexical and can miss an import (the check after loading,
+/// [confine_files_read], backs it up), and it can over-match: an
+/// `import "…"` inside a comment or a string is checked too.
+///
+/// A caller outside this module confines through [Confinement], which runs
+/// this and [confine_files_read] in the same order the loader does.
 fn confine_imports(entries: &[PathBuf], root: &Path, lib_path: &Path) -> Result<(), Error> {
     let lib = lib_path.canonicalize().ok();
     let outside = |file: &Path, import: &str| Error::ImportOutside {
@@ -325,6 +328,78 @@ fn confine_imports(entries: &[PathBuf], root: &Path, lib_path: &Path) -> Result<
         }
     }
     Ok(())
+}
+
+/// The canonical root a layer at `layer_dir` is confined to (see
+/// [LoadOptions::confine_to]). A layer directory that does not exist has no
+/// files to confine; its normalized path stands in as the root.
+fn layer_root(layer_dir: &Path) -> Result<PathBuf, Error> {
+    match layer_dir.canonicalize() {
+        Ok(root) => Ok(root),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(normalize_path(layer_dir)?),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Refuses a Nickel program that has read a file from disk outside `root`
+/// (canonical, see [layer_root]) and the minimal library at `lib_path`.
+///
+/// This is the check after loading that backs up [confine_imports]. Run it
+/// once the program has typechecked and compiled, and also when either
+/// fails, before reporting that failure: then a foreign file is reported as
+/// outside the layer rather than quoted in a diagnostic. The refusal is an
+/// [Error::ImportOutside] naming the file, never its content.
+fn confine_files_read(files: &Files, root: &Path, lib_path: &Path) -> Result<(), Error> {
+    let lib = lib_path.canonicalize().ok();
+    match first_file_outside(files, root, lib.as_deref()) {
+        Some(path) => Err(Error::ImportOutside {
+            file: None,
+            import: path.to_string_lossy().into_owned(),
+            root: root.to_path_buf(),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// The confinement of a Nickel program over a layer's files: it may read the
+/// layer's own files and the minimal library, and nothing else.
+///
+/// The layer loader and every other place that builds its own program over a
+/// layer's files (the package and stack checks) confine through this, so
+/// they apply the same rules in the same order: [Confinement::new] before
+/// the program reads anything, [Confinement::check_files_read] once it has
+/// typechecked and compiled, and also when either fails, before that failure
+/// is reported.
+#[derive(Debug, Clone)]
+pub struct Confinement {
+    root: PathBuf,
+    lib_path: PathBuf,
+}
+
+impl Confinement {
+    /// Confines a program whose entry files are `entries`, files of the
+    /// layer at `layer_dir`, with the minimal library at `lib_path` as Nickel
+    /// is given it. Refuses, before Nickel reads anything, an entry or an
+    /// import that leaves the layer (see [confine_imports]).
+    pub fn new(layer_dir: &Path, entries: &[PathBuf], lib_path: &Path) -> Result<Self, Error> {
+        let root = layer_root(layer_dir)?;
+        confine_imports(entries, &root, lib_path)?;
+        Ok(Self {
+            root,
+            lib_path: lib_path.to_path_buf(),
+        })
+    }
+
+    /// The canonical layer root (see [LoadOptions::confine_to]).
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Refuses a program that has read a file from disk outside the layer
+    /// and the minimal library (see [confine_files_read]).
+    pub fn check_files_read(&self, files: &Files) -> Result<(), Error> {
+        confine_files_read(files, &self.root, &self.lib_path)
+    }
 }
 
 /// The symlink that takes `entry`, a path the layer at `root` (canonical)
@@ -436,17 +511,9 @@ impl Loader {
         // escaped quote or a string form its pattern does not match. It runs
         // on the failure paths too, so a foreign file that fails to parse is
         // reported as outside the layer rather than quoted.
-        let lib = opts.minimal_lib_path.canonicalize().ok();
         let confine = |program: &Program<CacheImpl>| -> Result<(), Error> {
-            let Some(root) = opts.confine_to.as_deref() else {
-                return Ok(());
-            };
-            match first_file_outside(&program.files(), root, lib.as_deref()) {
-                Some(path) => Err(Error::ImportOutside {
-                    file: None,
-                    import: path.to_string_lossy().into_owned(),
-                    root: root.to_path_buf(),
-                }),
+            match opts.confine_to.as_deref() {
+                Some(root) => confine_files_read(&program.files(), root, &opts.minimal_lib_path),
                 None => Ok(()),
             }
         };
@@ -556,23 +623,15 @@ impl Loader {
         src.push('}');
 
         // The layer's own files may import each other and the minimal
-        // library, and nothing else. A layer directory that does not exist
-        // has no files to confine; its normalized path stands in as the root.
-        let root = match layer_dir.as_ref().canonicalize() {
-            Ok(root) => root,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                normalize_path(layer_dir.as_ref())?
-            }
-            Err(e) => return Err(e.into()),
-        };
-        confine_imports(&entries, &root, &opts.minimal_lib_path)?;
+        // library, and nothing else.
+        let confinement = Confinement::new(layer_dir.as_ref(), &entries, &opts.minimal_lib_path)?;
 
         let confined = LoadOptions {
             minimal_lib_path: opts.minimal_lib_path.clone(),
             from: opts.from.clone(),
             target: opts.target.clone(),
             params: opts.params.clone(),
-            confine_to: Some(root),
+            confine_to: Some(confinement.root().to_path_buf()),
         };
         Self::new(src, args, &confined)
     }

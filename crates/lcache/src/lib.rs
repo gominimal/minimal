@@ -111,6 +111,23 @@ impl PendingDir {
             std::fs::rename(from_path, to).map_err(CacheErr::IO)?;
         }
 
+        // The rename keeps the temp dir's mtime, which is the last change to
+        // its direct children and can predate this finalize by the whole
+        // build (or come from an extract that preserves upstream times). The
+        // cache clean reads this mtime as the write time of an entry nobody
+        // has read yet, so stamp it now. The stamp serves only the clean, so
+        // a failure is logged and does not abort the finalize: the entry is
+        // already in place and still needs its metadata.
+        if let Err(err) =
+            std::fs::File::open(to).and_then(|d| d.set_modified(std::time::SystemTime::now()))
+        {
+            tracing::warn!(
+                path = %to.display(),
+                error = %err,
+                "could not stamp the cache entry's write time"
+            );
+        }
+
         drop(st);
 
         meta.write(&inner.fs, &self.hash)?;
@@ -277,15 +294,20 @@ impl Cache<LocalDir> {
         })
     }
 
-    /// Invalidates (deletes) a directory cache entry with the given spec hash.
-    pub fn invalidate_dir(&self, hash: &SpecHash) -> Result<(), CacheErr> {
+    /// The path on the filesystem where the entry with `hash` lives, whether
+    /// or not it exists yet.
+    pub fn entry_path(&self, hash: &SpecHash) -> PathBuf {
         let hash_hex = hash.0.to_hex();
         // Entries on disk are at <root>/<first byte as hex>/<remaining bytes as hex>
         let subpath: PathBuf = [&hash_hex.as_str()[0..2], &hash_hex.as_str()[2..]]
             .iter()
             .collect();
+        self.inner().fs.path().join(subpath)
+    }
 
-        let p = self.inner().fs.path().join(subpath);
+    /// Invalidates (deletes) a directory cache entry with the given spec hash.
+    pub fn invalidate_dir(&self, hash: &SpecHash) -> Result<(), CacheErr> {
+        let p = self.entry_path(hash);
         std::fs::remove_dir_all(p).map_err(CacheErr::from)
     }
 

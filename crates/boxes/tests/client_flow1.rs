@@ -76,7 +76,7 @@ fn happy_path_one_of_each() {
         r#"name = "dev"
 packages = ["helix"]
 
-[vars]
+[env_vars]
 EDITOR = "hx"
 
 [[patches]]
@@ -125,14 +125,14 @@ on_activate = {{ type = "inline", value = "echo activated" }}
 fn multiple_loadouts_preserve_per_item_provenance() {
     let l1: Loadout = toml::from_str(
         r#"name = "first"
-[vars]
+[env_vars]
 EDITOR = "hx"
 "#,
     )
     .unwrap();
     let l2: Loadout = toml::from_str(
         r#"name = "second"
-[vars]
+[env_vars]
 LANG = "sjn_IV"
 "#,
     )
@@ -175,7 +175,7 @@ LANG = "sjn_IV"
 fn inherit_uses_env_value() {
     let loadout: Loadout = toml::from_str(
         r#"name = "dev"
-[vars]
+[env_vars]
 LANG = { inherit = true }
 TERM = { inherit = true, default = "xterm-256color" }
 "#,
@@ -205,7 +205,7 @@ TERM = { inherit = true, default = "xterm-256color" }
 fn inherit_with_default_falls_back_when_env_missing() {
     let loadout: Loadout = toml::from_str(
         r#"name = "dev"
-[vars]
+[env_vars]
 LANG = { inherit = true, default = "sjn_IV" }
 "#,
     )
@@ -330,7 +330,7 @@ source = "{root}/dotfiles/helix/themes/**/*.toml"
 fn ignore_filters_user_var() {
     let loadout: Loadout = toml::from_str(
         r#"name = "dev"
-[vars]
+[env_vars]
 EDITOR = { inherit = true }
 _TMP = { inherit = true }
 "#,
@@ -449,7 +449,7 @@ source = "{root}/dotfiles/secrets/id_rsa"
 fn deny_rejects_user_var() {
     let loadout: Loadout = toml::from_str(
         r#"name = "dev"
-[vars]
+[env_vars]
 AWS_KEY = { inherit = true }
 "#,
     )
@@ -489,7 +489,7 @@ fn wire_contribution_round_trips_through_json() {
         r#"name = "dev"
 packages = ["helix"]
 
-[vars]
+[env_vars]
 LANG = "sjn_IV"
 
 [[patches]]
@@ -703,7 +703,7 @@ fn a_loadout_root_var_does_not_redirect_patch_sources() {
     loadouts_dir_fixture(root);
     let src = format!(
         r#"
-[vars]
+[env_vars]
 LOADOUT_ROOT = "{root}/ops"
 
 [[patches]]
