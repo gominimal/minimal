@@ -6767,8 +6767,9 @@ impl BoxRegistry {
         // The node's own listeners now include its hostname proxy port, so
         // the mirror leaves it out, a port it held before included
         // (NET-138: a node listener is never mirrored).
-        self.node_mirror
-            .set_node_own(&crate::control::guest_infrastructure_ports(self));
+        let own =
+            crate::control::guest_infrastructure_ports(self, crate::net::answerer::hook_port());
+        self.node_mirror.set_node_own(&own);
         Ok(node)
     }
 
@@ -7519,7 +7520,8 @@ impl BoxRegistry {
     /// no caller can reach a bind without that check.
     pub fn mirror_notice(&self, notice: minimald_rpc::ListenNotice) -> MirrorOutcome {
         // NET-138: the node's own listeners are never mirrored.
-        let infrastructure = crate::control::guest_infrastructure_ports(self);
+        let infrastructure =
+            crate::control::guest_infrastructure_ports(self, crate::net::answerer::hook_port());
         self.node_mirror
             .notice(notice, &infrastructure, Instant::now())
     }

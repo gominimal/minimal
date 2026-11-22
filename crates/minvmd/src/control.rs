@@ -1531,11 +1531,15 @@ fn oversized_listen_notice(request: &BoxControlRequest, line: &str) -> Option<Bo
 /// own services, read from this daemon's own configuration and never from
 /// a guest report: the vsock ports it bridges (the in-VM daemon's RPC
 /// bridge, the boot marker, the timekeep bridge, the report door and the
-/// telemetry port), the zone answerer's port (the default or the operator's
-/// pin, [`crate::net::answerer::hook_port`]), the range probe's port, and
-/// the node row's admitted ports, which hold the hostname proxy's port the
-/// host assigned before boot.
-pub(crate) fn guest_infrastructure_ports(boxes: &BoxRegistry) -> std::collections::BTreeSet<u16> {
+/// telemetry port), the ports an answerer of this node's box names may be
+/// bound at given the hook port `hook`
+/// ([`crate::net::answerer::answerer_host_ports`]: the pin and the
+/// default), the range probe's port, and the node row's admitted ports,
+/// which hold the hostname proxy's port the host assigned before boot.
+pub(crate) fn guest_infrastructure_ports(
+    boxes: &BoxRegistry,
+    hook: u16,
+) -> std::collections::BTreeSet<u16> {
     let vsock = [
         crate::sock::VSOCK_BRIDGE_PORT,
         crate::cmd::VSOCK_MARKER_PORT,
@@ -1547,7 +1551,7 @@ pub(crate) fn guest_infrastructure_ports(boxes: &BoxRegistry) -> std::collection
         .into_iter()
         .filter_map(|port| u16::try_from(port).ok())
         .collect();
-    ports.insert(crate::net::answerer::hook_port());
+    ports.extend(crate::net::answerer::answerer_host_ports(hook));
     ports.insert(switch::loopback::RANGE_PROBE_PORT);
     if let Some(node) = boxes.table().by_source(boxes.subnet().daemon_ip().octets()) {
         ports.extend(node.admitted_ports().iter().copied());
@@ -4446,6 +4450,32 @@ mod tests {
     /// The default switch subnet, the plan the registries below are built
     /// for.
     const SUBNET: SwitchSubnet = switch::DEFAULT_SUBNET;
+
+    /// The guest-infrastructure ports hold the answerer's pinned hook port
+    /// and the default beside it, which the DNS service binds whatever the
+    /// pin is. A port is held for the answerer only when the hook port the
+    /// set is built from names it, or when it is the default.
+    #[test]
+    fn guest_infrastructure_ports_hold_the_pinned_hook_port_and_the_default() {
+        let boxes = BoxRegistry::new(SUBNET);
+        let pin = 17_656;
+        let default = crate::net::answerer::DEFAULT_ANSWERER_PORT;
+        let pinned = guest_infrastructure_ports(&boxes, pin);
+        assert!(pinned.contains(&pin), "the pin is held: {pinned:?}");
+        assert!(
+            pinned.contains(&default),
+            "the default stays held under a pin: {pinned:?}"
+        );
+        let unpinned = guest_infrastructure_ports(&boxes, default);
+        assert!(
+            unpinned.contains(&default),
+            "the default is held: {unpinned:?}"
+        );
+        assert!(
+            !unpinned.contains(&pin),
+            "a port no pin names is not held: {unpinned:?}"
+        );
+    }
 
     /// NET-046: the host-side audit log is bounded. Past its cap it rotates
     /// to one kept generation, so neither file grows past the cap however

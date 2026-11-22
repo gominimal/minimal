@@ -127,11 +127,12 @@ pub const DEFAULT_ANSWERER_PORT: u16 = 7656;
 /// beside `MINVMD_NODE_PROXY_PORT` because the supervisor's ports are set
 /// that way, not by `minvmd config set` (which holds the VM's sizing).
 /// Unset is [`DEFAULT_ANSWERER_PORT`]. As on the native daemon there is no
-/// select-when-busy and no off: the port is the one a host resolver is
-/// routed to, so `0` is refused rather than read as "any port". A pin moves
-/// only this daemon's bind and the ports it reserves for the answerer; an
-/// installed DNS service keeps its own port, and a daemon that finds a
-/// channel publishes there whatever its pin.
+/// select-when-busy and no off, so `0` is refused rather than read as "any
+/// port". A pin moves only the bind this daemon makes when it answers box
+/// names itself, and adds the pin to the ports Minimal's own listener sets
+/// hold ([`answerer_host_ports`]). An installed DNS service keeps its own
+/// port, and a daemon that finds a channel publishes there whatever its
+/// pin.
 pub const ANSWERER_PORT_ENV: &str = "MINVMD_ZONE_ANSWERER_PORT";
 
 /// The hook port this process resolved at start ([`configure_hook_port`]).
@@ -216,6 +217,20 @@ pub fn configure_hook_port() -> Result<u16, String> {
 #[must_use]
 pub fn hook_port() -> u16 {
     HOOK_PORT.get().copied().unwrap_or(DEFAULT_ANSWERER_PORT)
+}
+
+/// The host ports an answerer of this node's box names may be bound at,
+/// given this daemon's hook port `hook`: `hook`, which this daemon binds
+/// when it answers box names itself, and [`DEFAULT_ANSWERER_PORT`], which
+/// the installed DNS service binds whatever `hook` is (its socket unit
+/// names the port) and a native `minimald` binds unless told otherwise.
+/// Minimal's own listener sets (the proxy draw's reserved ports, the
+/// guest-infrastructure ports and the listeners a host exposure may not
+/// open) hold every one of them, so a pin adds a port to those sets and
+/// takes none out. One port when `hook` is the default.
+pub fn answerer_host_ports(hook: u16) -> impl Iterator<Item = u16> {
+    std::iter::once(DEFAULT_ANSWERER_PORT)
+        .chain((hook != DEFAULT_ANSWERER_PORT).then_some(hook))
 }
 
 /// The interim answerer channel socket's file name inside a state dir's
@@ -6858,6 +6873,21 @@ mod tests {
         );
         assert_eq!(hook_port_from_os(None), Ok(DEFAULT_ANSWERER_PORT));
         assert_eq!(hook_port_from_os(Some(OsStr::new("17656"))), Ok(17656));
+    }
+
+    /// The ports an answerer of this node's names may be bound at are the
+    /// pin and the default beside it, which the DNS service binds whatever
+    /// the pin is; with no pin, the default alone.
+    #[test]
+    fn answerer_host_ports_are_the_pin_and_the_default() {
+        assert_eq!(
+            answerer_host_ports(17_656).collect::<Vec<_>>(),
+            vec![DEFAULT_ANSWERER_PORT, 17_656]
+        );
+        assert_eq!(
+            answerer_host_ports(DEFAULT_ANSWERER_PORT).collect::<Vec<_>>(),
+            vec![DEFAULT_ANSWERER_PORT]
+        );
     }
 
     /// A daemon pinned off the service's port that publishes to the

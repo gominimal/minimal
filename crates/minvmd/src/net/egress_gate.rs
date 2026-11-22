@@ -644,6 +644,7 @@ impl<'a> AliasOpenings<'a> {
             .by_source(self.table.subnet().daemon_ip().octets());
         host_exposures::minimal_listeners(
             node.as_deref().map_or(&[][..], BoxRecord::admitted_ports),
+            crate::net::answerer::hook_port(),
             self.baseline.alias_ports(),
             baseline::ALIAS_FETCH_PROTOCOL,
         )

@@ -2515,17 +2515,19 @@ const SKIP_RESERVED_BY_ANOTHER_VM: &str = "another VM's reservation holds it";
 const SKIP_NODE_RESERVED: &str = "the node reserves it for its own daemons";
 
 /// The ports this node itself reserves, skipped by the draw whether or not
-/// anything is bound at them at the probe ([`SKIP_NODE_RESERVED`]). The
-/// zone answerer's hook port is the one port every VM-backed boot binds on
-/// the host: [`crate::net::answerer::hook_port`], the default or the
-/// operator's [`crate::net::answerer::ANSWERER_PORT_ENV`] pin. The in-VM
-/// egress and mTLS defaults (:7654/:7655) are not here — a VM-backed host
-/// runs its hostname proxy *and* its zone answerer on the host, and those
-/// in-guest defaults are exactly the ports a VM's own guest daemons bind
-/// inside their VM, not ports the node reserves on the host.
+/// anything is bound at them at the probe ([`SKIP_NODE_RESERVED`]), given
+/// the zone answerer's hook port `hook` (the default, or the operator's
+/// [`crate::net::answerer::ANSWERER_PORT_ENV`] pin): the ports an answerer
+/// of this node's box names may be bound at on the host
+/// ([`crate::net::answerer::answerer_host_ports`]), the pin and the
+/// default the DNS service binds. The in-VM egress and mTLS defaults
+/// (:7654/:7655) are not here — a VM-backed host runs its hostname proxy
+/// *and* its zone answerer on the host, and those in-guest defaults are
+/// exactly the ports a VM's own guest daemons bind inside their VM, not
+/// ports the node reserves on the host.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn node_reserved_ports() -> [u16; 1] {
-    [crate::net::answerer::hook_port()]
+fn node_reserved_ports(hook: u16) -> impl Iterator<Item = u16> {
+    crate::net::answerer::answerer_host_ports(hook)
 }
 
 /// The mode every ports directory is created with, and the widest mode an
@@ -2749,7 +2751,7 @@ fn check_candidate(
     udp: bool,
     probe: &dyn Fn(u16) -> std::io::Result<u16>,
 ) -> CandidateCheck {
-    let verdict = candidate_verdict(dir, port, udp, probe);
+    let verdict = candidate_verdict(dir, port, udp, crate::net::answerer::hook_port(), probe);
     match &verdict {
         CandidateCheck::Free(_) => log_reserved_candidate(port),
         CandidateCheck::Skip(reason) => log_skipped_candidate(port, reason),
@@ -2760,15 +2762,19 @@ fn check_candidate(
 
 /// [`check_candidate`]'s checks, in the same order, with no log line: the
 /// reclaim watcher runs them on every probe ([`proxy_reclaim_check`]).
+/// `hook` is the zone answerer's hook port the reserved set is built from
+/// ([`node_reserved_ports`]); both callers pass this process's
+/// [`crate::net::answerer::hook_port`].
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn candidate_verdict(
     dir: &std::path::Path,
     port: u16,
     udp: bool,
+    hook: u16,
     probe: &dyn Fn(u16) -> std::io::Result<u16>,
 ) -> CandidateCheck {
     use std::io::ErrorKind::AddrInUse;
-    if node_reserved_ports().contains(&port) {
+    if node_reserved_ports(hook).any(|reserved| reserved == port) {
         return CandidateCheck::Skip(SKIP_NODE_RESERVED);
     }
     let refused = match probe(port) {
@@ -3099,7 +3105,8 @@ pub(crate) fn proxy_reclaim_check(
 ) -> impl FnMut(u16) -> Option<NodePortReservation> + Send + 'static {
     move |port| {
         let probe = node_port_probe(false);
-        match candidate_verdict(&dir, port, false, &probe) {
+        let hook = crate::net::answerer::hook_port();
+        match candidate_verdict(&dir, port, false, hook, &probe) {
             CandidateCheck::Free(reservation) => Some(reservation),
             CandidateCheck::Skip(_) | CandidateCheck::Error(_) => None,
         }
@@ -4808,8 +4815,14 @@ mod tests {
         let mut reclaimed = check(pin);
         let mut fresh_attempts = 0;
         while reclaimed.is_none() && fresh_attempts < NODE_PORT_RACE_ATTEMPTS {
-            match super::candidate_verdict(ports.path(), pin, false, &super::node_port_probe(false))
-            {
+            let hook = crate::net::answerer::hook_port();
+            match super::candidate_verdict(
+                ports.path(),
+                pin,
+                false,
+                hook,
+                &super::node_port_probe(false),
+            ) {
                 // The race this retry exists for: a parallel test holds the
                 // freed pin, so the fallback asks a fresh port instead.
                 super::CandidateCheck::Skip(super::SKIP_BIND_REFUSED)
@@ -5160,7 +5173,7 @@ mod tests {
             "nothing binds the answerer's hook port while this test runs"
         );
         assert!(
-            super::node_reserved_ports().contains(&hook),
+            super::node_reserved_ports(hook).any(|port| port == hook),
             "the node-reserved set names the answerer's hook port"
         );
         let assigned = super::assign_node_port(ports.path(), hook, false).unwrap();
@@ -5172,6 +5185,37 @@ mod tests {
             assigned.skipped,
             Some(super::SKIP_NODE_RESERVED),
             "the skip names the reservation's reason, not a probe's"
+        );
+    }
+
+    /// A pinned hook port is reserved beside the default, which the DNS
+    /// service binds whatever the pin is, and a port is reserved only for
+    /// the hook port that names it: the reserved set is built from the hook
+    /// port the check is given, never from the default alone.
+    #[test]
+    fn candidate_verdict_reserves_the_pinned_hook_port_and_the_default() {
+        // Its own reservation dir: no test takes a flock in the real one.
+        let ports = tempfile::tempdir().expect("a test reservation dir");
+        let pin = 17_656;
+        let default = crate::net::answerer::DEFAULT_ANSWERER_PORT;
+        // A probe that finds every port free, so only the reserved set and
+        // the reservation decide. UDP, so no connect probe runs either.
+        let free = |port: u16| -> std::io::Result<u16> { Ok(port) };
+        for reserved in [pin, default] {
+            assert!(
+                matches!(
+                    super::candidate_verdict(ports.path(), reserved, true, pin, &free),
+                    super::CandidateCheck::Skip(super::SKIP_NODE_RESERVED)
+                ),
+                "with the hook port pinned to {pin}, port {reserved} is the node's own"
+            );
+        }
+        assert!(
+            matches!(
+                super::candidate_verdict(ports.path(), pin, true, default, &free),
+                super::CandidateCheck::Free(_)
+            ),
+            "with the hook port at the default, port {pin} is a candidate like any other"
         );
     }
 
