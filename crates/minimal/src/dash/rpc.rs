@@ -935,10 +935,14 @@ fn put_picked_entry(
     // This request carries the network and policy the dashboard gives it,
     // not the entry's. So an entry that declares network or secret settings
     // would store a spec that is not its expansion. Refuse it until #3739
-    // applies those settings here, as `activate_box` does.
+    // applies those settings here, as `activate_box` does. A `network.mode`
+    // that differs from the form's mode is one more refusal #3739 lifts.
     let egress = crate::project_egress(&dir, Some(&entry))?;
     let (bep, grants, env, quic443) = crate::project_bep_and_grants(&dir, Some(&entry))?;
     if egress.policy.is_some()
+        || egress
+            .mode
+            .is_some_and(|mode| mode != request.config.network)
         || egress.ingress.is_some()
         || !grants.is_empty()
         || bep != boxes::core::bep::BepSettings::default()
@@ -948,6 +952,7 @@ fn put_picked_entry(
         tracing::debug!(
             entry = %entry,
             egress = egress.policy.is_some(),
+            mode = ?egress.mode,
             ingress = egress.ingress.is_some(),
             grants = grants.len(),
             env = env.len(),
@@ -1834,6 +1839,11 @@ mod tests {
         assert_dashboard_refuses_entry_with(
             "[sessions.dev.network.egress]\nallow_dns_hosts = [\"github.com\"]\n",
         );
+    }
+
+    #[test]
+    fn dashboard_create_refuses_an_entry_whose_network_mode_differs() {
+        assert_dashboard_refuses_entry_with("[sessions.dev.network]\nmode = \"none\"\n");
     }
 
     #[test]
