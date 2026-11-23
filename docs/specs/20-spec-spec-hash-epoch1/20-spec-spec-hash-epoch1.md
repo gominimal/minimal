@@ -279,7 +279,7 @@ build-infra operator. Release manager.
   property: no two structural tags share a byte, and for all byte strings s
     with an unassigned tag: decode(s) errors
   harness:  kani_epoch1_tags_unique_and_unknown_rejected, exhaustive over
-    all 256 tag bytes with a bounded 8-byte payload, in spec and in
+    all 256 tag bytes with a bounded 8-byte payload, in spec, subset and
     container position, unwind 9 (the payload loop)
   - THE SYSTEM SHALL assign no tag in 0xF0 to 0xFF at the epoch-1 seal;
     that range is the reserve an additive optional field (EPOCH-021) draws
@@ -342,11 +342,13 @@ build-infra operator. Release manager.
     EPOCH-014, so the test holds the epoch by construction and checks the
     derivation, never reads it back from a key)
 
-- **EPOCH-012** WHEN a consumer computes a lookup key THE SYSTEM SHALL use
-  the epoch that the index of its registry pin declares.
+- **EPOCH-012** WHEN a consumer computes a lookup key, of a spec, a subset
+  or a container, THE SYSTEM SHALL use the epoch that the index of its
+  registry pin declares.
   tier:     T1
   verify:   cargo nextest run -p rcache epoch_follows_pinned_index
-  property: for all pins p whose index holds a record, specs s:
+  property: for all pins p whose index holds a record, specs, subsets or
+    containers s:
     lookup_key(p, s) == hash(epoch(index(p)), encode_epoch(index(p))(s))
   - IF a lookup reads several indexes as one (an upstream with its
     sideloads) AND two of them declare different epochs THEN THE SYSTEM
@@ -386,13 +388,16 @@ build-infra operator. Release manager.
 
 - **EPOCH-014** WHEN the system computes a container key THE SYSTEM SHALL
   enter each member package by the key that the same graph computes for
-  that member under the container's epoch. A container's epoch is the one
-  the producing side is configured to seal at: the same value that selects
-  the spec and subset encoders, epoch 1 once the flip has moved it
-  (EPOCH-015 derives the key under the epoch-1 context). A key carries no
-  epoch in its bytes, so the hasher never reads a member key from an index
-  record; every member key it enters is of the container's epoch by
-  construction.
+  that member under the container's epoch. On the producing side a
+  container's epoch is the one it is configured to seal at: the same value
+  that selects the spec and subset encoders, epoch 1 once the flip has
+  moved it (EPOCH-015 derives the key under the epoch-1 context). A
+  consumer that computes a container key to look one up takes the epoch
+  that the index of its registry pin declares (EPOCH-012), never the
+  producing side's setting, and enters the member keys under that epoch
+  too. A key carries no epoch in its bytes, so the hasher never reads a
+  member key from an index record; every member key it enters is of the
+  container's epoch by construction.
   tier:     T1
   verify:   cargo nextest run -p graph epoch1_container_members_by_key
   property: for all containers c, members m of c: the member bytes of
