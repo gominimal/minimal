@@ -82,6 +82,14 @@ pub enum Action {
 pub struct CreateForm {
     pub name: String,
     pub path: String,
+    /// The session entries of the project at `entries_for`, in the order
+    /// `min session start` lists them, or why none can be offered.
+    pub entries: Result<Vec<String>, String>,
+    /// Index into `entries`: the picked entry.
+    pub entry_idx: usize,
+    /// The path `entries` was read for, or `None` before the first read
+    /// comes back. A changed path reads them again.
+    pub entries_for: Option<String>,
     /// Index into [`NETWORK_MODES`].
     pub net_idx: usize,
     pub field: CreateField,
@@ -91,19 +99,146 @@ pub struct CreateForm {
 pub enum CreateField {
     Name,
     Path,
+    Entry,
     Network,
 }
 
 impl CreateForm {
+    /// A form for the project at `path`. Its session entries are not read
+    /// yet: [`CreateForm::read_request`] gives the read to run off the
+    /// event path, and [`Msg::EntriesRead`] brings the result back.
+    #[must_use]
+    pub fn new(path: String) -> Self {
+        Self {
+            name: String::new(),
+            path,
+            entries: Err(ENTRIES_READING.to_string()),
+            entry_idx: 0,
+            entries_for: None,
+            net_idx: 0,
+            field: CreateField::Name,
+        }
+    }
+
+    /// The read of the session entries for the path as it is now. The
+    /// dashboard reads them again each time the form asks, so an edited
+    /// `minimal.toml` is read again too.
+    #[must_use]
+    pub fn read_request(&self) -> Effect {
+        Effect::ReadEntries(self.path.trim().to_string())
+    }
+
+    /// The reads a focus change asks for: the entries again when the
+    /// focus reaches the entry field, or when the path changed.
+    fn focus_reads(&self) -> Vec<Effect> {
+        match self.field == CreateField::Entry || !self.entries_current() {
+            true => vec![self.read_request()],
+            false => Vec::new(),
+        }
+    }
+
+    /// True when `entries` were read for the path as it is now.
+    #[must_use]
+    pub fn entries_current(&self) -> bool {
+        self.entries_for.as_deref() == Some(self.path.trim())
+    }
+
+    /// Takes the session entries read for `path`, and preselects the entry
+    /// a start with no entry picks. An entry already picked for the same
+    /// path stays picked while the project still declares it. A read for a
+    /// path the form no longer shows is dropped.
+    fn take_entries(&mut self, path: &str, choices: EntryChoices) {
+        if path != self.path.trim() {
+            return;
+        }
+        if let Err(reason) = &choices {
+            tracing::debug!(path = %path, reason = %reason, "the create form offers no session entry");
+        }
+        let kept = match self.entries_for.as_deref() == Some(path) {
+            true => self.entry().map(str::to_string),
+            false => None,
+        };
+        (self.entries, self.entry_idx) = match choices {
+            Ok((names, picked)) => {
+                let idx = kept
+                    .and_then(|kept| names.iter().position(|name| *name == kept))
+                    .unwrap_or(picked);
+                (Ok(names), idx)
+            }
+            Err(reason) => (Err(reason), 0),
+        };
+        self.entries_for = Some(path.to_string());
+    }
+
+    /// The picked entry's name, if the project offers one.
+    #[must_use]
+    pub fn entry(&self) -> Option<&str> {
+        self.entries
+            .as_ref()
+            .ok()
+            .and_then(|names| names.get(self.entry_idx))
+            .map(String::as_str)
+    }
+
+    /// Moves the pick one entry on or back, wrapping at either end.
+    fn cycle_entry(&mut self, forward: bool) {
+        let count = self.entries.as_ref().map_or(0, Vec::len);
+        if count == 0 {
+            return;
+        }
+        self.entry_idx = match forward {
+            true => (self.entry_idx + 1) % count,
+            false => (self.entry_idx + count - 1) % count,
+        };
+    }
+
     /// The focused text field's buffer, if it is one (`Network` cycles
     /// modes instead of taking text).
     fn input_mut(&mut self) -> Option<&mut String> {
         match self.field {
             CreateField::Name => Some(&mut self.name),
             CreateField::Path => Some(&mut self.path),
-            CreateField::Network => None,
+            CreateField::Entry | CreateField::Network => None,
         }
     }
+}
+
+/// What the create form shows in place of the entries while it reads them.
+const ENTRIES_READING: &str = "reading the session entries";
+
+/// The session entry names of a project and the index of the preselected
+/// one, or why the project offers none.
+pub type EntryChoices = Result<(Vec<String>, usize), String>;
+
+/// The session entries of the project at `dir`, as `min session start`
+/// counts them (the implicit `default` included), and the index of the one
+/// a start with no entry picks. When that pick is undecided, the first.
+///
+/// # Errors
+///
+/// The reason as text, for the status line: a `minimal.toml` that does
+/// not load, an entry whose type does not resolve, or no session entry.
+fn session_entry_choices(dir: &camino::Utf8Path) -> EntryChoices {
+    // An empty path would read the minimal.toml of the dashboard's own
+    // working directory, which the form does not show.
+    if dir.as_str().is_empty() {
+        return Err("the project path is empty".to_string());
+    }
+    let entries = crate::project_entries(dir).map_err(|error| format!("{error:#}"))?;
+    let candidates = crate::start_candidates(&entries).map_err(|error| format!("{error:#}"))?;
+    let names: Vec<String> = candidates
+        .iter()
+        .filter(|entry| crate::is_session_entry(entry))
+        .map(|entry| entry.name.clone())
+        .collect();
+    if names.is_empty() {
+        return Err(format!("the minimal.toml of {dir} declares no session"));
+    }
+    let picked = crate::pick_session_start_entry(&entries, None)
+        .ok()
+        .and_then(|entry| names.iter().position(|name| *name == entry.name))
+        .unwrap_or(0);
+    Ok((names, picked))
 }
 
 /// The network modes the create form cycles through, in cycle order.
@@ -153,6 +288,11 @@ pub enum Msg {
         root: String,
         reply: tokio::sync::oneshot::Sender<UploadAnswer>,
     },
+    /// The create form's session entries, read for `path`.
+    EntriesRead {
+        path: String,
+        choices: EntryChoices,
+    },
 }
 
 /// The user's answer to a create's upload confirm. "n" and Esc are different
@@ -189,6 +329,8 @@ pub enum Effect {
         host: String,
         name: Option<String>,
         path: String,
+        /// The session entry the form picked.
+        entry: String,
         network: NetworkMode,
     },
     /// Suspend the TUI, attach to the session over ssh, and resume when the
@@ -203,6 +345,10 @@ pub enum Effect {
     },
     /// Persist the last-focused session to `dash-state.json`.
     SaveState,
+    /// Read the session entries of the project at this path for the create
+    /// form, off the event path: a stalled mount must not stall the
+    /// dashboard.
+    ReadEntries(String),
 }
 
 /// One line in the flattened sidebar.
@@ -579,6 +725,12 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             model.pending_focus = Some((host, id));
             vec![Effect::Refresh]
         }
+        Msg::EntriesRead { path, choices } => {
+            if let Some(Action::Create(form)) = &mut model.action {
+                form.take_entries(&path, choices);
+            }
+            Vec::new()
+        }
         Msg::Key(key) => update_key(model, key),
         // Intercepted by the run loop before `update` (it carries the create
         // task's reply sender); reaching here would drop that reply and hang
@@ -719,13 +871,10 @@ fn update_key(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
             let path = std::env::current_dir()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default();
-            model.action = Some(Action::Create(CreateForm {
-                name: String::new(),
-                path,
-                net_idx: 0,
-                field: CreateField::Name,
-            }));
-            Vec::new()
+            let form = CreateForm::new(path);
+            let read = form.read_request();
+            model.action = Some(Action::Create(form));
+            vec![read]
         }
         _ => Vec::new(),
     }
@@ -848,10 +997,23 @@ fn update_modal(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
                 }
                 (KeyCode::BackTab, _) => {
                     form.field = prev_field(form.field);
+                    let reads = form.focus_reads();
                     model.action = Some(Action::Create(form));
+                    return reads;
                 }
                 (KeyCode::Tab, _) => {
                     form.field = next_field(form.field);
+                    let reads = form.focus_reads();
+                    model.action = Some(Action::Create(form));
+                    return reads;
+                }
+                // Left/right and space cycle the session entry.
+                (KeyCode::Left, CreateField::Entry) => {
+                    form.cycle_entry(false);
+                    model.action = Some(Action::Create(form));
+                }
+                (KeyCode::Right | KeyCode::Char(' '), CreateField::Entry) => {
+                    form.cycle_entry(true);
                     model.action = Some(Action::Create(form));
                 }
                 // Left/right cycle the network mode when that field is focused.
@@ -868,9 +1030,13 @@ fn update_modal(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
                     model.action = Some(Action::Create(form));
                 }
                 // Enter advances through the fields and submits on the last.
-                (KeyCode::Enter, CreateField::Name) | (KeyCode::Enter, CreateField::Path) => {
+                (KeyCode::Enter, CreateField::Name)
+                | (KeyCode::Enter, CreateField::Path)
+                | (KeyCode::Enter, CreateField::Entry) => {
                     form.field = next_field(form.field);
+                    let reads = form.focus_reads();
                     model.action = Some(Action::Create(form));
+                    return reads;
                 }
                 (KeyCode::Enter, CreateField::Network) => {
                     // Create on the host the user is pointing at: the
@@ -895,6 +1061,37 @@ fn update_modal(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
                         model.action = Some(Action::Create(form));
                         return Vec::new();
                     }
+                    // The entries of the path as it is now. While they are
+                    // not read, the form stays open, its entry field shows
+                    // `reading…`, and Enter again creates. A
+                    // project with no session entry to offer is refused
+                    // here, before anything reaches the daemon. The form
+                    // closes, so the status line shows why.
+                    // An empty path has no minimal.toml to read. Refuse it
+                    // here, before a read or a create is asked.
+                    if form.path.trim().is_empty() {
+                        model.status = Some(
+                            "error: no session created: the project path is empty".to_string(),
+                        );
+                        model.action = None;
+                        return Vec::new();
+                    }
+                    if !form.entries_current() {
+                        let read = form.read_request();
+                        model.action = Some(Action::Create(form));
+                        return vec![read];
+                    }
+                    let Some(entry) = form.entry().map(str::to_string) else {
+                        let reason = form.entries.err().unwrap_or_else(|| {
+                            format!(
+                                "the minimal.toml of {} declares no session",
+                                form.path.trim()
+                            )
+                        });
+                        model.status = Some(format!("error: no session created: {reason}"));
+                        model.action = None;
+                        return Vec::new();
+                    };
                     model.action = None;
                     return vec![Effect::Create {
                         host,
@@ -903,6 +1100,7 @@ fn update_modal(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
                             n => Some(n.to_string()),
                         },
                         path: form.path.trim().to_string(),
+                        entry,
                         network: NETWORK_MODES[form.net_idx],
                     }];
                 }
@@ -938,7 +1136,8 @@ fn line_edit(input: &mut String, key: &KeyEvent) {
 fn next_field(field: CreateField) -> CreateField {
     match field {
         CreateField::Name => CreateField::Path,
-        CreateField::Path => CreateField::Network,
+        CreateField::Path => CreateField::Entry,
+        CreateField::Entry => CreateField::Network,
         CreateField::Network => CreateField::Name,
     }
 }
@@ -947,7 +1146,8 @@ fn prev_field(field: CreateField) -> CreateField {
     match field {
         CreateField::Name => CreateField::Network,
         CreateField::Path => CreateField::Name,
-        CreateField::Network => CreateField::Path,
+        CreateField::Entry => CreateField::Path,
+        CreateField::Network => CreateField::Entry,
     }
 }
 
@@ -1059,15 +1259,16 @@ fn show_pending_confirm(model: &mut Model, pending: &mut VecDeque<PendingConfirm
     true
 }
 
-/// The loadout selection of a dashboard create in the project at `root`.
-/// The mode of the project's session entry is read before any loadout, as
+/// The loadout selection of a dashboard create of `entry` in the project at
+/// `root`. The mode of that session entry is read before any loadout, as
 /// `min box start` reads it, so a sealed box reads no default loadout
 /// (BOX-171, BOX-175).
 fn create_loadout_selection(
     root: &camino::Utf8Path,
+    entry: &str,
     loadouts: crate::loadouts::LoadoutSelection,
 ) -> anyhow::Result<crate::loadouts::LoadoutSelection> {
-    let mode = crate::session_loadout_mode(root, None, &[])?;
+    let mode = crate::session_loadout_mode(root, Some(entry), &[])?;
     Ok(crate::loadouts::gate_selection(loadouts, mode))
 }
 
@@ -1175,6 +1376,20 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                 // State persistence is local disk, not a daemon call, so it
                 // runs inline rather than going through `exec_effect`.
                 Effect::SaveState => save_state(&model, opts.minimal_dir.as_deref()),
+                // The create form's entries: a blocking read of the
+                // project's `minimal.toml`, off the event path.
+                Effect::ReadEntries(path) => {
+                    let tx = bg_tx.clone();
+                    tokio::spawn(async move {
+                        let dir = path.clone();
+                        let choices = tokio::task::spawn_blocking(move || {
+                            session_entry_choices(camino::Utf8Path::new(&dir))
+                        })
+                        .await
+                        .unwrap_or_else(|error| Err(format!("{error}")));
+                        let _ = tx.send(Msg::EntriesRead { path, choices }).await;
+                    });
+                }
                 // The upload confirm the user just answered: deliver the
                 // stashed reply and, if another create is waiting, show its
                 // modal now that `update` closed this one.
@@ -1264,6 +1479,7 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                     host,
                     name,
                     path,
+                    entry,
                     network,
                 } => match hosts.iter().find(|p| p.label == host) {
                     Some(p) => {
@@ -1302,26 +1518,46 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                                 // not stall the runtime.
                                 let (upload_root, _) =
                                     rpc::resolve_project_off_worker(abs.as_utf8_path()).await?;
-                                let (inputs, decision) = {
+                                let (inputs, decision, picked) = {
                                     let global_blocking = global.clone();
                                     let root = upload_root.clone();
                                     tokio::task::spawn_blocking(move || {
-                                        let loadouts = create_loadout_selection(&root, loadouts)?;
+                                        let loadouts =
+                                            create_loadout_selection(&root, &entry, loadouts)?;
                                         let inputs =
                                             crate::loadouts::prepare_activation_inputs_with_config(
                                                 &client_config,
                                                 &global_blocking,
                                                 &root,
-                                                loadouts,
+                                                loadouts.clone(),
                                                 crate::loadouts::HookPrep::Enforce,
                                                 Some(user_policy),
                                             )?;
+                                        // BOX-064, BOX-179: the gated loadouts
+                                        // again, whole, for the selected-loadouts
+                                        // layer of the entry's expansion, as
+                                        // `min session activate` reads them.
+                                        let picked = rpc::PickedEntry {
+                                            name: Some(entry),
+                                            selected: crate::SelectedLoadouts {
+                                                loadouts: crate::loadouts::resolve_active_loadouts(
+                                                    loadouts,
+                                                    &client_config,
+                                                    &global_blocking,
+                                                )?
+                                                .loadouts,
+                                                ignore: Some(
+                                                    inputs.user_policy.vars().ignore().clone(),
+                                                ),
+                                            },
+                                            global: Some(global_blocking),
+                                        };
                                         let decision = crate::decide_workspace_upload(
                                             &root,
                                             false,
                                             std::env::home_dir().as_deref(),
                                         );
-                                        Ok::<_, anyhow::Error>((inputs, decision))
+                                        Ok::<_, anyhow::Error>((inputs, decision, picked))
                                     })
                                     .await
                                     .context("preparing the session create")??
@@ -1375,6 +1611,7 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                                     network,
                                     decision,
                                     inputs,
+                                    picked,
                                 )
                                 .await
                                 .map(CreateOutcome::Created)
@@ -1540,12 +1777,14 @@ async fn exec_effect(
             Some(Msg::ActionDone(result))
         }
         // Handled inline by the run loop: SaveState is local disk, Attach
-        // needs the terminal guard, Create spawns a background task, and
-        // AnswerCreateUpload delivers a stashed reply the loop owns.
+        // needs the terminal guard, Create and ReadEntries spawn a
+        // background task, and AnswerCreateUpload delivers a stashed reply
+        // the loop owns.
         Effect::SaveState
         | Effect::Attach(_)
         | Effect::Create { .. }
-        | Effect::AnswerCreateUpload { .. } => None,
+        | Effect::AnswerCreateUpload { .. }
+        | Effect::ReadEntries(_) => None,
     }
 }
 
@@ -1715,9 +1954,12 @@ mod tests {
         };
 
         write("[sessions.default]\nloadout_mode = 'sealed'\n");
-        let selection =
-            create_loadout_selection(&root, crate::loadouts::LoadoutSelection::Defaults)
-                .expect("a sealed entry decides its mode");
+        let selection = create_loadout_selection(
+            &root,
+            "default",
+            crate::loadouts::LoadoutSelection::Defaults,
+        )
+        .expect("a sealed entry decides its mode");
         assert!(
             matches!(selection, crate::loadouts::LoadoutSelection::None),
             "{selection:?}"
@@ -1726,9 +1968,12 @@ mod tests {
             .expect("a sealed create reads no loadout");
 
         write("[sessions.default]\nloadout_mode = 'open'\n");
-        let selection =
-            create_loadout_selection(&root, crate::loadouts::LoadoutSelection::Defaults)
-                .expect("an open entry decides its mode");
+        let selection = create_loadout_selection(
+            &root,
+            "default",
+            crate::loadouts::LoadoutSelection::Defaults,
+        )
+        .expect("an open entry decides its mode");
         assert!(
             crate::loadouts::resolve_active_loadouts(selection, &cfg, &global).is_err(),
             "an open create reads the broken default"
@@ -2110,10 +2355,12 @@ mod tests {
     #[test]
     fn create_form_submits_on_last_field() {
         let mut model = two_hosts();
-        update(&mut model, key(KeyCode::Char('n')));
+        let reads = update(&mut model, key(KeyCode::Char('n')));
         assert!(matches!(model.action, Some(Action::Create(_))));
+        run_reads(&mut model, reads);
         update(&mut model, key(KeyCode::Enter)); // name -> path
-        update(&mut model, key(KeyCode::Enter)); // path -> network
+        update(&mut model, key(KeyCode::Enter)); // path -> entry
+        update(&mut model, key(KeyCode::Enter)); // entry -> network
         let effects = update(&mut model, key(KeyCode::Enter)); // submit
         assert!(effects.iter().any(|e| matches!(
             e,
@@ -2125,9 +2372,152 @@ mod tests {
         assert!(model.action.is_none());
     }
 
-    /// "n" and Esc are different answers: "n" creates the box without the
-    /// tree, Esc calls the create off. Everywhere else in the dashboard Esc
-    /// backs out, and a user who mistyped the path must be able to too.
+    /// Runs the entry reads in `effects` here, as the run loop does on a
+    /// background task, and gives their results to `update`.
+    fn run_reads(model: &mut Model, effects: Vec<Effect>) {
+        for effect in effects {
+            if let Effect::ReadEntries(path) = effect {
+                let choices = session_entry_choices(camino::Utf8Path::new(&path));
+                update(model, Msg::EntriesRead { path, choices });
+            }
+        }
+    }
+
+    /// A form for the project at `path`, with its session entries read.
+    fn read_form(path: &str) -> CreateForm {
+        let mut model = two_hosts();
+        let form = CreateForm::new(path.to_string());
+        let read = form.read_request();
+        model.action = Some(Action::Create(form));
+        run_reads(&mut model, vec![read]);
+        match model.action {
+            Some(Action::Create(form)) => form,
+            other => panic!("the create form closed: {other:?}"),
+        }
+    }
+
+    /// The create form offers the project's session entries, with the
+    /// entry `min session start` picks with no entry preselected, and the
+    /// create carries the picked entry. A project with no session to offer
+    /// is refused on the status line, and nothing is created.
+    #[test]
+    fn create_form_preselects_the_default_session_entry() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join(mfile::MFILE_NAME),
+            "[sessions.dev]\npackages = [\"rust\"]\n\n[sessions.default]\n\n\
+             [tasks.lint]\nexec = [\"true\"]\n",
+        )
+        .unwrap();
+        let path = project.path().display().to_string();
+        // The form reads nothing on the event path: it asks for a read, and
+        // the entry field shows `reading…` until the result comes back.
+        let unread = CreateForm::new(path.clone());
+        assert!(!unread.entries_current());
+        assert_eq!(unread.entry(), None);
+        assert!(matches!(unread.read_request(), Effect::ReadEntries(p) if p == path));
+
+        // A submit before the read comes back creates nothing: the form
+        // stays open and asks for the read again.
+        let mut model = two_hosts();
+        model.action = Some(Action::Create(CreateForm {
+            field: CreateField::Network,
+            ..unread
+        }));
+        let effects = update(&mut model, key(KeyCode::Enter));
+        assert!(!effects.iter().any(|e| matches!(e, Effect::Create { .. })));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::ReadEntries(p) if *p == path))
+        );
+        assert!(matches!(model.action, Some(Action::Create(_))));
+        let form = read_form(&path);
+        assert!(form.entries_current());
+        assert_eq!(
+            form.entries,
+            Ok(vec!["default".to_string(), "dev".to_string()])
+        );
+        assert_eq!(form.entry(), Some("default"));
+
+        // Right picks `dev`, and the create carries it.
+        let mut model = two_hosts();
+        model.action = Some(Action::Create(form));
+        update(&mut model, key(KeyCode::Tab)); // name -> path
+        update(&mut model, key(KeyCode::Tab)); // path -> entry
+        update(&mut model, key(KeyCode::Right));
+        update(&mut model, key(KeyCode::Tab)); // entry -> network
+        let effects = update(&mut model, key(KeyCode::Enter));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Create { entry, .. } if entry == "dev")),
+            "{effects:?}"
+        );
+
+        // The focus reaching the entry field reads `minimal.toml` again, so
+        // an edit made while the form is open shows.
+        let mut model = two_hosts();
+        model.action = Some(Action::Create(CreateForm {
+            field: CreateField::Path,
+            ..read_form(&path)
+        }));
+        std::fs::write(
+            project.path().join(mfile::MFILE_NAME),
+            "[sessions.dev]\n\n[sessions.default]\n\n[sessions.web]\n",
+        )
+        .unwrap();
+        let reads = update(&mut model, key(KeyCode::Tab)); // path -> entry
+        run_reads(&mut model, reads);
+        let Some(Action::Create(form)) = &model.action else {
+            panic!("the create form closed");
+        };
+        assert_eq!(
+            form.entries,
+            Ok(vec![
+                "default".to_string(),
+                "dev".to_string(),
+                "web".to_string()
+            ])
+        );
+
+        // A project whose `minimal.toml` does not load offers no entry, and
+        // the submit is refused with the reason on the status line.
+        std::fs::write(project.path().join(mfile::MFILE_NAME), "not valid = =").unwrap();
+        let form = read_form(&path);
+        assert!(form.entries.is_err());
+        assert_eq!(form.entry(), None);
+        let mut model = two_hosts();
+        model.action = Some(Action::Create(CreateForm {
+            field: CreateField::Network,
+            ..form
+        }));
+        let effects = update(&mut model, key(KeyCode::Enter));
+        assert!(!effects.iter().any(|e| matches!(e, Effect::Create { .. })));
+        assert!(model.action.is_none());
+        let status = model.status.clone().unwrap_or_default();
+        assert!(
+            status.starts_with("error: no session created: "),
+            "{status}"
+        );
+
+        // A cleared path is refused on the first submit, with no read and
+        // no create asked, and the status line says why.
+        let mut model = two_hosts();
+        model.action = Some(Action::Create(CreateForm {
+            field: CreateField::Network,
+            path: String::new(),
+            ..read_form(&path)
+        }));
+        let effects = update(&mut model, key(KeyCode::Enter));
+        assert!(effects.is_empty(), "{effects:?}");
+        assert!(model.action.is_none());
+        assert_eq!(
+            model.status.as_deref(),
+            Some("error: no session created: the project path is empty")
+        );
+    }
+
     #[test]
     fn create_upload_confirm_answers_y_n_and_esc() {
         let answer = |code: KeyCode| {
@@ -2423,9 +2813,11 @@ mod tests {
             update(&mut model, key(KeyCode::Down));
         }
         assert!(matches!(model.cursor_row(), Some(Row::HostHeader(1))));
-        update(&mut model, key(KeyCode::Char('n')));
+        let reads = update(&mut model, key(KeyCode::Char('n')));
+        run_reads(&mut model, reads);
         update(&mut model, key(KeyCode::Enter)); // name -> path
-        update(&mut model, key(KeyCode::Enter)); // path -> network
+        update(&mut model, key(KeyCode::Enter)); // path -> entry
+        update(&mut model, key(KeyCode::Enter)); // entry -> network
         let effects = update(&mut model, key(KeyCode::Enter)); // submit
         assert!(
             effects
@@ -2453,6 +2845,7 @@ mod tests {
         }
         assert!(matches!(model.cursor_row(), Some(Row::HostHeader(_))));
         update(&mut model, key(KeyCode::Char('n')));
+        update(&mut model, key(KeyCode::Enter));
         update(&mut model, key(KeyCode::Enter));
         update(&mut model, key(KeyCode::Enter));
         let effects = update(&mut model, key(KeyCode::Enter));
