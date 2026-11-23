@@ -63,7 +63,7 @@ use p256::ecdsa::SigningKey;
 use zeroize::{Zeroize as _, Zeroizing};
 
 /// How long a control socket request waits for the proxy.
-const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the forget of a failed creation waits for the proxy. It is
 /// short, so a stuck proxy does not hold up the end of the creation.
@@ -1250,16 +1250,17 @@ impl ControlClient {
     ///
     /// # Errors
     ///
-    /// [`MintError::Control`] when the connection fails or times out, and
-    /// [`MintError::Refused`] when the proxy refuses the read.
+    /// [`MintError::Control`] when the connection fails, and
+    /// [`MintError::Refused`] when the proxy refuses the read. A proxy that
+    /// sends nothing for the connection's read timeout gives
+    /// [`MintError::Control`] with [`io::ErrorKind::TimedOut`], so the read
+    /// never waits without end.
     pub fn read_audit(mut self, subjects: &[String]) -> Result<AuditBatch, MintError> {
         self.send_audit(subjects, false)?;
         let mut stream = AuditStream::new(self);
-        loop {
-            if let Some(batch) = stream.next_batch()? {
-                return Ok(batch);
-            }
-        }
+        stream
+            .next_batch()?
+            .ok_or_else(|| MintError::Control(io::ErrorKind::TimedOut.into()))
     }
 
     /// Reads the audit records whose subject is one of `subjects`, and then
@@ -2116,7 +2117,7 @@ impl Drop for ProxyRegistration {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::cell::RefCell;
     use std::sync::Arc;
 
@@ -2216,6 +2217,37 @@ mod tests {
                 }
             }
         });
+    }
+
+    /// A control socket that accepts each connection and never answers.
+    /// Its thread holds each connection open until the test ends.
+    pub(crate) fn serve_silent(path: &Path) {
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                held.push(stream);
+            }
+        });
+    }
+
+    // Architecture principle 3: a proxy that accepts the audit read and
+    // never answers ends the read with a timeout, not a wait without end.
+    #[test]
+    fn an_audit_read_the_proxy_never_answers_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        serve_silent(&path);
+        let client =
+            ControlClient::connect_with_timeout(&path, Duration::from_millis(100)).unwrap();
+        let started = std::time::Instant::now();
+        let error = client.read_audit(&["00".repeat(16)]).unwrap_err();
+        assert!(
+            matches!(&error, MintError::Control(error) if error.kind() == io::ErrorKind::TimedOut),
+            "{error:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     // BEP-063: a store handle is a `gatehouse-store-handle+jws` signed under

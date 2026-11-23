@@ -393,6 +393,16 @@ fn audit_error(path: &Path, error: MintError) -> anyhow::Error {
         MintError::Refused { error, .. } => anyhow::anyhow!(
             "Cannot read the audit log: the Box Egress Proxy refused the read: {error}."
         ),
+        // The read without --follow waits at most CONTROL_TIMEOUT for each
+        // read, so a proxy that accepts and never answers ends the command.
+        MintError::Control(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+            anyhow::anyhow!(
+                "Cannot read the audit log: the Box Egress Proxy did not answer on {} \
+             within {} seconds. Restart minvmd, which starts the proxy again.",
+                path.display(),
+                crate::mint::CONTROL_TIMEOUT.as_secs()
+            )
+        }
         MintError::Control(error) => anyhow::anyhow!(
             "Cannot read the audit log: the connection to the Box Egress Proxy failed: {error}."
         ),
@@ -787,6 +797,35 @@ mod tests {
             String::from_utf8(out).unwrap(),
             String::from_utf8(err).unwrap(),
         )
+    }
+
+    // Architecture principle 3: without --follow, a proxy that accepts the
+    // read and never answers ends the command with a refusal.
+    #[test]
+    fn box_audit_refuses_a_proxy_that_does_not_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        crate::mint::tests::serve_silent(&path);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let error = run(
+            &args(Some(A), None, false),
+            &[],
+            false,
+            &path,
+            &mut out,
+            &mut err,
+            || false,
+        )
+        .unwrap_err();
+        assert!(out.is_empty());
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Cannot read the audit log: the Box Egress Proxy did not answer on {} \
+                 within 10 seconds. Restart minvmd, which starts the proxy again.",
+                path.display()
+            )
+        );
     }
 
     // BEP-042, BEP-068: one box id, across every segment, a reaped box
