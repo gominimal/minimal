@@ -685,6 +685,7 @@ fn stopped_vm_entries(vm: &client::VmSocket) -> Vec<minimald_rpc::BoxListingEntr
             signal: None,
             pty_enabled: false,
             lifetime: None,
+            build_boxes: Vec::new(),
         })
         .collect()
 }

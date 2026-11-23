@@ -385,6 +385,14 @@
 #                                    at the host-side gate (NET-155, NET-085),
 #                                    and each refusal's record is read back
 #                                    from the host's logs
+#   a_build_box_fetches_its_source
+#                                    NET-155, NET-165: a deny-all box's cold
+#                                    build of a package at the pinned commit
+#                                    fetches its source cold and succeeds,
+#                                    the build box lists while it runs and
+#                                    leaves when it ends, and the box stays
+#                                    deny-all; NOT RUN without a switch or,
+#                                    natively, a tap
 #   host_ip_rules_follow_the_running_box
 #                                    NET-085, VM host: root in the VM
 #                                    wearing the node's address and the box
@@ -604,6 +612,7 @@ ESU_B_SEED_DIR="" # its box B seed; removed on teardown
 ESU_LISTENER_PID="" # its host listener; killed on teardown
 ESU_LISTEN_PORT="" # the port the listener binds; this proof's own band
 EBR_SEED_DIR="" # the escapes-and-builds proof's seed; removed on teardown
+BBF_SEED_DIR="" # the build-box fetch proof's seed; removed on teardown
 EBR_LISTENER_PID="" # its host listener; killed on teardown
 EBR_LISTEN_PORT="" # the port the listener binds, beside the escape-union band
 HRF_SEED_DIR="" # the host_ip rules proof's seed; removed on teardown
@@ -1427,6 +1436,7 @@ teardown() {
   fi
   # The escapes-and-builds proof's seed and listener, for the same reasons.
   [ -n "$EBR_SEED_DIR" ] && rm -rf "$EBR_SEED_DIR"
+  [ -n "$BBF_SEED_DIR" ] && rm -rf "$BBF_SEED_DIR"
   [ -n "$HRF_SEED_DIR" ] && rm -rf "$HRF_SEED_DIR"
   if [ -n "$EBR_LISTENER_PID" ]; then
     kill "$EBR_LISTENER_PID" 2>/dev/null || true
@@ -23655,6 +23665,196 @@ source=203.0.113.7 destination=$esu_host:$ESU_LISTEN_PORT verdict=refused at the
   echo "::endgroup::"
 }
 
+# NET-155, NET-165: every other proof of a build box stops at a refusal or at a
+# cache hit, so this one forces a cold build and a cold source fetch. The
+# package comes from the pinned upstream, its source is `gs://`, and the box
+# allows nothing: only the table `min` made at the box's creation can give the
+# fetch its reach. The package is `tree`: a plain Makefile with no configure,
+# so its cold build regenerates nothing, and no other proof builds it. On a VM
+# lane the guest daemon's download cache starts empty with the lane's fresh
+# state. On a native lane this proof removes the source from the daemon's
+# download cache first. Either way the proof asks the daemon's log for the
+# grant the fetch opened, so a source that was cached anyway fails the proof.
+proof_a_build_box_fetches_its_source() {
+  local bbf_pkg="tree" bbf_sid="" bbf_out="" bbf_rc="" bbf_policy="" bbf_native=""
+  local bbf_sha="513a53cbc42ca1f4ea06af2bab1f5283524a3848266b1d162416f8033afc4985"
+  local bbf_grant="" bbf_log_mark=0 bbf_listed="" bbf_build_pid=""
+  echo "::group::a build box fetches its source for a deny-all box (NET-155, NET-165)"
+  # An own-address box needs the switch, as the other own-IP proofs do, and
+  # on a native lane the tap device too.
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ] && [ -z "$E2E_NATIVE_SWITCH" ]; then
+    not_run a_build_box_fetches_its_source "no switch staged: neither MINVMD_GVPROXY_BIN (VM) nor E2E_NATIVE_SWITCH (native) is set, and a deny-all box is an own-address box"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ "$min_daemon" != minvmd ] && [ -z "$E2E_VM" ]; then
+    bbf_native=1
+    if [ ! -c /dev/net/tun ]; then
+      not_run a_build_box_fetches_its_source "no /dev/net/tun on this host: a native own-address box opens its tap on this host and needs the device"
+      echo "::endgroup::"
+      return 0
+    fi
+    # The daemon's download cache, by the source's sha256 (paths::minimal_cache_dir).
+    # shellcheck disable=SC2031
+    rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/minimal/downloads/$bbf_sha"
+  fi
+  # Stop whatever daemon is up, so the activation below autospawns a fresh
+  # one under this proof's record filter. The grant lines it reads are INFO,
+  # which the lane's default filter drops (the daemon inherits RUST_LOG at
+  # autospawn; see the header). On a native lane the fresh daemon also
+  # carries the staged switch (native_switch_daemon).
+  mnl host stop "$E2E_HOST" --force >/dev/null 2>&1 || true
+  if [ -n "$E2E_VM" ]; then
+    minvmd stop >/dev/null 2>&1 || true
+  fi
+  local bbf_filter="warn,minimald::exec=info,minimald::build_boxes=info,minvmd=info"
+  # The daemon log this proof reads its grant from: the native daemon's own,
+  # or on a VM lane the VM host daemon's. Each day's file in date order, so a
+  # line count taken before the build marks where the build's lines begin.
+  bbf_grant_log() {
+    local daemon=minvmd
+    [ -z "$bbf_native" ] || daemon=minimald
+    find "$XDG_STATE_HOME/minimal/logs" -name "$daemon.log.*" -type f 2>/dev/null \
+      | sort | while IFS= read -r day; do cat "$day"; done
+  }
+  # The logs that say why a failed build failed: the daemon's, where this
+  # lane can read it, and on a VM lane the guest daemon's console too.
+  bbf_logs() {
+    if [ -n "$bbf_native" ]; then
+      echo "--- the daemon's log, last lines ---"
+      find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f \
+        -exec cat {} + 2>/dev/null | tail -n 40 || true
+    else
+      echo "--- the VM host daemon's build grant lines ---"
+      minvmd_log_lines 'build grant' | tail -n 20 || true
+      echo "--- the guest daemon's console, last lines ---"
+      tail -n 40 "${MINVMD_BOOT_LOG:-$XDG_STATE_HOME/minimal/providers/local-minvmd0/boot.log}" \
+        2>/dev/null || true
+    fi
+  }
+  BBF_SEED_DIR="$(hook_mktemp /tmp/mnlbbf.XXXXXX)"
+  hook_seed_preamble > "$BBF_SEED_DIR/minimal.toml"
+  mkdir "$BBF_SEED_DIR/.git"
+  bbf_sid="$(cd "$BBF_SEED_DIR" && RUST_LOG="$bbf_filter" mnl session start --detach --no-input \
+    --name e2e-bbf --network own_ip --deny-all-egress 2>"$WORK/bbf-activate.err")" || {
+    echo "::error::the deny-all box's 'min session start' failed"
+    cat "$WORK/bbf-activate.err" 2>/dev/null || true
+    switch_spawn_fault "$WORK/bbf-activate.err" || true
+    fail
+  }
+  bbf_sid="$(printf '%s\n' "$bbf_sid" | tail -n1)"
+  # Where this build's log lines begin: a grant the activation or an earlier
+  # build opened is before it, and does not count.
+  bbf_log_mark="$(bbf_grant_log | wc -l | tr -d ' ')"
+  # The build box's row in `min box list`, as JSON: a `build` entry for the
+  # package under this box. Empty when the list shows none.
+  bbf_listing() {
+    (cd "$BBF_SEED_DIR" && mnl box list -o json 2>/dev/null) \
+      | jq -c --arg pkg "$bbf_pkg" --arg sid "$bbf_sid" \
+        '.[] | select(.type == "build" and .name == $pkg and .parent == $sid)' 2>/dev/null \
+      | head -n1
+  }
+  # The build runs in the background, so the list can be read while it runs.
+  # shellcheck disable=SC2016 # `$?` must reach the box's shell unexpanded.
+  mnl box exec "$bbf_sid" -- bash -c \
+    "timeout 600 min package build --rebuild $bbf_pkg 2>&1; echo build-exit=\$?" \
+    >"$WORK/bbf-build.out" 2>"$WORK/bbf-build.err" </dev/null &
+  bbf_build_pid=$!
+  while kill -0 "$bbf_build_pid" 2>/dev/null; do
+    [ -n "$bbf_listed" ] || bbf_listed="$(bbf_listing)"
+    sleep 0.2
+  done
+  wait "$bbf_build_pid" || {
+    echo "::error::the in-box 'min package build --rebuild $bbf_pkg' could not run"
+    cat "$WORK/bbf-build.err" 2>/dev/null || true
+    bbf_logs
+    fail
+  }
+  bbf_out="$(tr -d '\r' <"$WORK/bbf-build.out")"
+  bbf_rc="$(printf '%s\n' "$bbf_out" | sed -n 's/^build-exit=//p' | tail -n1)"
+  if [ "$bbf_rc" != 0 ]; then
+    echo "::error::the cold build of $bbf_pkg failed (exit '$bbf_rc'): the table should give its fetch the source's host"
+    echo "--- the build's output, last lines ---"
+    printf '%s\n' "$bbf_out" | tail -n 60 | sed 's/^/  /'
+    bbf_logs
+    fail
+  fi
+  printf '%s\n' "$bbf_out" | tail -n 20 | sed 's/^/  /'
+  # The fetch was cold: the build box opened its grant, which a cached source
+  # never asks for. Only a line written after the build began counts. On a
+  # VM lane the line names the box's session, not the package: it names the
+  # spec hash, which the box computes from the resolved graph, and nothing
+  # this script runs prints that hash.
+  bbf_grant_line() {
+    if [ -n "$bbf_native" ]; then
+      bbf_grant_log | tail -n "+$((bbf_log_mark + 1))" \
+        | grep -F -- 'opened the network of a build box' \
+        | grep -F -- '"box_name":"e2e-bbf"' | grep -F -- '"granted":true' \
+        | grep -F -- "package: \\\"$bbf_pkg\\\"" | tail -n1
+    else
+      # The host sees the spec hash alone, never the package's name, so the
+      # line is matched on this package's grant: its `gs://` source's host
+      # and no internet.
+      bbf_grant_log | tail -n "+$((bbf_log_mark + 1))" \
+        | grep -F -- 'opened a build grant' \
+        | grep -F -- "\"session\":\"$bbf_sid\"" \
+        | grep -F -- '"internet":false' \
+        | grep -F -- 'storage.googleapis.com' | tail -n1
+    fi
+  }
+  # BOX-210, NET-171: the build box listed under this box while it ran, and
+  # leaves the list with its build.
+  if [ -z "$bbf_listed" ]; then
+    echo "::error::the build of $bbf_pkg passed, but 'min box list' never showed its build box under box e2e-bbf"
+    fail
+  fi
+  echo "listed: $bbf_listed"
+  # Gone only on a list read that worked: a failed read proves nothing.
+  if ! (cd "$BBF_SEED_DIR" && mnl box list -o json) \
+      >"$WORK/bbf-after.json" 2>"$WORK/bbf-after.err" </dev/null; then
+    echo "::error::'min box list' failed after the build of $bbf_pkg, so it cannot show that the build box left"
+    cat "$WORK/bbf-after.err" 2>/dev/null || true
+    fail
+  fi
+  if ! bbf_left="$(jq -n -c --arg pkg "$bbf_pkg" --arg sid "$bbf_sid" \
+      'input | if type == "array" then
+         [.[] | select(.type == "build" and .name == $pkg and .parent == $sid)] | first // empty
+       else error("not a list") end' "$WORK/bbf-after.json")"; then
+    echo "::error::'min box list -o json' printed no JSON list after the build of $bbf_pkg"
+    head -c 2000 "$WORK/bbf-after.json" 2>/dev/null || true
+    fail
+  fi
+  if [ -n "$bbf_left" ]; then
+    echo "::error::the build of $bbf_pkg ended, but 'min box list' still shows its build box"
+    echo "still listed: $bbf_left"
+    fail
+  fi
+  # The daemon's file writer is asynchronous, so the line can land after the
+  # build returns: wait for it, as esu_wait_gate_line does.
+  for _ in $(seq 1 40); do
+    bbf_grant="$(bbf_grant_line)"
+    [ -z "$bbf_grant" ] || break
+    sleep 0.25
+  done
+  if [ -z "$bbf_grant" ]; then
+    echo "::error::the build of $bbf_pkg passed, but no build grant line for box e2e-bbf appeared in the daemon's log after the build began"
+    bbf_logs
+    fail
+  fi
+  echo "grant: $bbf_grant"
+  bbf_policy="$(mnl box show "$bbf_sid" --network 2>&1)"
+  if ! grep -qF 'deny-all' <<<"$bbf_policy"; then
+    echo "::error::the box's own rules changed: the reach is the build box's, not the box's"
+    printf '%s\n' "$bbf_policy"
+    fail
+  fi
+  mnl box rm --force "$bbf_sid" >/dev/null 2>&1 </dev/null || true
+  rm -rf "$BBF_SEED_DIR"
+  BBF_SEED_DIR=""
+  echo "a build box fetches its source OK"
+  echo "::endgroup::"
+}
+
 # T108 on the VM host, end to end: escapes and builds stay inside the box's
 # rules. Each refusal that reaches the host leaves a record there. The
 # vsock refusal inside the box is the one exception (see the RPC leg). One deny-all
@@ -33464,6 +33664,7 @@ case "${1:-}" in
     # Beside the escape-union proof, for the same reason: it stops the daemon
     # pair and autospawns a fresh one under its own record filter.
     proof_escapes_and_builds_stay_inside_box_rules
+    proof_a_build_box_fetches_its_source
     # Beside them, for the same reason.
     proof_host_ip_rules_follow_the_running_box
     # Stops the VM host: its boxes, then the daemon and its VM. The next
@@ -33524,6 +33725,7 @@ case "${1:-}" in
     | published_proxy_routes_from_host \
     | escape_reaches_only_declared_union \
     | escapes_and_builds_stay_inside_box_rules \
+    | a_build_box_fetches_its_source \
     | host_ip_rules_follow_the_running_box \
     | host_ip_deny_all \
     | daemon_fetch_under_deny_all_host_address_box \
@@ -33605,6 +33807,7 @@ case "${1:-}" in
     echo "         published_proxy_routes_from_host"
     echo "         escape_reaches_only_declared_union"
     echo "         escapes_and_builds_stay_inside_box_rules"
+    echo "         a_build_box_fetches_its_source"
     echo "         host_ip_rules_follow_the_running_box"
     echo "         host_ip_deny_all"
     echo "         daemon_fetch_under_deny_all_host_address_box"

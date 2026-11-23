@@ -349,6 +349,16 @@ pub(crate) async fn write_box_network(
     // when the daemon cannot list them.
     let live = fetch_live_ingress_degrading(client, &box_id).await;
 
+    // NET-171: a read that fails shows no build box. The box's own policy
+    // stands either way.
+    let build_boxes = match client
+        .oneshot_rpc::<minimald_rpc::ShowBox>(minimald_rpc::ShowBoxRequest { id: record.id })
+        .await
+    {
+        Ok(minimald_rpc::Errorable::Ok(shown)) => shown.record.build_boxes,
+        Ok(minimald_rpc::Errorable::Err { .. }) | Err(_) => Vec::new(),
+    };
+
     let policy = match resp {
         minimald_rpc::Errorable::Ok(policy) => policy,
         minimald_rpc::Errorable::Err { error } => bail!("{error}"),
@@ -359,6 +369,7 @@ pub(crate) async fn write_box_network(
         record.network,
         facts.as_ref(),
         &live,
+        &build_boxes,
         host_kind,
     )?;
     write_vpn_network_names(out, &vpn_network_names)
@@ -424,7 +435,8 @@ pub(crate) fn write_vpn_network_names(
 
 /// Writes the text form of a box's effective network policy: `policy` for a
 /// box of `network` mode on a host of `host_kind`, with the runtime `facts`
-/// the host gave, if any, and the `live` ports the box published.
+/// the host gave, if any, the `live` ports the box published, and the
+/// `build_boxes` running for it.
 ///
 /// # Errors
 ///
@@ -435,6 +447,7 @@ pub(crate) fn render_box_network(
     network: boxes::NetworkMode,
     facts: Option<&minimald_rpc::BoxRuntimeFacts>,
     live: &[minimald_rpc::LiveMapping],
+    build_boxes: &[minimald_rpc::RunningBuildBox],
     host_kind: paths::HostKind,
 ) -> Result<(), anyhow::Error> {
     let host_ip_enforcement = facts.and_then(|facts| facts.host_ip_enforcement);
@@ -460,6 +473,7 @@ pub(crate) fn render_box_network(
         native_host,
     )?;
     write_live_ingress(out, live)?;
+    write_build_boxes(out, build_boxes)?;
     if let Some(facts) = facts {
         write_unaudited_listen_ports(
             out,
@@ -582,6 +596,56 @@ pub(crate) fn render_box_show(
             writeln!(out, "  {}  {mode:<8}  {}", exec.id, command.join(" "))?;
         }
     }
+    write_build_boxes(out, &record.build_boxes)
+}
+
+/// What one build box may reach, in a person's words (NET-171).
+fn build_box_reach(build: &minimald_rpc::RunningBuildBox) -> String {
+    if build.no_network {
+        return "no network".to_string();
+    }
+    // A build with no grant yet, or none to get, is on this box's rules.
+    if !build.granted {
+        return "no grant, this box's rules".to_string();
+    }
+    let Some(egress) = &build.egress else {
+        return "any destination".to_string();
+    };
+    let internet = egress
+        .allow_subnets
+        .as_ref()
+        .is_some_and(|subnets| subnets.iter().any(|subnet| subnet == "0.0.0.0/0"));
+    // A literal address the grant holds is one of its hosts too.
+    let mut hosts = egress.allow_dns_hosts.clone().unwrap_or_default();
+    hosts.extend(egress.allow_subnets.iter().flatten().filter_map(|subnet| {
+        subnet
+            .strip_suffix("/32")
+            .or_else(|| subnet.strip_suffix("/128"))
+            .map(ToString::to_string)
+    }));
+    if internet {
+        "the public internet".to_string()
+    } else if hosts.is_empty() {
+        "no destination".to_string()
+    } else {
+        hosts.join(", ")
+    }
+}
+
+/// Writes the block of the build boxes running for a box, and nothing when
+/// none runs (NET-171). Their reach is theirs: the box's own rules do not
+/// change.
+pub(crate) fn write_build_boxes(
+    out: &mut impl std::io::Write,
+    builds: &[minimald_rpc::RunningBuildBox],
+) -> std::io::Result<()> {
+    if builds.is_empty() {
+        return Ok(());
+    }
+    writeln!(out, "build boxes (their own reach, not this box's)")?;
+    for build in builds {
+        writeln!(out, "  {}: {}", build.package, build_box_reach(build))?;
+    }
     Ok(())
 }
 
@@ -644,6 +708,70 @@ pub(crate) fn format_disk(bytes: u64) -> String {
         unit = next;
     }
     format!("{value:.1} {unit}")
+}
+
+#[cfg(test)]
+mod build_box_tests {
+    use super::*;
+
+    /// NET-171: the block says what each build box may reach, and that it
+    /// is the build box's reach. No build box, no block.
+    #[test]
+    fn policy_shows_build_box_egress() {
+        let declared = boxes::EgressPolicy {
+            allow_subnets: Some(Vec::new()),
+            allow_dns_hosts: Some(vec!["storage.googleapis.com".to_string()]),
+            allow_protocols: None,
+            deny_subnets: None,
+        };
+        let internet = boxes::EgressPolicy {
+            allow_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+            allow_dns_hosts: Some(Vec::new()),
+            allow_protocols: None,
+            deny_subnets: None,
+        };
+        let nothing = boxes::EgressPolicy {
+            allow_subnets: Some(Vec::new()),
+            allow_dns_hosts: Some(Vec::new()),
+            allow_protocols: None,
+            deny_subnets: None,
+        };
+        let running = |package: &str, egress, granted| minimald_rpc::RunningBuildBox {
+            package: package.to_string(),
+            egress,
+            granted,
+            no_network: false,
+        };
+        let ended = minimald_rpc::RunningBuildBox {
+            no_network: true,
+            ..running("fetched", Some(nothing.clone()), true)
+        };
+        let mut out = Vec::new();
+        write_build_boxes(
+            &mut out,
+            &[
+                running("bucket", Some(declared), true),
+                running("tooling", Some(internet), true),
+                running("mine", None, false),
+                running("unlisted", Some(nothing), true),
+                ended,
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "build boxes (their own reach, not this box's)\n  \
+             bucket: storage.googleapis.com\n  \
+             tooling: the public internet\n  \
+             mine: no grant, this box's rules\n  \
+             unlisted: no destination\n  \
+             fetched: no network\n"
+        );
+
+        let mut none = Vec::new();
+        write_build_boxes(&mut none, &[]).unwrap();
+        assert!(none.is_empty());
+    }
 }
 
 #[cfg(test)]

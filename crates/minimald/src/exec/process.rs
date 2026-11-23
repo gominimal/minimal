@@ -161,6 +161,7 @@ impl TaskExec {
 /// declaration blocks a task's *inbound* too (`allowed`/`udp_allowed` empty),
 /// so attaching one where nothing needs gating would change behaviour the
 /// opt-out exists to keep.
+#[cfg(test)]
 pub(crate) fn task_network(
     record: &boxes::Record,
     switch: &std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
@@ -369,12 +370,11 @@ pub(super) fn parse_task_args(
         .map_err(|e| e.to_string())
 }
 
-/// Refuses the package builds of a task (NET-155) when the box's launch
-/// placed it in a classifier leaf (`enforcement` is
-/// [`boxes::HostIpEnforcement::PerBox`]) and the task's context has no leaf.
-/// Such a build would run outside the box's egress verdict. A box that was
-/// never placed builds in the daemon's own cgroup, as before.
-pub(crate) fn task_build_refusal(
+/// Refuses a task (NET-079) when the box's launch placed it in a classifier
+/// leaf (`enforcement` is [`boxes::HostIpEnforcement::PerBox`]) and the
+/// task's context has no leaf. Such a task would run outside the box's
+/// egress verdict. A box that was never placed runs its task as before.
+pub(crate) fn task_leaf_refusal(
     enforcement: Option<boxes::HostIpEnforcement>,
     box_name: &str,
     has_leaf: bool,
@@ -382,11 +382,11 @@ pub(crate) fn task_build_refusal(
     if enforcement == Some(boxes::HostIpEnforcement::PerBox) && !has_leaf {
         tracing::warn!(
             box_name = %box_name,
-            "refusing a task's package builds for a placed box whose classifier leaf is missing",
+            "refusing a task of a placed box whose classifier leaf is missing",
         );
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            crate::box_actor::placed_box_build_refusal(box_name),
+            crate::box_actor::placed_box_task_refusal(box_name),
         ));
     }
     Ok(())
@@ -480,7 +480,6 @@ fn shell_word(s: &str) -> String {
         format!("'{}'", s.replace('\'', r#"'\''"#))
     }
 }
-
 /// Producer side of [`TaskExec::exec`]. Inlined in one async fn so that
 /// `env` lives on a single stack frame across every spawn — that frame
 /// is alive for the whole life of this tokio task, which in turn is
@@ -520,14 +519,14 @@ pub(super) async fn task_producer(
             return Ok(());
         }
 
-        // NET-155: a task's package builds run in the box's leaf. A box
-        // whose launch placed it in a leaf never builds outside it, so a
-        // placed box whose leaf is gone has its task refused here. The
+        // NET-079: a task of a box whose launch placed it in a classifier
+        // leaf runs in that leaf. A placed box whose leaf is gone has its
+        // task refused here, never run outside the box's egress verdict. The
         // context lookup does not refuse, because a relaunch uses it too.
         {
             let record = session.record().await?;
             let box_name = record.name.clone().unwrap_or_else(|| record.id.to_string());
-            task_build_refusal(
+            task_leaf_refusal(
                 record.host_ip_enforcement,
                 &box_name,
                 ctx.classifier_leaf().is_some(),
