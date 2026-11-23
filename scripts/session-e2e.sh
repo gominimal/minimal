@@ -80,7 +80,10 @@
 #                                    terminal and reads the output again
 #   box_exec                         `min box exec`: plain with its exit code,
 #                                    -t on a pty and off one, --detach,
-#                                    --timeout 124, a stopped box refused
+#                                    --timeout 124, an idle session box
+#                                    stops in less than 10 s and
+#                                    `min box wait` exits 129, a stopped
+#                                    box refused
 #   attach_ends_on_stop              `min box stop` ends an attach with exit
 #                                    254 and a line that names the stop, never
 #                                    the shell-exit prompt (#3526). `min box
@@ -2217,11 +2220,23 @@ out="$(cd "$PROJECT_DIR" && mnl session start --detach --name e2e-box-exec-stopp
   fail
 }
 stop_sid="$(printf '%s\n' "$out" | tail -n1 | tr -d '\r')"
+# A graceful stop of an idle session box reaches its shell: the stop
+# returns well inside the 10 s grace, and the shell ends on SIGHUP, so
+# `min box wait` exits 129. The SIGHUP step is the interim of
+# gominimal/arch#201 option (a), and gominimal/minimal#3741 removes it.
+t0=$(now_ms)
 mnl box stop "$stop_sid" </dev/null >"$WORK/box-exec-stop.out" 2>&1 || {
   echo "::error::'min box stop $stop_sid' failed"
   cat "$WORK/box-exec-stop.out" 2>/dev/null || true
   fail
 }
+t1=$(now_ms)
+if [ $((t1 - t0)) -ge 10000 ]; then
+  echo "::error::'min box stop $stop_sid' on an idle session box returned after $((t1 - t0))ms (expected less than 10 s: the shell ends before the SIGKILL)"
+  cat "$WORK/box-exec-stop.out" 2>/dev/null || true
+  fail
+fi
+echo "min box stop: an idle session box stopped after $((t1 - t0))ms"
 for i in $(seq 1 20); do
   shown="$(mnl box show "$stop_sid" </dev/null 2>&1)" || shown=""
   state="$(printf '%s\n' "$shown" | sed -n 's/^State: *//p' | tr -d '\r')"
@@ -2233,6 +2248,14 @@ if [ "$state" != stopped ]; then
   echo "--- min box show $stop_sid ---"; printf '%s\n' "$shown"
   fail
 fi
+mnl box wait "$stop_sid" </dev/null >"$WORK/box-exec-stop-wait.out" 2>&1
+rc=$?
+if [ "$rc" -ne 129 ]; then
+  echo "::error::'min box wait $stop_sid' exited $rc after the stop (expected 129: the shell ended on SIGHUP)"
+  cat "$WORK/box-exec-stop-wait.out" 2>/dev/null || true
+  fail
+fi
+echo "min box wait: the stopped session box exits 129 (SIGHUP)"
 mnl box exec "$stop_sid" -- true </dev/null >"$WORK/box-exec-stopped.out" 2>"$WORK/box-exec-stopped.err"
 rc=$?
 if [ "$rc" -ne 2 ] || ! grep -Fq "$stop_sid is stopped. Only a running box can run a command." "$WORK/box-exec-stopped.err"; then
