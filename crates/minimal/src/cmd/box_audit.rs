@@ -14,11 +14,10 @@
 //! (BEP-068). The command reads every segment still in the log's
 //! directory, oldest first, so a box's trail is whole after a rotation.
 //!
-//! Interim: the client reads the operator-owned log files under file mode,
-//! on the host. The design reads over the proxy's local socket (ruled on
-//! gominimal/arch#137). The interim is
-//! <https://github.com/gominimal/minimal/issues/2459>, and it ends when
-//! <https://github.com/gominimal/minimal/issues/2463> serves the read.
+//! The command reads the records over the proxy's control socket, at
+//! [`crate::mint::control_path`]. The proxy reads its own log files and
+//! sends only the records of the boxes the command names, so the client
+//! opens none of the files under `~/.minimal/bep/audit`.
 //!
 //! [`resolve`], [`children`] and [`render`] are pure. [`follow`] takes its
 //! wait step as a closure. [`cmd_box_audit`] gathers the boxes this host
@@ -29,8 +28,9 @@ use std::os::fd::AsFd as _;
 use std::path::Path;
 
 use anyhow::Context as _;
-use bep::audit::{Entry, LogReader};
+use bep::audit::{Entry, Record};
 
+use crate::mint::{AuditBatch, AuditStream, ControlClient, MintError};
 use crate::{BoxAuditArgs, BoxAuditOutputFormat, GlobalArgs};
 
 /// The defined error code for `self` on a host that is not enrolled.
@@ -39,7 +39,8 @@ pub(crate) const AUDIT_SELF_UNSUPPORTED_UNENROLLED: &str = "audit_self_unsupport
 /// The environment variable the daemon sets in every box shell.
 const IN_BOX_ENV: &str = "MINIMAL_SESSION_NAME";
 
-/// How long `--follow` waits between two reads of the log.
+/// How long `--follow` waits for the proxy before it checks that the
+/// reader of its output is still there.
 const FOLLOW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// `min box audit self` inside a box, on a host that is not enrolled.
@@ -111,11 +112,8 @@ pub(crate) fn subject(id: boxes::SessionId) -> String {
 /// no host is enrolled today, so nothing serves the log into a box.
 /// `self` gets the defined error (BEP-042). Any other target gets the
 /// command to run on the host.
-// Interim: flip when the proxy serves the read over its local socket
-// (architecture, audit paragraph; Gatehouse §6.10), the same flip as the
-// direct read: https://github.com/gominimal/minimal/issues/2459, ended by
-// https://github.com/gominimal/minimal/issues/2463. The refusal of `self`
-// stays until a Gatehouse answers it.
+// The proxy's control socket is on the host, out of reach of a box. The
+// refusal of `self` stays until a Gatehouse answers it.
 pub(crate) fn refuse_in_box(args: &BoxAuditArgs, in_box: bool) -> anyhow::Result<()> {
     if !in_box {
         return Ok(());
@@ -286,49 +284,175 @@ pub(crate) fn render(
     Ok(written)
 }
 
+/// What one read of the audit log gave back.
+#[derive(Debug, Default)]
+pub(crate) struct AuditRead {
+    /// The records, in log order.
+    pub entries: Vec<Entry>,
+    /// The lines that are not records, and are not shown.
+    pub skipped: usize,
+    /// The proxy has no audit log yet.
+    pub no_log: bool,
+}
+
+/// Where `min box audit` reads the records from.
+pub(crate) trait AuditSource {
+    /// The records new since the last call. `None` when nothing came in
+    /// the wait for it.
+    fn read(&mut self) -> anyhow::Result<Option<AuditRead>>;
+}
+
+/// The read over the proxy's control socket (BEP-042).
+enum ProxyAudit {
+    /// One read, then the end.
+    Once {
+        path: std::path::PathBuf,
+        client: Option<ControlClient>,
+        subjects: Vec<String>,
+    },
+    /// A replay, then each new record.
+    Follow {
+        path: std::path::PathBuf,
+        stream: AuditStream,
+    },
+}
+
+impl ProxyAudit {
+    /// Connects to the proxy's control socket at `path`, and with `follow`
+    /// asks it for the records of `subjects` as they come.
+    fn open(path: &Path, subjects: &BTreeSet<String>, follow: bool) -> anyhow::Result<Self> {
+        let subjects: Vec<String> = subjects.iter().cloned().collect();
+        let client = ControlClient::connect(path).map_err(|error| audit_error(path, error))?;
+        if follow {
+            let stream = client
+                .follow_audit(&subjects, FOLLOW_INTERVAL)
+                .map_err(|error| audit_error(path, error))?;
+            return Ok(Self::Follow {
+                path: path.to_owned(),
+                stream,
+            });
+        }
+        Ok(Self::Once {
+            path: path.to_owned(),
+            client: Some(client),
+            subjects,
+        })
+    }
+}
+
+impl AuditSource for ProxyAudit {
+    fn read(&mut self) -> anyhow::Result<Option<AuditRead>> {
+        let (path, batch) = match self {
+            Self::Once {
+                path,
+                client,
+                subjects,
+            } => {
+                let Some(client) = client.take() else {
+                    return Ok(None);
+                };
+                let batch = client.read_audit(subjects);
+                (path, batch.map(Some))
+            }
+            Self::Follow { path, stream } => (path, stream.next_batch()),
+        };
+        let Some(batch) = batch.map_err(|error| audit_error(path, error))? else {
+            return Ok(None);
+        };
+        Ok(Some(parse_batch(batch)))
+    }
+}
+
+/// The records of `batch`. A line that does not parse as a record counts
+/// as skipped.
+fn parse_batch(batch: AuditBatch) -> AuditRead {
+    let mut read = AuditRead {
+        entries: Vec::with_capacity(batch.lines.len()),
+        skipped: batch.skipped,
+        no_log: batch.no_log,
+    };
+    for line in batch.lines {
+        match serde_json_lenient::from_str::<Record>(&line) {
+            Ok(record) => read.entries.push(Entry { record, line }),
+            Err(_) => read.skipped += 1,
+        }
+    }
+    read
+}
+
+/// The error `min box audit` gives when the read over the proxy's control
+/// socket at `path` fails.
+fn audit_error(path: &Path, error: MintError) -> anyhow::Error {
+    tracing::debug!(path = %path.display(), ?error, "the audit read over the control socket failed");
+    match error {
+        MintError::NotRunning { error, .. } => anyhow::anyhow!(
+            "Cannot read the audit log: the Box Egress Proxy does not answer on {}: {error}. \
+             Restart minvmd, which starts the proxy again.",
+            path.display()
+        ),
+        MintError::Refused { error, .. } => anyhow::anyhow!(
+            "Cannot read the audit log: the Box Egress Proxy refused the read: {error}."
+        ),
+        // The read without --follow waits at most CONTROL_TIMEOUT for each
+        // read, so a proxy that accepts and never answers ends the command.
+        MintError::Control(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+            anyhow::anyhow!(
+                "Cannot read the audit log: the Box Egress Proxy did not answer on {} \
+             within {} seconds. Restart minvmd, which starts the proxy again.",
+                path.display(),
+                crate::mint::CONTROL_TIMEOUT.as_secs()
+            )
+        }
+        MintError::Control(error) => anyhow::anyhow!(
+            "Cannot read the audit log: the connection to the Box Egress Proxy failed: {error}."
+        ),
+        other => anyhow::Error::new(other),
+    }
+}
+
 /// Reads what is new in the log and writes the matching records. One debug
-/// line names the boxes and the segments read. A line that is not a record
-/// is counted on `err`, so a damaged log is never silent.
+/// line names the boxes and the records read. A line that is not a record
+/// is counted on `err`, so a damaged log is never silent. It returns how
+/// many records it wrote, and whether the proxy has no log.
 fn read_and_render(
-    reader: &mut LogReader,
+    source: &mut dyn AuditSource,
     subjects: &BTreeSet<String>,
     output: Option<BoxAuditOutputFormat>,
     name_box: bool,
     out: &mut dyn std::io::Write,
     err: &mut dyn std::io::Write,
-) -> anyhow::Result<usize> {
-    let batch = reader
-        .read_new()
-        .with_context(|| format!("failed to read the audit log in {}", reader.dir().display()))?;
+) -> anyhow::Result<(usize, bool)> {
+    let Some(read) = source.read()? else {
+        return Ok((0, false));
+    };
     tracing::debug!(
         box_ids = ?subjects,
-        segments = ?batch.segments,
-        records = batch.entries.len(),
-        skipped = batch.skipped,
+        records = read.entries.len(),
+        skipped = read.skipped,
+        no_log = read.no_log,
         "read the audit log"
     );
-    let written = render(&batch.entries, subjects, output, name_box, out)?;
+    let written = render(&read.entries, subjects, output, name_box, out)?;
     out.flush()?;
-    if batch.skipped > 0 {
-        let (lines, are, they) = if batch.skipped == 1 {
+    if read.skipped > 0 {
+        let (lines, are, they) = if read.skipped == 1 {
             ("line", "is not an audit record", "It is")
         } else {
             ("lines", "are not audit records", "They are")
         };
         writeln!(
             err,
-            "The audit log in {} has {} {lines} that {are}. {they} not shown.",
-            reader.dir().display(),
-            batch.skipped
+            "The audit log has {} {lines} that {are}. {they} not shown.",
+            read.skipped
         )?;
     }
-    Ok(written)
+    Ok((written, read.no_log))
 }
 
 /// Replays the records for `subjects`, then tails new ones. `wait` runs
 /// between two reads, and the loop ends when it returns `false`.
 pub(crate) fn follow(
-    reader: &mut LogReader,
+    source: &mut dyn AuditSource,
     subjects: &BTreeSet<String>,
     output: Option<BoxAuditOutputFormat>,
     name_box: bool,
@@ -337,7 +461,7 @@ pub(crate) fn follow(
     mut wait: impl FnMut() -> bool,
 ) -> anyhow::Result<()> {
     loop {
-        read_and_render(reader, subjects, output, name_box, out, err)?;
+        read_and_render(source, subjects, output, name_box, out, err)?;
         if !wait() {
             return Ok(());
         }
@@ -384,13 +508,36 @@ async fn known_boxes(global: &GlobalArgs, parents: bool) -> anyhow::Result<Vec<K
     Ok(known)
 }
 
-/// The work of `min box audit`, over the log in `dir` and the boxes in
-/// `known`. Messages go to `err`, records to `out`.
+/// The work of `min box audit`, over the proxy's control socket at
+/// `control` and the boxes in `known`. Messages go to `err`, records to
+/// `out`. The proxy reads its log, and this opens none of its files.
 pub(crate) fn run(
     args: &BoxAuditArgs,
     known: &[KnownBox],
     in_box: bool,
-    dir: &Path,
+    control: &Path,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+    wait: impl FnMut() -> bool,
+) -> anyhow::Result<()> {
+    run_with(
+        args,
+        known,
+        in_box,
+        |subjects, follow| Ok(Box::new(ProxyAudit::open(control, subjects, follow)?)),
+        out,
+        err,
+        wait,
+    )
+}
+
+/// [`run`], with `open` giving the source of the records for the subjects,
+/// and whether to follow.
+pub(crate) fn run_with(
+    args: &BoxAuditArgs,
+    known: &[KnownBox],
+    in_box: bool,
+    open: impl FnOnce(&BTreeSet<String>, bool) -> anyhow::Result<Box<dyn AuditSource>>,
     out: &mut dyn std::io::Write,
     err: &mut dyn std::io::Write,
     wait: impl FnMut() -> bool,
@@ -415,10 +562,10 @@ pub(crate) fn run(
     if args.parent.is_some() && subjects.is_empty() {
         writeln!(err, "Box {} has no child boxes.", resolved.id())?;
     }
-    let mut reader = LogReader::new(dir);
+    let mut source = open(&subjects, args.follow)?;
     if args.follow {
         return follow(
-            &mut reader,
+            source.as_mut(),
             &subjects,
             args.output,
             name_box,
@@ -427,13 +574,13 @@ pub(crate) fn run(
             wait,
         );
     }
-    let written = read_and_render(&mut reader, &subjects, args.output, name_box, out, err)?;
+    let (written, no_log) =
+        read_and_render(source.as_mut(), &subjects, args.output, name_box, out, err)?;
     if written == 0 && !subjects.is_empty() {
-        if !dir.exists() {
+        if no_log {
             writeln!(
                 err,
-                "There is no audit log in {}, so no records for box {} are shown.",
-                dir.display(),
+                "The proxy has not written an audit log yet, so no records for box {} are shown.",
                 resolved.id()
             )?;
             return Ok(());
@@ -464,27 +611,22 @@ pub(crate) async fn cmd_box_audit(global: &GlobalArgs, args: BoxAuditArgs) -> an
     } else {
         Vec::new()
     };
-    // Interim (BEP-042): the client reads the proxy's log files on the host
-    // directly. The architecture's audit paragraph and Gatehouse §6.10 put
-    // the un-enrolled read behind the proxy's local socket. Flip to that
-    // read when the proxy serves it, and drop this direct read.
-    // Tracked by https://github.com/gominimal/minimal/issues/2459, ended by
-    // https://github.com/gominimal/minimal/issues/2463.
-    let dir = bep::audit::default_dir()
-        .context("cannot find the home directory, so the audit log cannot be found")?;
+    // BEP-042: un-enrolled, the read goes over the proxy's control socket.
+    let control = crate::mint::control_path().context(
+        "Cannot find your home directory, so the Box Egress Proxy's socket cannot be found.",
+    )?;
     let mut stdout = std::io::stdout().lock();
     let mut stderr = std::io::stderr().lock();
+    // With --follow, each read waits up to FOLLOW_INTERVAL for the proxy,
+    // so the check between two reads does not sleep.
     run(
         &args,
         &known,
         in_box,
-        &dir,
+        &control,
         &mut stdout,
         &mut stderr,
-        || {
-            std::thread::sleep(FOLLOW_INTERVAL);
-            !reader_gone(std::io::stdout().as_fd())
-        },
+        || !reader_gone(std::io::stdout().as_fd()),
     )
 }
 
@@ -509,7 +651,20 @@ fn reader_gone(fd: std::os::fd::BorrowedFd<'_>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bep::audit::{AuditLog, Decision, Kind, Mapping, Outcome, segment_name};
+    use bep::audit::{AuditLog, Decision, Kind, LogReader, Mapping, Outcome, segment_name};
+
+    /// The follow loop's tests read the log directly, so they step the
+    /// writer between two reads. The command reads over the socket.
+    impl AuditSource for LogReader {
+        fn read(&mut self) -> anyhow::Result<Option<AuditRead>> {
+            let batch = self.read_new()?;
+            Ok(Some(AuditRead {
+                entries: batch.entries,
+                skipped: batch.skipped,
+                no_log: !self.dir().exists(),
+            }))
+        }
+    }
 
     // UUIDv7 ids: the first 48 bits are the creation time, so B sorts after A.
     const A: &str = "01920000-0000-7000-8000-000000000001";
@@ -613,19 +768,64 @@ mod tests {
         known_box(entry(id_, name, live), Some(&record(id_, parent)))
     }
 
+    /// Runs `min box audit` over a control socket that serves the log in
+    /// `dir`, as `bep serve` does (BEP-042).
     fn run_to_strings(
         args: &BoxAuditArgs,
         boxes: &[KnownBox],
         in_box: bool,
         dir: &Path,
     ) -> (anyhow::Result<()>, String, String) {
+        let socket = tempfile::tempdir().unwrap();
+        let path = socket.path().join("bep/control.sock");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let control = runtime
+            .block_on(async {
+                bep::control::Control::bind(&path, Default::default(), Default::default())
+            })
+            .unwrap()
+            .with_audit_dir(dir);
+        runtime.spawn(control.run());
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let result = run(args, boxes, in_box, dir, &mut out, &mut err, || false);
+        let result = run(args, boxes, in_box, &path, &mut out, &mut err, || false);
         (
             result,
             String::from_utf8(out).unwrap(),
             String::from_utf8(err).unwrap(),
         )
+    }
+
+    // Architecture principle 3: without --follow, a proxy that accepts the
+    // read and never answers ends the command with a refusal.
+    #[test]
+    fn box_audit_refuses_a_proxy_that_does_not_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        crate::mint::tests::serve_silent(&path);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let error = run(
+            &args(Some(A), None, false),
+            &[],
+            false,
+            &path,
+            &mut out,
+            &mut err,
+            || false,
+        )
+        .unwrap_err();
+        assert!(out.is_empty());
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Cannot read the audit log: the Box Egress Proxy did not answer on {} \
+                 within 10 seconds. Restart minvmd, which starts the proxy again.",
+                path.display()
+            )
+        );
     }
 
     // BEP-042, BEP-068: one box id, across every segment, a reaped box
@@ -687,8 +887,7 @@ mod tests {
         assert_eq!(
             err,
             format!(
-                "There is no audit log in {}, so no records for box {A} are shown.\n",
-                missing.display()
+                "The proxy has not written an audit log yet, so no records for box {A} are shown.\n"
             )
         );
 

@@ -82,6 +82,25 @@
 //! < {"ok":true,"box_ids":["<id>"]}
 //! ```
 //!
+//! The client reads the audit log through the socket, so an un-enrolled
+//! host's `min box audit` opens none of the log's files (BEP-042). The
+//! proxy reads every retained segment through [`LogReader`] and writes one
+//! line for each record whose subject is a box the request names, in log
+//! order, with the record's line as the log holds it. A `caught_up` line
+//! ends each read. It counts the lines of that read that are not records,
+//! and says when the log has no directory yet:
+//!
+//! ```text
+//! > {"op":"read_audit","subjects":["<id>"]}
+//! < {"ok":true,"record":"<record line>"}
+//! < {"ok":true,"caught_up":true,"skipped":0}
+//! ```
+//!
+//! With `"follow":true`, the proxy then reads the log again every
+//! [`AUDIT_FOLLOW_INTERVAL`] and writes what is new, a rotation's new
+//! segment included, until the client closes the connection or sends
+//! another line. A socket with no audit directory refuses the read.
+//!
 //! A request the proxy cannot do gets `{"ok":false,"error":"<why>"}`, and the
 //! connection stays open for the next line. The registered key goes into the
 //! [`ClientKeys`] registry that the proxy verifies store handles under.
@@ -164,7 +183,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::audit::{Decision, Kind, Mapping, Outcome};
+use crate::audit::{Decision, Kind, LogReader, Mapping, Outcome, ReadBatch};
 use crate::boxes::{BoxRegistry, Boxes, Stance};
 use crate::ca::{Ca, CaError, CaKey};
 use crate::handle::{self, ClientKeys, parse_authority};
@@ -175,6 +194,10 @@ use crate::redeemer::Revocations;
 
 /// The longest request line the control socket reads.
 pub const MAX_LINE_LEN: usize = 16 * 1024;
+
+/// How long a `read_audit` with `follow` waits between two reads of the
+/// log.
+pub const AUDIT_FOLLOW_INTERVAL: Duration = Duration::from_millis(500);
 
 /// The client key registry the proxy verifies handles under, shared between
 /// the control socket and the proxy.
@@ -409,6 +432,83 @@ impl Records {
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         RevokedBoxIdsReply { ok: true, box_ids }
+    }
+}
+
+/// The client's request for the audit records of some boxes. It is a type
+/// of its own, beside [`Request`], so a client that matches every
+/// [`Request`] keeps its match, and [`Reply`] keeps its fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum AuditRequest {
+    /// Read the retained records whose subject is one of `subjects`.
+    ReadAudit {
+        /// The box ids, each 32 hex digits or a UUID.
+        subjects: Vec<String>,
+        /// Keep the connection open and write each new record, until the
+        /// client closes it.
+        #[serde(default)]
+        follow: bool,
+    },
+}
+
+/// One reply line to an [`AuditRequest`]: a record, the end of one read, or
+/// the refusal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditReply {
+    /// Whether the proxy read the log.
+    pub ok: bool,
+    /// One record's line, as the log holds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<String>,
+    /// This line ends one read of the log.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub caught_up: bool,
+    /// On a `caught_up` line, how many lines that read skipped because they
+    /// are not records.
+    #[serde(default)]
+    pub skipped: usize,
+    /// On a `caught_up` line, the log has no directory: the proxy has not
+    /// written a record yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_log: bool,
+    /// Why the proxy did not read the log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl AuditReply {
+    fn record(line: String) -> Self {
+        Self {
+            ok: true,
+            record: Some(line),
+            caught_up: false,
+            skipped: 0,
+            no_log: false,
+            error: None,
+        }
+    }
+
+    fn caught_up(skipped: usize, no_log: bool) -> Self {
+        Self {
+            ok: true,
+            record: None,
+            caught_up: true,
+            skipped,
+            no_log,
+            error: None,
+        }
+    }
+
+    fn refused(error: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            record: None,
+            caught_up: false,
+            skipped: 0,
+            no_log: false,
+            error: Some(error.into()),
+        }
     }
 }
 
@@ -1418,6 +1518,7 @@ pub struct Control {
     keys: Arc<KeyFile>,
     rotation: Option<Rotation>,
     recertification: Option<Recertification>,
+    audit_dir: Option<Arc<Path>>,
 }
 
 impl std::fmt::Debug for Control {
@@ -1426,6 +1527,7 @@ impl std::fmt::Debug for Control {
             .field("inner", &self.inner)
             .field("rotation", &self.rotation.is_some())
             .field("recertification", &self.recertification.is_some())
+            .field("audit_dir", &self.audit_dir)
             .finish_non_exhaustive()
     }
 }
@@ -1480,6 +1582,7 @@ impl Control {
             keys: Arc::new(keys),
             rotation: None,
             recertification: None,
+            audit_dir: None,
         })
     }
 
@@ -1515,6 +1618,15 @@ impl Control {
         self
     }
 
+    /// Takes `read_audit` requests for the log in `dir`, the directory the
+    /// proxy's [`crate::audit::AuditLog`] writes. Without it, the socket
+    /// refuses each one.
+    #[must_use]
+    pub fn with_audit_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.audit_dir = Some(Arc::from(dir.into()));
+        self
+    }
+
     /// Serves connections until the accept fails. With an idle period set,
     /// it also drops each idle key once a minute.
     ///
@@ -1542,6 +1654,7 @@ impl Control {
                 Arc::clone(&self.keys),
                 self.rotation.clone(),
                 self.recertification.clone(),
+                self.audit_dir.clone(),
             ));
         }
     }
@@ -1563,6 +1676,7 @@ async fn serve(
     keys: Arc<KeyFile>,
     rotation: Option<Rotation>,
     recertification: Option<Recertification>,
+    audit_dir: Option<Arc<Path>>,
 ) {
     // SAFETY: geteuid reads the caller's effective uid. It has no side
     // effects and cannot fail.
@@ -1594,6 +1708,12 @@ async fn serve(
             let _ = write_reply(&mut write, &Reply::refused("the request is too long")).await;
             return;
         }
+        if let Ok(AuditRequest::ReadAudit { subjects, follow }) = serde_json::from_str(&line) {
+            match read_audit(&mut lines, &mut write, audit_dir.clone(), &subjects, follow).await {
+                Ok(true) => continue,
+                Ok(false) | Err(_) => return,
+            }
+        }
         let written = if let Ok(RotationRequest::RotateSigning) = serde_json::from_str(&line) {
             write_reply(&mut write, &rotate(rotation.clone()).await).await
         } else if let Ok(RecertifyRequest::RecertifyRoot) = serde_json::from_str(&line) {
@@ -1607,6 +1727,95 @@ async fn serve(
         };
         if written.is_err() {
             return;
+        }
+    }
+}
+
+/// Writes the records of the log in `audit_dir` whose subject is one of
+/// `subjects`, then a `caught_up` line. With `follow`, it reads the log
+/// again every [`AUDIT_FOLLOW_INTERVAL`] and writes what is new, until the
+/// client closes the connection or sends another line. It returns whether
+/// the connection takes another request.
+async fn read_audit(
+    lines: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    write: &mut tokio::net::unix::OwnedWriteHalf,
+    audit_dir: Option<Arc<Path>>,
+    subjects: &[String],
+    follow: bool,
+) -> io::Result<bool> {
+    let Some(dir) = audit_dir else {
+        write_reply(
+            write,
+            &AuditReply::refused("this control socket has no audit log"),
+        )
+        .await?;
+        return Ok(true);
+    };
+    let Some(subjects) = subjects
+        .iter()
+        .map(|subject| normalise_box_id(subject))
+        .collect::<Option<BTreeSet<String>>>()
+    else {
+        write_reply(
+            write,
+            &AuditReply::refused("a subject is not a box id: 32 hex digits or a UUID"),
+        )
+        .await?;
+        return Ok(true);
+    };
+    let mut reader = LogReader::new(dir.to_path_buf());
+    let mut first = true;
+    loop {
+        let (back, batch, no_log) = tokio::task::spawn_blocking(move || {
+            let batch = reader.read_new();
+            let no_log = !reader.dir().exists();
+            (reader, batch, no_log)
+        })
+        .await
+        .map_err(io::Error::other)?;
+        reader = back;
+        let batch: ReadBatch = match batch {
+            Ok(batch) => batch,
+            Err(err) => {
+                tracing::warn!(audit = %dir.display(), error = %err, "did not read the audit log for a client");
+                write_reply(
+                    write,
+                    &AuditReply::refused(format!(
+                        "the proxy did not read the audit log in {}: {err}",
+                        dir.display()
+                    )),
+                )
+                .await?;
+                return Ok(false);
+            }
+        };
+        let mut records = 0usize;
+        for entry in batch.entries {
+            if subjects.contains(&entry.record.subject) {
+                records += 1;
+                write_reply(write, &AuditReply::record(entry.line)).await?;
+            }
+        }
+        if first || records > 0 || batch.skipped > 0 {
+            tracing::debug!(
+                subjects = ?subjects,
+                segments = ?batch.segments,
+                records,
+                skipped = batch.skipped,
+                follow,
+                "served the audit log over the control socket"
+            );
+            write_reply(write, &AuditReply::caught_up(batch.skipped, no_log)).await?;
+        }
+        first = false;
+        if !follow {
+            return Ok(true);
+        }
+        // The follow ends at the client's close, or at any line it sends.
+        let mut byte = [0u8; 1];
+        tokio::select! {
+            () = tokio::time::sleep(AUDIT_FOLLOW_INTERVAL) => {}
+            _ = lines.read(&mut byte) => return Ok(false),
         }
     }
 }
@@ -2361,5 +2570,202 @@ mod tests {
         // A list with an id that is not a box id is refused.
         let reply = live_boxes(&["not-a-box".to_owned()], &restored, &restarted);
         assert!(!reply.ok, "{reply:?}");
+    }
+
+    /// A decision for `box_id` against `authority`, for the audit tests.
+    fn audit_decision(box_id: &str, authority: &str) -> Decision {
+        Decision {
+            kind: Kind::Decision,
+            box_id: box_id.to_owned(),
+            authority: authority.to_owned(),
+            identifier: None,
+            jti: String::new(),
+            mapping: Mapping::ModuleUnmapped,
+            outcome: Outcome::Admit,
+            marker: None,
+        }
+    }
+
+    /// A control socket at `path` that answers `read_audit` from `audit`.
+    fn start_with_audit(path: &Path, audit: &Path) -> tokio::task::JoinHandle<io::Result<()>> {
+        let control = Control::bind(path, Registry::default(), BoxRegistry::default())
+            .unwrap()
+            .with_audit_dir(audit);
+        tokio::spawn(control.run())
+    }
+
+    /// Sends `request` on `write`.
+    async fn send_audit(write: &mut tokio::net::unix::OwnedWriteHalf, request: &AuditRequest) {
+        let line = serde_json::to_string(request).unwrap();
+        write
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .unwrap();
+    }
+
+    /// The record lines up to the next `caught_up` line, and that line.
+    async fn read_until_caught_up(
+        lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    ) -> (Vec<String>, AuditReply) {
+        let mut records = Vec::new();
+        loop {
+            let line = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+                .await
+                .expect("the proxy wrote no line in time")
+                .unwrap()
+                .expect("the proxy closed the connection");
+            let reply: AuditReply = serde_json::from_str(&line).unwrap();
+            assert!(reply.ok, "{reply:?}");
+            match reply.record {
+                Some(record) => records.push(record),
+                None => {
+                    assert!(reply.caught_up, "{reply:?}");
+                    return (records, reply);
+                }
+            }
+        }
+    }
+
+    const AUDIT_A: &str = "0192000000007000800000000000000a";
+    const AUDIT_B: &str = "0193000000007000800000000000000b";
+
+    // BEP-042: the client reads one box's records over the control socket,
+    // a removed box included, and opens no log file itself.
+    #[tokio::test]
+    async fn control_socket_streams_audit_records_for_one_subject() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = dir.path().join("audit");
+        let path = dir.path().join("bep/control.sock");
+        let mut log =
+            crate::audit::AuditLog::open_dir(&audit, crate::audit::Rotation::default()).unwrap();
+        let first = log
+            .append(&audit_decision(AUDIT_A, "github.com:443"))
+            .unwrap();
+        log.append(&audit_decision(AUDIT_B, "example.com:443"))
+            .unwrap();
+        let second = log
+            .append(&audit_decision(AUDIT_A, "api.github.com:443"))
+            .unwrap();
+        let task = start_with_audit(&path, &audit);
+
+        let stream = UnixStream::connect(&path).await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut lines = BufReader::new(read).lines();
+        // The hyphenated, upper-case form names the same box.
+        send_audit(
+            &mut write,
+            &AuditRequest::ReadAudit {
+                subjects: vec!["01920000-0000-7000-8000-00000000000A".to_owned()],
+                follow: false,
+            },
+        )
+        .await;
+        let (records, end) = read_until_caught_up(&mut lines).await;
+        assert_eq!(records, vec![first.to_line(), second.to_line()]);
+        assert_eq!(end.skipped, 0);
+        assert!(!end.no_log);
+
+        // The connection takes the next request. A subject that is not a
+        // box id is refused.
+        send_audit(
+            &mut write,
+            &AuditRequest::ReadAudit {
+                subjects: vec!["../audit".to_owned()],
+                follow: false,
+            },
+        )
+        .await;
+        let refused: AuditReply =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert!(!refused.ok, "{refused:?}");
+        stop(task).await;
+
+        // A socket with no audit directory refuses the read.
+        let bare = dir.path().join("bare/control.sock");
+        let (_registry, task) = start(&bare);
+        let stream = UnixStream::connect(&bare).await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut lines = BufReader::new(read).lines();
+        send_audit(
+            &mut write,
+            &AuditRequest::ReadAudit {
+                subjects: vec![AUDIT_A.to_owned()],
+                follow: false,
+            },
+        )
+        .await;
+        let refused: AuditReply =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert!(!refused.ok, "{refused:?}");
+        stop(task).await;
+
+        // A log with no directory yet is an empty read that says so.
+        let empty = dir.path().join("empty/control.sock");
+        let task = start_with_audit(&empty, &dir.path().join("no-audit"));
+        let stream = UnixStream::connect(&empty).await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut lines = BufReader::new(read).lines();
+        send_audit(
+            &mut write,
+            &AuditRequest::ReadAudit {
+                subjects: vec![AUDIT_A.to_owned()],
+                follow: false,
+            },
+        )
+        .await;
+        let (records, end) = read_until_caught_up(&mut lines).await;
+        assert!(records.is_empty());
+        assert!(end.no_log);
+        stop(task).await;
+    }
+
+    // BEP-042, BEP-068: a follow replays the box's records, then writes
+    // each new one, across a rotation into new segments.
+    #[tokio::test]
+    async fn control_socket_follows_audit_records_across_a_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = dir.path().join("audit");
+        let path = dir.path().join("bep/control.sock");
+        // A bound of one byte opens a new segment for each record.
+        let rotation = crate::audit::Rotation {
+            bound: 1,
+            ..crate::audit::Rotation::default()
+        };
+        let mut log = crate::audit::AuditLog::open_dir(&audit, rotation).unwrap();
+        let replayed = log
+            .append(&audit_decision(AUDIT_A, "github.com:443"))
+            .unwrap();
+        let task = start_with_audit(&path, &audit);
+
+        let stream = UnixStream::connect(&path).await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut lines = BufReader::new(read).lines();
+        send_audit(
+            &mut write,
+            &AuditRequest::ReadAudit {
+                subjects: vec![AUDIT_A.to_owned()],
+                follow: true,
+            },
+        )
+        .await;
+        let (records, _) = read_until_caught_up(&mut lines).await;
+        assert_eq!(records, vec![replayed.to_line()]);
+
+        log.append(&audit_decision(AUDIT_B, "example.com:443"))
+            .unwrap();
+        let tailed = log
+            .append(&audit_decision(AUDIT_A, "api.github.com:443"))
+            .unwrap();
+        assert!(
+            crate::audit::segments(&audit).unwrap().len() >= 3,
+            "the log rotated"
+        );
+        let (records, _) = read_until_caught_up(&mut lines).await;
+        assert_eq!(records, vec![tailed.to_line()]);
+
+        // The client's close ends the follow.
+        drop(write);
+        drop(lines);
+        stop(task).await;
     }
 }
