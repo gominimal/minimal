@@ -82,8 +82,10 @@
 #                                    -t on a pty and off one, --detach,
 #                                    --timeout 124, an idle session box
 #                                    stops in less than 10 s and
-#                                    `min box wait` exits 129, a stopped
-#                                    box refused
+#                                    `min box wait` exits 129, a detached
+#                                    box with no shell stops in less than
+#                                    10 s with no signal, a stopped box
+#                                    refused
 #   attach_ends_on_stop              `min box stop` ends an attach with exit
 #                                    254 and a line that names the stop, never
 #                                    the shell-exit prompt (#3526). `min box
@@ -2286,6 +2288,52 @@ if printf '%s\n' "$listed" | grep -Fqx "$stop_sid"; then
   fail
 fi
 echo "stopped box: exit 2, and the refusal names the state"
+
+# 6. A detached session box that nothing attached to or exec'd in. The
+# detached start files the box but does not run its shell, so the stop
+# has no process to signal. The stop returns well inside the 10 s grace,
+# and `min box show` records no signal.
+# This leg does not assert the `min box wait` code. That code is 137
+# today. gominimal/arch#202 decides the right code, and
+# gominimal/minimal#3743 tracks it.
+# shellcheck disable=SC2086
+out="$(cd "$PROJECT_DIR" && mnl session start --detach --name e2e-box-stop-unstarted ${E2E_ACTIVATE_ARGS:-} 2>"$WORK/box-stop-unstarted-activate.err")" || {
+  echo "::error::activation of the box for the stop of a box with no shell failed"
+  echo "--- stderr ---"; cat "$WORK/box-stop-unstarted-activate.err" 2>/dev/null || true
+  fail
+}
+idle_sid="$(printf '%s\n' "$out" | tail -n1 | tr -d '\r')"
+t0=$(now_ms)
+mnl box stop "$idle_sid" </dev/null >"$WORK/box-stop-unstarted.out" 2>&1 || {
+  echo "::error::'min box stop $idle_sid' failed on a detached box with no shell"
+  cat "$WORK/box-stop-unstarted.out" 2>/dev/null || true
+  fail
+}
+t1=$(now_ms)
+if [ $((t1 - t0)) -ge 10000 ]; then
+  echo "::error::'min box stop $idle_sid' on a detached box with no shell returned after $((t1 - t0))ms (expected less than 10 s: no process to wait for)"
+  cat "$WORK/box-stop-unstarted.out" 2>/dev/null || true
+  fail
+fi
+echo "min box stop: a detached box with no shell stopped after $((t1 - t0))ms"
+for i in $(seq 1 20); do
+  shown="$(mnl box show "$idle_sid" </dev/null 2>&1)" || shown=""
+  state="$(printf '%s\n' "$shown" | sed -n 's/^State: *//p' | tr -d '\r')"
+  [ "$state" = stopped ] && break
+  sleep 0.5
+done
+signal="$(printf '%s\n' "$shown" | sed -n 's/^Signal: *//p' | tr -d '\r')"
+if [ "$state" != stopped ] || [ "$signal" != "-" ]; then
+  echo "::error::box $idle_sid is '${state:-<none>}' with signal '${signal:-<none>}' after 'min box stop' (expected stopped with no signal: the box had no shell to signal)"
+  echo "--- min box show $idle_sid ---"; printf '%s\n' "$shown"
+  fail
+fi
+mnl box rm --force "$idle_sid" </dev/null >"$WORK/box-stop-unstarted-rm.out" 2>&1 || {
+  echo "::error::'min box rm --force $idle_sid' failed"
+  cat "$WORK/box-stop-unstarted-rm.out" 2>/dev/null || true
+  fail
+}
+echo "detached box with no shell: the stop returned in less than 10 s and recorded no signal"
 echo "box exec proof OK"
 echo "::endgroup::"
 }
