@@ -8,6 +8,7 @@ pub mod jq;
 mod remote_storage;
 pub use remote_storage::{
     GCS_HOST, NO_NETWORK, RULES_REFUSE, RemoteStorage, fetch_to_file, gcs_object_url, source_hosts,
+    stripped_url,
 };
 
 #[cfg(target_os = "linux")]
