@@ -103,45 +103,70 @@ pub enum CreateField {
 }
 
 impl CreateForm {
-    /// A form for the project at `path`, with its session entries read and
-    /// the entry `min session start` picks with no entry preselected:
-    /// `default` when the project has one.
+    /// A form for the project at `path`. Its session entries are not read
+    /// yet: [`CreateForm::read_request`] gives the read to run off the
+    /// event path, and [`Msg::EntriesRead`] brings the result back.
     #[must_use]
     pub fn new(path: String) -> Self {
-        let mut form = Self {
+        Self {
             name: String::new(),
             path,
-            entries: Ok(Vec::new()),
+            entries: Err(ENTRIES_READING.to_string()),
             entry_idx: 0,
             entries_for: String::new(),
             net_idx: 0,
             field: CreateField::Name,
-        };
-        form.read_entries();
-        form
-    }
-
-    /// Reads the session entries again when the path changed since the
-    /// last read.
-    fn sync_entries(&mut self) {
-        if self.entries_for != self.path.trim() {
-            self.read_entries();
         }
     }
 
-    /// Reads the session entries of the project at `path`, and preselects
-    /// the entry a start with no entry picks.
-    fn read_entries(&mut self) {
-        let path = self.path.trim().to_string();
-        let choices = session_entry_choices(camino::Utf8Path::new(&path));
+    /// The read of the session entries for the path as it is now. The
+    /// dashboard reads them again each time the form asks, so an edited
+    /// `minimal.toml` is read again too.
+    #[must_use]
+    pub fn read_request(&self) -> Effect {
+        Effect::ReadEntries(self.path.trim().to_string())
+    }
+
+    /// The reads a focus change asks for: the entries again when the
+    /// focus reaches the entry field, or when the path changed.
+    fn focus_reads(&self) -> Vec<Effect> {
+        match self.field == CreateField::Entry || !self.entries_current() {
+            true => vec![self.read_request()],
+            false => Vec::new(),
+        }
+    }
+
+    /// True when `entries` were read for the path as it is now.
+    #[must_use]
+    pub fn entries_current(&self) -> bool {
+        self.entries_for == self.path.trim()
+    }
+
+    /// Takes the session entries read for `path`, and preselects the entry
+    /// a start with no entry picks. An entry already picked for the same
+    /// path stays picked while the project still declares it. A read for a
+    /// path the form no longer shows is dropped.
+    fn take_entries(&mut self, path: &str, choices: EntryChoices) {
+        if path != self.path.trim() {
+            return;
+        }
         if let Err(reason) = &choices {
             tracing::debug!(path = %path, reason = %reason, "the create form offers no session entry");
         }
+        let kept = match self.entries_for == path {
+            true => self.entry().map(str::to_string),
+            false => None,
+        };
         (self.entries, self.entry_idx) = match choices {
-            Ok((names, picked)) => (Ok(names), picked),
+            Ok((names, picked)) => {
+                let idx = kept
+                    .and_then(|kept| names.iter().position(|name| *name == kept))
+                    .unwrap_or(picked);
+                (Ok(names), idx)
+            }
             Err(reason) => (Err(reason), 0),
         };
-        self.entries_for = path;
+        self.entries_for = path.to_string();
     }
 
     /// The picked entry's name, if the project offers one.
@@ -177,6 +202,13 @@ impl CreateForm {
     }
 }
 
+/// What the create form shows in place of the entries while it reads them.
+const ENTRIES_READING: &str = "reading the session entries";
+
+/// The session entry names of a project and the index of the preselected
+/// one, or why the project offers none.
+pub type EntryChoices = Result<(Vec<String>, usize), String>;
+
 /// The session entries of the project at `dir`, as `min session start`
 /// counts them (the implicit `default` included), and the index of the one
 /// a start with no entry picks. When that pick is undecided, the first.
@@ -185,7 +217,7 @@ impl CreateForm {
 ///
 /// The reason as text, for the status line: a `minimal.toml` that does
 /// not load, an entry whose type does not resolve, or no session entry.
-fn session_entry_choices(dir: &camino::Utf8Path) -> Result<(Vec<String>, usize), String> {
+fn session_entry_choices(dir: &camino::Utf8Path) -> EntryChoices {
     let entries = crate::project_entries(dir).map_err(|error| format!("{error:#}"))?;
     let candidates = crate::start_candidates(&entries).map_err(|error| format!("{error:#}"))?;
     let names: Vec<String> = candidates
@@ -250,6 +282,11 @@ pub enum Msg {
         root: String,
         reply: tokio::sync::oneshot::Sender<UploadAnswer>,
     },
+    /// The create form's session entries, read for `path`.
+    EntriesRead {
+        path: String,
+        choices: EntryChoices,
+    },
 }
 
 /// The user's answer to a create's upload confirm. "n" and Esc are different
@@ -302,6 +339,10 @@ pub enum Effect {
     },
     /// Persist the last-focused session to `dash-state.json`.
     SaveState,
+    /// Read the session entries of the project at this path for the create
+    /// form, off the event path: a stalled mount must not stall the
+    /// dashboard.
+    ReadEntries(String),
 }
 
 /// One line in the flattened sidebar.
@@ -678,6 +719,12 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             model.pending_focus = Some((host, id));
             vec![Effect::Refresh]
         }
+        Msg::EntriesRead { path, choices } => {
+            if let Some(Action::Create(form)) = &mut model.action {
+                form.take_entries(&path, choices);
+            }
+            Vec::new()
+        }
         Msg::Key(key) => update_key(model, key),
         // Intercepted by the run loop before `update` (it carries the create
         // task's reply sender); reaching here would drop that reply and hang
@@ -818,8 +865,10 @@ fn update_key(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
             let path = std::env::current_dir()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default();
-            model.action = Some(Action::Create(CreateForm::new(path)));
-            Vec::new()
+            let form = CreateForm::new(path);
+            let read = form.read_request();
+            model.action = Some(Action::Create(form));
+            vec![read]
         }
         _ => Vec::new(),
     }
@@ -942,13 +991,15 @@ fn update_modal(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
                 }
                 (KeyCode::BackTab, _) => {
                     form.field = prev_field(form.field);
-                    form.sync_entries();
+                    let reads = form.focus_reads();
                     model.action = Some(Action::Create(form));
+                    return reads;
                 }
                 (KeyCode::Tab, _) => {
                     form.field = next_field(form.field);
-                    form.sync_entries();
+                    let reads = form.focus_reads();
                     model.action = Some(Action::Create(form));
+                    return reads;
                 }
                 // Left/right and space cycle the session entry.
                 (KeyCode::Left, CreateField::Entry) => {
@@ -977,8 +1028,9 @@ fn update_modal(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
                 | (KeyCode::Enter, CreateField::Path)
                 | (KeyCode::Enter, CreateField::Entry) => {
                     form.field = next_field(form.field);
-                    form.sync_entries();
+                    let reads = form.focus_reads();
                     model.action = Some(Action::Create(form));
+                    return reads;
                 }
                 (KeyCode::Enter, CreateField::Network) => {
                     // Create on the host the user is pointing at: the
@@ -1003,11 +1055,17 @@ fn update_modal(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
                         model.action = Some(Action::Create(form));
                         return Vec::new();
                     }
-                    // The entries of the path as it is now. A project with
-                    // no session entry to offer is refused here, before
-                    // anything reaches the daemon. The form closes, so the
-                    // status line shows why.
-                    form.sync_entries();
+                    // The entries of the path as it is now. While they are
+                    // not read, the form stays open, its entry field shows
+                    // `reading…`, and Enter again creates. A
+                    // project with no session entry to offer is refused
+                    // here, before anything reaches the daemon. The form
+                    // closes, so the status line shows why.
+                    if !form.entries_current() {
+                        let read = form.read_request();
+                        model.action = Some(Action::Create(form));
+                        return vec![read];
+                    }
                     let Some(entry) = form.entry().map(str::to_string) else {
                         let reason = form.entries.err().unwrap_or_else(|| {
                             format!(
@@ -1303,6 +1361,20 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                 // State persistence is local disk, not a daemon call, so it
                 // runs inline rather than going through `exec_effect`.
                 Effect::SaveState => save_state(&model, opts.minimal_dir.as_deref()),
+                // The create form's entries: a blocking read of the
+                // project's `minimal.toml`, off the event path.
+                Effect::ReadEntries(path) => {
+                    let tx = bg_tx.clone();
+                    tokio::spawn(async move {
+                        let dir = path.clone();
+                        let choices = tokio::task::spawn_blocking(move || {
+                            session_entry_choices(camino::Utf8Path::new(&dir))
+                        })
+                        .await
+                        .unwrap_or_else(|error| Err(format!("{error}")));
+                        let _ = tx.send(Msg::EntriesRead { path, choices }).await;
+                    });
+                }
                 // The upload confirm the user just answered: deliver the
                 // stashed reply and, if another create is waiting, show its
                 // modal now that `update` closed this one.
@@ -1690,12 +1762,14 @@ async fn exec_effect(
             Some(Msg::ActionDone(result))
         }
         // Handled inline by the run loop: SaveState is local disk, Attach
-        // needs the terminal guard, Create spawns a background task, and
-        // AnswerCreateUpload delivers a stashed reply the loop owns.
+        // needs the terminal guard, Create and ReadEntries spawn a
+        // background task, and AnswerCreateUpload delivers a stashed reply
+        // the loop owns.
         Effect::SaveState
         | Effect::Attach(_)
         | Effect::Create { .. }
-        | Effect::AnswerCreateUpload { .. } => None,
+        | Effect::AnswerCreateUpload { .. }
+        | Effect::ReadEntries(_) => None,
     }
 }
 
@@ -2266,8 +2340,9 @@ mod tests {
     #[test]
     fn create_form_submits_on_last_field() {
         let mut model = two_hosts();
-        update(&mut model, key(KeyCode::Char('n')));
+        let reads = update(&mut model, key(KeyCode::Char('n')));
         assert!(matches!(model.action, Some(Action::Create(_))));
+        run_reads(&mut model, reads);
         update(&mut model, key(KeyCode::Enter)); // name -> path
         update(&mut model, key(KeyCode::Enter)); // path -> entry
         update(&mut model, key(KeyCode::Enter)); // entry -> network
@@ -2280,6 +2355,30 @@ mod tests {
             }
         )));
         assert!(model.action.is_none());
+    }
+
+    /// Runs the entry reads in `effects` here, as the run loop does on a
+    /// background task, and gives their results to `update`.
+    fn run_reads(model: &mut Model, effects: Vec<Effect>) {
+        for effect in effects {
+            if let Effect::ReadEntries(path) = effect {
+                let choices = session_entry_choices(camino::Utf8Path::new(&path));
+                update(model, Msg::EntriesRead { path, choices });
+            }
+        }
+    }
+
+    /// A form for the project at `path`, with its session entries read.
+    fn read_form(path: &str) -> CreateForm {
+        let mut model = two_hosts();
+        let form = CreateForm::new(path.to_string());
+        let read = form.read_request();
+        model.action = Some(Action::Create(form));
+        run_reads(&mut model, vec![read]);
+        match model.action {
+            Some(Action::Create(form)) => form,
+            other => panic!("the create form closed: {other:?}"),
+        }
     }
 
     /// The create form offers the project's session entries, with the
@@ -2296,7 +2395,30 @@ mod tests {
         )
         .unwrap();
         let path = project.path().display().to_string();
-        let form = CreateForm::new(path.clone());
+        // The form reads nothing on the event path: it asks for a read, and
+        // the entry field shows `reading…` until the result comes back.
+        let unread = CreateForm::new(path.clone());
+        assert!(!unread.entries_current());
+        assert_eq!(unread.entry(), None);
+        assert!(matches!(unread.read_request(), Effect::ReadEntries(p) if p == path));
+
+        // A submit before the read comes back creates nothing: the form
+        // stays open and asks for the read again.
+        let mut model = two_hosts();
+        model.action = Some(Action::Create(CreateForm {
+            field: CreateField::Network,
+            ..unread
+        }));
+        let effects = update(&mut model, key(KeyCode::Enter));
+        assert!(!effects.iter().any(|e| matches!(e, Effect::Create { .. })));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::ReadEntries(p) if *p == path))
+        );
+        assert!(matches!(model.action, Some(Action::Create(_))));
+        let form = read_form(&path);
+        assert!(form.entries_current());
         assert_eq!(
             form.entries,
             Ok(vec!["default".to_string(), "dev".to_string()])
@@ -2318,10 +2440,36 @@ mod tests {
             "{effects:?}"
         );
 
+        // The focus reaching the entry field reads `minimal.toml` again, so
+        // an edit made while the form is open shows.
+        let mut model = two_hosts();
+        model.action = Some(Action::Create(CreateForm {
+            field: CreateField::Path,
+            ..read_form(&path)
+        }));
+        std::fs::write(
+            project.path().join(mfile::MFILE_NAME),
+            "[sessions.dev]\n\n[sessions.default]\n\n[sessions.web]\n",
+        )
+        .unwrap();
+        let reads = update(&mut model, key(KeyCode::Tab)); // path -> entry
+        run_reads(&mut model, reads);
+        let Some(Action::Create(form)) = &model.action else {
+            panic!("the create form closed");
+        };
+        assert_eq!(
+            form.entries,
+            Ok(vec![
+                "default".to_string(),
+                "dev".to_string(),
+                "web".to_string()
+            ])
+        );
+
         // A project whose `minimal.toml` does not load offers no entry, and
         // the submit is refused with the reason on the status line.
         std::fs::write(project.path().join(mfile::MFILE_NAME), "not valid = =").unwrap();
-        let form = CreateForm::new(path);
+        let form = read_form(&path);
         assert!(form.entries.is_err());
         assert_eq!(form.entry(), None);
         let mut model = two_hosts();
@@ -2637,7 +2785,8 @@ mod tests {
             update(&mut model, key(KeyCode::Down));
         }
         assert!(matches!(model.cursor_row(), Some(Row::HostHeader(1))));
-        update(&mut model, key(KeyCode::Char('n')));
+        let reads = update(&mut model, key(KeyCode::Char('n')));
+        run_reads(&mut model, reads);
         update(&mut model, key(KeyCode::Enter)); // name -> path
         update(&mut model, key(KeyCode::Enter)); // path -> entry
         update(&mut model, key(KeyCode::Enter)); // entry -> network

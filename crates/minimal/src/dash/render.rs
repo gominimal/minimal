@@ -820,11 +820,16 @@ fn render_footer(model: &Model, frame: &mut Frame, area: Rect) {
                 Paragraph::new(Line::from(vec![
                     field("name", &form.name, form.field == CreateField::Name),
                     field("path", &form.path, form.field == CreateField::Path),
-                    // The picked session entry. A project with none to offer
-                    // shows `none`, and the create says why on submit.
+                    // The picked session entry. While the entries of the
+                    // path are not read it shows `reading…`. A project with
+                    // none to offer shows `none`, and the create says why
+                    // on submit.
                     field(
                         "entry",
-                        form.entry().unwrap_or("none"),
+                        match form.entries_current() {
+                            true => form.entry().unwrap_or("none"),
+                            false => "reading…",
+                        },
                         form.field == CreateField::Entry,
                     ),
                     field(
