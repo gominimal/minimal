@@ -539,8 +539,11 @@ pub async fn activate(
     // through.
     request.must_match_version = minimal_client::version_assertion();
     // The picked entry's expansion, the project root and the box's spec,
-    // through the helper `min box start` uses, so both store one spec for
-    // one entry. A refusal here comes before the daemon sees anything.
+    // through the helper `min box start` uses. The request's network and
+    // policy come from this caller, and only `activate_box` sets them from
+    // the project, so the helper refuses an entry that declares network or
+    // secret settings until #3739. A refusal here comes before the daemon
+    // sees anything.
     let (request, contribution) = put_picked_entry_off_worker(
         request,
         std::mem::take(&mut inputs.contribution),
@@ -929,6 +932,33 @@ fn put_picked_entry(
     // not declare as a session is refused, and no entry picks one.
     let entries = crate::project_entries(&dir)?;
     let entry = crate::pick_session_start_entry(&entries, picked.name.as_deref())?.name;
+    // This request carries the network and policy the dashboard gives it,
+    // not the entry's. So an entry that declares network or secret settings
+    // would store a spec that is not its expansion. Refuse it until #3739
+    // applies those settings here, as `activate_box` does.
+    let egress = crate::project_egress(&dir, Some(&entry))?;
+    let (bep, grants, env, quic443) = crate::project_bep_and_grants(&dir, Some(&entry))?;
+    if egress.policy.is_some()
+        || egress.ingress.is_some()
+        || !grants.is_empty()
+        || bep != boxes::core::bep::BepSettings::default()
+        || !env.is_empty()
+        || quic443.is_some()
+    {
+        tracing::debug!(
+            entry = %entry,
+            egress = egress.policy.is_some(),
+            ingress = egress.ingress.is_some(),
+            grants = grants.len(),
+            env = env.len(),
+            quic443 = ?quic443,
+            "dashboard create refused: the entry declares network or secret settings"
+        );
+        anyhow::bail!(
+            "the entry {entry} declares network or secret settings that min dash does not apply. \
+             Run min box start {entry}."
+        );
+    }
     crate::put_session_entry(
         request,
         contribution,
@@ -1761,6 +1791,57 @@ mod tests {
         )
         .expect_err("an undeclared entry is refused");
         assert!(format!("{error:#}").contains("nope"), "{error:#}");
+    }
+
+    /// Picks `dev` in a project whose `dev` entry declares `table`, and
+    /// asserts the dashboard refuses it with no spec on the request (#3739).
+    fn assert_dashboard_refuses_entry_with(table: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(mfile::MFILE_NAME),
+            format!("[sessions.dev]\n\n{table}"),
+        )
+        .unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let mut request = CreateSessionRequest::new(
+            String::new(),
+            paths::HostAbsPath::try_new(root.clone()).unwrap(),
+            NetworkMode::HostNet,
+            BoxPolicy::default(),
+        );
+        let mut contribution = boxes::wire::request::WireContribution::default();
+        let error = put_picked_entry(
+            &mut request,
+            &mut contribution,
+            &root,
+            &PickedEntry::new(Some("dev".to_owned())),
+        )
+        .expect_err("an entry with network or secret settings is refused");
+        assert_eq!(
+            format!("{error:#}"),
+            "the entry dev declares network or secret settings that min dash does not apply. \
+             Run min box start dev."
+        );
+        assert!(request.spec.is_none(), "no spec on a refused create");
+        assert!(
+            contribution.entry.is_none(),
+            "no expansion on a refused create"
+        );
+    }
+
+    #[test]
+    fn dashboard_create_refuses_an_entry_that_declares_network_egress() {
+        assert_dashboard_refuses_entry_with(
+            "[sessions.dev.network.egress]\nallow_dns_hosts = [\"github.com\"]\n",
+        );
+    }
+
+    #[test]
+    fn dashboard_create_refuses_an_entry_that_declares_secrets() {
+        assert_dashboard_refuses_entry_with(
+            "[sessions.dev.secrets.NPM_TOKEN]\nsource = \"store\"\n\
+             store = \"keychain\"\nid = \"npm-token\"\n",
+        );
     }
 
     /// NET-057's TUI half: the probe list covers every VM — the default one

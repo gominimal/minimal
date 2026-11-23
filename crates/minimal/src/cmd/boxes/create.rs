@@ -3915,7 +3915,9 @@ pub(crate) fn stamp_session_spec_as(
 
 /// The session entry a create starts a box from, and what its expansion
 /// reads. `min session activate`, `min box start` and the dashboard's
-/// create fill it in, so the three store the same spec for one entry.
+/// create fill it in. [`put_session_entry`] takes the request's network and
+/// policy from the caller, and only `activate_box` sets them from the
+/// project. #3739 makes the other callers set them from the project too.
 pub(crate) struct SessionEntryCreate<'a> {
     /// The directory the create runs from. The spec is read from here.
     pub(crate) dir: &'a camino::Utf8Path,
