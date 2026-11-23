@@ -980,7 +980,10 @@ fn scrub_sensitive_assignment(arg: &str) -> Option<String> {
         return None;
     }
     let masked = redaction_placeholder(&serde_json_lenient::Value::String(value.to_owned()));
-    Some(format!("{name}={}", masked.as_str().unwrap_or("<redacted>")))
+    Some(format!(
+        "{name}={}",
+        masked.as_str().unwrap_or("<redacted>")
+    ))
 }
 
 /// The `io::ErrorKind` behind an [`anyhow::Error`], if one is in its chain.
