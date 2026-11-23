@@ -900,7 +900,9 @@ pub async fn cmd_box_restart(
     ensure_daemon(global)?;
     let hosts = crate::cmd::list::local_hosts(global)?;
     let mut out = std::io::stdout().lock();
-    restart_box_on_hosts(hosts, &mut out, &args.target).await?;
+    let restarted = restart_box_on_hosts(hosts, &mut out, &args.target).await?;
+    // NET-169: a box with no row for its builds gets one here.
+    register_missing_build_row(global, &restarted.host, restarted.box_id).await;
     Ok(())
 }
 

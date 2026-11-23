@@ -353,7 +353,7 @@ fn a_build_without_its_own_network_stack_is_refused() {
 
 /// NET-169: a host-address box with no task addresses, created before build
 /// rows or with its row not registered at its start, has its network build
-/// refused with a step that works on a running box, never attached at no
+/// refused with the attach that registers them, never attached at no
 /// address.
 #[test]
 fn a_host_address_box_with_no_build_row_is_refused() {
@@ -361,8 +361,9 @@ fn a_host_address_box_with_no_build_row_is_refused() {
         super::no_build_row_refusal("web"),
         "the build needs the network, and box web has no addresses for its builds. An \
          earlier version of min created the box, or its addresses were not registered when \
-         it started. Remove the box with `min box rm --force web`, start it again with the \
-         command that created it, then run the build again."
+         it started. On the host, run `min box attach web` to register them, then run the \
+         build again. If it is refused again, remove the box with `min box rm --force web`, \
+         start it again with the command that created it, then run the build again."
     );
 }
 

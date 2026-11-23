@@ -679,6 +679,16 @@ impl BoxManagerHandle {
                 // daemon started under an id (BOX-149).
                 live_execs: crate::exec::live_execs(record.id),
                 disk_bytes,
+                // NET-169: a host-address box with no addresses for its
+                // builds, which `min` registers at the box's next attach or
+                // restart. The opt-out is the server's to fill in.
+                missing_build_row: (record.network == boxes::NetworkMode::HostNet
+                    && record.task_addresses.is_empty())
+                .then(|| minimald_rpc::MissingBuildRow {
+                    network: record.network,
+                    egress: record.policy.egress.clone(),
+                    deny_all_opt_out: false,
+                }),
             }))
         }
         .instrument(span)

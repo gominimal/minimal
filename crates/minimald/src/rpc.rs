@@ -206,6 +206,7 @@ async fn serve_list_sessions(
             );
             Ok(ListSessionsResponse {
                 daemon_version: Some(OWN_VERSION.to_string()),
+                daemon_epoch: Some(daemon_epoch().to_string()),
                 hostname_routing_unavailable: s.proxy_unavailable().await,
                 hostname_proxy_port,
                 zone_answerer_port,
@@ -1859,7 +1860,12 @@ async fn serve_show_box(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), C
         .handle_channel(c, async |req: minimald_rpc::ShowBoxRequest| {
             let mngr = s.sessions_manager().await;
             Ok(match mngr.show_box(req.id).await {
-                Ok(Some(reply)) => Errorable::Ok(reply),
+                Ok(Some(mut reply)) => {
+                    if let Some(missing) = &mut reply.missing_build_row {
+                        missing.deny_all_opt_out = s.deny_all_opt_out().await;
+                    }
+                    Errorable::Ok(reply)
+                }
                 Ok(None) => Errorable::Err {
                     error: format!(
                         "{} `{}`",
@@ -4387,4 +4393,11 @@ mod admission_refusal_tests {
         let mngr = server.state.sessions_manager().await;
         assert!(mngr.list_boxes(None).await.unwrap().is_empty());
     }
+}
+
+/// The id this daemon process took when it started, which the session list
+/// reports ([`minimald_rpc::ListSessionsResponse::daemon_epoch`]).
+fn daemon_epoch() -> &'static str {
+    static EPOCH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(|| boxes::SessionId::mint().to_string())
 }

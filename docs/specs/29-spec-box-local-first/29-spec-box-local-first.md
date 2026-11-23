@@ -360,7 +360,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
 - **BOX-209** WHEN a package is built for a box THE SYSTEM SHALL derive the Box Spec of a box of the `build` type from the Package Build Spec: its type `build`, its parent the requesting box, no PTY, `lifetime = "until_complete"`, `exec_enabled = false`, `loadout_mode = "sealed"`, no hooks, its packages the build's declared dependencies, and its egress as NET-167, NET-168 or NET-169 gives it.
   tier:     T0
   verify:   cargo nextest run -p boxes build_box_spec_derives_from_the_build_spec
-  <!-- event-driven; architecture line 45 ("a hermetic box derived from a Package Build Spec ... Expanded by `min` rather than written by hand") and line 99 ("mechanically transformable"); the derivation is pure; the build box's record lives in the daemon's memory while it runs, and it leaves `min box list` when the build ends: a build box has no resume, no attach and no exec, and its log is the build's own (BOX-210) -->
+  <!-- event-driven; architecture line 45 ("a hermetic box derived from a Package Build Spec ... Expanded by `min` rather than written by hand") and line 99 ("mechanically transformable"); the derivation is pure; the build box's record lives in the daemon's memory while it runs, and it leaves `min box list` when the build ends: a build box has no resume, no attach and no exec, and its log is the build's own (BOX-210). A box's CPU and memory limits do not cover its package builds, which run in build boxes of their own -->
   - IF a person names a running build box as the target of `min box exec`, an attach, a stop or a resume THEN THE SYSTEM SHALL find no box of that name.
     tier:   T0
     verify: cargo nextest run -p minimal build_box_is_no_target_of_a_box_verb

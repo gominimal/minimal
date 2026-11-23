@@ -293,33 +293,38 @@ const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 /// private, link-local or other non-public address, by literal or by the
 /// addresses its name resolves to, ends that source's walk and adds nothing.
 /// Each probe connects to the addresses checked, never to a later answer for
-/// its name. Every request and every name lookup ends within
-/// [`PROBE_BUDGET`] of the first.
+/// its name. Each declared source is checked within [`PROBE_TIMEOUT`], and
+/// every request and name lookup ends within [`PROBE_BUDGET`] of the first.
 pub async fn source_hosts(sources: &[String]) -> std::collections::BTreeSet<String> {
-    source_hosts_admitting(sources, is_public_address).await
+    source_hosts_admitting(sources, is_public_address, PROBE_BUDGET).await
 }
 
 /// [`source_hosts`], following a source or a redirect only to addresses
-/// `admits` admits.
+/// `admits` admits. Each declared source is checked first, all of them at
+/// once and each under [`PROBE_TIMEOUT`], so a slow source never costs
+/// another its declared host. The redirect walks then share what is left of
+/// `budget`, counted from the start.
 async fn source_hosts_admitting(
     sources: &[String],
     admits: fn(std::net::IpAddr) -> bool,
+    budget: std::time::Duration,
 ) -> std::collections::BTreeSet<String> {
-    let mut hosts = std::collections::BTreeSet::new();
-    let deadline = tokio::time::Instant::now() + PROBE_BUDGET;
-    for source in sources {
-        let Ok(mut at) = reqwest::Url::parse(source) else {
-            continue;
-        };
-        let Ok(Some(pinned)) =
-            tokio::time::timeout_at(deadline, redirect_addresses(&at, admits)).await
-        else {
-            continue;
-        };
-        let Ok(mut probe) = probe_client(pinned.as_ref()) else {
-            continue;
-        };
-        hosts.extend(at.host_str().map(str::to_ascii_lowercase));
+    let deadline = tokio::time::Instant::now() + budget;
+    let checked = futures::future::join_all(sources.iter().map(|source| async move {
+        let at = reqwest::Url::parse(source).ok()?;
+        let pinned = tokio::time::timeout(PROBE_TIMEOUT, redirect_addresses(&at, admits))
+            .await
+            .ok()??;
+        let probe = probe_client(pinned.as_ref()).ok()?;
+        Some((at, probe))
+    }))
+    .await;
+    let mut hosts: std::collections::BTreeSet<String> = checked
+        .iter()
+        .flatten()
+        .filter_map(|(at, _)| at.host_str().map(str::to_ascii_lowercase))
+        .collect();
+    for (mut at, mut probe) in checked.into_iter().flatten() {
         for _ in 0..MAX_REDIRECTS {
             let Ok(Ok(response)) =
                 tokio::time::timeout_at(deadline, probe.get(at.clone()).send()).await
@@ -674,7 +679,7 @@ mod tests {
     #[tokio::test]
     async fn a_redirect_probe_sends_the_user_agent() {
         let (addr, served) = serve_once(b"").await;
-        source_hosts_admitting(&[format!("http://{addr}/one")], |_| true).await;
+        source_hosts_admitting(&[format!("http://{addr}/one")], |_| true, PROBE_BUDGET).await;
         let head = served.await.unwrap().to_ascii_lowercase();
         let agent = format!(
             "\r\nuser-agent: {}\r\n",
@@ -794,13 +799,45 @@ mod connect_tests {
     async fn source_redirect_hosts_join_the_build_box_egress() {
         let (port, taken) = redirecting_server(vec![String::new()]).await;
         let (first, _) = redirecting_server(vec![format!("http://localhost:{port}/two")]).await;
-        let hosts =
-            source_hosts_admitting(&[format!("http://127.0.0.1:{first}/one")], |_| true).await;
+        let hosts = source_hosts_admitting(
+            &[format!("http://127.0.0.1:{first}/one")],
+            |_| true,
+            PROBE_BUDGET,
+        )
+        .await;
         assert_eq!(
             hosts.into_iter().collect::<Vec<_>>(),
             ["127.0.0.1", "localhost"]
         );
         assert_eq!(taken.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// NET-167: each declared source keeps its host whatever the others
+    /// cost: sources that never answer use up the redirect budget, and the
+    /// last source's declared host is still in.
+    #[tokio::test]
+    async fn a_slow_source_never_costs_another_its_declared_host() {
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let silent_port = silent.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = silent.accept().await {
+                held.push(stream);
+            }
+        });
+        let (port, _) = redirecting_server(vec![String::new()]).await;
+        let mut sources: Vec<String> = (0..4)
+            .map(|at| format!("http://127.0.0.1:{silent_port}/{at}"))
+            .collect();
+        sources.push(format!("http://localhost:{port}/last"));
+        let started = std::time::Instant::now();
+        let hosts =
+            source_hosts_admitting(&sources, |_| true, std::time::Duration::from_millis(300)).await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(
+            hosts.into_iter().collect::<Vec<_>>(),
+            ["127.0.0.1", "localhost"]
+        );
     }
 
     /// NET-167: a source is probed only at a public `http` or `https`
@@ -829,9 +866,12 @@ mod connect_tests {
         let (port, taken) = redirecting_server(vec![String::new()]).await;
         let location = format!("http://127.0.0.2:{port}/two");
         let (first, _) = redirecting_server(vec![location.clone()]).await;
-        let hosts =
-            source_hosts_admitting(&[format!("http://127.0.0.1:{first}/one")], only_127_0_0_1)
-                .await;
+        let hosts = source_hosts_admitting(
+            &[format!("http://127.0.0.1:{first}/one")],
+            only_127_0_0_1,
+            PROBE_BUDGET,
+        )
+        .await;
         assert_eq!(hosts.into_iter().collect::<Vec<_>>(), ["127.0.0.1"]);
         assert_eq!(
             taken.load(std::sync::atomic::Ordering::SeqCst),
@@ -846,8 +886,12 @@ mod connect_tests {
         );
 
         let (first, _) = redirecting_server(vec!["file:///etc/passwd".to_string()]).await;
-        let hosts =
-            source_hosts_admitting(&[format!("http://127.0.0.1:{first}/one")], |_| true).await;
+        let hosts = source_hosts_admitting(
+            &[format!("http://127.0.0.1:{first}/one")],
+            |_| true,
+            PROBE_BUDGET,
+        )
+        .await;
         assert_eq!(hosts.into_iter().collect::<Vec<_>>(), ["127.0.0.1"]);
     }
 

@@ -147,6 +147,9 @@ A build box does not reach a declared source on a loopback, private or
 link-local address. In a box started with `--network none`, no build box has a
 network, wherever the package comes from.
 
+A box's CPU and memory limits do not cover its package builds. Each build runs
+in a build box of its own.
+
 `min` reads the pins when it creates the box, and waits 5 seconds for them at
 most. The first fetch of an upstream can take longer, and then the box's builds
 follow the box's own rules. The same reach applies to a

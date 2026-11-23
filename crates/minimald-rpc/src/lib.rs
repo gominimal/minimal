@@ -347,6 +347,10 @@ pub struct ListSessionsResponse {
     /// skew rather than an unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_version: Option<String>,
+    /// The id this daemon process took when it started. A restarted daemon
+    /// reports a new one. `None` from a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_epoch: Option<String>,
     /// Why `<name>.local.min.internal` hostnames will not route, when they
     /// will not. `None` means the daemon brought its host-side proxy up, or
     /// predates this field.
@@ -886,18 +890,31 @@ pub struct BuildGrant {
 /// the box's creation, from the commits the box's spec pinned.
 pub type BuildGrantTable = std::collections::BTreeMap<String, BuildGrant>;
 
-/// What an internet grant never reaches (NET-168): the private ranges of
+/// What a build grant never reaches (NET-167, NET-168): the private ranges of
 /// RFC 1918, where a person's own network sits, the shared address space
 /// the switch's subnet, its box leases and its host alias are carved from,
-/// and link-local space. The resolver stays reachable: a box's own
-/// resolution is admitted ahead of its deny rules. An IPv6 deny list and a
-/// per-source probe timeout are https://github.com/gominimal/minimal/issues/3729.
-pub const BUILD_BOX_INTERNET_DENY: [&str; 5] = [
+/// and link-local space, with their IPv6 counterparts, the IPv4-mapped form
+/// of each IPv4 range and the NAT64 prefixes. The resolver stays reachable:
+/// a box's own resolution is admitted ahead of its deny rules.
+pub const BUILD_BOX_INTERNET_DENY: [&str; 15] = [
     "10.0.0.0/8",
     "172.16.0.0/12",
     "192.168.0.0/16",
     "100.64.0.0/10",
     "169.254.0.0/16",
+    // The same ranges in IPv6: unique local, link-local and loopback.
+    "fc00::/7",
+    "fe80::/10",
+    "::1/128",
+    // The IPv4 ranges above in their IPv4-mapped form.
+    "::ffff:10.0.0.0/104",
+    "::ffff:172.16.0.0/108",
+    "::ffff:192.168.0.0/112",
+    "::ffff:100.64.0.0/106",
+    "::ffff:169.254.0.0/112",
+    // The NAT64 prefixes, which embed an IPv4 address.
+    "64:ff9b::/96",
+    "64:ff9b:1::/48",
 ];
 
 /// The egress of a build box reaching `hosts`, or the public internet
@@ -913,26 +930,50 @@ pub fn build_box_egress(
     hosts: &std::collections::BTreeSet<String>,
     internet: bool,
 ) -> EgressPolicy {
+    let deny = Some(
+        BUILD_BOX_INTERNET_DENY
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+    );
     if internet {
-        EgressPolicy {
+        return EgressPolicy {
             allow_subnets: Some(vec!["0.0.0.0/0".to_string()]),
             allow_dns_hosts: Some(Vec::new()),
             allow_protocols: None,
-            deny_subnets: Some(
-                BUILD_BOX_INTERNET_DENY
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect(),
-            ),
-        }
-    } else {
-        EgressPolicy {
-            allow_subnets: Some(Vec::new()),
-            allow_dns_hosts: Some(hosts.iter().cloned().collect()),
-            allow_protocols: None,
-            deny_subnets: None,
-        }
+            deny_subnets: deny,
+        };
     }
+    // A host that is a literal address is that one address, under the same
+    // deny list, and never a name to resolve.
+    let (addresses, names): (Vec<&String>, Vec<&String>) = hosts
+        .iter()
+        .partition(|host| literal_address(host).is_some());
+    EgressPolicy {
+        allow_subnets: Some(
+            addresses
+                .into_iter()
+                .filter_map(|host| literal_address(host))
+                .map(|address| match address {
+                    std::net::IpAddr::V4(v4) => format!("{v4}/32"),
+                    std::net::IpAddr::V6(v6) => format!("{v6}/128"),
+                })
+                .collect(),
+        ),
+        allow_dns_hosts: Some(names.into_iter().cloned().collect()),
+        allow_protocols: None,
+        deny_subnets: deny,
+    }
+}
+
+/// The address `host` names when it is a literal address, as a URL's host
+/// writes it: an IPv6 address in brackets.
+fn literal_address(host: &str) -> Option<std::net::IpAddr> {
+    host.strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse()
+        .ok()
 }
 
 /// How long the in-VM daemon waits for its ask for a build grant
@@ -3407,6 +3448,25 @@ pub struct ShowBoxResponse {
     /// means zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_bytes: Option<u64>,
+    /// What a host-address box with no addresses for its builds registers
+    /// them with (NET-169). Absent for any other box, and from a daemon that
+    /// predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missing_build_row: Option<MissingBuildRow>,
+}
+
+/// The settings a host-address box's build row is registered with, for a
+/// box that has none ([`ShowBoxResponse::missing_build_row`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MissingBuildRow {
+    /// The box's network mode.
+    pub network: boxes::NetworkMode,
+    /// The box's declared egress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<boxes::EgressPolicy>,
+    /// Whether the daemon runs with the deny-all opt-out (NET-077).
+    #[serde(default)]
+    pub deny_all_opt_out: bool,
 }
 
 impl OneshotSshRpc for ShowBox {
@@ -4740,6 +4800,7 @@ mod box_listing_tests {
                 mode: crate::exec::ExecMode::Detached,
             }],
             disk_bytes: Some(4096),
+            missing_build_row: None,
         };
         let bytes = serde_json_lenient::to_vec(&Errorable::Ok(show.clone())).unwrap();
         match serde_json_lenient::from_slice::<Errorable<ShowBoxResponse>>(&bytes).unwrap() {

@@ -38,7 +38,7 @@ pub(crate) use address::*;
 pub use address::{AddressCandidate, BoxAddressRefusal};
 pub(crate) use attach::*;
 pub use attach::{BoxAttachRefusal, RowNotBack};
-pub(crate) use build_boxes::{BuildBoxActivation, prepare_build_boxes};
+pub(crate) use build_boxes::{BuildBoxActivation, prepare_build_boxes, register_missing_build_row};
 pub use create::*;
 pub use events::BoxFileRefusal;
 pub(crate) use events::*;

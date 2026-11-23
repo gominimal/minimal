@@ -1097,10 +1097,28 @@ fn spawn_host_ip_reconcile(
     let grants = boxes.clone();
     let (grants_order, grants_answerer, grants_audit) =
         (Arc::clone(&order), answerer.clone(), audit_path.clone());
+    let (epoch_boxes, epoch_order, epoch_answerer, epoch_audit) = (
+        boxes.clone(),
+        Arc::clone(&order),
+        answerer.clone(),
+        audit_path.clone(),
+    );
     spawn_host_ip_reconcile_with(
         boxes,
         HOST_IP_RECONCILE_INTERVAL,
-        move || read_guest_box_states(&guest_rpc_sock),
+        move || {
+            let listing = read_guest_listing(&guest_rpc_sock)?;
+            // A grant from before the guest daemon's restart ends now.
+            let ended = epoch_boxes
+                .build_grants()
+                .note_guest_epoch(listing.daemon_epoch.as_deref());
+            for withdrawal in ended {
+                epoch_order.apply(|| {
+                    withdraw_grant_row(&epoch_boxes, &epoch_answerer, &epoch_audit, withdrawal)
+                });
+            }
+            Ok(guest_box_states(&listing))
+        },
         move |name| {
             order.apply(|| withdraw_requester_row(&rows, &answerer, &audit_path, name));
             if let Some(session_id) = minimald_rpc::requester_build_row_session(name) {
@@ -1232,17 +1250,14 @@ where
 }
 
 /// The in-VM daemon's sessions, as each one's state.
-fn read_guest_box_states(
-    guest_rpc_sock: &Path,
-) -> anyhow::Result<std::collections::BTreeMap<boxes::SessionId, boxes::BoxState>> {
-    let listing = crate::rpc_client::call_oneshot_blocking::<minimald_rpc::ListSessions>(
+fn read_guest_listing(guest_rpc_sock: &Path) -> anyhow::Result<minimald_rpc::ListSessionsResponse> {
+    crate::rpc_client::call_oneshot_blocking::<minimald_rpc::ListSessions>(
         guest_rpc_sock,
         (),
         GUEST_LIST_CONNECT_TIMEOUT,
         GUEST_LIST_RPC_TIMEOUT,
         None,
-    )?;
-    Ok(guest_box_states(&listing))
+    )
 }
 
 /// The state of each session in a listing.

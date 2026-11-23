@@ -1161,6 +1161,8 @@ async fn attach_command(
         here.as_ref(),
         stdin_is_tty,
         async |target: &BoxAttachTarget| {
+            // NET-169: a box with no row for its builds gets one here.
+            register_missing_build_row(global, &target.host, target.box_id).await;
             let host_asks = host_asks_box(global, target.name.as_deref());
             ssh_exit_code(
                 box_via_ssh(

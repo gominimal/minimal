@@ -615,7 +615,14 @@ fn build_box_reach(build: &minimald_rpc::RunningBuildBox) -> String {
         .allow_subnets
         .as_ref()
         .is_some_and(|subnets| subnets.iter().any(|subnet| subnet == "0.0.0.0/0"));
-    let hosts = egress.allow_dns_hosts.clone().unwrap_or_default();
+    // A literal address the grant holds is one of its hosts too.
+    let mut hosts = egress.allow_dns_hosts.clone().unwrap_or_default();
+    hosts.extend(egress.allow_subnets.iter().flatten().filter_map(|subnet| {
+        subnet
+            .strip_suffix("/32")
+            .or_else(|| subnet.strip_suffix("/128"))
+            .map(ToString::to_string)
+    }));
     if internet {
         "the public internet".to_string()
     } else if hosts.is_empty() {

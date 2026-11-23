@@ -7,8 +7,9 @@
 //! box's own under a host-side deadline. A guest signal can end a grant
 //! early, and nothing extends one.
 //!
-//! Persisting the tables per box, and keeping grant deadlines across
-//! `minvmd` versions, is https://github.com/gominimal/minimal/issues/3730.
+//! Each filing rewrites the persisted tables whole. A grant's deadline lives
+//! in this process only: a restart of `minvmd` retires every grant row, so no
+//! grant outlives the process that opened it.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
@@ -73,6 +74,9 @@ struct OpenGrant {
     withdrawal: WithdrawBoxRequest,
     /// The change it opened at ([`State::changes`]).
     opened_at: u64,
+    /// The guest daemon's epoch it opened under, when one was known
+    /// ([`BuildGrants::note_guest_epoch`]).
+    epoch: Option<String>,
 }
 
 /// The changes to the tables and the grants so far, at one moment. Take it
@@ -102,6 +106,8 @@ struct State {
     reserved: BTreeMap<String, boxes::SessionId>,
     /// Counts grants, so each row has a name of its own.
     opened: u64,
+    /// The epoch the guest daemon's last good list reported.
+    guest_epoch: Option<String>,
     /// The boxes whose table [`BuildGrants::drop_table`] ended in this
     /// process, the most recent [`MAX_ENDED_BOXES`] of them. A box id is
     /// never used again, so a part of a table filed after its box's end is
@@ -125,6 +131,7 @@ impl Default for State {
             open: BTreeMap::new(),
             reserved: BTreeMap::new(),
             opened: 0,
+            guest_epoch: None,
             ended: BTreeSet::new(),
             ended_order: VecDeque::new(),
         }
@@ -436,6 +443,7 @@ impl BuildGrants {
         };
         state.changes += 1;
         let opened_at = state.changes;
+        let epoch = state.guest_epoch.clone();
         state.open.insert(
             withdrawal.name.clone(),
             OpenGrant {
@@ -443,9 +451,51 @@ impl BuildGrants {
                 deadline,
                 withdrawal,
                 opened_at,
+                epoch,
             },
         );
         true
+    }
+
+    /// Records the epoch `epoch` that the guest daemon's list reported, and
+    /// ends every grant opened under an earlier epoch, handing back their
+    /// withdrawals. The first epoch reported is taken as the one the open
+    /// grants run under. A reservation still registering ends with an epoch
+    /// change. A list with no epoch changes nothing.
+    pub(crate) fn note_guest_epoch(&self, epoch: Option<&str>) -> Vec<WithdrawBoxRequest> {
+        let Some(epoch) = epoch else {
+            return Vec::new();
+        };
+        let mut state = self.lock();
+        match state.guest_epoch.as_deref() {
+            Some(known) if known == epoch => Vec::new(),
+            None => {
+                state.guest_epoch = Some(epoch.to_string());
+                for grant in state.open.values_mut() {
+                    grant.epoch.get_or_insert_with(|| epoch.to_string());
+                }
+                Vec::new()
+            }
+            Some(_) => {
+                tracing::info!(
+                    epoch,
+                    "the guest daemon restarted; ending its earlier grants"
+                );
+                state.guest_epoch = Some(epoch.to_string());
+                state.reserved.clear();
+                let ended: Vec<String> = state
+                    .open
+                    .iter()
+                    .filter(|(_, grant)| grant.epoch.as_deref() != Some(epoch))
+                    .map(|(row, _)| row.clone())
+                    .collect();
+                ended
+                    .iter()
+                    .filter_map(|row| state.open.remove(row))
+                    .map(|grant| grant.withdrawal)
+                    .collect()
+            }
+        }
     }
 
     /// Ends the grant at the row `grant_row`, handing back its withdrawal. A
@@ -825,6 +875,34 @@ mod tests {
         );
         assert!(grants.lookup(starting, "aa").is_some());
         assert!(grants.holds_any());
+    }
+
+    /// NET-165: a new guest daemon epoch ends the grants opened under the
+    /// earlier one, and a grant opened under the new one stays. The first
+    /// epoch reported keeps the grants already open.
+    #[test]
+    fn a_new_guest_epoch_ends_the_earlier_grants() {
+        let grants = BuildGrants::default();
+        let id = boxes::SessionId::mint();
+        grants.file(id, table("aa", true));
+        let far = Instant::now() + BUILD_GRANT_DEADLINE;
+        let before = grants.next_row(id).expect("room under the cap");
+        assert!(grants.opened(withdrawal(&before), far));
+        assert!(grants.note_guest_epoch(Some("one")).is_empty());
+        assert!(grants.note_guest_epoch(None).is_empty());
+        assert!(grants.note_guest_epoch(Some("one")).is_empty());
+        let registering = grants.next_row(id).expect("room under the cap");
+
+        assert_eq!(grants.note_guest_epoch(Some("two")), [withdrawal(&before)]);
+        assert!(grants.take(&before).is_none());
+        assert!(
+            !grants.opened(withdrawal(&registering), far),
+            "a registration from the earlier epoch stands no more"
+        );
+        let after = grants.next_row(id).expect("room under the cap");
+        assert!(grants.opened(withdrawal(&after), far));
+        assert!(grants.note_guest_epoch(Some("two")).is_empty());
+        assert_eq!(grants.take(&after), Some(withdrawal(&after)));
     }
 
     /// NET-165: a box `min` filed with the network mode `none` holds no table

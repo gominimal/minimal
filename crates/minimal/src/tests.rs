@@ -7416,6 +7416,7 @@ fn listing_of(
             })
             .collect(),
         daemon_version: None,
+        daemon_epoch: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
         zone_answerer_port: None,

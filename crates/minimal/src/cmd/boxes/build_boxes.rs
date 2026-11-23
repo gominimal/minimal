@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use minimald_rpc::{
-    BoxControlReply, BoxControlRequest, BuildGrant, BuildGrantTable, FileBuildTableRequest,
-    PrepareBuildBoxes, PrepareBuildBoxesRequest,
+    BoxControlReply, BoxControlRequest, BuildGrant, BuildGrantTable, Errorable,
+    FileBuildTableRequest, PrepareBuildBoxes, PrepareBuildBoxesRequest, PrepareBuildBoxesResponse,
 };
 
 use crate::GlobalArgs;
@@ -29,8 +29,8 @@ const EVALUATION_STACK: usize = 128 * 1024 * 1024;
 
 /// How long a start waits for the project's evaluation. An evaluation that
 /// has to fetch an upstream can take longer, and the start does not wait for
-/// it: the box gets no table, and its builds follow its own rules. Filing the
-/// table after a timed-out evaluation is https://github.com/gominimal/minimal/issues/3728.
+/// it: the box gets no table, and its builds follow its own rules. Nothing
+/// files that table later.
 const EVALUATION_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// What this activation knows about the box it prepares.
@@ -52,6 +52,20 @@ pub(crate) async fn prepare_build_boxes(
     client: &mut minimal_client::Client,
     activation: BuildBoxActivation<'_>,
 ) {
+    prepare_build_boxes_with(activation, async |request| {
+        client.oneshot_rpc::<PrepareBuildBoxes>(request).await
+    })
+    .await;
+}
+
+/// [`prepare_build_boxes`], with `send` to put the `PrepareBuildBoxes`
+/// request to the daemon.
+async fn prepare_build_boxes_with(
+    activation: BuildBoxActivation<'_>,
+    send: impl AsyncFnOnce(
+        PrepareBuildBoxesRequest,
+    ) -> anyhow::Result<Errorable<PrepareBuildBoxesResponse>>,
+) {
     let started = std::time::Instant::now();
     let table = box_table(
         activation.network,
@@ -71,20 +85,109 @@ pub(crate) async fn prepare_build_boxes(
         table,
     )
     .await;
-    let prepared = client
-        .oneshot_rpc::<PrepareBuildBoxes>(PrepareBuildBoxesRequest {
-            session_id: activation.session_id,
-            task_addresses: activation.task_addresses,
-            table,
-        })
-        .await;
+    let prepared = send(PrepareBuildBoxesRequest {
+        session_id: activation.session_id,
+        task_addresses: activation.task_addresses,
+        table,
+    })
+    .await;
     match prepared {
-        Ok(minimald_rpc::Errorable::Ok(_)) => {}
-        Ok(minimald_rpc::Errorable::Err { error }) => {
+        Ok(Errorable::Ok(_)) => {}
+        Ok(Errorable::Err { error }) => {
             tracing::info!(%error, "the daemon did not take the box's build table");
         }
         Err(error) => tracing::info!(error = %format!("{error:#}"), "could not reach the daemon"),
     }
+}
+
+/// Registers the row of the builds of the box `box_id` on `host`, and files
+/// its table again, when the daemon reports the box has none (NET-169): a
+/// host-address box an earlier `min` created, or one whose registration
+/// failed at its start. A box with a row, or one on a host with no VM, asks
+/// nothing. Nothing here stops the command that called it.
+pub(crate) async fn register_missing_build_row(
+    global: &GlobalArgs,
+    host: &crate::cmd::list::LocalHost,
+    box_id: boxes::SessionId,
+) {
+    if host.provider != crate::cmd::list::LOCAL_MINVMD_PROVIDER {
+        return;
+    }
+    let mut client = match super::address::box_host_client(host).await {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::info!(error = %format!("{error:#}"), "could not reach the daemon");
+            return;
+        }
+    };
+    let shown = match client
+        .oneshot_rpc::<minimald_rpc::ShowBox>(minimald_rpc::ShowBoxRequest { id: box_id })
+        .await
+    {
+        Ok(Errorable::Ok(shown)) => shown,
+        Ok(Errorable::Err { error }) => {
+            tracing::info!(%error, "could not read the box");
+            return;
+        }
+        Err(error) => {
+            tracing::info!(error = %format!("{error:#}"), "could not reach the daemon");
+            return;
+        }
+    };
+    register_missing_build_row_with(
+        global,
+        super::vm_host::control_sock_beside(&host.sock),
+        box_id,
+        &shown,
+        async |request| client.oneshot_rpc::<PrepareBuildBoxes>(request).await,
+    )
+    .await;
+}
+
+/// [`register_missing_build_row`] for the box `shown`, with `control_sock`
+/// the VM host daemon's and `send` to put the `PrepareBuildBoxes` request to
+/// the daemon. Returns whether the row was registered.
+async fn register_missing_build_row_with(
+    global: &GlobalArgs,
+    control_sock: Option<PathBuf>,
+    box_id: boxes::SessionId,
+    shown: &minimald_rpc::ShowBoxResponse,
+    send: impl AsyncFnOnce(
+        PrepareBuildBoxesRequest,
+    ) -> anyhow::Result<Errorable<PrepareBuildBoxesResponse>>,
+) -> bool {
+    let (Some(missing), Some(project_root), Some(_)) = (
+        &shown.missing_build_row,
+        &shown.record.project_root,
+        &control_sock,
+    ) else {
+        return false;
+    };
+    let task_addresses = crate::hold_requester_build_row(
+        control_sock.as_deref(),
+        box_id,
+        missing.network,
+        missing.egress.as_ref(),
+        missing.deny_all_opt_out,
+    )
+    .await;
+    if task_addresses.is_empty() {
+        return false;
+    }
+    tracing::info!(box_id = %box_id, "registered the row of the box's builds again");
+    prepare_build_boxes_with(
+        BuildBoxActivation {
+            global,
+            session_id: box_id,
+            project_dir: project_root.as_utf8_path().as_std_path().to_path_buf(),
+            control_sock,
+            task_addresses,
+            network: missing.network,
+        },
+        send,
+    )
+    .await;
+    true
 }
 
 /// Hands `table` to the host side: on a VM-backed host, the VM host daemon
@@ -548,5 +651,210 @@ mod tests {
     #[test]
     fn an_empty_table_files_nothing() {
         assert!(filings(BuildGrantTable::new()).is_empty());
+    }
+
+    /// A project whose packages come from the `mctx` test packages, a
+    /// directory upstream, so its evaluation reaches no network.
+    fn fixture_project() -> tempfile::TempDir {
+        let packages = Path::new(env!("CARGO_MANIFEST_DIR")).join("../mctx/testdata/fakepkgs");
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("minimal.toml"),
+            format!("[upstream]\ndir = {:?}\n", packages.display().to_string()),
+        )
+        .unwrap();
+        project
+    }
+
+    fn activation<'a>(
+        global: &'a GlobalArgs,
+        project: &Path,
+        control_sock: Option<PathBuf>,
+        network: boxes::NetworkMode,
+    ) -> BuildBoxActivation<'a> {
+        BuildBoxActivation {
+            global,
+            session_id: boxes::SessionId::mint(),
+            project_dir: project.to_path_buf(),
+            control_sock,
+            task_addresses: vec![std::net::Ipv4Addr::new(192, 168, 127, 40)],
+            network,
+        }
+    }
+
+    fn global_in(state: &Path) -> GlobalArgs {
+        GlobalArgs {
+            minimal_dir: Some(state.to_path_buf()),
+            ..GlobalArgs::default()
+        }
+    }
+
+    /// NET-165: `min` evaluates the project in its own directory. A project
+    /// with no pinned upstream package holds no grant. A project file that
+    /// does not parse is an error, so the box gets no table.
+    #[tokio::test]
+    async fn the_table_is_the_projects_own_evaluation() {
+        let state = tempfile::tempdir().unwrap();
+        let global = global_in(state.path());
+        let project = fixture_project();
+        let table = table_of_project(&activation(
+            &global,
+            project.path(),
+            None,
+            boxes::NetworkMode::HostNet,
+        ))
+        .await
+        .expect("the project evaluates");
+        assert!(table.is_empty(), "{table:?}");
+
+        std::fs::write(project.path().join("minimal.toml"), "[upstream\n").unwrap();
+        assert!(
+            table_of_project(&activation(
+                &global,
+                project.path(),
+                None,
+                boxes::NetworkMode::HostNet,
+            ))
+            .await
+            .is_err()
+        );
+    }
+
+    /// NET-165: the daemon gets the box's task addresses and, on a host with
+    /// no VM, its table. On a VM-backed host the table went to the VM host
+    /// daemon, and the daemon gets none.
+    #[tokio::test]
+    async fn the_daemon_gets_the_addresses_and_the_native_table() {
+        let state = tempfile::tempdir().unwrap();
+        let global = global_in(state.path());
+        let project = fixture_project();
+        let sent = std::sync::Mutex::new(Vec::new());
+        let stand_in = || {
+            async |request: PrepareBuildBoxesRequest| {
+                sent.lock().unwrap().push(request);
+                Ok(Errorable::Ok(PrepareBuildBoxesResponse {}))
+            }
+        };
+
+        let native = activation(&global, project.path(), None, boxes::NetworkMode::HostNet);
+        let id = native.session_id;
+        prepare_build_boxes_with(native, stand_in()).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        fake_vm_host(&sock, BoxControlReply::BuildTable { build_table: true }).await;
+        let on_vm = activation(
+            &global,
+            project.path(),
+            Some(sock),
+            boxes::NetworkMode::HostNet,
+        );
+        prepare_build_boxes_with(on_vm, stand_in()).await;
+
+        let sent = sent.lock().unwrap();
+        let [native, on_vm] = sent.as_slice() else {
+            panic!("two requests: {sent:?}");
+        };
+        assert_eq!(native.session_id, id);
+        assert_eq!(
+            native.task_addresses,
+            [std::net::Ipv4Addr::new(192, 168, 127, 40)]
+        );
+        assert_eq!(native.table, Some(BuildGrantTable::new()));
+        assert_eq!(on_vm.table, None, "the VM host daemon has the table");
+    }
+
+    /// A read of the box `id` in the project `project`, with `missing` as
+    /// the daemon reports it.
+    fn shown(
+        id: boxes::SessionId,
+        project: &Path,
+        missing: Option<minimald_rpc::MissingBuildRow>,
+    ) -> minimald_rpc::ShowBoxResponse {
+        let mut shown: minimald_rpc::ShowBoxResponse = serde_json_lenient::from_str(&format!(
+            r#"{{"record":{{"box_id":"{id}","state":"running","project_root":{:?}}}}}"#,
+            project.display().to_string()
+        ))
+        .unwrap();
+        shown.missing_build_row = missing;
+        shown
+    }
+
+    /// NET-169: a host-address box that the daemon reports with no row for
+    /// its builds registers one at its next start, and the daemon gets the
+    /// row's addresses with the table filed again. A box with a row, or on a
+    /// host with no VM, registers nothing.
+    #[tokio::test]
+    async fn a_box_with_no_build_row_registers_one_at_its_start() {
+        let state = tempfile::tempdir().unwrap();
+        let global = global_in(state.path());
+        let project = fixture_project();
+        let id = boxes::SessionId::mint();
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        let addresses = vec![std::net::Ipv4Addr::new(192, 168, 127, 40)];
+        let seen = fake_vm_host(
+            &sock,
+            BoxControlReply::Registered(minimald_rpc::RegisteredBox {
+                switch_address: std::net::Ipv4Addr::new(192, 168, 127, 39),
+                loopback_address: std::net::Ipv4Addr::new(127, 0, 0, 39),
+                box_id: boxes::BoxId::mint(),
+                task_addresses: addresses.clone(),
+            }),
+        )
+        .await;
+        let missing = minimald_rpc::MissingBuildRow {
+            network: boxes::NetworkMode::HostNet,
+            egress: Some(boxes::EgressPolicy {
+                allow_subnets: Some(Vec::new()),
+                allow_dns_hosts: Some(vec!["downloads.example.org".to_string()]),
+                allow_protocols: None,
+                deny_subnets: None,
+            }),
+            deny_all_opt_out: false,
+        };
+        let sent = std::sync::Mutex::new(Vec::new());
+        let stand_in = || {
+            async |request: PrepareBuildBoxesRequest| {
+                sent.lock().unwrap().push(request);
+                Ok(Errorable::Ok(PrepareBuildBoxesResponse {}))
+            }
+        };
+
+        let with_row = shown(id, project.path(), None);
+        let missing_row = shown(id, project.path(), Some(missing));
+        assert!(
+            !register_missing_build_row_with(
+                &global,
+                Some(sock.clone()),
+                id,
+                &with_row,
+                stand_in()
+            )
+            .await
+        );
+        assert!(
+            !register_missing_build_row_with(&global, None, id, &missing_row, stand_in()).await
+        );
+        assert!(sent.lock().unwrap().is_empty());
+        assert!(seen.lock().unwrap().is_empty());
+
+        assert!(
+            register_missing_build_row_with(&global, Some(sock), id, &missing_row, stand_in())
+                .await
+        );
+        {
+            let seen = seen.lock().unwrap();
+            let [BoxControlRequest::Register(row)] = seen.as_slice() else {
+                panic!("one registration: {seen:?}");
+            };
+            assert_eq!(row.name, minimald_rpc::requester_build_row_name(id));
+        }
+        let sent = sent.lock().unwrap();
+        let [request] = sent.as_slice() else {
+            panic!("one request: {sent:?}");
+        };
+        assert_eq!(request.session_id, id);
+        assert_eq!(request.task_addresses, addresses);
     }
 }
