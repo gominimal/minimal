@@ -499,6 +499,7 @@ pub async fn rename(host: &mut Host, id: SessionId, new_name: &str) -> Result<()
 /// composition, staged hook scripts, and hook budget
 /// arrive as [`crate::loadouts::ActivationInputs`], resolved against the same
 /// project path, so an external loadout hook works from the dashboard.
+#[allow(clippy::too_many_arguments)]
 pub async fn activate(
     sock: &Path,
     name: Option<String>,
@@ -506,9 +507,9 @@ pub async fn activate(
     upload_root: camino::Utf8PathBuf,
     network: NetworkMode,
     decision: crate::UploadDecision,
-    inputs: crate::loadouts::ActivationInputs,
+    mut inputs: crate::loadouts::ActivationInputs,
+    picked: PickedEntry,
 ) -> Result<Activated, anyhow::Error> {
-    let mut client = Client::connect(sock).await?;
     // The dashboard's own copy of the create/upload/configure/finalize
     // sequence, so it needs the same gate `min session activate` gets: on a
     // skewed pair `FinalizeSession` fails after the record exists, and the
@@ -533,14 +534,22 @@ pub async fn activate(
     // The caller resolved the upload root and its decision, before the create
     // and off the async worker, so the TUI could confirm. The root is both the
     // box's project root on the create and the upload root after it.
-    // The directory that holds the project's `minimal.toml`, as `min session
-    // activate` sends it. The daemon records it as the box's project root
-    // (BOX-001), and falls back to the form's path only for older clients.
-    set_project_root(&mut request, &upload_root)?;
     // A daemon of another build refuses this before it allocates anything;
     // `None` under the skew override, which is how an operator still gets
     // through.
     request.must_match_version = minimal_client::version_assertion();
+    // The picked entry's expansion, the project root and the box's spec,
+    // through the helper `min box start` uses, so both store one spec for
+    // one entry. A refusal here comes before the daemon sees anything.
+    let (request, contribution) = put_picked_entry_off_worker(
+        request,
+        std::mem::take(&mut inputs.contribution),
+        upload_root.clone(),
+        picked,
+    )
+    .await?;
+    inputs.contribution = contribution;
+    let mut client = Client::connect(sock).await?;
     let undeclared_own_ip =
         request.config.network == NetworkMode::OwnIp && request.config.policy.egress.is_none();
     let (created, mut row) = create_registering(
@@ -874,14 +883,81 @@ pub(super) async fn resolve_project_off_worker(
     .context("resolving the upload root")?
 }
 
-/// Puts `root` on the create request as the box's project root (BOX-001).
-fn set_project_root(
+/// The session entry a dashboard create starts its box from, and what its
+/// expansion reads beside the project.
+#[derive(Debug, Clone, Default)]
+pub struct PickedEntry {
+    /// The entry the create form picked. `None` applies the session entry
+    /// pick that `min session start` makes with no entry.
+    pub name: Option<String>,
+    /// The gated loadouts of the selected-loadouts layer (BOX-064).
+    pub(crate) selected: crate::SelectedLoadouts,
+    /// Reads the client's store rules for the spec's `[secrets]` (BOX-071).
+    pub(crate) global: Option<crate::GlobalArgs>,
+}
+
+impl PickedEntry {
+    /// The entry `name`, with no selected loadouts and no store rules.
+    #[must_use]
+    pub fn new(name: Option<String>) -> Self {
+        Self {
+            name,
+            ..Self::default()
+        }
+    }
+}
+
+/// Puts the picked entry on the create request and its contribution: the
+/// entry's expansion, the project root `upload_root` (BOX-001), and the
+/// box's spec with its hooks (BOX-068). The request's `name` is the spec's
+/// `[box] name`, as `min box start --name` gives it.
+///
+/// # Errors
+///
+/// Fails on a `minimal.toml` that does not load or expand, and when the
+/// picked entry is not a session entry of the project. With no picked
+/// entry, fails when no single session entry can be picked.
+fn put_picked_entry(
     request: &mut CreateSessionRequest,
-    root: &camino::Utf8Path,
+    contribution: &mut boxes::wire::request::WireContribution,
+    upload_root: &camino::Utf8Path,
+    picked: &PickedEntry,
 ) -> Result<(), anyhow::Error> {
-    request.config.project_root =
-        Some(paths::HostAbsPath::try_new(root.to_path_buf()).context("Invalid project root")?);
-    Ok(())
+    let dir = request.config.project_path.as_utf8_path().to_path_buf();
+    let box_name = request.config.name.clone();
+    // The pick `min session start` makes: a typed entry the project does
+    // not declare as a session is refused, and no entry picks one.
+    let entries = crate::project_entries(&dir)?;
+    let entry = crate::pick_session_start_entry(&entries, picked.name.as_deref())?.name;
+    crate::put_session_entry(
+        request,
+        contribution,
+        &crate::SessionEntryCreate {
+            dir: &dir,
+            project_root: upload_root,
+            entry: Some(&entry),
+            box_name: box_name.as_deref(),
+            selected: &picked.selected,
+            global: picked.global.as_ref(),
+        },
+    )
+}
+
+/// [`put_picked_entry`], off the async worker: it reads the project's
+/// `minimal.toml` and the client configuration, and a stalled mount must
+/// not stall the dashboard.
+async fn put_picked_entry_off_worker(
+    mut request: CreateSessionRequest,
+    mut contribution: boxes::wire::request::WireContribution,
+    upload_root: camino::Utf8PathBuf,
+    picked: PickedEntry,
+) -> Result<(CreateSessionRequest, boxes::wire::request::WireContribution), anyhow::Error> {
+    tokio::task::spawn_blocking(move || {
+        put_picked_entry(&mut request, &mut contribution, &upload_root, &picked)?;
+        Ok::<_, anyhow::Error>((request, contribution))
+    })
+    .await
+    .context("reading the session entry")?
 }
 
 #[cfg(test)]
@@ -1564,16 +1640,127 @@ mod tests {
             BoxPolicy::default(),
         );
 
+        request.config.name = None;
+
         let (upload_root, _) = resolve_project_off_worker(project_path.as_utf8_path())
             .await
             .unwrap();
-        set_project_root(&mut request, &upload_root).unwrap();
+        let mut contribution = boxes::wire::request::WireContribution::default();
+        put_picked_entry(
+            &mut request,
+            &mut contribution,
+            &upload_root,
+            &PickedEntry::default(),
+        )
+        .unwrap();
 
         assert_eq!(
             request.config.project_root,
             Some(paths::HostAbsPath::try_new(root).unwrap())
         );
         assert_eq!(request.config.project_path.as_str(), sub.as_str());
+    }
+
+    /// A box created from `min dash` with the entry `dev` stores the spec,
+    /// and the projection digest, that `min box start dev` stores for the
+    /// same project, and the contribution carries the same expansion.
+    #[test]
+    fn dashboard_create_with_a_named_entry_stores_the_box_start_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(mfile::MFILE_NAME),
+            "[session]\npackages = [\"git\"]\n\n\
+             [sessions.dev]\npackages = [\"rust\"]\n",
+        )
+        .unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let project_path = paths::HostAbsPath::try_new(root.clone()).unwrap();
+        let fresh = |name: Option<&str>| {
+            let mut request = CreateSessionRequest::new(
+                String::new(),
+                project_path.clone(),
+                NetworkMode::HostNet,
+                BoxPolicy::default(),
+            );
+            request.config.name = name.map(str::to_owned);
+            request
+        };
+
+        // `min box start dev`: the plan the CLI makes, then the shared
+        // helper with the plan's options, as `activate_box` calls it.
+        let entries = crate::project_entries(&root).unwrap();
+        let start = crate::StartEntry {
+            verb: crate::StartVerb::Box,
+            entry: Some("dev".to_owned()),
+            name: None,
+            new: false,
+            detach: true,
+            overrides: crate::StartOverrideArgs::default(),
+        };
+        let crate::StartPlan::Session { options, .. } =
+            crate::plan_start(&start, &entries, false).unwrap()
+        else {
+            panic!("dev is a session entry");
+        };
+        let mut started = fresh(None);
+        let mut started_contribution = boxes::wire::request::WireContribution::default();
+        crate::put_session_entry(
+            &mut started,
+            &mut started_contribution,
+            &crate::SessionEntryCreate {
+                dir: &root,
+                project_root: &root,
+                entry: options.entry.as_deref(),
+                box_name: options.box_name.as_deref(),
+                selected: &crate::SelectedLoadouts::default(),
+                global: None,
+            },
+        )
+        .unwrap();
+
+        // The dashboard's create, with `dev` picked in the form.
+        let mut created = fresh(None);
+        let mut created_contribution = boxes::wire::request::WireContribution::default();
+        put_picked_entry(
+            &mut created,
+            &mut created_contribution,
+            &root,
+            &PickedEntry::new(Some("dev".to_owned())),
+        )
+        .unwrap();
+
+        let spec = created.spec.clone().expect("the dashboard sends a spec");
+        assert_eq!(spec["entry"], "dev", "{spec}");
+        assert_eq!(
+            spec["install"]["packages"],
+            serde_json_lenient::json!(["git", "rust"])
+        );
+        assert_eq!(created.spec, started.spec);
+        assert!(created.config.client_projection_digest().is_some());
+        assert_eq!(
+            created.config.client_projection_digest(),
+            started.config.client_projection_digest()
+        );
+        assert_eq!(created.config.project_root, started.config.project_root);
+        assert_eq!(created_contribution, started_contribution);
+        assert_eq!(
+            created_contribution
+                .entry
+                .as_ref()
+                .map(|entry| entry.name.as_str()),
+            Some("dev")
+        );
+
+        // An entry the project does not declare is refused before a create.
+        let mut unknown = fresh(None);
+        let error = put_picked_entry(
+            &mut unknown,
+            &mut boxes::wire::request::WireContribution::default(),
+            &root,
+            &PickedEntry::new(Some("nope".to_owned())),
+        )
+        .expect_err("an undeclared entry is refused");
+        assert!(format!("{error:#}").contains("nope"), "{error:#}");
     }
 
     /// NET-057's TUI half: the probe list covers every VM — the default one

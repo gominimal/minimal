@@ -874,6 +874,7 @@ async fn dashboard_activate_uploads_loadout_patches() {
         boxes::NetworkMode::NoNet,
         minimal::UploadDecision::Upload,
         inputs,
+        minimal::dash::rpc::PickedEntry::default(),
     )
     .await
     .expect("a patch-carrying dashboard create finalizes");
