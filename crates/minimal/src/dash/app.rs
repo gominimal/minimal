@@ -1067,6 +1067,15 @@ fn update_modal(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
                     // project with no session entry to offer is refused
                     // here, before anything reaches the daemon. The form
                     // closes, so the status line shows why.
+                    // An empty path has no minimal.toml to read. Refuse it
+                    // here, before a read or a create is asked.
+                    if form.path.trim().is_empty() {
+                        model.status = Some(
+                            "error: no session created: the project path is empty".to_string(),
+                        );
+                        model.action = None;
+                        return Vec::new();
+                    }
                     if !form.entries_current() {
                         let read = form.read_request();
                         model.action = Some(Action::Create(form));
@@ -2492,28 +2501,23 @@ mod tests {
             "{status}"
         );
 
-        // An empty path is not read as read: the first submit asks for the
-        // read, and the next one refuses with the empty path as the reason.
+        // A cleared path is refused on the first submit, with no read and
+        // no create asked, and the status line says why.
         let mut model = two_hosts();
         model.action = Some(Action::Create(CreateForm {
             field: CreateField::Network,
-            ..CreateForm::new(String::new())
+            path: String::new(),
+            ..read_form(&path)
         }));
         let effects = update(&mut model, key(KeyCode::Enter));
-        assert!(!effects.iter().any(|e| matches!(e, Effect::Create { .. })));
-        assert!(matches!(model.action, Some(Action::Create(_))));
-        run_reads(&mut model, effects);
-        let effects = update(&mut model, key(KeyCode::Enter));
-        assert!(!effects.iter().any(|e| matches!(e, Effect::Create { .. })));
+        assert!(effects.is_empty(), "{effects:?}");
+        assert!(model.action.is_none());
         assert_eq!(
             model.status.as_deref(),
             Some("error: no session created: the project path is empty")
         );
     }
 
-    /// "n" and Esc are different answers: "n" creates the box without the
-    /// tree, Esc calls the create off. Everywhere else in the dashboard Esc
-    /// backs out, and a user who mistyped the path must be able to too.
     #[test]
     fn create_upload_confirm_answers_y_n_and_esc() {
         let answer = |code: KeyCode| {
