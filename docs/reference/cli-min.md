@@ -292,10 +292,14 @@ own-address box (`--network own_ip`) gets the deny-all default when it does
 not declare egress by these flags or in the project's `minimal.toml`. It
 then reaches no external address. It can still resolve names in the box zone,
 `host.min.internal` included. The name alone opens no port on the host. A box
-reaches the host only at a port that the `[host-exposures]` table in the client
-`config.toml` opens, and an own-address box also needs an egress rule that names
-the host: `--allow-dns-hosts host.min.internal`, or an `--allow-subnets` range
-that covers its address (see [minvmd](./cli-minvmd.md)). When an own-address
+on a VM host, and an own-address box on any host, reaches the host only at a
+port that the `[host-exposures]` table in the client `config.toml` opens. An
+own-address box also needs an egress rule that names the host:
+`--allow-dns-hosts host.min.internal`, or an `--allow-subnets` range that covers
+the address of `host.min.internal` (see [minvmd](./cli-minvmd.md)). A
+host-address box on a native Linux host shares the host's network namespace. It
+reaches host services directly, as any host process does, and the
+`[host-exposures]` table does not apply to it. When an own-address
 box gets the deny-all default, `min session start` prints one line that says so:
 
 ```

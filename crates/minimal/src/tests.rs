@@ -26409,6 +26409,18 @@ fn cli_reference_says_how_a_box_reaches_the_host() {
             paragraph.contains("./cli-minvmd.md"),
             "the cli-min.md paragraph that names host.min.internal must link the minvmd page"
         );
+        // A native host-address box shares the host's namespace, so the
+        // exposure table does not bind it (design §7.1 Lanes).
+        let flat = paragraph.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("A box on a VM host, and an own-address box on any host,"),
+            "the cli-min.md sentence on [host-exposures] must scope itself to VM hosts \
+             and own-address boxes: {flat}"
+        );
+        assert!(
+            flat.contains("host-address box on a native Linux host shares the host's network"),
+            "the cli-min.md paragraph must say what a native host-address box reaches: {flat}"
+        );
     }
 }
 
