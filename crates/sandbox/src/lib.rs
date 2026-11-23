@@ -9026,7 +9026,11 @@ int main(int argc, char **argv) {
     ///
     /// Gated, with the reason printed, as `host_address_box_placed_in_leaf`
     /// is: the tree installed, writable by this account, and a child of this
-    /// process able to migrate into a leaf of it.
+    /// process able to migrate into a leaf of it. No lane holds that, so the
+    /// lane's measurement of this placement is the root proof
+    /// `a_box_launch_in_a_real_leaf_places_its_supervisor_before_its_program_runs`
+    /// in `crates/minimald/tests/classifier_root_integration.rs`, which
+    /// installs a scratch tree of its own.
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_run_in_a_classifier_leaf_places_its_supervisor_in_the_real_tree() {
