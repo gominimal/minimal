@@ -6,6 +6,9 @@
 //! build follows the box's own rules. Each open grant is a row of the build
 //! box's own under a host-side deadline. A guest signal can end a grant
 //! early, and nothing extends one.
+//!
+//! Persisting the tables per box, and keeping grant deadlines across
+//! `minvmd` versions, is https://github.com/gominimal/minimal/issues/3730.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;

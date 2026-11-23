@@ -890,7 +890,8 @@ pub type BuildGrantTable = std::collections::BTreeMap<String, BuildGrant>;
 /// RFC 1918, where a person's own network sits, the shared address space
 /// the switch's subnet, its box leases and its host alias are carved from,
 /// and link-local space. The resolver stays reachable: a box's own
-/// resolution is admitted ahead of its deny rules.
+/// resolution is admitted ahead of its deny rules. An IPv6 deny list and a
+/// per-source probe timeout are https://github.com/gominimal/minimal/issues/3729.
 pub const BUILD_BOX_INTERNET_DENY: [&str; 5] = [
     "10.0.0.0/8",
     "172.16.0.0/12",

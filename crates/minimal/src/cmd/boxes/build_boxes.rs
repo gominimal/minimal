@@ -29,7 +29,8 @@ const EVALUATION_STACK: usize = 128 * 1024 * 1024;
 
 /// How long a start waits for the project's evaluation. An evaluation that
 /// has to fetch an upstream can take longer, and the start does not wait for
-/// it: the box gets no table, and its builds follow its own rules.
+/// it: the box gets no table, and its builds follow its own rules. Filing the
+/// table after a timed-out evaluation is https://github.com/gominimal/minimal/issues/3728.
 const EVALUATION_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// What this activation knows about the box it prepares.
