@@ -199,7 +199,7 @@ fn ask(
         Ok(other) => bail!("{} answered {other:?}", control.display()),
         Err(error) => bail!(
             "the Minimal daemon at {} sent a reply this minzoned does not understand \
-             ({error}); it may be an older version: run `min stop`, then \
+             ({error}); it may be an older version: run `min host stop <host>`, then \
              `min finalize-install` again",
             control.display()
         ),

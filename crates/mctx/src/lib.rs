@@ -2059,6 +2059,63 @@ mod tests {
         assert_eq!(config.classifier_leaf, Some(leaf));
     }
 
+    /// A `min patched-pkg` build takes the classifier leaf of its box, or the
+    /// box's network when the box has no leaf. A context made for no box
+    /// gives neither, so the build stays its caller's own traffic. The
+    /// choice survives the reload that `run_patched_pkg` makes.
+    #[test]
+    fn patched_build_takes_the_leaf_or_the_network_of_its_box() {
+        let state = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let config = ConfigBuilder::new()
+            .with_state_dir(state.path().to_path_buf())
+            .with_cache_dir(cache.path().to_path_buf())
+            .with_stdlib_dir(
+                std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("../stdlib/minimal-ncl"),
+            )
+            .build()
+            .unwrap();
+        let daemon = Arc::new(DaemonContext::init(config).unwrap());
+        let repo = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("testdata")
+            .join("fakerepo");
+        let mfile = MFileSearchStrategy::Override(repo)
+            .find_mfile()
+            .expect("fakerepo has a minimal.toml");
+        let leaf = sandbox::config::ClassifierLeaf::under(
+            std::path::Path::new("/sys/fs/cgroup/minimald.slice"),
+            "box-1",
+            sandbox::config::Verdict::Deny,
+        );
+        let network =
+            || op::BuildNetwork::new(|| Arc::new(sandbox::NoNet) as Arc<dyn sandbox::Network>);
+
+        let plain = Context::from_daemon(Arc::clone(&daemon), mfile);
+        let (no_leaf, no_network) = env::patched_build_egress(&plain.cloned_reinit().unwrap());
+        assert_eq!(no_leaf, None);
+        assert!(no_network.is_none());
+
+        let in_leaf = plain.clone().with_classifier_leaf(leaf.clone());
+        let (got_leaf, got_network) = env::patched_build_egress(&in_leaf.cloned_reinit().unwrap());
+        assert_eq!(got_leaf, Some(leaf.clone()));
+        assert!(got_network.is_none());
+
+        let on_network = plain.clone().with_box_network(network());
+        let (got_leaf, got_network) =
+            env::patched_build_egress(&on_network.cloned_reinit().unwrap());
+        assert_eq!(got_leaf, None);
+        assert!(got_network.is_some());
+
+        // A leaf wins over a network, as in the session channel of minimald.
+        let both = plain
+            .with_classifier_leaf(leaf.clone())
+            .with_box_network(network());
+        let (got_leaf, got_network) = env::patched_build_egress(&both);
+        assert_eq!(got_leaf, Some(leaf));
+        assert!(got_network.is_none());
+    }
+
     #[test]
     #[ignore] // Do not run in github: does not support nested namespaces
     fn toplevel_layer_init_and_build() {

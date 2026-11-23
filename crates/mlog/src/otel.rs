@@ -45,6 +45,8 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::filter::Filtered;
 
+mod body;
+pub use body::BodyFromError;
 mod forward;
 pub use forward::{
     Destination as ForwardDestination, FORWARD_ENV, MAX_FRAME_BYTES as FORWARD_MAX_FRAME_BYTES,
@@ -716,11 +718,14 @@ pub type SpanLayer<S> = Filtered<
     ExportFilter<S>,
     S,
 >;
-/// The event (logs) layer, already filtered by the export filter.
+/// The event (logs) layer, already filtered by the export filter. The bridge
+/// sits behind [`BodyFromError`], so a record with no message gets a body.
 pub type LogLayer<S> = Filtered<
-    opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge<
-        SdkLoggerProvider,
-        opentelemetry_sdk::logs::SdkLogger,
+    BodyFromError<
+        opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge<
+            SdkLoggerProvider,
+            opentelemetry_sdk::logs::SdkLogger,
+        >,
     >,
     ExportFilter<S>,
     S,
@@ -1235,7 +1240,10 @@ pub fn init(service_name: &str) {
             b.build()
         });
     let logger_provider = (built.1.is_some() || log_spool.is_some() || forward_logs).then(|| {
-        let mut b = SdkLoggerProvider::builder().with_resource(resource);
+        // First, so every later processor sees the body it fills in.
+        let mut b = SdkLoggerProvider::builder()
+            .with_resource(resource)
+            .with_log_processor(body::FillBody);
         if let Some(exporter) = built.1 {
             b = b.with_batch_exporter(exporter);
         }
@@ -1286,7 +1294,7 @@ where
 {
     let p = PROVIDERS.get()?.1.as_ref()?;
     Some(
-        opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(p)
+        BodyFromError(opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(p))
             .with_filter(export_filter()),
     )
 }

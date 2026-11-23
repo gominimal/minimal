@@ -757,7 +757,10 @@ fn version_skew_message_names_both_builds_the_recovery_and_the_override() {
         msg.contains("0.5.0-dev.12.g86ce5c3a"),
         "missing the daemon version: {msg}"
     );
-    assert!(msg.contains("min stop"), "missing the recovery: {msg}");
+    assert!(
+        msg.contains("min host stop <host>"),
+        "missing the recovery: {msg}"
+    );
     assert!(
         msg.contains(SKEW_OVERRIDE_VAR),
         "missing the override: {msg}"

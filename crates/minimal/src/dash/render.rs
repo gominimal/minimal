@@ -636,7 +636,7 @@ fn render_preview_body(model: &Model, key: &SessionKey, frame: &mut Frame, area:
             // A subsystem refusal means the running daemon predates
             // GetSessionScreen; everything else is transient.
             let text = if e.contains("request subsystem") {
-                "preview unavailable: this minimald is too old — restart it (min stop --force)"
+                "preview unavailable: this minimald is too old — restart it (min host stop <host>)"
                     .to_string()
             } else {
                 format!("preview unavailable: {e}")
