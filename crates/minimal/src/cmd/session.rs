@@ -473,7 +473,25 @@ pub(crate) async fn cmd_typed_box_rm(
 ) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
     let hosts = crate::cmd::list::local_hosts(global)?;
-    let (host, removed) = typed_box_rm_on_hosts(hosts, &args, box_type, verb).await?;
+    let mut prompt = RmPrompt {
+        no_input: global.no_input,
+        stdin_is_terminal: std::io::IsTerminal::is_terminal(&std::io::stdin()),
+        ask: Box::new(|lines: &[String], question: &str| {
+            for line in lines {
+                println!("{line}");
+            }
+            confirm(question, false)
+        }),
+    };
+    let (host, removed) =
+        match typed_box_rm_on_hosts(hosts, &args, box_type, verb, &mut prompt).await {
+            Ok(removed) => removed,
+            Err(e) if e.is::<RmAborted>() => {
+                writeln!(std::io::stdout().lock(), "Aborted.")?;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
     // The same cleanup as `min box rm`: withdraw the box's row on the VM
     // host daemon, or release the name it held.
     let control_sock = box_host_control_sock(&host);
@@ -485,18 +503,21 @@ pub(crate) async fn cmd_typed_box_rm(
     Ok(())
 }
 
-/// The typed removal over the local `hosts`. Returns the host that kept
-/// the box and the box it removed. Prints nothing.
+/// The typed removal over the local `hosts`. It runs the gate of
+/// `min box rm` first, so it refuses what `min box rm` refuses. Returns
+/// the host that kept the box and the box it removed. Prints nothing.
 pub(crate) async fn typed_box_rm_on_hosts(
     hosts: Vec<crate::cmd::list::LocalHost>,
     args: &BoxRmArgs,
     box_type: &str,
     verb: &'static str,
+    prompt: &mut RmPrompt<'_>,
 ) -> Result<(crate::cmd::list::LocalHost, RemovedBox), anyhow::Error> {
     let target = args.target.as_str();
     let ResolvedBox { host, box_id } = resolve_box_of_type(hosts, target, box_type, verb).await?;
     let removed = async {
         let mut client = gated_box_host_client(&host).await?;
+        rm_preflight(&mut client, box_id, target, args.force, prompt).await?;
         rm_listed_box(&mut client, box_id, target, args.force).await
     }
     .await;

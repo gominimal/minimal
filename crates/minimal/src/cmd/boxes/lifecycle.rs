@@ -663,10 +663,8 @@ pub(crate) struct RemovedBox {
 }
 
 /// Resolves the address `target` over `hosts` and reaps that box on the
-/// host that keeps it, as [`rm_listed_box`] does. Without `force`, a
-/// running box is refused first, and then the box's changed files go
-/// through [`rm_gate`] with `prompt`. Returns that host and the box it
-/// reaped.
+/// host that keeps it, as [`rm_listed_box`] does, after [`rm_preflight`]
+/// with `prompt`. Returns that host and the box it reaped.
 pub(crate) async fn rm_box_on_hosts(
     hosts: Vec<crate::cmd::list::LocalHost>,
     target: &str,
@@ -675,30 +673,42 @@ pub(crate) async fn rm_box_on_hosts(
 ) -> Result<(crate::cmd::list::LocalHost, RemovedBox), anyhow::Error> {
     let ResolvedBox { host, box_id } = resolve_box_on_hosts(hosts, target, "box rm").await?;
     let mut client = gated_box_host_client(&host).await?;
-    if !force {
-        // The running refusal comes before the question: a running box is
-        // never asked about.
-        crate::output::record_box_id(&box_id.to_string());
-        let running = list_box_records(&mut client, None)
-            .await?
-            .iter()
-            .any(|entry| entry.box_id == box_id && entry.state == "running");
-        if running {
-            return Err(BoxRunningRefusal::new(target).into());
-        }
-        // Until gominimal/inbox#1295, the daemon answers `Unavailable` for a
-        // box with no live host. So `box_delta` gets `Unavailable` here and
-        // `at_risk` is `Unknowable`.
-        let at_risk = assess_at_risk(box_delta(&mut client, box_id).await);
-        tracing::debug!(
-            r#box = target,
-            ?at_risk,
-            "min box rm checked the box's files"
-        );
-        rm_gate(target, force, &at_risk, prompt)?;
-    }
+    rm_preflight(&mut client, box_id, target, force, prompt).await?;
     let removed = rm_listed_box(&mut client, box_id, target, force).await?;
     Ok((host, removed))
+}
+
+/// The gate every rm path runs before [`rm_listed_box`], so `min box rm`,
+/// `min session rm` and `min task rm` refuse the same boxes. Without
+/// `force`, a running box is refused first, and then the box's changed
+/// files go through [`rm_gate`] with `prompt`. Under `force` it does
+/// nothing.
+pub(crate) async fn rm_preflight(
+    client: &mut client::Client,
+    box_id: boxes::SessionId,
+    target: &str,
+    force: bool,
+    prompt: &mut RmPrompt<'_>,
+) -> Result<(), anyhow::Error> {
+    if force {
+        return Ok(());
+    }
+    // The running refusal comes before the question: a running box is
+    // never asked about.
+    crate::output::record_box_id(&box_id.to_string());
+    let running = list_box_records(client, None)
+        .await?
+        .iter()
+        .any(|entry| entry.box_id == box_id && entry.state == "running");
+    if running {
+        return Err(BoxRunningRefusal::new(target).into());
+    }
+    // Until gominimal/inbox#1295, the daemon answers `Unavailable` for a
+    // box with no live host. So `box_delta` gets `Unavailable` here and
+    // `at_risk` is `Unknowable`.
+    let at_risk = assess_at_risk(box_delta(client, box_id).await);
+    tracing::debug!(r#box = target, ?at_risk, "rm checked the box's files");
+    rm_gate(target, force, &at_risk, prompt)
 }
 
 /// Reaps the box `id`, which the address `target` resolved to, as BOX-019

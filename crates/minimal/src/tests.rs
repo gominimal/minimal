@@ -1253,11 +1253,13 @@ async fn box_grammar_and_migration_end_to_end() {
         (&["box", "rm", "api"], 2, ""),
         (&["session", "stop", "api"], 0, ""),
         (&["box", "prune", "--dry-run"], 0, "api"),
-        (&["session", "rm", "api"], 0, ""),
+        (&["session", "rm", "api"], 2, ""),
+        (&["session", "rm", "--force", "api"], 0, ""),
         (&["task", "stop", "check"], 0, ""),
         (&["box", "stop", "check"], 0, ""),
         (&["box", "rm", "check"], 2, ""),
-        (&["task", "rm", "check"], 0, ""),
+        (&["task", "rm", "check"], 2, ""),
+        (&["task", "rm", "--force", "check"], 0, ""),
         (&["box", "list", "--all"], 0, ""),
     ];
     for (args, exit, shows) in steps {
@@ -1266,6 +1268,11 @@ async fn box_grammar_and_migration_end_to_end() {
         let ran = runs.last().expect("the run just pushed");
         assert_eq!(ran.exit, *exit, "{}", transcript(&runs));
         assert!(ran.stdout.contains(shows), "{}", transcript(&runs));
+        // Each rm form refuses a box it cannot remove unasked as
+        // `min box rm` does, and the refusal names `--force`.
+        if args.contains(&"rm") && *exit == 2 {
+            assert!(ran.stderr.contains("--force"), "{}", transcript(&runs));
+        }
     }
     assert!(boxes_now().await.is_empty(), "{}", transcript(&runs));
 
@@ -8381,7 +8388,8 @@ async fn every_box_verb_refuses_box_on_stopped_vm() {
         target: "beta".to_owned(),
         force: false,
     };
-    let session_rm = cmd::typed_box_rm_on_hosts(hosts(), &rm_args, session, "rm").await;
+    let session_rm =
+        cmd::typed_box_rm_on_hosts(hosts(), &rm_args, session, "rm", &mut headless_rm()).await;
     results.push((
         "session rm",
         session_rm.map(|_| ()).expect_err("session rm"),
@@ -16012,9 +16020,10 @@ async fn type_noun_verbs_alias_box_forms() {
             "{err:#}"
         );
         assert!(out.is_empty());
-        let err = cmd::typed_box_rm_on_hosts(hosts(), &rm(other), box_type, "rm")
-            .await
-            .expect_err("a box of another type is not removed");
+        let err =
+            cmd::typed_box_rm_on_hosts(hosts(), &rm(other), box_type, "rm", &mut headless_rm())
+                .await
+                .expect_err("a box of another type is not removed");
         assert!(
             matches!(
                 err.downcast_ref::<BoxAddressRefusal>(),
@@ -16048,9 +16057,15 @@ async fn type_noun_verbs_alias_box_forms() {
         other => panic!("an unknown exec in the session box, not {other:?}: {err:#}"),
     }
     assert!(out.is_empty());
-    cmd::typed_box_rm_on_hosts(hosts(), &rm(&decoy.to_string()), task, "rm")
-        .await
-        .expect("the decoy task box goes");
+    cmd::typed_box_rm_on_hosts(
+        hosts(),
+        &rm(&decoy.to_string()),
+        task,
+        "rm",
+        &mut confirmed_rm(),
+    )
+    .await
+    .expect("the decoy task box goes");
 
     // With `--exec`, each noun prints the line of `min box stop --exec`,
     // and the line names the box as the person typed it.
@@ -16126,9 +16141,15 @@ async fn type_noun_verbs_alias_box_forms() {
         "the task box's exec runs on\n{text}"
     );
     for (box_type, id) in [(task, twin_task), (session, twin_session)] {
-        cmd::typed_box_rm_on_hosts(hosts(), &rm(&id.to_string()), box_type, "rm")
-            .await
-            .expect("the twin box goes");
+        cmd::typed_box_rm_on_hosts(
+            hosts(),
+            &rm(&id.to_string()),
+            box_type,
+            "rm",
+            &mut confirmed_rm(),
+        )
+        .await
+        .expect("the twin box goes");
     }
 
     // Under its own noun, each box stops with the line of `min box stop`,
@@ -16145,9 +16166,10 @@ async fn type_noun_verbs_alias_box_forms() {
             String::from_utf8(out).unwrap(),
             format!("Stopped {name}.\n")
         );
-        let (_, removed) = cmd::typed_box_rm_on_hosts(hosts(), &rm(name), box_type, "rm")
-            .await
-            .expect("the box goes");
+        let (_, removed) =
+            cmd::typed_box_rm_on_hosts(hosts(), &rm(name), box_type, "rm", &mut confirmed_rm())
+                .await
+                .expect("the box goes");
         assert_eq!(removed.id, id);
     }
     let (mut out, mut err) = (Vec::new(), Vec::new());
