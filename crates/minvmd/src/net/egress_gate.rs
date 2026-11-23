@@ -13229,6 +13229,60 @@ mod tests {
         expect_silence(&mut guest).await;
     }
 
+    /// NET-168: an internet grant reaches the public internet and nothing
+    /// private: not the person's network, not another box's lease, not the
+    /// host alias, not link-local space. The box's own resolver stays.
+    #[tokio::test]
+    async fn an_internet_grant_reaches_no_private_destination() {
+        let registry = BoxRegistry::new(SUBNET);
+        let grant = [100, 64, 0, 20];
+        registry.register(
+            BoxRegistration::new("weather", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080]),
+        );
+        registry.register(
+            BoxRegistration::new("build-grant", Ipv4Addr::from(grant), Ipv4Addr::LOCALHOST)
+                .with_egress_policy(minimald_rpc::build_box_egress(
+                    &std::collections::BTreeSet::new(),
+                    true,
+                )),
+        );
+        let mut h = gate_over(registry).await;
+
+        let refused = [
+            ipv4_frame(grant, 6, [192, 168, 1, 10], 80),
+            ipv4_frame(grant, 6, [10, 1, 2, 3], 22),
+            ipv4_frame(grant, 6, [172, 16, 4, 5], 443),
+            ipv4_frame(grant, 6, LEASE, 8080),
+            ipv4_frame(grant, 6, SUBNET.host_alias().octets(), 80),
+            ipv4_frame(grant, 6, [169, 254, 169, 254], 80),
+        ];
+        for frame in &refused {
+            send_frame(&mut h.guest, frame).await;
+        }
+        let resolver = dns_pins::tests::udp_payload_frame(
+            Ipv4Addr::from(grant),
+            40000,
+            SUBNET.dns_server(),
+            53,
+            &dns_pins::tests::dns_query("example.com"),
+        );
+        send_frame(&mut h.guest, &resolver).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            resolver,
+            "the grant's own resolution reaches the switch"
+        );
+        let public = ipv4_frame(grant, 6, [93, 184, 216, 34], 443);
+        send_frame(&mut h.guest, &public).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            public,
+            "no private destination reached the switch; the public one did"
+        );
+        expect_silence(&mut h.switch).await;
+    }
+
     /// The §5.3 infrastructure deny set as a host frame rule
     /// ([`INFRASTRUCTURE_RULE`]), decided for every row before the row's own
     /// rules and before the deferral: a name-declaring row and a CIDR row

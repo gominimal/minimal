@@ -169,6 +169,11 @@ const PUBLISH_RETRY_CAP: Duration = Duration::from_secs(30);
 /// arrives still leaves the later attempts their turn.
 const REPORT_DEADLINE: Duration = Duration::from_secs(10);
 
+/// How long the VM host daemon has to open a build grant: it reads the
+/// sources' redirects first. One attempt, because a second could open a
+/// second grant. The VM host daemon opens no grant past it.
+const BUILD_GRANT_DEADLINE: Duration = minimald_rpc::BUILD_GRANT_ASK_DEADLINE;
+
 /// The one deadline every attempt of a *withdrawn*-port report shares: the
 /// withdrawal is teardown, so it is given up on sooner than a publish. A
 /// sweep that withdraws several ports runs them side by side, so the sweep
@@ -376,6 +381,78 @@ pub(crate) fn reports_to_vm_host(control: &ControlChannel) -> bool {
     box_report_channel(control).is_some()
 }
 
+/// What the host side answered a build's ask with (NET-165).
+pub(crate) enum BuildGrantAnswer {
+    /// A grant opened.
+    Opened(minimald_rpc::OpenedBuildGrant),
+    /// No grant: the build follows the box's own rules.
+    NoGrant,
+    /// No VM host daemon to ask: this is a host with no VM.
+    NoDoor,
+}
+
+/// Asks the VM host daemon for the build of `spec_hash`. The ask names the
+/// hash and nothing else. A failed ask opens nothing, so the build follows the
+/// box's own rules, the narrower reach.
+pub(crate) async fn open_build_grant(
+    control: &ControlChannel,
+    session_id: boxes::SessionId,
+    spec_hash: &str,
+) -> BuildGrantAnswer {
+    let Some(channel) = box_report_channel(control) else {
+        return BuildGrantAnswer::NoDoor;
+    };
+    let request =
+        minimald_rpc::BoxControlRequest::OpenBuildGrant(minimald_rpc::OpenBuildGrantRequest {
+            session_id,
+            spec_hash: spec_hash.to_string(),
+        });
+    let deadline = tokio::time::Instant::now() + BUILD_GRANT_DEADLINE;
+    match report_exchange(&channel, &request, deadline).await {
+        Ok(minimald_rpc::BoxControlReply::BuildGrantOpened(opened)) => {
+            BuildGrantAnswer::Opened(*opened)
+        }
+        Ok(minimald_rpc::BoxControlReply::NoBuildGrant { .. }) => BuildGrantAnswer::NoGrant,
+        Ok(other) => {
+            tracing::warn!(reply = ?other, "the VM host daemon opened no build grant");
+            BuildGrantAnswer::NoGrant
+        }
+        Err(error) => {
+            tracing::warn!(%error, "the build grant ask was not answered");
+            BuildGrantAnswer::NoGrant
+        }
+    }
+}
+
+/// Tells the VM host daemon a grant can end. A failed signal leaves the
+/// grant to its host-side deadline.
+pub(crate) async fn close_build_grant(control: &ControlChannel, grant_row: &str) {
+    let request =
+        minimald_rpc::BoxControlRequest::CloseBuildGrant(minimald_rpc::CloseBuildGrantRequest {
+            grant_row: grant_row.to_string(),
+        });
+    signal_build_grants(control, &request).await;
+}
+
+/// Tells the VM host daemon a box is gone, so its table ends.
+pub(crate) async fn drop_build_table(control: &ControlChannel, session_id: boxes::SessionId) {
+    let request =
+        minimald_rpc::BoxControlRequest::DropBuildTable(minimald_rpc::DropBuildTableRequest {
+            session_id,
+        });
+    signal_build_grants(control, &request).await;
+}
+
+async fn signal_build_grants(control: &ControlChannel, request: &minimald_rpc::BoxControlRequest) {
+    let Some(channel) = box_report_channel(control) else {
+        return;
+    };
+    let deadline = tokio::time::Instant::now() + REPORT_DEADLINE;
+    if let Err(error) = report_exchange(&channel, request, deadline).await {
+        tracing::warn!(%error, "a build grant signal was not answered");
+    }
+}
+
 /// Whether the VM host daemon holds a row at `switch_address` (NET-138):
 /// the host's own table, read over the report door before this daemon
 /// relaunches a registered box whose host ended, so the box rejoins the
@@ -390,11 +467,44 @@ pub(crate) async fn host_row_standing(
     switch_address: Ipv4Addr,
     box_id: minimald_rpc::BoxId,
 ) -> Option<bool> {
+    row_standing_read(
+        control,
+        minimald_rpc::RowStandingRequest {
+            switch_address,
+            box_id: Some(box_id),
+            build_row_of: None,
+        },
+    )
+    .await
+}
+
+/// Asks the VM host daemon whether the build row of the host-address box
+/// `session_id` (NET-169) still stands, with `task_address` among its task
+/// rows. `None` when the host cannot be asked.
+pub(crate) async fn build_row_standing(
+    control: &ControlChannel,
+    task_address: Ipv4Addr,
+    session_id: boxes::SessionId,
+) -> Option<bool> {
+    row_standing_read(
+        control,
+        minimald_rpc::RowStandingRequest {
+            switch_address: task_address,
+            box_id: None,
+            build_row_of: Some(session_id),
+        },
+    )
+    .await
+}
+
+/// One row read, retried within the report deadline.
+async fn row_standing_read(
+    control: &ControlChannel,
+    request: minimald_rpc::RowStandingRequest,
+) -> Option<bool> {
+    let switch_address = request.switch_address;
     let channel = box_report_channel(control)?;
-    let request = minimald_rpc::BoxControlRequest::RowStanding(minimald_rpc::RowStandingRequest {
-        switch_address,
-        box_id: Some(box_id),
-    });
+    let request = minimald_rpc::BoxControlRequest::RowStanding(request);
     let deadline = tokio::time::Instant::now() + REPORT_DEADLINE;
     for attempt in 1..=REPORT_ATTEMPTS {
         let bound = attempt_deadline(deadline, REPORT_DEADLINE, REPORT_ATTEMPTS);

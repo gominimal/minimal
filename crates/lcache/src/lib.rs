@@ -83,6 +83,19 @@ impl PendingDir {
         self.tempdir.path()
     }
 
+    /// This entry, finalized under `hash` instead of the hash it was
+    /// allocated for.
+    #[must_use]
+    pub fn retarget(mut self, hash: SpecHash) -> Self {
+        self.hash = hash;
+        self
+    }
+
+    /// The hash this entry is finalized under.
+    pub fn hash(&self) -> &SpecHash {
+        &self.hash
+    }
+
     pub fn finalize(self, meta: EntryMeta) -> Result<(), CacheErr> {
         let hash_hex = self.hash.0.to_hex();
         // Entries on disk are at <root>/<first byte as hex>/<remaining bytes as hex>

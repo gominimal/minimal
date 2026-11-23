@@ -46,6 +46,7 @@ camino.workspace = true
 chrono.workspace = true
 diagnostics.workspace = true
 dirs.workspace = true
+graph.workspace = true
 hex.workspace = true
 # The CLI's own answerer-liveness query on a VM-backed host (NET-138): one A
 # query for the host's row at the reported port, in the same wire codec the

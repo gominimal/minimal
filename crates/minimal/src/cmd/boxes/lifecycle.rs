@@ -272,11 +272,19 @@ pub(crate) async fn shut_down_host_daemon(
         }
         return Ok(());
     }
+    // Stopped is written by the VM host daemon under its lifecycle lock,
+    // before it exits. Waiting for the process to go too means a
+    // `minvmd status` right after this stop finds the lock free.
     let stopped = || async {
         let dir = vm_dir.clone();
-        tokio::task::spawn_blocking(move || wait_for_vm_stopped_at(&dir, HOST_STOP_RELEASE_WAIT))
-            .await
-            .unwrap_or(false)
+        tokio::task::spawn_blocking(move || {
+            wait_for_vm_stopped_at(&dir, HOST_STOP_RELEASE_WAIT)
+                && minvmd::state::StateDir::new(dir).is_ok_and(|state_dir| {
+                    wait_for_alive_lock_released(&state_dir, HOST_STOP_RELEASE_WAIT).is_ok()
+                })
+        })
+        .await
+        .unwrap_or(false)
     };
     match resp {
         Ok(ShutdownResponse::ShuttingDown) => {
@@ -892,7 +900,9 @@ pub async fn cmd_box_restart(
     ensure_daemon(global)?;
     let hosts = crate::cmd::list::local_hosts(global)?;
     let mut out = std::io::stdout().lock();
-    restart_box_on_hosts(hosts, &mut out, &args.target).await?;
+    let restarted = restart_box_on_hosts(hosts, &mut out, &args.target).await?;
+    // NET-169: a box with no row for its builds gets one here.
+    register_missing_build_row(&restarted.host, restarted.box_id).await;
     Ok(())
 }
 

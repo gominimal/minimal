@@ -7416,6 +7416,7 @@ fn listing_of(
             })
             .collect(),
         daemon_version: None,
+        daemon_epoch: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
         zone_answerer_port: None,
@@ -9344,6 +9345,7 @@ fn address_entry(id: &str, name: &str, state: &str) -> minimald_rpc::BoxListingE
         signal: None,
         pty_enabled: true,
         lifetime: None,
+        build_boxes: Vec::new(),
     }
 }
 
@@ -13920,6 +13922,7 @@ fn fake_listed(id: boxes::BoxId, parent: Option<boxes::BoxId>) -> minimald_rpc::
         signal: None,
         pty_enabled: false,
         lifetime: None,
+        build_boxes: Vec::new(),
     }
 }
 
@@ -17808,6 +17811,7 @@ async fn box_show_network_renders_effective_policy() {
         record.network,
         None,
         &live,
+        &[],
         paths::HostKind::Minimald,
     )
     .expect("the render");
@@ -26527,4 +26531,124 @@ fn setup_zed_unchanged() {
             .iter()
             .any(|v| v == "setup-zed")
     );
+}
+
+/// BCLI-034: every refusal that carries its own exit code carries the one
+/// the exit-code table gives its outcome: 2 for a usage or state error, 3
+/// for a project file or a spec that does not load, 4 for a thing not
+/// found, and 124 for a timeout. `main.rs`'s `exit_code_table` pins how
+/// each one reaches the process exit status.
+#[test]
+fn exit_code_table_refusal_codes() {
+    const USAGE: u8 = 2;
+    const CONFIG: u8 = 3;
+    const NOT_FOUND: u8 = 4;
+    const TIMEOUT: u8 = 124;
+    for (outcome, code, row) in [
+        ("rm of a running box", BoxRunningRefusal::EXIT_CODE, USAGE),
+        (
+            "rename to a refused name",
+            BoxRenameRefusal::EXIT_CODE,
+            USAGE,
+        ),
+        ("prune off a terminal", PruneNeedsYes::EXIT_CODE, USAGE),
+        ("network flag refused", NetworkFlagRefusal::EXIT_CODE, USAGE),
+        (
+            "session entry undecided",
+            SessionEntryUndecided::EXIT_CODE,
+            USAGE,
+        ),
+        (
+            "start needs a terminal",
+            StartNeedsTerminal::EXIT_CODE,
+            USAGE,
+        ),
+        ("start name held", StartNameHeld::EXIT_CODE, USAGE),
+        (
+            "create name held",
+            minimald_rpc::HeldNameRefusal::EXIT_CODE,
+            USAGE,
+        ),
+        (
+            "run flag misplaced",
+            task::RunFlagMisplaced::EXIT_CODE,
+            USAGE,
+        ),
+        (
+            "run needs a terminal",
+            task::RunNeedsTerminal::EXIT_CODE,
+            USAGE,
+        ),
+        (
+            "task network unapplied",
+            TaskNetworkUnapplied::EXIT_CODE,
+            CONFIG,
+        ),
+        ("spec file invalid", SpecFileInvalid::EXIT_CODE, CONFIG),
+        ("box types invalid", BoxTypesInvalid::EXIT_CODE, CONFIG),
+        (
+            "task file invalid",
+            task::TaskFileInvalid::EXIT_CODE,
+            CONFIG,
+        ),
+        ("box type not found", BoxTypeNotFound::EXIT_CODE, NOT_FOUND),
+        (
+            "project file not found",
+            task::ProjectFileNotFound::EXIT_CODE,
+            NOT_FOUND,
+        ),
+        ("task not found", task::TaskNotFound::EXIT_CODE, NOT_FOUND),
+        (
+            "loadout not found",
+            loadouts::LoadoutNotFound::EXIT_CODE,
+            NOT_FOUND,
+        ),
+        (
+            "local host not found",
+            hosts::LocalHostNotFound::EXIT_CODE,
+            NOT_FOUND,
+        ),
+        ("box timed out", BoxTimedOut::EXIT_CODE, TIMEOUT),
+        ("exec timed out", BoxExecTimedOut::EXIT_CODE, TIMEOUT),
+    ] {
+        assert_eq!(code, row, "{outcome}");
+    }
+}
+
+/// BCLI-034: `box_host_client` on a host this process did not select types
+/// a stopped host and an unreachable host as `HostUnreachable`, which
+/// `main.rs`'s `failure_exit_code` ends with 7. Each keeps its text.
+#[tokio::test]
+async fn exit_code_table_box_host_client_host_unreachable() {
+    let stopped = address_host(LOCAL_MINVMD_PROVIDER, "local-minvmd0", false);
+    let err = box_host_client(&stopped)
+        .await
+        .err()
+        .expect("a stopped host gives no client");
+    assert!(
+        err.downcast_ref::<client::box_registration::HostUnreachable>()
+            .is_some(),
+        "{err:#}"
+    );
+    assert_eq!(err.to_string(), "Host local-minvmd0 is not running.");
+
+    // A socket path longer than the kernel accepts fails the connect with
+    // an error that is neither refused nor missing: the probe's
+    // unreachable arm.
+    let unreachable = LocalHost {
+        provider: LOCAL_MINVMD_PROVIDER,
+        host: "beta.local-minvmd0".to_owned(),
+        sock: std::path::PathBuf::from(format!("/{}/ssh.sock", "x".repeat(200))),
+        selected: false,
+    };
+    let err = box_host_client(&unreachable)
+        .await
+        .err()
+        .expect("an unreachable host gives no client");
+    assert!(
+        err.downcast_ref::<client::box_registration::HostUnreachable>()
+            .is_some(),
+        "{err:#}"
+    );
+    assert_eq!(err.to_string(), "Could not reach host beta.local-minvmd0.");
 }
