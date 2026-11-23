@@ -79,9 +79,7 @@ pub fn linked_worktree_gitdir(dir: &Path) -> Option<String> {
 /// worth a confirmation, and `$HOME` — even when non-empty or itself a
 /// VCS root — is far too much to bulk-upload on a stray keystroke, so
 /// the home check ignores contents entirely. `home` is `None` when the
-/// caller can't resolve one, leaving only the emptiness check. The
-/// escape hatch for a genuinely wanted upload (`--sync tarball` passed
-/// explicitly) is decided at the call site, not here.
+/// caller can't resolve one, leaving only the emptiness check.
 pub fn is_empty_or_home(dir: &Path, home: Option<&Path>) -> bool {
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     if home.is_some_and(|home| canon(dir) == canon(home)) {
@@ -95,10 +93,10 @@ pub fn is_empty_or_home(dir: &Path, home: Option<&Path>) -> bool {
 /// `Prompt` case is resolved by the caller (#441).
 #[derive(Debug, PartialEq, Eq)]
 pub enum UploadGate {
-    /// Upload without asking: a VCS root, a directory carrying a
-    /// `minimal.toml`, or an explicit `--sync tarball`.
+    /// Upload without asking: a VCS root or a directory carrying a
+    /// `minimal.toml`.
     Upload,
-    /// Headless caller, non-VCS root, implicit sync: skip and warn.
+    /// Headless caller, non-VCS root, no `minimal.toml`: skip and warn.
     SkipHeadless,
     /// Interactive caller, non-VCS root: confirm before uploading.
     Prompt,
@@ -106,21 +104,15 @@ pub enum UploadGate {
 
 /// Decide the non-empty, non-`$HOME` upload gate. `headless` means no
 /// interactive confirm is possible (`--no-prompt`, `--no-input`, or a
-/// non-TTY). An explicit `--sync tarball` (`sync_explicit`), a directory
-/// carrying a `minimal.toml` (`has_blueprint` — `min init` declared it,
+/// non-TTY). A directory carrying a `minimal.toml` (`has_blueprint` — `min init` declared it,
 /// so its config should reach the session), or a VCS root each force the
 /// upload; otherwise a headless caller skips rather than upload a
 /// directory nobody confirmed, and an interactive one is asked. The
 /// `$HOME` and empty-directory carve-outs are decided by the caller via
 /// [`is_empty_or_home`] before this runs, so `$HOME` never syncs on a
 /// blueprint alone.
-pub fn upload_gate(
-    is_vcs_root: bool,
-    sync_explicit: bool,
-    has_blueprint: bool,
-    headless: bool,
-) -> UploadGate {
-    if sync_explicit || has_blueprint || is_vcs_root {
+pub fn upload_gate(is_vcs_root: bool, has_blueprint: bool, headless: bool) -> UploadGate {
+    if has_blueprint || is_vcs_root {
         UploadGate::Upload
     } else if headless {
         UploadGate::SkipHeadless
@@ -132,15 +124,15 @@ pub fn upload_gate(
 /// The warning shown when an implicit upload is skipped because
 /// `upload_root` is neither a VCS root nor carries a `minimal.toml`.
 /// Names what the session gets — an empty workspace on a default
-/// blueprint — not only what was skipped, and points at the `--sync
-/// tarball` escape hatch. Shared by both upload callers (session
+/// blueprint — not only what was skipped, and points at `min init`, which
+/// declares the directory a project so the next start uploads it. Shared by both upload callers (session
 /// activate and task run) so the wording cannot drift between them.
 pub fn skipped_upload_warning(upload_root: &Path) -> String {
     format!(
         "warning: {} is not a version control repository root and has no \
          minimal.toml — skipping file upload; the session starts with an \
-         empty workspace and a default blueprint (pass --sync tarball to \
-         upload anyway)",
+         empty workspace and a default blueprint (run 'min init' in that \
+         directory to give it a minimal.toml, and the next start uploads it)",
         upload_root.display()
     )
 }
@@ -1757,23 +1749,17 @@ mod tests {
 
     #[test]
     fn upload_gate_covers_three_lanes() {
-        // A VCS root, or an explicit `--sync tarball`, always uploads —
-        // headless or not.
-        assert_eq!(upload_gate(true, false, false, true), UploadGate::Upload);
-        assert_eq!(upload_gate(false, true, false, true), UploadGate::Upload);
+        // A VCS root always uploads — headless or not.
+        assert_eq!(upload_gate(true, false, true), UploadGate::Upload);
+        assert_eq!(upload_gate(true, false, false), UploadGate::Upload);
         // A declared project (a `minimal.toml` is present) uploads even
-        // when it is neither a VCS root nor an explicit sync — the
-        // `min init && min session activate` case (rule 3 beats rule 6).
-        assert_eq!(upload_gate(false, false, true, true), UploadGate::Upload);
-        // An explicit `--sync tarball` is obeyed regardless of a blueprint.
-        assert_eq!(upload_gate(false, true, true, true), UploadGate::Upload);
-        // Neither blueprint nor VCS root, implicit sync: a headless caller
-        // skips and warns, an interactive one confirms first.
-        assert_eq!(
-            upload_gate(false, false, false, true),
-            UploadGate::SkipHeadless
-        );
-        assert_eq!(upload_gate(false, false, false, false), UploadGate::Prompt);
+        // when it is not a VCS root — the `min init && min session start`
+        // case (rule 3 beats rule 6).
+        assert_eq!(upload_gate(false, true, true), UploadGate::Upload);
+        // Neither blueprint nor VCS root: a headless caller skips and
+        // warns, an interactive one confirms first.
+        assert_eq!(upload_gate(false, false, true), UploadGate::SkipHeadless);
+        assert_eq!(upload_gate(false, false, false), UploadGate::Prompt);
     }
 
     #[test]
@@ -1782,7 +1768,11 @@ mod tests {
         assert!(warning.contains("/srv/data/run42"));
         assert!(warning.contains("has no minimal.toml"));
         assert!(warning.contains("empty workspace and a default blueprint"));
-        assert!(warning.contains("--sync tarball"));
+        assert!(
+            warning.contains("run 'min init' in that directory"),
+            "{warning}"
+        );
+        assert!(!warning.contains("--sync"), "{warning}");
     }
 
     // ---- TarZstArchive per-entry API ----

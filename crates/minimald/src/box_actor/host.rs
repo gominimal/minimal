@@ -1261,8 +1261,8 @@ impl BoxActor {
             AttachError::SpawnFailed(std::io::Error::new(
                 error.kind(),
                 format!(
-                    "{error} Destroy it with `min session destroy {name}`, then start a new \
-                     one with `min session activate`.",
+                    "{error} Remove it with `min box rm --force {name}`, then start a new \
+                     one with `min session start`.",
                     name = registry_name(&record),
                 ),
             ))

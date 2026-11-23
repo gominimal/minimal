@@ -2230,7 +2230,7 @@ async fn launch_refuses_unreadable_stored_spec() {
         Err(crate::box_actor::AttachError::SpawnFailed(error)) => {
             let text = error.to_string();
             assert!(text.contains("cannot be read"), "{text}");
-            assert!(text.contains("min session destroy bad-spec"), "{text}");
+            assert!(text.contains("min box rm --force bad-spec"), "{text}");
         }
         Err(other) => panic!("expected a refused launch, got {other}"),
         Ok(_) => panic!("a box whose stored spec cannot be read launched"),
@@ -16557,7 +16557,7 @@ async fn resume_refuses_unsatisfiable_spec_keeps_state() {
         &[
             "session `old-spec`",
             "version 99",
-            "min session destroy old-spec",
+            "min box rm --force old-spec",
         ],
         3,
     )
@@ -16622,7 +16622,7 @@ async fn resume_refuses_stored_spec_its_root_excludes_keeps_state() {
             "session `root-spec`",
             "`io.pty_enabled` to `true`",
             "the built-in type `task` allows only `false`",
-            "min session destroy root-spec",
+            "min box rm --force root-spec",
         ],
         3,
     )
@@ -16707,7 +16707,7 @@ async fn resume_refuses_when_name_held_by_running_box() {
         RecordState::Stopped(ending),
         &[
             "The running session `proj` holds the name `proj`",
-            &format!("min session rename {holder} <new-name>"),
+            &format!("min box rename {holder} <new-name>"),
         ],
         2,
     )
@@ -17031,9 +17031,9 @@ async fn hooks_on_resume_missing_composition_refuses_resume_keeps_state() {
         RecordState::Stopped(ending),
         &[
             "session `resume-blind` cannot resume, and it stays stopped. \
-           The daemon cannot read its hook settings. Destroy it with \
-           `min session destroy resume-blind`, then start a new one with \
-           `min session activate`.",
+           The daemon cannot read its hook settings. Remove it with \
+           `min box rm --force resume-blind`, then start a new one with \
+           `min session start`.",
         ],
         1,
     )
@@ -18799,7 +18799,7 @@ async fn restart_refuses_stored_spec_its_root_excludes_keeps_state() {
         "It stays stopped.",
         "`io.pty_enabled` to `true`",
         "the built-in type `task` allows only `false`",
-        "min session destroy restart-root",
+        "min box rm --force restart-root",
     ] {
         assert!(
             refusal.message.contains(words),
@@ -18895,7 +18895,7 @@ async fn restart_takes_resume_refusals_before_it_stops_anything() {
     for words in [
         "It stays running.",
         "The running session `pair` holds the name `pair`.",
-        &format!("min session rename {holder} <new-name>"),
+        &format!("min box rename {holder} <new-name>"),
     ] {
         assert!(
             refusal.message.contains(words),
@@ -18932,7 +18932,7 @@ async fn restart_takes_resume_refusals_before_it_stops_anything() {
     for words in [
         "It stays running.",
         "version 99",
-        "min session destroy alone",
+        "min box rm --force alone",
     ] {
         assert!(
             refusal.message.contains(words),

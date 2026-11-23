@@ -1648,7 +1648,7 @@ async fn recheck_live_carve_outs_against(
                         live_bind = ?live,
                         refusal = %why,
                         "box {name}'s resolver carve-out reaches a non-Minimal listener at \
-                         {target}; stop the box with `min session destroy {name}` until the \
+                         {target}; stop the box with `min box rm --force {name}` until the \
                          table is reinstalled at the live answerer"
                     );
                     continue;
@@ -4004,7 +4004,7 @@ mod tests {
             "a non-Minimal listener is an error: {foreign_line}"
         );
         assert!(
-            foreign_line.contains("min session destroy carve-out-box"),
+            foreign_line.contains("min box rm --force carve-out-box"),
             "the line names the command that stops the box: {foreign_line}"
         );
         drop(foreign);
