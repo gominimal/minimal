@@ -13,6 +13,7 @@ impl BoxMessage {
             Self::GetWorkspaceDelta { .. } => "GetWorkspaceDelta",
             Self::GetHostScreen { .. } => "GetHostScreen",
             Self::ConfigureLoadout { .. } => "ConfigureLoadout",
+            Self::PrepareBuildBoxes(..) => "PrepareBuildBoxes",
             Self::SubmitVerdict { .. } => "SubmitVerdict",
             Self::Finalize { .. } => "Finalize",
             Self::RunDetachHooks { .. } => "RunDetachHooks",

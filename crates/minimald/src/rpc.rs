@@ -206,6 +206,7 @@ async fn serve_list_sessions(
             );
             Ok(ListSessionsResponse {
                 daemon_version: Some(OWN_VERSION.to_string()),
+                daemon_epoch: Some(daemon_epoch().to_string()),
                 hostname_routing_unavailable: s.proxy_unavailable().await,
                 hostname_proxy_port,
                 zone_answerer_port,
@@ -667,6 +668,18 @@ async fn serve_create_session(
                         }
                         None => "A session with that name already exists".to_string(),
                     })
+                }
+                // BOX-160: a spec its built-in root excludes, or one that
+                // names no built-in root. The reply carries the refusal's
+                // text and its exit code, so `min` exits 3 as it does for
+                // the same refusal made on the client.
+                Err(e) if crate::box_manager::admission_refusal(&e).is_some() => {
+                    CreateSessionReply::Err {
+                        error: e.to_string(),
+                        code: None,
+                        exit_code: crate::box_manager::admission_refusal(&e),
+                        hint: None,
+                    }
                 }
                 // R2.1: a policy/network-mode mismatch is rejected at
                 // declaration time and surfaced as a clean typed error rather
@@ -1174,7 +1187,12 @@ async fn serve_answerer_control(
                 | BoxControlRequest::MintBoxId(_)
                 | BoxControlRequest::ReportExposeDecision(_)
                 | BoxControlRequest::ReportRefusedEgress(_)
-                | BoxControlRequest::ListenNotice(_) => BoxControlReply::Error {
+                | BoxControlRequest::ListenNotice(_)
+                | BoxControlRequest::FileBuildTable(_)
+                | BoxControlRequest::OpenBuildGrant(_)
+                | BoxControlRequest::CloseBuildGrant(_)
+                | BoxControlRequest::DropBuildTable(_)
+                | BoxControlRequest::RegisterBuildRow(_) => BoxControlReply::Error {
                     error: "the native daemon's control socket answers only the answerer \
                             verbs; boxes register over the daemon's RPC channels"
                         .to_string(),
@@ -1309,6 +1327,36 @@ async fn serve_configure_loadout(
                 Err(e) => Errorable::Err {
                     error: e.to_string(),
                 },
+            })
+        })
+        .await
+}
+
+/// `PrepareBuildBoxes`: takes what `min` prepared for a box's builds
+/// (NET-165).
+async fn serve_prepare_build_boxes(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    minimald_rpc::PrepareBuildBoxes
+        .handle_channel(c, async |req: minimald_rpc::PrepareBuildBoxesRequest| {
+            let mngr = s.sessions_manager().await;
+            let handle = mngr
+                .get_session(BoxKeyPredicate::Id(req.session_id))
+                .await
+                .map_err(|e| ConnectionError::Internal(e.to_string()))?;
+            let Some(h) = handle else {
+                return Ok(Errorable::Err {
+                    error: format!(
+                        "{} `{}`",
+                        minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                        req.session_id.as_ref()
+                    ),
+                });
+            };
+            Ok(match h.prepare_build_boxes(req).await {
+                Ok(prepared) => Errorable::Ok(prepared),
+                Err(error) => Errorable::Err { error },
             })
         })
         .await
@@ -3657,6 +3705,7 @@ pub async fn handle_ssh_rpc(
         | GetSessionRecord::NAME
         | CreateSession::NAME
         | minimald_rpc::ConfigureLoadout::NAME
+        | minimald_rpc::PrepareBuildBoxes::NAME
         | SubmitVerdict::NAME
         | FinalizeSession::NAME
         | RenameSession::NAME
@@ -3748,6 +3797,7 @@ pub async fn handle_ssh_rpc(
         GetSessionRecord::NAME => serve!(serve_get_session_record(s, channel)),
         CreateSession::NAME => serve!(serve_create_session(s, c.clone(), channel, ssh_username)),
         minimald_rpc::ConfigureLoadout::NAME => serve!(serve_configure_loadout(s, channel)),
+        minimald_rpc::PrepareBuildBoxes::NAME => serve!(serve_prepare_build_boxes(s, channel)),
         SubmitVerdict::NAME => serve!(serve_submit_verdict(s, channel)),
         FinalizeSession::NAME => serve!(serve_finalize_session(s, channel)),
         RenameSession::NAME => serve!(serve_rename_session(s, channel)),
@@ -3994,7 +4044,7 @@ mod create_naming_tests {
         assert_eq!(HeldNameRefusal::EXIT_CODE, 2);
         assert!(error.contains(&holder.to_string()), "{error}");
         assert!(
-            error.contains(&format!("min session rename {holder} <new-name>")),
+            error.contains(&format!("min box rename {holder} <new-name>")),
             "the refusal names the next step: {error}"
         );
         assert_eq!(
@@ -4302,4 +4352,48 @@ mod unenrolled_refusal_tests {
         let mngr = server.state.sessions_manager().await;
         assert!(mngr.list_boxes(None).await.unwrap().is_empty());
     }
+}
+
+#[cfg(test)]
+mod admission_refusal_tests {
+    use minimald_rpc::{CreateSession, CreateSessionReply};
+
+    use crate::test_harness::{TestServer, create_session_req};
+
+    // BOX-160: the daemon's admission refusal reaches the client with its
+    // exit code, 3, and not as a bare text refusal that exits 1 (#3313).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admission_refusal_reply_carries_exit_code() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let mut req = create_session_req("rooted", "/uwu");
+        req.config.creating_verb = minimald_rpc::CreatingVerb::Session;
+        let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+        spec.pty_enabled = false;
+        req.spec = Some(serde_json_lenient::to_value(&spec).expect("a spec serializes"));
+        match client.call::<CreateSession>(&req).await {
+            CreateSessionReply::Err {
+                error,
+                code,
+                exit_code,
+                hint,
+            } => {
+                assert!(error.contains("io.pty_enabled"), "{error}");
+                assert!(error.contains("No box was created."), "{error}");
+                assert_eq!(exit_code, Some(3), "{error}");
+                assert_eq!(code, None);
+                assert_eq!(hint, None);
+            }
+            CreateSessionReply::Ok(reply) => panic!("the create is refused, not {reply:?}"),
+        }
+        let mngr = server.state.sessions_manager().await;
+        assert!(mngr.list_boxes(None).await.unwrap().is_empty());
+    }
+}
+
+/// The id this daemon process took when it started, which the session list
+/// reports ([`minimald_rpc::ListSessionsResponse::daemon_epoch`]).
+fn daemon_epoch() -> &'static str {
+    static EPOCH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(|| boxes::SessionId::mint().to_string())
 }

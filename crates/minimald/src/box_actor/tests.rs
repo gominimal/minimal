@@ -2230,7 +2230,7 @@ async fn launch_refuses_unreadable_stored_spec() {
         Err(crate::box_actor::AttachError::SpawnFailed(error)) => {
             let text = error.to_string();
             assert!(text.contains("cannot be read"), "{text}");
-            assert!(text.contains("min session destroy bad-spec"), "{text}");
+            assert!(text.contains("min box rm --force bad-spec"), "{text}");
         }
         Err(other) => panic!("expected a refused launch, got {other}"),
         Ok(_) => panic!("a box whose stored spec cannot be read launched"),
@@ -4109,6 +4109,163 @@ async fn activation_refused_when_declared_port_is_held_by_a_host_program() {
     );
 }
 
+/// A stand-in for a native host's gvproxy at `sock` that binds a real host
+/// listener for each expose and drops it at the matching unexpose, so a
+/// program on the host can connect to a declared port while the forward
+/// stands. A bind the OS refuses is answered as the real forwarder answers
+/// it. Every request is recorded as `"<request line>\n<body>"`.
+#[cfg(target_os = "linux")]
+fn binding_forwarder(
+    sock: &std::path::Path,
+) -> (
+    tokio::task::JoinHandle<()>,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use tokio::io::AsyncWriteExt;
+    if let Some(parent) = sock.parent() {
+        std::fs::create_dir_all(parent).expect("create the switch state dir");
+    }
+    let listener = tokio::net::UnixListener::bind(sock).expect("bind the control socket");
+    let served = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = served.clone();
+    let server = crate::traced::spawn(async move {
+        let mut bound: std::collections::HashMap<String, std::net::TcpListener> =
+            std::collections::HashMap::new();
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Some(request) = read_control_request(&mut stream).await else {
+                continue;
+            };
+            let local = request
+                .split("\"local\":\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .unwrap_or_default()
+                .to_string();
+            let answer = if request.contains("/services/forwarder/unexpose") {
+                bound.remove(&local);
+                "200 OK\r\nContent-Length: 0\r\n\r\n".to_string()
+            } else if request.contains("/services/forwarder/expose") {
+                match std::net::TcpListener::bind(local.as_str()) {
+                    Ok(held) => {
+                        bound.insert(local, held);
+                        "200 OK\r\nContent-Length: 0\r\n\r\n".to_string()
+                    }
+                    Err(e) => {
+                        let reason = format!("listen tcp {local}: bind: {e}").to_lowercase();
+                        format!(
+                            "500 Internal Server Error\r\nContent-Length: {}\r\n\r\n{reason}",
+                            reason.len()
+                        )
+                    }
+                }
+            } else {
+                "200 OK\r\nContent-Length: 0\r\n\r\n".to_string()
+            };
+            recorded.lock().expect("served lock").push(request);
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "the answer's fate is not what the stand-in records; the request is"
+            )]
+            let _ = stream
+                .write_all(format!("HTTP/1.1 {answer}").as_bytes())
+                .await;
+        }
+    });
+    (server, served)
+}
+
+/// On a native host the finalize binds the box's declared forwards toward a
+/// lease it draws, before the record goes `Active`. A program on the host
+/// connects to the declared port right after the activation returns, before
+/// any attach. The destroy of a box that no attach reached unbinds the port
+/// and gives the lease back.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_native_activation_binds_declared_forwards_before_the_first_attach() {
+    use minimald_rpc::{DestroySession, DestroySessionRequest, Errorable};
+    let server = TestServer::new().await;
+    let manager = server.state.sessions_manager().await;
+    let mut client = server.connect().await;
+    // A native box: nobody hands it a switch address, so the daemon draws.
+    let id = create_own_ip_session(&mut client, "early").await;
+    let switch = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves")
+        .net_switch()
+        .await
+        .unwrap();
+    let sock = {
+        let mut switch = switch.lock().await;
+        switch.serve_externally();
+        switch.control_socket()
+    };
+    let (forwarder, served) = binding_forwarder(&sock);
+
+    finalize_session(&mut client, id).await;
+    let published = manager
+        .hostnames()
+        .read()
+        .expect("registry lock")
+        .published_own_address(id)
+        .expect("the finalize published the box");
+    std::net::TcpStream::connect((published, declared_port()))
+        .expect("a program on the host connects to the declared port before any attach");
+    {
+        let switch = switch.lock().await;
+        assert!(
+            switch.activation_lease(id).is_some(),
+            "the finalize drew the box's lease"
+        );
+        assert_eq!(switch.attached(), 1, "the drawn lease keeps the switch up");
+    }
+    let requests = served.lock().expect("served lock").clone();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.contains("/services/forwarder/expose"))
+            .count(),
+        1,
+        "one expose for the one declared port: {requests:?}"
+    );
+    assert!(
+        requests.iter().all(|request| !request.contains("/connect")),
+        "no attach reached the switch: {requests:?}"
+    );
+
+    match client
+        .call::<DestroySession>(&DestroySessionRequest {
+            id,
+            only_if_unfinalized: false,
+        })
+        .await
+    {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("the destroy failed: {error}"),
+    }
+    let requests = served.lock().expect("served lock").clone();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.contains("/services/forwarder/unexpose")
+                && request.contains(&format!("{published}:{}", declared_port()))),
+        "the destroy unbinds the forward no attach adopted: {requests:?}"
+    );
+    assert!(
+        std::net::TcpStream::connect((published, declared_port())).is_err(),
+        "the declared port is free after the destroy"
+    );
+    let switch = switch.lock().await;
+    assert_eq!(switch.activation_lease(id), None, "the lease went back");
+    assert_eq!(switch.attached(), 0, "nothing holds the switch any more");
+    drop(switch);
+    forwarder.abort();
+}
+
 /// NET-144: at the shared `127.0.0.1` fallback a declared port that another
 /// box already holds fails the second box's activation, naming the box that
 /// holds it, where before the second box yielded the port. The first box
@@ -5023,6 +5180,7 @@ async fn ensure_host_relaunches_a_registered_box_while_its_host_row_stands() {
         minimald_rpc::BoxControlRequest::RowStanding(minimald_rpc::RowStandingRequest {
             switch_address,
             box_id: Some(HANDED_BOX_ID),
+            build_row_of: None,
         }),
         "the read names the row's own key and the box's id, nothing else"
     );
@@ -14260,777 +14418,6 @@ fn grant_box_git_credential_helper_answers_for_grant_hosts() {
     );
 }
 
-/// The events of one package build named `package`, whose output ends in
-/// `lines`, as the build side-op's pump sees them (NET-155).
-fn build_events(package: &str, lines: &[&str]) -> Vec<orchestrator::BuildEvent> {
-    let start = orchestrator::BuildEvent {
-        idx: 7,
-        inner: orchestrator::BuildEventInner::Start {
-            name: package.to_string(),
-            full_build: true,
-            spec_hash: "0".repeat(64),
-        },
-    };
-    std::iter::once(start)
-        .chain(lines.iter().map(|line| orchestrator::BuildEvent {
-            idx: 7,
-            inner: orchestrator::BuildEventInner::Log {
-                is_stderr: true,
-                line: (*line).to_string(),
-            },
-        }))
-        .collect()
-}
-
-/// NET-155: a box's package build runs in the box's own classifier leaf,
-/// so the box's egress verdict decides it. A deny-all box's build that
-/// cannot reach its download is reported as refused by the box's rules. A
-/// box allowed the destination is placed in its allow leaf, and its build
-/// is never reported as refused. A box never placed in a leaf builds in the
-/// daemon's own cgroup, as before. A placed box whose leaf is gone has its
-/// build refused, never run outside its egress verdict.
-#[test]
-fn box_package_build_under_box_egress_verdict() {
-    use crate::box_ops::{BuildPlacement, BuildTap};
-    use sandbox::config::Verdict;
-
-    let tree = tempfile::tempdir().unwrap();
-    let root = tree.path();
-    // A box never placed in a leaf builds in the daemon's own cgroup.
-    assert_eq!(
-        super::setup::box_build_leaf(root, "sealed", "sealed", false),
-        Ok(None)
-    );
-    // A placed box whose leaf is gone fails closed: its build is refused.
-    assert_eq!(
-        super::setup::box_build_leaf(root, "sealed", "sealed", true),
-        Err(
-            "the build for box sealed did not start: box sealed runs under \
-             egress rules, and its shell is not running to apply them to the \
-             build. Run `min session attach sealed` to start its shell, then \
-             run the build again."
-                .to_string()
-        )
-    );
-
-    let deny_dir = sandbox::classifier::box_leaf(root, "sealed", Verdict::Deny);
-    std::fs::create_dir_all(&deny_dir).unwrap();
-    let allow_dir = sandbox::classifier::box_leaf(root, "open", Verdict::Allow);
-    std::fs::create_dir_all(&allow_dir).unwrap();
-
-    let sealed = super::setup::box_build_leaf(root, "sealed", "sealed", true)
-        .unwrap()
-        .expect("the deny-all box's leaf");
-    assert_eq!(sealed.dir(), deny_dir);
-    assert!(sealed.is_deny());
-    let open = super::setup::box_build_leaf(root, "open", "open", true)
-        .unwrap()
-        .expect("the allowed box's leaf");
-    assert_eq!(open.dir(), allow_dir);
-    assert!(!open.is_deny());
-
-    let download = [
-        "curl: (6) Could not resolve host: downloads.example.org",
-        "build command failed",
-    ];
-    // The error the build returns, as the daemon receives it.
-    let failed = |package: &str| {
-        mctx::Error::from(orchestrator::Error::BuildFailed(
-            package.to_string(),
-            op::Error::Other(anyhow::anyhow!("build command failed")),
-        ))
-        .to_string()
-    };
-    let run = |name: &str, leaf| {
-        let placement = BuildPlacement {
-            box_name: name.to_string(),
-            leaf,
-            network: None,
-        };
-        let mut tap = BuildTap::default();
-        for event in build_events("fetcher", &download) {
-            tap.observe(&event, &placement);
-        }
-        tap.refusal(&placement, &failed("fetcher"))
-    };
-    assert_eq!(
-        run("sealed", Some(sealed.clone())).as_deref(),
-        Some(
-            "the build of fetcher could not reach downloads.example.org: \
-             the egress rules of box sealed do not allow it. \
-             To allow it, activate a new session with \
-             --network own_ip --allow-dns-hosts downloads.example.org. \
-             Or add downloads.example.org to network.egress.allow_dns_hosts under [defaults] in minimal.toml, \
-             then activate a new session with --network own_ip"
-        )
-    );
-    assert_eq!(run("open", Some(open)), None);
-    assert_eq!(run("unplaced", None), None);
-
-    // Only the build that failed is read. A package that printed a failed
-    // download and still built is not blamed when another package fails.
-    let placement = BuildPlacement {
-        box_name: "sealed".to_string(),
-        leaf: Some(sealed),
-        network: None,
-    };
-    let mut tap = BuildTap::default();
-    let other = build_events("compiler", &["error: cc failed"])
-        .into_iter()
-        .map(|mut event| {
-            event.idx = 8;
-            event
-        });
-    for event in build_events("fetcher", &download).into_iter().chain(other) {
-        tap.observe(&event, &placement);
-    }
-    assert_eq!(tap.refusal(&placement, &failed("compiler")), None);
-    assert!(tap.refusal(&placement, &failed("fetcher")).is_some());
-    // An error that names no build reports no refusal.
-    assert_eq!(tap.refusal(&placement, "the build was cancelled"), None);
-}
-
-/// NET-155: a package that declares a web source fetches it in its box's
-/// classifier leaf, so the box's egress verdict decides the fetch. The build
-/// of a deny-all box fails, and its error names the source host and the box,
-/// on the build side operation and on the in-box patched build. A box whose
-/// leaf allows the host builds the package. The fetcher stands in for the
-/// kernel's verdict: a leaf in the deny subtree is refused the connection,
-/// in the words the placed download reports.
-#[tokio::test]
-async fn box_build_web_source_under_box_verdict() {
-    use crate::box_ops::{BuildPlacement, BuildTap};
-    use crate::env::{LineTap, build_denies_all, patched_build_refusal};
-    use op::Runnable;
-    use sandbox::config::{ClassifierLeaf, Verdict};
-    use std::sync::{Arc, Mutex};
-
-    #[derive(Debug)]
-    struct VerdictFetcher(std::path::PathBuf, Mutex<Vec<Option<ClassifierLeaf>>>);
-
-    impl op::SourceFetcher for VerdictFetcher {
-        async fn download_web(
-            &self,
-            url: &str,
-            _sha256: &str,
-            place: Option<op::SourcePlace<'_>>,
-            _op: &ot::OpTracker,
-        ) -> anyhow::Result<(std::path::PathBuf, bool)> {
-            let leaf = match place {
-                Some(op::SourcePlace::Leaf(leaf)) => Some(leaf),
-                _ => None,
-            };
-            self.1.lock().unwrap().push(leaf.cloned());
-            assert!(url.starts_with("https://downloads.example.org/"), "{url}");
-            match leaf {
-                Some(leaf) if leaf.is_deny() => anyhow::bail!(
-                    "could not connect to downloads.example.org:443: \
-                     Connection refused (os error 111)"
-                ),
-                Some(_) => Ok((self.0.clone(), true)),
-                None => anyhow::bail!("the fetch ran outside the box's leaf"),
-            }
-        }
-
-        async fn download_gcs(
-            &self,
-            _bucket_id: String,
-            _file: &str,
-            _sha256: &str,
-            _op: &ot::OpTracker,
-        ) -> anyhow::Result<std::path::PathBuf> {
-            unreachable!("the package declares a web source only")
-        }
-    }
-
-    let tmp = tempfile::tempdir().unwrap();
-    let archive = tmp.path().join("fetcher-1.0.tar.zst");
-    {
-        let enc = zstd::Encoder::new(std::fs::File::create(&archive).unwrap(), 1).unwrap();
-        let mut tar = tar::Builder::new(enc);
-        let body = b"fetched";
-        let mut header = tar::Header::new_gnu();
-        header.set_path("README").unwrap();
-        header.set_size(body.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        tar.append(&header, &body[..]).unwrap();
-        tar.into_inner().unwrap().finish().unwrap();
-    }
-    let graph = graph::Graph::new()
-        .ingest(
-            decode::Layer::new_for_test(
-                r#"
-                let {BuildSpec, Source, OutputLib, ..} = import "minimal.ncl" in
-                {
-                    name = "fetcher",
-                    prebuilt = true,
-                    build_deps = [
-                        {
-                            url = "https://downloads.example.org/fetcher-1.0.tar.zst",
-                            sha256 = "0000000000000000000000000000000000000000000000000000000000000000",
-                            extract = true,
-                        } | Source,
-                    ],
-                    runtime_deps = [],
-                    outputs = { docs = { glob = "*" } | OutputLib },
-                } | BuildSpec
-                "#
-                .to_string(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-    let bsr = *graph.by_name("fetcher").unwrap();
-    std::fs::create_dir(tmp.path().join("cache")).unwrap();
-    let opts = op::Options {
-        cache: lcache::Cache::at_dir(tmp.path().join("cache")).unwrap(),
-        graph: &graph,
-        exec_base: tmp.path().to_path_buf(),
-        ot: None,
-        daemon_id: None,
-    };
-    let fetcher = VerdictFetcher(archive, Mutex::default());
-    let root = std::path::Path::new("/sys/fs/cgroup/minimald.slice");
-    let sealed = ClassifierLeaf::under(root, "sealed", Verdict::Deny);
-    let open = ClassifierLeaf::under(root, "open", Verdict::Allow);
-
-    let build = |leaf: ClassifierLeaf| {
-        let lines = Arc::new(Mutex::new(std::collections::VecDeque::new()));
-        let spec_build = op::SpecBuild {
-            spec: &bsr,
-            override_deps: None,
-            remote_fetcher: &fetcher,
-            stdout_writer: None,
-            stderr_writer: Some(Box::new(LineTap::new(tokio::io::sink(), lines.clone()))),
-            cancel: tokio_util::sync::CancellationToken::new(),
-            cpu_weight: None,
-            classifier_leaf: Some(leaf),
-            box_network: None,
-        };
-        (spec_build, lines)
-    };
-    let expected = "the build of fetcher could not reach downloads.example.org: \
-                    the egress rules of box sealed do not allow it. \
-                    To allow it, activate a new session with \
-                    --network own_ip --allow-dns-hosts downloads.example.org. \
-                    Or add downloads.example.org to network.egress.allow_dns_hosts under [defaults] in minimal.toml, \
-                    then activate a new session with --network own_ip";
-
-    // The deny-all box: its build fails, naming the host and the box.
-    let (mut spec_build, lines) = build(sealed.clone());
-    let refused = match spec_build.run(&opts).await {
-        Ok(_) => panic!("a deny-all box's fetch of its web source is refused"),
-        Err(e) => e,
-    };
-    drop(spec_build);
-    let lines: Vec<String> = lines.lock().unwrap().iter().cloned().collect();
-    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
-    // The in-box patched build reads its own error and the build's output.
-    assert_eq!(
-        patched_build_refusal(
-            build_denies_all(Some(&sealed), None),
-            "fetcher",
-            "sealed",
-            &refused.to_string(),
-            lines.iter().copied(),
-        )
-        .as_deref(),
-        Some(expected),
-        "{lines:?}"
-    );
-    // The build side operation reads the build's events.
-    let placement = |name: &str, leaf: &ClassifierLeaf| BuildPlacement {
-        box_name: name.to_string(),
-        leaf: Some(leaf.clone()),
-        network: None,
-    };
-    let failed = mctx::Error::from(orchestrator::Error::BuildFailed(
-        "fetcher".to_string(),
-        refused,
-    ))
-    .to_string();
-    let mut tap = BuildTap::default();
-    for event in build_events("fetcher", &lines) {
-        tap.observe(&event, &placement("sealed", &sealed));
-    }
-    assert_eq!(
-        tap.refusal(&placement("sealed", &sealed), &failed)
-            .as_deref(),
-        Some(expected)
-    );
-
-    // The box its rules allow the host: the package builds from the source.
-    let (mut spec_build, lines) = build(open.clone());
-    let built = spec_build
-        .run(&opts)
-        .await
-        .expect("a box allowed the host builds the package");
-    assert_eq!(
-        std::fs::read_to_string(built.outputs.path().join("README")).unwrap(),
-        "fetched"
-    );
-    drop(spec_build);
-    assert!(lines.lock().unwrap().is_empty(), "no fetch failed");
-
-    assert_eq!(
-        *fetcher.1.lock().unwrap(),
-        vec![Some(sealed), Some(open)],
-        "each fetch ran in its box's leaf"
-    );
-
-    // A fetch that failed for another reason names no refused destination.
-    assert_eq!(
-        crate::env::refused_destination([
-            "could not fetch the source https://downloads.example.org/fetcher-1.0.tar.zst: \
-             other: the sha256 of the download does not match",
-        ]),
-        None
-    );
-}
-
-/// NET-155 (T124): a box's launch builds the packages it lacks in the box's
-/// classifier leaf. When a deny-all box's launch build is refused its web
-/// source, the error names the source host and the box on one line, before
-/// the build's own error, as the build side operation's does. The box is
-/// named as `min ls` shows it, not by the id its leaf is named after. A box
-/// whose leaf allows the host, and a build that succeeds, are reported as
-/// before.
-#[tokio::test]
-async fn box_launch_build_refused_web_source_names_host_and_box() {
-    use crate::box_ops::BuildPlacement;
-    use crate::env::tapped_build;
-    use sandbox::config::{ClassifierLeaf, Verdict};
-
-    let root = std::path::Path::new("/sys/fs/cgroup/minimald.slice");
-    let box_id = "01a1b338-491b-766a-9c29-43184470ccf3";
-    let placement = |verdict| BuildPlacement {
-        box_name: "d876x1".to_string(),
-        leaf: Some(ClassifierLeaf::under(root, box_id, verdict)),
-        network: None,
-    };
-    let refused = "could not connect to deb.debian.org:443: the egress rules admit no destination";
-    // The line the package's spec build writes when its fetch fails, and the
-    // error the launch's build returns.
-    let output = format!(
-        "could not fetch the source \
-         https://deb.debian.org/debian/pool/main/m/minisat2/minisat2_2.2.1.orig.tar.gz: \
-         other: {refused}"
-    );
-    let failed = mctx::Error::from(orchestrator::Error::BuildFailed(
-        "fetch876".to_string(),
-        op::Error::Other(anyhow::anyhow!("{refused}")),
-    ))
-    .to_string();
-    let launch = |placement: BuildPlacement, failure: Option<String>| {
-        let output = output.clone();
-        async move {
-            let (log_tx, log_rx) = futures::channel::mpsc::unbounded();
-            let build = async move {
-                for event in build_events("fetch876", &[output.as_str()]) {
-                    log_tx.unbounded_send(event).unwrap();
-                }
-                failure
-            };
-            tapped_build(build, log_rx, &placement).await
-        }
-    };
-
-    let denied = launch(placement(Verdict::Deny), Some(failed.clone()))
-        .await
-        .expect_err("the deny-all box's launch build fails");
-    // The refusal line leads, in the words of the box's own refusal (the
-    // remedy sentence after it is `egress_rules_refuse`'s, not this
-    // branch's), and the build's own error follows on the next line.
-    let (first, rest) = denied.split_once('\n').expect("two lines");
-    assert!(
-        first.starts_with(
-            "the build of fetch876 could not reach deb.debian.org: \
-             the egress rules of box d876x1 do not allow it"
-        ),
-        "{denied}"
-    );
-    assert_eq!(rest, failed);
-    assert!(
-        denied
-            .lines()
-            .any(|line| line.contains("deb.debian.org") && line.contains("d876x1")),
-        "{denied}"
-    );
-    assert!(!denied.contains(box_id), "{denied}");
-
-    // A box its rules allow the host is never reported as refused: its
-    // failure is the line any build's connect failure gets (NET-155,
-    // `unreachable_source`), with no refusal ahead of it.
-    let allowed = launch(placement(Verdict::Allow), Some(failed.clone()))
-        .await
-        .expect_err("the allowed box's launch build fails");
-    assert_eq!(
-        allowed,
-        crate::env::unreachable_source(&failed, "d876x1").expect("a connect failure is named")
-    );
-    assert!(!allowed.contains("do not allow it"), "{allowed}");
-    assert_eq!(launch(placement(Verdict::Deny), None).await, Ok(()));
-}
-
-/// NET-155: a web source that redirects to another host fails on that
-/// host, and the refusal names the host the download could not connect to.
-/// When the failure names no host, the source's own host stands in.
-#[test]
-fn box_build_web_source_under_box_verdict_names_the_host_it_could_not_reach() {
-    use crate::env::refused_destination;
-
-    // The source redirects to a CDN host the box does not allow.
-    assert_eq!(
-        refused_destination([
-            "could not fetch the source https://downloads.example.org/fetcher-1.0.tar.zst: \
-             other: could not connect to CDN.example.net:443: the egress rules refused it",
-        ])
-        .as_deref(),
-        Some("cdn.example.net")
-    );
-    // A literal IPv6 address keeps its colons and loses its port.
-    assert_eq!(
-        refused_destination([
-            "could not fetch the source https://downloads.example.org/fetcher-1.0.tar.zst: \
-             other: could not connect to 2001:db8::1:443: refused",
-        ])
-        .as_deref(),
-        Some("2001:db8::1")
-    );
-    // The failure names no host: the source's host stands in.
-    assert_eq!(
-        refused_destination([
-            "could not fetch the source https://downloads.example.org/fetcher-1.0.tar.zst: \
-             other: could not connect to ",
-        ])
-        .as_deref(),
-        Some("downloads.example.org")
-    );
-}
-
-/// NET-155: a materialize reports the error of a package build it started
-/// the way the build side operation does. A build in a deny leaf whose
-/// output names a refused destination fails with the refusal, which names
-/// the destination and the box, before the build's own error.
-#[test]
-fn box_package_build_refusal_names_destination_and_box_for_materialize() {
-    use crate::box_ops::{BuildPlacement, BuildTap};
-    use sandbox::config::{ClassifierLeaf, Verdict};
-
-    let root = std::path::Path::new("/sys/fs/cgroup/minimald.slice");
-    let placement = BuildPlacement {
-        box_name: "sealed".to_string(),
-        leaf: Some(ClassifierLeaf::under(root, "sealed", Verdict::Deny)),
-        network: None,
-    };
-    let mut tap = BuildTap::default();
-    for event in build_events(
-        "fetcher",
-        &[
-            "curl: (6) Could not resolve host: downloads.example.org",
-            "build command failed",
-        ],
-    ) {
-        tap.observe(&event, &placement);
-    }
-    let failed = mctx::Error::from(orchestrator::Error::BuildFailed(
-        "fetcher".to_string(),
-        op::Error::Other(anyhow::anyhow!("build command failed")),
-    ))
-    .to_string();
-    assert_eq!(
-        tap.failure(&placement, failed.clone()),
-        format!(
-            "the build of fetcher could not reach downloads.example.org: \
-             the egress rules of box sealed do not allow it. \
-             To allow it, activate a new session with \
-             --network own_ip --allow-dns-hosts downloads.example.org. \
-             Or add downloads.example.org to network.egress.allow_dns_hosts under [defaults] in minimal.toml, \
-             then activate a new session with --network own_ip\n{failed}"
-        )
-    );
-}
-
-/// NET-155: a materialize build in a deny leaf that fails for a reason other
-/// than the box's egress rules keeps the build's own error, unchanged.
-#[test]
-fn box_package_build_refusal_names_destination_and_box_for_materialize_only_when_refused() {
-    use crate::box_ops::{BuildPlacement, BuildTap};
-    use sandbox::config::{ClassifierLeaf, Verdict};
-
-    let root = std::path::Path::new("/sys/fs/cgroup/minimald.slice");
-    let placement = BuildPlacement {
-        box_name: "sealed".to_string(),
-        leaf: Some(ClassifierLeaf::under(root, "sealed", Verdict::Deny)),
-        network: None,
-    };
-    let mut tap = BuildTap::default();
-    for event in build_events("compiler", &["cc -c hello.c", "error: cc failed"]) {
-        tap.observe(&event, &placement);
-    }
-    let failed = mctx::Error::from(orchestrator::Error::BuildFailed(
-        "compiler".to_string(),
-        op::Error::Other(anyhow::anyhow!("build command failed")),
-    ))
-    .to_string();
-    assert_eq!(tap.failure(&placement, failed.clone()), failed);
-}
-
-/// NET-155: the error of a build the box's egress rules refused names the
-/// destination the build could not reach and the box whose rules refused
-/// it, for the failure lines of `curl`, `wget` and `git`.
-#[test]
-fn box_package_build_refusal_names_destination_and_box() {
-    use crate::env::{build_denies_all, egress_refusal, refused_destination};
-    use sandbox::config::{ClassifierLeaf, Verdict};
-
-    let root = std::path::Path::new("/sys/fs/cgroup/minimald.slice");
-    let deny = ClassifierLeaf::under(root, "b1", Verdict::Deny);
-    let allow = ClassifierLeaf::under(root, "b1", Verdict::Allow);
-
-    let cases: [(&str, &str); 6] = [
-        (
-            "curl: (7) Failed to connect to example.com port 443 after 2 ms: Couldn't connect to server",
-            "example.com:443",
-        ),
-        (
-            "curl: (6) Could not resolve host: example.com",
-            "example.com",
-        ),
-        (
-            "fatal: unable to access 'https://github.com/o/r/': Could not resolve host: github.com",
-            "github.com",
-        ),
-        (
-            "Resolving example.com (example.com)... failed: Temporary failure in name resolution.",
-            "example.com",
-        ),
-        (
-            "Connecting to example.com (example.com)|93.184.215.14|:443... failed: No route to host.",
-            "example.com:443",
-        ),
-        (
-            "Connecting to 93.184.215.14:80... failed: No route to host.",
-            "93.184.215.14:80",
-        ),
-    ];
-    for (line, destination) in cases {
-        // A literal address has no flag that helps. A flag takes no port.
-        let step = match destination.split(':').next().unwrap() {
-            "93.184.215.14" => String::new(),
-            host => format!(
-                ". To allow it, activate a new session with \
-                --network own_ip --allow-dns-hosts {host}. \
-                Or add {host} to network.egress.allow_dns_hosts under [defaults] in minimal.toml, \
-                then activate a new session with --network own_ip"
-            ),
-        };
-        assert_eq!(
-            refused_destination(["make: entering", line]).as_deref(),
-            Some(destination),
-            "{line}"
-        );
-        assert_eq!(
-            egress_refusal(
-                build_denies_all(Some(&deny), None),
-                "hello",
-                "my-box",
-                [line]
-            ),
-            Some(format!(
-                "the build of hello could not reach {destination}: \
-                 the egress rules of box my-box do not allow it{step}"
-            )),
-        );
-        // An allowed box's failure is the destination's, not the rules'.
-        assert_eq!(
-            egress_refusal(
-                build_denies_all(Some(&allow), None),
-                "hello",
-                "my-box",
-                [line]
-            ),
-            None
-        );
-        assert_eq!(
-            egress_refusal(build_denies_all(None, None), "hello", "my-box", [line]),
-            None
-        );
-    }
-    // An earlier tolerated failure does not hide the one that ended the build.
-    assert_eq!(
-        refused_destination([
-            "curl: (6) Could not resolve host: optional.example",
-            "make: entering",
-            "curl: (7) Failed to connect to example.com port 443 after 2 ms: Couldn't connect to server",
-        ])
-        .as_deref(),
-        Some("example.com:443"),
-    );
-    // A failure that names no destination is left as the build said it.
-    assert_eq!(
-        egress_refusal(
-            build_denies_all(Some(&deny), None),
-            "hello",
-            "my-box",
-            ["error: cc failed"]
-        ),
-        None
-    );
-    // Box-zone names are not subject to egress rules: a deny box that cannot
-    // resolve or reach one was not refused by its rules.
-    for line in [
-        "curl: (6) Could not resolve host: web.min.internal",
-        "curl: (7) Failed to connect to host.min.internal port 8080 after 1 ms: Couldn't connect to server",
-        "curl: (6) Could not resolve host: min.internal",
-    ] {
-        assert_eq!(
-            egress_refusal(
-                build_denies_all(Some(&deny), None),
-                "hello",
-                "my-box",
-                [line]
-            ),
-            None,
-            "{line}"
-        );
-    }
-    // A name that only ends in the apex text is not in the zone.
-    assert!(
-        egress_refusal(
-            build_denies_all(Some(&deny), None),
-            "hello",
-            "my-box",
-            ["curl: (6) Could not resolve host: evilmin.internal"]
-        )
-        .is_some()
-    );
-}
-
-/// NET-155: the in-box patched build reports a refusal only when the
-/// build's own error carries the refused destination. A deny box whose build
-/// tolerated a failed download and then failed to compile keeps the compile
-/// error.
-#[test]
-fn box_package_build_refusal_names_destination_and_box_only_for_the_error() {
-    use crate::env::{build_denies_all, patched_build_refusal};
-    use sandbox::config::{ClassifierLeaf, Verdict};
-
-    let root = std::path::Path::new("/sys/fs/cgroup/minimald.slice");
-    let deny = ClassifierLeaf::under(root, "b1", Verdict::Deny);
-    let denies_all = build_denies_all(Some(&deny), None);
-    let download = "curl: (7) Failed to connect to example.com port 443 after 2 ms: Couldn't connect to server";
-
-    // The download ended the build: its error carries the failed download.
-    let failure = format!("Invocation 0 failed with exit code 7: exit status\nstderr:\n{download}");
-    assert_eq!(
-        patched_build_refusal(
-            denies_all,
-            "hello",
-            "my-box",
-            &failure,
-            ["make: entering", download]
-        ),
-        Some(
-            "the build of hello could not reach example.com:443: \
-             the egress rules of box my-box do not allow it. \
-             To allow it, activate a new session with \
-             --network own_ip --allow-dns-hosts example.com. \
-             Or add example.com to network.egress.allow_dns_hosts under [defaults] in minimal.toml, \
-             then activate a new session with --network own_ip"
-                .to_string()
-        )
-    );
-
-    // A compile failure after a tolerated download is the build's own error.
-    let failure = "Invocation 0 failed with exit code 1: exit status\nstderr:\nerror: cc failed";
-    assert_eq!(
-        patched_build_refusal(
-            denies_all,
-            "hello",
-            "my-box",
-            failure,
-            [download, "cc -c hello.c", "error: cc failed"]
-        ),
-        None
-    );
-}
-
-/// NET-155: the build output tap ends a line at `\r` as well as `\n`, holds
-/// a bounded part of an unfinished line, and keeps the last unfinished line
-/// when it shuts down, so a final failure with no newline is still read.
-#[tokio::test]
-async fn box_package_build_refusal_names_destination_and_box_from_unfinished_output() {
-    use crate::env::{LineTap, refused_destination};
-    use tokio::io::AsyncWriteExt;
-
-    let lines = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-    let mut tap = LineTap::new(tokio::io::sink(), lines.clone());
-    for pct in 0..1000 {
-        tap.write_all(format!("  {pct:>3}% [=====>      ] 1.2MB/s\r").as_bytes())
-            .await
-            .unwrap();
-        assert_eq!(tap.pending(), 0);
-    }
-    // A long run with no line end at all keeps only a bounded tail.
-    tap.write_all(&vec![b'#'; 64 * 1024]).await.unwrap();
-    assert!(tap.pending() <= 4096, "held {} bytes", tap.pending());
-    tap.write_all(b"\n").await.unwrap();
-    tap.write_all(b"curl: (7) Failed to connect to example.com port 443")
-        .await
-        .unwrap();
-    tap.shutdown().await.unwrap();
-
-    let lines = lines.lock().unwrap();
-    assert!(lines.len() <= 64);
-    assert_eq!(
-        refused_destination(lines.iter().map(String::as_str)).as_deref(),
-        Some("example.com:443")
-    );
-}
-
-/// NET-155: a task of a box whose launch placed it in a classifier leaf is
-/// refused when the task's context has no leaf, with the same text the build
-/// side operation gives. Its builds never run outside the box's egress verdict.
-#[test]
-fn box_package_build_under_box_egress_verdict_refuses_task_of_placed_box_without_leaf() {
-    let refusal =
-        crate::exec::task_build_refusal(Some(boxes::HostIpEnforcement::PerBox), "sealed", false)
-            .expect_err("a placed box with no leaf has its task refused");
-    assert_eq!(refusal.kind(), std::io::ErrorKind::PermissionDenied);
-    assert_eq!(
-        refusal.to_string(),
-        "the build for box sealed did not start: box sealed runs under \
-         egress rules, and its shell is not running to apply them to the \
-         build. Run `min session attach sealed` to start its shell, then \
-         run the build again."
-    );
-    assert_eq!(
-        Err(refusal.to_string()),
-        super::setup::box_build_leaf(
-            tempfile::tempdir().unwrap().path(),
-            "sealed",
-            "sealed",
-            true
-        ),
-        "the task refusal and the build refusal say the same thing"
-    );
-    // A placed box with its leaf builds in that leaf.
-    crate::exec::task_build_refusal(Some(boxes::HostIpEnforcement::PerBox), "sealed", true)
-        .expect("a placed box with its leaf builds");
-}
-
-/// NET-155: a task of a box that was never placed in a leaf still builds,
-/// in the daemon's own cgroup, as before.
-#[test]
-fn box_package_build_under_box_egress_verdict_builds_task_of_box_never_placed() {
-    for enforcement in [None, Some(boxes::HostIpEnforcement::None)] {
-        crate::exec::task_build_refusal(enforcement, "plain", false)
-            .expect("a box that was never placed builds without a leaf");
-    }
-}
-
 /// The handle of the box `id` on `server`.
 async fn box_handle(server: &TestServer, id: SessionId) -> crate::box_actor::BoxHandle {
     server
@@ -15041,47 +14428,6 @@ async fn box_handle(server: &TestServer, id: SessionId) -> crate::box_actor::Box
         .await
         .unwrap()
         .expect("session should resolve")
-}
-
-/// NET-155: `min check` on a box whose launch placed it in a classifier leaf
-/// is refused when that leaf is gone, with the same text a task gives. Its
-/// package builds never run in the daemon's own cgroup.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn box_package_build_under_box_egress_verdict_refuses_check_of_placed_box_without_leaf() {
-    let server = TestServer::new().await;
-    let mut client = server.connect().await;
-    let id = create_configured_session(&mut client, "check-sealed", "/uwu").await;
-    rewrite_record(&server, id, |record| {
-        record.host_ip_enforcement = Some(boxes::HostIpEnforcement::PerBox);
-    })
-    .await;
-
-    let refusal = box_handle(&server, id)
-        .await
-        .start_check(crate::box_ops::CheckOpts::from_args("").unwrap())
-        .await
-        .expect_err("a placed box with no leaf has its check refused");
-    assert_eq!(refusal.kind(), std::io::ErrorKind::PermissionDenied);
-    assert_eq!(
-        refusal.to_string(),
-        super::placed_box_build_refusal("check-sealed")
-    );
-}
-
-/// NET-155: `min check` on a box that was never placed in a leaf still
-/// starts, and its builds run in the daemon's own cgroup, as before.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn box_package_build_under_box_egress_verdict_starts_check_of_box_never_placed() {
-    let server = TestServer::new().await;
-    let mut client = server.connect().await;
-    let id = create_configured_session(&mut client, "check-plain", "/uwu").await;
-    assert_eq!(read_record(&server, id).await.host_ip_enforcement, None);
-
-    box_handle(&server, id)
-        .await
-        .start_check(crate::box_ops::CheckOpts::from_args("").unwrap())
-        .await
-        .expect("a box that was never placed starts a check");
 }
 
 /// inbox#1245: the context the box actor builds for a box confines its
@@ -15168,7 +14514,7 @@ fn a_box_context_keys_task_state_on_the_records_project() {
     );
 }
 
-/// A box record for the NET-155 tests, in `mode` and under `egress`.
+/// A box record in `mode` and under `egress`.
 fn build_record(mode: boxes::NetworkMode, egress: Option<boxes::EgressPolicy>) -> boxes::Record {
     boxes::Record {
         id: boxes::SessionId::nil(),
@@ -15197,178 +14543,6 @@ fn build_record(mode: boxes::NetworkMode, egress: Option<boxes::EgressPolicy>) -
         attrs: Default::default(),
     }
 }
-
-/// A switch on a VM host, which a test never reaches.
-fn build_switch() -> std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>> {
-    std::sync::Arc::new(tokio::sync::Mutex::new(
-        crate::net::SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy").with_transport(
-            crate::net::SwitchTransport::HostShuttle {
-                cid: crate::net::VSOCK_HOST_CID,
-                port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
-            },
-        ),
-    ))
-}
-
-/// NET-155: an own-address box has no classifier leaf. Its package build
-/// runs on the box's own network, under the box's egress rules, and never
-/// as the daemon's own traffic. A deny-all box's build that cannot reach its
-/// download is reported as refused by the box's rules. A box allowed the
-/// destination is never reported as refused. Before each build attaches,
-/// the network asks whether the box's host-side row stands, as a task run
-/// does, so a build never attaches under another box's row.
-#[tokio::test]
-async fn box_package_build_under_box_egress_verdict_runs_own_address_box_on_its_network() {
-    use crate::box_ops::{BuildPlacement, BuildTap};
-    let switch = build_switch();
-
-    let sealed = build_record(
-        boxes::NetworkMode::OwnIp,
-        Some(boxes::EgressPolicy::deny_all()),
-    );
-    let network = super::setup::own_address_build_network(&sealed, &switch, false)
-        .expect("an own-address box builds on its own network");
-    assert!(network.denies_all());
-    assert!(format!("{:?}", network.network()).contains("OwnAddressBuildNetwork"));
-    // With no `egress` section, the deny-all default applies to the build.
-    let defaulted = build_record(boxes::NetworkMode::OwnIp, None);
-    assert!(
-        super::setup::own_address_build_network(&defaulted, &switch, false)
-            .unwrap()
-            .denies_all()
-    );
-
-    let open = build_record(
-        boxes::NetworkMode::OwnIp,
-        Some(boxes::EgressPolicy {
-            allow_subnets: Some(Vec::new()),
-            allow_dns_hosts: Some(vec!["downloads.example.org".to_string()]),
-            allow_protocols: None,
-            deny_subnets: None,
-        }),
-    );
-    let open_network = super::setup::own_address_build_network(&open, &switch, false)
-        .expect("an allowed own-address box builds on its own network");
-    assert!(!open_network.denies_all());
-
-    let download = [
-        "curl: (6) Could not resolve host: downloads.example.org",
-        "build command failed",
-    ];
-    let failed = mctx::Error::from(orchestrator::Error::BuildFailed(
-        "fetcher".to_string(),
-        op::Error::Other(anyhow::anyhow!("build command failed")),
-    ))
-    .to_string();
-    let run = |network: op::BuildNetwork| {
-        let placement = BuildPlacement {
-            box_name: "sealed".to_string(),
-            leaf: None,
-            network: Some(network),
-        };
-        let mut tap = BuildTap::default();
-        for event in build_events("fetcher", &download) {
-            tap.observe(&event, &placement);
-        }
-        tap.refusal(&placement, &failed)
-    };
-    assert_eq!(
-        run(network.clone()).as_deref(),
-        Some(
-            "the build of fetcher could not reach downloads.example.org: \
-             the egress rules of box sealed do not allow it. \
-             To allow it, activate a new session with \
-             --network own_ip --allow-dns-hosts downloads.example.org. \
-             Or add downloads.example.org to network.egress.allow_dns_hosts under [defaults] in minimal.toml, \
-             then activate a new session with --network own_ip"
-        )
-    );
-    assert_eq!(run(open_network), None);
-
-    // A box the VM host registered, whose row the host cannot confirm, has
-    // its build's network refused before anything attaches.
-    let mut registered = sealed.clone();
-    registered.box_addresses = Some(boxes::BoxAddresses {
-        switch_address: std::net::Ipv4Addr::new(192, 168, 127, 10),
-        loopback_address: std::net::Ipv4Addr::new(127, 77, 0, 10),
-    });
-    let network = super::setup::own_address_build_network(&registered, &switch, false).unwrap();
-    let refused = network
-        .network()
-        .plan()
-        .await
-        .expect_err("a build of a box whose row is not confirmed does not attach");
-    assert!(
-        refused.to_string().contains("could not confirm"),
-        "{refused}"
-    );
-}
-
-/// NET-155: a box with no network gets a network that gives its builds none,
-/// never the daemon's. Its record has no rules, so nothing reports a failure
-/// as the box's rules. Every other box keeps the placement its mode gives it.
-#[test]
-fn box_package_build_under_box_egress_verdict_gives_no_network_box_none() {
-    let switch = build_switch();
-    let record = build_record(boxes::NetworkMode::NoNet, None);
-    let network = super::setup::box_build_network(&record, &switch, false)
-        .expect("a box with no network has a build network");
-    assert!(network.is_none());
-    assert!(!network.denies_all());
-
-    let own = build_record(boxes::NetworkMode::OwnIp, None);
-    let network = super::setup::box_build_network(&own, &switch, false).unwrap();
-    assert!(!network.is_none());
-
-    let mut host = build_record(boxes::NetworkMode::HostNet, None);
-    host.host_ip_enforcement = Some(boxes::HostIpEnforcement::None);
-    assert!(super::setup::box_build_network(&host, &switch, false).is_none());
-}
-
-/// NET-155: a host-address box with no per-box enforcement has no leaf and
-/// no network of its own. Its build runs in the daemon's own cgroup, because
-/// the box has no enforcement, and no failure is reported as the box's rules.
-#[test]
-fn box_package_build_under_box_egress_verdict_builds_unenforced_box_without_rules() {
-    use crate::box_ops::{BuildPlacement, BuildTap};
-    let switch = build_switch();
-    let mut record = build_record(
-        boxes::NetworkMode::HostNet,
-        Some(boxes::EgressPolicy::deny_all()),
-    );
-    record.host_ip_enforcement = Some(boxes::HostIpEnforcement::None);
-    assert!(super::setup::own_address_build_network(&record, &switch, false).is_none());
-    assert_eq!(
-        super::setup::box_build_leaf(
-            tempfile::tempdir().unwrap().path(),
-            "sealed",
-            "sealed",
-            false
-        ),
-        Ok(None)
-    );
-    let placement = BuildPlacement {
-        box_name: "sealed".to_string(),
-        leaf: None,
-        network: None,
-    };
-    assert!(!placement.denies_all());
-    let mut tap = BuildTap::default();
-    for event in build_events(
-        "fetcher",
-        &["curl: (6) Could not resolve host: downloads.example.org"],
-    ) {
-        tap.observe(&event, &placement);
-    }
-    assert_eq!(
-        tap.refusal(
-            &placement,
-            "`fetcher` failed to build: build command failed"
-        ),
-        None
-    );
-}
-
 /// Spawns a stand-in box: `/bin/sh` sets `trap`, then loops on `sleep`.
 /// It answers once the shell set the trap and started its first `sleep`, so
 /// a stop never reaches a shell that still has the default SIGTERM action.
@@ -15389,6 +14563,32 @@ fn spawn_stand_in_box(trap: &str) -> std::process::Child {
         .expect("read the stand-in box's ready line");
     assert_eq!(line.trim(), "ready", "the stand-in box set its trap");
     child
+}
+
+/// A stand-in pinned by a pidfd, opened before its waiter can reap it. It
+/// sends the stand-in SIGKILL when dropped, however the test ends, so a
+/// stand-in that a stop failed to end cannot leave its blocking waiter to
+/// hang the test. The waiter then reaps it. Every signal goes through the
+/// pidfd, so one sent after the reap reaches no other process that got the
+/// stand-in's pid.
+struct KillOnDrop(std::os::fd::OwnedFd);
+
+impl KillOnDrop {
+    /// Pins `child`, which nothing has reaped yet.
+    fn pin(child: &std::process::Child) -> Self {
+        Self(crate::box_runtime::pidfd_open(child.id()).expect("pin the stand-in"))
+    }
+
+    /// Sends `signal` to the pinned stand-in, unless it was reaped.
+    fn signal(&self, signal: i32) {
+        crate::box_runtime::pidfd_send_signal(&self.0, signal);
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        self.signal(libc::SIGKILL);
+    }
 }
 
 /// A stand-in host loop for `child`: it reaps the child and reports the end
@@ -15647,6 +14847,600 @@ async fn stop_records_an_entrypoint_exit_125_as_its_exit_code() {
     assert_eq!(exited["reason"], "stopped");
     assert_eq!(exited["exit_code"], 125);
     assert!(!exited.contains_key("signal"));
+}
+
+/// BOX-013: a stop ends the task containers recorded beside the box, not
+/// only the box's own processes. A task's TERM trap runs, its shell exits 0,
+/// and nothing of the task outlives the stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_ends_the_recorded_task_containers() {
+    let box_id = SessionId::mint();
+    // A stand-in task. The trap is the proof the stop's signal reached the
+    // task container: without it the shell is signalled to 125, with it the
+    // shell exits 0. No `echo` — the stand-in's stdout pipe is already
+    // closed, and a trap that writes dies of SIGPIPE before it can exit 0.
+    let child = spawn_stand_in_box("trap 'exit 0' TERM");
+    let processes = crate::box_runtime::BoxProcesses::of_container(child.id());
+    assert!(!processes.pids().is_empty(), "the stand-in task runs");
+    let _record = crate::box_runtime::record_task_container(
+        crate::box_runtime::untracked_task_run(box_id),
+        child.id(),
+    )
+    .unwrap();
+    // The entrypoint wraps the task container, as a task box's entrypoint
+    // wraps the relay: the task's end is the entrypoint's end.
+    let entrypoint = stand_in_entrypoint(child);
+
+    let started = std::time::Instant::now();
+    let _stop = super::stop_task_containers(
+        box_id,
+        &entrypoint,
+        false,
+        Duration::from_secs(5),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the task container ends within the stop's grace period"
+    );
+    let exit = entrypoint.await.unwrap().unwrap();
+    assert_eq!(
+        exit.code, 0,
+        "the task container's trap ran; its shell exited 0, not signalled"
+    );
+    assert_eq!(exit.reason.unwrap().exit_code, Some(0));
+    assert!(
+        processes.pids().is_empty(),
+        "no process of the task outlives the stop"
+    );
+    assert!(
+        crate::box_runtime::take_task_containers(box_id).is_empty(),
+        "the stop drained the box's task containers"
+    );
+
+    // A box with no recorded container — no task ran, or the run returned —
+    // signals nothing and ends at once: the entrypoint is untouched. The
+    // stand-in ignores TERM, so the proof ends it: kill, then reap.
+    drop(_stop);
+    let relay = spawn_stand_in_box("trap '' TERM");
+    let relay_cleanup = KillOnDrop::pin(&relay);
+    let entrypoint = stand_in_entrypoint(relay);
+    let _stop = super::stop_task_containers(
+        box_id,
+        &entrypoint,
+        false,
+        Duration::from_millis(200),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .await;
+    assert!(
+        !entrypoint.is_finished(),
+        "a stop without a recorded task container leaves the box alone"
+    );
+    // The stand-in ignores TERM, so SIGKILL is what ends it; the await
+    // reaps it.
+    drop(relay_cleanup);
+    entrypoint.await.unwrap().unwrap();
+}
+
+/// BOX-013: a forced stop kills the recorded task containers at once,
+/// without the grace period, and cuts a graceful stop's grace short the same
+/// way it does the box's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_forces_the_recorded_task_containers() {
+    let box_id = SessionId::mint();
+    // A task that ignores TERM, apart from noting it got it: only the
+    // forced SIGKILL ends it. The note is written to a file, because the
+    // stand-in's stdout pipe is closed.
+    let dir = tempfile::tempdir().unwrap();
+    let termed = dir.path().join("termed");
+    let child = spawn_stand_in_box(&format!("trap ': > {}' TERM", termed.display()));
+    let task_pid = child.id();
+    let _cleanup = KillOnDrop::pin(&child);
+    let processes = crate::box_runtime::BoxProcesses::of_container(task_pid);
+    let entrypoint = stand_in_entrypoint(child);
+    let _record = crate::box_runtime::record_task_container(
+        crate::box_runtime::untracked_task_run(box_id),
+        task_pid,
+    )
+    .unwrap();
+    let forced = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // The force arrives once the graceful stop is in its grace period: the
+    // task got its SIGTERM, so the stop is past its check for a force at
+    // the start. The time is read before the flag is set, so the stop
+    // cannot end before it.
+    let setter = std::sync::Arc::clone(&forced);
+    let (set, set_at) = tokio::sync::oneshot::channel();
+    // A task that never notes its SIGTERM fails the test: the setter gives
+    // up, and the dropped sender fails the wait for the force.
+    let _setter = crate::traced::spawn(async move {
+        let termed = tokio::time::timeout(Duration::from_secs(10), async {
+            while !termed.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if termed.is_ok() {
+            let at = std::time::Instant::now();
+            setter.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = set.send(at);
+        }
+    });
+    let _stop = tokio::time::timeout(
+        Duration::from_secs(20),
+        super::stop_task_containers(box_id, &entrypoint, false, Duration::from_secs(60), &forced),
+    )
+    .await
+    .expect("the forced stop ended the graceful stop");
+    let ended = std::time::Instant::now();
+    let set_at = tokio::time::timeout(Duration::from_secs(10), set_at)
+        .await
+        .expect("the force was set in time")
+        .expect("the task noted its SIGTERM, and the force was set");
+    assert!(
+        ended >= set_at && ended - set_at < Duration::from_secs(5),
+        "the graceful stop of the task containers ends when the forced stop arrives, not \
+         before it and not at the grace period's end"
+    );
+    let exit = tokio::time::timeout(Duration::from_secs(10), entrypoint)
+        .await
+        .expect("the forced SIGKILL ended the task")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        exit.code, 125,
+        "the killed task carries the container's 125"
+    );
+    assert_eq!(
+        exit.reason.map(|reason| reason.reason).as_deref(),
+        Some(format!("container received signal {}", libc::SIGKILL).as_str()),
+        "the escalation ended the task with SIGKILL"
+    );
+    assert!(
+        processes.pids().is_empty(),
+        "no process of the task outlives the forced stop"
+    );
+}
+
+/// BOX-013: the task containers' grace period ends when the last of them
+/// ends, not when the box's entrypoint does. A session box's shell outlives
+/// the task run in it, and its stop must not wait the whole grace period for
+/// that shell before the box's own stop starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_ends_the_task_containers_without_waiting_out_a_lasting_entrypoint() {
+    let box_id = SessionId::mint();
+    let task = spawn_stand_in_box("trap 'exit 0' TERM");
+    let task_pid = task.id();
+    let processes = crate::box_runtime::BoxProcesses::of_container(task_pid);
+    let _record = crate::box_runtime::record_task_container(
+        crate::box_runtime::untracked_task_run(box_id),
+        task_pid,
+    )
+    .unwrap();
+    let task = stand_in_entrypoint(task);
+    // The session's shell: it ignores TERM and does not end with the task.
+    let shell = spawn_stand_in_box("trap '' TERM");
+    let shell_cleanup = KillOnDrop::pin(&shell);
+    let entrypoint = stand_in_entrypoint(shell);
+
+    let started = std::time::Instant::now();
+    let _stop = super::stop_task_containers(
+        box_id,
+        &entrypoint,
+        false,
+        Duration::from_secs(60),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < super::TASK_EXIT_RELAY_WAIT + Duration::from_secs(3),
+        "the stop of the task containers ends soon after the task, not after the grace period: \
+         {elapsed:?}"
+    );
+    assert_eq!(task.await.unwrap().unwrap().code, 0, "the task's trap ran");
+    assert!(processes.pids().is_empty(), "the task is gone");
+    assert!(
+        !entrypoint.is_finished(),
+        "the session's shell is left to the box's own stop"
+    );
+    // The stand-in ignores TERM, so SIGKILL is what ends it; the await
+    // reaps it.
+    drop(shell_cleanup);
+    tokio::time::timeout(Duration::from_secs(10), entrypoint)
+        .await
+        .expect("the SIGKILL ended the session's shell")
+        .unwrap()
+        .unwrap();
+}
+
+/// BOX-013: a task container that cannot be pinned with a pidfd is not
+/// recorded, so its run kills it: a stop could only signal it by pid, which
+/// a reaped container may have left to another process.
+#[test]
+fn a_task_container_that_cannot_be_pinned_is_refused() {
+    let box_id = SessionId::mint();
+    let refused = crate::box_runtime::record_task_container_opening(
+        crate::box_runtime::untracked_task_run(box_id),
+        4_000_004,
+        |_| Err(std::io::Error::from_raw_os_error(libc::ENOSYS)),
+    )
+    .expect_err("an unpinned container is refused");
+    assert!(matches!(
+        refused,
+        crate::box_runtime::TaskContainerRefused::Unpinned(_)
+    ));
+    assert_eq!(
+        refused.to_string(),
+        format!(
+            "the task cannot run in this box: this kernel cannot open a pidfd on its process, \
+             which `min box stop` needs to stop it ({})",
+            std::io::Error::from_raw_os_error(libc::ENOSYS)
+        )
+    );
+    assert_eq!(
+        crate::box_runtime::task_containers_recorded(box_id),
+        0,
+        "nothing is recorded"
+    );
+}
+
+/// BOX-013: a stop that starts after a task run's container was reaped,
+/// before the run sent its exit to the in-box helper, waits for that exit.
+/// The helper then ends with the task's exit, and the box records that, not
+/// the signal of the box's own stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_after_the_reap_waits_for_the_task_exit() {
+    use std::io::BufRead as _;
+
+    let box_id = SessionId::mint();
+    let dir = tempfile::tempdir().unwrap();
+    let exit_line = dir.path().join("exit");
+    // The in-box helper: it exits with the code the run sends it. A SIGTERM
+    // before that ends it by signal.
+    let mut helper = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(r#"echo ready; while [ ! -s "$1" ]; do sleep 0.05; done; exit "$(cat "$1")""#)
+        .arg("sh")
+        .arg(&exit_line)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the stand-in helper");
+    let mut line = String::new();
+    std::io::BufReader::new(helper.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert_eq!(line.trim(), "ready");
+    let cleanup = KillOnDrop::pin(&helper);
+    let entrypoint = stand_in_entrypoint(helper);
+
+    // The run's container ran and was reaped. Its network teardown and the
+    // exit it sends are still to come.
+    let run = crate::box_runtime::begin_task_run(box_id);
+    let mut task = std::process::Command::new("/bin/true").spawn().unwrap();
+    let record = crate::box_runtime::record_task_container(run.id(), task.id()).unwrap();
+    task.wait().unwrap();
+    drop(record);
+    // The run delivers after the stop's wait for the entrypoint alone would
+    // have ended, and within its wait for the delivery: without that wait,
+    // the box's own stop signals the helper before the exit arrives.
+    let delivery = super::TASK_EXIT_RELAY_WAIT + Duration::from_millis(1500);
+    assert!(delivery < super::TASK_EXIT_DELIVERY_WAIT);
+    let deliver = crate::traced::spawn(async move {
+        tokio::time::sleep(delivery).await;
+        std::fs::write(&exit_line, b"7").unwrap();
+        drop(run);
+    });
+
+    let _stop = super::stop_task_containers(
+        box_id,
+        &entrypoint,
+        false,
+        Duration::from_secs(5),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .await;
+    // The box's own stop signals the helper next.
+    if !entrypoint.is_finished() {
+        cleanup.signal(libc::SIGTERM);
+    }
+    let exit = tokio::time::timeout(Duration::from_secs(10), entrypoint)
+        .await
+        .expect("the helper ended")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        exit.code, 7,
+        "the box records the task's exit, not the stop's signal"
+    );
+    deliver.await.unwrap();
+}
+
+/// BOX-013: a task container reaped before the stop signals it gets no
+/// signal, even when the kernel gave its pid to another child of the daemon.
+/// The record's pidfd pins the reaped process, so neither the stop's SIGTERM
+/// nor its SIGKILL escalation reaches the process that holds the pid now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reaped_task_container_gets_no_signal_through_a_reused_pid() {
+    let box_id = SessionId::mint();
+    // The container that ran the task: pinned, then reaped.
+    let mut reaped = spawn_stand_in_box("trap '' TERM");
+    let pidfd = crate::box_runtime::pidfd_open(reaped.id()).expect("pin the task container");
+    reaped.kill().unwrap();
+    reaped.wait().unwrap();
+    // Another child of the daemon, standing in for the process the kernel
+    // gave the reaped pid to: the record names its pid. A SIGTERM would end
+    // it with 0, a SIGKILL by signal.
+    let mut holder = spawn_stand_in_box("trap 'exit 0' TERM");
+    let _reaped_record = crate::box_runtime::record_task_container_opening(
+        crate::box_runtime::untracked_task_run(box_id),
+        holder.id(),
+        move |_| Ok(pidfd),
+    )
+    .unwrap();
+    // A live task container that ignores TERM, so the stop sends both its
+    // SIGTERM and its SIGKILL escalation.
+    let live = spawn_stand_in_box("trap '' TERM");
+    let _live_record = crate::box_runtime::record_task_container(
+        crate::box_runtime::untracked_task_run(box_id),
+        live.id(),
+    )
+    .unwrap();
+    let entrypoint = stand_in_entrypoint(live);
+
+    let _stop = super::stop_task_containers(
+        box_id,
+        &entrypoint,
+        false,
+        Duration::from_millis(300),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .await;
+    assert_eq!(
+        entrypoint.await.unwrap().unwrap().code,
+        125,
+        "the live task container got the SIGKILL escalation"
+    );
+    assert!(
+        holder.try_wait().unwrap().is_none(),
+        "the process holding the reaped container's pid got no signal"
+    );
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+}
+
+/// BOX-013: a descendant of a task container that a scan found, and whose
+/// pid the kernel gave to another process before the signal, gets no
+/// signal: each descendant is pinned and checked again before it is
+/// signalled.
+#[test]
+fn a_task_container_descendant_whose_pid_was_reused_gets_no_signal() {
+    let box_id = SessionId::mint();
+    let container = spawn_stand_in_box("trap '' TERM");
+    let _container_cleanup = KillOnDrop::pin(&container);
+    let _record = crate::box_runtime::record_task_container(
+        crate::box_runtime::untracked_task_run(box_id),
+        container.id(),
+    )
+    .unwrap();
+    let taken = crate::box_runtime::take_task_containers(box_id);
+    let [task] = taken.as_slice() else {
+        panic!("one task container is recorded");
+    };
+    // Another child of the daemon, standing in for the process that got a
+    // reaped descendant's pid: it is not in the container's tree. SIGCONT
+    // stands in for the stop's signals, so a mistake leaves it running.
+    let holder = spawn_stand_in_box("trap 'exit 0' TERM");
+    let _holder_cleanup = KillOnDrop::pin(&holder);
+    let holder_pid = i32::try_from(holder.id()).unwrap();
+    let root = i32::try_from(task.supervisor()).unwrap();
+    assert_eq!(
+        task.signal_scanned(&[root, holder_pid], libc::SIGCONT),
+        1,
+        "the supervisor got the signal, the reused pid did not"
+    );
+    // SIGTERM would end the holder with 0.
+    assert_eq!(
+        task.signal_scanned(&[root, holder_pid], libc::SIGTERM),
+        1,
+        "the reused pid is skipped with every signal"
+    );
+    let mut holder = holder;
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        holder.try_wait().unwrap().is_none(),
+        "the process holding the reused pid got no signal"
+    );
+    drop(taken);
+    let mut container = container;
+    container.kill().unwrap();
+    container.wait().unwrap();
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+}
+
+/// BOX-013: once a stop of a box has started, the box records no new task
+/// container until that stop ends. A later invocation of a multi-invocation
+/// task, spawned after the stop took the box's containers, is refused, so
+/// its run kills it rather than leaving it to outlive the stop. A dropped
+/// record forgets its container.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stopping_box_records_no_new_task_container() {
+    let box_id = SessionId::mint();
+    let relay = spawn_stand_in_box("trap 'exit 0' TERM");
+    let relay_cleanup = KillOnDrop::pin(&relay);
+    let entrypoint = stand_in_entrypoint(relay);
+    let first = spawn_stand_in_box("trap 'exit 0' TERM");
+    let run = crate::box_runtime::untracked_task_run(box_id);
+    let _first = crate::box_runtime::record_task_container(run, first.id()).unwrap();
+    let first = stand_in_entrypoint(first);
+
+    let stop = super::stop_task_containers(
+        box_id,
+        &entrypoint,
+        false,
+        Duration::from_secs(5),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .await;
+    assert_eq!(
+        first.await.unwrap().unwrap().code,
+        0,
+        "the first invocation was stopped"
+    );
+    // The next invocation, spawned after the stop's take.
+    // A stand-in pid, pinned by a pidfd on this process: never signalled.
+    let pin = |_| crate::box_runtime::pidfd_open(std::process::id());
+    assert!(
+        matches!(
+            crate::box_runtime::record_task_container_opening(run, 4_000_001, pin),
+            Err(crate::box_runtime::TaskContainerRefused::BoxStopping)
+        ),
+        "a container spawned while the box is stopping is refused"
+    );
+    assert!(
+        crate::box_runtime::take_task_containers(box_id).is_empty(),
+        "the refused container left no record"
+    );
+    // Another box is not stopping, and records as before.
+    let other = SessionId::mint();
+    let other_record = crate::box_runtime::record_task_container_opening(
+        crate::box_runtime::untracked_task_run(other),
+        4_000_002,
+        pin,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::box_runtime::take_task_containers(other)
+            .iter()
+            .map(crate::box_runtime::TaskContainer::supervisor)
+            .collect::<Vec<_>>(),
+        vec![4_000_002],
+        "only the stopping box refuses"
+    );
+    drop(other_record);
+
+    drop(stop);
+    let record = crate::box_runtime::record_task_container_opening(run, 4_000_003, pin)
+        .expect("the box records again once its stop has ended");
+    drop(record);
+    assert!(
+        crate::box_runtime::take_task_containers(box_id).is_empty(),
+        "a dropped record forgets its container"
+    );
+    // The await reaps the stand-in.
+    drop(relay_cleanup);
+    entrypoint.await.unwrap().unwrap();
+}
+
+/// BOX-013: a scan that lists nothing while the supervisor still runs, as
+/// when `/proc` cannot be read, still signals the supervisor through its
+/// pidfd.
+#[test]
+fn a_task_container_supervisor_the_scan_missed_is_still_signalled() {
+    let box_id = SessionId::mint();
+    let container = spawn_stand_in_box("trap 'exit 0' TERM");
+    let _cleanup = KillOnDrop::pin(&container);
+    let _record = crate::box_runtime::record_task_container(
+        crate::box_runtime::untracked_task_run(box_id),
+        container.id(),
+    )
+    .unwrap();
+    let taken = crate::box_runtime::take_task_containers(box_id);
+    let [task] = taken.as_slice() else {
+        panic!("one task container is recorded");
+    };
+    assert_eq!(
+        task.signal_scanned(&[], libc::SIGTERM),
+        1,
+        "the supervisor got the signal through its pidfd"
+    );
+    let mut container = container;
+    let status = container.wait().unwrap();
+    assert_eq!(status.code(), Some(0), "the supervisor's TERM trap ran");
+}
+
+/// BOX-013: a process of a task container's tree that ends while the walk
+/// reads its children is left out, with the children read from it: once it
+/// ended, its pid can be another process's, and so can what it listed.
+#[test]
+fn a_task_container_process_that_ends_mid_walk_leaves_its_children_out() {
+    let mut root = Some(spawn_stand_in_box("trap '' TERM"));
+    let root_pid = root.as_ref().unwrap().id();
+    let walked = crate::box_runtime::tree_pids_reading(root_pid, |pid| {
+        assert_eq!(pid, i32::try_from(root_pid).unwrap());
+        let mut ended = root.take().expect("the root is read once");
+        ended.kill().unwrap();
+        ended.wait().unwrap();
+        vec![4_000_007]
+    });
+    assert!(
+        walked.is_empty(),
+        "the ended process and what it listed are left out: {walked:?}"
+    );
+
+    // A process that still runs after its children were read is kept.
+    let live = spawn_stand_in_box("trap '' TERM");
+    let _cleanup = KillOnDrop::pin(&live);
+    let live_pid = i32::try_from(live.id()).unwrap();
+    assert_eq!(
+        crate::box_runtime::tree_pids_reading(live.id(), |_| Vec::new()),
+        vec![live_pid]
+    );
+    let mut live = live;
+    live.kill().unwrap();
+    live.wait().unwrap();
+}
+
+/// BOX-013: a task run under way when a stop of its box starts records no
+/// container after that stop ends. Its spawn can still be in flight when the
+/// stop ends, and nothing would stop the container it records then. A run
+/// that starts after the stop records as before.
+#[test]
+fn a_task_run_a_stop_overtook_records_no_container_after_the_stop() {
+    let box_id = SessionId::mint();
+    // A stand-in pid, pinned by a pidfd on this process: never signalled.
+    let pin = |_| crate::box_runtime::pidfd_open(std::process::id());
+    let overtaken = crate::box_runtime::begin_task_run(box_id);
+    drop(crate::box_runtime::begin_task_stop(box_id));
+    assert!(
+        matches!(
+            crate::box_runtime::record_task_container_opening(overtaken.id(), 4_000_005, pin),
+            Err(crate::box_runtime::TaskContainerRefused::BoxStopped)
+        ),
+        "a run the stop overtook is refused once the stop has ended"
+    );
+    assert_eq!(crate::box_runtime::task_containers_recorded(box_id), 0);
+    let later = crate::box_runtime::begin_task_run(box_id);
+    let record = crate::box_runtime::record_task_container_opening(later.id(), 4_000_006, pin)
+        .expect("a run started after the stop records");
+    drop(record);
+    drop(later);
+    drop(overtaken);
+}
+
+/// BOX-013: a task run that begins while a stop of its box is under way
+/// records no container, even once that stop has ended: the stop took the
+/// box's records without it, and would never signal what it records.
+#[test]
+fn a_task_run_begun_during_a_stop_records_no_container_after_it() {
+    let box_id = SessionId::mint();
+    // A stand-in pid, pinned by a pidfd on this process: never signalled.
+    let pin = |_| crate::box_runtime::pidfd_open(std::process::id());
+    let stop = crate::box_runtime::begin_task_stop(box_id);
+    let begun = crate::box_runtime::begin_task_run(box_id);
+    drop(stop);
+    assert!(
+        matches!(
+            crate::box_runtime::record_task_container_opening(begun.id(), 4_000_008, pin),
+            Err(crate::box_runtime::TaskContainerRefused::BoxStopped)
+        ),
+        "a run begun during the stop is refused once the stop has ended"
+    );
+    assert_eq!(crate::box_runtime::task_containers_recorded(box_id), 0);
+    drop(begun);
 }
 
 /// BOX-013: a stop that ends the processes and cannot write the `stopped`
@@ -16400,7 +16194,7 @@ async fn resume_refuses_unsatisfiable_spec_keeps_state() {
         &[
             "session `old-spec`",
             "version 99",
-            "min session destroy old-spec",
+            "min box rm --force old-spec",
         ],
         3,
     )
@@ -16465,7 +16259,7 @@ async fn resume_refuses_stored_spec_its_root_excludes_keeps_state() {
             "session `root-spec`",
             "`io.pty_enabled` to `true`",
             "the built-in type `task` allows only `false`",
-            "min session destroy root-spec",
+            "min box rm --force root-spec",
         ],
         3,
     )
@@ -16550,7 +16344,7 @@ async fn resume_refuses_when_name_held_by_running_box() {
         RecordState::Stopped(ending),
         &[
             "The running session `proj` holds the name `proj`",
-            &format!("min session rename {holder} <new-name>"),
+            &format!("min box rename {holder} <new-name>"),
         ],
         2,
     )
@@ -16874,9 +16668,9 @@ async fn hooks_on_resume_missing_composition_refuses_resume_keeps_state() {
         RecordState::Stopped(ending),
         &[
             "session `resume-blind` cannot resume, and it stays stopped. \
-           The daemon cannot read its hook settings. Destroy it with \
-           `min session destroy resume-blind`, then start a new one with \
-           `min session activate`.",
+           The daemon cannot read its hook settings. Remove it with \
+           `min box rm --force resume-blind`, then start a new one with \
+           `min session start`.",
         ],
         1,
     )
@@ -17580,6 +17374,7 @@ async fn until_complete_ends_on_entrypoint_return_without_client_runs_a_task_beh
             minimald_rpc::BoxControlRequest::RowStanding(minimald_rpc::RowStandingRequest {
                 switch_address,
                 box_id: Some(HANDED_BOX_ID),
+                build_row_of: None,
             }),
             "the run reads the box's own row, nothing else"
         );
@@ -18642,7 +18437,7 @@ async fn restart_refuses_stored_spec_its_root_excludes_keeps_state() {
         "It stays stopped.",
         "`io.pty_enabled` to `true`",
         "the built-in type `task` allows only `false`",
-        "min session destroy restart-root",
+        "min box rm --force restart-root",
     ] {
         assert!(
             refusal.message.contains(words),
@@ -18738,7 +18533,7 @@ async fn restart_takes_resume_refusals_before_it_stops_anything() {
     for words in [
         "It stays running.",
         "The running session `pair` holds the name `pair`.",
-        &format!("min session rename {holder} <new-name>"),
+        &format!("min box rename {holder} <new-name>"),
     ] {
         assert!(
             refusal.message.contains(words),
@@ -18775,7 +18570,7 @@ async fn restart_takes_resume_refusals_before_it_stops_anything() {
     for words in [
         "It stays running.",
         "version 99",
-        "min session destroy alone",
+        "min box rm --force alone",
     ] {
         assert!(
             refusal.message.contains(words),
@@ -19280,4 +19075,52 @@ fn a_scaffold_over_a_link_out_of_the_workspace_is_refused() {
     );
     assert_eq!(std::fs::read_to_string(&outside).unwrap(), "# outside\n");
     assert_eq!(std::fs::read_link(&link).unwrap(), outside);
+}
+
+/// NET-079: a daemon-side task of a host-address box runs in the leaf its
+/// launch placed the box in, the deny leaf of a deny-all box and the allow
+/// leaf of an allowed one. A box with no leaf has none.
+#[test]
+fn a_daemon_side_task_runs_in_the_box_leaf() {
+    use sandbox::config::Verdict;
+
+    let tree = tempfile::tempdir().unwrap();
+    let root = tree.path();
+    assert_eq!(super::setup::box_task_leaf(root, "sealed"), None);
+
+    let deny_dir = sandbox::classifier::box_leaf(root, "sealed", Verdict::Deny);
+    std::fs::create_dir_all(&deny_dir).unwrap();
+    let allow_dir = sandbox::classifier::box_leaf(root, "open", Verdict::Allow);
+    std::fs::create_dir_all(&allow_dir).unwrap();
+
+    let sealed = super::setup::box_task_leaf(root, "sealed").expect("the deny-all box's leaf");
+    assert_eq!(sealed.dir(), deny_dir);
+    assert!(sealed.is_deny());
+    let open = super::setup::box_task_leaf(root, "open").expect("the allowed box's leaf");
+    assert_eq!(open.dir(), allow_dir);
+    assert!(!open.is_deny());
+}
+
+/// NET-079: a task of a box whose launch placed it in a classifier leaf is
+/// refused when the task's context has no leaf, so it never runs outside
+/// the box's egress verdict. A box that was never placed runs its task.
+#[test]
+fn a_daemon_side_task_of_a_placed_box_without_its_leaf_is_refused() {
+    let refusal =
+        crate::exec::task_leaf_refusal(Some(boxes::HostIpEnforcement::PerBox), "sealed", false)
+            .expect_err("a placed box with no leaf has its task refused");
+    assert_eq!(refusal.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        refusal.to_string(),
+        "the task for box sealed did not start: box sealed runs under \
+         egress rules, and its shell is not running to apply them to the \
+         task. Run `min session attach sealed` to start its shell, then \
+         run the task again."
+    );
+    crate::exec::task_leaf_refusal(Some(boxes::HostIpEnforcement::PerBox), "sealed", true)
+        .expect("a placed box with its leaf runs its task");
+    for enforcement in [None, Some(boxes::HostIpEnforcement::None)] {
+        crate::exec::task_leaf_refusal(enforcement, "plain", false)
+            .expect("a box that was never placed runs its task without a leaf");
+    }
 }

@@ -2672,9 +2672,23 @@ mod tests {
                 msg.starts_with(&format!("`{header}` has the type `{box_type}`")),
                 "{msg}"
             );
-            assert!(msg.contains("gominimal/inbox#678"), "{msg}");
             assert!(msg.contains(&format!("a box of type `{root}`")), "{msg}");
+            // A build box is min's to make, so no epic is named for it.
+            assert_eq!(
+                msg.contains("gominimal/inbox#678"),
+                root != "build",
+                "{msg}"
+            );
         }
+        assert_eq!(
+            expand_typed(TYPED_FILE, "builder")
+                .expect_err("refused")
+                .to_string(),
+            "`[boxes.builder]` has the type `build`. \
+             min makes a box of type `build` for each package build, \
+             and never from an entry in minimal.toml. \
+             The other entries of minimal.toml are not affected."
+        );
         assert_eq!(
             expand_typed(TYPED_FILE, "assistant")
                 .expect_err("refused")
@@ -3631,14 +3645,10 @@ mod tests {
         )
         .expect("the file reads");
         let session = read.session.expect("the session defaults read");
+        // A lower-case POSIX name is a strict name, so both land in `vars`.
         let strict: Vec<&str> = session.vars.keys().map(AsRef::as_ref).collect();
-        assert_eq!(strict, ["A"]);
-        let lenient: Vec<&str> = session
-            .vars_lenient
-            .iter()
-            .map(|v| v.name().as_ref())
-            .collect();
-        assert_eq!(lenient, ["my_var"]);
+        assert_eq!(strict, ["A", "my_var"]);
+        assert!(session.vars_lenient.is_empty());
         assert!(read.tasks["lint"].vars.contains_key("T"));
         // A session writes its variables back as one `env_vars` table.
         let written = toml::Table::try_from(&session).expect("the session writes");

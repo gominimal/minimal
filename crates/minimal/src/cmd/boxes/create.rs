@@ -2023,44 +2023,33 @@ pub(crate) fn task_box_entry(
     .map(Some)
 }
 
-/// The wire's two variable lists from the expanded spec's `env_vars`
-/// (BOX-205): a strict POSIX name (`[A-Z_][A-Z0-9_]*`) in the first, any
-/// other name in the second, in name order. Both are `None` when the spec
-/// sets no `env_vars`.
-#[allow(clippy::type_complexity)]
-fn wire_vars(
+/// Whether `name` is a secret grant's variable name: `[A-Z_][A-Z0-9_]*`.
+fn is_secret_variable_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_uppercase() || first == '_')
+        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// The wire's `env_vars` from the expanded spec's `env_vars` (BOX-205),
+/// whole and by name. `None` when the spec sets no `env_vars`. The
+/// expansion already refused a name that is not POSIX-shaped (BOX-207), so
+/// every name reads as a [`StrictVarName`](boxes::core::primitives::StrictVarName).
+fn wire_env_vars(
     spec: &toml::Table,
 ) -> Result<
-    (
-        Option<
-            std::collections::BTreeMap<
-                boxes::core::primitives::StrictVarName,
-                boxes::core::primitives::VarValue,
-            >,
+    Option<
+        std::collections::BTreeMap<
+            boxes::core::primitives::StrictVarName,
+            boxes::core::primitives::VarValue,
         >,
-        Option<Vec<boxes::core::primitives::LenientVarEntry>>,
-    ),
+    >,
     toml::de::Error,
 > {
-    use boxes::core::primitives::{LenientVarEntry, StrictVarName, VarValue};
-    let Some(value) = spec.get(mfile::expand::ENV_VARS_KEY) else {
-        return Ok((None, None));
-    };
-    let vars: std::collections::BTreeMap<String, VarValue> = value.clone().try_into()?;
-    let mut strict = std::collections::BTreeMap::new();
-    let mut lenient = Vec::new();
-    for (name, value) in vars {
-        match StrictVarName::try_new(name.clone()) {
-            Ok(name) => {
-                strict.insert(name, value);
-            }
-            Err(_) => lenient.push(
-                LenientVarEntry::try_new(name, value)
-                    .map_err(<toml::de::Error as serde::de::Error>::custom)?,
-            ),
-        }
-    }
-    Ok((Some(strict), (!lenient.is_empty()).then_some(lenient)))
+    spec.get(mfile::expand::ENV_VARS_KEY)
+        .map(|value| value.clone().try_into())
+        .transpose()
 }
 
 /// Expands `entry` of the `minimal.toml` in `bytes` over `[defaults]` and
@@ -2203,7 +2192,7 @@ pub(crate) fn box_entry(
     // and `[defaults.task]` values for them do not reach the task box.
     // gominimal/minimal#3266 tracks that gap.
     if box_type != boxes::TASK_BOX_TYPE {
-        (wire.vars, wire.vars_lenient) = wire_vars(spec).map_err(format_error)?;
+        wire.env_vars = wire_env_vars(spec).map_err(format_error)?;
         wire.patches = list(spec, "patches").map_err(format_error)?;
     }
     tracing::info!(
@@ -2827,11 +2816,10 @@ pub(crate) fn check_github_grants(
     }
     // BEP-007: each grant's name becomes a variable in the box's
     // environment, so a name that is not one is refused before anything
-    // is created.
-    if let Some(grant) = grants
-        .iter()
-        .find(|grant| boxes::core::primitives::StrictVarName::try_new(grant.as_str()).is_err())
-    {
+    // is created. A secret name keeps the capital-letter rule: the
+    // lower-case names that `env_vars` accepts (BOX-207) do not cover
+    // `[secrets]`, which gominimal/arch#185 decides.
+    if let Some(grant) = grants.iter().find(|grant| !is_secret_variable_name(grant)) {
         return Err(GrantNotDelivered::InvalidName {
             grant: grant.clone(),
         }
@@ -3371,6 +3359,8 @@ pub(crate) enum ActivationStep {
     UploadFiles,
     /// The loadout composition and its gating.
     ComposeLoadout,
+    /// The box's packages, each in its build box (NET-165).
+    PrepareBuildBoxes,
     /// The patch upload and the finalize that makes the session active.
     Finalize,
     /// The `host_ip` name hold on the VM host daemon.
@@ -3380,7 +3370,7 @@ pub(crate) enum ActivationStep {
 impl ActivationStep {
     /// Every step, in the order [`activate_box`] runs them.
     #[cfg(test)]
-    pub(crate) const ORDER: [Self; 14] = [
+    pub(crate) const ORDER: [Self; 15] = [
         Self::CheckArguments,
         Self::CheckProject,
         Self::StartDaemon,
@@ -3393,6 +3383,7 @@ impl ActivationStep {
         Self::ReportStart,
         Self::UploadFiles,
         Self::ComposeLoadout,
+        Self::PrepareBuildBoxes,
         Self::Finalize,
         Self::HoldName,
     ];
@@ -3412,6 +3403,7 @@ impl ActivationStep {
             Self::ReportStart => "report_start",
             Self::UploadFiles => "upload_files",
             Self::ComposeLoadout => "compose_loadout",
+            Self::PrepareBuildBoxes => "prepare_build_boxes",
             Self::Finalize => "finalize",
             Self::HoldName => "hold_name",
         }
@@ -3931,7 +3923,7 @@ pub(crate) fn stamp_session_spec_as(
 /// The project root to record for an activation from `dir`. Tarball sync
 /// already resolved it as `upload_root`, so it is reused. Otherwise the root
 /// is resolved here. `CheckProject` already refuses a `minimal.toml` that does
-/// not load under every `--sync` mode, before `PlanUpload` runs, so an error
+/// not load, with or without an upload, before `PlanUpload` runs, so an error
 /// here is not expected and propagates.
 ///
 /// # Errors
@@ -3950,7 +3942,7 @@ fn activation_project_root(
 /// The workspace upload a create planned, so the upload step holds one value
 /// instead of a root and a decision that are only meaningful together.
 enum UploadPlan {
-    /// `--sync none`: the daemon composes against an empty workspace.
+    /// `skip_upload`: the daemon composes against an empty workspace.
     Skip,
     /// The tree to stream, and what the upload gate decided about it.
     Workspace {
@@ -4036,6 +4028,79 @@ pub(crate) fn subnet_notices(args: &crate::EgressArgs) -> Vec<String> {
     let mut lines = notices("--allow-subnets", &args.allow_subnets);
     lines.extend(notices("--deny-subnets", &args.deny_subnets));
     lines
+}
+
+/// Registers the row a host-address box's own builds attach under, on a
+/// VM-backed host, and returns its task addresses (NET-169). The box shares
+/// the node's address, so nothing else gives a build of its an address the
+/// host's gate can hold to the box's rules. A box that admits nothing has no
+/// row: its builds that need the network are refused. The registration is
+/// the client's, on the host's socket, and the box's retirement withdraws
+/// it. A failure leaves the box with no row, and those builds refused.
+pub(crate) async fn hold_requester_build_row(
+    control_sock: Option<&std::path::Path>,
+    session_id: boxes::SessionId,
+    network: boxes::NetworkMode,
+    declared: Option<&boxes::EgressPolicy>,
+    opt_out: bool,
+) -> Vec<std::net::Ipv4Addr> {
+    let Some(sock) = control_sock else {
+        return Vec::new();
+    };
+    if network != boxes::NetworkMode::HostNet {
+        return Vec::new();
+    }
+    let egress =
+        match boxes::effective_egress(declared, network, boxes::EGRESS_DEFAULT_PHASE, opt_out) {
+            boxes::EffectiveEgress::DenyAll => return Vec::new(),
+            boxes::EffectiveEgress::Declared(section) if section.admits_nothing() => {
+                return Vec::new();
+            }
+            boxes::EffectiveEgress::Declared(section) => section,
+            // The box's own rules, which allow everything: an internet grant
+            // is narrower than that (NET-168), so it is not this row's.
+            boxes::EffectiveEgress::AllowAll => boxes::EgressPolicy {
+                allow_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+                allow_dns_hosts: Some(Vec::new()),
+                allow_protocols: None,
+                deny_subnets: None,
+            },
+        };
+    let request = minimald_rpc::RegisterBoxRequest {
+        name: minimald_rpc::requester_build_row_name(session_id),
+        ingress_ports: Vec::new(),
+        egress: Some(egress),
+        credentialed_upstream: None,
+        dynamic_ingress: None,
+        dynamic_allowed_range: None,
+        hold: false,
+        task_slots: minimald_rpc::TASK_SLOTS_PER_BOX,
+        host_ip: false,
+        stays_detached: true,
+    };
+    let registration = tokio::time::timeout(
+        minimal_client::box_registration::BOX_CONTROL_TIMEOUT,
+        minimal_client::box_registration::register_box_with_vm_host(sock, request),
+    )
+    .await;
+    match registration {
+        Ok(Ok(registered)) => registered.task_addresses,
+        Ok(Err(error)) => {
+            tracing::info!(
+                error = %format!("{error:#}"),
+                "could not register the row of the box's builds"
+            );
+            Vec::new()
+        }
+        Err(_elapsed) => {
+            tracing::info!(
+                timeout = ?minimal_client::box_registration::BOX_CONTROL_TIMEOUT,
+                "the VM host daemon did not answer the registration of the row of the box's \
+                 builds in time"
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// The `--ingress` mappings and the egress flags of an activation, parsed
@@ -4300,25 +4365,21 @@ pub(crate) async fn activate_box(
     // skew override, which is what lets an operator proceed.
     request.must_match_version = version_assertion();
 
-    // `--sync` defaults to tarball; `sync_explicit` records whether the
-    // user actually typed the flag, which distinguishes a deliberate
-    // `--sync tarball` (the escape hatch that force-uploads an empty dir
-    // or `$HOME`) from the implicit default.
-    let sync_explicit = args.sync.is_some();
-
     // Resolve the upload root before opening the daemon connection: a
     // malformed mfile in an ancestor should fail loudly before we create a
     // session on the daemon, so we don't leak a draft session. Resolved
     // before the loadout prep, which checks the project's own hooks and sizes
     // the finalize budget against the project root — not the directory the
-    // command was invoked from. Only needed for tarball sync, the default:
-    // `--sync none` skips the upload entirely (#770).
-    let upload_root = match args.sync.unwrap_or(SyncMode::Tarball) {
-        SyncMode::None => None,
-        SyncMode::Tarball => Some(resolve_upload_root(&utf8_path)?),
+    // command was invoked from. Every start from the command line uploads
+    // (BCLI-042 removed `--sync`); only an internal start that sets
+    // `skip_upload` goes without one.
+    let upload_root = if args.skip_upload {
+        None
+    } else {
+        Some(resolve_upload_root(&utf8_path)?)
     };
-    // The record's project root (BOX-001), set on the request below under
-    // every `--sync` mode, `none` included.
+    // The record's project root (BOX-001), set on the request below with
+    // or without an upload.
     let project_root = activation_project_root(upload_root.as_deref(), &utf8_path)?;
 
     let (
@@ -4373,10 +4434,10 @@ pub(crate) async fn activate_box(
             // Scaffold-offer a missing `minimal.toml` only after the loadouts
             // resolve and compose: a bad `--loadout` must error before anything
             // prints, so the user is never told the session is proceeding and
-            // then that it is not. `--sync none` never sends a `minimal.toml`,
-            // so offering to create one there would only write a file the
-            // session then ignores.
-            if offer_scaffold && !matches!(args.sync, Some(SyncMode::None)) {
+            // then that it is not. A start without an upload never sends a
+            // `minimal.toml`, so offering to create one there would only write
+            // a file the session then ignores.
+            if offer_scaffold && !args.skip_upload {
                 offer_mfile_scaffold(
                     &utf8_path,
                     global,
@@ -4456,12 +4517,8 @@ pub(crate) async fn activate_box(
                 return Ok::<_, anyhow::Error>(UploadPlan::Skip);
             };
             let headless = args.no_prompt || global.no_input || !can_prompt_interactively();
-            let decision = decide_workspace_upload(
-                &root,
-                sync_explicit,
-                headless,
-                std::env::home_dir().as_deref(),
-            );
+            let decision =
+                decide_workspace_upload(&root, headless, std::env::home_dir().as_deref());
             // Only a hooks-enabled activation refuses: `--no-hooks` already
             // disabled the project's hooks, so it cannot drop any by surprise.
             if !args.no_hooks {
@@ -5092,22 +5149,15 @@ pub(crate) async fn activate_box(
     // workspace holds the user's files — `ConfigureLoadout`'s compose
     // reads the mfile (and any local `packages/`, `stacks/`,
     // `profiles/` used by graph resolution) off that workspace, so it
-    // has to run before `ConfigureLoadout`. `--sync none` opts out;
+    // has to run before `ConfigureLoadout`. `skip_upload` opts out;
     // the daemon then composes against an empty workspace and the
     // caller is on their own for getting files there.
     ActivationStep::UploadFiles
         .run(async {
             match upload_plan {
-                UploadPlan::Skip => {
-                    // `--sync none` skips the upload, so the daemon composes against
-                    // an empty workspace and the project's `minimal.toml` — packages,
-                    // vars, patches, hooks — is silently dropped. Say so when there
-                    // is a config to lose, so the default-config session is not a
-                    // surprise.
-                    if let Some(notice) = sync_none_notice(&utf8_path) {
-                        eprintln!("{notice}");
-                    }
-                }
+                // An internal start without an upload: the daemon composes
+                // against an empty workspace.
+                UploadPlan::Skip => {}
                 UploadPlan::Workspace { root, decision } => {
                     // `--no-hooks` already disabled the project's hooks, so a
                     // skip cannot drop anything by surprise and says nothing
@@ -5357,6 +5407,35 @@ pub(crate) async fn activate_box(
             // squash the lint without dropping the useful name.
             let _ = initial_policy;
             Ok::<_, anyhow::Error>(collected_patches)
+        })
+        .await?;
+
+    // NET-165: the box's table goes to the host side now, before any process
+    // of the box exists. A failure stops nothing here: the box's builds follow
+    // its own rules, and a refusal is said when one needs more.
+    ActivationStep::PrepareBuildBoxes
+        .run(async {
+            let task_addresses = hold_requester_build_row(
+                control_sock.as_deref(),
+                id,
+                request.config.network,
+                request.config.policy.egress.as_ref(),
+                created.deny_all_opt_out == Some(true),
+            )
+            .await;
+            prepare_build_boxes(
+                &mut client,
+                BuildBoxActivation {
+                    global,
+                    session_id: id,
+                    project_dir: abs_path.as_utf8_path().as_std_path().to_path_buf(),
+                    control_sock: control_sock.clone(),
+                    task_addresses,
+                    network: request.config.network,
+                },
+            )
+            .await;
+            Ok::<_, anyhow::Error>(())
         })
         .await?;
 
@@ -6019,7 +6098,7 @@ mod tests {
         let args = ActivateArgs {
             name: Some("grant-box".into()),
             path: Some(project.path().to_string_lossy().into_owned()),
-            sync: None,
+            skip_upload: false,
             network: Some(CliNetworkMode::OwnIp),
             ingress: Vec::new(),
             dynamic_ingress: None,
@@ -6508,7 +6587,7 @@ mod tests {
         let args = ActivateArgs {
             name: Some("broken-box".into()),
             path: Some(project.path().to_string_lossy().into_owned()),
-            sync: None,
+            skip_upload: false,
             network: Some(CliNetworkMode::OwnIp),
             ingress: Vec::new(),
             dynamic_ingress: None,

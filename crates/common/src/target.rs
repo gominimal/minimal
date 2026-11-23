@@ -118,6 +118,16 @@ impl Target {
     pub const fn new(arch: Arch, os: OS) -> Self {
         Self { arch, os }
     }
+    /// The target a box on this host builds for: Linux, whatever the host
+    /// runs, on the host's architecture.
+    #[must_use]
+    pub fn of_a_box() -> Self {
+        Self {
+            arch: Self::host().arch,
+            os: OS::Linux,
+        }
+    }
+
     /// Creates a target matching the host system.
     pub const fn host() -> Self {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -248,6 +258,15 @@ impl FromStr for Target {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NET-165: a box runs Linux whatever the host runs, so a table made on
+    /// any host holds the hashes the box computes.
+    #[test]
+    fn a_box_builds_for_linux_on_the_hosts_architecture() {
+        let target = Target::of_a_box();
+        assert_eq!(target.os, OS::Linux);
+        assert_eq!(target.arch, Target::host().arch);
+    }
 
     #[test]
     fn arch_parses_amd64_and_alias() {

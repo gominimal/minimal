@@ -161,6 +161,7 @@ impl TaskExec {
 /// declaration blocks a task's *inbound* too (`allowed`/`udp_allowed` empty),
 /// so attaching one where nothing needs gating would change behaviour the
 /// opt-out exists to keep.
+#[cfg(test)]
 pub(crate) fn task_network(
     record: &boxes::Record,
     switch: &std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
@@ -249,8 +250,8 @@ pub(crate) async fn ensure_task_rows_stand(
     } else {
         Err(io::Error::other(format!(
             "the VM host daemon could not confirm session {}'s network addresses, so \
-             the task was not run; destroy the session with `min session destroy <session>`, \
-             then start it again with `min session activate`",
+             the task was not run; remove the session with `min box rm --force <box>`, \
+             then start it again with `min session start`",
             record.name.as_deref().unwrap_or("(unnamed)")
         )))
     }
@@ -314,12 +315,11 @@ pub(super) fn parse_task_args(
         .map_err(|e| e.to_string())
 }
 
-/// Refuses the package builds of a task (NET-155) when the box's launch
-/// placed it in a classifier leaf (`enforcement` is
-/// [`boxes::HostIpEnforcement::PerBox`]) and the task's context has no leaf.
-/// Such a build would run outside the box's egress verdict. A box that was
-/// never placed builds in the daemon's own cgroup, as before.
-pub(crate) fn task_build_refusal(
+/// Refuses a task (NET-079) when the box's launch placed it in a classifier
+/// leaf (`enforcement` is [`boxes::HostIpEnforcement::PerBox`]) and the
+/// task's context has no leaf. Such a task would run outside the box's
+/// egress verdict. A box that was never placed runs its task as before.
+pub(crate) fn task_leaf_refusal(
     enforcement: Option<boxes::HostIpEnforcement>,
     box_name: &str,
     has_leaf: bool,
@@ -327,11 +327,11 @@ pub(crate) fn task_build_refusal(
     if enforcement == Some(boxes::HostIpEnforcement::PerBox) && !has_leaf {
         tracing::warn!(
             box_name = %box_name,
-            "refusing a task's package builds for a placed box whose classifier leaf is missing",
+            "refusing a task of a placed box whose classifier leaf is missing",
         );
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            crate::box_actor::placed_box_build_refusal(box_name),
+            crate::box_actor::placed_box_task_refusal(box_name),
         ));
     }
     Ok(())
@@ -383,7 +383,7 @@ pub(super) struct UnansweredInherit {
 }
 
 impl UnansweredInherit {
-    /// The refusal the person running `min session run` sees, for the
+    /// The refusal the person running a task in a session sees, for the
     /// session `id`, named `name` if it has one, of the project at
     /// `project` on the host.
     ///
@@ -391,23 +391,23 @@ impl UnansweredInherit {
     /// variable the session's copy declares (that copy predates a change
     /// on the host, or a stack provides the task, which the client cannot
     /// read), and the commands that replace the session with one of the
-    /// project as it is now. A second `min session activate` alone would
+    /// project as it is now. A second `min session start` alone would
     /// leave this session in place and still out of date.
     pub(super) fn refusal(&self, name: Option<&str>, id: &str, project: &str) -> String {
         let Self { task, var } = self;
         let project = shell_word(project);
-        let destroy = format!("min session destroy {}", shell_word(name.unwrap_or(id)));
+        let destroy = format!("min box rm --force {}", shell_word(name.unwrap_or(id)));
         let activate = match name.map(shell_word) {
-            Some(name) => format!("min session activate --name {name} {project}"),
-            None => format!("min session activate {project}"),
+            Some(name) => format!("min -C {project} session start --name {name}"),
+            None => format!("min -C {project} session start"),
         };
         format!(
             "refused to run task '{task}': the session's copy of the project declares \
-             `env_vars.{var} = {{ inherit = true }}` for it, and `min session run` sent \
+             `env_vars.{var} = {{ inherit = true }}` for it, and `min` sent \
              no value for {var}. `min` reads the task from the minimal.toml of {project} \
              on the host, which does not declare {var} for this task. Either that file \
              changed after the session was activated, or a stack provides the task, and \
-             `min session run` cannot pass an inherited variable to a stack's task. If \
+             `min` cannot pass an inherited variable to a stack's task. If \
              the file changed, run `{destroy}`, then `{activate}`."
         )
     }
@@ -425,7 +425,6 @@ fn shell_word(s: &str) -> String {
         format!("'{}'", s.replace('\'', r#"'\''"#))
     }
 }
-
 /// Producer side of [`TaskExec::exec`]. Inlined in one async fn so that
 /// `env` lives on a single stack frame across every spawn — that frame
 /// is alive for the whole life of this tokio task, which in turn is
@@ -465,14 +464,14 @@ pub(super) async fn task_producer(
             return Ok(());
         }
 
-        // NET-155: a task's package builds run in the box's leaf. A box
-        // whose launch placed it in a leaf never builds outside it, so a
-        // placed box whose leaf is gone has its task refused here. The
+        // NET-079: a task of a box whose launch placed it in a classifier
+        // leaf runs in that leaf. A placed box whose leaf is gone has its
+        // task refused here, never run outside the box's egress verdict. The
         // context lookup does not refuse, because a relaunch uses it too.
         {
             let record = session.record().await?;
             let box_name = record.name.clone().unwrap_or_else(|| record.id.to_string());
-            task_build_refusal(
+            task_leaf_refusal(
                 record.host_ip_enforcement,
                 &box_name,
                 ctx.classifier_leaf().is_some(),

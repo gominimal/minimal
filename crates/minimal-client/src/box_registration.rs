@@ -341,8 +341,8 @@ impl RegisteredWithVmHost {
 /// remain. A VM restart starts a fresh VM host daemon with no rows.
 const HOST_IP_REGISTRATION_UNSUPPORTED: &str = "the VM host daemon is older than this min, so \
      it cannot start a --network host_ip box with a credentialed upstream. It may keep a box \
-     address under this box's name until the VM restarts. Run `min stop` and `min ls` to \
-     restart the VM with the matching VM host daemon (with the same --vm or --provider flags, \
+     address under this box's name until the VM restarts. Run `min host stop <host>` and \
+     `min ls` to restart the VM with the matching VM host daemon (with the same --vm or --provider flags, \
      if you use them)";
 
 /// Registers an own-address box with the VM host daemon over its control
@@ -488,6 +488,14 @@ pub async fn register_box_with_vm_host(
             anyhow::bail!(
                 "the VM host daemon answered the box registration with an \
                  answerer release reply; the registration did not happen"
+            )
+        }
+        minimald_rpc::BoxControlReply::BuildGrantOpened(_)
+        | minimald_rpc::BoxControlReply::NoBuildGrant { .. }
+        | minimald_rpc::BoxControlReply::BuildTable { .. } => {
+            anyhow::bail!(
+                "the VM host daemon answered the box registration with a build grant's \
+                 reply; the registration did not happen"
             )
         }
         other @ (minimald_rpc::BoxControlReply::AsksSubscribed { .. }
@@ -1027,6 +1035,7 @@ async fn register_box_at(
             minimald_rpc::TASK_SLOTS_PER_BOX
         },
         host_ip,
+        stays_detached: false,
     };
     let registration = tokio::time::timeout(
         BOX_CONTROL_TIMEOUT,
@@ -1615,6 +1624,7 @@ mod tests {
                 hold: false,
                 task_slots: 0,
                 host_ip: true,
+                stays_detached: false,
             };
             let outcome = register_box_with_vm_host(&sock_path, request).await;
             daemon.await.unwrap();
@@ -1629,8 +1639,8 @@ mod tests {
                 format!("{error:#}"),
                 "the VM host daemon is older than this min, so it cannot start a --network \
                  host_ip box with a credentialed upstream. It may keep a box address under this \
-                 box's name until the VM restarts. Run `min stop` and `min ls` to restart the VM \
-                 with the matching VM host daemon (with the same --vm or --provider flags, if \
+                 box's name until the VM restarts. Run `min host stop <host>` and `min ls` to \
+                 restart the VM with the matching VM host daemon (with the same --vm or --provider flags, if \
                  you use them)",
                 "{reply:?}"
             );
