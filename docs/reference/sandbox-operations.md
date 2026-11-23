@@ -94,12 +94,18 @@ way forward, such as starting the box again with the flags or the host-side
 Builds the packages in a clean room. The builds become available in the local
 cache.
 
+A build you ask for inside a box runs in a build box. Its reach depends on
+where the package comes from, and a box that admits nothing refuses a project
+package that needs the network. See
+[build boxes](./build-specs.md#build-boxes).
+
 ### `package patched-build <PACKAGE>`
 
 Builds the package in a clean room with potentially-stale dependencies: the
 already-cached builds of its dependencies, without rebuilding them first. It
-commits the result to the local cache. Useful for quickly iterating on a
-single package's build.
+commits the result to the local cache, apart from the builds that a normal
+build or install uses. A later patched build of a package that depends on it
+uses it. Useful for quickly iterating on one package's build.
 
 ### `materialize [--arch <arch>] -o <out-file> <output-name>`
 
