@@ -34,7 +34,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
 
 ### Verbs that read and drive the box record and spec
 
-- **BCLI-001** WHEN `min box list` runs THE SYSTEM SHALL print at least the id, name, entry, type, state, provider and host of each box BOX-158 lists. It SHALL scope the list to the current project unless the caller passes `--all`. Under `-o json` it SHALL write exactly the `"schema": "min/v1/box"` objects to stdout, and nothing else.
+- **BCLI-001** WHEN `min box list` runs THE SYSTEM SHALL print at least the id, name, project, entry, type, state, provider and host of each box BOX-158 lists. It SHALL scope the list to the current project unless the caller passes `--all`. Under `-o json` it SHALL write exactly the `"schema": "min/v1/box"` objects to stdout, and nothing else.
   <!-- the entry column shows up front which entry a box came from. The list shows no name origin and no project name, for space. Its project column is the project root -->
   tier:     T0
   verify:   cargo nextest run -p minimal box_list_prints_columns_and_schema
@@ -347,7 +347,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
 
 ### The command tree, aliases and hosts
 
-- **BCLI-026** THE SYSTEM SHALL provide `min box start`, `run`, `list`, `show`, `spec`, `stop`, `rm`, `prune`, `resume`, `rename`, `restart`, `logs`, `wait`, `events`, `cp`, `exec` and `attach` with the flags the architecture's command reference lists. The exceptions are the Non-goals: `--all-providers`, `--provider` naming a remote provider, `--using <pkg>[@<ver>]`, `min box wait --parent <box|self> [--any]`, and `self` as the value of `--parent`. The verbs SHALL also take BCLI-053's `--timeout` for `exec`, BCLI-068's `--exec` for `attach`, BCLI-069's `--name` for `start` and `run`, and BCLI-070's `--new` for `start`.
+- **BCLI-026** THE SYSTEM SHALL provide `min box start`, `run`, `list`, `show`, `spec`, `stop`, `rm`, `prune`, `resume`, `rename`, `restart`, `logs`, `wait`, `events`, `cp`, `exec` and `attach` with the flags the architecture's command reference lists. The exceptions are the Non-goals: `--all-providers`, `--provider` naming a remote provider, `--using <pkg>[@<ver>]`, `min box wait --parent <box|self> [--any]`, and `self` as the value of `--parent`. The verbs SHALL also take BCLI-053's `--timeout` for `exec`, BCLI-068's `--exec` for `attach`, and BCLI-069's `--name` for `start` and `run`.
   <!-- limited to the flags this spec delivers, the rest in Non-goals -->
   tier:     T0
   verify:   cargo nextest run -p minimal box_verbs_exist_with_arch_flags
@@ -382,6 +382,10 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     <!-- unwanted; the architecture's naming rule (gominimal/arch#186): Minimal never changes a written name, because a script, a URL or another box's egress rule addresses it -->
     tier:   T0
     verify: cargo nextest run -p minimal create_written_name_held_exit2_names_holder_and_next_steps
+  - IF a create verb's written name is taken and the caller does not hold Gatehouse `BoxRead` on the box that has it THEN THE SYSTEM SHALL say in the refusal only that the name is taken, and name no box, no state and no verb that goes back into it.
+    <!-- unwanted; the architecture's shared-host rule: every person with a box on a Box Host shares its names, and a refusal names the box that has the name only as far as the caller may read that box -->
+    tier:   T0
+    verify: cargo nextest run -p minimal create_written_name_held_without_box_read_names_no_box
 
 - **BCLI-070** WHEN `min box start`, `min box run`, `min session start` or `min task run` creates a box under a derived name that a box on the same host has THE SYSTEM SHALL create the box under the name BOX-210 numbers, and never refuse the creation for its name.
   <!-- event-driven; the architecture's naming rule (gominimal/arch#186): `start` and `run` always create a box, and one rule names it. So a second concurrent `min task run build` on one host succeeds as `build-1` -->
@@ -410,6 +414,10 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     <!-- unwanted; the architecture's naming rule: a reserved label or the form of a box id counts as taken, so the box of a project in a directory named `self` is `self-1` -->
     tier:   T0
     verify: cargo nextest run -p minimal unattached_create_numbered_excluded_name_names_no_box
+  - IF a numbered box's derived name is taken and the caller does not hold Gatehouse `BoxRead` on the box that has it THEN THE SYSTEM SHALL say in the line only that the box took a number because the name is taken, and name no box, no state and no verb.
+    <!-- unwanted; the architecture's shared-host rule, as for BCLI-069's refusal -->
+    tier:   T0
+    verify: cargo nextest run -p minimal unattached_create_numbered_without_box_read_names_no_box
 
 - **BCLI-082** WHEN `min box start` or `min session start` attaches this terminal to a box that took a number THE SYSTEM SHALL print nothing about the box's name before the box shell.
   <!-- event-driven; gominimal/arch#195 point 2 and the AGENTS.md rule for the box shell: the shell's first paint replaces anything printed before it -->
@@ -689,7 +697,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
 
 **A box's name lives in its record, and only a derived name takes a number.** The architecture's naming rule (gominimal/arch#186) has `start` and `run` always create a box, and one rule names it. gominimal/arch#195 makes the name a creation argument. `min` sends the requested name, `--name` before the entry's `[box] name`, or none, beside the project's name (BCLI-069, BCLI-079, BCLI-080). The Box Host assigns the name and keeps it in the box record with its origin (BOX-218, BOX-226). Nothing reads a name from a stored spec (BOX-225), so a spec's bytes and projection digest do not depend on what a box is called, and a rename never leaves a stale name in a spec. Under a written name the box gets exactly that name, or the creation is refused (BCLI-069), because a script, a URL or another box's egress rule addresses it. Under a derived name the box takes a number when the name is taken (BCLI-070). So a second concurrent `min task run build` on one host succeeds as `build-1`, which is the CI case. That makes `--new` redundant, and BCLI-042 removes it with no alias. No surface marks a box that took a number: a trailing `-<n>` on a derived name shows it. `min box list` shows each box's entry beside its name. `min box show` and the `min/v1/box` object also say whether the name was written or derived. The line that says a box took a number prints only when the command does not attach (BCLI-081, BCLI-082), because the shell's first paint replaces anything printed before it.
 
-**`run` follows the architecture's stdio contract and never allocates a PTY.** The architecture's `min box run` wires the box's stdio to the command and writes only the payload to stdout (design principle 4). An entry whose spec sets `pty_enabled` fails with exit 2 and a hint naming `min box start --new` (BCLI-010). Each alternative fails. An attach makes `run` a copy of `start --new`. Plain pipes into a `pty_enabled` entry make a session box with no terminal, which the type requires. Interactive use of a PTY entry stays with `min box start --new` and `min box exec -t`.
+**`run` follows the architecture's stdio contract and never allocates a PTY.** The architecture's `min box run` wires the box's stdio to the command and writes only the payload to stdout (design principle 4). An entry whose spec sets `pty_enabled` fails with exit 2 and a hint naming `min box start <entry>` (BCLI-010). Each alternative fails. An attach makes `run` a copy of `start`. Plain pipes into a `pty_enabled` entry make a session box with no terminal, which the type requires. Interactive use of a PTY entry stays with `min box start` and `min box exec -t`.
 
 **A bare attach resolves within the project, and an unreachable host refuses rather than guesses.** The architecture's `min box attach` takes an optional address, and so does `session attach`. With none, it attaches the project's running PTY box, else the project's only retained one (BCLI-068, BCLI-032). It resolves by the project root BOX-001 records. So a developer enters their project's session from its directory, and the bare form is permanent. An ambiguous match fails with exit 2 listing the candidates instead of opening a picker. Design principle 3 admits a prompt only for destructive or file-access decisions. Resolving an unqualified name across hosts refuses with exit 7 when a host does not answer (BCLI-002). A match on the hosts that answered is not known to be the only one, and picking it bypasses BOX-005's ambiguity refusal.
 
