@@ -15,10 +15,10 @@ This documentation site is itself built and maintained using Claude Code inside 
 packages = ["claude-code", "base"]
 ```
 
-Then activate the session and run the agent inside it:
+Then start the session and run the agent inside it:
 
 ```shell
-$ min session activate --attach .
+$ min session start
 $ claude
 ```
 
