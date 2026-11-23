@@ -249,8 +249,8 @@ pub(crate) async fn ensure_task_rows_stand(
     } else {
         Err(io::Error::other(format!(
             "the VM host daemon could not confirm session {}'s network addresses, so \
-             the task was not run; destroy the session with `min session destroy <session>`, \
-             then start it again with `min session activate`",
+             the task was not run; remove the session with `min box rm --force <box>`, \
+             then start it again with `min session start`",
             record.name.as_deref().unwrap_or("(unnamed)")
         )))
     }
@@ -429,7 +429,7 @@ pub(super) struct UnansweredInherit {
 }
 
 impl UnansweredInherit {
-    /// The refusal the person running `min session run` sees, for the
+    /// The refusal the person running a task in a session sees, for the
     /// session `id`, named `name` if it has one, of the project at
     /// `project` on the host.
     ///
@@ -437,23 +437,23 @@ impl UnansweredInherit {
     /// variable the session's copy declares (that copy predates a change
     /// on the host, or a stack provides the task, which the client cannot
     /// read), and the commands that replace the session with one of the
-    /// project as it is now. A second `min session activate` alone would
+    /// project as it is now. A second `min session start` alone would
     /// leave this session in place and still out of date.
     pub(super) fn refusal(&self, name: Option<&str>, id: &str, project: &str) -> String {
         let Self { task, var } = self;
         let project = shell_word(project);
-        let destroy = format!("min session destroy {}", shell_word(name.unwrap_or(id)));
+        let destroy = format!("min box rm --force {}", shell_word(name.unwrap_or(id)));
         let activate = match name.map(shell_word) {
-            Some(name) => format!("min session activate --name {name} {project}"),
-            None => format!("min session activate {project}"),
+            Some(name) => format!("min -C {project} session start --name {name}"),
+            None => format!("min -C {project} session start"),
         };
         format!(
             "refused to run task '{task}': the session's copy of the project declares \
-             `env_vars.{var} = {{ inherit = true }}` for it, and `min session run` sent \
+             `env_vars.{var} = {{ inherit = true }}` for it, and `min` sent \
              no value for {var}. `min` reads the task from the minimal.toml of {project} \
              on the host, which does not declare {var} for this task. Either that file \
              changed after the session was activated, or a stack provides the task, and \
-             `min session run` cannot pass an inherited variable to a stack's task. If \
+             `min` cannot pass an inherited variable to a stack's task. If \
              the file changed, run `{destroy}`, then `{activate}`."
         )
     }

@@ -77,6 +77,7 @@ pub enum WireError {
     ChecksumMismatch,
     UnsupportedVersion(u32),
     FileHashMismatch { filename: String },
+    LocalFileName { filename: String },
     RecordTooLarge { len: u64, max: u64 },
 }
 
@@ -109,6 +110,10 @@ impl fmt::Display for WireError {
             Self::FileHashMismatch { filename } => {
                 write!(f, "blake3 hash mismatch for file {filename:?}")
             }
+            Self::LocalFileName { filename } => write!(
+                f,
+                "local file name {filename:?} must be a relative path to a file, with no \"..\""
+            ),
             Self::RecordTooLarge { len, max } => {
                 write!(f, "record length {len} exceeds maximum {max}")
             }
@@ -657,7 +662,10 @@ fn materialize_local_file(
     std::fs::create_dir_all(&subdir)?;
     *file_counter += 1;
     // The filename is wire-controlled; reject absolute paths and `..`/root
-    // components so it cannot escape the per-file subdir.
+    // components so it cannot escape the per-file subdir. What is left is
+    // relative and made of plain names (and `.`), so it stays under `subdir`.
+    // It must also end in a file name: an empty name, `.`, or a name ending
+    // in `/` or `/.` names a directory, not a file to write.
     let fname = std::path::Path::new(&file_header.filename);
     if fname.is_absolute()
         || fname.components().any(|c| {
@@ -668,10 +676,24 @@ fn materialize_local_file(
                     | std::path::Component::Prefix(_)
             )
         })
+        || !matches!(
+            fname.components().next_back(),
+            Some(std::path::Component::Normal(_))
+        )
+        || file_header.filename.ends_with('/')
+        || file_header.filename.ends_with("/.")
     {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "unsafe local file name").into());
+        return Err(WireError::LocalFileName {
+            filename: file_header.filename.clone(),
+        });
     }
+    // A local input declared in a subdirectory of its package (`files/a.patch`)
+    // keeps that relative name on the wire; create its directories under
+    // `subdir` first.
     let dest = subdir.join(&file_header.filename);
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     std::fs::write(&dest, file_data)?;
     std::fs::set_permissions(
         &dest,
@@ -1215,6 +1237,154 @@ mod tests {
         assert!(materialize_local_file(&payload, &mut td, &mut counter, None).is_err());
     }
 
+    /// A `TAG_LOCAL_FILE_DATA` payload for a file named `filename` holding
+    /// `data`.
+    fn local_file_payload(filename: &str, data: &[u8]) -> Vec<u8> {
+        let header = serde_json_lenient::to_vec(&LocalFileHeader {
+            filename: filename.into(),
+            file_hash: blake3::hash(data),
+            data_len: data.len() as u64,
+            file_mode: 0o644,
+        })
+        .unwrap();
+        let mut payload = Vec::new();
+        encode_varint(header.len() as u64, &mut payload);
+        payload.extend_from_slice(&header);
+        payload.extend_from_slice(data);
+        payload
+    }
+
+    /// Names that would leave the per-file directory, or that name a
+    /// directory rather than a file, are refused; plain names, nested or
+    /// not, are written under the reader's temp dir.
+    #[test]
+    fn local_file_names_that_escape_or_name_a_directory_are_rejected() {
+        for name in [
+            "../escape",
+            "files/../../escape",
+            "/abs/escape",
+            "",
+            ".",
+            "./",
+            "files/",
+            "files/.",
+            "files//",
+        ] {
+            let mut td = None;
+            let mut counter = 0;
+            let err = materialize_local_file(
+                &local_file_payload(name, b"x"),
+                &mut td,
+                &mut counter,
+                None,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{name:?} was accepted"));
+            assert!(
+                matches!(&err, WireError::LocalFileName { filename } if filename == name),
+                "{name:?}: {err:?}"
+            );
+            // The message shows the name, escaped, so a reader can find the input.
+            assert!(
+                err.to_string().contains(&format!("{name:?}")),
+                "{name:?}: {err}"
+            );
+        }
+        // A name from the wire may hold control characters; the message escapes them.
+        let err = materialize_local_file(
+            &local_file_payload("files/\x1b[2J/", b"x"),
+            &mut None,
+            &mut 0,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            concat!(
+                r#"local file name "files/\u{1b}[2J/" "#,
+                r#"must be a relative path to a file, with no "..""#,
+            )
+        );
+        for name in [
+            "a.patch",
+            "files/a.patch",
+            "./files/a.patch",
+            "files/deeper/a.patch",
+        ] {
+            let mut td = None;
+            let mut counter = 0;
+            let dest = materialize_local_file(
+                &local_file_payload(name, b"x"),
+                &mut td,
+                &mut counter,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{name:?} was refused: {e}"));
+            assert!(
+                dest.starts_with(td.as_ref().unwrap().path()),
+                "{name:?}: {dest:?}"
+            );
+            assert_eq!(std::fs::read(&dest).unwrap(), b"x", "{name:?}");
+        }
+    }
+
+    /// A graph with one spec `pkg` whose only build dep is a local file sent
+    /// as `filename`, holding `content`. Keep the returned dir alive.
+    fn graph_with_local_file(filename: &str, content: &[u8]) -> (Graph, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file_path = tmp.path().join("source");
+        std::fs::write(&file_path, content).unwrap();
+        let mut graph = Graph::new();
+        let bsr = graph.insert_build(BuildSpec {
+            name: "pkg".into(),
+            build_deps: smallvec![BuildDep::Local {
+                full_path: file_path,
+                filename: filename.into(),
+                file_hash: blake3::hash(content),
+            }],
+            from: Arc::new(SpecOrigin::Inline),
+            ..Default::default()
+        });
+        graph.top_levels = vec![bsr];
+        (graph, tmp)
+    }
+
+    /// The round-tripped `pkg`'s local file is named `filename`, sits in the
+    /// reader's temp dir under that name, and holds `content`.
+    fn assert_local_file_materialized(
+        restored: &Graph,
+        td: &Option<tempfile::TempDir>,
+        filename: &str,
+        content: &[u8],
+    ) {
+        let td = td.as_ref().expect("should have materialised files");
+        let spec = restored.get(restored.by_name("pkg").unwrap()).unwrap();
+        let BuildDep::Local {
+            full_path,
+            filename: name,
+            ..
+        } = &spec.build_deps[0]
+        else {
+            panic!("expected Local dep");
+        };
+        assert_eq!(name, filename);
+        assert!(full_path.starts_with(td.path()), "{full_path:?}");
+        assert!(full_path.ends_with(filename), "{full_path:?}");
+        assert_eq!(std::fs::read(full_path).unwrap(), content, "{filename}");
+    }
+
+    /// A local input declared in a subdirectory (`files/a.patch`) survives the
+    /// sync writer and reader. Control: a flat name still works.
+    #[test]
+    fn nested_local_file_name_roundtrips() {
+        let content = b"--- a/foo\n+++ b/foo\n";
+        for filename in ["files/a.patch", "a.patch"] {
+            let (graph, _src) = graph_with_local_file(filename, content);
+            let (restored, td) = roundtrip(&graph);
+            assert_local_file_materialized(&restored, &td, filename, content);
+        }
+    }
+
     #[test]
     fn roundtrip_with_local_files() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1492,6 +1662,22 @@ mod tests {
         assert_eq!(*h, file_hash);
         assert_ne!(full_path, &file_path);
         assert_eq!(std::fs::read(full_path).unwrap(), content);
+    }
+
+    /// The same through the async writer and reader, and across the two.
+    /// Control: a flat name still works.
+    #[tokio::test]
+    async fn async_nested_local_file_name_roundtrips() {
+        let content = b"--- a/foo\n+++ b/foo\n";
+        for filename in ["files/a.patch", "a.patch"] {
+            let (graph, _src) = graph_with_local_file(filename, content);
+            let (restored, td) = async_roundtrip(&graph).await;
+            assert_local_file_materialized(&restored, &td, filename, content);
+            let (restored, td) = sync_write_async_read(&graph).await;
+            assert_local_file_materialized(&restored, &td, filename, content);
+            let (restored, td) = async_write_sync_read(&graph).await;
+            assert_local_file_materialized(&restored, &td, filename, content);
+        }
     }
 
     /// Multiple local files on a single spec, interleaved with a Build dep.

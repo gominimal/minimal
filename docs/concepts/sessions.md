@@ -121,9 +121,9 @@ Starting an entry whose name a running session already holds does not reuse
 that session: `min session start` refuses, and creates nothing. Attach to the
 existing session when you mean to rejoin it. Pass `--new` or `--name <NAME>`
 when you want a second session from the same entry. Once two sessions share a
-project directory, a bare `min session attach` there opens a picker to choose
-between them (and fails when `--no-input` is set or stdin/stdout is not a
-terminal).
+project directory, a bare `min session attach` there cannot choose between
+them. When more than one session can match, the command lists them and exits
+with code 2.
 
 ## How a session is composed
 
@@ -256,6 +256,28 @@ The through-line: a **session** is the durable, named environment a provider
 hosts; a **sandbox** is the isolated execution context composed from a package
 closure; and a **task** is a declared command that runs in such a sandbox. Your
 project config and loadouts decide what goes into all three.
+
+## Old command names
+
+Earlier releases spelled some session commands differently. These spellings
+are gone, and `min` refuses each of them as an unknown command, with exit
+code 2. Use the command on the right in its place.
+
+| Old spelling | Use now |
+|--------------|---------|
+| `min session activate` | `min session start` |
+| `min session destroy <box>` | `min box rm --force <box>` |
+| `min session exec <box>` | `min box exec <box> -- <command>` |
+| `min session rename <box> <name>` | `min box rename <box> <name>` |
+| `min session policy <box>` | `min box show <box> --network` |
+| `min session hooks <box>` | `min box spec <box-id>` |
+| `min session run` | No replacement yet. `min task run <task>` runs a task in a box of its own |
+| `min task run --path <dir>` | `min -C <dir> task run <task>` |
+| `min stop` | `min host stop <host>`. `min host list` prints the host names |
+
+The provider name `local-minimald` still works for `--provider`, and means
+`local`. After such a command ends, `min` prints a hint that names `local`.
+Release 0.9 removes the old name, so use `--provider local` now.
 
 ## See also
 

@@ -1128,7 +1128,12 @@ impl OwnIpNetwork {
                 (None, Some(slots)) => {
                     s.attach_task_slot(slots).await.map_err(NetworkError::new)?
                 }
-                (None, None) => s.attach().await.map_err(NetworkError::new)?,
+                // A native box takes the lease its finalize drew, when one
+                // stands, with the forwards bound toward it.
+                (None, None) => s
+                    .attach_drawn(self.own_address.as_ref().map(|own| own.session_id))
+                    .await
+                    .map_err(NetworkError::new)?,
             };
             let control = match s.transport() {
                 crate::net::SwitchTransport::LocalSpawn => ControlChannel::Unix(s.control_socket()),

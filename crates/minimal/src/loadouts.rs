@@ -979,7 +979,7 @@ impl LoadoutRow {
             counts: format!(
                 "{} pkg / {} var / {} patch",
                 loadout.packages().len(),
-                loadout.vars().len() + loadout.vars_lenient().len(),
+                loadout.vars().len(),
                 loadout.patches().iter().count(),
             ),
         }
@@ -997,7 +997,7 @@ impl LoadoutRow {
             counts: format!(
                 "{} pkg / {} var / {} patch",
                 l.packages().len(),
-                l.vars().len() + l.vars_lenient().len(),
+                l.vars().len(),
                 l.patches().iter().count(),
             ),
         }
@@ -1007,6 +1007,24 @@ impl LoadoutRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // T136: `min loadout list` counts each variable of a loadout's one
+    // `env_vars` table once, a lower-case name included.
+    #[test]
+    fn loadout_list_counts_each_env_var_once() {
+        let src = "description = \"proxy\"\n[env_vars]\nEDITOR = \"vi\"\nhttp_proxy = \"http://proxy:3128\"\n";
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("proxy.toml"), src).unwrap();
+        let entries = boxes::client::disk::list_loadouts(tmp.path()).expect("lists");
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        let loadout = entry.loadout.as_ref().expect("loads");
+        let row = LoadoutRow::from_entry(entry, loadout, &std::collections::HashSet::new());
+        assert_eq!(row.counts, "0 pkg / 2 var / 0 patch");
+
+        let builtin = LoadoutRow::builtin_default();
+        assert_eq!(builtin.counts, "0 pkg / 3 var / 0 patch");
+    }
 
     /// `HookPrep::StageOnly` leaves alone a project whose hooks the staging
     /// check would reject: `min task run` never refused one before the prep

@@ -1081,6 +1081,25 @@ impl BoxProcesses {
         Self { root, scope }
     }
 
+    /// Whether `pid` is still one of the box's processes, read again from
+    /// `/proc` after a scan that found it: a process in the box's PID
+    /// namespace, or, in the daemon's own namespace, a child of a process in
+    /// `scanned`, the processes that scan found.
+    fn still_holds(&self, pid: i32, scanned: &[i32]) -> bool {
+        match self.scope {
+            ProcessScope::Gone => false,
+            ProcessScope::Namespace(namespace) => {
+                namespace_id(std::path::Path::new(&format!("/proc/{pid}/ns/pid")))
+                    == Some(namespace)
+            }
+            ProcessScope::Tree => u32::try_from(pid)
+                .ok()
+                .and_then(parent_of)
+                .and_then(|parent| i32::try_from(parent).ok())
+                .is_some_and(|parent| parent != pid && scanned.contains(&parent)),
+        }
+    }
+
     /// The box's live processes. A zombie has ended, so it is not one.
     pub(crate) fn pids(&self) -> Vec<i32> {
         match self.scope {
@@ -1093,18 +1112,7 @@ impl BoxProcesses {
                 })
                 .filter(|pid| is_live(*pid))
                 .collect(),
-            ProcessScope::Tree => {
-                let mut tree = Vec::new();
-                let mut next = vec![i32::try_from(self.root).unwrap_or(i32::MAX)];
-                while let Some(pid) = next.pop() {
-                    if tree.contains(&pid) || !is_live(pid) {
-                        continue;
-                    }
-                    tree.push(pid);
-                    next.extend(children_of(pid));
-                }
-                tree
-            }
+            ProcessScope::Tree => tree_pids_reading(self.root, children_of),
         }
     }
 
@@ -1121,6 +1129,42 @@ impl BoxProcesses {
             })
             .count()
     }
+}
+
+/// The live processes of the tree under `root`, a child of this daemon,
+/// with `children` reading the children of a process.
+///
+/// A process found in the walk can end, and its pid go to another process,
+/// before its children are read. So each process is pinned with a pidfd,
+/// checked to still be a child of the process the walk found it under, and
+/// checked through the pidfd to still run after its children were read.
+/// A process that fails a check is left out, and so are the children read
+/// from it.
+pub(crate) fn tree_pids_reading(root: u32, mut children: impl FnMut(i32) -> Vec<i32>) -> Vec<i32> {
+    let mut tree = Vec::new();
+    let mut next = vec![(i32::try_from(root).unwrap_or(i32::MAX), std::process::id())];
+    while let Some((pid, parent)) = next.pop() {
+        if tree.contains(&pid) {
+            continue;
+        }
+        let Ok(pinned) = u32::try_from(pid)
+            .map_err(|_| ())
+            .and_then(|pid| pidfd_open(pid).map_err(|_| ()))
+        else {
+            continue;
+        };
+        if u32::try_from(pid).ok().and_then(parent_of) != Some(parent) || !is_live(pid) {
+            continue;
+        }
+        let found = children(pid);
+        if !pidfd_send_signal(&pinned, 0) || !is_live(pid) {
+            continue;
+        }
+        tree.push(pid);
+        let pid_parent = u32::try_from(pid).unwrap_or(u32::MAX);
+        next.extend(found.into_iter().map(|child| (child, pid_parent)));
+    }
+    tree
 }
 
 /// The `(device, inode)` that names the namespace `link` points at.
@@ -1324,6 +1368,432 @@ pub(crate) fn require_host_address_box_namespace(
 /// when no running host-address box runs in it.
 pub(crate) fn host_address_box_in_namespace(namespace: (u64, u64)) -> Option<boxes::SessionId> {
     host_address_namespaces().owner(namespace)
+}
+
+/// The task containers of the running boxes, by box: the container a
+/// `min task run` invocation runs in, spawned by this daemon beside the
+/// invocation's box (BOX-013). Each entry is the box and the container's
+/// supervisor pid.
+///
+/// A box's own PID namespace ends with the box, but a task invocation runs
+/// in a container of its own, and a stop that signals only the box leaves
+/// the task running. The stop takes these records so it can end the task
+/// containers first. Each record holds a pidfd opened while the supervisor
+/// is still this daemon's unreaped child, so a stop signals through it and
+/// never reaches a process that took a reaped supervisor's pid
+/// ([`TaskContainer`]).
+///
+/// A box in `stopping` records no new container: from the moment its stop
+/// starts until that stop ends, a record is refused, and the run kills the
+/// container it just spawned. So the stop's one take sees every container
+/// that can run, and a multi-invocation task starts no invocation after it.
+/// A task run under way when the stop starts records no container after the
+/// stop ends either: its spawn may still be in flight when the stop ends,
+/// and nothing would stop the container it records then.
+///
+/// A task run that spawned a container delivers an exit: after the
+/// container is reaped, the run still tears its network down and then
+/// sends the exit code to the in-box helper. `exits_pending` holds those
+/// runs, from the first record until the run ends ([`TaskRun`]), so a stop
+/// waits for that delivery before it signals the box's own processes, even
+/// a stop that starts after the container was reaped.
+#[derive(Debug, Default)]
+pub(crate) struct TaskContainers {
+    by_box: BTreeMap<(boxes::SessionId, u32), std::sync::Arc<std::os::fd::OwnedFd>>,
+    stopping: BTreeMap<boxes::SessionId, usize>,
+    /// The task runs under way, by box and run number. `true` for a run
+    /// that a stop of its box overtook: it records no container again.
+    runs: BTreeMap<TaskRunId, bool>,
+    /// The runs among them whose container was reaped.
+    exits_pending: BTreeMap<TaskRunId, ()>,
+}
+
+/// One task run of a box ([`begin_task_run`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct TaskRunId {
+    id: boxes::SessionId,
+    run: u64,
+}
+
+impl TaskContainers {
+    /// Records the task container `supervisor` of box `id`, pinned by
+    /// `pidfd`. Refused, and nothing is recorded, while a stop of the box
+    /// is under way, and for a run that a stop overtook.
+    fn record(
+        &mut self,
+        run: TaskRunId,
+        supervisor: u32,
+        pidfd: std::sync::Arc<std::os::fd::OwnedFd>,
+    ) -> Result<(), TaskContainerRefused> {
+        if self.stopping.contains_key(&run.id) {
+            return Err(TaskContainerRefused::BoxStopping);
+        }
+        if self.runs.get(&run) == Some(&true) {
+            return Err(TaskContainerRefused::BoxStopped);
+        }
+        self.by_box.insert((run.id, supervisor), pidfd);
+        // The run delivers an exit from now on, even once a stop has taken
+        // this record: the stop waits for it.
+        if self.runs.contains_key(&run) {
+            self.exits_pending.insert(run, ());
+        }
+        Ok(())
+    }
+
+    /// Drops the record of task run `run`'s container `supervisor`, which
+    /// was reaped. The run's exit stays pending until the run ends.
+    fn forget(&mut self, run: TaskRunId, supervisor: u32) {
+        self.by_box.remove(&(run.id, supervisor));
+    }
+
+    /// Ends task run `run`: its exit was delivered, or the run is gone.
+    fn end_run(&mut self, run: TaskRunId) {
+        self.runs.remove(&run);
+        self.exits_pending.remove(&run);
+    }
+
+    /// Whether a task run of box `id` spawned a container and has not
+    /// delivered its exit yet.
+    fn exit_pending(&self, id: boxes::SessionId) -> bool {
+        self.exits_pending.keys().any(|run| run.id == id)
+    }
+
+    /// Takes every task container record of box `id`, so the stop that
+    /// signals them cannot race a second take.
+    fn take(&mut self, id: boxes::SessionId) -> Vec<(u32, std::sync::Arc<std::os::fd::OwnedFd>)> {
+        let mut supervisors = Vec::new();
+        self.by_box.retain(|(boxed, supervisor), pidfd| {
+            if *boxed == id {
+                supervisors.push((*supervisor, std::sync::Arc::clone(pidfd)));
+                false
+            } else {
+                true
+            }
+        });
+        supervisors
+    }
+
+    /// Marks a stop of box `id` as under way. It overtakes every task run
+    /// of the box under way now.
+    fn begin_stop(&mut self, id: boxes::SessionId) {
+        *self.stopping.entry(id).or_default() += 1;
+        for (_, overtaken) in self.runs.iter_mut().filter(|(run, _)| run.id == id) {
+            *overtaken = true;
+        }
+    }
+
+    /// Marks a stop of box `id` as over.
+    fn end_stop(&mut self, id: boxes::SessionId) {
+        if let std::collections::btree_map::Entry::Occupied(mut stops) = self.stopping.entry(id) {
+            *stops.get_mut() -= 1;
+            if *stops.get() == 0 {
+                stops.remove();
+            }
+        }
+    }
+}
+
+/// The running boxes' task containers ([`TaskContainers`]).
+static TASK_CONTAINERS: std::sync::Mutex<TaskContainers> = std::sync::Mutex::new(TaskContainers {
+    by_box: BTreeMap::new(),
+    stopping: BTreeMap::new(),
+    runs: BTreeMap::new(),
+    exits_pending: BTreeMap::new(),
+});
+
+fn task_containers() -> std::sync::MutexGuard<'static, TaskContainers> {
+    TASK_CONTAINERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The record of one task container ([`record_task_container`]). Dropping it
+/// drops the record, so a run that ends on any path, its future dropped
+/// included, leaves no pid behind for a later stop to signal.
+#[derive(Debug)]
+#[must_use = "dropping the record forgets the task container at once"]
+pub(crate) struct TaskContainerRecord {
+    run: TaskRunId,
+    supervisor: u32,
+}
+
+impl Drop for TaskContainerRecord {
+    fn drop(&mut self) {
+        task_containers().forget(self.run, self.supervisor);
+    }
+}
+
+/// A task run of a box under way (BOX-013), from before its first
+/// invocation until its exit is delivered to the in-box helper. Dropping it
+/// ends the run. The run's containers are recorded against it
+/// ([`record_task_container`]).
+#[derive(Debug)]
+#[must_use = "dropping the run ends it at once"]
+pub(crate) struct TaskRun {
+    key: TaskRunId,
+}
+
+impl TaskRun {
+    /// The run, as its container records name it.
+    pub(crate) fn id(&self) -> TaskRunId {
+        self.key
+    }
+}
+
+impl Drop for TaskRun {
+    fn drop(&mut self) {
+        task_containers().end_run(self.key);
+    }
+}
+
+/// A run of box `id` that no stop waits on: no [`TaskRun`] holds it, so
+/// its records mark no exit as pending. For tests of the signalling alone.
+#[cfg(test)]
+pub(crate) fn untracked_task_run(id: boxes::SessionId) -> TaskRunId {
+    TaskRunId { id, run: u64::MAX }
+}
+
+/// Starts a task run of box `id`. Drop it once the run's exit is delivered.
+/// A run started while a stop of the box is under way records no container,
+/// during that stop or after it.
+pub(crate) fn begin_task_run(id: boxes::SessionId) -> TaskRun {
+    static NEXT_RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let key = TaskRunId {
+        id,
+        run: NEXT_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    };
+    // A run that begins while a stop of its box is under way is overtaken
+    // from the start: the stop has taken, or will take, the box's records
+    // without it.
+    let mut containers = task_containers();
+    let overtaken = containers.stopping.contains_key(&id);
+    containers.runs.insert(key, overtaken);
+    TaskRun { key }
+}
+
+/// How many task containers box `id` has recorded and no stop has taken.
+#[cfg(test)]
+pub(crate) fn task_containers_recorded(id: boxes::SessionId) -> usize {
+    task_containers()
+        .by_box
+        .keys()
+        .filter(|(boxed, _)| *boxed == id)
+        .count()
+}
+
+/// Whether a task run of box `id` spawned a container and has not
+/// delivered its exit yet ([`TaskRun`]).
+pub(crate) fn task_exit_pending(id: boxes::SessionId) -> bool {
+    task_containers().exit_pending(id)
+}
+
+/// A stop of a box under way ([`begin_task_stop`]). While it is held, the
+/// box records no new task container. Dropping it ends that.
+#[derive(Debug)]
+#[must_use = "dropping the stop lets the box record task containers again at once"]
+pub(crate) struct TaskStop {
+    id: boxes::SessionId,
+}
+
+impl Drop for TaskStop {
+    fn drop(&mut self) {
+        task_containers().end_stop(self.id);
+    }
+}
+
+/// Why a task container was not recorded, so it must not run.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum TaskContainerRefused {
+    /// A stop of the box is under way.
+    #[error("the box is stopping")]
+    BoxStopping,
+    /// The box was stopped after the run started.
+    #[error("the box was stopped")]
+    BoxStopped,
+    /// The container could not be pinned, and a stop could not signal it
+    /// safely.
+    #[error(
+        "the task cannot run in this box: this kernel cannot open a pidfd on its process, \
+         which `min box stop` needs to stop it ({0})"
+    )]
+    Unpinned(std::io::Error),
+}
+
+/// Records the task container `supervisor` that task run `run` just
+/// spawned (BOX-013), so `min box stop` can end it with the box. Refused
+/// while a stop of the box is under way ([`begin_task_stop`]).
+///
+/// The caller has not reaped `supervisor` yet, so the pidfd opened here
+/// names that process for as long as the record exists, even after the
+/// kernel gives its pid to another process. A container with no pidfd is
+/// refused: a stop could only signal it by pid, which a reaped container
+/// may have left to another process.
+pub(crate) fn record_task_container(
+    run: TaskRunId,
+    supervisor: u32,
+) -> Result<TaskContainerRecord, TaskContainerRefused> {
+    record_task_container_opening(run, supervisor, pidfd_open)
+}
+
+/// [`record_task_container`], pinning `supervisor` with `open`.
+pub(crate) fn record_task_container_opening(
+    run: TaskRunId,
+    supervisor: u32,
+    open: impl FnOnce(u32) -> std::io::Result<std::os::fd::OwnedFd>,
+) -> Result<TaskContainerRecord, TaskContainerRefused> {
+    let pidfd = open(supervisor).map_err(TaskContainerRefused::Unpinned)?;
+    task_containers().record(run, supervisor, std::sync::Arc::new(pidfd))?;
+    Ok(TaskContainerRecord { run, supervisor })
+}
+
+/// Opens a pidfd on `pid` (`pidfd_open(2)`).
+pub(crate) fn pidfd_open(pid: u32) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd as _;
+    // SAFETY: pidfd_open(2) takes a pid and flags=0, reads no memory of
+    // ours, and returns an fd or -1.
+    let raw = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_open,
+            libc::c_long::from(pid),
+            0 as libc::c_long,
+        )
+    };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let raw = libc::c_int::try_from(raw).map_err(std::io::Error::other)?;
+    // SAFETY: `raw` is a valid fd just returned by pidfd_open, owned by
+    // nothing else.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) })
+}
+
+/// Sends `signal` to the process `pidfd` names (`pidfd_send_signal(2)`).
+/// `false` when it is not delivered: the process was reaped, or the call
+/// failed.
+pub(crate) fn pidfd_send_signal(pidfd: &std::os::fd::OwnedFd, signal: i32) -> bool {
+    use std::os::fd::AsRawFd as _;
+    // SAFETY: pidfd_send_signal(2) with a null siginfo and flags=0 is
+    // kill(2) on the pinned process; it reads no memory of ours.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            libc::c_long::from(pidfd.as_raw_fd()),
+            libc::c_long::from(signal),
+            0 as libc::c_long,
+            0 as libc::c_long,
+        )
+    };
+    rc == 0
+}
+
+/// One task container a stop took ([`take_task_containers`]): its
+/// processes, and the pidfd that pins its supervisor.
+///
+/// Every scan and every signal first asks the pidfd whether the supervisor
+/// still runs. Once it was reaped, its pid can belong to another process,
+/// another box's supervisor included, so the container has no process and
+/// gets no further signal. The supervisor itself is signalled through the
+/// pidfd.
+#[derive(Debug)]
+pub(crate) struct TaskContainer {
+    processes: BoxProcesses,
+    pidfd: std::sync::Arc<std::os::fd::OwnedFd>,
+}
+
+impl TaskContainer {
+    /// The supervisor's pid, as the record names it.
+    #[cfg(test)]
+    pub(crate) fn supervisor(&self) -> u32 {
+        self.processes.root
+    }
+
+    /// Whether the supervisor is still the process the record pinned, and
+    /// has not ended. A zombie has ended.
+    fn runs(&self) -> bool {
+        pidfd_send_signal(&self.pidfd, 0)
+            && is_live(i32::try_from(self.processes.root).unwrap_or(i32::MAX))
+    }
+
+    /// The container's live processes, none once the supervisor was reaped.
+    pub(crate) fn pids(&self) -> Vec<i32> {
+        if !self.runs() {
+            return Vec::new();
+        }
+        let pids = self.processes.pids();
+        // What was read from `/proc` is the pinned process's only if it
+        // still runs after the read.
+        if self.runs() { pids } else { Vec::new() }
+    }
+
+    /// Sends `signal` to the container's processes: the supervisor's
+    /// descendants first, then the supervisor through its pidfd. Stops as
+    /// soon as the supervisor is gone. Answers how many processes it
+    /// reached.
+    pub(crate) fn signal(&self, signal: i32) -> usize {
+        self.signal_scanned(&self.pids(), signal)
+    }
+
+    /// Sends `signal` to the processes a scan found, `scanned`, then to the
+    /// supervisor through its pidfd when the scan listed it or listed
+    /// nothing. A scan that could not read the supervisor lists nothing, and
+    /// the pidfd still names it. A container in a PID namespace of its own
+    /// does not list its supervisor, which the namespace's processes are
+    /// signalled without.
+    ///
+    /// A descendant found by the scan can be reaped, and its pid given to
+    /// another process, before the signal. So each descendant is pinned
+    /// with a pidfd first, then checked again against `/proc`, and signalled
+    /// through that pidfd. When the pid was reused before the pin, the check
+    /// reads the new process and skips it. When it was reused after the pin,
+    /// the signal goes to the pinned process, which has ended.
+    pub(crate) fn signal_scanned(&self, scanned: &[i32], signal: i32) -> usize {
+        let root = i32::try_from(self.processes.root).unwrap_or(i32::MAX);
+        let mut reached = 0;
+        let mut root_seen = scanned.is_empty();
+        for &pid in scanned {
+            if pid == root {
+                root_seen = true;
+                continue;
+            }
+            if !self.runs() {
+                return reached;
+            }
+            let Ok(pinned) = u32::try_from(pid)
+                .map_err(|_| ())
+                .and_then(|pid| pidfd_open(pid).map_err(|_| ()))
+            else {
+                continue;
+            };
+            if self.processes.still_holds(pid, scanned) && pidfd_send_signal(&pinned, signal) {
+                reached += 1;
+            }
+        }
+        if root_seen && pidfd_send_signal(&self.pidfd, signal) {
+            reached += 1;
+        }
+        reached
+    }
+}
+
+/// Starts a stop of box `id` (BOX-013): until the returned [`TaskStop`] is
+/// dropped, [`record_task_container`] refuses the box.
+pub(crate) fn begin_task_stop(id: boxes::SessionId) -> TaskStop {
+    task_containers().begin_stop(id);
+    TaskStop { id }
+}
+
+/// Takes every task container of box `id` (BOX-013): the containers
+/// `min box stop` signals before the box's own processes, so the task's
+/// TERM trap runs and its exit code reaches the box's record.
+pub(crate) fn take_task_containers(id: boxes::SessionId) -> Vec<TaskContainer> {
+    let taken = task_containers().take(id);
+    taken
+        .into_iter()
+        .map(|(supervisor, pidfd)| TaskContainer {
+            processes: BoxProcesses::of_container(supervisor),
+            pidfd,
+        })
+        .collect()
 }
 
 /// The `(device, inode)` of process `pid`'s PID namespace, or `None` when
