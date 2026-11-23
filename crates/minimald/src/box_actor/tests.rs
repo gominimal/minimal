@@ -14767,6 +14767,44 @@ async fn session_box_stop_ends_within_grace() {
     assert!(!exited.contains_key("exit_code"));
 }
 
+/// gominimal/arch#201: a box whose spec was never read is not taken for a
+/// shell. Its stop sends the design's SIGTERM, grace period, SIGKILL and no
+/// interim SIGHUP. A box filed with no spec still starts its shell.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unread_spec_box_stop_sends_no_sighup() {
+    use boxes::core::record::StopEnding;
+
+    assert_eq!(
+        super::EntrypointKind::of_held(Some(None)),
+        super::EntrypointKind::Shell
+    );
+    let kind = super::EntrypointKind::of_held(None);
+    assert_eq!(kind, super::EntrypointKind::Program);
+
+    // A stand-in that ignores TERM: only SIGKILL ends it.
+    let child = spawn_stand_in_box("trap '' TERM");
+    let processes = crate::box_runtime::BoxProcesses::of_container(child.id());
+    let entrypoint = stand_in_entrypoint(child);
+    let outcome = super::stop_box_processes(
+        SessionId::mint(),
+        Some(processes),
+        entrypoint,
+        kind,
+        false,
+        Duration::from_millis(1500),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .await;
+    assert_eq!(outcome.sent, vec![libc::SIGTERM, libc::SIGKILL]);
+    assert_eq!(
+        outcome.ending,
+        StopEnding::Signalled {
+            signal: libc::SIGKILL
+        }
+    );
+    assert!(processes.pids().is_empty());
+}
+
 /// BOX-013: a forced stop kills every process in the box at once, without
 /// the grace period.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
