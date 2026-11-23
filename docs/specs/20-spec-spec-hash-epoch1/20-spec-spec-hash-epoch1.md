@@ -317,12 +317,15 @@ build-infra operator. Release manager.
   form.
   tier:     T0
   verify:   cargo nextest run -p graph epoch1_tests_outside_the_hash
-  - THE SYSTEM SHALL run a spec's tests against a read-only view of its
-    **output tree**, the files the build produced under its declared
-    outputs as the orchestrator captured them into the store, the bytes
-    the spec's key names. The view is read-only by the sandbox's mount of
-    those files, outside the test's own process, so no test can turn it
-    off; the standalone test sandbox mounts its rootfs this way today.
+  - THE SYSTEM SHALL run a spec's standalone tests against a read-only
+    view of its **output tree**, the files the build produced under its
+    declared outputs as the orchestrator captured them into the store, the
+    bytes the spec's key names. The view is read-only by the sandbox's
+    mount of those files, outside the test's own process, so no standalone
+    test can turn it off; the standalone test sandbox mounts its rootfs
+    this way today. A `build_test` test is not covered by this
+    requirement: nothing runs one yet, and its guard is the first open
+    question.
     tier:   T0
     verify: cargo nextest run -p orchestrator a_test_sees_the_output_tree_read_only
   - IF a test writes into the output tree THEN THE SYSTEM SHALL fail the
