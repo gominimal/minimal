@@ -42,8 +42,7 @@ pub async fn cmd_pkg_patched_build(
         remote_cache: remote_cache.as_ref(),
         // NET-155: a command-line patched build runs for no box, so it
         // stays the caller's own traffic.
-        classifier_leaf: None,
-        box_network: None,
+        build_box: None,
     }
     .run(&op::Options {
         cache,
@@ -56,7 +55,10 @@ pub async fn cmd_pkg_patched_build(
     .map_err(|e| Error::Other(anyhow!("build failed: {}", e)))?;
 
     res.outputs.finalize(res.meta).unwrap();
-    println!("Written to cache with hash {}", graph.spec_hash(&bsr).0);
+    println!(
+        "Written to cache with hash {}",
+        graph.spec_hash(&bsr).patched_slot().0
+    );
 
     Ok(())
 }

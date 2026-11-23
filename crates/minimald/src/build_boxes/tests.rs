@@ -1,0 +1,400 @@
+use std::sync::Arc;
+
+use op::BuildBoxes as _;
+
+use super::BoxBuildBoxes;
+
+/// A box record for these tests, in `mode` and under `egress`.
+fn record(mode: boxes::NetworkMode, egress: Option<boxes::EgressPolicy>) -> boxes::Record {
+    boxes::Record {
+        id: boxes::SessionId::nil(),
+        name: Some("sealed".to_string()),
+        username: None,
+        project_path: paths::HostAbsPath::try_new("/tmp/project").unwrap(),
+        network: mode,
+        policy: boxes::BoxPolicy::new(egress, None),
+        task_addresses: Vec::new(),
+        box_addresses: None,
+        status: boxes::BoxState::Active,
+        reason: None,
+        exit_code: None,
+        signal: None,
+        hooks_enabled: true,
+        host_ip_enforcement: None,
+        box_id: None,
+        host_row_bound: false,
+        bound_ports: std::collections::BTreeSet::new(),
+        ends_with_run: false,
+        sealed_deliveries: Vec::new(),
+        root_certificate: None,
+        box_type: None,
+        parent: None,
+        project_root: None,
+        attrs: Default::default(),
+    }
+}
+
+/// A switch on a host with no VM, so a lookup reads the table on disk.
+fn switch() -> Arc<tokio::sync::Mutex<crate::net::SwitchClient>> {
+    Arc::new(tokio::sync::Mutex::new(crate::net::SwitchClient::new(
+        "/usr/bin/gvproxy",
+        "/run/minimal/gvproxy",
+    )))
+}
+
+fn boxes_of(
+    mode: boxes::NetworkMode,
+    egress: Option<boxes::EgressPolicy>,
+    state: &std::path::Path,
+) -> BoxBuildBoxes {
+    BoxBuildBoxes::new(record(mode, egress), switch(), false, state.to_path_buf())
+}
+
+fn open_egress() -> boxes::EgressPolicy {
+    minimald_rpc::build_box_egress(&std::collections::BTreeSet::new(), true)
+}
+
+fn hash(byte: u8) -> common::SpecHash {
+    common::SpecHash(blake3::hash(&[byte]))
+}
+
+fn table_of(spec_hash: &common::SpecHash) -> minimald_rpc::BuildGrantTable {
+    std::collections::BTreeMap::from([(
+        spec_hash.0.to_hex().to_string(),
+        minimald_rpc::BuildGrant {
+            sources: Vec::new(),
+            internet: true,
+        },
+    )])
+}
+
+/// NET-155: every build of a box gets a build box, whatever the box's mode,
+/// and no mode reaches the host's network: a build box's network is its own
+/// or none. A build that needs a network its build box does not have says
+/// why: the box has none, or its rules admit nothing.
+#[tokio::test]
+async fn box_package_build_runs_in_a_build_box() {
+    let state = tempfile::tempdir().unwrap();
+    for (mode, egress, why) in [
+        (boxes::NetworkMode::NoNet, None, op::NEEDS_NETWORK),
+        (
+            boxes::NetworkMode::OwnIp,
+            Some(boxes::EgressPolicy::deny_all()),
+            op::NEEDS_NETWORK_RULES,
+        ),
+        (
+            boxes::NetworkMode::HostNet,
+            Some(boxes::EgressPolicy::deny_all()),
+            op::NEEDS_NETWORK_RULES,
+        ),
+    ] {
+        let build_box =
+            boxes_of(mode, egress, state.path()).build_box("pkg", Vec::new(), &hash(1), true);
+        assert!(build_box.network().await.is_none(), "{mode:?}");
+        assert_eq!(
+            build_box.needs_network().to_string(),
+            format!("other: {why}")
+        );
+    }
+}
+
+/// NET-169: a build no table covers follows the box. A box that allows the
+/// destination gives the build a network, and a `none` box gives it none.
+#[tokio::test]
+async fn workspace_build_box_follows_the_requester() {
+    let state = tempfile::tempdir().unwrap();
+    let open = boxes_of(boxes::NetworkMode::OwnIp, Some(open_egress()), state.path());
+    let build_box = open.build_box("pkg", Vec::new(), &hash(1), true);
+    assert!(build_box.network().await.is_some());
+
+    let none = boxes_of(boxes::NetworkMode::NoNet, None, state.path());
+    let build_box = none.build_box("pkg", Vec::new(), &hash(1), true);
+    assert!(build_box.network().await.is_none());
+}
+
+/// NET-169: a deny-all box gives a build no table covers no network, declared
+/// or by default, so the build is refused before any packet.
+#[tokio::test]
+async fn workspace_build_refused_in_deny_all_box() {
+    let state = tempfile::tempdir().unwrap();
+    for egress in [Some(boxes::EgressPolicy::deny_all()), None] {
+        let sealed = boxes_of(boxes::NetworkMode::OwnIp, egress, state.path());
+        let build_box = sealed.build_box("pkg", Vec::new(), &hash(1), true);
+        assert!(build_box.network().await.is_none());
+    }
+}
+
+/// NET-165: a build the table covers gets its grant whenever it asks, in a
+/// deny-all box, and `min add` in a running box asks the same way. A patched
+/// build never looks, so its spec follows the box.
+#[tokio::test]
+async fn install_through_minenv_sock_takes_the_same_lookup() {
+    let state = tempfile::tempdir().unwrap();
+    let sealed = boxes_of(boxes::NetworkMode::OwnIp, None, state.path());
+    super::file_table(state.path(), boxes::SessionId::nil(), &table_of(&hash(1))).unwrap();
+
+    let added = sealed.build_box("claude-code", Vec::new(), &hash(1), true);
+    assert!(added.network().await.is_some());
+
+    let patched = sealed.build_box("claude-code", Vec::new(), &hash(1), false);
+    assert!(patched.network().await.is_none());
+}
+
+/// NET-165, NET-169: a `none` box's builds get no network, even for a spec
+/// hash its table grants the internet. The build never asks for the grant.
+#[tokio::test]
+async fn a_none_box_build_opens_no_grant() {
+    let state = tempfile::tempdir().unwrap();
+    let none = boxes_of(boxes::NetworkMode::NoNet, None, state.path());
+    super::file_table(state.path(), boxes::SessionId::nil(), &table_of(&hash(1))).unwrap();
+
+    let build_box = none.build_box("pkg", Vec::new(), &hash(1), true);
+    assert!(
+        build_box.network().await.is_none(),
+        "a none box's registry build opened a granted network"
+    );
+    assert_eq!(
+        build_box.needs_network().to_string(),
+        format!("other: {}", op::NEEDS_NETWORK)
+    );
+}
+
+/// NET-166: a grant reaches its spec hash and no other build, whatever the
+/// package's name. An ended table grants nothing.
+#[tokio::test]
+async fn grant_applies_only_to_the_expanded_spec_hash() {
+    let state = tempfile::tempdir().unwrap();
+    let sealed = boxes_of(boxes::NetworkMode::OwnIp, None, state.path());
+    super::file_table(state.path(), boxes::SessionId::nil(), &table_of(&hash(1))).unwrap();
+
+    let other = sealed.build_box("pkg", Vec::new(), &hash(2), true);
+    assert!(other.network().await.is_none());
+    let granted = sealed.build_box("another-name", Vec::new(), &hash(1), true);
+    assert!(granted.network().await.is_some());
+
+    super::drop_table(state.path(), boxes::SessionId::nil(), &switch()).await;
+    let ended = sealed.build_box("pkg", Vec::new(), &hash(1), true);
+    assert!(ended.network().await.is_none());
+}
+
+/// NET-155: a box's rules decide a source by its host before any packet,
+/// as the box's own name query would be answered. A box that lists hosts
+/// admits those alone. A grant admits its sources whatever the box lists.
+#[tokio::test]
+async fn a_box_refuses_a_source_host_it_does_not_list() {
+    use op::BuildReach as _;
+    let state = tempfile::tempdir().unwrap();
+    let listed = boxes::EgressPolicy {
+        allow_subnets: Some(Vec::new()),
+        allow_dns_hosts: Some(vec!["Downloads.Example.org".to_string()]),
+        allow_protocols: None,
+        deny_subnets: None,
+    };
+    let reach = |egress: Option<boxes::EgressPolicy>, spec_hash: Option<String>| super::BoxReach {
+        shared: Arc::clone(&boxes_of(boxes::NetworkMode::OwnIp, egress, state.path()).0),
+        package: "pkg".to_string(),
+        packages: Vec::new(),
+        spec_hash,
+        listing: super::running_key("pkg", &hash(1), 0),
+        granted: std::sync::OnceLock::new(),
+    };
+    let own = reach(Some(listed.clone()), None);
+    assert!(own.admits_source("downloads.example.org"));
+    assert!(!own.admits_source("elsewhere.example"));
+    assert!(reach(Some(open_egress()), None).admits_source("elsewhere.example"));
+    assert!(reach(None, None).admits_source("elsewhere.example"));
+
+    super::file_table(state.path(), boxes::SessionId::nil(), &table_of(&hash(1))).unwrap();
+    let granted = reach(Some(listed), Some(hash(1).0.to_hex().to_string()));
+    assert!(granted.open().await.is_some());
+    assert!(granted.admits_source("elsewhere.example"));
+}
+
+/// NET-171: a build box lists while it runs, with the reach the host side
+/// granted it, and leaves when the build ends. A box with no build lists none.
+#[tokio::test]
+async fn a_running_build_box_lists_until_its_build_ends() {
+    let state = tempfile::tempdir().unwrap();
+    let mut listed = record(boxes::NetworkMode::OwnIp, None);
+    listed.id = boxes::SessionId::mint();
+    let id = listed.id;
+    let box_id = id.to_string();
+    let expanded = hash(1);
+    super::file_table(state.path(), id, &table_of(&expanded)).unwrap();
+    let boxes = BoxBuildBoxes::new(listed, switch(), false, state.path().to_path_buf());
+    assert!(super::running_build_boxes(&box_id).is_empty());
+
+    let build_box = boxes.build_box("pkg", Vec::new(), &expanded, true);
+    boxes.note_running("pkg", &expanded, build_box.listing(), true);
+    let running = super::running_build_boxes(&box_id);
+    assert_eq!(running.len(), 1);
+    assert_eq!(running[0].package, "pkg");
+    assert!(!running[0].granted, "it has not asked yet");
+
+    assert!(build_box.network().await.is_some());
+    let running = super::running_build_boxes(&box_id);
+    assert!(running[0].granted);
+    assert_eq!(running[0].egress, Some(open_egress()));
+
+    build_box.close().await;
+    let running = super::running_build_boxes(&box_id);
+    assert!(running[0].no_network, "its steps run with no address now");
+
+    boxes.note_running("pkg", &expanded, build_box.listing(), false);
+    assert!(super::running_build_boxes(&box_id).is_empty());
+}
+
+/// NET-171: two builds of one package at different spec hashes are two
+/// entries in the box's listing. The end of one leaves the other listed,
+/// with its own reach.
+#[tokio::test]
+async fn builds_of_one_package_at_two_spec_hashes_list_apart() {
+    let state = tempfile::tempdir().unwrap();
+    let mut listed = record(boxes::NetworkMode::OwnIp, None);
+    listed.id = boxes::SessionId::mint();
+    let box_id = listed.id.to_string();
+    let boxes = BoxBuildBoxes::new(listed, switch(), false, state.path().to_path_buf());
+
+    let first = boxes.build_box("pkg", Vec::new(), &hash(1), false);
+    let second = boxes.build_box("pkg", Vec::new(), &hash(2), false);
+    boxes.note_running("pkg", &hash(1), first.listing(), true);
+    boxes.note_running("pkg", &hash(2), second.listing(), true);
+    assert_eq!(super::running_build_boxes(&box_id).len(), 2);
+
+    first.close().await;
+    let running = super::running_build_boxes(&box_id);
+    assert_eq!(
+        running.iter().filter(|build| build.no_network).count(),
+        1,
+        "only the closed build has no network: {running:?}"
+    );
+
+    boxes.note_running("pkg", &hash(1), first.listing(), false);
+    let running = super::running_build_boxes(&box_id);
+    assert_eq!(running.len(), 1, "the other build still runs");
+    assert!(!running[0].no_network);
+
+    boxes.note_running("pkg", &hash(2), second.listing(), false);
+    assert!(super::running_build_boxes(&box_id).is_empty());
+}
+
+/// NET-171: two builds of one package at one spec hash in one box are two
+/// entries, each with its own reach. The first build's network ending
+/// leaves the second's open, and the end of the first leaves the second
+/// listed.
+#[tokio::test]
+async fn two_builds_at_one_spec_hash_list_apart_until_both_end() {
+    let state = tempfile::tempdir().unwrap();
+    let mut listed = record(boxes::NetworkMode::OwnIp, None);
+    listed.id = boxes::SessionId::mint();
+    let box_id = listed.id.to_string();
+    let boxes = BoxBuildBoxes::new(listed, switch(), false, state.path().to_path_buf());
+
+    let first = boxes.build_box("pkg", Vec::new(), &hash(1), false);
+    let second = boxes.build_box("pkg", Vec::new(), &hash(1), false);
+    assert_ne!(first.listing(), second.listing());
+    boxes.note_running("pkg", &hash(1), first.listing(), true);
+    boxes.note_running("pkg", &hash(1), second.listing(), true);
+    assert_eq!(super::running_build_boxes(&box_id).len(), 2);
+
+    first.close().await;
+    let running = super::running_build_boxes(&box_id);
+    assert_eq!(
+        running.iter().filter(|build| build.no_network).count(),
+        1,
+        "only the closed build has no network: {running:?}"
+    );
+
+    boxes.note_running("pkg", &hash(1), first.listing(), false);
+    let running = super::running_build_boxes(&box_id);
+    assert_eq!(running.len(), 1, "the second build still runs");
+    assert!(!running[0].no_network, "its network is still open");
+
+    boxes.note_running("pkg", &hash(1), second.listing(), false);
+    assert!(super::running_build_boxes(&box_id).is_empty());
+}
+
+/// NET-165: a table that does not parse reads as none, so the build follows
+/// the box's own rules: in a deny-all box, no network. A table filed again
+/// replaces it whole.
+#[tokio::test]
+async fn an_unreadable_table_grants_nothing() {
+    let state = tempfile::tempdir().unwrap();
+    let sealed = boxes_of(boxes::NetworkMode::OwnIp, None, state.path());
+    let path = super::table_path(state.path(), boxes::SessionId::nil());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, b"{ not json").unwrap();
+    let build_box = sealed.build_box("pkg", Vec::new(), &hash(1), true);
+    assert!(build_box.network().await.is_none());
+
+    super::file_table(state.path(), boxes::SessionId::nil(), &table_of(&hash(1))).unwrap();
+    let build_box = sealed.build_box("pkg", Vec::new(), &hash(1), true);
+    assert!(build_box.network().await.is_some());
+}
+
+/// NET-155: on a host with no VM, a build box's network needs /dev/net/tun
+/// and the daemon's network switch. A build never falls back to the host's
+/// network: it is refused, naming what is missing and the next step.
+#[test]
+fn a_build_without_its_own_network_stack_is_refused() {
+    assert_eq!(
+        super::own_stack_refusal(super::MissingStack::Tun, ""),
+        "the build needs a network of its own, and the daemon finds no /dev/net/tun to make \
+         one. On a host, load the tun module with `sudo modprobe tun`. A daemon in a \
+         container needs the container to have the /dev/net/tun device. Then run the build \
+         again."
+    );
+    assert_eq!(
+        super::own_stack_refusal(super::MissingStack::Switch, "no switch binary"),
+        "the build needs a network of its own, and the daemon could not set it up: no \
+         switch binary. Run `min bug` to collect a report of the daemon's logs."
+    );
+}
+
+/// NET-169: a host-address box with no task addresses, created before build
+/// rows or with its row not registered at its start, has its network build
+/// refused with the attach that registers them, never attached at no
+/// address.
+#[test]
+fn a_host_address_box_with_no_build_row_is_refused() {
+    assert_eq!(
+        super::no_build_row_refusal("web"),
+        "the build needs the network, and box web has no addresses for its builds. An \
+         earlier version of min created the box, or its addresses were not registered when \
+         it started. On the host, run `min box attach web` to register them, then run the \
+         build again. If it is refused again, remove the box with `min box rm --force web`, \
+         start it again with the command that created it, then run the build again."
+    );
+}
+
+/// NET-169: a host-address box whose build row the VM host daemon cannot
+/// confirm has its network build refused in words of its own, never the
+/// task run's.
+#[test]
+fn a_build_whose_row_is_unconfirmed_is_refused() {
+    assert_eq!(
+        super::build_row_unconfirmed_refusal("web"),
+        "the build needs the network, and the VM host daemon could not confirm the addresses \
+         of box web's builds, so the build did not run. Run the build again. If it is \
+         refused again, remove the box with `min box rm --force web`, start it again with \
+         the command that created it, then run the build again."
+    );
+}
+
+/// NET-155: `__build-fetch` takes a hash and a file, and says so. Its URL
+/// is never an argument.
+#[test]
+fn fetch_process_names_its_arguments() {
+    assert_eq!(
+        super::fetch_main(Vec::new()),
+        Err("__build-fetch takes a sha256 and a file".to_string())
+    );
+    assert_eq!(
+        super::fetch_main(vec![
+            "https://downloads.example.org/a.tar.gz".into(),
+            "aa".into(),
+            "output/fetched".into(),
+        ]),
+        Err("__build-fetch takes a sha256 and a file".to_string())
+    );
+}

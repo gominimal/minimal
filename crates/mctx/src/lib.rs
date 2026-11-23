@@ -272,16 +272,15 @@ pub struct DaemonContext {
 pub struct Context {
     pub(crate) daemon: Arc<DaemonContext>,
     pub(crate) mfile: mfile::File,
-    /// The classifier leaf of the box this context builds for, if any
-    /// (NET-155). Every package build the context starts runs in it, so the
-    /// box's egress verdict decides the build's connections. `None` for a
-    /// context that builds as its caller's own traffic.
+    /// The build boxes of the box this context builds for, if any (NET-155).
+    /// Every package build the context starts runs in one of them. `None`
+    /// for a context that builds outside any box.
+    pub(crate) build_boxes: Option<Arc<dyn op::BuildBoxes>>,
+    /// The classifier leaf a task env of this context runs in, on a
+    /// VM-backed host_ip box, so the box's egress verdict decides the task's
+    /// connections. `None` for a context made for no such box. Package
+    /// builds take their box from `build_boxes`, never from this leaf.
     pub(crate) classifier_leaf: Option<sandbox::config::ClassifierLeaf>,
-    /// The network of the own-address box this context builds for, if any
-    /// (NET-155). Every package build the context starts that needs the
-    /// network attaches to it, so the box's egress verdict decides the
-    /// build's connections.
-    pub(crate) box_network: Option<op::BuildNetwork>,
     /// The workspace a box's `minimal.toml` edits and re-reads must stay
     /// inside, for a context the daemon builds for a box (inbox#1245).
     /// `None` for a context whose caller chose the project itself, as the
@@ -449,8 +448,8 @@ impl Context {
         Ok(Self {
             daemon,
             mfile,
+            build_boxes: None,
             classifier_leaf: None,
-            box_network: None,
             mfile_edit_root: None,
             state_root: None,
         })
@@ -475,8 +474,8 @@ impl Context {
         Self {
             daemon,
             mfile,
+            build_boxes: None,
             classifier_leaf: None,
-            box_network: None,
             mfile_edit_root: None,
             state_root: None,
         }
@@ -491,38 +490,37 @@ impl Context {
         Self {
             daemon,
             mfile,
+            build_boxes: None,
             classifier_leaf: None,
-            box_network: None,
             mfile_edit_root: None,
             state_root: None,
         }
     }
 
-    /// Places every package build this context starts in `leaf`, the
-    /// classifier leaf of the box the builds run for (NET-155).
+    /// Runs every package build this context starts in one of `boxes`, the
+    /// build boxes of the box the builds run for (NET-155).
+    #[must_use]
+    pub fn with_build_boxes(mut self, boxes: Arc<dyn op::BuildBoxes>) -> Self {
+        self.build_boxes = Some(boxes);
+        self
+    }
+
+    /// Places every task env this context makes in `leaf`, the classifier
+    /// leaf of the box the tasks run for.
     #[must_use]
     pub fn with_classifier_leaf(mut self, leaf: sandbox::config::ClassifierLeaf) -> Self {
         self.classifier_leaf = Some(leaf);
         self
     }
 
-    /// The classifier leaf this context's package builds run in, if any.
+    /// The classifier leaf this context's task envs run in, if any.
     pub fn classifier_leaf(&self) -> Option<&sandbox::config::ClassifierLeaf> {
         self.classifier_leaf.as_ref()
     }
 
-    /// Runs every package build this context starts that needs the network
-    /// on `network`, the network of the own-address box the builds run for
-    /// (NET-155).
-    #[must_use]
-    pub fn with_box_network(mut self, network: op::BuildNetwork) -> Self {
-        self.box_network = Some(network);
-        self
-    }
-
-    /// The box network this context's package builds attach to, if any.
-    pub fn box_network(&self) -> Option<&op::BuildNetwork> {
-        self.box_network.as_ref()
+    /// The build boxes this context's package builds run in, if any.
+    pub fn build_boxes(&self) -> Option<&Arc<dyn op::BuildBoxes>> {
+        self.build_boxes.as_ref()
     }
 
     /// Confines every edit this context makes to its `minimal.toml`, and
@@ -591,8 +589,8 @@ impl Context {
         };
         let mfile = strategy.find_mfile()?;
         Ok(Self {
+            build_boxes: self.build_boxes.clone(),
             classifier_leaf: self.classifier_leaf.clone(),
-            box_network: self.box_network.clone(),
             mfile_edit_root: self.mfile_edit_root.clone(),
             state_root: self.state_root.clone(),
             ..Self::from_daemon(Arc::clone(&self.daemon), mfile)
@@ -913,8 +911,8 @@ impl Context {
     }
 
     /// The orchestrator this context builds `graph` with. It carries the
-    /// context's classifier leaf (NET-155), so every spec build it schedules
-    /// runs in the leaf of the box the context was made for.
+    /// context's build boxes (NET-155), so every spec build it schedules for a
+    /// box runs in its own build box.
     async fn local_orchestrator(
         &self,
         graph: &Graph,
@@ -934,8 +932,7 @@ impl Context {
             log_sink,
             self.daemon.config.ot.clone(),
             cancel,
-            self.classifier_leaf.clone(),
-            self.box_network.clone(),
+            self.build_boxes.clone(),
         )?)
     }
 
@@ -1264,8 +1261,9 @@ impl Context {
 
     /// `args` placed in this context's classifier leaf, if it has one. A task
     /// env made for a host-address box then runs in the leaf of its box, so
-    /// the box's egress verdict decides the task's connections, the same as
-    /// for the package builds the context starts (NET-155).
+    /// the box's egress verdict decides the task's connections (NET-079). The
+    /// package builds the context starts run in build boxes, outside the
+    /// leaf (NET-155).
     pub(crate) fn task_env_args<'a>(&self, args: EnvArgs<'a>) -> EnvArgs<'a> {
         EnvArgs {
             classifier_leaf: self.classifier_leaf.clone(),
@@ -1927,11 +1925,26 @@ mod tests {
         assert!(!msg.contains("Choose a state key"), "{msg}");
     }
 
-    /// NET-155: a context made for a box carries the box's classifier leaf,
+    /// NET-155: a context made for a box carries the box's build boxes,
     /// across a clone and a reload of its mfile, into the orchestrator it
-    /// builds with. A context made for no box carries no leaf.
+    /// builds with. A context made for no box carries none.
     #[tokio::test]
-    async fn box_context_carries_its_classifier_leaf() {
+    async fn box_context_carries_its_build_boxes() {
+        #[derive(Debug)]
+        struct NoBoxes;
+        impl op::BuildBoxes for NoBoxes {
+            #[expect(clippy::unreachable, reason = "this test builds nothing")]
+            fn build_box(
+                &self,
+                _: &str,
+                _: Vec<String>,
+                _: &common::SpecHash,
+                _: bool,
+            ) -> op::BuildBox {
+                unreachable!("nothing builds here")
+            }
+        }
+
         let state = tempdir().unwrap();
         let cache = tempdir().unwrap();
         let config = ConfigBuilder::new()
@@ -1950,51 +1963,25 @@ mod tests {
         let mfile = MFileSearchStrategy::Override(repo)
             .find_mfile()
             .expect("fakerepo has a minimal.toml");
-        let leaf = sandbox::config::ClassifierLeaf::under(
-            std::path::Path::new("/sys/fs/cgroup/minimald.slice"),
-            "box-1",
-            sandbox::config::Verdict::Deny,
-        );
 
         let plain = Context::from_daemon(Arc::clone(&daemon), mfile);
-        assert_eq!(plain.classifier_leaf(), None);
+        assert!(plain.build_boxes().is_none());
         let graph = Graph::new();
         let orchestrator = plain
             .local_orchestrator(&graph, None, None, Default::default())
             .await
             .unwrap();
-        assert_eq!(orchestrator.backend.classifier_leaf(), None);
+        assert!(orchestrator.backend.build_boxes().is_none());
 
-        let boxed = plain.clone().with_classifier_leaf(leaf.clone());
-        assert_eq!(boxed.clone().classifier_leaf(), Some(&leaf));
-        assert_eq!(
-            boxed.cloned_reinit().unwrap().classifier_leaf(),
-            Some(&leaf)
-        );
-        let orchestrator = boxed
-            .local_orchestrator(&graph, None, None, Default::default())
-            .await
-            .unwrap();
-        assert_eq!(orchestrator.backend.classifier_leaf(), Some(&leaf));
-        assert!(orchestrator.backend.box_network().is_none());
-
-        // An own-address box has no leaf. Its context carries the box's
-        // network instead, across a clone and a reload, into the
-        // orchestrator.
-        assert!(plain.box_network().is_none());
-        let on_box_network = plain.with_box_network(op::BuildNetwork::new(|| {
-            Arc::new(sandbox::NoNet) as Arc<dyn sandbox::Network>
-        }));
-        assert!(on_box_network.clone().box_network().is_some());
-        let reloaded = on_box_network.cloned_reinit().unwrap();
-        assert!(reloaded.box_network().is_some());
-        assert_eq!(reloaded.classifier_leaf(), None);
+        let boxed = plain.with_build_boxes(Arc::new(NoBoxes));
+        assert!(boxed.clone().build_boxes().is_some());
+        let reloaded = boxed.cloned_reinit().unwrap();
+        assert!(reloaded.build_boxes().is_some());
         let orchestrator = reloaded
             .local_orchestrator(&graph, None, None, Default::default())
             .await
             .unwrap();
-        assert!(orchestrator.backend.box_network().is_some());
-        assert_eq!(orchestrator.backend.classifier_leaf(), None);
+        assert!(orchestrator.backend.build_boxes().is_some());
     }
 
     /// A task env made from a context with a classifier leaf runs in that
@@ -2057,63 +2044,6 @@ mod tests {
             placed.classifier_leaf,
         );
         assert_eq!(config.classifier_leaf, Some(leaf));
-    }
-
-    /// A `min patched-pkg` build takes the classifier leaf of its box, or the
-    /// box's network when the box has no leaf. A context made for no box
-    /// gives neither, so the build stays its caller's own traffic. The
-    /// choice survives the reload that `run_patched_pkg` makes.
-    #[test]
-    fn patched_build_takes_the_leaf_or_the_network_of_its_box() {
-        let state = tempdir().unwrap();
-        let cache = tempdir().unwrap();
-        let config = ConfigBuilder::new()
-            .with_state_dir(state.path().to_path_buf())
-            .with_cache_dir(cache.path().to_path_buf())
-            .with_stdlib_dir(
-                std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
-                    .join("../stdlib/minimal-ncl"),
-            )
-            .build()
-            .unwrap();
-        let daemon = Arc::new(DaemonContext::init(config).unwrap());
-        let repo = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
-            .join("testdata")
-            .join("fakerepo");
-        let mfile = MFileSearchStrategy::Override(repo)
-            .find_mfile()
-            .expect("fakerepo has a minimal.toml");
-        let leaf = sandbox::config::ClassifierLeaf::under(
-            std::path::Path::new("/sys/fs/cgroup/minimald.slice"),
-            "box-1",
-            sandbox::config::Verdict::Deny,
-        );
-        let network =
-            || op::BuildNetwork::new(|| Arc::new(sandbox::NoNet) as Arc<dyn sandbox::Network>);
-
-        let plain = Context::from_daemon(Arc::clone(&daemon), mfile);
-        let (no_leaf, no_network) = env::patched_build_egress(&plain.cloned_reinit().unwrap());
-        assert_eq!(no_leaf, None);
-        assert!(no_network.is_none());
-
-        let in_leaf = plain.clone().with_classifier_leaf(leaf.clone());
-        let (got_leaf, got_network) = env::patched_build_egress(&in_leaf.cloned_reinit().unwrap());
-        assert_eq!(got_leaf, Some(leaf.clone()));
-        assert!(got_network.is_none());
-
-        let on_network = plain.clone().with_box_network(network());
-        let (got_leaf, got_network) =
-            env::patched_build_egress(&on_network.cloned_reinit().unwrap());
-        assert_eq!(got_leaf, None);
-        assert!(got_network.is_some());
-
-        // A leaf wins over a network, as in the session channel of minimald.
-        let both = plain
-            .with_classifier_leaf(leaf.clone())
-            .with_box_network(network());
-        let (got_leaf, got_network) = env::patched_build_egress(&both);
-        assert_eq!(got_leaf, Some(leaf));
-        assert!(got_network.is_none());
     }
 
     #[test]

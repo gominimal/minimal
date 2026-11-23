@@ -2672,9 +2672,23 @@ mod tests {
                 msg.starts_with(&format!("`{header}` has the type `{box_type}`")),
                 "{msg}"
             );
-            assert!(msg.contains("gominimal/inbox#678"), "{msg}");
             assert!(msg.contains(&format!("a box of type `{root}`")), "{msg}");
+            // A build box is min's to make, so no epic is named for it.
+            assert_eq!(
+                msg.contains("gominimal/inbox#678"),
+                root != "build",
+                "{msg}"
+            );
         }
+        assert_eq!(
+            expand_typed(TYPED_FILE, "builder")
+                .expect_err("refused")
+                .to_string(),
+            "`[boxes.builder]` has the type `build`. \
+             min makes a box of type `build` for each package build, \
+             and never from an entry in minimal.toml. \
+             The other entries of minimal.toml are not affected."
+        );
         assert_eq!(
             expand_typed(TYPED_FILE, "assistant")
                 .expect_err("refused")

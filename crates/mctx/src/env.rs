@@ -231,11 +231,26 @@ impl EnvChannel<'_> {
         };
 
         let bsr = graph.top_levels[0];
+        // NET-155: in a box, a patched build's spec is one the box can
+        // change, so it runs in a build box on the box's own rules and looks
+        // up nothing (NET-169), as the daemon's patched build does. With no
+        // build boxes, as on the client, it stays the caller's own traffic.
+        let spec_hash = graph.spec_hash(&bsr);
+        let build_box = build_ctx.build_boxes().map(|boxes| {
+            boxes.build_box(
+                pkg_name,
+                op::build_box::declared_packages(&graph, &bsr),
+                &spec_hash,
+                false,
+            )
+        });
+        let build_boxes = build_ctx.build_boxes().cloned();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap();
         if let Err(e) = rt.block_on(async {
+            let run = op::BuildBoxRun::start(build_boxes, build_box.clone(), pkg_name, spec_hash);
             let remote_storage = build_ctx
                 .remote_storage()
                 .await
@@ -258,7 +273,6 @@ impl EnvChannel<'_> {
             std::fs::create_dir_all(&output_base).ok();
 
             let cache = build_ctx.local_cache();
-            let (classifier_leaf, box_network) = patched_build_egress(&build_ctx);
             let (stdout_writer, stderr_writer) = StreamWriter::pair(stream);
             let res = op::PatchedBuild {
                 spec: &bsr,
@@ -266,8 +280,7 @@ impl EnvChannel<'_> {
                 stdout_writer: Some(Box::new(stdout_writer)),
                 stderr_writer: Some(Box::new(stderr_writer)),
                 remote_cache: remote_cache.as_ref(),
-                classifier_leaf,
-                box_network,
+                build_box,
             }
             .run(&op::Options {
                 cache,
@@ -276,8 +289,9 @@ impl EnvChannel<'_> {
                 ot: self.ot.clone(),
                 daemon_id: self.daemon_id.clone(),
             })
-            .await
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+            .await;
+            run.end().await;
+            let res = res.map_err(|e| anyhow::anyhow!("{}", e))?;
 
             res.outputs
                 .finalize(res.meta)
@@ -290,7 +304,7 @@ impl EnvChannel<'_> {
         writeln!(
             stream,
             "msg:Written to cache with hash {}",
-            graph.spec_hash(&bsr).0
+            graph.spec_hash(&bsr).patched_slot().0
         )
         .ok();
     }
@@ -653,23 +667,6 @@ pub struct EnvArgs<'a> {
     pub classifier_leaf: Option<sandbox::config::ClassifierLeaf>,
     /// The operation tracker to use downstream, if applicable.
     pub ot: Option<OpTracker>,
-}
-
-/// The classifier leaf and the box network a `min patched-pkg` build runs
-/// on, from the context of the box it runs for. The build takes the box's
-/// leaf, or the box's network when the box has no leaf, as the session
-/// channel in `minimald` does. A context made for no box gives neither, so
-/// the build stays its caller's own traffic.
-pub(crate) fn patched_build_egress(
-    ctx: &Context,
-) -> (
-    Option<sandbox::config::ClassifierLeaf>,
-    Option<op::BuildNetwork>,
-) {
-    match ctx.classifier_leaf() {
-        Some(leaf) => (Some(leaf.clone()), None),
-        None => (None, ctx.box_network().cloned()),
-    }
 }
 
 /// Places the sandbox `config` in `leaf`, the classifier leaf of the box a
