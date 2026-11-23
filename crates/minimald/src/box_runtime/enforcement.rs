@@ -965,7 +965,7 @@ pub(super) fn unenforced_placement_notice(
 /// its last.
 ///
 /// The placement is confirmed, not assumed, by the one function every
-/// launch in a box's leaf uses — this one, a package build's and a task's:
+/// launch in a box's leaf uses — this one, a sandbox run's and a task's:
 /// [`sandbox::classifier::place_supervisor`] writes the supervisor in and
 /// reads the leaf's own `cgroup.procs` back, which must list it. The program
 /// is still held at its start gate here, so the supervisor is alive for the

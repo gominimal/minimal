@@ -868,7 +868,7 @@ pub mod classifier {
 
     /// Moves a sandbox's supervisor, `pid`, into `leaf` and confirms it
     /// there: the one function every launch in a box's leaf — a box's own
-    /// launch, a package build, a task — places its supervisor with.
+    /// launch, a sandbox run, a task — places its supervisor with.
     ///
     /// The supervisor is the one process of a sandbox that never runs the
     /// pre-exec closure that joins the leaf: hakoniwa forks it inside

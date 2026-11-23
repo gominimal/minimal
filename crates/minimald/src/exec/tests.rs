@@ -685,7 +685,7 @@ fn a_task_supervisor_the_leaf_refuses_stops_the_task() {
 }
 
 /// NET-079. A task in a box's leaf holds its program at a start gate until
-/// its supervisor is in the leaf, as a box launch and a package build do.
+/// its supervisor is in the leaf, as a box launch and a sandbox run do.
 /// The gate goes only after the placement: on success it releases the
 /// program, and on a refusal it goes after the process is reaped, so a
 /// refused task never runs its program.

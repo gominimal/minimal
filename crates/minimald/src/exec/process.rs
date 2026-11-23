@@ -296,7 +296,7 @@ pub(super) async fn attach_or_reap<P: Reapable>(
 /// and fails the task with the cause. The program joined the leaf in its own
 /// pre-exec closure and waits at `gate`; the supervisor never runs that
 /// closure, so the daemon moves it after the spawn with the same function a
-/// box launch and a package build use. So the program never runs while its
+/// box launch and a sandbox run use. So the program never runs while its
 /// supervisor is outside the leaf, and a refused task never runs its program:
 /// the process is reaped before `gate` drops. `leaf` is `None` for a box with
 /// no leaf, which places nothing and holds no gate.
@@ -640,7 +640,7 @@ pub(super) async fn task_producer(
                     .map_err(|e| io::Error::other(format!("building container failed: {}", e)))?;
                 // A task in a box's leaf holds its program at a start gate
                 // until its supervisor is in the leaf too, as a box launch
-                // and a package build do.
+                // and a sandbox run do.
                 let gate = match &leaf {
                     Some(_) => Some(container.hold_start().map_err(|e| {
                         io::Error::other(format!("holding the task's start failed: {e}"))
