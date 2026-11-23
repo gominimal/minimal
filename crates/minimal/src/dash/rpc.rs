@@ -205,7 +205,7 @@ pub async fn connect_missing(hosts: &mut Vec<Host>, minimal_dir: Option<&Path>) 
         // Version-gated like `discover`, but a skewed host that appears
         // mid-run must not kill the dashboard the other hosts are still
         // serving, so the refusal skips it — the warning it logged is the
-        // operator's cue to `min stop --force` and reopen.
+        // operator's cue to `min host stop <host>` and reopen.
         if let Err(e) = minimal_client::ensure_version_match(&mut client).await {
             tracing::warn!(provider = label, error = %e, "provider build is skewed");
             continue;
@@ -636,7 +636,7 @@ pub async fn activate(
             Errorable::Ok(minimald_rpc::ConfigureLoadoutResponse::Pending { .. }) => {
                 anyhow::bail!(
                     "this project needs approvals the dashboard cannot ask for; \
-                     create it with `min session activate` instead"
+                     create it with `min session start` instead"
                 );
             }
             Errorable::Err { error } => anyhow::bail!("{error}"),

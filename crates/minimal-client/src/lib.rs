@@ -2286,7 +2286,10 @@ mod tests {
             .expect_err("a differing build must be refused")
             .to_string();
         assert!(err.contains("0.6.0") && err.contains("0.5.0"), "got: {err}");
-        assert!(err.contains("min stop"), "missing the recovery: {err}");
+        assert!(
+            err.contains("min host stop <host>"),
+            "missing the recovery: {err}"
+        );
         assert!(
             err.contains(super::SKEW_OVERRIDE_VAR),
             "missing the override: {err}"
@@ -2311,7 +2314,10 @@ mod tests {
             err.contains(super::UNVERSIONED_DAEMON),
             "the daemon must be named, got: {err}"
         );
-        assert!(err.contains("min stop"), "missing the recovery: {err}");
+        assert!(
+            err.contains("min host stop <host>"),
+            "missing the recovery: {err}"
+        );
 
         super::version_gate("0.6.0", None, true)
             .expect("the override must let the operator proceed")

@@ -1261,8 +1261,8 @@ impl BoxActor {
             AttachError::SpawnFailed(std::io::Error::new(
                 error.kind(),
                 format!(
-                    "{error} Destroy it with `min session destroy {name}`, then start a new \
-                     one with `min session activate`.",
+                    "{error} Remove it with `min box rm --force {name}`, then start a new \
+                     one with `min session start`.",
                     name = registry_name(&record),
                 ),
             ))
@@ -2287,6 +2287,114 @@ pub(crate) struct StopOutcome {
     pub(crate) unfinished: Option<JoinHandle<Result<box_runtime::HostExit, std::io::Error>>>,
 }
 
+/// How long a stop that ended the box's task containers waits for the
+/// entrypoint to end with them (BOX-013). A task box's relay forwards the
+/// task's exit and ends within it. A session box's shell does not end, and
+/// the box's own stop takes over once it passes.
+pub(crate) const TASK_EXIT_RELAY_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long a graceful stop waits for a task run of the box to deliver its
+/// exit to the in-box helper (BOX-013), once its containers have ended. The
+/// run tears the container's network down before it sends the exit, and a
+/// stop that signalled the helper first would record the signal, not the
+/// task's exit. A run that has not delivered by then is left behind.
+pub(crate) const TASK_EXIT_DELIVERY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Ends the task containers the box's invocations run in (BOX-013): the
+/// containers a task run records beside the box, which the box's own PID
+/// namespace does not hold. A task box's entrypoint is the in-box relay, not
+/// the task: signalling only the box ends the relay and leaves the task
+/// running, its TERM trap unrun. This sends the task containers the stop's
+/// signals first — SIGTERM, the grace period, SIGKILL to what is left, a
+/// forced stop's SIGKILL at once — while the relay stays up, so the task's
+/// last output and its `exit:N` line still reach the box, and the
+/// entrypoint that ends with the task is the exit status the box records.
+///
+/// The returned [`box_runtime::TaskStop`] marks the stop as under way from
+/// before the take: until the caller drops it, the box records no new task
+/// container, and a run that spawns one kills it and starts no later
+/// invocation. So the one take holds every task container that can run.
+/// The caller holds it until the box's own processes are stopped.
+///
+/// The grace period ends as soon as no task container is left. A graceful
+/// stop then waits, for at most [`TASK_EXIT_DELIVERY_WAIT`], until every
+/// task run of the box has delivered its exit: a run whose container was
+/// already reaped when the stop started is waited for too. It then waits
+/// for the entrypoint for at most [`TASK_EXIT_RELAY_WAIT`], never for the
+/// whole grace period, because a session box's entrypoint does not end
+/// with a task. A forced stop waits for neither. `entrypoint` is only read,
+/// never taken: the caller's [`stop_box_processes`] still consumes it. A
+/// box with no task container and no task run delivering its exit is
+/// skipped at once.
+pub(crate) async fn stop_task_containers(
+    box_id: boxes::SessionId,
+    entrypoint: &JoinHandle<Result<box_runtime::HostExit, std::io::Error>>,
+    force: bool,
+    grace: std::time::Duration,
+    forced: &std::sync::atomic::AtomicBool,
+) -> box_runtime::TaskStop {
+    let stop = box_runtime::begin_task_stop(box_id);
+    let containers = box_runtime::take_task_containers(box_id);
+    let exit_pending = || box_runtime::task_exit_pending(box_id);
+    if containers.is_empty() && !exit_pending() {
+        return stop;
+    }
+    let signal = |signal: i32| {
+        let reached: usize = containers.iter().map(|c| c.signal(signal)).sum();
+        tracing::info!(
+            box_id = %box_id,
+            signal = stop_signal_name(signal),
+            signal_number = signal,
+            processes = reached,
+            "stop: signalled the box's task containers"
+        );
+    };
+    let left = || containers.iter().map(|c| c.pids().len()).sum::<usize>();
+    let forced_now = || forced.load(std::sync::atomic::Ordering::SeqCst);
+    if force || forced_now() {
+        if !containers.is_empty() {
+            signal(libc::SIGKILL);
+        }
+        return stop;
+    }
+    if !containers.is_empty() {
+        signal(libc::SIGTERM);
+        let deadline = tokio::time::Instant::now() + grace;
+        loop {
+            if left() == 0 || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            if forced_now() {
+                tracing::info!(
+                    box_id = %box_id,
+                    "stop: a forced stop arrived; the task containers' grace period ends now"
+                );
+                break;
+            }
+            tokio::time::sleep(STOP_POLL).await;
+        }
+        if left() > 0 {
+            signal(libc::SIGKILL);
+        }
+    }
+    let delivery_deadline = tokio::time::Instant::now() + TASK_EXIT_DELIVERY_WAIT;
+    while exit_pending() && !forced_now() && tokio::time::Instant::now() < delivery_deadline {
+        tokio::time::sleep(STOP_POLL).await;
+    }
+    if exit_pending() && !forced_now() {
+        tracing::info!(
+            box_id = %box_id,
+            "stop: a task run did not deliver its exit in time; the box's stop goes on"
+        );
+    }
+    let relay_deadline = tokio::time::Instant::now() + TASK_EXIT_RELAY_WAIT;
+    while !entrypoint.is_finished() && !forced_now() && tokio::time::Instant::now() < relay_deadline
+    {
+        tokio::time::sleep(STOP_POLL).await;
+    }
+    stop
+}
+
 /// Sends a stop's signals to every process in the box (BOX-013), and reads
 /// how the entrypoint ended from the host loop `entrypoint`, which ends when
 /// the entrypoint does.
@@ -2546,6 +2654,9 @@ impl BoxActor {
         {
             return self.write_kept_exit(ending).await;
         }
+        // Held until what ran beside the host is down: a task run of this
+        // box starts no container meanwhile.
+        let mut task_stop = None;
         let ending = match (self.unrecorded_stop, launched) {
             // An earlier stop ended the processes and could not write the
             // record. This one writes how they ended then. `launch_host`
@@ -2566,6 +2677,12 @@ impl BoxActor {
                 // any signal, so an attached client is told the box was
                 // stopped or restarted, and sees no shell-exit prompt.
                 host.announce_end(end).await;
+                // The task containers first (BOX-013), relay still up: the
+                // task's exit reaches the box, and what the entrypoint then
+                // records is the task's own ending.
+                task_stop = Some(
+                    stop_task_containers(box_id, &task, force, grace, &self.weak_self.3).await,
+                );
                 let container_pid = probe_host(host.get_attrs())
                     .await
                     .and_then(|attrs| attrs.container_pid);
@@ -2612,6 +2729,7 @@ impl BoxActor {
         // The host is gone: this takes down what ran beside it, as every
         // other stop does.
         self.stop_running(false).await;
+        drop(task_stop);
 
         // The `stopped` record is the step a stop cannot skip. A failed
         // read or write keeps the ending on the actor and returns the error,

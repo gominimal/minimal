@@ -1468,7 +1468,6 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                                         let decision = crate::decide_workspace_upload(
                                             &root,
                                             false,
-                                            false,
                                             std::env::home_dir().as_deref(),
                                         );
                                         Ok::<_, anyhow::Error>((inputs, decision, picked))
