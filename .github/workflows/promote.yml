@@ -68,7 +68,7 @@ jobs:
             # App is installed on. The org permission holds either way.
             - name: Mint team-read token (gominimal-aw-bot)
               id: team-token
-              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+              uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3
               with:
                   app-id: ${{ vars.AW_BOT_APP_ID }}
                   private-key: ${{ secrets.AW_BOT_PRIVATE_KEY }}
@@ -156,7 +156,7 @@ jobs:
               id: ops-token
               if: ${{ !inputs.dry_run }}
               continue-on-error: true
-              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+              uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3
               with:
                   app-id: ${{ vars.MINIMAL_BACKPORTER_APP_ID }}
                   private-key: ${{ secrets.MINIMAL_BACKPORTER_PRIVATE_KEY }}
@@ -362,7 +362,7 @@ jobs:
             - name: Mint webapp-repo token (gominimal-aw-bot)
               id: docs-token
               if: ${{ inputs.dry_run != true }}
-              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3 # zizmor: ignore[github-app] token scoped to owner+repositories:docs (ADR-0002)
+              uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3 # zizmor: ignore[github-app] token scoped to owner+repositories:docs (ADR-0002)
               with:
                   app-id: ${{ vars.AW_BOT_APP_ID }}
                   private-key: ${{ secrets.AW_BOT_PRIVATE_KEY }}
@@ -451,7 +451,7 @@ jobs:
             - name: Mint PR token (minimal-backporter)
               id: bump-token
               if: steps.line.outputs.line != ''
-              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+              uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3
               with:
                   app-id: ${{ vars.MINIMAL_BACKPORTER_APP_ID }}
                   private-key: ${{ secrets.MINIMAL_BACKPORTER_PRIVATE_KEY }}
@@ -610,7 +610,7 @@ jobs:
             # POST /repos/{owner}/{repo}/dispatches needs, and nothing else.
             - name: Mint release-ops token (minimal-backporter)
               id: ops-token
-              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+              uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3
               with:
                   app-id: ${{ vars.MINIMAL_BACKPORTER_APP_ID }}
                   private-key: ${{ secrets.MINIMAL_BACKPORTER_PRIVATE_KEY }}
@@ -705,7 +705,7 @@ jobs:
             - name: Mint release-ops token (minimal-backporter)
               id: ops-token
               continue-on-error: true
-              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+              uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3
               with:
                   app-id: ${{ vars.MINIMAL_BACKPORTER_APP_ID }}
                   private-key: ${{ secrets.MINIMAL_BACKPORTER_PRIVATE_KEY }}
