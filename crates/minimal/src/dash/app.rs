@@ -87,8 +87,9 @@ pub struct CreateForm {
     pub entries: Result<Vec<String>, String>,
     /// Index into `entries`: the picked entry.
     pub entry_idx: usize,
-    /// The path `entries` was read for. A changed path reads them again.
-    pub entries_for: String,
+    /// The path `entries` was read for, or `None` before the first read
+    /// comes back. A changed path reads them again.
+    pub entries_for: Option<String>,
     /// Index into [`NETWORK_MODES`].
     pub net_idx: usize,
     pub field: CreateField,
@@ -113,7 +114,7 @@ impl CreateForm {
             path,
             entries: Err(ENTRIES_READING.to_string()),
             entry_idx: 0,
-            entries_for: String::new(),
+            entries_for: None,
             net_idx: 0,
             field: CreateField::Name,
         }
@@ -139,7 +140,7 @@ impl CreateForm {
     /// True when `entries` were read for the path as it is now.
     #[must_use]
     pub fn entries_current(&self) -> bool {
-        self.entries_for == self.path.trim()
+        self.entries_for.as_deref() == Some(self.path.trim())
     }
 
     /// Takes the session entries read for `path`, and preselects the entry
@@ -153,7 +154,7 @@ impl CreateForm {
         if let Err(reason) = &choices {
             tracing::debug!(path = %path, reason = %reason, "the create form offers no session entry");
         }
-        let kept = match self.entries_for == path {
+        let kept = match self.entries_for.as_deref() == Some(path) {
             true => self.entry().map(str::to_string),
             false => None,
         };
@@ -166,7 +167,7 @@ impl CreateForm {
             }
             Err(reason) => (Err(reason), 0),
         };
-        self.entries_for = path.to_string();
+        self.entries_for = Some(path.to_string());
     }
 
     /// The picked entry's name, if the project offers one.
@@ -218,6 +219,11 @@ pub type EntryChoices = Result<(Vec<String>, usize), String>;
 /// The reason as text, for the status line: a `minimal.toml` that does
 /// not load, an entry whose type does not resolve, or no session entry.
 fn session_entry_choices(dir: &camino::Utf8Path) -> EntryChoices {
+    // An empty path would read the minimal.toml of the dashboard's own
+    // working directory, which the form does not show.
+    if dir.as_str().is_empty() {
+        return Err("the project path is empty".to_string());
+    }
     let entries = crate::project_entries(dir).map_err(|error| format!("{error:#}"))?;
     let candidates = crate::start_candidates(&entries).map_err(|error| format!("{error:#}"))?;
     let names: Vec<String> = candidates
@@ -2484,6 +2490,24 @@ mod tests {
         assert!(
             status.starts_with("error: no session created: "),
             "{status}"
+        );
+
+        // An empty path is not read as read: the first submit asks for the
+        // read, and the next one refuses with the empty path as the reason.
+        let mut model = two_hosts();
+        model.action = Some(Action::Create(CreateForm {
+            field: CreateField::Network,
+            ..CreateForm::new(String::new())
+        }));
+        let effects = update(&mut model, key(KeyCode::Enter));
+        assert!(!effects.iter().any(|e| matches!(e, Effect::Create { .. })));
+        assert!(matches!(model.action, Some(Action::Create(_))));
+        run_reads(&mut model, effects);
+        let effects = update(&mut model, key(KeyCode::Enter));
+        assert!(!effects.iter().any(|e| matches!(e, Effect::Create { .. })));
+        assert_eq!(
+            model.status.as_deref(),
+            Some("error: no session created: the project path is empty")
         );
     }
 
