@@ -291,17 +291,22 @@ pub(super) async fn attach_or_reap<P: Reapable>(
 }
 
 /// NET-079: moves a task invocation's supervisor into the leaf of its box,
-/// or kills and reaps the process and fails the task with the cause. The
-/// program joined the leaf in its own pre-exec closure; the supervisor
-/// never runs that closure, so the daemon moves it after the spawn with the
-/// same function a box launch and a package build use. `leaf` is `None` for
-/// a box with no leaf, which places nothing.
-pub(super) fn place_supervisor_or_reap<P: Reapable>(
+/// then releases the program's start gate, or kills and reaps the process
+/// and fails the task with the cause. The program joined the leaf in its own
+/// pre-exec closure and waits at `gate`; the supervisor never runs that
+/// closure, so the daemon moves it after the spawn with the same function a
+/// box launch and a package build use. So the program never runs while its
+/// supervisor is outside the leaf, and a refused task never runs its program:
+/// the process is reaped before `gate` drops. `leaf` is `None` for a box with
+/// no leaf, which places nothing and holds no gate.
+pub(super) fn place_supervisor_or_reap<P: Reapable, G>(
     leaf: Option<&sandbox::config::ClassifierLeaf>,
     supervisor: u32,
     child: &mut P,
+    gate: Option<G>,
 ) -> io::Result<()> {
     let Some(leaf) = leaf else {
+        drop(gate);
         return Ok(());
     };
     match sandbox::classifier::place_supervisor(leaf, supervisor) {
@@ -311,6 +316,8 @@ pub(super) fn place_supervisor_or_reap<P: Reapable>(
                 supervisor,
                 "placed the task's supervisor in its box's classifier leaf",
             );
+            // The supervisor is in the leaf: let the program start.
+            drop(gate);
             Ok(())
         }
         Err(e) => {
@@ -322,6 +329,8 @@ pub(super) fn place_supervisor_or_reap<P: Reapable>(
                  the task is stopped",
             );
             child.kill_and_reap();
+            // Only now, with the process reaped, does the gate go.
+            drop(gate);
             let cause = match e.kind() {
                 io::ErrorKind::NotFound => "The cgroup no longer exists.".to_string(),
                 io::ErrorKind::PermissionDenied => "The kernel refused the move.".to_string(),
@@ -627,9 +636,18 @@ pub(super) async fn task_producer(
                 let planned = env.plan_launch().await.map_err(|e| {
                     io::Error::other(format!("setting up the task's network failed: {e}"))
                 })?;
-                let container = env
+                let mut container = env
                     .container(planned.plan())
                     .map_err(|e| io::Error::other(format!("building container failed: {}", e)))?;
+                // A task in a box's leaf holds its program at a start gate
+                // until its supervisor is in the leaf too, as a box launch
+                // and a package build do.
+                let gate = match &leaf {
+                    Some(_) => Some(container.hold_start().map_err(|e| {
+                        io::Error::other(format!("holding the task's start failed: {e}"))
+                    })?),
+                    None => None,
+                };
                 let mut cmd = env
                     .invocation_command(&container, &inv)
                     .map_err(|e| io::Error::other(format!("building command failed: {}", e)))?;
@@ -650,7 +668,7 @@ pub(super) async fn task_producer(
                 let mut child = sandbox::forker::on_fork_thread(move || cmd.spawn())
                     .map_err(|e| io::Error::other(format!("command launch failed: {}", e)))?;
                 let supervisor = child.id();
-                place_supervisor_or_reap(leaf.as_ref(), supervisor, &mut child)?;
+                place_supervisor_or_reap(leaf.as_ref(), supervisor, &mut child, gate)?;
                 let spawned = sandbox::Spawned::from_child(&mut child);
                 let guard = attach_or_reap(planned, spawned, &mut child).await?;
                 let mut process = HakoniwaProcess::new(child, guard);

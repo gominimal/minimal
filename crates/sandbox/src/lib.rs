@@ -194,54 +194,7 @@ impl<C: Channel> Sandbox<C> {
     #[cfg(target_os = "linux")]
     #[tracing::instrument(level = "info", skip_all, err)]
     pub fn hold_start(&self, container: &mut Container) -> Result<StartGate, Error> {
-        use std::os::fd::FromRawFd as _;
-        use std::os::unix::ffi::OsStrExt as _;
-
-        static NEXT_GATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let name = format!(
-            "{START_GATE_NAME}-{}",
-            NEXT_GATE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
-        let path = self.base_dir.join("run").join(&name);
-        // A FIFO left at this name by an earlier daemon process has no
-        // writer; replace it rather than share it.
-        match fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(Error::IO("removing a stale start gate", path, e)),
-        }
-        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|e| {
-            Error::IO(
-                "naming the start gate",
-                path.clone(),
-                std::io::Error::other(e),
-            )
-        })?;
-        // SAFETY: `mkfifo(3)` with a NUL-terminated path and a mode.
-        if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } != 0 {
-            return Err(Error::IO(
-                "creating the start gate",
-                path,
-                std::io::Error::last_os_error(),
-            ));
-        }
-        // `O_RDWR` on a FIFO opens without waiting for a reader (Linux
-        // `fifo(7)`), and makes this the writer whose close releases the box.
-        // SAFETY: `open(2)` with a NUL-terminated path.
-        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
-        if fd < 0 {
-            return Err(Error::IO(
-                "opening the start gate",
-                path,
-                std::io::Error::last_os_error(),
-            ));
-        }
-        container.start_gate = Some(Path::new("/run").join(&name));
-        Ok(StartGate {
-            // SAFETY: `fd` is a fresh descriptor nothing else owns.
-            _writer: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) },
-            path,
-        })
+        container.hold_start()
     }
 
     /// Creates a new sandbox, containing all filesystem state within `base_dir`.
@@ -488,6 +441,9 @@ pub struct Container {
     /// its program, as the box spells it (`/run/<START_GATE_NAME>-<n>`). Set by
     /// [`Sandbox::hold_start`]; `None` runs the program at once.
     start_gate: Option<PathBuf>,
+    /// The box's `/run` on the daemon's side, where [`Self::hold_start`]
+    /// makes the start gate's FIFO.
+    run_dir: PathBuf,
     /// Whether a command from this container calls `setsid(2)` in its
     /// pre-exec closure, without taking a controlling terminal. Set by
     /// [`Container::set_session_leader_without_terminal`].
@@ -551,6 +507,62 @@ impl Container {
     /// program runs.
     pub fn set_session_leader_without_terminal(&mut self) {
         self.new_session = true;
+    }
+
+    /// Holds the program of every command this container spawns at a start
+    /// gate, as [`Sandbox::hold_start`] does. For a caller that has the
+    /// container but not its sandbox: the task launch, whose sandbox
+    /// `mctx::Env` keeps.
+    #[tracing::instrument(level = "info", skip_all, err)]
+    pub fn hold_start(&mut self) -> Result<StartGate, Error> {
+        use std::os::fd::FromRawFd as _;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        static NEXT_GATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let name = format!(
+            "{START_GATE_NAME}-{}",
+            NEXT_GATE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let path = self.run_dir.join(&name);
+        // A FIFO left at this name by an earlier daemon process has no
+        // writer; replace it rather than share it.
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::IO("removing a stale start gate", path, e)),
+        }
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|e| {
+            Error::IO(
+                "naming the start gate",
+                path.clone(),
+                std::io::Error::other(e),
+            )
+        })?;
+        // SAFETY: `mkfifo(3)` with a NUL-terminated path and a mode.
+        if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } != 0 {
+            return Err(Error::IO(
+                "creating the start gate",
+                path,
+                std::io::Error::last_os_error(),
+            ));
+        }
+        // `O_RDWR` on a FIFO opens without waiting for a reader (Linux
+        // `fifo(7)`), and makes this the writer whose close releases the box.
+        // SAFETY: `open(2)` with a NUL-terminated path.
+        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(Error::IO(
+                "opening the start gate",
+                path,
+                std::io::Error::last_os_error(),
+            ));
+        }
+        self.start_gate = Some(Path::new("/run").join(&name));
+        Ok(StartGate {
+            // SAFETY: `fd` is a fresh descriptor nothing else owns.
+            _writer: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) },
+            path,
+        })
     }
 
     fn command_inner<C, I, IE, ArgS, EnvK, EnvV>(
@@ -863,7 +875,9 @@ pub mod classifier {
     ///
     /// A supervisor that already exited is no process of the run left
     /// outside the leaf, so a failure for a supervisor that is a zombie is
-    /// `Ok`: a run that is not held at a start gate can end before the move.
+    /// `Ok`. Every launch in a leaf holds its program at a start gate until
+    /// this returns, but the supervisor can still end first: the box can
+    /// fail to build before it reaches its gate.
     /// `pid` must be the caller's own unreaped child, so that it still names
     /// the supervisor. Any other `Err` means the supervisor is not in the
     /// leaf.
@@ -2681,6 +2695,7 @@ impl<C: Channel> Sandbox<C> {
             socket_family_filter,
             fresh_netns: isolate,
             start_gate: None,
+            run_dir: self.base_dir.join("run"),
             new_session: false,
             session_binds,
         })
