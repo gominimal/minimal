@@ -86,8 +86,44 @@ impl ControlChannel {
     /// switch directly, and the unbind is its own job.
     #[must_use]
     pub fn host_unbinds_declared_forwards(&self) -> bool {
+        #[cfg(test)]
+        if let Self::Unix(sock) = self
+            && VM_HOST_GATE_SEAM
+                .lock()
+                .expect("the vm host gate seam lock poisoned")
+                .contains(sock)
+        {
+            return true;
+        }
         matches!(self, Self::Vsock { .. })
     }
+}
+
+/// The switch control sockets a test serves as a VM host's gated forwarder:
+/// the harness reaches its switch over a unix socket, and a channel there
+/// reads as native unless its socket is seeded here
+/// ([`seed_vm_host_gate_for_tests`]).
+#[cfg(test)]
+static VM_HOST_GATE_SEAM: std::sync::LazyLock<Mutex<HashSet<std::path::PathBuf>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Makes the unix control channel at `control_socket` read as a VM host's
+/// (tests only), so a box on that switch takes the VM-backed paths.
+#[cfg(test)]
+pub(crate) fn seed_vm_host_gate_for_tests(control_socket: &std::path::Path) {
+    VM_HOST_GATE_SEAM
+        .lock()
+        .expect("the vm host gate seam lock poisoned")
+        .insert(control_socket.to_path_buf());
+}
+
+/// Clears what [`seed_vm_host_gate_for_tests`] seeded (tests only).
+#[cfg(test)]
+pub(crate) fn clear_vm_host_gate_for_tests(control_socket: &std::path::Path) {
+    VM_HOST_GATE_SEAM
+        .lock()
+        .expect("the vm host gate seam lock poisoned")
+        .remove(control_socket);
 }
 
 /// gvproxy's wire spelling of an [`IpProto`] in a forwarder request.
@@ -534,9 +570,32 @@ pub async fn bind_declared_at_publish(
     yielded: &[super::dns::SharedPortCollision],
     holder_of: &(dyn Fn(u16) -> minimald_rpc::PortHolder + Sync),
 ) -> io::Result<Vec<PortForwarder>> {
-    apply_declared(
+    bind_declared_on(
         control,
         control.host_unbinds_declared_forwards(),
+        published,
+        switch_address,
+        ingress,
+        yielded,
+        holder_of,
+    )
+    .await
+}
+
+/// [`bind_declared_at_publish`], with `host_holds_listeners` given by the
+/// caller, so a test can drive the activation bind over a unix socket.
+async fn bind_declared_on(
+    control: &ControlChannel,
+    host_holds_listeners: bool,
+    published: Ipv4Addr,
+    switch_address: Ipv4Addr,
+    ingress: &IngressPolicy,
+    yielded: &[super::dns::SharedPortCollision],
+    holder_of: &(dyn Fn(u16) -> minimald_rpc::PortHolder + Sync),
+) -> io::Result<Vec<PortForwarder>> {
+    apply_declared(
+        control,
+        host_holds_listeners,
         published,
         switch_address,
         ingress,
@@ -3969,8 +4028,8 @@ mod tests {
 
         use super::super::{
             ControlChannel, IngressPolicy, PORT_HELD_BINDS, PORT_HELD_RETRY, PortMapping,
-            apply_declared, apply_ingress, host_ports_in_use, is_address_in_use, port_held_by,
-            port_in_use_refusal,
+            apply_declared, apply_ingress, bind_declared_on, host_ports_in_use, is_address_in_use,
+            port_held_by, port_in_use_refusal,
         };
         use super::forwarder_probe::read_request;
 
@@ -4131,6 +4190,70 @@ mod tests {
                 asked[0].contains("\"local\":\"127.0.64.9:18999\"")
                     && asked[0].contains("\"remote\":\"100.64.128.10:80\""),
                 "the bind names the published address and the handed switch address: {asked:?}"
+            );
+        }
+
+        /// NET-121 on a VM-backed host: the activation's bind entry
+        /// ([`bind_declared_at_publish`], driven through its seam) binds the
+        /// declared forward toward the handed switch address. The box's
+        /// later attach posts the same expose. The switch answers that the
+        /// listener is already bound, because the forward the activation
+        /// bound still holds the port, and the attach takes it as the box's
+        /// own. So a later attach does not fail on the port. The
+        /// finalize's choice of this entry on a VM-backed host is proved by
+        /// `a_vm_backed_activation_binds_declared_forwards_before_active` in
+        /// `box_actor/tests.rs`.
+        #[tokio::test]
+        async fn declared_ingress_bound_at_activation() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sock = dir.path().join("gvproxy.sock");
+            let forwarder = forwarder_answering_in_turn(
+                sock.clone(),
+                vec![(200, ""), (500, "proxy already running\n")],
+            );
+            let control = ControlChannel::Unix(sock);
+            let holder_of = |_| minimald_rpc::PortHolder::Host;
+            let activated = bind_declared_on(
+                &control,
+                true,
+                PUBLISHED,
+                LEASE,
+                &ingress(&[18080]),
+                &[],
+                &holder_of,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("the activation must bind the port: {e}"));
+            assert_eq!(activated.len(), 1, "the activation binds the forward");
+            assert_eq!(activated[0].local(), "127.0.64.9:18080");
+            let attached = apply_declared(
+                &control,
+                true,
+                PUBLISHED,
+                LEASE,
+                &ingress(&[18080]),
+                None,
+                &[],
+                &holder_of,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("the attach must take the bound forward: {e}"));
+            assert_eq!(attached.len(), 1, "the attach tracks the forward");
+            assert_eq!(attached[0].local(), "127.0.64.9:18080");
+            let asked = forwarder.await.expect("the fake forwarder ran");
+            assert_eq!(
+                asked.len(),
+                2,
+                "one expose per round, no rollback: {asked:?}"
+            );
+            assert!(
+                asked[0].contains("\"local\":\"127.0.64.9:18080\"")
+                    && asked[0].contains("\"remote\":\"100.64.128.10:80\""),
+                "the activation binds the published address toward the switch: {asked:?}"
+            );
+            assert_eq!(
+                asked[0], asked[1],
+                "the attach asks for the forward the activation bound"
             );
         }
 

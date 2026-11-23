@@ -1312,12 +1312,15 @@ impl Wiring {
 
     /// The control socket at `path`, which registers into this wiring and
     /// appends its mint and revocation records to `audit`, the log the
-    /// proxy's decisions go to (BEP-067).
+    /// proxy's decisions go to (BEP-067). It answers `read_audit` from the
+    /// log's directory `audit_dir`, so `min box audit` reads the records
+    /// over the socket and opens no log file (BEP-042).
     /// The registry keeps at most the keys that `bound` admits.
     fn control(
         &self,
         path: &Path,
         audit: Arc<dyn AuditWriter>,
+        audit_dir: &Path,
         bound: KeyBound,
     ) -> io::Result<Control> {
         Ok(Control::bind_with_key_bound(
@@ -1327,7 +1330,8 @@ impl Wiring {
             bound,
         )?
         .with_revocations(Arc::clone(&self.revocations))
-        .with_audit(audit))
+        .with_audit(audit)
+        .with_audit_dir(audit_dir))
     }
 }
 
@@ -1591,7 +1595,7 @@ fn serve<K: CaKey + Send + Sync + 'static>(
         // The same socket takes `bep --rotate-signing`, which rotates the
         // signing CA the proxy signs leaves with (BEP-061).
         let control_socket = wiring
-            .control(&control, log, key_bound)
+            .control(&control, log, &dir, key_bound)
             .map_err(|err| format!("bep did not listen on {}: {err}", control.display()))?
             .with_rotation(ca)
             .with_recertification(store_admission);
@@ -2573,6 +2577,7 @@ mod tests {
                 .control(
                     &path,
                     Arc::new(Mutex::new(Vec::<Decision>::new())),
+                    &path.with_file_name("audit"),
                     KeyBound::default(),
                 )
                 .unwrap()
@@ -2733,6 +2738,7 @@ mod tests {
                 .control(
                     &path,
                     Arc::new(Mutex::new(Vec::<Decision>::new())),
+                    &path.with_file_name("audit"),
                     KeyBound::default(),
                 )
                 .unwrap()
@@ -3294,6 +3300,7 @@ mod tests {
                 .control(
                     &path,
                     Arc::new(Mutex::new(Vec::<Decision>::new())),
+                    &path.with_file_name("audit"),
                     serve.key_bound(),
                 )
                 .unwrap()

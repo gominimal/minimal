@@ -223,6 +223,7 @@ fn ls_shows_shared_resource_pool() {
     let resp = ListSessionsResponse {
         box_networks: Default::default(),
         daemon_version: None,
+        daemon_epoch: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
         zone_answerer_port: None,
@@ -267,6 +268,7 @@ fn ls_table_exposes_project_path_and_status() {
     let resp = ListSessionsResponse {
         box_networks: Default::default(),
         daemon_version: None,
+        daemon_epoch: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
         zone_answerer_port: None,
@@ -358,6 +360,7 @@ fn ls_table_shows_host_address_enforcement() {
         .into_iter()
         .collect(),
         daemon_version: None,
+        daemon_epoch: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
         zone_answerer_port: None,
@@ -419,6 +422,7 @@ fn ls_reports_yielded_shared_address_ports() {
     let resp = ListSessionsResponse {
         box_networks: Default::default(),
         daemon_version: None,
+        daemon_epoch: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
         zone_answerer_port: None,
@@ -505,6 +509,7 @@ fn ls_across_vms_table_shows_host_address_enforcement() {
         resp: ListSessionsResponse {
             box_networks,
             daemon_version: None,
+            daemon_epoch: None,
             hostname_routing_unavailable: None,
             hostname_proxy_port: None,
             zone_answerer_port: None,
@@ -3748,6 +3753,7 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
     let resp = ListSessionsResponse {
         box_networks: Default::default(),
         daemon_version: None,
+        daemon_epoch: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
         zone_answerer_port: None,
@@ -3890,6 +3896,7 @@ fn ls_keeps_the_answerer_row_beside_a_down_proxy() {
     let resp = ListSessionsResponse {
         box_networks: Default::default(),
         daemon_version: None,
+        daemon_epoch: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
         zone_answerer_port: None,
@@ -4070,6 +4077,7 @@ fn ls_across_vms_names_one_proxy_verdict_per_vm() {
         resp: ListSessionsResponse {
             box_networks: Default::default(),
             daemon_version: None,
+            daemon_epoch: None,
             hostname_routing_unavailable: None,
             hostname_proxy_port: Some(proxy_port),
             zone_answerer_port: None,
@@ -4329,6 +4337,7 @@ fn session_list_decodes_without_mtls_field() {
     let resp = ListSessionsResponse {
         box_networks: Default::default(),
         daemon_version: Some("test".to_string()),
+        daemon_epoch: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
         zone_answerer_port: None,

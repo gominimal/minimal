@@ -291,6 +291,16 @@ impl fmt::Display for BoxTypeError {
                 if box_type != root {
                     write!(f, ", which extends `{root}`")?;
                 }
+                // A build box is never written by hand: `min` makes one for
+                // each package build (BOX-209), so no epic tracks the entry.
+                if *root == "build" {
+                    return write!(
+                        f,
+                        ". min makes a box of type `build` for each package build, \
+                         and never from an entry in minimal.toml. \
+                         The other entries of minimal.toml are not affected."
+                    );
+                }
                 write!(
                     f,
                     ". This release cannot create a box of type `{root}`. \

@@ -38,9 +38,9 @@
 //! that holds a revocation record while a value naming its box can be
 //! unexpired ([`prune`]). It never changes a segment it keeps.
 //!
-//! [`LogReader`] is the client's read-only view of the log, across every
-//! segment in the log's directory ([`segments`]). `min box audit` reads
-//! through it.
+//! [`LogReader`] is a read-only view of the log, across every segment in
+//! the log's directory ([`segments`]). The control socket's `read_audit`
+//! reads through it, and `min box audit` reads over that socket.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write as _};
@@ -1128,16 +1128,8 @@ fn segment_number(name: &str) -> Option<u64> {
 }
 
 /// `~/.minimal/bep/audit`, the directory that holds the proxy's log on
-/// this host.
-///
-/// Interim: `min box audit` reads this directory directly, through
-/// [`LogReader`]. Un-enrolled, the architecture's audit paragraph and
-/// Gatehouse §6.10 put the read behind the proxy's local socket (ruled on
-/// gominimal/arch#137). The interim is tracked by
-/// <https://github.com/gominimal/minimal/issues/2459>. When the proxy
-/// serves the read there
-/// (<https://github.com/gominimal/minimal/issues/2463>), the client stops
-/// reading this directory.
+/// this host. `bep serve` writes it, and its control socket serves the read
+/// of it (BEP-042, [`crate::control`]).
 pub fn default_dir() -> Option<PathBuf> {
     std::env::home_dir().map(|home| home.join(".minimal/bep/audit"))
 }
@@ -1626,13 +1618,8 @@ pub struct ReadBatch {
 /// A read-only reader over the log in one directory, across every
 /// retained segment. The first [`read_new`](Self::read_new) call reads the
 /// whole log. Each later call reads only what the proxy appended since,
-/// so a caller can replay the log and then tail it.
-///
-/// Interim: the client reads the operator-owned log files directly, under
-/// file mode, in place of the read over the proxy's local socket. See
-/// <https://github.com/gominimal/minimal/issues/2459>. The flip is
-/// <https://github.com/gominimal/minimal/issues/2463>, when the proxy
-/// serves the read.
+/// so a caller can replay the log and then tail it. The control socket's
+/// `read_audit` reads through it.
 #[derive(Debug)]
 pub struct LogReader {
     dir: PathBuf,

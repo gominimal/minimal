@@ -262,6 +262,10 @@ fn every_daemon_connection_is_classified() {
             // the same ride-along shape `resolve_session_version_gated` uses.
             "attach.rs::box_record_on = gated",
             "cmd/admin.rs::cmd_version = ungated",
+            // Not a daemon connection: `min box audit` reads the audit
+            // records from the Box Egress Proxy over its control socket. The
+            // proxy is not the daemon, and the read builds nothing.
+            "cmd/box_audit.rs::open = ungated",
             // A box address reaches every local host, split as `min box
             // list` splits it: the selected host is the one this process
             // ensured, so it keeps the gate. The others are probed ungated,
@@ -375,6 +379,9 @@ fn every_daemon_connection_is_classified() {
             "tests.rs::an_identity_with_no_root_validity_mints_nothing = ungated",
             "tests.rs::attach_fall_through_hands_off_the_owning_vm = gated",
             "tests.rs::attach_refuses_a_box_name_two_vms_know = gated",
+            // Test-only: the audit read test serves its own proxy control
+            // socket, so no daemon is involved.
+            "tests.rs::box_audit_reads_over_the_proxy_socket = ungated",
             "tests.rs::exec_fall_through_hands_off_the_owning_vm = gated",
             "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy = ungated",
             "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy = ungated",
@@ -1060,6 +1067,255 @@ async fn kept_session_list_and_attach_still_work() {
         .await
         .unwrap_or_else(|err| panic!("the session attach: {err:#}"));
     assert_eq!(attached.box_id, dev);
+}
+
+/// One `min` command line the box grammar end-to-end test ran, with
+/// its stdout, its stderr and its exit code.
+struct GrammarRun {
+    argv: Vec<String>,
+    stdout: String,
+    stderr: String,
+    exit: u8,
+}
+
+impl std::fmt::Display for GrammarRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "$ {}", self.argv.join(" "))?;
+        writeln!(f, "  exit: {}", self.exit)?;
+        writeln!(f, "  stdout: {:?}", self.stdout)?;
+        writeln!(f, "  stderr: {:?}", self.stderr)
+    }
+}
+
+/// Runs `argv` as `main` does: a parse failure ends with clap's exit code
+/// and runs nothing. A parsed command goes through [`run`], with fd 1 and
+/// fd 2 captured. The exit code of a failed run is the one
+/// [`box_command_ending`] gives. Under nextest every test owns its
+/// process, so the redirect reaches no other test.
+async fn run_min_captured(argv: &[&str]) -> GrammarRun {
+    use clap::Parser as _;
+    use std::io::{Read as _, Seek as _, Write as _};
+
+    let argv_owned: Vec<String> = argv.iter().map(|arg| (*arg).to_owned()).collect();
+    let cli = match Cli::try_parse_from(argv) {
+        Ok(cli) => cli,
+        Err(err) => {
+            let err = with_retired_command_hint(err);
+            return GrammarRun {
+                argv: argv_owned,
+                stdout: String::new(),
+                stderr: err.to_string(),
+                exit: u8::try_from(err.exit_code()).unwrap_or(u8::MAX),
+            };
+        }
+    };
+    struct RestoreStdio {
+        out: std::os::fd::OwnedFd,
+        err: std::os::fd::OwnedFd,
+    }
+    impl Drop for RestoreStdio {
+        fn drop(&mut self) {
+            let _ = std::io::stdout().flush();
+            nix::unistd::dup2_stdout(&self.out).expect("restore stdout after capture");
+            nix::unistd::dup2_stderr(&self.err).expect("restore stderr after capture");
+        }
+    }
+    let mut out = tempfile::tempfile().expect("a stdout capture file");
+    let mut err = tempfile::tempfile().expect("a stderr capture file");
+    std::io::stdout().flush().expect("flush stdout");
+    let restore = RestoreStdio {
+        out: nix::unistd::dup(std::io::stdout()).expect("dup stdout"),
+        err: nix::unistd::dup(std::io::stderr()).expect("dup stderr"),
+    };
+    nix::unistd::dup2_stdout(&out).expect("redirect stdout");
+    nix::unistd::dup2_stderr(&err).expect("redirect stderr");
+    let result = run(cli).await;
+    drop(restore);
+    let read = |file: &mut std::fs::File| {
+        let mut text = String::new();
+        file.rewind().expect("rewind the capture");
+        file.read_to_string(&mut text).expect("read the capture");
+        text
+    };
+    let (stdout, mut stderr) = (read(&mut out), read(&mut err));
+    let (error, exit) = box_command_ending(&result);
+    if !error.is_empty() {
+        stderr.push_str(&format!("error: {error}\n"));
+    }
+    GrammarRun {
+        argv: argv_owned,
+        stdout,
+        stderr,
+        exit,
+    }
+}
+
+// T34 (S8; BCLI-026, BCLI-030, BCLI-032, BCLI-042): the box grammar and
+// its migration, end to end. Every `min box` verb and its session and task
+// forms parse to their own verb. The verbs a harness daemon can answer run
+// through the CLI's dispatch against it. The harness cannot start a box, so
+// start, run, attach, resume, restart, exec, cp and wait are proved at the
+// parser here, and through stand-ins in their own end-to-end tests. Each
+// spelling BCLI-042 removed fails with exit 2 and leaves the daemon's boxes
+// as they were. A failure prints every command run so far.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn box_grammar_and_migration_end_to_end() {
+    use clap::CommandFactory as _;
+
+    // Each form parses to the verb it names (an alias to its verb).
+    for (argv, path) in [
+        (&["min", "box", "start", "--detach"][..], "box start"),
+        (&["min", "box", "run", "check"], "box run"),
+        (&["min", "box", "list", "--all"], "box list"),
+        (&["min", "boxes", "list"], "box list"),
+        (&["min", "box", "show", "web"], "box show"),
+        (&["min", "box", "spec", "web"], "box spec"),
+        (&["min", "box", "audit", "web"], "box audit"),
+        (&["min", "box", "stop", "web"], "box stop"),
+        (&["min", "box", "rm", "--force", "web"], "box rm"),
+        (&["min", "box", "prune", "--dry-run"], "box prune"),
+        (&["min", "box", "resume", "web"], "box resume"),
+        (&["min", "box", "rename", "web", "api"], "box rename"),
+        (&["min", "box", "restart", "web"], "box restart"),
+        (&["min", "box", "logs", "web"], "box logs"),
+        (&["min", "box", "wait", "web"], "box wait"),
+        (&["min", "box", "events", "web"], "box events"),
+        (&["min", "box", "cp", "web:/etc/hostname", "out"], "box cp"),
+        (&["min", "box", "exec", "web", "--", "true"], "box exec"),
+        (&["min", "box", "attach", "web"], "box attach"),
+        (&["min", "session", "start", "--detach"], "session start"),
+        (&["min", "session", "list"], "session list"),
+        (&["min", "sessions", "ls"], "session list"),
+        (&["min", "session", "attach", "web"], "session attach"),
+        (&["min", "session", "logs", "web"], "session logs"),
+        (&["min", "session", "stop", "web"], "session stop"),
+        (&["min", "session", "rm", "web"], "session rm"),
+        (&["min", "task", "run", "check"], "task run"),
+        (&["min", "task", "list"], "task list"),
+        (&["min", "tasks", "list"], "task list"),
+        (&["min", "task", "logs", "check"], "task logs"),
+        (&["min", "task", "stop", "check"], "task stop"),
+        (&["min", "task", "rm", "check"], "task rm"),
+    ] {
+        let matches = Cli::command()
+            .try_get_matches_from(argv)
+            .unwrap_or_else(|err| panic!("`{}` does not parse: {err}", argv.join(" ")));
+        let (noun, sub) = matches.subcommand().expect("a noun");
+        let verb = sub.subcommand_name().expect("a verb");
+        assert_eq!(format!("{noun} {verb}"), path, "`{}`", argv.join(" "));
+    }
+
+    // A session box and a task box in one project, on a harness daemon
+    // that the native host's socket serves.
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let config_dir = tempfile::tempdir().expect("a temp config dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let (server, _global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let project = project.path().to_str().expect("a UTF-8 project path");
+    let mut daemon = server.connect().await;
+    let web = minimald::test_harness::create_configured_session(&mut daemon, "web", project).await;
+    let check = create_configured_task(&mut daemon, "check", project).await;
+    let boxes_now = async || {
+        let mut ids: Vec<String> = server
+            .connect()
+            .await
+            .call::<minimald_rpc::ListSessions>(&())
+            .await
+            .sessions
+            .iter()
+            .map(|listed| format!("{listed:?}"))
+            .collect();
+        ids.sort();
+        ids
+    };
+
+    let dirs = [
+        "--minimal-dir",
+        minimal_dir.path().to_str().expect("a UTF-8 state dir"),
+        "--config-dir",
+        config_dir.path().to_str().expect("a UTF-8 config dir"),
+        "--provider",
+        "local",
+        "--no-input",
+        "-C",
+        project,
+    ];
+    let mut runs: Vec<GrammarRun> = Vec::new();
+    let transcript = |runs: &[GrammarRun]| -> String {
+        runs.iter().map(ToString::to_string).collect::<String>()
+    };
+    // (argv after `min`, exit, text stdout must hold)
+    let (web, check) = (web.to_string(), check.to_string());
+    let steps: &[(&[&str], u8, &str)] = &[
+        (&["box", "list", "--all"], 0, &web),
+        (&["box", "list", "--all"], 0, &check),
+        (&["session", "list", "--all"], 0, &web),
+        (&["task", "list"], 0, "check"),
+        (&["box", "show", "web"], 0, &web),
+        (&["box", "events", "web"], 0, ""),
+        (&["box", "rename", "web", "api"], 0, ""),
+        (&["box", "show", "api"], 0, "api"),
+        (&["box", "show", "web"], 4, ""),
+        (&["box", "rm", "api"], 2, ""),
+        (&["session", "stop", "api"], 0, ""),
+        (&["box", "prune", "--dry-run"], 0, "api"),
+        (&["session", "rm", "api"], 2, ""),
+        (&["session", "rm", "--force", "api"], 0, ""),
+        (&["task", "stop", "check"], 0, ""),
+        (&["box", "stop", "check"], 0, ""),
+        (&["box", "rm", "check"], 2, ""),
+        (&["task", "rm", "check"], 2, ""),
+        (&["task", "rm", "--force", "check"], 0, ""),
+        (&["box", "list", "--all"], 0, ""),
+    ];
+    for (args, exit, shows) in steps {
+        let argv: Vec<&str> = ["min"].iter().chain(&dirs).chain(*args).copied().collect();
+        runs.push(run_min_captured(&argv).await);
+        let ran = runs.last().expect("the run just pushed");
+        assert_eq!(ran.exit, *exit, "{}", transcript(&runs));
+        assert!(ran.stdout.contains(shows), "{}", transcript(&runs));
+        // Each rm form refuses a box it cannot remove unasked as
+        // `min box rm` does, and the refusal names `--force`.
+        if args.contains(&"rm") && *exit == 2 {
+            assert!(ran.stderr.contains("--force"), "{}", transcript(&runs));
+        }
+    }
+    assert!(boxes_now().await.is_empty(), "{}", transcript(&runs));
+
+    // Each spelling BCLI-042 removed fails as an unknown command or flag,
+    // with exit 2, and the daemon's boxes are as they were.
+    let kept = minimald::test_harness::create_configured_session(&mut daemon, "web", project).await;
+    let before = boxes_now().await;
+    let mut removed: Vec<Vec<&str>> = REMOVED_SESSION_VERBS
+        .iter()
+        .flat_map(|verb| [vec!["session", *verb, "web"], vec!["sessions", *verb]])
+        .collect();
+    removed.push(vec!["stop"]);
+    removed.push(vec!["stop", "--force"]);
+    removed.push(vec!["task", "run", "--path", "sub", "check"]);
+    removed.push(vec!["task", "run", "--path=sub", "check"]);
+    for args in removed {
+        let argv: Vec<&str> = ["min"].iter().chain(&dirs).chain(&args).copied().collect();
+        runs.push(run_min_captured(&argv).await);
+        let ran = runs.last().expect("the run just pushed");
+        assert_eq!(ran.exit, 2, "{}", transcript(&runs));
+        assert_eq!(ran.stdout, "", "{}", transcript(&runs));
+        assert!(
+            ran.stderr.contains("unrecognized subcommand")
+                || ran.stderr.contains("unexpected argument '--path"),
+            "{}",
+            transcript(&runs)
+        );
+        assert_eq!(boxes_now().await, before, "{}", transcript(&runs));
+    }
+    assert!(
+        before
+            .iter()
+            .any(|listed| listed.contains(&kept.to_string())),
+        "{}",
+        transcript(&runs)
+    );
 }
 
 /// The clap command of [`ActivateArgs`], built, so its flags and help are
@@ -7102,6 +7358,100 @@ mod mint_tests {
             None
         );
     }
+    // BEP-042: un-enrolled, `min box audit <box-id>` reads the records that
+    // `bep serve` wrote for the box over the proxy's control socket. The
+    // box is in no listing, as after a reap. The command is given the
+    // socket only, never the log's directory, so it opens no log file.
+    #[test]
+    fn box_audit_reads_over_the_proxy_socket() {
+        use bep::audit::{AuditLog, Rotation};
+
+        use crate::cmd::box_audit;
+        use crate::{BoxAuditArgs, BoxAuditOutputFormat};
+
+        const OTHER_HEX: &str = "0193f0c17a2b7c3d8e4fa0b1c2d3e4f6";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/control.sock");
+        let audit = dir.path().join("audit");
+        let log = AuditLog::open_dir(&audit, Rotation::default()).unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let control = runtime
+            .block_on(async {
+                Control::bind(&path, Registry::default(), BoxRegistry::default()).map(|control| {
+                    control
+                        .with_audit(Arc::new(std::sync::Mutex::new(log)))
+                        .with_audit_dir(&audit)
+                })
+            })
+            .unwrap();
+        runtime.spawn(control.run());
+
+        // The proxy writes the records, as at the box's mints.
+        let mut client = ControlClient::connect(&path).unwrap();
+        client.record_mint(BOX_HEX, "github:one").unwrap();
+        client.record_mint(OTHER_HEX, "github:other").unwrap();
+        client.record_mint(BOX_HEX, "github:two").unwrap();
+        drop(client);
+
+        let read = |output: Option<BoxAuditOutputFormat>| {
+            let args = BoxAuditArgs {
+                target: Some(BOX_ID.to_owned()),
+                parent: None,
+                output,
+                follow: false,
+            };
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            box_audit::run(&args, &[], false, &path, &mut out, &mut err, || false).unwrap();
+            (
+                String::from_utf8(out).unwrap(),
+                String::from_utf8(err).unwrap(),
+            )
+        };
+        let (out, err) = read(None);
+        assert!(err.is_empty(), "{err}");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "{out}");
+        assert!(lines[0].starts_with("mint  admit"), "{out}");
+        assert!(lines[0].contains("github:one"), "{out}");
+        assert!(lines[1].contains("github:two"), "{out}");
+        assert!(!out.contains("github:other"), "{out}");
+
+        // -o jsonl gives the proxy's lines as its log holds them.
+        let (out, _) = read(Some(BoxAuditOutputFormat::Jsonl));
+        let segments = bep::audit::segments(&audit).unwrap();
+        let on_disk: String = segments
+            .iter()
+            .map(|segment| std::fs::read_to_string(segment).unwrap())
+            .collect();
+        let expected: Vec<&str> = on_disk
+            .lines()
+            .filter(|line| line.contains(&format!("\"subject\":\"{BOX_HEX}\"")))
+            .collect();
+        assert_eq!(out.lines().collect::<Vec<_>>(), expected);
+
+        // With the proxy gone, the command says so and reads no file.
+        drop(runtime);
+        let args = BoxAuditArgs {
+            target: Some(BOX_ID.to_owned()),
+            parent: None,
+            output: None,
+            follow: false,
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let error =
+            box_audit::run(&args, &[], false, &path, &mut out, &mut err, || false).unwrap_err();
+        assert!(out.is_empty());
+        assert!(
+            error
+                .to_string()
+                .starts_with("Cannot read the audit log: the Box Egress Proxy does not answer on "),
+            "{error}"
+        );
+    }
 }
 
 /// BEP-070: on a host that is not enrolled, each box creation gets a box id
@@ -7416,6 +7766,7 @@ fn listing_of(
             })
             .collect(),
         daemon_version: None,
+        daemon_epoch: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
         zone_answerer_port: None,
@@ -8139,7 +8490,8 @@ async fn every_box_verb_refuses_box_on_stopped_vm() {
         target: "beta".to_owned(),
         force: false,
     };
-    let session_rm = cmd::typed_box_rm_on_hosts(hosts(), &rm_args, session, "rm").await;
+    let session_rm =
+        cmd::typed_box_rm_on_hosts(hosts(), &rm_args, session, "rm", &mut headless_rm()).await;
     results.push((
         "session rm",
         session_rm.map(|_| ()).expect_err("session rm"),
@@ -9344,6 +9696,7 @@ fn address_entry(id: &str, name: &str, state: &str) -> minimald_rpc::BoxListingE
         signal: None,
         pty_enabled: true,
         lifetime: None,
+        build_boxes: Vec::new(),
     }
 }
 
@@ -13920,6 +14273,7 @@ fn fake_listed(id: boxes::BoxId, parent: Option<boxes::BoxId>) -> minimald_rpc::
         signal: None,
         pty_enabled: false,
         lifetime: None,
+        build_boxes: Vec::new(),
     }
 }
 
@@ -15770,9 +16124,10 @@ async fn type_noun_verbs_alias_box_forms() {
             "{err:#}"
         );
         assert!(out.is_empty());
-        let err = cmd::typed_box_rm_on_hosts(hosts(), &rm(other), box_type, "rm")
-            .await
-            .expect_err("a box of another type is not removed");
+        let err =
+            cmd::typed_box_rm_on_hosts(hosts(), &rm(other), box_type, "rm", &mut headless_rm())
+                .await
+                .expect_err("a box of another type is not removed");
         assert!(
             matches!(
                 err.downcast_ref::<BoxAddressRefusal>(),
@@ -15806,9 +16161,15 @@ async fn type_noun_verbs_alias_box_forms() {
         other => panic!("an unknown exec in the session box, not {other:?}: {err:#}"),
     }
     assert!(out.is_empty());
-    cmd::typed_box_rm_on_hosts(hosts(), &rm(&decoy.to_string()), task, "rm")
-        .await
-        .expect("the decoy task box goes");
+    cmd::typed_box_rm_on_hosts(
+        hosts(),
+        &rm(&decoy.to_string()),
+        task,
+        "rm",
+        &mut confirmed_rm(),
+    )
+    .await
+    .expect("the decoy task box goes");
 
     // With `--exec`, each noun prints the line of `min box stop --exec`,
     // and the line names the box as the person typed it.
@@ -15884,9 +16245,15 @@ async fn type_noun_verbs_alias_box_forms() {
         "the task box's exec runs on\n{text}"
     );
     for (box_type, id) in [(task, twin_task), (session, twin_session)] {
-        cmd::typed_box_rm_on_hosts(hosts(), &rm(&id.to_string()), box_type, "rm")
-            .await
-            .expect("the twin box goes");
+        cmd::typed_box_rm_on_hosts(
+            hosts(),
+            &rm(&id.to_string()),
+            box_type,
+            "rm",
+            &mut confirmed_rm(),
+        )
+        .await
+        .expect("the twin box goes");
     }
 
     // Under its own noun, each box stops with the line of `min box stop`,
@@ -15903,9 +16270,10 @@ async fn type_noun_verbs_alias_box_forms() {
             String::from_utf8(out).unwrap(),
             format!("Stopped {name}.\n")
         );
-        let (_, removed) = cmd::typed_box_rm_on_hosts(hosts(), &rm(name), box_type, "rm")
-            .await
-            .expect("the box goes");
+        let (_, removed) =
+            cmd::typed_box_rm_on_hosts(hosts(), &rm(name), box_type, "rm", &mut confirmed_rm())
+                .await
+                .expect("the box goes");
         assert_eq!(removed.id, id);
     }
     let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -17808,6 +18176,7 @@ async fn box_show_network_renders_effective_policy() {
         record.network,
         None,
         &live,
+        &[],
         paths::HostKind::Minimald,
     )
     .expect("the render");

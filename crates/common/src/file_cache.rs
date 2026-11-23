@@ -156,6 +156,46 @@ impl FileCache {
         }
     }
 
+    /// Moves the file at `from` into the cache with the given filename and hash, after its
+    /// SHA-256 matches. The file may have been written by something the cache does not trust, so
+    /// its hash is read here, and a mismatch leaves the cache as it was.
+    ///
+    /// # Errors
+    ///
+    /// [FileCacheError::BadSha] if `sha256` contains `/`, [FileCacheError::HashMismatch] if the
+    /// digest differs, or [FileCacheError::IO] if the copy into the cache fails.
+    pub fn adopt(
+        &self,
+        filename: &str,
+        sha256: &str,
+        from: &std::path::Path,
+    ) -> Result<PathBuf, FileCacheError> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = self.sha_dir(sha256)?;
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".dl.")
+            .suffix(".part")
+            .permissions(fs::Permissions::from_mode(0o666))
+            .tempfile_in(&dir)?;
+        let mut hasher = super::HashWriter(Sha256::new());
+        {
+            let mut w = Tee::new(tmp.as_file_mut(), &mut hasher);
+            std::io::copy(&mut fs::File::open(from)?, &mut w)?;
+        }
+        tmp.as_file().sync_all()?;
+        let computed_hex = hex::encode(hasher.0.finalize());
+        if computed_hex != sha256 {
+            return Err(FileCacheError::HashMismatch {
+                want: sha256.to_string(),
+                got: computed_hex,
+            });
+        }
+        let cached_path = dir.join(filename);
+        tmp.persist(&cached_path).map_err(|e| e.error)?;
+        Ok(cached_path)
+    }
+
     /// Drives the given response to read bytes and write them into the cache with the given filename
     /// and hash.
     ///
@@ -391,6 +431,35 @@ mod tests {
         let mut h = sha2::Sha256::new();
         sha2::Digest::update(&mut h, data);
         hex::encode(h.finalize())
+    }
+
+    /// NET-155: the daemon takes a build box's fetched file into the cache
+    /// only when its hash is the declared one. A file with another hash
+    /// leaves nothing under the declared hash, and a later read finds
+    /// nothing.
+    #[test]
+    fn adopt_takes_only_a_file_with_the_declared_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = FileCache::new(tmp.path().join("cache")).unwrap();
+        let fetched = tmp.path().join("fetched");
+        std::fs::write(&fetched, b"the source").unwrap();
+        let want = sha256_hex(b"the source");
+
+        let other = sha256_hex(b"another source");
+        let err = cache.adopt("a.tar.gz", &other, &fetched).unwrap_err();
+        assert!(
+            matches!(&err, FileCacheError::HashMismatch { want: w, got } if *w == other && *got == want),
+            "{err:?}"
+        );
+        assert!(cache.read_cached("a.tar.gz", &other).unwrap().is_none());
+
+        let adopted = cache.adopt("a.tar.gz", &want, &fetched).unwrap();
+        assert_eq!(std::fs::read(&adopted).unwrap(), b"the source");
+        assert_eq!(cache.read_cached("a.tar.gz", &want).unwrap(), Some(adopted));
+        assert!(
+            cache.adopt("a.tar.gz", "../escape", &fetched).is_err(),
+            "a hash with a path separator is refused"
+        );
     }
 
     /// A [FetchResponse] that yields one chunk, waits for `resume` to be

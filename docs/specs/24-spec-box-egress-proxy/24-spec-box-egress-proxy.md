@@ -770,7 +770,10 @@ Review, audit and revocation
   tier:     T0
   verify:   cargo nextest run -p minimal box_audit_filters_to_one_box
   <!-- the ruled grammar: `min box audit <box|self> | --parent <box|self> [-o jsonl] [--follow]`; the log is the proxy's, not part of the box record, so `rm` and `prune` never touch it; retention is BEP-068's -->
-  <!-- the design reads over the helper's local UDS (architecture line 501, Gatehouse §6.10 line 836, ruled on gominimal/arch#137); v1 reads the operator-owned log files under file mode in its place until gominimal/minimal#2463 serves the read; the interim is gominimal/minimal#2459 -->
+  - WHERE the host is not enrolled, WHEN `min box audit` reads a box's records THE SYSTEM SHALL read them from the proxy over its local control socket and open no audit log file in the client.
+    tier:   T0
+    verify: cargo nextest run -p minimal box_audit_reads_over_the_proxy_socket
+    <!-- the helper's local UDS (architecture line 501, Gatehouse §6.10 line 836, ruled on gominimal/arch#137): `bep serve` reads every retained segment and sends only the records whose subject the read names, and `--follow` tails over the same connection; `min doctor` keeps its read of the files, because the chain check (BEP-049) needs every segment's bytes -->
   - WHEN `min box audit <name>` is run with a friendly name THE SYSTEM SHALL read the live box of that name, else the most recent creation under it, and name the id it read.
     tier:   T0
     verify: cargo nextest run -p minimal box_audit_name_reads_live_else_latest_creation

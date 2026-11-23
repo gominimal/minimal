@@ -660,6 +660,13 @@ value. `minimald` does not connect the box to a VPN yet. With `-o json`,
 of the text. The document lists the names in `vpn_network_names`. The
 command refuses `-o yaml` with `--network`, with exit code 2.
 
+A `build boxes` block follows while a package builds for the box, with one
+line for each build box and what it can reach. That reach is the build box's,
+not the box's. A build box whose network ended reads `no network`. Without
+`--network`, the block follows the running commands. With `--network`, the
+block is in the text output only: the `min/v1/session-policy` document has
+no key for it. See [build boxes](./build-specs.md#build-boxes).
+
 ### `box wait`
 
 ```
