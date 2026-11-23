@@ -3050,9 +3050,21 @@ fn hook_port_holder(port: u16) -> Option<(u32, String)> {
     }
 }
 
+/// The command that stops the VM named `vm`: `minvmd stop` for the
+/// default VM, `minvmd --vm <vm> stop` for a named one.
+fn stop_command(vm: &str) -> String {
+    if vm == paths::DEFAULT_VM_NAME {
+        "minvmd stop".to_string()
+    } else {
+        format!("minvmd --vm {vm} stop")
+    }
+}
+
 /// The error a node with no answerer channel and the hook port held
 /// surfaces, and every box registration fails with: the port, the holder
-/// when known, and the remedy for its kind.
+/// when known, and the remedy for its kind. A native `minimald` holder has
+/// two: the DNS service (`min finalize-install`), or a restart with
+/// [`ANSWERER_PORT_ENV`] set to another port.
 fn channelless_holder_error(port: u16, holder: Option<(u32, String)>) -> String {
     let native = holder.as_ref().is_some_and(|(_, exe)| {
         Path::new(exe)
@@ -3064,11 +3076,13 @@ fn channelless_holder_error(port: u16, holder: Option<(u32, String)>) -> String 
         |(pid, exe)| format!("pid {pid} ({exe})"),
     );
     if native {
+        let stop = stop_command(crate::state::vm_name());
         format!(
             "port 127.0.0.1:{port}, which box names are answered on, is in use by a Minimal \
-             daemon running directly on this machine ({who}), so no box in the VM can be given \
-             an address; run `min finalize-install` to install Minimal's DNS service on that \
-             port instead"
+             daemon running directly on this machine ({who}). No box in the VM can be given an \
+             address while that daemon holds the port. Run `min finalize-install` to install \
+             Minimal's DNS service, or stop this VM with `{stop}` and start it again with \
+             {ANSWERER_PORT_ENV} set to a free port."
         )
     } else {
         format!(
@@ -7963,13 +7977,22 @@ mod tests {
             refused.contains("free the port, then try again"),
             "the error gives the remedy: {refused}"
         );
-        // The native remedy, for a minimald holder.
+        // The native remedies, for a minimald holder: the DNS service, or a
+        // pin. The text names no port for the service, which binds its own.
         let native = channelless_holder_error(port, Some((42, "/usr/bin/minimald".to_string())));
-        assert!(
-            native.contains("run `min finalize-install` to install Minimal's DNS service")
-                && native.contains("pid 42"),
-            "{native}"
+        assert_eq!(
+            native,
+            format!(
+                "port 127.0.0.1:{port}, which box names are answered on, is in use by a Minimal \
+                 daemon running directly on this machine (pid 42 (/usr/bin/minimald)). No box in \
+                 the VM can be given an address while that daemon holds the port. Run `min \
+                 finalize-install` to install Minimal's DNS service, or stop this VM with \
+                 `minvmd stop` and start it again with MINVMD_ZONE_ANSWERER_PORT set to a free \
+                 port."
+            )
         );
+        assert_eq!(stop_command("default"), "minvmd stop");
+        assert_eq!(stop_command("work"), "minvmd --vm work stop");
         drop(squatter);
     }
 
