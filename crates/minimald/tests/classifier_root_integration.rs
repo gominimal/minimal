@@ -6,7 +6,7 @@
 //! before it is loaded, and a request through the proxy is answered before
 //! anything refused it.
 //!
-//! Eleven proofs, all `#[ignore]`d so the default suite and the surveyed
+//! Twelve proofs, all `#[ignore]`d so the default suite and the surveyed
 //! nextest lines never run them. The native lane's
 //! `minimald-root-integration` job runs this binary, and its recipe
 //! (`just test-root-integration`) runs it unprivileged — the same posture
@@ -32,13 +32,14 @@
 //! own leaf, completes while the same deny-all box's own connect to the
 //! same server is refused, and that the fetch is recorded as the
 //! node-plane traffic it is, naming that box
-//! (`daemon_fetch_survives_a_live_deny_leaf_over_a_loaded_table`) — one
-//! proves NET-155: a package build placed in a box's deny leaf cannot
-//! connect to a local peer, and the same build in an allow leaf connects
-//! (`package_build_in_a_box_leaf_follows_its_verdict_over_a_loaded_table`),
-//! and its web-source fetch in a deny leaf is refused while the same fetch
-//! in an allow leaf completes
-//! (`web_source_fetch_in_a_box_leaf_follows_its_verdict_over_a_loaded_table`) —
+//! (`daemon_fetch_survives_a_live_deny_leaf_over_a_loaded_table`) — two
+//! measure NET-079's placement of a launch's supervisor on a real leaf:
+//! before the program runs, `/proc/<pid>/cgroup` puts the supervisor and
+//! the program in the box's leaf and neither in the daemon's, and a leaf
+//! that refuses the supervisor refuses the launch, for a box's launch
+//! (`a_box_launch_in_a_real_leaf_places_its_supervisor_before_its_program_runs`)
+//! and a task's
+//! (`a_task_launch_in_a_real_leaf_places_its_supervisor_before_its_program_runs`) —
 //! and
 //! four prove the classification itself, live on the kernel that loads
 //! it: that the installer's whole transaction — the classify chain at
@@ -56,8 +57,8 @@
 //! whole mark (`install_refuses_a_whole_mark_ct_writer`) and a mask in a
 //! well-known component's range (`install_refuses_a_well_known_mark_range`),
 //! and the table refuses an allow box's IPv6 connection to a peer
-//! (`host_ip_box_ipv6_egress_refused`). The identity proof drives an
-//! twelfth `#[ignore]`d test as its observer — the half of
+//! (`host_ip_box_ipv6_egress_refused`). The identity proof drives a
+//! thirteenth `#[ignore]`d test as its observer — the half of
 //! itself that runs re-exec'd inside the peer's namespace — which passes
 //! on its own, with nothing to observe.
 //!
@@ -2518,4 +2519,431 @@ fn host_ip_box_ipv6_egress_refused() {
 
     // Out of the box's leaf before the guard removes it.
     migrate_self(&daemon_leaf(&scratch).join("cgroup.procs"));
+}
+
+/// `/bin/true` and the libraries `ldd` says it loads, at their own paths,
+/// plus the `usr/lib` the sandbox layer's `lib64` symlink expects: the
+/// rootfs of the launch proofs below, whose program does nothing but exit.
+fn true_rootfs(dir: &Path) {
+    std::fs::create_dir_all(dir.join("usr").join("lib")).expect("the rootfs's usr/lib");
+    let ldd = Command::new("ldd")
+        .arg("/bin/true")
+        .output()
+        .expect("running ldd on /bin/true");
+    let libs = String::from_utf8_lossy(&ldd.stdout);
+    let files = libs
+        .split_whitespace()
+        .filter(|word| word.starts_with('/'))
+        .chain(std::iter::once("/bin/true"));
+    for file in files {
+        let dest = dir.join(file.trim_start_matches('/'));
+        std::fs::create_dir_all(dest.parent().expect("a file in the rootfs has a parent"))
+            .expect("the rootfs directory of a copied file");
+        std::fs::copy(file, &dest).unwrap_or_else(|e| panic!("copying {file}: {e}"));
+    }
+}
+
+/// The cgroup `pid` sits in, as this process's cgroup namespace names it:
+/// the path on the `0::` line of `/proc/<pid>/cgroup`. A box unshares its
+/// own cgroup namespace, but the kernel names the path relative to the
+/// *reader's* namespace root, so a box process reads here as its host path.
+fn cgroup_of(pid: u32) -> Option<String> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    text.lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .map(str::to_owned)
+}
+
+/// `pid`'s command name: the forking thread's until the process execs, the
+/// program's own (`true`) after.
+fn comm_of(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|comm| comm.trim().to_owned())
+}
+
+/// Every live process below `ancestor`, by `/proc`'s parent links.
+fn descendants_of(ancestor: u32) -> Vec<u32> {
+    let links: Vec<(u32, u32)> = std::fs::read_dir("/proc")
+        .expect("listing /proc")
+        .flatten()
+        .filter_map(|entry| {
+            let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
+            let status = std::fs::read_to_string(entry.path().join("status")).ok()?;
+            let parent = status
+                .lines()
+                .find_map(|line| line.strip_prefix("PPid:"))?
+                .trim()
+                .parse()
+                .ok()?;
+            Some((pid, parent))
+        })
+        .collect();
+    let mut found = Vec::new();
+    let mut frontier = vec![ancestor];
+    while let Some(parent) = frontier.pop() {
+        for (pid, _) in links.iter().filter(|(_, of)| *of == parent) {
+            found.push(*pid);
+            frontier.push(*pid);
+        }
+    }
+    found
+}
+
+/// What a launch's processes were while its program was still held at its
+/// start gate: read after the supervisor's placement, before the release.
+#[derive(Debug)]
+struct HeldLaunch {
+    supervisor: u32,
+    supervisor_cgroup: Option<String>,
+    /// The supervisor's descendants — the program, forked and waiting at its
+    /// gate — each with its cgroup and its command name.
+    program: Vec<(u32, Option<String>, Option<String>)>,
+    /// The daemon leaf's `cgroup.procs`: this proof process, the daemon's
+    /// stand-in, and nothing of the launch.
+    daemon_leaf_members: String,
+}
+
+/// Reads a held launch: waits until the supervisor has a descendant and
+/// every descendant is in `leaf_cgroup` — the program joins the leaf in its
+/// pre-exec closure, which can still be running here — or 30 s pass, and
+/// records what it saw either way, for [`assert_held_in_leaf`] to judge.
+fn observe_held_launch(supervisor: u32, leaf_cgroup: &str, daemon_procs: &Path) -> HeldLaunch {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let program: Vec<_> = descendants_of(supervisor)
+            .into_iter()
+            .map(|pid| (pid, cgroup_of(pid), comm_of(pid)))
+            .collect();
+        let settled = !program.is_empty()
+            && program
+                .iter()
+                .all(|(_, cgroup, _)| cgroup.as_deref() == Some(leaf_cgroup));
+        if settled || std::time::Instant::now() >= deadline {
+            return HeldLaunch {
+                supervisor,
+                supervisor_cgroup: cgroup_of(supervisor),
+                program,
+                daemon_leaf_members: std::fs::read_to_string(daemon_procs).unwrap_or_default(),
+            };
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// NET-079 on the kernel's own bookkeeping, for a launch read by
+/// [`observe_held_launch`]: the supervisor and the program are in the box's
+/// leaf, the program has not exec'd, and the daemon's leaf holds neither.
+fn assert_held_in_leaf(held: &HeldLaunch, leaf_cgroup: &str, launch: &str) {
+    assert_eq!(
+        held.supervisor_cgroup.as_deref(),
+        Some(leaf_cgroup),
+        "{launch}: the supervisor is in the box's leaf before the program runs: {held:?}"
+    );
+    assert!(
+        !held.program.is_empty(),
+        "{launch}: the supervisor forked the program before its gate was released: {held:?}"
+    );
+    for (pid, cgroup, comm) in &held.program {
+        assert_eq!(
+            cgroup.as_deref(),
+            Some(leaf_cgroup),
+            "{launch}: program process {pid} is in the box's leaf before it runs: {held:?}"
+        );
+        assert_ne!(
+            comm.as_deref(),
+            Some("true"),
+            "{launch}: program process {pid} has not exec'd while its gate is held: {held:?}"
+        );
+    }
+    let members: Vec<&str> = held.daemon_leaf_members.lines().map(str::trim).collect();
+    for pid in std::iter::once(held.supervisor).chain(held.program.iter().map(|(pid, ..)| *pid)) {
+        assert!(
+            !members.contains(&pid.to_string().as_str()),
+            "{launch}: the daemon's leaf holds no process of the launch, but lists {pid}: {held:?}"
+        );
+    }
+}
+
+/// The setup both launch proofs share, after the lock and the lane's
+/// preconditions: the installer's scratch tree, this proof process in its
+/// daemon leaf (the daemon's stand-in, from which every launch is
+/// spawned), and a real `boxes/deny` leaf for the box. Returns the guard,
+/// the leaf, and the leaf's cgroup as `/proc/<pid>/cgroup` names it.
+fn scratch_tree_with_a_box_leaf(tag: &str, box_id: &str) -> (ScratchInstall, PathBuf, String) {
+    let mountpoint = refuse_unless_the_root_lane_can_run();
+    let account = the_delegated_account();
+    let scratch = mountpoint.join(format!("minimald-proof-{tag}-{}", std::process::id()));
+    let mut install = ScratchInstall {
+        root: scratch.clone(),
+        mountpoint: mountpoint.clone(),
+        leaf: None,
+        child: None,
+    };
+    install_over_scratch(&scratch, &account);
+    place_this_process_in_the_tree(&scratch);
+    let leaf = create_box_leaf(&scratch, box_id, Verdict::Deny)
+        .expect("the step's deny subtree takes a box leaf");
+    install.leaf = Some(leaf.clone());
+    let leaf_cgroup = format!(
+        "/{}",
+        leaf.strip_prefix(&mountpoint)
+            .expect("the leaf is under the cgroup2 mountpoint")
+            .display()
+    );
+    (install, leaf, leaf_cgroup)
+}
+
+/// A sandbox whose box is placed in `leaf`, on the host's network, running
+/// out of a rootfs that holds `/bin/true`.
+async fn sandbox_in_leaf(
+    name: &str,
+    leaf: sandbox::config::ClassifierLeaf,
+    dir: &Path,
+) -> sandbox::Sandbox<()> {
+    let source = dir.join(format!("{name}-rootfs"));
+    true_rootfs(&source);
+    sandbox::config::Config::new(name)
+        .with_rootfs(std::iter::once(sandbox::config::SandboxMapped::Dir(source)))
+        .with_dns(false)
+        .with_classifier_leaf(leaf)
+        .build(dir.join(format!("{name}-sandbox")), ())
+        .await
+        .expect("building the sandbox")
+}
+
+/// A multi-thread runtime for the launch proofs: the spawn hook below
+/// blocks its worker while it reads the held launch.
+fn launch_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("the launch proof's runtime")
+}
+
+/// NET-079, the box launch's placement measured on a real classifier leaf
+/// (design §4.1): a sandbox run in a box's `boxes/deny` leaf holds its
+/// program at its start gate until the run's supervisor is in the leaf. The
+/// run's spawn hook — called after the placement and before the gate's
+/// release — reads `/proc/<pid>/cgroup` for the supervisor and the program:
+/// both are in the leaf, the program has not exec'd, and the daemon's leaf
+/// holds neither. Then a launch whose leaf refuses its supervisor — a leaf
+/// path with no cgroup behind it — fails at the placement, its program is
+/// never released, and no process of the run is left.
+#[test]
+#[ignore = "installs the classifier's scratch tree and launches a box in a real boxes/deny leaf; run by the native lane's minimald-root-integration job (just test-root-integration)"]
+fn a_box_launch_in_a_real_leaf_places_its_supervisor_before_its_program_runs() {
+    if !nft_present() {
+        eprintln!(
+            "skipping a_box_launch_in_a_real_leaf_places_its_supervisor_before_its_program_runs: \
+             no nft on this host — the install's nftables transaction lays out the tree \
+             (apt install nftables)"
+        );
+        return;
+    }
+    let _table = one_table_at_a_time();
+    let (install, leaf, leaf_cgroup) = scratch_tree_with_a_box_leaf("launch", "launchbox");
+    let daemon_procs = daemon_leaf(&install.root).join("cgroup.procs");
+    let refused =
+        sandbox::config::ClassifierLeaf::under(&install.root, "refusedbox", Verdict::Deny);
+    let dir = tempfile::TempDir::new().expect("a temp dir for the sandboxes");
+
+    launch_runtime().block_on(async {
+        let mut placed = sandbox_in_leaf(
+            "launchbox",
+            sandbox::config::ClassifierLeaf::new(leaf.clone()),
+            dir.path(),
+        )
+        .await;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let hook_seen = std::sync::Arc::clone(&seen);
+        let hook_cgroup = leaf_cgroup.clone();
+        let hook_procs = daemon_procs.clone();
+        let options = sandbox::RunOptions {
+            on_spawn: Some(Box::new(move |supervisor| {
+                let held = observe_held_launch(supervisor, &hook_cgroup, &hook_procs);
+                *hook_seen.lock().expect("the hook's record") = Some(held);
+                Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
+            })),
+            ..Default::default()
+        };
+        let ran = placed
+            .run_with_cancel(
+                vec![true_invocation()],
+                None::<tokio::io::Sink>,
+                None::<tokio::io::Sink>,
+                options,
+            )
+            .await;
+        let held = seen
+            .lock()
+            .expect("the hook's record")
+            .take()
+            .expect("the spawn hook saw the launch");
+        assert_held_in_leaf(&held, &leaf_cgroup, "box launch");
+        ran.expect("the launch runs its program once its supervisor is placed");
+
+        let mut refusing = sandbox_in_leaf("refusedbox", refused.clone(), dir.path()).await;
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_released = std::sync::Arc::clone(&released);
+        let options = sandbox::RunOptions {
+            on_spawn: Some(Box::new(move |_| {
+                hook_released.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
+            })),
+            ..Default::default()
+        };
+        let ran = refusing
+            .run_with_cancel(
+                vec![true_invocation()],
+                None::<tokio::io::Sink>,
+                None::<tokio::io::Sink>,
+                options,
+            )
+            .await;
+        match ran {
+            Err(sandbox::Error::IO(_, path, _)) if path == refused.procs() => {}
+            other => panic!(
+                "a launch whose leaf refuses its supervisor fails at the placement, \
+                 naming the leaf's cgroup.procs ({}), got {other:?}",
+                refused.procs().display()
+            ),
+        }
+        assert!(
+            !released.load(std::sync::atomic::Ordering::SeqCst),
+            "a refused launch never reaches the spawn hook, which runs before the \
+             program's gate is released"
+        );
+        assert_eq!(
+            descendants_of(std::process::id()),
+            Vec::<u32>::new(),
+            "the refused launch is killed and reaped: no process of it is left"
+        );
+    });
+    drop(dir);
+    drop(install);
+}
+
+/// The one invocation the launch proofs run: `/bin/true`, so a program
+/// that exec'd reads as `true` in `/proc/<pid>/comm`.
+fn true_invocation() -> sandbox::config::Invocation {
+    sandbox::config::Invocation {
+        executable: "/bin/true".to_string(),
+        args: Vec::new(),
+        envs: Default::default(),
+    }
+}
+
+/// NET-079, the task launch's placement measured on a real classifier
+/// leaf (design §4.1). A task's launch in `minimald` is the daemon's own
+/// code, reachable from no integration test, so this proof runs its steps
+/// through the same public calls, in its order: plan, container,
+/// `hold_start`, spawn on the fork thread,
+/// [`sandbox::classifier::place_supervisor`], release, attach. Before the
+/// release, `/proc/<pid>/cgroup` puts the supervisor and the program in
+/// the box's leaf, the program has not exec'd, and the daemon's leaf holds
+/// neither. Then a second launch, its program held in the leaf, is placed
+/// against a leaf that refuses it: `place_supervisor` fails for the live
+/// supervisor, and once the process is killed and reaped — what the task
+/// launch does with that failure — its program never ran.
+#[test]
+#[ignore = "installs the classifier's scratch tree and launches a task's sandbox in a real boxes/deny leaf; run by the native lane's minimald-root-integration job (just test-root-integration)"]
+fn a_task_launch_in_a_real_leaf_places_its_supervisor_before_its_program_runs() {
+    if !nft_present() {
+        eprintln!(
+            "skipping a_task_launch_in_a_real_leaf_places_its_supervisor_before_its_program_runs: \
+             no nft on this host — the install's nftables transaction lays out the tree \
+             (apt install nftables)"
+        );
+        return;
+    }
+    let _table = one_table_at_a_time();
+    let (install, leaf, leaf_cgroup) = scratch_tree_with_a_box_leaf("task", "taskbox");
+    let daemon_procs = daemon_leaf(&install.root).join("cgroup.procs");
+    let task_leaf = sandbox::config::ClassifierLeaf::new(leaf.clone());
+    let refused =
+        sandbox::config::ClassifierLeaf::under(&install.root, "refusedtask", Verdict::Deny);
+    let dir = tempfile::TempDir::new().expect("a temp dir for the sandbox");
+
+    launch_runtime().block_on(async {
+        let mut task = sandbox_in_leaf("taskbox", task_leaf.clone(), dir.path()).await;
+
+        let planned = task
+            .plan_launch()
+            .await
+            .expect("planning the task's launch");
+        let mut container = task
+            .new_container(planned.plan())
+            .expect("the task's container");
+        let gate = container.hold_start().expect("holding the task's start");
+        let mut cmd = task
+            .command(&container, "/bin/true", [""; 0], [("", ""); 0])
+            .expect("the task's command");
+        let mut child = sandbox::forker::on_fork_thread(move || cmd.spawn())
+            .expect("spawning the task's sandbox");
+        let supervisor = child.id();
+        let placed = sandbox::classifier::place_supervisor(&task_leaf, supervisor);
+        let held = observe_held_launch(supervisor, &leaf_cgroup, &daemon_procs);
+        gate.release();
+        let guard = planned
+            .attach(sandbox::Spawned::from_child(&mut child))
+            .await
+            .expect("attaching the task's network");
+        let status = child.wait().expect("waiting for the task");
+        drop(guard);
+        placed.expect("the task's supervisor is placed in its box's leaf");
+        assert_held_in_leaf(&held, &leaf_cgroup, "task launch");
+        assert!(
+            status.success(),
+            "the task's program ran once released: {status:?}"
+        );
+
+        let planned = task
+            .plan_launch()
+            .await
+            .expect("planning the refused launch");
+        let mut container = task
+            .new_container(planned.plan())
+            .expect("the refused launch's container");
+        let gate = container
+            .hold_start()
+            .expect("holding the refused launch's start");
+        let mut cmd = task
+            .command(&container, "/bin/true", [""; 0], [("", ""); 0])
+            .expect("the refused launch's command");
+        let mut child = sandbox::forker::on_fork_thread(move || cmd.spawn())
+            .expect("spawning the refused launch's sandbox");
+        let supervisor = child.id();
+        // The program is in the box's leaf at its gate, so the supervisor is
+        // alive and waiting when the refusing leaf is asked to take it.
+        let held = observe_held_launch(supervisor, &leaf_cgroup, &daemon_procs);
+        let refusal = sandbox::classifier::place_supervisor(&refused, supervisor);
+        // What the task launch does with a refusal: kill and reap, then drop
+        // the gate, so the program never runs.
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(gate);
+        drop(planned);
+        let err = refusal.expect_err("a leaf with no cgroup behind it refuses a live supervisor");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+        assert!(
+            !held.program.is_empty(),
+            "the refused launch's program was forked and held: {held:?}"
+        );
+        for (pid, _, comm) in &held.program {
+            assert_ne!(
+                comm.as_deref(),
+                Some("true"),
+                "the refused launch's program process {pid} never exec'd: {held:?}"
+            );
+        }
+        assert_eq!(
+            descendants_of(std::process::id()),
+            Vec::<u32>::new(),
+            "the refused launch is killed and reaped: no process of it is left"
+        );
+    });
+    drop(dir);
+    drop(install);
 }
