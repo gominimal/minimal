@@ -83,7 +83,7 @@ Contributors to this repository should read [AGENTS.md](AGENTS.md).
 
 ## Getting Started
 
-If you have a repository and want a session, three commands get you there — no GitHub PAT, no keychain entry, no account. The two walkthroughs after them add a GitHub credential: starting a brand-new project inside a sandbox, and joining an existing project that already has a `minimal.toml`. Once sessions are running, `min dash` opens a terminal UI for browsing and managing them without attaching to each one. `min session policy` prints the effective networking policy for a session.
+If you have a repository and want a session, three commands get you there — no GitHub PAT, no keychain entry, no account. The two walkthroughs after them add a GitHub credential: starting a brand-new project inside a sandbox, and joining an existing project that already has a `minimal.toml`. Once sessions are running, `min dash` opens a terminal UI for browsing and managing them without attaching to each one. `min box show --network <box>` prints the effective networking policy for a session.
 
 ### Start in three commands
 
@@ -92,17 +92,17 @@ Run these from the root of a repository that has no `minimal.toml` yet. No PAT, 
 ```shell
 curl --proto "=https" --tlsv1.2 -fsSL https://go.minimal.dev/stable | sh
 min init
-min session activate --attach
+min session start
 ```
 
 Joining a project that already ships a `minimal.toml`? Skip `min init`; the walkthrough below covers it.
 
 ### See every session in `min dash`
 
-The demo above is three sessions of one repository, each from its own checkout on its own branch. Activate a session from each checkout without attaching, then open the dash:
+The demo above is three sessions of one repository, each from its own checkout on its own branch. Start a session from each checkout without attaching, then open the dash:
 
 ```shell
-min session activate --name api   # run once in each checkout; without --attach it returns
+min session start --detach --name api   # run once in each checkout; --detach returns
 min dash
 ```
 
@@ -128,7 +128,7 @@ min add --session git gh claude-code mermaid-cli kittyview less emacs
 security find-generic-password -w -s "PAT-foo-repo" -a "my-mac-user-name" | pbcopy
 
 # start and enter a sandbox; the current directory's file tree is copied in
-min session activate --attach .
+min session start
 
 git init
 
@@ -165,8 +165,8 @@ git pull
 # copy the GitHub PAT to your clipboard from your macOS keychain
 security find-generic-password -w -s "PAT-foo-repo" -a "my-mac-user-name" | pbcopy
 
-# don't copy any files up; we'll git pull inside the sandbox
-min session activate --attach --sync none .
+# start and enter a sandbox; the current directory's file tree is copied in
+min session start
 
 # note: the exported GH_TOKEN is visible to Claude in this session
 read -sp "paste GitHub PAT now: " GH_TOKEN && export GH_TOKEN
@@ -224,7 +224,7 @@ VISUAL    = "hx"
 on_activate = { type = "inline", value = "hx --grammar fetch >/dev/null 2>&1 || true" }
 ```
 
-Apply one with `min session activate --loadout dev --attach .`, or list it in
+Apply one with `min session start --loadout dev`, or list it in
 `default_loadouts` under `[loadouts]` in `~/.config/minimal/config.toml` to have it join every
 session automatically. `min loadout list` shows what's available, in either
 layout — so `git clone <repo> ~/.config/minimal/loadouts/dev` is enough to
