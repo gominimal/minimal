@@ -2220,6 +2220,15 @@ out="$(cd "$PROJECT_DIR" && mnl session start --detach --name e2e-box-exec-stopp
   fail
 }
 stop_sid="$(printf '%s\n' "$out" | tail -n1 | tr -d '\r')"
+# A detached start files the box but does not run its shell. A stop of
+# that box signals nothing and keeps neither a signal nor an exit code, so
+# `min box wait` gives 137. `min box exec` starts the shell, and the box
+# is then an idle session box with its shell running.
+mnl box exec "$stop_sid" -- true </dev/null >"$WORK/box-exec-stop-start.out" 2>&1 || {
+  echo "::error::'min box exec $stop_sid -- true' failed, so the box's shell did not start before the stop"
+  cat "$WORK/box-exec-stop-start.out" 2>/dev/null || true
+  fail
+}
 # A graceful stop of an idle session box reaches its shell: the stop
 # returns well inside the 10 s grace, and the shell ends on SIGHUP, so
 # `min box wait` exits 129. The SIGHUP step is the interim of
