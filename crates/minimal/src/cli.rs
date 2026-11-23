@@ -1309,10 +1309,6 @@ pub struct TaskRunArgs {
 pub struct BoxRunArgs {
     /// Name of an entry declared in the project's minimal.toml: a task
     pub entry: String,
-    /// Project path. Defaults to the directory set by `-C`/`--repo-dir`,
-    /// or the current working directory when neither is given
-    #[arg(long)]
-    pub path: Option<String>,
     /// Start the box, print its id and return. The box gets no input
     #[arg(long)]
     pub detach: bool,
