@@ -910,8 +910,15 @@ fn redact_event_lines(bytes: &[u8]) -> (Vec<u8>, bool) {
 /// In a list, the string after a long flag whose name is a sensitive key
 /// (`--token`, then its value) is masked whole, because the two elements
 /// are scrubbed apart and the value alone need not look like a credential.
-/// A flag that carries its value (`--token=x`) is one string and needs no
-/// such rule.
+/// A string that is one assignment under a sensitive name (`--token=x`,
+/// `PASSWORD=two words`) has its whole value masked, spaces included: the
+/// list gives the argument's true bounds, which a log line does not, so
+/// nothing after the first space is left behind.
+///
+/// Both rules read a name as [`is_sensitive_key`] does, by the parts it
+/// holds. A flag such as `--keyring` or `--author` is therefore masked too,
+/// with its value: the bundle loses that argument and keeps no secret, the
+/// same choice the key redaction makes for a record's members.
 fn scrub_event_strings(value: &mut serde_json_lenient::Value) -> bool {
     use serde_json_lenient::Value;
     match value {
@@ -930,6 +937,9 @@ fn scrub_event_strings(value: &mut serde_json_lenient::Value) -> bool {
                 mask_next = item.as_str().is_some_and(is_sensitive_flag);
                 if masked {
                     *item = redaction_placeholder(item);
+                    changed = true;
+                } else if let Some(clean) = item.as_str().and_then(scrub_sensitive_assignment) {
+                    *item = Value::String(clean);
                     changed = true;
                 } else {
                     changed |= scrub_event_strings(item);
@@ -953,6 +963,24 @@ fn scrub_event_strings(value: &mut serde_json_lenient::Value) -> bool {
 fn is_sensitive_flag(arg: &str) -> bool {
     arg.strip_prefix("--")
         .is_some_and(|name| !name.is_empty() && !name.contains('=') && is_sensitive_key(name))
+}
+
+/// `name=value` with its whole value masked, when the argument is one
+/// assignment whose name is a sensitive key: the name has no whitespace (so
+/// a shell line or a header is not taken for one, and goes to the log scrub
+/// instead) and the value is not already a placeholder. `None` otherwise.
+fn scrub_sensitive_assignment(arg: &str) -> Option<String> {
+    let (name, value) = arg.split_once('=')?;
+    if name.is_empty()
+        || name.contains(char::is_whitespace)
+        || value.is_empty()
+        || value.starts_with("<redacted:len=")
+        || !is_sensitive_key(name)
+    {
+        return None;
+    }
+    let masked = redaction_placeholder(&serde_json_lenient::Value::String(value.to_owned()));
+    Some(format!("{name}={}", masked.as_str().unwrap_or("<redacted>")))
 }
 
 /// The `io::ErrorKind` behind an [`anyhow::Error`], if one is in its chain.
@@ -1759,6 +1787,7 @@ mod tests {
                 "--token",
                 "plain-value-after-a-flag",
                 "--password=hunter2-in-a-flag",
+                "--db-password=correct horse battery staple",
                 "https://example.test/",
             ]),
         );
@@ -1784,6 +1813,10 @@ mod tests {
             "ghp_argvHeaderExample0123",
             "plain-value-after-a-flag",
             "hunter2-in-a-flag",
+            "correct",
+            "horse",
+            "battery",
+            "staple",
             "ghp_argvShellExample0123",
         ] {
             assert!(
@@ -1800,11 +1833,12 @@ mod tests {
         let curl: serde_json_lenient::Value = serde_json_lenient::from_str(lines[1]).unwrap();
         assert_eq!(curl["type"], "exec_started");
         let argv = curl["data"]["argv"].as_array().unwrap();
-        assert_eq!(argv.len(), 7, "the argv keeps its length: {argv:?}");
+        assert_eq!(argv.len(), 8, "the argv keeps its length: {argv:?}");
         assert_eq!(argv[0], "curl");
         assert_eq!(argv[1], "-H");
         assert_eq!(argv[3], "--token");
-        assert_eq!(argv[6], "https://example.test/");
+        assert_eq!(argv[6], "--db-password=<redacted:len=28>");
+        assert_eq!(argv[7], "https://example.test/");
         let shell: serde_json_lenient::Value = serde_json_lenient::from_str(lines[2]).unwrap();
         assert_eq!(shell["data"]["argv"][0], "sh");
         assert_eq!(shell["data"]["argv"][1], "-c");
@@ -1840,6 +1874,34 @@ mod tests {
         let before = event.clone();
         assert!(!scrub_event_strings(&mut event));
         assert_eq!(event, before);
+    }
+
+    /// An argument that is one assignment under a sensitive name loses its
+    /// whole value, spaces included, and keeps its name. A shell line or a
+    /// header with a sensitive word before its first `=` is not taken for an
+    /// assignment: it goes to the log scrub, which finds the credential in
+    /// it. An already masked value is left as it is.
+    #[test]
+    fn scrub_event_strings_masks_the_whole_value_of_a_sensitive_assignment() {
+        let mut event = serde_json_lenient::json!({
+            "data": {"argv": [
+                "tool",
+                "--password=correct horse battery staple",
+                "API_TOKEN=a b",
+                "--jobs=4",
+                "curl -H 'Authorization: Bearer ghp_shellLineExample0123' https://example.test/?q=1",
+                "--secret=<redacted:len=3>",
+            ]},
+        });
+        assert!(scrub_event_strings(&mut event));
+        let argv = event["data"]["argv"].as_array().unwrap();
+        assert_eq!(argv[1], "--password=<redacted:len=28>");
+        assert_eq!(argv[2], "API_TOKEN=<redacted:len=3>");
+        assert_eq!(argv[3], "--jobs=4");
+        let shell = argv[4].as_str().unwrap();
+        assert!(!shell.contains("ghp_shellLineExample0123"), "{shell}");
+        assert!(shell.starts_with("curl -H "), "{shell}");
+        assert_eq!(argv[5], "--secret=<redacted:len=3>");
     }
 
     /// The value after a sensitive long flag is masked whole; the flag that
