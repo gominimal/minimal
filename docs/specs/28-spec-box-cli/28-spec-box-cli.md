@@ -39,7 +39,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
   tier:     T0
   verify:   cargo nextest run -p minimal box_list_prints_columns_and_schema
   - WHEN `min box list` or `min box show` writes a `"schema": "min/v1/box"` object THE SYSTEM SHALL include `project_name`, the project's name, `entry`, the entry the box came from, and `name_origin`, which is `"written"` for a name a person wrote and `"derived"` for a name the host derived.
-    <!-- event-driven; BOX-158, BOX-159 and BOX-226 carry these fields. New fields only, so an existing reader of `min/v1/box` keeps working. `project` stays the project root -->
+    <!-- event-driven; BOX-158, BOX-159 and BOX-228 carry these fields. New fields only, so an existing reader of `min/v1/box` keeps working. `project` stays the project root -->
     tier:   T0
     verify: cargo nextest run -p minimal box_json_carries_project_name_entry_and_name_origin
 
@@ -62,7 +62,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
   tier:     T0
   verify:   cargo nextest run -p minimal box_show_renders_state_and_identity
   - WHEN `min box show <box>` runs THE SYSTEM SHALL show the box's project name and entry, and say whether a person wrote the box's name or the host derived it.
-    <!-- event-driven; BOX-159 returns these fields and BOX-226 keeps the origin. No line says that a box took a number: a trailing `-<n>` on a derived name shows it -->
+    <!-- event-driven; BOX-159 returns these fields and BOX-228 keeps the origin. No line says that a box took a number: a trailing `-<n>` on a derived name shows it -->
     tier:   T0
     verify: cargo nextest run -p minimal box_show_renders_project_entry_and_name_origin
 
@@ -258,7 +258,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     tier:   T0
     verify: cargo nextest run -p minimal box_spec_box_lists_hooks_with_declarer
   - WHEN `min box spec <box>` renders a stored spec THE SYSTEM SHALL show the box's name as its record holds it, and say whether a person wrote the name or the host derived it.
-    <!-- event-driven; gominimal/arch#195: a box's name is held in the box record with its origin (BOX-226) and never read from its Box Spec (BOX-225). So after a rename this shows the new name -->
+    <!-- event-driven; gominimal/arch#195: a box's name is held in the box record with its origin (BOX-228) and never read from its Box Spec (BOX-227). So after a rename this shows the new name -->
     tier:   T0
     verify: cargo nextest run -p minimal box_spec_box_shows_record_name_and_origin
   - WHERE the stored spec sets `[box] name` THE SYSTEM SHALL label that value in `min box spec <box>` as the entry's default name request, and never as the box's name.
@@ -370,12 +370,12 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     tier:   T0
     verify: cargo nextest run -p minimal unattached_start_closes_stdin_and_hints_run_logs_wait
 
-- **BCLI-069** WHERE `min box start`, `min box run`, `min session start` or `min task run` runs with `--name <name>` THE SYSTEM SHALL send `<name>` as the requested name of the create request, in place of the entry's `[box] name`. BOX-163 then names the box exactly `<name>`, and the Box Host assigns it (BOX-218).
+- **BCLI-069** WHERE `min box start`, `min box run`, `min session start` or `min task run` runs with `--name <name>` THE SYSTEM SHALL send `<name>` as the requested name of the create request, in place of the entry's `[box] name`. BOX-163 then names the box exactly `<name>`, and the Box Host assigns it (BOX-220).
   <!-- optional-feature; gominimal/arch#195: a name is a creation argument, never a spec value. BOX-163 takes `--name` before `[box] name` -->
   tier:     T0
   verify:   cargo nextest run -p minimal create_verbs_send_name_flag_as_requested_name
   - WHERE a create verb runs with `--name <name>` THE SYSTEM SHALL send the expanded spec that the same entry gives without the flag, so the flag changes neither the spec nor its projection digest.
-    <!-- optional-feature; BOX-225: the Box Host never reads a box's name from its spec. So two people who start one entry get one digest, whatever they call their boxes -->
+    <!-- optional-feature; BOX-227: the Box Host never reads a box's name from its spec. So two people who start one entry get one digest, whatever they call their boxes -->
     tier:   T0
     verify: cargo nextest run -p minimal create_name_flag_leaves_expanded_spec_unchanged
   - IF a create verb runs under a written name, from `--name` or the entry's `[box] name`, that a box on the same host has, running or stopped, THEN THE SYSTEM SHALL report BOX-163's refusal with exit 2 and create nothing. The message SHALL say that the name is taken, and name that box and its state. It SHALL name the next steps: the verb that goes back into that box where one fits, `min session attach <name>` for a box whose spec sets `pty_enabled` and `min box restart <name>` for one whose spec sets `lifetime = "until_stopped"`, then `min box rm <name>`, which frees the name, and `--name <other>`, which starts another box from the entry.
@@ -387,7 +387,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     tier:   T0
     verify: cargo nextest run -p minimal create_written_name_held_without_box_read_names_no_box
 
-- **BCLI-070** WHEN `min box start`, `min box run`, `min session start` or `min task run` creates a box under a derived name that a box on the same host has THE SYSTEM SHALL create the box under the name BOX-210 numbers, and never refuse the creation for its name.
+- **BCLI-070** WHEN `min box start`, `min box run`, `min session start` or `min task run` creates a box under a derived name that a box on the same host has THE SYSTEM SHALL create the box under the name BOX-212 numbers, and never refuse the creation for its name.
   <!-- event-driven; the architecture's naming rule (gominimal/arch#186): `start` and `run` always create a box, and one rule names it. So a second concurrent `min task run build` on one host succeeds as `build-1` -->
   tier:     T0
   verify:   cargo nextest run -p minimal create_derived_name_held_takes_number
@@ -397,16 +397,16 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
   tier:     T0
   verify:   cargo nextest run -p minimal create_sends_box_name_as_requested_name
 
-- **BCLI-080** WHEN a create verb runs without `--name` and the entry sets no `[box] name` THE SYSTEM SHALL send the create request with no requested name, so the Box Host derives the name (BOX-209).
-  <!-- event-driven; BOX-218: the host takes the entry part of a derived name from the stored spec's `entry` field -->
+- **BCLI-080** WHEN a create verb runs without `--name` and the entry sets no `[box] name` THE SYSTEM SHALL send the create request with no requested name, so the Box Host derives the name (BOX-211).
+  <!-- event-driven; BOX-220 takes the entry part of a derived name from the stored spec's top-level `entry` field, which BOX-229 defines -->
   tier:     T0
   verify:   cargo nextest run -p minimal create_without_name_sends_no_requested_name
   - WHEN a create verb sends a create request THE SYSTEM SHALL include the project's name in it.
-    <!-- event-driven; BOX-218: the project's name is the project part of a derived name, and the client knows it -->
+    <!-- event-driven; BOX-220: the project's name is the project part of a derived name, and the client knows it -->
     tier:   T0
     verify: cargo nextest run -p minimal create_request_carries_project_name
 
-- **BCLI-081** WHERE a create verb does not attach this terminal to the box, WHEN the Box Host reports that the box took a number (BOX-219) THE SYSTEM SHALL print one line on stderr. The line SHALL name the name the box took and the name it did not get. Where a box on the host has that name, the line SHALL say so, and name that box, its state and the verb that fits it: `min session attach <name>` for a box whose spec sets `pty_enabled`, `min box restart <name>` for one whose spec sets `lifetime = "until_stopped"`, else `min box logs <name>`. It SHALL also name `min box prune`, which removes stopped boxes.
+- **BCLI-081** WHERE a create verb does not attach this terminal to the box, WHEN the Box Host reports that the box took a number (BOX-221) THE SYSTEM SHALL print one line on stderr. The line SHALL name the name the box took and the name it did not get. Where a box on the host has that name, the line SHALL say so, and name that box, its state and the verb that fits it: `min session attach <name>` for a box whose spec sets `pty_enabled`, `min box restart <name>` for one whose spec sets `lifetime = "until_stopped"`, else `min box logs <name>`. It SHALL also name `min box prune`, which removes stopped boxes.
   <!-- optional-feature; the architecture's naming rule (gominimal/arch#186) announces a numbered box on stderr, and gominimal/arch#195 point 2 keeps that line off an interactive start (BCLI-082) -->
   tier:     T0
   verify:   cargo nextest run -p minimal unattached_create_numbered_prints_one_stderr_line
@@ -695,7 +695,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
 
 **Resume restarts processes, and enrolled identity composes with it.** BCLI-007 and BCLI-009 drive the restart of a stopped or exited box's processes that BOX-025 and BOX-030 define. The refusal is only for restarting the processes of a non-PTY box. Its hint follows `lifetime`, not type (design principle 8). A box whose spec sets `lifetime = "until_stopped"` comes back with `min box restart` (BCLI-074). A box that runs to completion comes back with a new `min box run <entry>`. Under enrollment, the identity plane re-establishes the identity of any box, non-PTY included, and the architecture names `min box resume <box>` among its paths. That composes with this, as the Design reasoning of BOX states. A resume refused because a running box holds the name exits 2. The architecture's exit-code table puts a name that the target does not admit under 2. A resume refused because another box holds a volume the box declares belongs to BVOL, which sets its exit code. The name check runs before the spec and volume checks, so a resume that meets both refusals reports the name.
 
-**A box's name lives in its record, and only a derived name takes a number.** The architecture's naming rule (gominimal/arch#186) has `start` and `run` always create a box, and one rule names it. gominimal/arch#195 makes the name a creation argument. `min` sends the requested name, `--name` before the entry's `[box] name`, or none, beside the project's name (BCLI-069, BCLI-079, BCLI-080). The Box Host assigns the name and keeps it in the box record with its origin (BOX-218, BOX-226). Nothing reads a name from a stored spec (BOX-225), so a spec's bytes and projection digest do not depend on what a box is called, and a rename never leaves a stale name in a spec. Under a written name the box gets exactly that name, or the creation is refused (BCLI-069), because a script, a URL or another box's egress rule addresses it. Under a derived name the box takes a number when the name is taken (BCLI-070). So a second concurrent `min task run build` on one host succeeds as `build-1`, which is the CI case. That makes `--new` redundant, and BCLI-042 removes it with no alias. No surface marks a box that took a number: a trailing `-<n>` on a derived name shows it. `min box list` shows each box's entry beside its name. `min box show` and the `min/v1/box` object also say whether the name was written or derived. The line that says a box took a number prints only when the command does not attach (BCLI-081, BCLI-082), because the shell's first paint replaces anything printed before it.
+**A box's name lives in its record, and only a derived name takes a number.** The architecture's naming rule (gominimal/arch#186) has `start` and `run` always create a box, and one rule names it. gominimal/arch#195 makes the name a creation argument. `min` sends the requested name, `--name` before the entry's `[box] name`, or none, beside the project's name (BCLI-069, BCLI-079, BCLI-080). The Box Host assigns the name and keeps it in the box record with its origin (BOX-220, BOX-228). Nothing reads a name from a stored spec (BOX-227), so a spec's bytes and projection digest do not depend on what a box is called, and a rename never leaves a stale name in a spec. Under a written name the box gets exactly that name, or the creation is refused (BCLI-069), because a script, a URL or another box's egress rule addresses it. Under a derived name the box takes a number when the name is taken (BCLI-070). So a second concurrent `min task run build` on one host succeeds as `build-1`, which is the CI case. That makes `--new` redundant, and BCLI-042 removes it with no alias. No surface marks a box that took a number: a trailing `-<n>` on a derived name shows it. `min box list` shows each box's entry beside its name. `min box show` and the `min/v1/box` object also say whether the name was written or derived. The line that says a box took a number prints only when the command does not attach (BCLI-081, BCLI-082), because the shell's first paint replaces anything printed before it.
 
 **`run` follows the architecture's stdio contract and never allocates a PTY.** The architecture's `min box run` wires the box's stdio to the command and writes only the payload to stdout (design principle 4). An entry whose spec sets `pty_enabled` fails with exit 2 and a hint naming `min box start <entry>` (BCLI-010). Each alternative fails. An attach makes `run` a copy of `start`. Plain pipes into a `pty_enabled` entry make a session box with no terminal, which the type requires. Interactive use of a PTY entry stays with `min box start` and `min box exec -t`.
 
@@ -750,7 +750,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
 - Bare `min stop`: TEL-011, and the installer's R5.5. The installer, `scripts/install.sh`, runs `min stop` and matches its refusal for live sessions by message. Without that match it runs `min stop --force`. `min host stop` does not refuse while boxes run (BCLI-049). So the installer moves to `min host stop` with a running-box check of its own, and keeps its choice of a forced stop. The owner ruled on 2026-11-09 how the installer upgrades an older client. If the installed client answers `min host stop` with an unknown command, the installer falls back to bare `min stop`. That fallback lives only in the installer, so the CLI keeps no alias (BCLI-042). Release 0.9 removes the fallback with the other compatibility windows. The installer belongs to `docs/specs/07-spec-installer`, and T31 (gominimal/minimal#2917) makes this change to `scripts/install.sh`. The end-to-end scripts `scripts/session-e2e.sh`, `scripts/stress-session-e2e.sh` and `scripts/bulk-upload-e2e.sh`, and the installer's tests in `scripts/install_test.sh`, call `min stop` too.
 - `docs/reference` and `docs/concepts`: every page that names one of these spellings.
 
-**The box-name requirements land with spec 29's amendment.** BCLI-069, BCLI-070, BCLI-079 to BCLI-082, and the name sub-bullets of BCLI-001, BCLI-003 and BCLI-022 cite BOX-158, BOX-159, BOX-163, BOX-209, BOX-210, BOX-218, BOX-219, BOX-225 and BOX-226 as spec 29's amendment for gominimal/arch#195 states them. The two amendments merge one after the other. gominimal/minimal#3196 and gominimal/minimal#3212 implement them, and they also remove `--new` from `min box start` and `min session start` (BCLI-042). The same change moves every caller of `--new`. `scripts/bulk-upload-e2e.sh` runs `min session start --detach --new` (line 326) and moves to `min session start --detach`, because the entry's derived name takes a number when it is taken (BCLI-070). `docs/concepts/sessions.md` and the `session start` and `box start` tables of `docs/reference/cli-min.md` drop the flag. The PTY-entry hint in `crates/minimal/src/task.rs` names `min box start <entry>` (BCLI-010). The idempotency key for a repeated creation waits on gominimal/arch#199, and is not in this amendment.
+**The box-name requirements land with spec 29's amendment.** BCLI-069, BCLI-070, BCLI-079 to BCLI-082, and the name sub-bullets of BCLI-001, BCLI-003 and BCLI-022 cite BOX-158, BOX-159, BOX-163, BOX-211, BOX-212, BOX-220, BOX-221, BOX-227, BOX-228 and BOX-229 as spec 29's amendment for gominimal/arch#195 states them. The two amendments merge one after the other. gominimal/minimal#3196 and gominimal/minimal#3212 implement them, and they also remove `--new` from `min box start` and `min session start` (BCLI-042). The same change moves every caller of `--new`. `scripts/bulk-upload-e2e.sh` runs `min session start --detach --new` (line 326) and moves to `min session start --detach`, because the entry's derived name takes a number when it is taken (BCLI-070). `docs/concepts/sessions.md` and the `session start` and `box start` tables of `docs/reference/cli-min.md` drop the flag. The PTY-entry hint in `crates/minimal/src/task.rs` names `min box start <entry>` (BCLI-010). The idempotency key for a repeated creation waits on gominimal/arch#199, and is not in this amendment.
 
 **`scripts/session-e2e.sh` moves to `--repo-dir` with BCLI-021.** The script renders the Box Egress Proxy demo project as `min box spec "$GRANT_SEED_DIR"`. No requirement uses the bare directory form. The change that implements BCLI-021 and BCLI-022 moves the script to `min box spec --repo-dir "$GRANT_SEED_DIR"`, because the bare form has no alias.
 
