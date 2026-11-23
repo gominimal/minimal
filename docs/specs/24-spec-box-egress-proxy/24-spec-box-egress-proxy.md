@@ -549,6 +549,10 @@ Redemption
     tier:   T0
     verify: cargo nextest run -p minimal host_ip_grant_box_with_no_egress_section_registers_the_github_hosts
     <!-- the box lists no names, so an empty registration would refuse the hosts BEP-008 lets it reach -->
+  - WHEN a `host_ip` box that declares a store reference matched by a `[secret-store-rules]` rule and has no `egress` section registers with the proxy THE SYSTEM SHALL register the rule's upstream hosts as part of its declared egress.
+    tier:   T0
+    verify: cargo nextest run -p minimal host_ip_store_box_with_no_egress_section_registers_the_rule_upstream
+    <!-- the box lists no names, so an empty registration would refuse the upstream BEP-036 lets it reach -->
 
 - **BEP-023** IF a request's `Host` header, or the authority of an absolute-form request target, differs from the connection authority it arrived on THEN THE SYSTEM SHALL refuse the request before substitution.
   tier:     T2

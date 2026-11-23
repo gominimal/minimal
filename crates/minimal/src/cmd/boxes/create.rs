@@ -3211,22 +3211,38 @@ fn store_grants(
 
 /// The authorities to register with the proxy as the box's declared egress
 /// (BEP-022). A box whose egress admits every name lists none, so a GitHub
-/// grant registers the module's hosts for it, or the proxy would refuse them.
+/// grant registers the module's hosts for it, and each store grant registers
+/// its rule's upstream hosts (BEP-036), or the proxy would refuse them.
 fn proxy_egress(
     egress: Option<&boxes::EgressPolicy>,
     network: boxes::NetworkMode,
     github_grant: bool,
+    store_grants: &[crate::mint::StoreGrant],
 ) -> Vec<String> {
-    if github_grant && boxes::core::bep::egress_admits_every_name(network, egress) {
-        return bep::module::GITHUB
-            .hosts
-            .iter()
-            .map(|authority| authority.host.to_string())
-            .collect();
+    if !boxes::core::bep::egress_admits_every_name(network, egress) {
+        return egress
+            .and_then(|egress| egress.allow_dns_hosts.clone())
+            .unwrap_or_default();
     }
-    egress
-        .and_then(|egress| egress.allow_dns_hosts.clone())
-        .unwrap_or_default()
+    let github = bep::module::GITHUB
+        .hosts
+        .iter()
+        .filter(|_| github_grant)
+        .map(|authority| authority.host.to_string());
+    let stores = store_grants
+        .iter()
+        .flat_map(|store| store.rule.upstream.iter())
+        .map(|authority| {
+            bep::handle::parse_authority(authority)
+                .map_or_else(|| authority.to_ascii_lowercase(), |parsed| parsed.host)
+        });
+    let mut hosts: Vec<String> = Vec::new();
+    for host in github.chain(stores) {
+        if !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
+    hosts
 }
 
 /// Mints the box's GitHub grants and its accepted store references for the
@@ -3263,6 +3279,7 @@ async fn mint_into_request(
         request.config.policy.egress.as_ref(),
         network,
         !github_grants.is_empty(),
+        store_grants,
     );
     // The mint blocks on the proxy's control socket and the host keychain,
     // so it runs off the runtime's workers.
@@ -6369,17 +6386,65 @@ mod tests {
             .iter()
             .map(|authority| authority.host.to_string())
             .collect();
-        assert_eq!(proxy_egress(None, boxes::NetworkMode::HostNet, true), hosts);
-        assert!(proxy_egress(None, boxes::NetworkMode::HostNet, false).is_empty());
-        assert!(proxy_egress(None, boxes::NetworkMode::OwnIp, true).is_empty());
+        assert_eq!(
+            proxy_egress(None, boxes::NetworkMode::HostNet, true, &[]),
+            hosts
+        );
+        assert!(proxy_egress(None, boxes::NetworkMode::HostNet, false, &[]).is_empty());
+        assert!(proxy_egress(None, boxes::NetworkMode::OwnIp, true, &[]).is_empty());
 
         let listed = boxes::EgressPolicy {
             allow_dns_hosts: Some(vec!["github.com".to_string()]),
             ..boxes::EgressPolicy::default()
         };
         assert_eq!(
-            proxy_egress(Some(&listed), boxes::NetworkMode::HostNet, true),
+            proxy_egress(Some(&listed), boxes::NetworkMode::HostNet, true, &[]),
             ["github.com"]
+        );
+    }
+
+    /// BEP-022, BEP-036: a `host_ip` box with no `egress` section and one
+    /// store rule registers that rule's upstream host with the proxy. An
+    /// `own_ip` box and a box with a section register what they list.
+    #[test]
+    fn host_ip_store_box_with_no_egress_section_registers_the_rule_upstream() {
+        let store = crate::mint::StoreGrant {
+            grant: "EXAMPLE_KEY".into(),
+            rule: bep::handle::StoreRule {
+                store: "native".into(),
+                id: "example-key".into(),
+                upstream: vec!["API.example.com".into(), "api.example.com:8443".into()],
+                inject: bep::handle::Inject::Header {
+                    name: "Authorization".into(),
+                    prefix: None,
+                },
+            },
+        };
+        let stores = std::slice::from_ref(&store);
+        assert_eq!(
+            proxy_egress(None, boxes::NetworkMode::HostNet, false, stores),
+            ["api.example.com"]
+        );
+        assert!(proxy_egress(None, boxes::NetworkMode::OwnIp, false, stores).is_empty());
+
+        let mut with_github: Vec<String> = bep::module::GITHUB
+            .hosts
+            .iter()
+            .map(|authority| authority.host.to_string())
+            .collect();
+        with_github.push("api.example.com".into());
+        assert_eq!(
+            proxy_egress(None, boxes::NetworkMode::HostNet, true, stores),
+            with_github
+        );
+
+        let listed = boxes::EgressPolicy {
+            allow_dns_hosts: Some(vec!["api.example.com".to_string()]),
+            ..boxes::EgressPolicy::default()
+        };
+        assert_eq!(
+            proxy_egress(Some(&listed), boxes::NetworkMode::HostNet, false, stores),
+            ["api.example.com"]
         );
     }
 
