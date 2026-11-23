@@ -55,7 +55,10 @@ pub async fn cmd_pkg_patched_build(
     .map_err(|e| Error::Other(anyhow!("build failed: {}", e)))?;
 
     res.outputs.finalize(res.meta).unwrap();
-    println!("Written to cache with hash {}", graph.spec_hash(&bsr).0);
+    println!(
+        "Written to cache with hash {}",
+        graph.spec_hash(&bsr).patched_slot().0
+    );
 
     Ok(())
 }

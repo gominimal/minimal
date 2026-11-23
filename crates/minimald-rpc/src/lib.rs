@@ -949,6 +949,10 @@ pub struct FileBuildTableRequest {
     pub session_id: SessionId,
     /// The table.
     pub table: BuildGrantTable,
+    /// The box's network mode is `none`: the VM host daemon records that the
+    /// box gets no grant, and `table` is empty.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_network: bool,
 }
 
 /// The guest asks for the build of one spec hash

@@ -42,6 +42,8 @@ pub(crate) struct BuildBoxActivation<'a> {
     pub(crate) control_sock: Option<PathBuf>,
     /// The task addresses of the box's own build row, if it has one.
     pub(crate) task_addresses: Vec<std::net::Ipv4Addr>,
+    /// The box's network mode. A `none` box gets no table.
+    pub(crate) network: boxes::NetworkMode,
 }
 
 /// Makes the box's table and hands it to the host side, before any process of
@@ -51,7 +53,12 @@ pub(crate) async fn prepare_build_boxes(
     activation: BuildBoxActivation<'_>,
 ) {
     let started = std::time::Instant::now();
-    let table = table_within(EVALUATION_BOUND, table_of_project(&activation)).await;
+    let table = box_table(
+        activation.network,
+        EVALUATION_BOUND,
+        table_of_project(&activation),
+    )
+    .await;
     tracing::info!(
         grants = table.len(),
         elapsed_ms = started.elapsed().as_millis(),
@@ -60,6 +67,7 @@ pub(crate) async fn prepare_build_boxes(
     let table = hand_over(
         activation.control_sock.as_deref(),
         activation.session_id,
+        activation.network == boxes::NetworkMode::NoNet,
         table,
     )
     .await;
@@ -81,13 +89,19 @@ pub(crate) async fn prepare_build_boxes(
 
 /// Hands `table` to the host side: on a VM-backed host, the VM host daemon
 /// on `control_sock`, and the daemon gets none. On a host with no VM the
-/// daemon gets it, returned here.
+/// daemon gets it, returned here. For a box with `no_network`, the VM host
+/// daemon gets no table, only the box's network mode.
 async fn hand_over(
     control_sock: Option<&Path>,
     session_id: boxes::SessionId,
+    no_network: bool,
     table: BuildGrantTable,
 ) -> Option<BuildGrantTable> {
     match control_sock {
+        Some(sock) if no_network => {
+            file_no_network_with_vm_host(sock, session_id).await;
+            None
+        }
         Some(sock) => {
             file_with_vm_host(
                 sock,
@@ -100,6 +114,19 @@ async fn hand_over(
         }
         None => Some(table),
     }
+}
+
+/// The table of a box whose network mode is `network`: none for a `none` box,
+/// whose builds get no grant, and otherwise [`table_within`].
+async fn box_table(
+    network: boxes::NetworkMode,
+    bound: std::time::Duration,
+    evaluation: impl std::future::Future<Output = anyhow::Result<BuildGrantTable>>,
+) -> BuildGrantTable {
+    if network == boxes::NetworkMode::NoNet {
+        return BuildGrantTable::new();
+    }
+    table_within(bound, evaluation).await
 }
 
 /// The table `evaluation` makes, or an empty one when it fails or takes
@@ -174,8 +201,11 @@ async fn file_with_vm_host(
 ) {
     let deadline = tokio::time::Instant::now() + bound;
     for table in filings(table) {
-        let request =
-            BoxControlRequest::FileBuildTable(FileBuildTableRequest { session_id, table });
+        let request = BoxControlRequest::FileBuildTable(FileBuildTableRequest {
+            session_id,
+            table,
+            no_network: false,
+        });
         let filed = minimal_client::box_registration::control_request_with_vm_host(sock, request);
         match tokio::time::timeout_at(deadline, filed).await {
             Ok(Ok(BoxControlReply::BuildTable { .. })) => {}
@@ -193,6 +223,26 @@ async fn file_with_vm_host(
                 return;
             }
         }
+    }
+}
+
+/// Files with the VM host daemon that the box `session_id` has the network
+/// mode `none`, with no table, so it opens no grant for the box. A daemon
+/// that does not answer in time is logged, and the start goes on.
+async fn file_no_network_with_vm_host(sock: &Path, session_id: boxes::SessionId) {
+    let request = BoxControlRequest::FileBuildTable(FileBuildTableRequest {
+        session_id,
+        table: BuildGrantTable::new(),
+        no_network: true,
+    });
+    let filed = minimal_client::box_registration::control_request_with_vm_host(sock, request);
+    match tokio::time::timeout(minimal_client::box_registration::BOX_CONTROL_TIMEOUT, filed).await {
+        Ok(Ok(BoxControlReply::BuildTable { .. })) => {}
+        Ok(Ok(reply)) => tracing::info!(?reply, "the VM host daemon did not take the box's mode"),
+        Ok(Err(error)) => {
+            tracing::info!(error = %format!("{error:#}"), "could not file the box's mode");
+        }
+        Err(_elapsed) => tracing::info!("the VM host daemon did not answer the box's mode in time"),
     }
 }
 
@@ -245,6 +295,7 @@ mod tests {
             let request = BoxControlRequest::FileBuildTable(FileBuildTableRequest {
                 session_id: boxes::SessionId::mint(),
                 table: part.clone(),
+                no_network: false,
             });
             let line = serde_json_lenient::to_string(&request).unwrap();
             assert!(line.len() < 64 * 1024, "{}", line.len());
@@ -324,12 +375,15 @@ mod tests {
     #[tokio::test]
     async fn the_table_goes_to_the_vm_host_or_to_the_daemon() {
         let id = boxes::SessionId::mint();
-        assert_eq!(hand_over(None, id, one_grant()).await, Some(one_grant()));
+        assert_eq!(
+            hand_over(None, id, false, one_grant()).await,
+            Some(one_grant())
+        );
 
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("control.sock");
         let seen = fake_vm_host(&sock, BoxControlReply::BuildTable { build_table: true }).await;
-        assert_eq!(hand_over(Some(&sock), id, one_grant()).await, None);
+        assert_eq!(hand_over(Some(&sock), id, false, one_grant()).await, None);
         let seen = seen.lock().unwrap();
         let [BoxControlRequest::FileBuildTable(filed)] = seen.as_slice() else {
             panic!("one filing: {seen:?}");
@@ -345,7 +399,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("absent.sock");
         assert_eq!(
-            hand_over(Some(&sock), boxes::SessionId::mint(), one_grant()).await,
+            hand_over(Some(&sock), boxes::SessionId::mint(), false, one_grant()).await,
             None
         );
     }
@@ -453,6 +507,41 @@ mod tests {
                 .await
                 .is_empty()
         );
+    }
+
+    /// NET-165: a box with network mode `none` gets no table: its project
+    /// is not evaluated, and the VM host daemon gets no table for it, only
+    /// the box's mode.
+    #[tokio::test]
+    async fn a_box_with_no_network_files_no_table() {
+        let bound = std::time::Duration::from_secs(5);
+        let table = box_table(boxes::NetworkMode::NoNet, bound, async {
+            panic!("a `none` box's project is not evaluated")
+        })
+        .await;
+        assert!(table.is_empty());
+        assert_eq!(
+            box_table(
+                boxes::NetworkMode::OwnIp,
+                bound,
+                std::future::ready(Ok(one_grant()))
+            )
+            .await,
+            one_grant()
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        let seen = fake_vm_host(&sock, BoxControlReply::BuildTable { build_table: true }).await;
+        let id = boxes::SessionId::mint();
+        assert_eq!(hand_over(Some(&sock), id, true, one_grant()).await, None);
+        let seen = seen.lock().unwrap();
+        let [BoxControlRequest::FileBuildTable(filed)] = seen.as_slice() else {
+            panic!("one filing: {seen:?}");
+        };
+        assert_eq!(filed.session_id, id);
+        assert!(filed.no_network);
+        assert!(filed.table.is_empty(), "no table is filed");
     }
 
     /// NET-165: an empty table files nothing.

@@ -1374,7 +1374,11 @@ fn serve_request(
         }
         // NET-165: `min` files a box's table with the host-side creator.
         (BoxControlRequest::FileBuildTable(request), ControlDoor::Host) => {
-            boxes.build_grants().file(request.session_id, request.table);
+            if request.no_network {
+                boxes.build_grants().file_no_network(request.session_id);
+            } else {
+                boxes.build_grants().file(request.session_id, request.table);
+            }
             write_reply(stream, &BoxControlReply::BuildTable { build_table: true })
         }
         // NET-165: the guest names a spec hash, and the table decides. The
@@ -1907,6 +1911,15 @@ fn open_build_grant(
         no_build_grant: true,
     };
     let grants = boxes.build_grants();
+    // The box's network mode is the one `min` filed on the host's door,
+    // never one the guest sends.
+    if grants.has_no_network(request.session_id) {
+        tracing::info!(
+            session = %request.session_id,
+            "refused a build grant for a box with no network"
+        );
+        return no_grant;
+    }
     let Some(grant) = grants.lookup(request.session_id, &request.spec_hash) else {
         return no_grant;
     };
@@ -9494,6 +9507,7 @@ mod tests {
                     internet: true,
                 },
             )]),
+            no_network: false,
         });
         let refused = control(&guest, &file).expect("the guest door answers");
         assert!(
@@ -9543,6 +9557,56 @@ mod tests {
         assert!(registry.row_by_name(&opened.grant_row).is_none());
     }
 
+    /// NET-165: a box `min` filed on the host's door with the network mode
+    /// `none` gets no build grant, even for a hash a table part names. The
+    /// guest door cannot file that mode.
+    #[test]
+    fn a_build_grant_for_a_box_with_no_network_is_refused() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, _registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let guest = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        let session_id = boxes::SessionId::mint();
+        let file = |no_network| {
+            BoxControlRequest::FileBuildTable(minimald_rpc::FileBuildTableRequest {
+                session_id,
+                table: if no_network {
+                    std::collections::BTreeMap::new()
+                } else {
+                    std::collections::BTreeMap::from([(
+                        "aa".to_string(),
+                        minimald_rpc::BuildGrant {
+                            sources: Vec::new(),
+                            internet: true,
+                        },
+                    )])
+                },
+                no_network,
+            })
+        };
+        let refused = control(&guest, &file(true)).expect("the guest door answers");
+        assert!(
+            matches!(refused, BoxControlReply::Error { .. }),
+            "{refused:?}"
+        );
+        for no_network in [true, false] {
+            let filed = control(&sock_path, &file(no_network)).expect("the host door answers");
+            assert!(matches!(filed, BoxControlReply::BuildTable { .. }));
+        }
+        let opened = control(
+            &guest,
+            &BoxControlRequest::OpenBuildGrant(minimald_rpc::OpenBuildGrantRequest {
+                session_id,
+                spec_hash: "aa".to_string(),
+            }),
+        )
+        .expect("the guest door answers");
+        assert!(
+            matches!(opened, BoxControlReply::NoBuildGrant { .. }),
+            "{opened:?}"
+        );
+    }
+
     /// A filed table and an open grant on it, through the server at
     /// `sock_path`: the grant the guest opened.
     fn open_a_grant(
@@ -9560,6 +9624,7 @@ mod tests {
                         internet: true,
                     },
                 )]),
+                no_network: false,
             }),
         )
         .expect("the host door answers");

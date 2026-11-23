@@ -1906,6 +1906,7 @@ pub(crate) async fn run_entry(
             project_dir: abs_path.as_utf8_path().as_std_path().to_path_buf(),
             control_sock,
             task_addresses,
+            network: request.config.network,
         },
     )
     .await;

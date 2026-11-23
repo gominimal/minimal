@@ -60,6 +60,9 @@ pub(crate) fn grant_deadline(now: Instant, internet: bool) -> Instant {
 struct BuildTablesFile {
     version: u32,
     tables: BTreeMap<boxes::SessionId, BuildGrantTable>,
+    /// The boxes `min` filed with the network mode `none`.
+    #[serde(default)]
+    no_network: BTreeSet<boxes::SessionId>,
 }
 
 #[derive(Debug)]
@@ -81,6 +84,9 @@ pub(crate) struct BuildGrantMark(u64);
 #[derive(Debug)]
 struct State {
     tables: BTreeMap<boxes::SessionId, BuildGrantTable>,
+    /// The boxes `min` filed with the network mode `none`
+    /// ([`BuildGrants::file_no_network`]). They get no table and no grant.
+    no_network: BTreeSet<boxes::SessionId>,
     /// The change each box's table was last filed at.
     filed_at: BTreeMap<boxes::SessionId, u64>,
     /// Counts filings and grant opens, for [`BuildGrantMark`].
@@ -112,6 +118,7 @@ impl Default for State {
         let nonce = minted.rsplit('-').next().unwrap_or(&minted).to_string();
         Self {
             tables: BTreeMap::new(),
+            no_network: BTreeSet::new(),
             filed_at: BTreeMap::new(),
             changes: 0,
             nonce,
@@ -161,7 +168,11 @@ impl BuildGrants {
         match read_tables_file(&path) {
             // A reloaded table counts as filed before any mark, so the
             // second good list that leaves its box out ends it.
-            Ok(tables) => self.lock().tables = tables,
+            Ok((tables, no_network)) => {
+                let mut state = self.lock();
+                state.tables = tables;
+                state.no_network = no_network;
+            }
             Err(why) => {
                 if !set_aside_tables_file(&path, &why) {
                     return self;
@@ -183,12 +194,12 @@ impl BuildGrants {
             .persist_turn
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let tables = {
+        let (tables, no_network) = {
             let mut state = self.lock();
             if !change(&mut state) {
                 return;
             }
-            state.tables.clone()
+            (state.tables.clone(), state.no_network.clone())
         };
         let Some(path) = &self.persisted_at else {
             return;
@@ -196,6 +207,7 @@ impl BuildGrants {
         let file = BuildTablesFile {
             version: BUILD_TABLES_FILE_VERSION,
             tables,
+            no_network,
         };
         if let Err(error) = crate::box_registry::write_registry_file(path, &file) {
             tracing::warn!(%error, "could not persist the box tables");
@@ -215,12 +227,40 @@ impl BuildGrants {
                 );
                 return false;
             }
+            if state.no_network.contains(&session_id) {
+                tracing::info!(
+                    session = %session_id,
+                    "dropped a part of a build table for a box with no network"
+                );
+                return false;
+            }
             state.tables.entry(session_id).or_default().extend(table);
             state.changes += 1;
             let at = state.changes;
             state.filed_at.insert(session_id, at);
             true
         });
+    }
+
+    /// Records that the box `session_id` has the network mode `none`, as `min`
+    /// filed it: the box holds no table from here on, and gets no grant.
+    pub fn file_no_network(&self, session_id: boxes::SessionId) {
+        self.change_tables(|state| {
+            if state.ended.contains(&session_id) {
+                return false;
+            }
+            state.tables.remove(&session_id);
+            state.filed_at.remove(&session_id);
+            state
+                .reserved
+                .retain(|_, reserved_for| *reserved_for != session_id);
+            state.no_network.insert(session_id)
+        });
+    }
+
+    /// Whether `min` filed the box `session_id` with the network mode `none`.
+    pub(crate) fn has_no_network(&self, session_id: boxes::SessionId) -> bool {
+        self.lock().no_network.contains(&session_id)
     }
 
     /// Ends the table of the box `session_id`, which is gone, and every grant
@@ -246,7 +286,8 @@ impl BuildGrants {
                 .map(|grant| grant.withdrawal)
                 .collect();
             state.filed_at.remove(&session_id);
-            state.tables.remove(&session_id).is_some()
+            let no_network = state.no_network.remove(&session_id);
+            state.tables.remove(&session_id).is_some() || no_network
         });
         withdrawals
     }
@@ -260,7 +301,7 @@ impl BuildGrants {
     /// end.
     pub(crate) fn holds_any(&self) -> bool {
         let state = self.lock();
-        !state.tables.is_empty() || !state.open.is_empty()
+        !state.tables.is_empty() || !state.open.is_empty() || !state.no_network.is_empty()
     }
 
     /// Ends what stands for boxes the in-VM daemon's list `listed` leaves
@@ -340,7 +381,18 @@ impl BuildGrants {
                         .map(|grant| grant.withdrawal),
                 );
             }
-            !left.is_empty()
+            // A box filed with no network has no table to end, so the same
+            // list ends its record.
+            let quiet: Vec<boxes::SessionId> = state
+                .no_network
+                .iter()
+                .filter(|session| !listed.contains(session))
+                .copied()
+                .collect();
+            for session in &quiet {
+                state.no_network.remove(session);
+            }
+            !left.is_empty() || !quiet.is_empty()
         });
         withdrawals
     }
@@ -358,6 +410,7 @@ impl BuildGrants {
         // The table is read under the reservation's own lock, so a table that
         // ends after the caller's lookup leaves nothing to reserve.
         if !state.tables.contains_key(&session_id)
+            || state.no_network.contains(&session_id)
             || state.open.len() + state.reserved.len() >= MAX_OPEN_GRANTS
         {
             return None;
@@ -431,13 +484,16 @@ impl BuildGrants {
 
 /// Reads the tables persisted at `path`: none when there is no file yet, and
 /// the reason when the file cannot be used.
-fn read_tables_file(
-    path: &std::path::Path,
-) -> Result<BTreeMap<boxes::SessionId, BuildGrantTable>, String> {
+type PersistedTables = (
+    BTreeMap<boxes::SessionId, BuildGrantTable>,
+    BTreeSet<boxes::SessionId>,
+);
+
+fn read_tables_file(path: &std::path::Path) -> Result<PersistedTables, String> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(BTreeMap::new());
+            return Ok((BTreeMap::new(), BTreeSet::new()));
         }
         Err(error) => return Err(error.to_string()),
     };
@@ -449,7 +505,7 @@ fn read_tables_file(
             file.version
         ));
     }
-    Ok(file.tables)
+    Ok((file.tables, file.no_network))
 }
 
 /// Renames an unusable tables file aside under the `.unusable-<unix seconds>`
@@ -769,6 +825,33 @@ mod tests {
         );
         assert!(grants.lookup(starting, "aa").is_some());
         assert!(grants.holds_any());
+    }
+
+    /// NET-165: a box `min` filed with the network mode `none` holds no table
+    /// and reserves no grant, whatever table part arrives for it, and the
+    /// record survives a restart.
+    #[test]
+    fn a_box_filed_with_no_network_gets_no_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(BUILD_TABLES_FILE);
+        let grants = BuildGrants::default().persisting_to(path.clone());
+        let (none, open) = (boxes::SessionId::mint(), boxes::SessionId::mint());
+        grants.file(none, table("aa", true));
+        grants.file_no_network(none);
+        grants.file(none, table("bb", true));
+        grants.file(open, table("aa", true));
+        assert!(grants.has_no_network(none));
+        assert!(grants.lookup(none, "aa").is_none());
+        assert!(grants.lookup(none, "bb").is_none());
+        assert!(grants.next_row(none).is_none());
+        assert!(grants.next_row(open).is_some(), "another box is unchanged");
+
+        let reloaded = BuildGrants::default().persisting_to(path);
+        assert!(reloaded.has_no_network(none));
+        assert!(reloaded.next_row(none).is_none());
+
+        grants.drop_table(none);
+        assert!(!grants.has_no_network(none));
     }
 
     /// NET-165: a grant opened after the list's mark ends with its box's

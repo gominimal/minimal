@@ -2269,7 +2269,7 @@ impl BoxChannel {
         let _ = writeln!(
             stream,
             "msg:Written to cache with hash {}",
-            graph.spec_hash(&bsr).0
+            graph.spec_hash(&bsr).patched_slot().0
         );
 
         self.ctx = ctx;

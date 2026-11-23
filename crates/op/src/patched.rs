@@ -7,7 +7,10 @@ use rcache::RemoteCache;
 
 use crate::{Error, Options, Runnable, SpecBuild};
 
-/// The return value of a successful patched build.
+/// The return value of a successful patched build. Its outputs finalize under
+/// the spec's [`common::SpecHash::patched_slot`], never under its spec hash,
+/// so a lookup by spec hash never returns them. A later patched build finds
+/// them by name.
 pub struct PatchedBuildResult {
     pub outputs: PendingDir,
     pub build_ms: usize,
@@ -156,6 +159,7 @@ impl<'a, SF: crate::SourceFetcher> Runnable for PatchedBuild<'a, SF> {
         .run(opts)
         .await?;
 
+        let slot = opts.graph.spec_hash(self.spec).patched_slot();
         Ok(PatchedBuildResult {
             meta: EntryMeta {
                 inner: MetaInner::Spec(build.name.clone()),
@@ -164,7 +168,7 @@ impl<'a, SF: crate::SourceFetcher> Runnable for PatchedBuild<'a, SF> {
                 origin: Some(build.from.as_ref().clone()),
                 ..Default::default()
             },
-            outputs: res.outputs,
+            outputs: res.outputs.retarget(slot),
             build_ms: res.build_ms,
         })
     }
@@ -423,6 +427,116 @@ mod tests {
             assert!(entry.path().join("marker").exists());
             assert!(!entry.path().join("remote.txt").exists());
         }
+    }
+
+    /// A patched build's output finalizes under the spec's patched slot: a
+    /// lookup by the spec hash finds nothing, and the next patched build
+    /// finds it by name.
+    #[tokio::test]
+    async fn a_patched_output_stays_out_of_its_spec_hash_slot() {
+        let tmp = TempDir::new().unwrap();
+        let cache = Cache::at_dir(tmp.path()).unwrap();
+        let dg = graph_from(THREE_DEPS);
+        for dep in ["dep-a", "dep-b", "dep-c"] {
+            fake_build(&cache, &dg, dep, dep);
+        }
+        let bsr = *dg.by_name("top").unwrap();
+        let spec_hash = dg.spec_hash(&bsr);
+        let fetcher = UnusedFetcher;
+        let opts = Options {
+            cache: cache.clone(),
+            graph: &dg,
+            exec_base: "/not-exists".into(),
+            ot: None,
+            daemon_id: None,
+        };
+
+        let res = patched_build(&bsr, &fetcher)
+            .run(&opts)
+            .await
+            .expect("all dependencies are local");
+        assert_eq!(res.outputs.hash(), &spec_hash.patched_slot());
+        assert_ne!(spec_hash.patched_slot(), spec_hash);
+        res.outputs.finalize(res.meta).expect("finalize");
+
+        assert!(
+            matches!(cache.read_dir(&spec_hash), Err(CacheErr::NotFound)),
+            "a lookup by spec hash finds no patched output"
+        );
+        let by_name = cache
+            .unsafe_get_build_by_name("top")
+            .expect("the patched output is found by name");
+        let slot = cache.read_dir(&spec_hash.patched_slot()).expect("slot");
+        assert_eq!(by_name.path(), slot.path());
+        assert!(
+            cache
+                .read_meta(&spec_hash.patched_slot())
+                .expect("meta")
+                .breaker_build
+        );
+    }
+
+    /// A normal build after a patched build of the same spec hash does not
+    /// use the patched output: its slot stays empty until the normal build
+    /// writes it, and the patched output stays where it was.
+    #[tokio::test]
+    async fn a_normal_build_after_a_patched_build_does_not_use_its_output() {
+        let tmp = TempDir::new().unwrap();
+        let cache = Cache::at_dir(tmp.path()).unwrap();
+        let dg = graph_from(THREE_DEPS);
+        for dep in ["dep-a", "dep-b", "dep-c"] {
+            fake_build(&cache, &dg, dep, dep);
+        }
+        let bsr = *dg.by_name("top").unwrap();
+        let spec_hash = dg.spec_hash(&bsr);
+        let fetcher = UnusedFetcher;
+        let opts = Options {
+            cache: cache.clone(),
+            graph: &dg,
+            exec_base: "/not-exists".into(),
+            ot: None,
+            daemon_id: None,
+        };
+        let res = patched_build(&bsr, &fetcher)
+            .run(&opts)
+            .await
+            .expect("all dependencies are local");
+        std::fs::write(res.outputs.path().join("patched"), b"p").unwrap();
+        res.outputs.finalize(res.meta).expect("finalize");
+        assert!(matches!(
+            cache.read_dir(&spec_hash),
+            Err(CacheErr::NotFound)
+        ));
+
+        let normal = crate::SpecBuild {
+            spec: &bsr,
+            override_deps: None,
+            remote_fetcher: &fetcher,
+            stdout_writer: None,
+            stderr_writer: None,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            cpu_weight: None,
+            build_box: None,
+            patched: false,
+        }
+        .run(&opts)
+        .await
+        .expect("a collection builds without a sandbox");
+        normal
+            .outputs
+            .finalize(EntryMeta {
+                inner: MetaInner::Spec("top".to_string()),
+                ..Default::default()
+            })
+            .expect("finalize");
+        let entry = cache
+            .read_dir(&spec_hash)
+            .expect("the normal build's entry");
+        assert!(!entry.path().join("patched").exists());
+        let patched = cache
+            .read_dir(&spec_hash.patched_slot())
+            .expect("the patched entry stays");
+        assert!(patched.path().join("patched").exists());
     }
 
     /// A dependency the remote index lists but whose artifact cannot be
