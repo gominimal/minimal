@@ -552,7 +552,7 @@ ID                                    NAME          TYPE     PARENT             
             identity: BoxIdentity::None,
             live_execs: Vec::new(),
             disk_bytes: None,
-            missing_build_row: None,
+            missing_build_row: false,
         };
         let mut out = Vec::new();
         render_box_show(&mut out, &shown, "local", "local0").unwrap();
@@ -585,7 +585,7 @@ Host:       local0
                 mode: minimald_rpc::exec::ExecMode::Detached,
             }],
             disk_bytes: None,
-            missing_build_row: None,
+            missing_build_row: false,
         };
         let mut out = Vec::new();
         render_box_show(&mut out, &shown, "local", "local0").unwrap();
@@ -789,7 +789,7 @@ ID                                    NAME   TYPE     PARENT  PROJECT         ST
             identity: BoxIdentity::Unknown,
             live_execs: Vec::new(),
             disk_bytes: None,
-            missing_build_row: None,
+            missing_build_row: false,
         };
         let mut out = Vec::new();
         render_box_show(&mut out, &shown, "local-minvmd", "local-minvmd0").unwrap();
@@ -821,7 +821,7 @@ Host:       local-minvmd0
             identity: BoxIdentity::None,
             live_execs: Vec::new(),
             disk_bytes: None,
-            missing_build_row: None,
+            missing_build_row: false,
         };
         let mut out = Vec::new();
         render_box_show(&mut out, &shown, "local", "local0").unwrap();

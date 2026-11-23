@@ -2269,11 +2269,7 @@ fn preview_prune_and_show_disk_round_trip() {
         identity: BoxIdentity::None,
         live_execs: Vec::new(),
         disk_bytes: Some(8192),
-        missing_build_row: Some(MissingBuildRow {
-            network: boxes::NetworkMode::HostNet,
-            egress: None,
-            deny_all_opt_out: true,
-        }),
+        missing_build_row: true,
     };
     assert_eq!(round_trip(&show), show);
     let older: ShowBoxResponse = serde_json_lenient::from_str(&format!(
@@ -2282,7 +2278,7 @@ fn preview_prune_and_show_disk_round_trip() {
     ))
     .unwrap();
     assert_eq!(older.disk_bytes, None);
-    assert_eq!(older.missing_build_row, None);
+    assert!(!older.missing_build_row);
 
     let error = r#"{"error":"no session with ID `x`"}"#;
     assert!(matches!(

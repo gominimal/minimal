@@ -100,13 +100,15 @@ async fn prepare_build_boxes_with(
     }
 }
 
-/// Registers the row of the builds of the box `box_id` on `host`, and files
-/// its table again, when the daemon reports the box has none (NET-169): a
+/// Asks the VM host daemon to register the row of the builds of the box
+/// `box_id` on `host` when the daemon reports the box has none (NET-169): a
 /// host-address box an earlier `min` created, or one whose registration
-/// failed at its start. A box with a row, or one on a host with no VM, asks
-/// nothing. Nothing here stops the command that called it.
+/// failed at its start. The VM host daemon takes the row's rules from those
+/// it holds for the box, and the daemon gets the row's addresses. No table is
+/// filed: the box's builds follow its own rules. A box with a row, or one on
+/// a host with no VM, asks nothing. Nothing here stops the command that
+/// called it.
 pub(crate) async fn register_missing_build_row(
-    global: &GlobalArgs,
     host: &crate::cmd::list::LocalHost,
     box_id: boxes::SessionId,
 ) {
@@ -135,8 +137,7 @@ pub(crate) async fn register_missing_build_row(
         }
     };
     register_missing_build_row_with(
-        global,
-        super::vm_host::control_sock_beside(&host.sock),
+        super::vm_host::control_sock_beside(&host.sock).as_deref(),
         box_id,
         &shown,
         async |request| client.oneshot_rpc::<PrepareBuildBoxes>(request).await,
@@ -148,45 +149,64 @@ pub(crate) async fn register_missing_build_row(
 /// the VM host daemon's and `send` to put the `PrepareBuildBoxes` request to
 /// the daemon. Returns whether the row was registered.
 async fn register_missing_build_row_with(
-    global: &GlobalArgs,
-    control_sock: Option<PathBuf>,
+    control_sock: Option<&Path>,
     box_id: boxes::SessionId,
     shown: &minimald_rpc::ShowBoxResponse,
     send: impl AsyncFnOnce(
         PrepareBuildBoxesRequest,
     ) -> anyhow::Result<Errorable<PrepareBuildBoxesResponse>>,
 ) -> bool {
-    let (Some(missing), Some(project_root), Some(_)) = (
-        &shown.missing_build_row,
-        &shown.record.project_root,
-        &control_sock,
-    ) else {
+    let (true, Some(sock)) = (shown.missing_build_row, control_sock) else {
         return false;
     };
-    let task_addresses = crate::hold_requester_build_row(
-        control_sock.as_deref(),
-        box_id,
-        missing.network,
-        missing.egress.as_ref(),
-        missing.deny_all_opt_out,
-    )
-    .await;
+    let request = BoxControlRequest::RegisterBuildRow(minimald_rpc::RegisterBuildRowRequest {
+        session_id: box_id,
+    });
+    let asked = minimal_client::box_registration::control_request_with_vm_host(sock, request);
+    let task_addresses =
+        match tokio::time::timeout(minimal_client::box_registration::BOX_CONTROL_TIMEOUT, asked)
+            .await
+        {
+            Ok(Ok(BoxControlReply::Registered(registered))) => registered.task_addresses,
+            Ok(Ok(reply)) => {
+                tracing::info!(
+                    ?reply,
+                    "the VM host daemon registered no row for the box's builds"
+                );
+                return false;
+            }
+            Ok(Err(error)) => {
+                tracing::info!(
+                    error = %format!("{error:#}"),
+                    "could not register the row of the box's builds"
+                );
+                return false;
+            }
+            Err(_elapsed) => {
+                tracing::info!(
+                    "the VM host daemon did not answer the registration of the row of the box's \
+                     builds in time"
+                );
+                return false;
+            }
+        };
     if task_addresses.is_empty() {
         return false;
     }
-    tracing::info!(box_id = %box_id, "registered the row of the box's builds again");
-    prepare_build_boxes_with(
-        BuildBoxActivation {
-            global,
-            session_id: box_id,
-            project_dir: project_root.as_utf8_path().as_std_path().to_path_buf(),
-            control_sock,
-            task_addresses,
-            network: missing.network,
-        },
-        send,
-    )
-    .await;
+    tracing::info!(box_id = %box_id, "registered the row of the box's builds");
+    match send(PrepareBuildBoxesRequest {
+        session_id: box_id,
+        task_addresses,
+        table: None,
+    })
+    .await
+    {
+        Ok(Errorable::Ok(_)) => {}
+        Ok(Errorable::Err { error }) => {
+            tracing::info!(%error, "the daemon did not take the addresses of the box's builds");
+        }
+        Err(error) => tracing::info!(error = %format!("{error:#}"), "could not reach the daemon"),
+    }
     true
 }
 
@@ -764,16 +784,10 @@ mod tests {
         assert_eq!(on_vm.table, None, "the VM host daemon has the table");
     }
 
-    /// A read of the box `id` in the project `project`, with `missing` as
-    /// the daemon reports it.
-    fn shown(
-        id: boxes::SessionId,
-        project: &Path,
-        missing: Option<minimald_rpc::MissingBuildRow>,
-    ) -> minimald_rpc::ShowBoxResponse {
+    /// A read of the box `id`, with `missing` as the daemon reports it.
+    fn shown(id: boxes::SessionId, missing: bool) -> minimald_rpc::ShowBoxResponse {
         let mut shown: minimald_rpc::ShowBoxResponse = serde_json_lenient::from_str(&format!(
-            r#"{{"record":{{"box_id":"{id}","state":"running","project_root":{:?}}}}}"#,
-            project.display().to_string()
+            r#"{{"record":{{"box_id":"{id}","state":"running","project_root":"/project"}}}}"#
         ))
         .unwrap();
         shown.missing_build_row = missing;
@@ -781,14 +795,12 @@ mod tests {
     }
 
     /// NET-169: a host-address box that the daemon reports with no row for
-    /// its builds registers one at its next start, and the daemon gets the
-    /// row's addresses with the table filed again. A box with a row, or on a
-    /// host with no VM, registers nothing.
+    /// its builds asks the VM host daemon for one at its next start, naming
+    /// the box and no rule, and files no table. The daemon gets the row's
+    /// addresses and no table. A box with a row, or on a host with no VM,
+    /// asks nothing.
     #[tokio::test]
     async fn a_box_with_no_build_row_registers_one_at_its_start() {
-        let state = tempfile::tempdir().unwrap();
-        let global = global_in(state.path());
-        let project = fixture_project();
         let id = boxes::SessionId::mint();
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("control.sock");
@@ -803,16 +815,6 @@ mod tests {
             }),
         )
         .await;
-        let missing = minimald_rpc::MissingBuildRow {
-            network: boxes::NetworkMode::HostNet,
-            egress: Some(boxes::EgressPolicy {
-                allow_subnets: Some(Vec::new()),
-                allow_dns_hosts: Some(vec!["downloads.example.org".to_string()]),
-                allow_protocols: None,
-                deny_subnets: None,
-            }),
-            deny_all_opt_out: false,
-        };
         let sent = std::sync::Mutex::new(Vec::new());
         let stand_in = || {
             async |request: PrepareBuildBoxesRequest| {
@@ -821,40 +823,54 @@ mod tests {
             }
         };
 
-        let with_row = shown(id, project.path(), None);
-        let missing_row = shown(id, project.path(), Some(missing));
         assert!(
-            !register_missing_build_row_with(
-                &global,
-                Some(sock.clone()),
-                id,
-                &with_row,
-                stand_in()
-            )
-            .await
+            !register_missing_build_row_with(Some(&sock), id, &shown(id, false), stand_in()).await
         );
-        assert!(
-            !register_missing_build_row_with(&global, None, id, &missing_row, stand_in()).await
-        );
+        assert!(!register_missing_build_row_with(None, id, &shown(id, true), stand_in()).await);
         assert!(sent.lock().unwrap().is_empty());
         assert!(seen.lock().unwrap().is_empty());
 
         assert!(
-            register_missing_build_row_with(&global, Some(sock), id, &missing_row, stand_in())
-                .await
+            register_missing_build_row_with(Some(&sock), id, &shown(id, true), stand_in()).await
         );
-        {
-            let seen = seen.lock().unwrap();
-            let [BoxControlRequest::Register(row)] = seen.as_slice() else {
-                panic!("one registration: {seen:?}");
-            };
-            assert_eq!(row.name, minimald_rpc::requester_build_row_name(id));
-        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [BoxControlRequest::RegisterBuildRow(
+                minimald_rpc::RegisterBuildRowRequest { session_id: id }
+            )],
+            "the VM host daemon is asked by box alone, and no table is filed"
+        );
         let sent = sent.lock().unwrap();
         let [request] = sent.as_slice() else {
             panic!("one request: {sent:?}");
         };
         assert_eq!(request.session_id, id);
         assert_eq!(request.task_addresses, addresses);
+        assert_eq!(request.table, None, "the daemon gets no table");
+    }
+
+    /// NET-169: a VM host daemon that holds no rules for the box registers
+    /// no row, and the daemon is told nothing.
+    #[tokio::test]
+    async fn no_build_row_without_the_vm_hosts_rules() {
+        let id = boxes::SessionId::mint();
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        fake_vm_host(
+            &sock,
+            BoxControlReply::Error {
+                error: "no rules".to_string(),
+            },
+        )
+        .await;
+        let sent = std::sync::Mutex::new(Vec::new());
+        let stand_in = async |request: PrepareBuildBoxesRequest| {
+            sent.lock().unwrap().push(request);
+            Ok(Errorable::Ok(PrepareBuildBoxesResponse {}))
+        };
+        assert!(
+            !register_missing_build_row_with(Some(&sock), id, &shown(id, true), stand_in).await
+        );
+        assert!(sent.lock().unwrap().is_empty());
     }
 }

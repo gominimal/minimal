@@ -7462,6 +7462,41 @@ impl BoxRegistry {
         }
     }
 
+    /// The egress the build row of the `host_ip` box `session_id` registers
+    /// with (NET-169): the policy its creator declared when this host
+    /// admitted it, under this host's egress default. `None` when this host
+    /// holds no rules for the box, resident or set aside, or when they admit
+    /// nothing.
+    #[must_use]
+    pub fn host_ip_build_row_egress(&self, session_id: boxes::SessionId) -> Option<EgressPolicy> {
+        let held = self
+            .host_ip_boxes
+            .read()
+            .expect("the resident host_ip boxes' lock is never held across a panic");
+        let rules = held
+            .boxes
+            .get(&session_id)
+            .or_else(|| held.dormant.get(&session_id))?;
+        match boxes::effective_egress(
+            rules.declared.as_ref(),
+            boxes::NetworkMode::HostNet,
+            self.egress_default_phase,
+            self.egress_deny_all_opt_out,
+        ) {
+            boxes::EffectiveEgress::DenyAll => None,
+            boxes::EffectiveEgress::Declared(policy) if policy.admits_nothing() => None,
+            boxes::EffectiveEgress::Declared(policy) => Some(policy),
+            // The box's own rules allow everything. An internet grant is
+            // narrower than that (NET-168), so it is not this row's.
+            boxes::EffectiveEgress::AllowAll => Some(EgressPolicy {
+                allow_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+                allow_dns_hosts: Some(Vec::new()),
+                allow_protocols: None,
+                deny_subnets: None,
+            }),
+        }
+    }
+
     /// Drops the egress [`Self::admit_host_ip_box`] holds for a session:
     /// its box stopped or was destroyed, as `end` says, so its rules admit
     /// nothing from now on. A session the set does not hold is the goal

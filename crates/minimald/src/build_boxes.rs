@@ -480,8 +480,9 @@ impl op::BuildBoxes for BoxBuildBoxes {
 /// The refusal of a network build in the host-address box `box_name` on a
 /// VM-backed host when the box has no build row (NET-169): a box created
 /// before its builds had addresses of their own, or one whose build row was
-/// not registered at its start. `min box attach` registers them for a box
-/// with a terminal, and the box can be running.
+/// not registered at its start. `min box attach` asks the VM host daemon to
+/// register them for a box with a terminal, and the box can be running. The
+/// box then gets no table: its builds follow its own rules.
 fn no_build_row_refusal(box_name: &str) -> String {
     format!(
         "the build needs the network, and box {box_name} has no addresses for its builds. \

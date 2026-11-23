@@ -1387,6 +1387,22 @@ fn serve_request(
             let reply = order.apply(|| rename_box(boxes, &request));
             write_reply(stream, &reply)
         }
+        // NET-169: the build row of a host-address box that has none, from
+        // the rules this host holds for the box.
+        (BoxControlRequest::RegisterBuildRow(request), ControlDoor::Host) => {
+            let reply = match build_row_request(boxes, request.session_id) {
+                Some(register) => {
+                    registration_reply(boxes, answerer, order, register, Some(BuildRow::Requester))
+                }
+                None => BoxControlReply::Error {
+                    error: format!(
+                        "this host holds no rules that admit anything for box {}",
+                        request.session_id
+                    ),
+                },
+            };
+            write_reply(stream, &reply)
+        }
         // NET-165: `min` files a box's table with the host-side creator.
         (BoxControlRequest::FileBuildTable(request), ControlDoor::Host) => {
             if request.no_network {
@@ -1861,6 +1877,28 @@ fn claim_row_box_id(boxes: &BoxRegistry, box_id: minimald_rpc::BoxId, token: Opt
 /// Register a box in its door's apply order and build the reply: the one
 /// registration path the one-shot and the held verb share. `build_row`
 /// names the kind of build row the registration is, when it is one.
+/// The registration of the build row of the `host_ip` box `session_id`
+/// (NET-169), its egress from the rules this host holds for the box
+/// ([`BoxRegistry::host_ip_build_row_egress`]). `None` when it holds none
+/// that admit anything.
+fn build_row_request(
+    boxes: &BoxRegistry,
+    session_id: boxes::SessionId,
+) -> Option<RegisterBoxRequest> {
+    Some(RegisterBoxRequest {
+        name: minimald_rpc::requester_build_row_name(session_id),
+        ingress_ports: Vec::new(),
+        egress: Some(boxes.host_ip_build_row_egress(session_id)?),
+        credentialed_upstream: None,
+        dynamic_ingress: None,
+        dynamic_allowed_range: None,
+        hold: false,
+        task_slots: minimald_rpc::TASK_SLOTS_PER_BOX,
+        host_ip: false,
+        stays_detached: true,
+    })
+}
+
 fn registration_reply(
     boxes: &BoxRegistry,
     answerer: &AnswererStatus,
@@ -2435,6 +2473,7 @@ fn request_verb(request: &BoxControlRequest) -> &'static str {
         BoxControlRequest::OpenBuildGrant(_) => "open_build_grant",
         BoxControlRequest::CloseBuildGrant(_) => "close_build_grant",
         BoxControlRequest::DropBuildTable(_) => "drop_build_table",
+        BoxControlRequest::RegisterBuildRow(_) => "register_build_row",
         BoxControlRequest::Withdraw(_) => "withdraw",
         BoxControlRequest::RenameBox(_) => "rename_box",
         BoxControlRequest::HoldBoxName(_) => "hold_box_name",
@@ -9570,6 +9609,67 @@ mod tests {
         assert!(registry.row_by_name(&opened.grant_row).is_some());
         close(&opened.grant_row);
         assert!(registry.row_by_name(&opened.grant_row).is_none());
+    }
+
+    /// NET-169: the build row of a host-address box that has none is
+    /// registered from the rules this host holds for the box, and the
+    /// request names the box alone. A box this host holds no rules for, or
+    /// whose rules admit nothing, gets no row. The guest door cannot ask.
+    #[test]
+    fn a_build_row_comes_from_the_rules_this_host_holds() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let guest = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        let ask = |session_id| {
+            BoxControlRequest::RegisterBuildRow(minimald_rpc::RegisterBuildRowRequest {
+                session_id,
+            })
+        };
+        let declared = boxes::EgressPolicy {
+            allow_subnets: Some(Vec::new()),
+            allow_dns_hosts: Some(vec!["downloads.example.org".to_string()]),
+            allow_protocols: None,
+            deny_subnets: None,
+        };
+        let held = boxes::SessionId::mint();
+        assert!(registry.admit_host_ip_box(held, Some(&declared)));
+        let closed = boxes::SessionId::mint();
+        assert!(registry.admit_host_ip_box(closed, Some(&boxes::EgressPolicy::deny_all())));
+        assert_eq!(registry.host_ip_build_row_egress(held), Some(declared));
+        assert_eq!(registry.host_ip_build_row_egress(closed), None);
+
+        let unknown = boxes::SessionId::mint();
+        for session_id in [unknown, closed] {
+            let refused = control(&sock_path, &ask(session_id)).expect("the host door answers");
+            assert!(
+                matches!(refused, BoxControlReply::Error { .. }),
+                "{refused:?}"
+            );
+            let name = minimald_rpc::requester_build_row_name(session_id);
+            assert!(registry.row_by_name(&name).is_none());
+        }
+        let refused = control(&guest, &ask(held)).expect("the guest door answers");
+        assert!(
+            matches!(refused, BoxControlReply::Error { .. }),
+            "{refused:?}"
+        );
+        assert!(
+            registry
+                .row_by_name(&minimald_rpc::requester_build_row_name(held))
+                .is_none()
+        );
+
+        let registered = control(&sock_path, &ask(held)).expect("the host door answers");
+        let BoxControlReply::Registered(registered) = registered else {
+            panic!("a registration: {registered:?}");
+        };
+        assert!(!registered.task_addresses.is_empty());
+        assert!(
+            registry
+                .row_by_name(&minimald_rpc::requester_build_row_name(held))
+                .is_some()
+        );
     }
 
     /// NET-165: a box `min` filed on the host's door with the network mode

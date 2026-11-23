@@ -1036,6 +1036,13 @@ pub struct DropBuildTableRequest {
     pub session_id: SessionId,
 }
 
+/// The box whose build row [`BoxControlRequest::RegisterBuildRow`] asks for.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegisterBuildRowRequest {
+    /// The box.
+    pub session_id: SessionId,
+}
+
 /// The name of the row a host-address box's builds attach under (NET-169).
 #[must_use]
 pub fn requester_build_row_name(session_id: SessionId) -> String {
@@ -1952,6 +1959,13 @@ pub enum BoxControlRequest {
     /// The in-VM daemon's signal that a box is gone: its table ends. Answered
     /// with [`BoxControlReply::BuildTable`].
     DropBuildTable(DropBuildTableRequest),
+    /// `min`'s request for the build row of a host-address box that has none
+    /// (NET-169). The VM host daemon registers it from the rules it holds for
+    /// the box, and from nothing the request carries. Served on the host's
+    /// control socket only, answered with [`BoxControlReply::Registered`], or
+    /// [`BoxControlReply::Error`] when it holds no rules for the box or they
+    /// admit nothing.
+    RegisterBuildRow(RegisterBuildRowRequest),
     /// Read one box's row by name — the read-only row verb: the row's
     /// switch address, its derived egress allow-list, and its declared and
     /// runtime-admitted ports, or [`BoxControlReply::NoRow`] when no live
@@ -3448,25 +3462,13 @@ pub struct ShowBoxResponse {
     /// means zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_bytes: Option<u64>,
-    /// What a host-address box with no addresses for its builds registers
-    /// them with (NET-169). Absent for any other box, and from a daemon that
+    /// Whether the box is a host-address box with no addresses for its
+    /// builds (NET-169). It carries no rule: the VM host daemon registers the
+    /// row from the rules it holds for the box
+    /// ([`BoxControlRequest::RegisterBuildRow`]). `false` from a daemon that
     /// predates the field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub missing_build_row: Option<MissingBuildRow>,
-}
-
-/// The settings a host-address box's build row is registered with, for a
-/// box that has none ([`ShowBoxResponse::missing_build_row`]).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MissingBuildRow {
-    /// The box's network mode.
-    pub network: boxes::NetworkMode,
-    /// The box's declared egress.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub egress: Option<boxes::EgressPolicy>,
-    /// Whether the daemon runs with the deny-all opt-out (NET-077).
-    #[serde(default)]
-    pub deny_all_opt_out: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub missing_build_row: bool,
 }
 
 impl OneshotSshRpc for ShowBox {
@@ -4800,7 +4802,7 @@ mod box_listing_tests {
                 mode: crate::exec::ExecMode::Detached,
             }],
             disk_bytes: Some(4096),
-            missing_build_row: None,
+            missing_build_row: false,
         };
         let bytes = serde_json_lenient::to_vec(&Errorable::Ok(show.clone())).unwrap();
         match serde_json_lenient::from_slice::<Errorable<ShowBoxResponse>>(&bytes).unwrap() {

@@ -902,7 +902,7 @@ pub async fn cmd_box_restart(
     let mut out = std::io::stdout().lock();
     let restarted = restart_box_on_hosts(hosts, &mut out, &args.target).await?;
     // NET-169: a box with no row for its builds gets one here.
-    register_missing_build_row(global, &restarted.host, restarted.box_id).await;
+    register_missing_build_row(&restarted.host, restarted.box_id).await;
     Ok(())
 }
 

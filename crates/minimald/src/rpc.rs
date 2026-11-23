@@ -1191,7 +1191,8 @@ async fn serve_answerer_control(
                 | BoxControlRequest::FileBuildTable(_)
                 | BoxControlRequest::OpenBuildGrant(_)
                 | BoxControlRequest::CloseBuildGrant(_)
-                | BoxControlRequest::DropBuildTable(_) => BoxControlReply::Error {
+                | BoxControlRequest::DropBuildTable(_)
+                | BoxControlRequest::RegisterBuildRow(_) => BoxControlReply::Error {
                     error: "the native daemon's control socket answers only the answerer \
                             verbs; boxes register over the daemon's RPC channels"
                         .to_string(),
@@ -1860,12 +1861,7 @@ async fn serve_show_box(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), C
         .handle_channel(c, async |req: minimald_rpc::ShowBoxRequest| {
             let mngr = s.sessions_manager().await;
             Ok(match mngr.show_box(req.id).await {
-                Ok(Some(mut reply)) => {
-                    if let Some(missing) = &mut reply.missing_build_row {
-                        missing.deny_all_opt_out = s.deny_all_opt_out().await;
-                    }
-                    Errorable::Ok(reply)
-                }
+                Ok(Some(reply)) => Errorable::Ok(reply),
                 Ok(None) => Errorable::Err {
                     error: format!(
                         "{} `{}`",
