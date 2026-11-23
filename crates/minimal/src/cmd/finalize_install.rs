@@ -3192,9 +3192,7 @@ mod tests {
         let step = item.step.as_deref().unwrap();
         if cfg!(target_os = "macos") {
             assert!(
-                step.contains(
-                    "on 127.0.0.1:7656, installs that service, and reserves the box IPs"
-                ),
+                step.contains("on 127.0.0.1:7656, installs that service, and reserves the box IPs"),
                 "{step}"
             );
         } else {
