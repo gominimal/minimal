@@ -1776,12 +1776,8 @@ pub(crate) async fn run_entry(
     let interrupt_guard = crate::arm_activation_interrupt(global, id);
 
     let headless = global.no_input || !crate::can_prompt_interactively();
-    let decision = crate::decide_workspace_upload(
-        &upload_root,
-        false,
-        headless,
-        std::env::home_dir().as_deref(),
-    );
+    let decision =
+        crate::decide_workspace_upload(&upload_root, headless, std::env::home_dir().as_deref());
     // `min task run` has no `--sync` flags, so it warns rather than refuses:
     // an undeclared root starts empty, and a `$HOME` skip names the lifecycle
     // hooks it drops. The box still starts, as it did before the shared gate.
@@ -1883,6 +1879,33 @@ pub(crate) async fn run_entry(
         }
     }
     let _ = initial_policy;
+
+    // NET-165: the task box's table goes to the host side before it runs, as
+    // an activation's does.
+    let control_sock = crate::vm_host_control_sock(
+        crate::daemon_host_kind(global),
+        global.minimal_dir.as_deref(),
+    );
+    let task_addresses = crate::hold_requester_build_row(
+        control_sock.as_deref(),
+        id,
+        request.config.network,
+        request.config.policy.egress.as_ref(),
+        created.deny_all_opt_out == Some(true),
+    )
+    .await;
+    crate::prepare_build_boxes(
+        &mut client,
+        crate::BuildBoxActivation {
+            global,
+            session_id: id,
+            project_dir: abs_path.as_utf8_path().as_std_path().to_path_buf(),
+            control_sock,
+            task_addresses,
+            network: request.config.network,
+        },
+    )
+    .await;
 
     minimal_client::dedup_patch_uploads(&mut collected_patches);
     if let Err(e) = crate::upload_and_finalize(

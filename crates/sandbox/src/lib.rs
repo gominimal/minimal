@@ -303,9 +303,13 @@ impl<C: Channel> Sandbox<C> {
         // into lib64/. Create a usr/lib64 → lib symlink in the rootfs so
         // configure scripts detect it and use usr/lib/ instead. Also create
         // the same symlink in the output directory so DESTDIR installs that
-        // still target lib64/ land in lib/ transparently.
+        // still target lib64/ land in lib/ transparently. A sandbox with no
+        // `usr/` of its own, such as a build box's fetch process, has nothing
+        // to link.
         let usr_lib64 = rootfs.join("usr").join("lib64");
-        if !fs::exists(&usr_lib64).unwrap_or(true) {
+        if fs::exists(rootfs.join("usr")).unwrap_or(false)
+            && !fs::exists(&usr_lib64).unwrap_or(true)
+        {
             std::os::unix::fs::symlink("lib", &usr_lib64)
                 .map_err(|e| Error::IO("create usr/lib64 symlink", usr_lib64, e))?;
         }
@@ -2065,6 +2069,13 @@ struct BindOpts {
 /// the run.
 pub type StdinSlot = Box<dyn FnOnce(fs::File) -> std::io::Result<()> + Send>;
 
+/// Called with the pid of each invocation's container once it is spawned,
+/// before the run waits on it. The value it returns is held while the
+/// container runs, and dropped as soon as the container is reaped, before
+/// its network is torn down: a reaped pid can name another process. An error kills
+/// and reaps the container and fails the run, so no later invocation starts.
+pub type SpawnHook = Box<dyn FnMut(u32) -> std::io::Result<Box<dyn std::any::Any + Send>> + Send>;
+
 /// How [`Sandbox::run_with_cancel`] runs its invocations.
 #[derive(Default)]
 pub struct RunOptions {
@@ -2075,6 +2086,8 @@ pub struct RunOptions {
     pub current_dir: Option<String>,
     /// Gives the first invocation a stdin pipe, and receives it.
     pub stdin: Option<StdinSlot>,
+    /// Told the pid of each invocation's container ([`SpawnHook`]).
+    pub on_spawn: Option<SpawnHook>,
 }
 
 impl From<tokio_util::sync::CancellationToken> for RunOptions {
@@ -2092,6 +2105,7 @@ impl std::fmt::Debug for RunOptions {
             .field("cancel", &self.cancel)
             .field("current_dir", &self.current_dir)
             .field("stdin", &self.stdin.is_some())
+            .field("on_spawn", &self.on_spawn.is_some())
             .finish()
     }
 }
@@ -2448,13 +2462,60 @@ impl<C: Channel> Sandbox<C> {
             // replaces them.
         }
 
-        if self.needs_bin_symlink()? {
+        // Read-only host paths: a build box's fetch process runs the daemon's
+        // own program, so it needs that program's libraries and the trust
+        // roots (NET-155). A path that a bind fills is no symlink's to fill.
+        let bound_host_path = |path: &str| {
+            self.config
+                .read_only_host_paths
+                .iter()
+                .any(|bound| bound == Path::new(path) && bound.exists())
+        };
+        for path in &self.config.read_only_host_paths {
+            if !path.exists() {
+                continue;
+            }
+            let in_rootfs = self.rootfs().join(path.strip_prefix("/").unwrap_or(path));
+            if path.parent().is_some_and(|parent| parent != Path::new("/")) {
+                std::fs::create_dir_all(&in_rootfs).map_err(|e| {
+                    Error::IO("creating a read-only bind's target", in_rootfs.clone(), e)
+                })?;
+            }
+            let target = path.to_str().ok_or_else(|| {
+                Error::Execution(ExecutionError::MountError {
+                    msg: "Unable to convert path to unicode string",
+                    path: path.clone(),
+                })
+            })?;
+            Self::bind_mount(
+                path,
+                target,
+                BindOpts {
+                    recursive: true,
+                    read_only: true,
+                },
+                &mut container,
+            )?;
+        }
+        for (host, target) in &self.config.read_only_files {
+            Self::bind_mount(
+                host,
+                target,
+                BindOpts {
+                    recursive: false,
+                    read_only: true,
+                },
+                &mut container,
+            )?;
+        }
+
+        if self.needs_bin_symlink()? && !bound_host_path("/bin") {
             container.symlink("/usr/bin", "/bin");
         }
-        if self.needs_lib64_symlink()? {
+        if self.needs_lib64_symlink()? && !bound_host_path("/lib64") {
             container.symlink("/usr/lib", "/lib64");
         }
-        if self.needs_lib_symlink()? {
+        if self.needs_lib_symlink()? && !bound_host_path("/lib") {
             container.symlink("/usr/lib", "/lib");
         }
 
@@ -2721,6 +2782,7 @@ impl<C: Channel> Sandbox<C> {
             cancel,
             current_dir,
             mut stdin,
+            mut on_spawn,
         } = options.into();
         for (i, exec) in invocations.iter().enumerate() {
             if cancel.is_cancelled() {
@@ -2741,9 +2803,38 @@ impl<C: Channel> Sandbox<C> {
             let mut child = forker::on_fork_thread(move || cmd.spawn())
                 .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
 
+            // Held while the process can be signalled, and dropped the moment
+            // it is reaped, before anything awaits: once reaped, its PID can
+            // belong to another process.
+            let mut spawned = match on_spawn.as_mut().map(|hook| hook(child.id())) {
+                None => None,
+                Some(Ok(held)) => Some(held),
+                Some(Err(e)) => {
+                    // No attach adopts the tap descriptor now, and a
+                    // `hakoniwa::Child` never closes it: adopt it here so
+                    // it closes with this.
+                    drop(network::Spawned::from_child(&mut child));
+                    // The process may have exited already: the reap below
+                    // runs whatever the kill answers.
+                    if let Err(error) = child.kill() {
+                        tracing::debug!(%error, "killing a refused process");
+                    }
+                    if let Err(error) = child.wait() {
+                        tracing::debug!(%error, "reaping a refused process");
+                    }
+                    return Err(Error::Execution(ExecutionError::SpawnRefused(e)));
+                }
+            };
+
             // Step 3: wire this invocation's netns. Torn down explicitly once
             // the invocation completes (both arms).
-            let net_guard = match planned.attach_child(&mut child).await {
+            // A process that ended before its attach failed was reaped by
+            // that check: what the hook returned goes before the release
+            // awaits.
+            let net_guard = match planned
+                .attach_child(&mut child, || drop(spawned.take()))
+                .await
+            {
                 Ok(guard) => guard,
                 Err(e) => {
                     // Attach failed after spawn: kill+reap the child so it
@@ -2766,6 +2857,7 @@ impl<C: Channel> Sandbox<C> {
                 if let Err(e) = started {
                     let _ = child.kill();
                     let _ = child.wait();
+                    drop(spawned.take());
                     if let Some(net_guard) = net_guard {
                         net_guard.teardown().await;
                     }
@@ -2905,6 +2997,7 @@ impl<C: Channel> Sandbox<C> {
 
                     // Reap the child process, then tear down its network.
                     let _ = child.wait();
+                    drop(spawned.take());
                     if let Some(net_guard) = net_guard {
                         net_guard.teardown().await;
                     }
@@ -2916,6 +3009,9 @@ impl<C: Channel> Sandbox<C> {
                     // error, non-zero exit) funnels through one point; then tear
                     // the network down unconditionally *before* propagating, so a
                     // switch attachment is never leaked on an error return.
+                    // Whether the closure reaped the child. An early error
+                    // return leaves it unreaped, and it may still run.
+                    let mut reaped = false;
                     let outcome: Result<(), Error> = (|| {
                         let (stdout_file, stdout_tail) = stdout_thread
                             .join()
@@ -2935,6 +3031,7 @@ impl<C: Channel> Sandbox<C> {
                         let status = child
                             .wait()
                             .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
+                        reaped = true;
 
                         if !status.success() {
                             let stderr_str = String::from_utf8_lossy(&stderr_tail).into_owned();
@@ -2949,6 +3046,18 @@ impl<C: Channel> Sandbox<C> {
                         }
                         Ok(())
                     })();
+                    // What the spawn hook returned is held while the process
+                    // can be signalled. On an error before the reap, end the
+                    // process and reap it first, then release it.
+                    if !reaped {
+                        if let Err(error) = child.kill() {
+                            tracing::debug!(%error, "killing an invocation after an output error");
+                        }
+                        if let Err(error) = child.wait() {
+                            tracing::debug!(%error, "reaping an invocation after an output error");
+                        }
+                    }
+                    drop(spawned.take());
 
                     // The invocation's process has exited; tear down its network
                     // before propagating any error.
@@ -3564,6 +3673,10 @@ impl PlannedLaunch {
     /// stands for that outcome. The plan's release has run by then, because
     /// a next step's plan can replace what the release gives back.
     ///
+    /// The check that the process ended reaps it, and `on_reaped` runs then,
+    /// before the release awaits: once reaped, its pid can belong to another
+    /// process.
+    ///
     /// # Errors
     ///
     /// Propagates the provider's attach failure while the process still runs.
@@ -3571,10 +3684,17 @@ impl PlannedLaunch {
     pub async fn attach_child(
         self,
         child: &mut hakoniwa::Child,
+        on_reaped: impl FnOnce(),
     ) -> Result<Option<Box<dyn NetGuard>>, Error> {
         let spawned = network::Spawned::from_child(child);
-        self.attach_unless_ended(spawned, || matches!(child.try_wait(), Ok(Some(_))))
-            .await
+        self.attach_unless_ended(spawned, || {
+            let ended = matches!(child.try_wait(), Ok(Some(_)));
+            if ended {
+                on_reaped();
+            }
+            ended
+        })
+        .await
     }
 
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -3618,201 +3738,6 @@ impl Drop for PlannedLaunch {
             handle.spawn(async move { network.abandon().await });
         }
     }
-}
-
-/// A network namespace on a [`Network`](network::Network), held open with no
-/// program in it. A process of this daemon can create sockets in the
-/// namespace, so they leave on that network and under its rules. Dropping it
-/// ends the namespace and releases the network.
-pub struct HeldNetwork {
-    pid: u32,
-    nameservers: Vec<std::net::Ipv4Addr>,
-    #[cfg(target_os = "linux")]
-    _held: std::sync::Mutex<Held>,
-}
-
-impl std::fmt::Debug for HeldNetwork {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HeldNetwork")
-            .field("pid", &self.pid)
-            .field("nameservers", &self.nameservers)
-            .finish_non_exhaustive()
-    }
-}
-
-impl HeldNetwork {
-    /// The process whose `/proc/<pid>/ns` holds the namespace.
-    #[must_use]
-    pub fn pid(&self) -> u32 {
-        self.pid
-    }
-
-    /// The name servers the network's plan names, which answer inside the
-    /// namespace.
-    #[must_use]
-    pub fn nameservers(&self) -> &[std::net::Ipv4Addr] {
-        &self.nameservers
-    }
-}
-
-/// What keeps a [`HeldNetwork`] up. The sandbox's process waits at the start
-/// gate and never runs a program, so its rootfs holds nothing to run.
-#[cfg(target_os = "linux")]
-struct Held {
-    child: hakoniwa::Child,
-    guard: Option<Box<dyn NetGuard>>,
-    _gate: StartGate,
-    _sandbox: Sandbox<()>,
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for Held {
-    fn drop(&mut self) {
-        // Killed before the gate goes, so no program ever starts.
-        end_held(&mut self.child);
-        // `Drop` cannot `await`; with no runtime there is nothing to release to.
-        if let (Some(guard), Ok(handle)) =
-            (self.guard.take(), tokio::runtime::Handle::try_current())
-        {
-            handle.spawn(guard.teardown());
-        }
-    }
-}
-
-/// Ends a held process and reaps it. A process that already exited refuses
-/// the kill, and the wait still reaps it.
-#[cfg(target_os = "linux")]
-fn end_held(child: &mut hakoniwa::Child) {
-    if let Err(e) = child.kill() {
-        tracing::debug!(error = %e, "a held process refused the kill");
-    }
-    if let Err(e) = child.wait() {
-        tracing::warn!(error = %e, "could not reap a held process");
-    }
-}
-
-/// The error for a held process that ended before its network was attached.
-#[cfg(target_os = "linux")]
-fn held_process_ended(status: &hakoniwa::ExitStatus) -> Error {
-    Error::Execution(ExecutionError::InvocationFailed {
-        idx: 0,
-        code: status.code,
-        reason: format!(
-            "the held network's process ended before its attach: {}",
-            status.reason
-        ),
-        stderr: String::new(),
-        stdout: String::new(),
-    })
-}
-
-/// The sandbox a [`HeldNetwork`] runs in. Its rootfs is the bare `usr/` that
-/// [`Sandbox::new`] links `usr/lib64` in.
-#[cfg(target_os = "linux")]
-async fn held_sandbox(
-    base_dir: &Path,
-    network: std::sync::Arc<dyn network::Network>,
-) -> Result<Sandbox<()>, Error> {
-    let rootfs = tempfile::tempdir()
-        .map_err(|e| Error::IO("create held rootfs", base_dir.to_path_buf(), e))?;
-    let usr = rootfs.path().join("usr");
-    fs::create_dir(&usr).map_err(|e| Error::IO("create held rootfs usr", usr, e))?;
-    Config::new("held-network")
-        .with_add_rootfs(config::SandboxMapped::TempDir(rootfs))
-        .with_network(network)
-        .build(base_dir, ())
-        .await
-}
-
-/// Starts a sandbox under `base_dir` that holds `network` up with no program
-/// in it.
-///
-/// # Errors
-///
-/// Propagates a failure to plan, spawn or attach. Nothing stays held.
-#[cfg(target_os = "linux")]
-pub async fn hold_network(
-    base_dir: &Path,
-    network: std::sync::Arc<dyn network::Network>,
-) -> Result<HeldNetwork, Error> {
-    let mut sandbox = held_sandbox(base_dir, network).await?;
-    let planned = sandbox.plan_launch().await?;
-    let nameservers = match planned.plan().resolver() {
-        network::Resolver::Nameservers(nameservers) => nameservers.clone(),
-        _ => Vec::new(),
-    };
-    let mut container = sandbox.new_container(planned.plan())?;
-    let gate = sandbox.hold_start(&mut container)?;
-    let mut cmd = sandbox.command(&container, "/held-network", [""; 0], [("", ""); 0])?;
-    // A held process reads and writes nothing, so its stdio is /dev/null. It
-    // must not take the daemon's terminal: hakoniwa binds a terminal stdout
-    // as the box's console, and a daemon whose stdout is a microVM guest's
-    // console has none it can bind there.
-    let null = || {
-        std::fs::File::options()
-            .read(true)
-            .write(true)
-            .open("/dev/null")
-            .map(hakoniwa::Stdio::from)
-            .map_err(|e| Error::IO("open the held network's stdio", "/dev/null".into(), e))
-    };
-    cmd.stdin(null()?);
-    cmd.stdout(null()?);
-    cmd.stderr(null()?);
-    let mut child = forker::on_fork_thread(move || cmd.spawn())
-        .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
-    let pid = child.id();
-    let spawned = network::Spawned::from_child(&mut child);
-    // A held process waits at its start gate, so one that has ended failed
-    // its own setup. Its exit status says why, and neither the attach's
-    // error nor a later read of its namespace carries that.
-    let guard = match planned.attach(spawned).await {
-        Ok(guard) => {
-            // An attach that touches no namespace succeeds over an ended
-            // process too.
-            if let Ok(Some(status)) = child.try_wait() {
-                end_held(&mut child);
-                return Err(held_process_ended(&status));
-            }
-            guard
-        }
-        Err(e) => {
-            let ended = child.try_wait().ok().flatten();
-            end_held(&mut child);
-            return Err(match ended {
-                Some(status) => held_process_ended(&status),
-                None => e,
-            });
-        }
-    };
-    Ok(HeldNetwork {
-        pid,
-        nameservers,
-        _held: std::sync::Mutex::new(Held {
-            child,
-            guard: Some(guard),
-            _gate: gate,
-            _sandbox: sandbox,
-        }),
-    })
-}
-
-/// Sandboxes run only on Linux, so no network is held anywhere else.
-///
-/// # Errors
-///
-/// Always.
-#[cfg(not(target_os = "linux"))]
-#[allow(clippy::unused_async)]
-pub async fn hold_network(
-    base_dir: &Path,
-    _network: std::sync::Arc<dyn network::Network>,
-) -> Result<HeldNetwork, Error> {
-    Err(Error::IO(
-        "holding a network",
-        base_dir.to_path_buf(),
-        std::io::Error::from(std::io::ErrorKind::Unsupported),
-    ))
 }
 
 /// The network plan a sandbox's built-in configuration implies. See
@@ -5576,6 +5501,358 @@ int main(int argc, char **argv) {
             "a run without a dir keeps the sandbox's own: {}",
             String::from_utf8_lossy(&out),
         );
+
+        // The spawn hook is told each invocation's container, and what it
+        // returns is dropped once that invocation is done.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(u32, bool)>::new()));
+        let (hook_seen, dropped) = (seen.clone(), std::sync::Arc::new(()));
+        let held = dropped.clone();
+        let options = RunOptions {
+            on_spawn: Some(Box::new(move |pid| {
+                // A second strong count while the previous one is held.
+                let overlapping = std::sync::Arc::strong_count(&held) > 2;
+                hook_seen.lock().unwrap().push((pid, overlapping));
+                Ok(Box::new(held.clone()) as Box<dyn std::any::Any + Send>)
+            })),
+            ..RunOptions::default()
+        };
+        sandbox
+            .run_with_cancel(
+                vec![invocation("none"), invocation("none")],
+                None::<Vec<u8>>,
+                None::<Vec<u8>>,
+                options,
+            )
+            .await
+            .expect("the run passes");
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "the hook sees both invocations: {seen:?}");
+        assert!(seen.iter().all(|(pid, _)| *pid > 0));
+        assert!(
+            seen.iter().all(|(_, overlapping)| !overlapping),
+            "each invocation's held value is dropped before the next starts: {seen:?}"
+        );
+        assert_eq!(
+            std::sync::Arc::strong_count(&dropped),
+            1,
+            "nothing the hook returned outlives the run"
+        );
+
+        // A hook that refuses ends the run: the refused container is killed
+        // and no later invocation starts.
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = calls.clone();
+        let options = RunOptions {
+            on_spawn: Some(Box::new(move |_pid| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(std::io::Error::other("refused"))
+            })),
+            ..RunOptions::default()
+        };
+        let mut out = Vec::new();
+        let refused = sandbox
+            .run_with_cancel(
+                vec![invocation("none"), invocation("none")],
+                Some(&mut out),
+                None::<Vec<u8>>,
+                options,
+            )
+            .await;
+        assert!(refused.is_err(), "a refused spawn fails the run");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no invocation starts after the refused one"
+        );
+    }
+
+    /// A network whose teardown notes whether the spawn hook's value for that
+    /// invocation was already dropped: `live` counts the values held.
+    #[cfg(target_os = "linux")]
+    #[derive(Debug)]
+    struct TeardownProbe {
+        live: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
+    }
+
+    /// What the probe's spawn hook returns: counted in `live` while held.
+    #[cfg(target_os = "linux")]
+    struct LiveRecord(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for LiveRecord {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl network::Network for TeardownProbe {
+        fn plan(&self) -> network::PlanFuture<'_> {
+            Box::pin(std::future::ready(Ok(network::NetPlan::isolated())))
+        }
+        fn attach(&self, spawned: network::Spawned) -> network::AttachFuture<'_> {
+            drop(spawned);
+            struct Guard {
+                live: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+                seen: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
+            }
+            impl network::NetGuard for Guard {
+                fn teardown(
+                    self: Box<Self>,
+                ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+                {
+                    let released = self.live.load(std::sync::atomic::Ordering::SeqCst) == 0;
+                    self.seen.lock().unwrap().push(released);
+                    Box::pin(std::future::ready(()))
+                }
+            }
+            Box::pin(std::future::ready(Ok(Box::new(Guard {
+                live: self.live.clone(),
+                seen: self.seen.clone(),
+            })
+                as Box<dyn network::NetGuard>)))
+        }
+    }
+
+    /// Once an invocation's container is reaped its pid is free for another
+    /// process, so the run drops what the spawn hook returned before the
+    /// network teardown awaits. A stop that reads the record then never
+    /// signals a reaped pid.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reaped_invocation_leaves_no_record_before_its_teardown() {
+        if let Some(reason) = user_namespaces_restriction() {
+            eprintln!(
+                "skipping a_reaped_invocation_leaves_no_record_before_its_teardown: this host \
+                 denies the unprivileged user namespace every sandbox starts by unsharing: \
+                 {reason}"
+            );
+            return;
+        }
+        let Some(base_dir) = sandbox_base_dir() else {
+            eprintln!("no directory on this host can hold a sandbox — skipping");
+            return;
+        };
+        let base = tempfile::tempdir_in(&base_dir).unwrap();
+        let src = base.path().join("probe.c");
+        fs::write(&src, CWD_PROBE_C).unwrap();
+        let rootfs = base.path().join("rootfs-src");
+        let usr_bin = rootfs.join("usr").join("bin");
+        fs::create_dir_all(&usr_bin).unwrap();
+        fs::create_dir_all(rootfs.join("usr").join("lib")).unwrap();
+        fs::create_dir_all(rootfs.join("etc")).unwrap();
+        match std::process::Command::new("gcc")
+            .args(["-static", "-o"])
+            .arg(usr_bin.join("probe"))
+            .arg(&src)
+            .status()
+        {
+            Ok(status) => assert!(status.success(), "gcc failed: {status:?}"),
+            Err(e) => {
+                eprintln!("no gcc to build the probe with — skipping: {e}");
+                return;
+            }
+        }
+
+        let live = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let probe = TeardownProbe {
+            live: live.clone(),
+            seen: seen.clone(),
+        };
+        let mut sandbox = Config::new("reap-probe")
+            .with_rootfs(std::iter::once(SandboxMapped::Dir(rootfs)))
+            .with_dns(false)
+            .with_network(std::sync::Arc::new(probe))
+            .build(base.path().join("sandbox"), ())
+            .await
+            .expect("building the sandbox");
+
+        let hook_live = live.clone();
+        let options = RunOptions {
+            on_spawn: Some(Box::new(move |_pid| {
+                hook_live.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Box::new(LiveRecord(hook_live.clone())) as Box<dyn std::any::Any + Send>)
+            })),
+            ..RunOptions::default()
+        };
+        let invocation = Invocation {
+            executable: "/usr/bin/probe".to_string(),
+            args: vec!["none".to_string()],
+            envs: Default::default(),
+        };
+        sandbox
+            .run_with_cancel(
+                vec![invocation.clone(), invocation],
+                None::<Vec<u8>>,
+                None::<Vec<u8>>,
+                options,
+            )
+            .await
+            .expect("the run passes");
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![true, true],
+            "each invocation's record is gone before its network teardown"
+        );
+    }
+
+    /// A program that writes one line, closes its stdout and stderr, and
+    /// then waits for a release that never comes: only a signal ends it.
+    #[cfg(target_os = "linux")]
+    const WRITE_CLOSE_LINGER_C: &str = r#"
+#include <stdio.h>
+#include <unistd.h>
+int main(void) {
+    printf("one line\n");
+    fflush(stdout);
+    close(1);
+    close(2);
+    for (;;) pause();
+    return 0;
+}
+"#;
+
+    /// A writer whose every write fails.
+    #[cfg(target_os = "linux")]
+    struct FailingWriter;
+
+    #[cfg(target_os = "linux")]
+    impl tokio::io::AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::other("the caller's writer failed")))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// What the spawn hook returns in the output-error test: when dropped,
+    /// it notes whether the invocation's process still existed.
+    #[cfg(target_os = "linux")]
+    struct PidRecord {
+        pid: u32,
+        alive_at_drop: std::sync::Arc<std::sync::Mutex<Option<bool>>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for PidRecord {
+        fn drop(&mut self) {
+            let alive = Path::new(&format!("/proc/{}", self.pid)).exists();
+            *self.alive_at_drop.lock().unwrap() = Some(alive);
+        }
+    }
+
+    /// A run whose output writer fails ends the invocation's process and
+    /// reaps it before it drops what the spawn hook returned, then returns
+    /// the writer's error. The hook's value is held while the process can be
+    /// signalled, and a process that closed its output can still run.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_output_error_reaps_the_invocation_before_it_drops_the_hook_value() {
+        if let Some(reason) = user_namespaces_restriction() {
+            eprintln!(
+                "skipping an_output_error_reaps_the_invocation_before_it_drops_the_hook_value: \
+                 this host denies the unprivileged user namespace every sandbox starts by \
+                 unsharing: {reason}"
+            );
+            return;
+        }
+        let Some(base_dir) = sandbox_base_dir() else {
+            eprintln!("no directory on this host can hold a sandbox — skipping");
+            return;
+        };
+        let base = tempfile::tempdir_in(&base_dir).unwrap();
+        let src = base.path().join("linger.c");
+        fs::write(&src, WRITE_CLOSE_LINGER_C).unwrap();
+        let rootfs = base.path().join("rootfs-src");
+        let usr_bin = rootfs.join("usr").join("bin");
+        fs::create_dir_all(&usr_bin).unwrap();
+        fs::create_dir_all(rootfs.join("usr").join("lib")).unwrap();
+        fs::create_dir_all(rootfs.join("etc")).unwrap();
+        match std::process::Command::new("gcc")
+            .args(["-static", "-o"])
+            .arg(usr_bin.join("linger"))
+            .arg(&src)
+            .status()
+        {
+            Ok(status) => assert!(status.success(), "gcc failed: {status:?}"),
+            Err(e) => {
+                eprintln!("no gcc to build the probe with — skipping: {e}");
+                return;
+            }
+        }
+        let mut sandbox = Config::new("output-error")
+            .with_rootfs(std::iter::once(SandboxMapped::Dir(rootfs)))
+            .with_dns(false)
+            .build(base.path().join("sandbox"), ())
+            .await
+            .expect("building the sandbox");
+
+        let alive_at_drop = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let noted = alive_at_drop.clone();
+        let spawned_pid = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let hook_pid = spawned_pid.clone();
+        let options = RunOptions {
+            on_spawn: Some(Box::new(move |pid| {
+                *hook_pid.lock().unwrap() = Some(pid);
+                Ok(Box::new(PidRecord {
+                    pid,
+                    alive_at_drop: noted.clone(),
+                }) as Box<dyn std::any::Any + Send>)
+            })),
+            ..RunOptions::default()
+        };
+        // The program never exits on its own, so the run returns only if its
+        // cleanup ends it. The watchdog fails a stalled run instead of
+        // hanging: the dropped run never reaped the program, so its pid is
+        // still the program's, and the watchdog kills it.
+        let run = sandbox.run_with_cancel(
+            vec![Invocation {
+                executable: "/usr/bin/linger".to_string(),
+                args: Vec::new(),
+                envs: Default::default(),
+            }],
+            Some(FailingWriter),
+            None::<Vec<u8>>,
+            options,
+        );
+        let Ok(result) = tokio::time::timeout(std::time::Duration::from_secs(60), run).await else {
+            if let Some(pid) = *spawned_pid.lock().unwrap() {
+                // SAFETY: `kill` reads no memory of ours; the program was
+                // never reaped, so its pid is still its own.
+                unsafe {
+                    libc::kill(i32::try_from(pid).unwrap(), libc::SIGKILL);
+                }
+            }
+            panic!("the run did not end the program after its writer failed");
+        };
+        assert!(
+            matches!(result, Err(Error::IO("writing to stdout writer", _, _))),
+            "the run returns the writer's error: {result:?}"
+        );
+        assert_eq!(
+            *alive_at_drop.lock().unwrap(),
+            Some(false),
+            "the hook's value is dropped only once the process is gone"
+        );
     }
 
     /// Creates a tempdir with the `synth/usr/` structure required by
@@ -5587,6 +5864,19 @@ int main(int argc, char **argv) {
         let base = tmp.path().to_path_buf();
         fs::create_dir_all(base.join("synth").join("usr")).unwrap();
         (tmp, base)
+    }
+
+    /// NET-155: a sandbox with no rootfs of its own, as a build box's fetch
+    /// process has, starts: it has no `usr/` to link inside.
+    #[test]
+    fn sandbox_new_takes_a_rootfs_with_no_usr() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        fs::create_dir_all(base.join("synth")).unwrap();
+        let config = Config::new("test-no-usr").with_isolated_wd(std::iter::empty());
+        let sandbox = Sandbox::new(base.clone(), config, ());
+        assert!(sandbox.is_ok(), "{:?}", sandbox.err());
+        assert!(!base.join("rootfs").join("usr").exists());
     }
 
     /// `Sandbox::new` must reject a `SandboxMapped::File` entry in `config.rootfs`
@@ -7757,48 +8047,6 @@ int main(int argc, char **argv) {
         assert!(
             home.join("o").is_dir() && !outside.join("o").exists(),
             "the outside mapping's mount point was made in the home, beneath it"
-        );
-    }
-
-    /// A held network builds with no package in its rootfs, holds a namespace
-    /// of its own while it lives, and takes its process with it when dropped.
-    /// Building needs no user namespace, so that part holds on every host.
-    #[cfg(target_os = "linux")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_held_network_holds_its_namespace_until_dropped() {
-        let name = "held-network";
-        let base_dir = box_base_dir(name);
-        let home = tempfile::tempdir_in(&base_dir)
-            .unwrap_or_else(|e| panic!("a temp dir under {}: {e}", base_dir.display()));
-        let rec = std::sync::Arc::new(Recorder::default());
-        held_sandbox(home.path(), rec.clone())
-            .await
-            .expect("building the held sandbox");
-
-        if let Some(reason) = user_namespaces_restriction() {
-            eprintln!(
-                "skipping the rest of a_held_network_holds_its_namespace_until_dropped: \
-                 this host denies the unprivileged user namespace every \
-                 sandbox starts by unsharing: {reason}"
-            );
-            return;
-        }
-
-        let held = hold_network(home.path(), rec.clone())
-            .await
-            .expect("holding the network");
-        let proc_dir = PathBuf::from(format!("/proc/{}", held.pid()));
-        assert_ne!(
-            fs::read_link(proc_dir.join("ns/net")).expect("reading the held namespace"),
-            fs::read_link("/proc/self/ns/net").expect("reading this process's namespace"),
-            "the held process shares this process's network namespace"
-        );
-
-        drop(held);
-        assert!(
-            !proc_dir.exists(),
-            "the held process outlived its handle: {}",
-            proc_dir.display()
         );
     }
 

@@ -1300,6 +1300,7 @@ mod tests {
                 hold: false,
                 task_slots: 0,
                 host_ip: false,
+                stays_detached: false,
             },
         )
         .await
@@ -3400,7 +3401,7 @@ mod tests {
             name: Some("gate-web".to_string()),
             path: Some(project.path().to_str().unwrap().to_string()),
             network: Some(CliNetworkMode::OwnIp),
-            sync: Some(SyncMode::None),
+            skip_upload: true,
             no_loadouts: true,
             no_prompt: true,
             attach: false,

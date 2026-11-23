@@ -3723,18 +3723,6 @@ pub(crate) fn cache_host(location: &AnyUrl) -> String {
     }
 }
 
-/// The host inside an authority: the authority minus any userinfo before
-/// the last `@`. A `FetchSource` URL may carry a credential in its userinfo
-/// (`https://<token>@github.com/…`), and the record is a log line a bundle
-/// keeps on disk, so no spelling it writes carries one; the host the fetch
-/// left for is the host, never the credential before it.
-fn authority_host(authority: &str) -> &str {
-    match authority.rsplit_once('@') {
-        Some((_, host)) => host,
-        None => authority,
-    }
-}
-
 /// The port a fetch record's host field carries, one rule for both
 /// spellings a fetch's host is read from — the configured cache's
 /// location and a source URL: the port the fetch's URL spells, kept when
@@ -3758,51 +3746,6 @@ fn host_field(host: &str, port: Option<u16>, scheme: &str) -> String {
         Some(port) => format!("{host}:{port}"),
         None => host.to_owned(),
     }
-}
-
-/// The host a URL names — its authority, between the scheme and the first
-/// path, query, or fragment delimiter, with any userinfo dropped and the
-/// port carried only as the one rule every fetch kind's host field
-/// carries it — which is where a `FetchSource` fetch leaves for. A
-/// spelling with no scheme (a local source tarball) names no host and
-/// crosses no network: the record's object still carries the whole
-/// spelling, so the fetch is read whole from the two fields.
-pub(crate) fn url_host(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return String::new();
-    };
-    let authority = authority_host(rest.split(['/', '?', '#']).next().unwrap_or_default());
-    // The port the authority spells after its last colon, when what
-    // follows that colon is one: the colons inside a bracketed IPv6
-    // literal are not a port, so an authority that spells none is the
-    // host whole.
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((host, port)) => match port.parse::<u16>() {
-            Ok(port) => (host, Some(port)),
-            Err(_) => (authority, None),
-        },
-        None => (authority, None),
-    };
-    host_field(host, port, scheme)
-}
-
-/// The object a `FetchSource` record names its fetch by: the URL's own
-/// spelling minus the parts that never belong in a log line — the userinfo
-/// before the last `@` (a credential), and the query and fragment after the
-/// path (a query is where a signed URL carries its signature). A spelling
-/// with no scheme (a local source tarball) names no host and crosses no
-/// network, and is the object whole: the way the record has always spelled
-/// a source it read off the operator's own disk.
-pub(crate) fn url_object(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return url.to_owned();
-    };
-    let before_query = rest.split(['?', '#']).next().unwrap_or_default();
-    let (authority, path) = match before_query.split_once('/') {
-        Some((authority, path)) => (authority, format!("/{path}")),
-        None => (before_query, String::new()),
-    };
-    format!("{scheme}://{}{path}", authority_host(authority))
 }
 
 /// Whether the cohort's two subtrees are there as the step delegates them:
@@ -6013,11 +5956,6 @@ mod tests {
             "[::1]:8080",
             "host_str keeps an IPv6 mirror's brackets, so its port reads apart from the address"
         );
-        assert_eq!(
-            cache_host(&ipv6),
-            url_host("https://[::1]:8080/prefix/index.shisha"),
-            "the cache and source spellings agree for the same IPv6 host"
-        );
         let bucket = AnyUrl::Gcs(common::fetchers::GcsUrl {
             bucket: "projects/_/buckets/minimal-cache".to_string(),
             object: String::new(),
@@ -6026,96 +5964,6 @@ mod tests {
             cache_host(&bucket),
             "projects/_/buckets/minimal-cache",
             "a GCS location's host is the bucket it names"
-        );
-    }
-
-    /// NET-080: the two spellings a `FetchSource` URL's record carries — the
-    /// host it names and the object it is recorded as — never carry the
-    /// parts of the URL that must not reach a log line. The record is an
-    /// INFO line a bundle's daemon-log tail keeps on disk, and a source URL
-    /// can carry a credential in its userinfo (`https://<token>@github.com/…`)
-    /// and a signature in its query (`?X-Amz-Signature=…`), so the host is
-    /// the URL's authority minus its userinfo and the object is its spelling
-    /// minus the userinfo, the query, and the fragment. The port rides the
-    /// one rule every fetch kind's host field keeps — kept when it is not
-    /// the scheme's own default, dropped when it is, the same rule the
-    /// cache's host is spelled by — and that rule is the host field's
-    /// alone: the object keeps the URL's own spelling. A source with no
-    /// scheme — a tarball off the operator's own disk — names no host and
-    /// crosses no network, and stays the object whole.
-    #[test]
-    fn url_host_and_object_carry_no_credentials() {
-        // A credential in the userinfo, before the host a GitHub source
-        // fetch actually leaves for.
-        let tokened = "https://ghp_deadbeef@github.com/example/example/archive/v1.tar.gz";
-        assert_eq!(
-            url_host(tokened),
-            "github.com",
-            "the host is the authority minus its userinfo, so the token never \
-             reaches the record: {}",
-            url_host(tokened)
-        );
-        assert_eq!(
-            url_object(tokened),
-            "https://github.com/example/example/archive/v1.tar.gz",
-            "the object is the URL minus its userinfo, so the token never \
-             reaches the record: {}",
-            url_object(tokened)
-        );
-        // A login pair, a port, a query, and a fragment: each is dropped or
-        // kept by what it is, not by where it sits.
-        let signed = "https://user:pass@mirror.example.com:8443/src/v2.tar.gz?X-Amz-Signature=deadbeef#fragment";
-        assert_eq!(
-            url_host(signed),
-            "mirror.example.com:8443",
-            "the host keeps the port and drops the login pair before it"
-        );
-        assert_eq!(
-            url_object(signed),
-            "https://mirror.example.com:8443/src/v2.tar.gz",
-            "the object keeps the host and port and drops the login pair, the \
-             query, and the fragment"
-        );
-        // Each scheme's own default port, dropped by the same one rule the
-        // cache's host is spelled by — while the object keeps the URL's
-        // whole spelling, because the port rule is the host field's.
-        let https_default = "https://mirror.example.com:443/src/v2.tar.gz";
-        assert_eq!(
-            url_host(https_default),
-            "mirror.example.com",
-            "the host drops https's own default port: 443 is what the scheme \
-             already says"
-        );
-        assert_eq!(
-            url_object(https_default),
-            "https://mirror.example.com:443/src/v2.tar.gz",
-            "the object keeps the URL's spelling whole minus what must not be \
-             logged: the port rule is the host field's alone"
-        );
-        let http_default = "http://mirror.example.com:80/src/v2.tar.gz";
-        assert_eq!(
-            url_host(http_default),
-            "mirror.example.com",
-            "the host drops http's own default port, the same one rule"
-        );
-        let http_kept = "http://mirror.example.com:8080/src/v2.tar.gz";
-        assert_eq!(
-            url_host(http_kept),
-            "mirror.example.com:8080",
-            "the host keeps http's non-default port the same way it keeps \
-             https's: one rule for every fetch kind"
-        );
-        // A URL with nothing to drop is spelled whole in both fields.
-        let plain = "https://example.com/src/v3.tar.gz";
-        assert_eq!(url_host(plain), "example.com");
-        assert_eq!(url_object(plain), "https://example.com/src/v3.tar.gz");
-        // A local source names no host and is the object whole.
-        let local = "../tarballs/v4.tar.gz";
-        assert_eq!(url_host(local), "", "a local source names no host");
-        assert_eq!(
-            url_object(local),
-            "../tarballs/v4.tar.gz",
-            "a local source stays the object whole"
         );
     }
 
@@ -9632,7 +9480,7 @@ mod tests {
                 "the refusal says why no mask avoids it: {text}"
             );
             assert!(
-                text.contains("then run min finalize-install again."),
+                text.contains("run min finalize-install again."),
                 "the refusal names the command to run once the rule is changed: {text}"
             );
             assert!(
@@ -10002,6 +9850,168 @@ mod tests {
                 "`ct mark set {value}` writes every bit: {text}"
             );
         }
+    }
+
+    /// Tailscale's connmark save in its nftables mode, in the ip and ip6
+    /// mangle tables: a native `ct mark set meta mark & 0x00ff0000`, which
+    /// replaces the whole connection mark, under the packet-mark match
+    /// `meta mark & 0x00ff0000 != 0x00000000`. Neither the table nor the
+    /// chain carries a name that ties it to Tailscale.
+    const TAILSCALE_NFT_MODE_CONNMARK: &str = "table ip mangle {\n\
+         \tchain OUTPUT {\n\
+         \t\ttype route hook output priority mangle; policy accept;\n\
+         \t\tct state new meta mark & 0x00ff0000 != 0x00000000 ct mark set meta mark & 0x00ff0000\n\
+         \t}\n\
+         }\n\
+         table ip6 mangle {\n\
+         \tchain OUTPUT {\n\
+         \t\ttype route hook output priority mangle; policy accept;\n\
+         \t\tct state new meta mark & 0x00ff0000 != 0x00000000 ct mark set meta mark & 0x00ff0000\n\
+         \t}\n\
+         }\n";
+
+    /// NET-079: Tailscale's nftables-mode connmark save writes every bit of
+    /// the connection mark, so the install refuses it under every mask. The
+    /// refusal names the packet-mark match, says that its bits are the range
+    /// Tailscale marks connections with, so Tailscale can load the rule. It
+    /// does not tell the user to change the rule.
+    #[test]
+    fn install_refuses_tailscale_nft_mode_connmark_with_its_match() {
+        for mask in [None, Some("0x0c000000")] {
+            let mount = standin_mount();
+            let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+            host_ruleset_tools(tools.path(), TAILSCALE_NFT_MODE_CONNMARK, "");
+            let flags: Vec<&str> = mask.map(|m| vec!["--ct-mark-mask", m]).unwrap_or_default();
+            let refused = run_install_with(&mount, &flags, tools.path());
+            let text = said(&refused);
+            assert!(
+                !refused.status.success(),
+                "the install refuses under mask {mask:?}: {text}"
+            );
+            for family in ["ip", "ip6"] {
+                assert!(
+                    text.contains(&format!(
+                        "table {family} mangle, chain OUTPUT: ct state new meta mark & 0x00ff0000 \
+                         != 0x00000000 ct mark set meta mark & 0x00ff0000 (writes every bit of the \
+                         connection mark, for packets that match meta mark & 0x00ff0000 != \
+                         0x00000000)\n"
+                    )),
+                    "the refusal names the {family} rule and its packet-mark match: {text}"
+                );
+                assert!(
+                    text.contains(&format!(
+                        "The rule in table {family} mangle, chain OUTPUT matches the packet-mark \
+                         bits 0x00ff0000. Tailscale marks connections with these bits, so \
+                         Tailscale can load this rule. If another program loads it, that \
+                         program must write only the connection-mark bits it uses.\n"
+                    )),
+                    "the refusal names the mark range the {family} rule matches: {text}"
+                );
+            }
+            assert!(
+                !text.contains("Change that rule"),
+                "the refusal does not tell the user to change Tailscale's rule: {text}"
+            );
+            assert!(
+                text.contains(
+                    "no --ct-mark-mask avoids it. The lines above name the program or the mark \
+                     range of that rule. When this host's ruleset no longer has the rule, run \
+                     min finalize-install again.\n"
+                ),
+                "the refusal says what to wait for and the command to run: {text}"
+            );
+            assert!(
+                !mount.root.join(sandbox::classifier::TABLE_MARKER).exists(),
+                "a refused install writes no marker: {text}"
+            );
+        }
+
+        // The same write with no packet-mark match, in a table no program
+        // is known by, is still the user's rule to change.
+        let mount = standin_mount();
+        let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+        host_ruleset_tools(
+            tools.path(),
+            "table inet other {\n\tchain c {\n\t\tct mark set meta mark & 0x00ff0000\n\t}\n}\n",
+            "",
+        );
+        let refused = run_install_with(&mount, &[], tools.path());
+        let text = said(&refused);
+        assert!(!refused.status.success(), "{text}");
+        assert!(
+            text.contains("(writes every bit of the connection mark)\n")
+                && text.contains("Change that rule to write only the bits it uses"),
+            "a whole-mark rule no program or range accounts for is the user's to change: {text}"
+        );
+
+        // A packet-mark match whose mask has bits outside every well-known
+        // range names no range, and the rule is still the user's to change.
+        let mount = standin_mount();
+        let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+        host_ruleset_tools(
+            tools.path(),
+            "table inet other {\n\tchain c {\n\t\tmeta mark & 0xffffffff != 0x00000000 \
+             ct mark set meta mark & 0x00ff0000\n\t}\n}\n",
+            "",
+        );
+        let refused = run_install_with(&mount, &[], tools.path());
+        let text = said(&refused);
+        assert!(!refused.status.success(), "{text}");
+        assert!(
+            text.contains("for packets that match meta mark & 0xffffffff != 0x00000000)\n")
+                && !text.contains("Tailscale marks connections with these bits")
+                && text.contains("Change that rule to write only the bits it uses"),
+            "a match mask wider than a well-known range names no range: {text}"
+        );
+
+        // A one-bit packet-mark match outside every well-known range names
+        // no range either, and the rule is still the user's to change.
+        let mount = standin_mount();
+        let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+        host_ruleset_tools(
+            tools.path(),
+            "table inet other {\n\tchain c {\n\t\tmeta mark & 0x01000000 != 0x00000000 \
+             ct mark set meta mark & 0x00ff0000\n\t}\n}\n",
+            "",
+        );
+        let refused = run_install_with(&mount, &[], tools.path());
+        let text = said(&refused);
+        assert!(!refused.status.success(), "{text}");
+        assert!(
+            text.contains("for packets that match meta mark & 0x01000000 != 0x00000000)\n")
+                && !text.contains("Tailscale marks connections with these bits")
+                && !text.contains("kube-proxy marks connections with these bits")
+                && text.contains("Change that rule to write only the bits it uses"),
+            "a one-bit match mask outside every well-known range names no range: {text}"
+        );
+
+        // One chain with a rule in a well-known range and then a rule in
+        // none: each rule gets its own line, so the rule the user is told
+        // to change is one the lines above name.
+        let mount = standin_mount();
+        let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+        host_ruleset_tools(
+            tools.path(),
+            "table inet other {\n\tchain c {\n\t\tmeta mark & 0x00ff0000 != 0x00000000 \
+             ct mark set meta mark & 0x00ff0000\n\t\tmeta mark & 0x01000000 != 0x00000000 \
+             ct mark set meta mark & 0x00ff0000\n\t}\n}\n",
+            "",
+        );
+        let refused = run_install_with(&mount, &[], tools.path());
+        let text = said(&refused);
+        assert!(!refused.status.success(), "{text}");
+        assert!(
+            text.contains(
+                "The rule in table inet other, chain c matches the packet-mark bits \
+                 0x00ff0000. Tailscale marks connections with these bits, so Tailscale can \
+                 load this rule. If another program loads it, that program must write only \
+                 the connection-mark bits it uses.\n"
+            ) && text.contains(
+                "The rule in table inet other, chain c belongs to a program that this step \
+                 cannot name from its table and chain.\n"
+            ) && text.contains("Change that rule to write only the bits it uses"),
+            "each rule in one chain gets the line that explains it: {text}"
+        );
     }
 
     /// One family's mangle table as `nft -a --debug=netlink list ruleset`

@@ -685,6 +685,7 @@ fn stopped_vm_entries(vm: &client::VmSocket) -> Vec<minimald_rpc::BoxListingEntr
             signal: None,
             pty_enabled: false,
             lifetime: None,
+            build_boxes: Vec::new(),
         })
         .collect()
 }
@@ -711,7 +712,11 @@ pub(crate) async fn box_host_client(
     }
     match probe_other_host(host).await? {
         Some(client) => Ok(client),
-        None => bail!("Host {} is not running.", host.host),
+        // BCLI-034: a stopped host exits 7, provider or host unreachable.
+        None => Err(client::box_registration::HostUnreachable::error(format!(
+            "Host {} is not running.",
+            host.host
+        ))),
     }
 }
 
@@ -755,7 +760,10 @@ async fn probe_other_host(
         Ok(client) => Ok(Some(client)),
         Err(client::ProbeRefusal::NotRunning) => Ok(None),
         Err(client::ProbeRefusal::Unreachable(e)) => {
-            Err(e.context(format!("Could not reach host {}.", host.host)))
+            Err(client::box_registration::HostUnreachable::over(
+                e,
+                format!("Could not reach host {}.", host.host),
+            ))
         }
     }
 }

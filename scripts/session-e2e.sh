@@ -385,6 +385,14 @@
 #                                    at the host-side gate (NET-155, NET-085),
 #                                    and each refusal's record is read back
 #                                    from the host's logs
+#   a_build_box_fetches_its_source
+#                                    NET-155, NET-165: a deny-all box's cold
+#                                    build of a package at the pinned commit
+#                                    fetches its source cold and succeeds,
+#                                    the build box lists while it runs and
+#                                    leaves when it ends, and the box stays
+#                                    deny-all; NOT RUN without a switch or,
+#                                    natively, a tap
 #   host_ip_rules_follow_the_running_box
 #                                    NET-085, VM host: root in the VM
 #                                    wearing the node's address and the box
@@ -604,6 +612,7 @@ ESU_B_SEED_DIR="" # its box B seed; removed on teardown
 ESU_LISTENER_PID="" # its host listener; killed on teardown
 ESU_LISTEN_PORT="" # the port the listener binds; this proof's own band
 EBR_SEED_DIR="" # the escapes-and-builds proof's seed; removed on teardown
+BBF_SEED_DIR="" # the build-box fetch proof's seed; removed on teardown
 EBR_LISTENER_PID="" # its host listener; killed on teardown
 EBR_LISTEN_PORT="" # the port the listener binds, beside the escape-union band
 HRF_SEED_DIR="" # the host_ip rules proof's seed; removed on teardown
@@ -1427,6 +1436,7 @@ teardown() {
   fi
   # The escapes-and-builds proof's seed and listener, for the same reasons.
   [ -n "$EBR_SEED_DIR" ] && rm -rf "$EBR_SEED_DIR"
+  [ -n "$BBF_SEED_DIR" ] && rm -rf "$BBF_SEED_DIR"
   [ -n "$HRF_SEED_DIR" ] && rm -rf "$HRF_SEED_DIR"
   if [ -n "$EBR_LISTENER_PID" ]; then
     kill "$EBR_LISTENER_PID" 2>/dev/null || true
@@ -7044,6 +7054,11 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     # shellcheck disable=SC2016 # $l is the task's, expanded in the box
     printf '\n[tasks.e2e-stdin]\nbash = "read -r l; echo STDIN_GOT:$l"\n'
     printf '\n[tasks.e2e-sleep]\nbash = "sleep 300"\n'
+    # A task that runs long enough to outlive its box's stop, and traps
+    # TERM so a stop that reaches it is observable: the trap's echo lands in
+    # the redirected output, and the wait below proves the run itself ended
+    # 0 — the task's own exit, not the relay's signal death.
+    printf '\n[tasks.e2e-stoptask]\nbash = "trap '"'"'echo TASK-TERM; echo TASK-TERM >&2; exit 0'"'"' TERM; echo TASK-UP; sleep 31337 & wait; echo TASK-NOT-STOPPED"\n'
     printf '\n[tasks.e2e-envprint]\nexec = "printenv E2E_INHERIT_MARKER"\nenv_vars.E2E_INHERIT_MARKER = { inherit = true }\n'
     # shellcheck disable=SC2016 # $PWD is the task's, expanded in the box
     printf '\n[tasks.e2e-ic]\ninherit_cwd = true\nbash = "echo PWD=$PWD"\n'
@@ -7203,6 +7218,101 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     fail
   fi
   echo "task run interrupt: box stopped, record kept, exit 130 OK"
+
+  # `min box stop` on a task box must stop the task itself, not just the
+  # box's own relay: the daemon records the container each invocation runs
+  # in and signals it first, so the task's TERM trap runs, the run exits 0,
+  # and the box record keeps that exit (BOX-013). Before the fix only the
+  # relay died: the client saw 143 and the task was left running.
+  ts_env=()
+  # shellcheck disable=SC2031
+  if [ -n "$E2E_NATIVE_SWITCH_DIR" ] && [ "${MINIMAL_BIN:-}" = "$E2E_LANE_MINIMAL_BIN" ]; then
+    ts_env=(env "MINIMAL_BIN=$E2E_NATIVE_SWITCH_DIR")
+  fi
+  # shellcheck disable=SC2086
+  (cd "$TASK_SEED_DIR" \
+    && exec ${ts_env[@]+"${ts_env[@]}"} min ${E2E_MINIMAL_ARGS:-} task run e2e-stoptask \
+      >"$WORK/task-stop.out" 2>"$WORK/task-stop.err") &
+  ts_pid=$!
+  ts_name=""
+  for _ in $(seq 1 120); do
+    ts_name="$(grep -o 'Running task e2e-stoptask in box [^ .]*' "$WORK/task-stop.err" 2>/dev/null \
+      | head -n1)"
+    ts_name="${ts_name#Running task e2e-stoptask in box }"
+    [ -n "$ts_name" ] && break
+    sleep 0.5
+  done
+  if [ -z "$ts_name" ]; then
+    echo "::error::'min task run e2e-stoptask' did not name its box"
+    cat "$WORK/task-stop.err" 2>/dev/null || true
+    kill "$ts_pid" 2>/dev/null || true
+    fail
+  fi
+  for _ in $(seq 1 120); do
+    grep -q 'TASK-UP' "$WORK/task-stop.out" 2>/dev/null && break
+    sleep 0.5
+  done
+  if ! grep -q 'TASK-UP' "$WORK/task-stop.out" 2>/dev/null; then
+    echo "::error::task e2e-stoptask never reported TASK-UP in the box $ts_name"
+    cat "$WORK/task-stop.out" 2>/dev/null || true
+    mnl box stop "$ts_name" >/dev/null 2>&1 || true
+    kill "$ts_pid" 2>/dev/null || true
+    fail
+  fi
+  # Long enough for the trap to be armed at the wait.
+  sleep 3
+  if ! mnl box stop "$ts_name" </dev/null >"$WORK/task-stop-stop.out" 2>"$WORK/task-stop-stop.err"; then
+    echo "::error::'min box stop $ts_name' failed while the task was running"
+    cat "$WORK/task-stop-stop.err" 2>/dev/null || true
+    kill "$ts_pid" 2>/dev/null || true
+    fail
+  fi
+  # The client ends with the task's relayed exit. A client still connected
+  # after the stop is the regression this proof catches, so the wait is
+  # bounded and a miss fails with the client's output.
+  ts_deadline=$((SECONDS + 60))
+  while kill -0 "$ts_pid" 2>/dev/null && [ "$SECONDS" -lt "$ts_deadline" ]; do
+    sleep 0.5
+  done
+  if kill -0 "$ts_pid" 2>/dev/null; then
+    echo "::error::'min task run e2e-stoptask' was still running 60s after 'min box stop $ts_name'"
+    echo "--- task stdout ---"; cat "$WORK/task-stop.out" 2>/dev/null || true
+    echo "--- task stderr ---"; cat "$WORK/task-stop.err" 2>/dev/null || true
+    kill "$ts_pid" 2>/dev/null || true
+    wait "$ts_pid" 2>/dev/null || true
+    fail
+  fi
+  wait "$ts_pid"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "::error::'min task run e2e-stoptask' exited $rc after 'min box stop' (expected 0)"
+    echo "--- task stdout ---"; cat "$WORK/task-stop.out" 2>/dev/null || true
+    echo "--- task stderr ---"; cat "$WORK/task-stop.err" 2>/dev/null || true
+    fail
+  fi
+  if ! grep -q 'TASK-TERM' "$WORK/task-stop.out" 2>/dev/null; then
+    echo "::error::the task never saw the stop's TERM (no TASK-TERM in its output)"
+    echo "--- task stdout ---"; cat "$WORK/task-stop.out" 2>/dev/null || true
+    echo "--- task stderr ---"; cat "$WORK/task-stop.err" 2>/dev/null || true
+    fail
+  fi
+  if grep -q 'TASK-NOT-STOPPED' "$WORK/task-stop.out" 2>/dev/null; then
+    echo "::error::the task outlived the stop (TASK-NOT-STOPPED printed after the wait)"
+    echo "--- task stdout ---"; cat "$WORK/task-stop.out" 2>/dev/null || true
+    fail
+  fi
+  # `min ls` prints only the state; `min box show` prints the exit code the
+  # record keeps.
+  ts_shown="$(mnl box show "$ts_name" </dev/null 2>&1)" || ts_shown=""
+  ts_state="$(printf '%s\n' "$ts_shown" | sed -n 's/^State: *//p' | tr -d '\r')"
+  ts_code="$(printf '%s\n' "$ts_shown" | sed -n 's/^Exit code: *//p' | tr -d '\r')"
+  if [ "$ts_state" != stopped ] || [ "$ts_code" != 0 ]; then
+    echo "::error::stopped task box $ts_name is recorded as state '${ts_state:-<none>}', exit code '${ts_code:-<none>}' (expected stopped, 0)"
+    echo "--- min box show $ts_name ---"; printf '%s\n' "$ts_shown"
+    fail
+  fi
+  task_kept_check e2e-stoptask "$WORK/task-stop.err"
+  echo "task run box-stop: task container signalled, run exits 0, record kept OK"
 
   # The step that ran a declared task inside a running session is gone: the
   # CLI no longer has that verb, and no box verb replaces it yet.
@@ -14139,14 +14249,19 @@ proof_published_proxy_routes_from_host() {
 # The live Box Egress Proxy gate (BEP-015, #2275). The VM host daemon starts
 # `bep serve` beside gvproxy on a production boot, and the proxy opens its
 # control socket under the real home. Records case $1 as NOT RUN and returns
-# 1 where no proxy can run: off macOS (the proxy keeps its keys in the macOS
-# Keychain), without gvproxy (the daemon starts the proxy beside it), or
-# without a GitHub sign-in a person made with `min auth login`. A case that
-# passes "no_sign_in" as $2 skips the sign-in check, and is NOT RUN without
-# a bep binary in its place (MINVMD_BEP_BIN, else the bep beside minvmd, as
-# rt_bep_bin resolves it; the macOS CI testbed ships none). Everywhere
-# else the proxy must come up, so a proxy that does not is a failure, never
-# NOT RUN.
+# 1 where no proxy can run: on Linux without a key store the proxy can use
+# (bep_linux_key_store), without gvproxy (the daemon starts the proxy beside
+# it), or without a GitHub sign-in a person made with `min auth login`. On
+# macOS the proxy keeps its keys in the Keychain, which is always there. A
+# case that passes "no_sign_in" as $2 skips the sign-in check, and is NOT
+# RUN without a bep binary in its place (MINVMD_BEP_BIN, else the bep beside
+# minvmd, as rt_bep_bin resolves it; `just minvmd-build` puts one there on
+# both hosts, and the macOS CI testbed ships none). Everywhere else the
+# proxy must come up, so a proxy that does not is a failure, never NOT RUN.
+#
+# A case that stores a value with `min secret set` also calls
+# bep_native_store_gate: `min secret` uses the macOS Keychain only, so on
+# Linux that case, or that leg of a case, is NOT RUN.
 #
 # A daemon an earlier case started under MINVMD_BEP_STUB runs the stand-in
 # in place of the proxy, so the first live case restarts the daemon pair
@@ -14159,13 +14274,45 @@ s = socket.socket(socket.AF_UNIX)
 s.settimeout(2)
 s.connect(sys.argv[1])' "$1" 2>/dev/null
 }
+# On Linux `bep serve` keeps its keys in the TPM (through tpm2-tools on
+# /dev/tpmrm0) or in Secret Service (through secret-tool), BEP-088 and
+# BEP-089. Returns 0 when one of them answers, or when the lane sets
+# E2E_BEP_KEY_STORE=1 to say that it provides one: then a proxy that does
+# not come up is a failure. Else prints why neither answers and returns 1.
+# The Secret Service probe looks up an attribute no item carries: exit 1
+# with no error output is a keyring that answered with no match.
+bep_linux_key_store() {
+  local ks_err ks_rc=0
+  [ "${E2E_BEP_KEY_STORE:-}" = 1 ] && return 0
+  if [ -r /dev/tpmrm0 ] && [ -w /dev/tpmrm0 ] \
+    && command -v tpm2_createprimary >/dev/null 2>&1; then
+    return 0
+  fi
+  if command -v secret-tool >/dev/null 2>&1; then
+    ks_err="$(timeout 10 secret-tool lookup dev.minimal.e2e-probe absent </dev/null 2>&1 >/dev/null)" || ks_rc=$?
+    if [ -z "$ks_err" ] && { [ "$ks_rc" = 0 ] || [ "$ks_rc" = 1 ]; }; then
+      return 0
+    fi
+    echo "no key store for the Box Egress Proxy: no TPM at /dev/tpmrm0 that this user can use with tpm2-tools, and Secret Service did not answer secret-tool (exit $ks_rc${ks_err:+: ${ks_err%%$'\n'*}}). Set E2E_BEP_KEY_STORE=1 on a lane that provides one; https://github.com/gominimal/minimal/issues/3652"
+    return 1
+  fi
+  echo "no key store for the Box Egress Proxy: no TPM at /dev/tpmrm0 that this user can use with tpm2-tools, and no secret-tool for Secret Service. Set E2E_BEP_KEY_STORE=1 on a lane that provides one; https://github.com/gominimal/minimal/issues/3652"
+  return 1
+}
+# `min secret` stores values in the macOS Keychain only. Records case $1 as
+# NOT RUN and returns 1 on any other host.
+bep_native_store_gate() {
+  [ "$(uname -s)" = Darwin ] && return 0
+  not_run "$1" "'min secret' stores secrets only in the macOS Keychain, and this host is $(uname -s); Linux: https://github.com/gominimal/minimal/issues/3695"
+  return 1
+}
 bep_live_gate() {
   # This reads the real home, which no earlier subshell export changes.
   # shellcheck disable=SC2031
-  local lg_control="$HOME/.minimal/bep/control.sock" lg_status lg_try
+  local lg_control="$HOME/.minimal/bep/control.sock" lg_status lg_try lg_why
   local lg_log="$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log"
-  if [ "$(uname -s)" != "Darwin" ]; then
-    not_run "$1" "the live Box Egress Proxy cases run on macOS lanes only; Linux: https://github.com/gominimal/minimal/issues/3652"
+  if [ "$(uname -s)" != "Darwin" ] && ! lg_why="$(bep_linux_key_store)"; then
+    not_run "$1" "$lg_why"
     return 1
   fi
   if [ -z "$E2E_VM" ] || [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
@@ -14226,9 +14373,9 @@ bep_live_gate() {
 # Egress Proxy running, two boxes that declare a GitHub grant start one after
 # the other, headless, and neither asks for a sign-in. Each creation mints a
 # sealed sign-in reference and registers the box with the proxy, so the second
-# box reuses the sign-in the first one found. The live proxy cases run on
-# macOS lanes only, and the case needs a sign-in a person made with `min auth
-# login`, so a lane without both records it as NOT RUN.
+# box reuses the sign-in the first one found. The case needs the live proxy
+# (bep_live_gate) and a sign-in a person made with `min auth login`, so a
+# lane without both records it as NOT RUN.
 proof_bep_second_box_needs_no_sign_in() {
   echo "::group::GitHub grant boxes: the second box needs no sign-in"
   bep_live_gate bep_second_box_needs_no_sign_in || { echo "::endgroup::"; return 0; }
@@ -14444,8 +14591,8 @@ proof_bep_git_and_gh_against_private_repo() {
 # the sealed value and the proxy substituted it. The case first checks that
 # the one helper git finds for github.com is the one the box carries, that
 # it answers with the box's sealed GH_TOKEN, and afterwards that its log
-# names github.com and never the value. A lane off macOS, without a sign-in
-# or without E2E_BEP_PRIVATE_REPO records NOT RUN. #2500 owns the macOS lane
+# names github.com and never the value. A lane without a live proxy, without
+# a sign-in or without E2E_BEP_PRIVATE_REPO records NOT RUN. #2500 owns the macOS lane
 # that runs it.
 proof_bep_git_credential_helper_sends_header() {
   echo "::group::GitHub grant box: the shipped git credential helper sends a header the proxy substitutes (BEP-015)"
@@ -14791,7 +14938,9 @@ proof_bep_first_slice_end_to_end() {
 #   5. `min box audit` shows the admitted injection for the upstream by
 #      store and identifier, and neither the audit nor bep.log holds the
 #      value.
-# The case needs no GitHub sign-in. The value is never printed: the
+# The case needs no GitHub sign-in. `min secret` stores values in the macOS
+# Keychain only, so on Linux the case is NOT RUN (bep_native_store_gate),
+# even where the proxy itself runs. The value is never printed: the
 # transcript names only its length. The case removes the item at the end.
 bep_store_jsonl_check() { # $1 = the jsonl file, $2 = the upstream authority, $3 = the store, $4 = the identifier
   python3 - "$1" "$2" "$3" "$4" <<'PY'
@@ -14830,6 +14979,7 @@ proof_bep_store_reference_end_to_end() {
     echo "::error::E2E_BEP_STORE_ECHO_URL is '$sr_url', not an https:// URL on port 443"
     fail
   fi
+  bep_native_store_gate "$sr_case" || { echo "::endgroup::"; return 0; }
   bep_live_gate "$sr_case" no_sign_in || { echo "::endgroup::"; return 0; }
   # r3_proxy_pids selects this run's proxy by its listener socket. Step 1
   # must leave the same proxy serving.
@@ -16226,11 +16376,14 @@ if len(r) >= 8 and r[0:2] == b"\x5e\x32" and r[2] & 0x80:
 #                answers the proxy's address, and a plain curl with no proxy
 #                variable reaches the upstream with the stored value in the
 #                rule's header (BEP-062, the store-rule authorities of T114).
+#                `min secret` uses the macOS Keychain only, so on Linux this
+#                leg is NOT RUN.
 #   git          With a GitHub sign-in and E2E_BEP_PRIVATE_REPO, a grant box
 #                resolves github.com to the proxy and clones the private
 #                repository through it (BEP-062, BEP-015).
 #   fail_closed  With the proxy stopped, the A lookup of each steered name a
-#                box above holds is answered SERVFAIL (BEP-062).
+#                box above holds is answered SERVFAIL (BEP-062). NOT RUN when
+#                no leg above started a box.
 # A lane without the live proxy records the whole case NOT RUN. Any admission
 # refusal of a box here is a hard failure. The stored value is never printed.
 proof_bep_dns_steering_through_the_box_zone_resolver() {
@@ -16383,63 +16536,69 @@ print(rcode, an, addr)' "$dq_b64"
 
   # --- store: a store reference's upstream resolves to the proxy, and its
   # request carries the stored value.
-  bz_id="e2e-dns-store-$(date +%s)-$$"
-  bz_value="mne2e$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
-  BZ_ID="$bz_id"
-  if ! printf '%s' "$bz_value" | mnl secret set "$bz_id" \
-    --upstream "$bz_host" --header "$bz_header" --yes >/dev/null 2>"$WORK/$bz_case.set.err"; then
-    echo "::error::'min secret set $bz_id --upstream $bz_host --header $bz_header' failed"
-    grep -vF -- "$bz_value" "$WORK/$bz_case.set.err" 2>/dev/null || true
-    bz_fail
+  # `min secret` stores values in the macOS Keychain only, so on Linux the
+  # leg is NOT RUN and the fail_closed leg checks the git box alone.
+  if [ "$(uname -s)" != Darwin ]; then
+    bz_not_run store "'min secret' stores secrets only in the macOS Keychain, and this host is $(uname -s); Linux: https://github.com/gominimal/minimal/issues/3695"
+  else
+    bz_id="e2e-dns-store-$(date +%s)-$$"
+    bz_value="mne2e$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+    BZ_ID="$bz_id"
+    if ! printf '%s' "$bz_value" | mnl secret set "$bz_id" \
+      --upstream "$bz_host" --header "$bz_header" --yes >/dev/null 2>"$WORK/$bz_case.set.err"; then
+      echo "::error::'min secret set $bz_id --upstream $bz_host --header $bz_header' failed"
+      grep -vF -- "$bz_value" "$WORK/$bz_case.set.err" 2>/dev/null || true
+      bz_fail
+    fi
+    GRANT_SEED_DIR="$(hook_mktemp /tmp/mnldnsstore.XXXXXX)"
+    {
+      hook_seed_preamble
+      printf '\n[session]\npackages = ["base", "coreutils", "ca-certificates"]\n'
+      printf '\n[session.secrets.E2E_STORE_KEY]\nsource = "store"\nstore = "keychain"\nid = "%s"\n' "$bz_id"
+      printf '\n[session.network.bep]\nsteering = "dns"\n'
+    } > "$GRANT_SEED_DIR/minimal.toml"
+    mkdir "$GRANT_SEED_DIR/.git"
+    BZ_STORE_SID="$(bz_activate store e2e-bep-dns-store "$bz_host")"
+    bz_status=$?
+    rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
+    [ "$bz_status" = 0 ] || bz_fail
+    mnl box exec "$BZ_STORE_SID" -- bash -c 'test -x /usr/bin/socat && test -x /usr/bin/base64' >/dev/null 2>&1 || {
+      echo "::error::the dns-steered store box has no /usr/bin/socat or /usr/bin/base64 (both launcher baseline packages)"
+      bz_fail
+    }
+    bz_no_proxy_env "$BZ_STORE_SID" store || bz_fail
+    bz_steered_to_proxy "$BZ_STORE_SID" "$bz_host" || bz_fail
+    # The box prints one word and the hash of the echoed header, as the
+    # store-reference case does. The echo stays in the pipe.
+    # shellcheck disable=SC2016 # expanded inside the box
+    if ! bz_out="$(mnl box exec "$BZ_STORE_SID" -- sh -c '
+        command -v curl >/dev/null || { echo "no curl in the box" >&2; exit 9; }
+        r="$(curl -fsS --max-time 60 -H "'"$bz_header"': $E2E_STORE_KEY" "'"$bz_url"'")" || exit 7
+        v="$(printf "%s" "$r" | tr "[:upper:]" "[:lower:]" \
+          | grep -o "\"'"$bz_header_lc"'\": *\"[^\"]*\"" | head -n1 \
+          | sed "s/^[^:]*: *\"//; s/\"\$//")"
+        r=""
+        if [ -z "$v" ]; then w=absent
+        elif [ "$v" = "$(printf "%s" "$E2E_STORE_KEY" | tr "[:upper:]" "[:lower:]")" ]; then w=sealed
+        else w=other; fi
+        printf "%s %s\n" "$w" "$(printf "%s" "$v" | sha256sum | cut -d" " -f1)"
+      ' </dev/null 2>"$WORK/$bz_case.request.err")"; then
+      echo "::error::the request from the dns-steered box to $bz_url, with no proxy variable, failed"
+      grep -vF -- "$bz_value" "$WORK/$bz_case.request.err" 2>/dev/null || true
+      bz_fail
+    fi
+    bz_got="$(printf '%s\n' "$bz_out" | tr -d '\r' | tail -n1)"
+    bz_want="other $(printf '%s' "$bz_value" | python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"
+    if [ "$bz_got" != "$bz_want" ]; then
+      case "$bz_got" in
+        absent*) echo "::error::$bz_host received no $bz_header header from the dns-steered box" ;;
+        sealed*) echo "::error::$bz_host received the box's sealed value in $bz_header, not the stored value: the proxy did not inject it" ;;
+        *) echo "::error::$bz_host received a $bz_header value that is not the stored value (box answered '${bz_got%% *}')" ;;
+      esac
+      bz_fail
+    fi
+    bz_pass store "$bz_host resolved to $bz_proxy_ip and received the stored value in $bz_header, with no proxy variable"
   fi
-  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnldnsstore.XXXXXX)"
-  {
-    hook_seed_preamble
-    printf '\n[session]\npackages = ["base", "coreutils", "ca-certificates"]\n'
-    printf '\n[session.secrets.E2E_STORE_KEY]\nsource = "store"\nstore = "keychain"\nid = "%s"\n' "$bz_id"
-    printf '\n[session.network.bep]\nsteering = "dns"\n'
-  } > "$GRANT_SEED_DIR/minimal.toml"
-  mkdir "$GRANT_SEED_DIR/.git"
-  BZ_STORE_SID="$(bz_activate store e2e-bep-dns-store "$bz_host")"
-  bz_status=$?
-  rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
-  [ "$bz_status" = 0 ] || bz_fail
-  mnl box exec "$BZ_STORE_SID" -- bash -c 'test -x /usr/bin/socat && test -x /usr/bin/base64' >/dev/null 2>&1 || {
-    echo "::error::the dns-steered store box has no /usr/bin/socat or /usr/bin/base64 (both launcher baseline packages)"
-    bz_fail
-  }
-  bz_no_proxy_env "$BZ_STORE_SID" store || bz_fail
-  bz_steered_to_proxy "$BZ_STORE_SID" "$bz_host" || bz_fail
-  # The box prints one word and the hash of the echoed header, as the
-  # store-reference case does. The echo stays in the pipe.
-  # shellcheck disable=SC2016 # expanded inside the box
-  if ! bz_out="$(mnl box exec "$BZ_STORE_SID" -- sh -c '
-      command -v curl >/dev/null || { echo "no curl in the box" >&2; exit 9; }
-      r="$(curl -fsS --max-time 60 -H "'"$bz_header"': $E2E_STORE_KEY" "'"$bz_url"'")" || exit 7
-      v="$(printf "%s" "$r" | tr "[:upper:]" "[:lower:]" \
-        | grep -o "\"'"$bz_header_lc"'\": *\"[^\"]*\"" | head -n1 \
-        | sed "s/^[^:]*: *\"//; s/\"\$//")"
-      r=""
-      if [ -z "$v" ]; then w=absent
-      elif [ "$v" = "$(printf "%s" "$E2E_STORE_KEY" | tr "[:upper:]" "[:lower:]")" ]; then w=sealed
-      else w=other; fi
-      printf "%s %s\n" "$w" "$(printf "%s" "$v" | sha256sum | cut -d" " -f1)"
-    ' </dev/null 2>"$WORK/$bz_case.request.err")"; then
-    echo "::error::the request from the dns-steered box to $bz_url, with no proxy variable, failed"
-    grep -vF -- "$bz_value" "$WORK/$bz_case.request.err" 2>/dev/null || true
-    bz_fail
-  fi
-  bz_got="$(printf '%s\n' "$bz_out" | tr -d '\r' | tail -n1)"
-  bz_want="other $(printf '%s' "$bz_value" | python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"
-  if [ "$bz_got" != "$bz_want" ]; then
-    case "$bz_got" in
-      absent*) echo "::error::$bz_host received no $bz_header header from the dns-steered box" ;;
-      sealed*) echo "::error::$bz_host received the box's sealed value in $bz_header, not the stored value: the proxy did not inject it" ;;
-      *) echo "::error::$bz_host received a $bz_header value that is not the stored value (box answered '${bz_got%% *}')" ;;
-    esac
-    bz_fail
-  fi
-  bz_pass store "$bz_host resolved to $bz_proxy_ip and received the stored value in $bz_header, with no proxy variable"
 
   # --- git: a grant box clones a private repository through the proxy.
   bz_status="$(mnl auth status </dev/null 2>/dev/null || true)"
@@ -16479,7 +16638,17 @@ print(rcode, an, addr)' "$dq_b64"
 
   # --- fail_closed: with the proxy stopped, each steered name is SERVFAIL.
   # The DNS gate learns that the listener is down from minvmd, so the case
-  # allows it 10 s.
+  # allows it 10 s. With no box from the legs above there is nothing to ask.
+  if [ -z "$BZ_STORE_SID" ] && [ -z "$BZ_GIT_SID" ]; then
+    bz_not_run fail_closed "no steered box to ask: the store and git legs did not run"
+    bz_cleanup
+    rm -f "${WORK:?}/${bz_case:?}".*
+    echo "::endgroup::"
+    echo "::group::DNS steering through the box-zone resolver: each leg"
+    printf '%s' "$bz_summary"
+    echo "::endgroup::"
+    return 0
+  fi
   if ! r3_proxy_down "$bz_control"; then
     bz_fail
   fi
@@ -16497,12 +16666,16 @@ print(rcode, an, addr)' "$dq_b64"
       return 1
     fi
   }
-  bz_servfail "$BZ_STORE_SID" "$bz_host" || bz_fail
-  if [ -n "$BZ_GIT_SID" ]; then
+  if [ -n "$BZ_STORE_SID" ] && [ -n "$BZ_GIT_SID" ]; then
+    bz_servfail "$BZ_STORE_SID" "$bz_host" || bz_fail
     bz_servfail "$BZ_GIT_SID" github.com || bz_fail
     bz_pass fail_closed "$bz_host and github.com answered SERVFAIL while the proxy was down"
-  else
+  elif [ -n "$BZ_STORE_SID" ]; then
+    bz_servfail "$BZ_STORE_SID" "$bz_host" || bz_fail
     bz_pass fail_closed "$bz_host answered SERVFAIL while the proxy was down. github.com was not checked: the git leg did not run"
+  else
+    bz_servfail "$BZ_GIT_SID" github.com || bz_fail
+    bz_pass fail_closed "github.com answered SERVFAIL while the proxy was down. $bz_host was not checked: the store leg did not run"
   fi
 
   bz_cleanup
@@ -19030,10 +19203,6 @@ proof_bep_ahm_relayed_response_has_no_alt_svc() {
 
 proof_bep_ahm_missing_proxy_refused() {
   local mp_case=bep_ahm_missing_proxy_refused mp_home mp_bin mp_rc=0 mp_err mp_want mp_next
-  if [ "$(uname -s)" != "Darwin" ]; then
-    not_run "$mp_case" "the Box Egress Proxy runs on macOS only"
-    return 0
-  fi
   if [ -z "$E2E_VM" ] || [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
     not_run "$mp_case" "no MINVMD_GVPROXY_BIN: the VM host daemon starts the Box Egress Proxy beside gvproxy, and this target has none"
     return 0
@@ -23496,6 +23665,196 @@ source=203.0.113.7 destination=$esu_host:$ESU_LISTEN_PORT verdict=refused at the
   echo "::endgroup::"
 }
 
+# NET-155, NET-165: every other proof of a build box stops at a refusal or at a
+# cache hit, so this one forces a cold build and a cold source fetch. The
+# package comes from the pinned upstream, its source is `gs://`, and the box
+# allows nothing: only the table `min` made at the box's creation can give the
+# fetch its reach. The package is `tree`: a plain Makefile with no configure,
+# so its cold build regenerates nothing, and no other proof builds it. On a VM
+# lane the guest daemon's download cache starts empty with the lane's fresh
+# state. On a native lane this proof removes the source from the daemon's
+# download cache first. Either way the proof asks the daemon's log for the
+# grant the fetch opened, so a source that was cached anyway fails the proof.
+proof_a_build_box_fetches_its_source() {
+  local bbf_pkg="tree" bbf_sid="" bbf_out="" bbf_rc="" bbf_policy="" bbf_native=""
+  local bbf_sha="513a53cbc42ca1f4ea06af2bab1f5283524a3848266b1d162416f8033afc4985"
+  local bbf_grant="" bbf_log_mark=0 bbf_listed="" bbf_build_pid=""
+  echo "::group::a build box fetches its source for a deny-all box (NET-155, NET-165)"
+  # An own-address box needs the switch, as the other own-IP proofs do, and
+  # on a native lane the tap device too.
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ] && [ -z "$E2E_NATIVE_SWITCH" ]; then
+    not_run a_build_box_fetches_its_source "no switch staged: neither MINVMD_GVPROXY_BIN (VM) nor E2E_NATIVE_SWITCH (native) is set, and a deny-all box is an own-address box"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ "$min_daemon" != minvmd ] && [ -z "$E2E_VM" ]; then
+    bbf_native=1
+    if [ ! -c /dev/net/tun ]; then
+      not_run a_build_box_fetches_its_source "no /dev/net/tun on this host: a native own-address box opens its tap on this host and needs the device"
+      echo "::endgroup::"
+      return 0
+    fi
+    # The daemon's download cache, by the source's sha256 (paths::minimal_cache_dir).
+    # shellcheck disable=SC2031
+    rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/minimal/downloads/$bbf_sha"
+  fi
+  # Stop whatever daemon is up, so the activation below autospawns a fresh
+  # one under this proof's record filter. The grant lines it reads are INFO,
+  # which the lane's default filter drops (the daemon inherits RUST_LOG at
+  # autospawn; see the header). On a native lane the fresh daemon also
+  # carries the staged switch (native_switch_daemon).
+  mnl host stop "$E2E_HOST" --force >/dev/null 2>&1 || true
+  if [ -n "$E2E_VM" ]; then
+    minvmd stop >/dev/null 2>&1 || true
+  fi
+  local bbf_filter="warn,minimald::exec=info,minimald::build_boxes=info,minvmd=info"
+  # The daemon log this proof reads its grant from: the native daemon's own,
+  # or on a VM lane the VM host daemon's. Each day's file in date order, so a
+  # line count taken before the build marks where the build's lines begin.
+  bbf_grant_log() {
+    local daemon=minvmd
+    [ -z "$bbf_native" ] || daemon=minimald
+    find "$XDG_STATE_HOME/minimal/logs" -name "$daemon.log.*" -type f 2>/dev/null \
+      | sort | while IFS= read -r day; do cat "$day"; done
+  }
+  # The logs that say why a failed build failed: the daemon's, where this
+  # lane can read it, and on a VM lane the guest daemon's console too.
+  bbf_logs() {
+    if [ -n "$bbf_native" ]; then
+      echo "--- the daemon's log, last lines ---"
+      find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f \
+        -exec cat {} + 2>/dev/null | tail -n 40 || true
+    else
+      echo "--- the VM host daemon's build grant lines ---"
+      minvmd_log_lines 'build grant' | tail -n 20 || true
+      echo "--- the guest daemon's console, last lines ---"
+      tail -n 40 "${MINVMD_BOOT_LOG:-$XDG_STATE_HOME/minimal/providers/local-minvmd0/boot.log}" \
+        2>/dev/null || true
+    fi
+  }
+  BBF_SEED_DIR="$(hook_mktemp /tmp/mnlbbf.XXXXXX)"
+  hook_seed_preamble > "$BBF_SEED_DIR/minimal.toml"
+  mkdir "$BBF_SEED_DIR/.git"
+  bbf_sid="$(cd "$BBF_SEED_DIR" && RUST_LOG="$bbf_filter" mnl session start --detach --no-input \
+    --name e2e-bbf --network own_ip --deny-all-egress 2>"$WORK/bbf-activate.err")" || {
+    echo "::error::the deny-all box's 'min session start' failed"
+    cat "$WORK/bbf-activate.err" 2>/dev/null || true
+    switch_spawn_fault "$WORK/bbf-activate.err" || true
+    fail
+  }
+  bbf_sid="$(printf '%s\n' "$bbf_sid" | tail -n1)"
+  # Where this build's log lines begin: a grant the activation or an earlier
+  # build opened is before it, and does not count.
+  bbf_log_mark="$(bbf_grant_log | wc -l | tr -d ' ')"
+  # The build box's row in `min box list`, as JSON: a `build` entry for the
+  # package under this box. Empty when the list shows none.
+  bbf_listing() {
+    (cd "$BBF_SEED_DIR" && mnl box list -o json 2>/dev/null) \
+      | jq -c --arg pkg "$bbf_pkg" --arg sid "$bbf_sid" \
+        '.[] | select(.type == "build" and .name == $pkg and .parent == $sid)' 2>/dev/null \
+      | head -n1
+  }
+  # The build runs in the background, so the list can be read while it runs.
+  # shellcheck disable=SC2016 # `$?` must reach the box's shell unexpanded.
+  mnl box exec "$bbf_sid" -- bash -c \
+    "timeout 600 min package build --rebuild $bbf_pkg 2>&1; echo build-exit=\$?" \
+    >"$WORK/bbf-build.out" 2>"$WORK/bbf-build.err" </dev/null &
+  bbf_build_pid=$!
+  while kill -0 "$bbf_build_pid" 2>/dev/null; do
+    [ -n "$bbf_listed" ] || bbf_listed="$(bbf_listing)"
+    sleep 0.2
+  done
+  wait "$bbf_build_pid" || {
+    echo "::error::the in-box 'min package build --rebuild $bbf_pkg' could not run"
+    cat "$WORK/bbf-build.err" 2>/dev/null || true
+    bbf_logs
+    fail
+  }
+  bbf_out="$(tr -d '\r' <"$WORK/bbf-build.out")"
+  bbf_rc="$(printf '%s\n' "$bbf_out" | sed -n 's/^build-exit=//p' | tail -n1)"
+  if [ "$bbf_rc" != 0 ]; then
+    echo "::error::the cold build of $bbf_pkg failed (exit '$bbf_rc'): the table should give its fetch the source's host"
+    echo "--- the build's output, last lines ---"
+    printf '%s\n' "$bbf_out" | tail -n 60 | sed 's/^/  /'
+    bbf_logs
+    fail
+  fi
+  printf '%s\n' "$bbf_out" | tail -n 20 | sed 's/^/  /'
+  # The fetch was cold: the build box opened its grant, which a cached source
+  # never asks for. Only a line written after the build began counts. On a
+  # VM lane the line names the box's session, not the package: it names the
+  # spec hash, which the box computes from the resolved graph, and nothing
+  # this script runs prints that hash.
+  bbf_grant_line() {
+    if [ -n "$bbf_native" ]; then
+      bbf_grant_log | tail -n "+$((bbf_log_mark + 1))" \
+        | grep -F -- 'opened the network of a build box' \
+        | grep -F -- '"box_name":"e2e-bbf"' | grep -F -- '"granted":true' \
+        | grep -F -- "package: \\\"$bbf_pkg\\\"" | tail -n1
+    else
+      # The host sees the spec hash alone, never the package's name, so the
+      # line is matched on this package's grant: its `gs://` source's host
+      # and no internet.
+      bbf_grant_log | tail -n "+$((bbf_log_mark + 1))" \
+        | grep -F -- 'opened a build grant' \
+        | grep -F -- "\"session\":\"$bbf_sid\"" \
+        | grep -F -- '"internet":false' \
+        | grep -F -- 'storage.googleapis.com' | tail -n1
+    fi
+  }
+  # BOX-210, NET-171: the build box listed under this box while it ran, and
+  # leaves the list with its build.
+  if [ -z "$bbf_listed" ]; then
+    echo "::error::the build of $bbf_pkg passed, but 'min box list' never showed its build box under box e2e-bbf"
+    fail
+  fi
+  echo "listed: $bbf_listed"
+  # Gone only on a list read that worked: a failed read proves nothing.
+  if ! (cd "$BBF_SEED_DIR" && mnl box list -o json) \
+      >"$WORK/bbf-after.json" 2>"$WORK/bbf-after.err" </dev/null; then
+    echo "::error::'min box list' failed after the build of $bbf_pkg, so it cannot show that the build box left"
+    cat "$WORK/bbf-after.err" 2>/dev/null || true
+    fail
+  fi
+  if ! bbf_left="$(jq -n -c --arg pkg "$bbf_pkg" --arg sid "$bbf_sid" \
+      'input | if type == "array" then
+         [.[] | select(.type == "build" and .name == $pkg and .parent == $sid)] | first // empty
+       else error("not a list") end' "$WORK/bbf-after.json")"; then
+    echo "::error::'min box list -o json' printed no JSON list after the build of $bbf_pkg"
+    head -c 2000 "$WORK/bbf-after.json" 2>/dev/null || true
+    fail
+  fi
+  if [ -n "$bbf_left" ]; then
+    echo "::error::the build of $bbf_pkg ended, but 'min box list' still shows its build box"
+    echo "still listed: $bbf_left"
+    fail
+  fi
+  # The daemon's file writer is asynchronous, so the line can land after the
+  # build returns: wait for it, as esu_wait_gate_line does.
+  for _ in $(seq 1 40); do
+    bbf_grant="$(bbf_grant_line)"
+    [ -z "$bbf_grant" ] || break
+    sleep 0.25
+  done
+  if [ -z "$bbf_grant" ]; then
+    echo "::error::the build of $bbf_pkg passed, but no build grant line for box e2e-bbf appeared in the daemon's log after the build began"
+    bbf_logs
+    fail
+  fi
+  echo "grant: $bbf_grant"
+  bbf_policy="$(mnl box show "$bbf_sid" --network 2>&1)"
+  if ! grep -qF 'deny-all' <<<"$bbf_policy"; then
+    echo "::error::the box's own rules changed: the reach is the build box's, not the box's"
+    printf '%s\n' "$bbf_policy"
+    fail
+  fi
+  mnl box rm --force "$bbf_sid" >/dev/null 2>&1 </dev/null || true
+  rm -rf "$BBF_SEED_DIR"
+  BBF_SEED_DIR=""
+  echo "a build box fetches its source OK"
+  echo "::endgroup::"
+}
+
 # T108 on the VM host, end to end: escapes and builds stay inside the box's
 # rules. Each refusal that reaches the host leaves a record there. The
 # vsock refusal inside the box is the one exception (see the RPC leg). One deny-all
@@ -27576,12 +27935,33 @@ proof_listen_published_port_reaches_peer_and_host() {
   # ---- the audit: the allow decision has its decisions.log line (NET-046) --
   # The watcher appends one record per listen it publishes, to the audit log
   # of the daemon that runs the box. On a VM lane that daemon is the guest's,
-  # whose state directory this host does not read — the same split the
-  # expose case's guest-audit legs carry — so the leg is counted NOT RUN
-  # there and asserted everywhere else.
+  # whose state directory this host does not read. The publish crossed to the
+  # VM host daemon's admission, though, and that admission writes its own
+  # copy to the owner-only host audit (audit/box-admissions.log, T84): the
+  # box, the port, and the source the report carried — a listen's is
+  # 'listen'. So on a VM lane the leg asserts that host-held line instead.
   if [ -n "${E2E_VM:-}" ]; then
-    not_run listen_published_port_reaches_peer_and_host \
-      "VM lane: the listen's decision record is in the guest daemon's audit file, which this host does not read (NET-046)"
+    local lp_vm_audit="$XDG_STATE_HOME/minimal/providers/local-minvmd0/audit/box-admissions.log"
+    local lp_vm_line=""
+    for _ in $(seq 1 20); do
+      lp_vm_line="$(grep -F "\"box\":\"$lp_target_name\"" "$lp_vm_audit" 2>/dev/null \
+        | grep -E "\"port\":${lp_listen_port}[,}]" \
+        | grep -F '"source":"listen"' | tail -n1)"
+      [ -n "$lp_vm_line" ] && break
+      sleep 0.25
+    done
+    if [ -z "$lp_vm_line" ]; then
+      echo "::error::the VM host daemon's host audit carries no admission line for box $lp_target_name port $lp_listen_port with source listen — the listen's publish was never audited on the host (T84, NET-046)"
+      local lp_vm_box_lines
+      lp_vm_box_lines="$(grep -F "\"box\":\"$lp_target_name\"" "$lp_vm_audit" 2>/dev/null || true)"
+      if [ -n "$lp_vm_box_lines" ]; then
+        printf '%s\n' "$lp_vm_box_lines" | sed 's/^/  /'
+      else
+        echo "(no host audit line for $lp_target_name in $lp_vm_audit)"
+      fi
+      fail
+    fi
+    echo "host audit: $lp_vm_line (the listen's admission in the owner-only host audit, T84, NET-046)"
   elif python3 - "$lp_target_name" "$lp_listen_port" \
       "$XDG_STATE_HOME/minimal/audit/decisions.log" <<'PY'
 import json
@@ -33284,6 +33664,7 @@ case "${1:-}" in
     # Beside the escape-union proof, for the same reason: it stops the daemon
     # pair and autospawns a fresh one under its own record filter.
     proof_escapes_and_builds_stay_inside_box_rules
+    proof_a_build_box_fetches_its_source
     # Beside them, for the same reason.
     proof_host_ip_rules_follow_the_running_box
     # Stops the VM host: its boxes, then the daemon and its VM. The next
@@ -33344,6 +33725,7 @@ case "${1:-}" in
     | published_proxy_routes_from_host \
     | escape_reaches_only_declared_union \
     | escapes_and_builds_stay_inside_box_rules \
+    | a_build_box_fetches_its_source \
     | host_ip_rules_follow_the_running_box \
     | host_ip_deny_all \
     | daemon_fetch_under_deny_all_host_address_box \
@@ -33425,6 +33807,7 @@ case "${1:-}" in
     echo "         published_proxy_routes_from_host"
     echo "         escape_reaches_only_declared_union"
     echo "         escapes_and_builds_stay_inside_box_rules"
+    echo "         a_build_box_fetches_its_source"
     echo "         host_ip_rules_follow_the_running_box"
     echo "         host_ip_deny_all"
     echo "         daemon_fetch_under_deny_all_host_address_box"

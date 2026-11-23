@@ -315,6 +315,25 @@ pub(crate) struct TypedBoxList<'a> {
     pub(crate) output: Option<BoxListOutputFormat>,
 }
 
+/// The records of `box_type` in `project_root`, every project when `None`.
+/// A typed listing shows boxes of its type only, so the build boxes a
+/// record carries are left out: `min box list` shows them.
+fn typed_records(
+    records: Vec<minimald_rpc::BoxListingEntry>,
+    box_type: &str,
+    project_root: Option<&paths::HostAbsPath>,
+) -> Vec<minimald_rpc::BoxListingEntry> {
+    records
+        .into_iter()
+        .filter(|entry| entry.box_type.as_deref() == Some(box_type))
+        .filter(|entry| project_root.is_none_or(|root| entry.project_root.as_ref() == Some(root)))
+        .map(|mut entry| {
+            entry.build_boxes.clear();
+            entry
+        })
+        .collect()
+}
+
 /// The typed listing over the local `hosts`: the `min box list` table, or
 /// its JSON array, with only the boxes of the requested type. A host that
 /// does not answer is named on `err`, and the list goes on without it. The
@@ -347,14 +366,8 @@ pub(crate) async fn typed_box_list_on_hosts(
             }
         };
         listed.extend(
-            records
+            typed_records(records, box_type, project_root.as_ref())
                 .into_iter()
-                .filter(|entry| entry.box_type.as_deref() == Some(box_type))
-                .filter(|entry| {
-                    project_root
-                        .as_ref()
-                        .is_none_or(|root| entry.project_root.as_ref() == Some(root))
-                })
                 .map(|record| ListedBox {
                     provider: host.provider.to_string(),
                     host: host.host.clone(),
@@ -473,7 +486,25 @@ pub(crate) async fn cmd_typed_box_rm(
 ) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
     let hosts = crate::cmd::list::local_hosts(global)?;
-    let (host, removed) = typed_box_rm_on_hosts(hosts, &args, box_type, verb).await?;
+    let mut prompt = RmPrompt {
+        no_input: global.no_input,
+        stdin_is_terminal: std::io::IsTerminal::is_terminal(&std::io::stdin()),
+        ask: Box::new(|lines: &[String], question: &str| {
+            for line in lines {
+                println!("{line}");
+            }
+            confirm(question, false)
+        }),
+    };
+    let (host, removed) =
+        match typed_box_rm_on_hosts(hosts, &args, box_type, verb, &mut prompt).await {
+            Ok(removed) => removed,
+            Err(e) if e.is::<RmAborted>() => {
+                writeln!(std::io::stdout().lock(), "Aborted.")?;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
     // The same cleanup as `min box rm`: withdraw the box's row on the VM
     // host daemon, or release the name it held.
     let control_sock = box_host_control_sock(&host);
@@ -485,18 +516,21 @@ pub(crate) async fn cmd_typed_box_rm(
     Ok(())
 }
 
-/// The typed removal over the local `hosts`. Returns the host that kept
-/// the box and the box it removed. Prints nothing.
+/// The typed removal over the local `hosts`. It runs the gate of
+/// `min box rm` first, so it refuses what `min box rm` refuses. Returns
+/// the host that kept the box and the box it removed. Prints nothing.
 pub(crate) async fn typed_box_rm_on_hosts(
     hosts: Vec<crate::cmd::list::LocalHost>,
     args: &BoxRmArgs,
     box_type: &str,
     verb: &'static str,
+    prompt: &mut RmPrompt<'_>,
 ) -> Result<(crate::cmd::list::LocalHost, RemovedBox), anyhow::Error> {
     let target = args.target.as_str();
     let ResolvedBox { host, box_id } = resolve_box_of_type(hosts, target, box_type, verb).await?;
     let removed = async {
         let mut client = gated_box_host_client(&host).await?;
+        rm_preflight(&mut client, box_id, target, args.force, prompt).await?;
         rm_listed_box(&mut client, box_id, target, args.force).await
     }
     .await;
@@ -508,6 +542,35 @@ pub(crate) async fn typed_box_rm_on_hosts(
 #[cfg(test)]
 mod tests {
     use super::activate_refusal;
+
+    /// BOX-210: `min session list` and `min task list` show boxes of their
+    /// type only, so a session's running build boxes are not rows there.
+    #[test]
+    fn a_typed_listing_leaves_out_build_boxes() {
+        let entry = |box_type: &str| minimald_rpc::BoxListingEntry {
+            build_boxes: vec![minimald_rpc::RunningBuildBox {
+                package: "claude-code".to_string(),
+                egress: None,
+                granted: false,
+                no_network: false,
+            }],
+            box_id: boxes::SessionId::mint(),
+            name: None,
+            box_type: Some(box_type.to_string()),
+            parent: None,
+            project_root: None,
+            state: "running".to_string(),
+            reason: None,
+            exit_code: None,
+            signal: None,
+            pty_enabled: true,
+            lifetime: None,
+        };
+        let typed = super::typed_records(vec![entry("session"), entry("task")], "session", None);
+        assert_eq!(typed.len(), 1);
+        assert_eq!(typed[0].box_type.as_deref(), Some("session"));
+        assert!(typed[0].build_boxes.is_empty());
+    }
 
     /// NET-144: the daemon's refusal reaches the person as its own text,
     /// with the port and the holder named, whatever context the
