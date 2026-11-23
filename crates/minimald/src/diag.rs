@@ -966,13 +966,16 @@ fn is_sensitive_flag(arg: &str) -> bool {
 }
 
 /// `name=value` with its whole value masked, when the argument is one
-/// assignment whose name is a sensitive key: the name has no whitespace (so
-/// a shell line or a header is not taken for one, and goes to the log scrub
-/// instead) and the value is not already a placeholder. `None` otherwise.
+/// assignment whose name is a sensitive key and the value is not already a
+/// placeholder. `None` otherwise, and the argument goes to the log scrub.
+///
+/// The name must have the form of an environment variable or of a long flag
+/// ([`is_assignment_name`]). A shell line, a header or a URL with a
+/// sensitive word before its first `=` has neither form, so the log scrub
+/// reads the whole of it, the part before the `=` included.
 fn scrub_sensitive_assignment(arg: &str) -> Option<String> {
     let (name, value) = arg.split_once('=')?;
-    if name.is_empty()
-        || name.contains(char::is_whitespace)
+    if !is_assignment_name(name)
         || value.is_empty()
         || value.starts_with("<redacted:len=")
         || !is_sensitive_key(name)
@@ -984,6 +987,25 @@ fn scrub_sensitive_assignment(arg: &str) -> Option<String> {
         "{name}={}",
         masked.as_str().unwrap_or("<redacted>")
     ))
+}
+
+/// True for the name of an environment variable (`API_TOKEN`: a letter or
+/// `_`, then letters, digits and `_`) and for a long flag (`--api-token`:
+/// `--`, a letter or digit, then letters, digits, `-`, `_` and `.`). ASCII
+/// only, so no separator of a URL, a path or a header is in a name.
+fn is_assignment_name(name: &str) -> bool {
+    match name.strip_prefix("--") {
+        Some(flag) => {
+            flag.starts_with(|c: char| c.is_ascii_alphanumeric())
+                && flag
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        }
+        None => {
+            name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+    }
 }
 
 /// The `io::ErrorKind` behind an [`anyhow::Error`], if one is in its chain.
@@ -1905,6 +1927,54 @@ mod tests {
         assert!(!shell.contains("ghp_shellLineExample0123"), "{shell}");
         assert!(shell.starts_with("curl -H "), "{shell}");
         assert_eq!(argv[5], "--secret=<redacted:len=3>");
+    }
+
+    /// A URL is not an assignment, whatever word stands before its first
+    /// `=`: its user name can hold `token` or `auth`. It goes to the log
+    /// scrub, which masks the userinfo. Only the name of an environment
+    /// variable or of a long flag makes an assignment.
+    #[test]
+    fn scrub_event_strings_sends_a_url_to_the_log_scrub() {
+        let mut event = serde_json_lenient::json!({
+            "data": {"argv": [
+                "git",
+                "clone",
+                "https://x-access-token:userinfoPassword0123@example.test/o/r.git?ref=main",
+                "https://oauth2:anotherPassword4567@example.test/o/r.git?a=b",
+            ]},
+        });
+        assert!(scrub_event_strings(&mut event));
+        let argv = event["data"]["argv"].as_array().unwrap();
+        let first = argv[2].as_str().unwrap();
+        assert!(!first.contains("userinfoPassword0123"), "{first}");
+        assert!(first.ends_with("@example.test/o/r.git?ref=main"), "{first}");
+        let second = argv[3].as_str().unwrap();
+        assert!(!second.contains("anotherPassword4567"), "{second}");
+        assert!(second.ends_with("@example.test/o/r.git?a=b"), "{second}");
+
+        for name in [
+            "API_TOKEN",
+            "_secret",
+            "--api-key",
+            "--db.password",
+            "--2fa-token",
+        ] {
+            assert!(is_assignment_name(name), "{name}");
+        }
+        for name in [
+            "",
+            "--",
+            "-t",
+            "---token",
+            "2TOKEN",
+            "https://token@host/?a",
+            "/etc/token",
+            "token:x",
+            "tok en",
+            "tökén",
+        ] {
+            assert!(!is_assignment_name(name), "{name}");
+        }
     }
 
     /// The value after a sensitive long flag is masked whole; the flag that
