@@ -16,33 +16,12 @@ pub(crate) fn project_has_mfile(project_path: &camino::Utf8Path) -> bool {
     )
 }
 
-/// Whether `--sync none` will silently discard a project config: true when a
-/// `minimal.toml` is found walking up from `dir`. The notice is only worth
-/// printing when there is a config to lose, so this mirrors
-/// [`project_has_mfile`]'s "any outcome other than NotFound counts as
-/// present" rule, but walks up the tree the way [`resolve_upload_root`] does.
-pub(crate) fn sync_none_drops_project_config(dir: &camino::Utf8Path) -> bool {
-    !matches!(
-        mfile::File::from_dir_recursive(dir.as_std_path()),
-        Err(mfile::Error::NotFound)
-    )
-}
-
-/// The notice `min activate --sync none` prints, or `None` when there is no
-/// project config up the tree for it to drop.
-pub(crate) fn sync_none_notice(dir: &camino::Utf8Path) -> Option<&'static str> {
-    sync_none_drops_project_config(dir).then_some(
-        "--sync none: this project's minimal.toml is not sent; the session uses a default \
-         project configuration (its packages, vars, patches and hooks are not applied)",
-    )
-}
-
 /// Offer to initialize a `minimal.toml` at the project path when it has
 /// none, on the way into an activation or a `min add`.
 ///
 /// Purely an offer: declining or skipping returns `Ok` and leaves the
 /// project untouched. `decline_notice`, when `Some`, is printed in that
-/// case. `min session activate` passes the session-specific wording; `min
+/// case. `min session start` passes the session-specific wording; `min
 /// add` passes `None` and reports its own `min init` hint if the project
 /// still has no config afterwards.
 ///
@@ -169,22 +148,18 @@ pub enum UploadDecision {
 /// carve-out is testable off this machine's own home directory.
 pub(crate) fn decide_workspace_upload(
     root: &camino::Utf8Path,
-    sync_explicit: bool,
     headless: bool,
     home: Option<&std::path::Path>,
 ) -> UploadDecision {
     // An empty box has nothing to sync, and `$HOME` — even when non-empty or
     // itself a VCS root — is far too much to bulk-upload on a stray keystroke.
-    // A deliberate `--sync tarball` (`sync_explicit`) is the escape hatch that
-    // still uploads both. A `$HOME` that is itself a declared project loses
-    // its hooks here; the callers refuse over that count rather than let the
+    // A `$HOME` that is itself a declared project loses its hooks here; the callers refuse over that count rather than let the
     // session come up without them.
-    if !sync_explicit && file_upload::is_empty_or_home(root.as_std_path(), home) {
+    if file_upload::is_empty_or_home(root.as_std_path(), home) {
         return UploadDecision::SkipEmptyOrHome;
     }
     match file_upload::upload_gate(
         file_upload::is_vcs_root(root.as_std_path()),
-        sync_explicit,
         project_has_mfile(root),
         headless,
     ) {
@@ -371,15 +346,15 @@ pub(crate) fn refuse_dropped_hooks_before_create(
     Err(dropped_hooks_error(root, dropped_hooks, remedy))
 }
 
-/// What a refusing CLI caller tells the user of a `$HOME` create: which of
-/// the two upload flags they meant.
-pub(crate) const CLI_DROPPED_HOOKS_REMEDY: &str = "Pass `--sync tarball` to upload the project (hooks included), or `--sync none` to start \
-     without them deliberately";
+/// What a refusing CLI caller tells the user of a `$HOME` create: the flag
+/// that starts the box without the hooks on purpose.
+pub(crate) const CLI_DROPPED_HOOKS_REMEDY: &str =
+    "Pass `--no-hooks` to start without them deliberately";
 
-/// What `min dash`, which owns neither flag, tells the user of the same
+/// What `min dash`, which has no `--no-hooks`, tells the user of the same
 /// create: the command that does.
 pub(crate) const DASH_DROPPED_HOOKS_REMEDY: &str =
-    "Create the box from a terminal with `min session activate --sync tarball` instead";
+    "Create the box from a terminal with `min session start --no-hooks` instead";
 
 /// The refusal for the skip that would drop the project's lifecycle hooks,
 /// for the callers that refuse rather than start a box without them. `min
@@ -1134,7 +1109,7 @@ pub async fn cmd_add(global: &GlobalArgs, args: AddArgs) -> Result<(), mctx::Err
     let mut ctx = match mctx::Context::new(config) {
         Ok(ctx) => ctx,
         // A project with no `minimal.toml` cannot take a dependency, so offer
-        // the same scaffold `min session activate` does before failing with
+        // the same scaffold `min session start` does before failing with
         // the `min init` hint `min update` already gives.
         Err(mctx::Error::MFile(mfile::Error::NotFound)) => {
             let project_path = match &global.repo_dir {
@@ -1209,7 +1184,7 @@ pub async fn cmd_add(global: &GlobalArgs, args: AddArgs) -> Result<(), mctx::Err
     } else {
         eprintln!(
             "Note: packages are not downloaded now; they are downloaded the \
-             next time you run `min session activate`."
+             next time you run `min session start`."
         );
     }
 
@@ -1224,7 +1199,7 @@ pub async fn cmd_update(global: &GlobalArgs, _args: UpdateArgs) -> Result<(), mc
     let mut ctx = match mctx::Context::new(config) {
         Ok(ctx) => ctx,
         // Point a user with no `minimal.toml` at `min init`, matching the hint
-        // `min session activate` gives in the same situation.
+        // `min session start` gives in the same situation.
         Err(e @ mctx::Error::MFile(mfile::Error::NotFound)) => {
             return Err(mctx::Error::Other(anyhow::anyhow!(
                 "{e}\nRun 'min init' to give the project its own config."
@@ -1261,7 +1236,7 @@ pub async fn cmd_update(global: &GlobalArgs, _args: UpdateArgs) -> Result<(), mc
     if report.repinned() {
         println!(
             "\nRe-pinned minimal.toml (a diff to commit). The next \
-             'min session activate' materializes the new closure, which can \
+             'min session start' materializes the new closure, which can \
              take several minutes on the first activate.\n\
              This did not update the 'min' binary; reinstall it with the \
              installer to do that."
@@ -1280,7 +1255,7 @@ pub async fn cmd_update(global: &GlobalArgs, _args: UpdateArgs) -> Result<(), mc
     } else {
         eprintln!(
             "Note: packages are not downloaded now; they are downloaded the \
-             next time you run `min session activate`."
+             next time you run `min session start`."
         );
     }
 

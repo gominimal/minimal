@@ -232,7 +232,10 @@ fn version_skew_is_reported_with_both_builds_and_a_recovery() {
         msg.contains("0.5.0-dev.12.g86ce5c3a"),
         "missing the daemon version: {msg}"
     );
-    assert!(msg.contains("min stop"), "missing the recovery: {msg}");
+    assert!(
+        msg.contains("min host stop <host>"),
+        "missing the recovery: {msg}"
+    );
     assert!(
         msg.contains(client::SKEW_OVERRIDE_VAR),
         "missing the override: {msg}"
@@ -893,6 +896,18 @@ async fn removed_session_verbs_fail_as_unknown_commands() {
         );
     }
 
+    // `--sync` left with `min session activate`: no start takes it.
+    for argv in [
+        &["min", "session", "start", "--sync", "none"][..],
+        &["min", "box", "start", "--sync", "none"],
+    ] {
+        let rendered = refused(argv, ErrorKind::UnknownArgument);
+        assert!(
+            rendered.contains("unexpected argument '--sync'"),
+            "{argv:?}: {rendered}"
+        );
+    }
+
     // The command model has none of them, hidden or not, so neither help
     // nor completions offer them.
     let cli = Cli::command();
@@ -1524,7 +1539,7 @@ fn held_name_refusal_exits_2_and_names_the_holder() {
         printed,
         "Cannot create a session named `default`: the running session `Default` \
          (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) holds that name. Rename that session \
-         with `min session rename 0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b <new-name>`, \
+         with `min box rename 0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b <new-name>`, \
          or choose another name."
     );
 
@@ -1560,7 +1575,7 @@ fn own_address_held_name_refusal_exits_2_and_names_the_holder() {
         format!("{error:#}"),
         "Cannot create a session named `dev`: the running session `Dev` \
          (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) holds that name. Rename that session \
-         with `min session rename 0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b <new-name>`, \
+         with `min box rename 0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b <new-name>`, \
          or choose another name."
     );
 
@@ -3801,44 +3816,6 @@ fn project_has_mfile_false_when_absent() {
     assert!(!project_has_mfile(path));
 }
 
-/// `--sync none` drops a config only when one exists up the tree: a
-/// `minimal.toml` at the project root is detected from a nested subdir,
-/// so the notice fires for the case that would otherwise silently lose
-/// the project's packages, vars, patches and hooks.
-#[test]
-fn sync_none_drops_project_config_true_when_mfile_up_tree() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join(mfile::MFILE_NAME),
-        "[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\n",
-    )
-    .unwrap();
-    let root = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
-    let subdir = root.join("nested/deep");
-    std::fs::create_dir_all(&subdir).unwrap();
-
-    assert!(sync_none_drops_project_config(&subdir));
-    let notice = sync_none_notice(&subdir).expect("a config to drop gets a notice");
-    assert!(notice.contains("minimal.toml is not sent"), "{notice}");
-}
-
-/// With no mfile anywhere up the tree, `--sync none` has nothing to
-/// drop, so the notice stays silent. Anchored in `$HOME` for the same
-/// reason as [`resolve_upload_root_returns_input_when_no_mfile`]: the
-/// upward walk stops there, so "no mfile up the tree" is guaranteed.
-#[test]
-fn sync_none_drops_project_config_false_when_no_mfile() {
-    let Some(home) = std::env::home_dir() else {
-        return; // no HOME: no walk boundary to anchor the test to
-    };
-    let Ok(dir) = tempfile::tempdir_in(&home) else {
-        return; // can't create temp dir in HOME, such as on a read only file system
-    };
-    let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
-    assert!(!sync_none_drops_project_config(path));
-    assert_eq!(sync_none_notice(path), None);
-}
-
 /// With no mfile anywhere up the tree, `resolve_upload_root` returns the
 /// input directory unchanged — the original activate behaviour.
 ///
@@ -3907,21 +3884,20 @@ fn resolve_upload_root_errors_on_malformed_mfile() {
 }
 
 /// The pure upload decision over its whole domain: the empty/`$HOME`
-/// carve-out, the explicit-sync escape hatch, and the VCS / blueprint /
+/// carve-out and the VCS / blueprint /
 /// headless gate, with no TTY and no daemon in sight.
 #[test]
 fn decide_workspace_upload_covers_empty_vcs_blueprint_and_headless() {
-    // An empty directory skips silently — unless the caller passed an
-    // explicit `--sync tarball`, which uploads it anyway.
+    // An empty directory skips silently.
     let empty = tempfile::tempdir().unwrap();
     let empty = camino::Utf8Path::from_path(empty.path()).expect("temp path is UTF-8");
     assert_eq!(
-        decide_workspace_upload(empty, false, false, None),
+        decide_workspace_upload(empty, false, None),
         UploadDecision::SkipEmptyOrHome
     );
     assert_eq!(
-        decide_workspace_upload(empty, true, false, None),
-        UploadDecision::Upload
+        decide_workspace_upload(empty, true, None),
+        UploadDecision::SkipEmptyOrHome
     );
 
     // A non-empty, undeclared, non-VCS root: a headless caller skips with
@@ -3930,11 +3906,11 @@ fn decide_workspace_upload_covers_empty_vcs_blueprint_and_headless() {
     std::fs::write(plain.path().join("notes.txt"), "x").unwrap();
     let plain = camino::Utf8Path::from_path(plain.path()).expect("temp path is UTF-8");
     assert_eq!(
-        decide_workspace_upload(plain, false, true, None),
+        decide_workspace_upload(plain, true, None),
         UploadDecision::SkipUndeclared
     );
     assert_eq!(
-        decide_workspace_upload(plain, false, false, None),
+        decide_workspace_upload(plain, false, None),
         UploadDecision::Confirm
     );
 
@@ -3944,7 +3920,7 @@ fn decide_workspace_upload_covers_empty_vcs_blueprint_and_headless() {
     std::fs::create_dir(repo.path().join(".git")).unwrap();
     let repo = camino::Utf8Path::from_path(repo.path()).expect("temp path is UTF-8");
     assert_eq!(
-        decide_workspace_upload(repo, false, true, None),
+        decide_workspace_upload(repo, true, None),
         UploadDecision::Upload
     );
 
@@ -3953,7 +3929,7 @@ fn decide_workspace_upload_covers_empty_vcs_blueprint_and_headless() {
     std::fs::write(declared.path().join(mfile::MFILE_NAME), "[upstream]\n").unwrap();
     let declared = camino::Utf8Path::from_path(declared.path()).expect("temp path is UTF-8");
     assert_eq!(
-        decide_workspace_upload(declared, false, true, None),
+        decide_workspace_upload(declared, true, None),
         UploadDecision::Upload
     );
 
@@ -3970,7 +3946,7 @@ fn decide_workspace_upload_covers_empty_vcs_blueprint_and_headless() {
     .unwrap();
     let home = camino::Utf8Path::from_path(home.path()).expect("temp path is UTF-8");
     assert_eq!(
-        decide_workspace_upload(home, false, false, Some(home.as_std_path())),
+        decide_workspace_upload(home, false, Some(home.as_std_path())),
         UploadDecision::SkipEmptyOrHome
     );
     assert_eq!(project_lifecycle_hook_count(home), 1);
@@ -3987,12 +3963,12 @@ fn decide_workspace_upload_covers_empty_vcs_blueprint_and_headless() {
     );
 }
 
-/// The refusal a hook-dropping skip raises names the root, the count, and the
-/// `--sync` escape hatch. It is shared by both CLI callers and by the
+/// The refusal a hook-dropping skip raises names the root, the count, and
+/// `--no-hooks`, the flag that starts the box without them. It is shared by both CLI callers and by the
 /// dashboard's own gate, so the wording cannot drift between them; the remedy
 /// clause is the caller's, and each caller's names what it can do.
 #[test]
-fn dropped_hooks_error_names_root_count_and_escape_hatch() {
+fn dropped_hooks_error_names_root_count_and_no_hooks() {
     let err = dropped_hooks_error(
         camino::Utf8Path::new("/srv/data/run42"),
         3,
@@ -4002,11 +3978,14 @@ fn dropped_hooks_error_names_root_count_and_escape_hatch() {
     assert!(text.contains("/srv/data/run42"), "{text}");
     assert!(text.contains("is your home directory"), "{text}");
     assert!(text.contains("3 lifecycle hook(s)"), "{text}");
-    assert!(text.contains("--sync tarball"), "{text}");
-    assert!(text.contains("--sync none"), "{text}");
+    assert!(
+        text.contains("Pass `--no-hooks` to start without them deliberately."),
+        "{text}"
+    );
+    assert!(!text.contains("--sync"), "{text}");
 
-    // The dashboard owns neither flag, so its refusal names the command that
-    // does rather than advice no key on the screen can follow.
+    // The dashboard has no `--no-hooks`, so its refusal names the command
+    // that does rather than advice no key on the screen can follow.
     let dashboard = dropped_hooks_error(
         camino::Utf8Path::new("/home/dev"),
         2,
@@ -4014,13 +3993,12 @@ fn dropped_hooks_error_names_root_count_and_escape_hatch() {
     )
     .to_string();
     assert!(
-        dashboard.contains("min session activate --sync tarball"),
+        dashboard.contains(
+            "Create the box from a terminal with `min session start --no-hooks` instead."
+        ),
         "{dashboard}"
     );
-    assert!(
-        !dashboard.contains("`--sync none`"),
-        "the dashboard cannot pass --sync none, so it must not be told to: {dashboard}"
-    );
+    assert!(!dashboard.contains("--sync"), "{dashboard}");
 }
 
 /// The resolved-root notice appears only when the upload walked above the
@@ -17358,7 +17336,7 @@ fn parsed_run(argv: &[&str]) -> task::RunEntry {
 async fn start_and_run_take_every_network_key_flag() {
     let activate = activate_long_flags();
     // The flags of activate that do not override a key of the box.
-    let not_overrides = ["--name", "--sync", "--no-prompt", "--attach", "--help"];
+    let not_overrides = ["--name", "--no-prompt", "--attach", "--help"];
     // The run path takes no `--ingress` (#3163) and no `--loadout` (#3237).
     let not_on_run = ["--ingress", "--loadout"];
     for verb in [

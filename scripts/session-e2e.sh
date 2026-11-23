@@ -7054,6 +7054,11 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     # shellcheck disable=SC2016 # $l is the task's, expanded in the box
     printf '\n[tasks.e2e-stdin]\nbash = "read -r l; echo STDIN_GOT:$l"\n'
     printf '\n[tasks.e2e-sleep]\nbash = "sleep 300"\n'
+    # A task that runs long enough to outlive its box's stop, and traps
+    # TERM so a stop that reaches it is observable: the trap's echo lands in
+    # the redirected output, and the wait below proves the run itself ended
+    # 0 — the task's own exit, not the relay's signal death.
+    printf '\n[tasks.e2e-stoptask]\nbash = "trap '"'"'echo TASK-TERM; echo TASK-TERM >&2; exit 0'"'"' TERM; echo TASK-UP; sleep 31337 & wait; echo TASK-NOT-STOPPED"\n'
     printf '\n[tasks.e2e-envprint]\nexec = "printenv E2E_INHERIT_MARKER"\nenv_vars.E2E_INHERIT_MARKER = { inherit = true }\n'
     # shellcheck disable=SC2016 # $PWD is the task's, expanded in the box
     printf '\n[tasks.e2e-ic]\ninherit_cwd = true\nbash = "echo PWD=$PWD"\n'
@@ -7213,6 +7218,101 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     fail
   fi
   echo "task run interrupt: box stopped, record kept, exit 130 OK"
+
+  # `min box stop` on a task box must stop the task itself, not just the
+  # box's own relay: the daemon records the container each invocation runs
+  # in and signals it first, so the task's TERM trap runs, the run exits 0,
+  # and the box record keeps that exit (BOX-013). Before the fix only the
+  # relay died: the client saw 143 and the task was left running.
+  ts_env=()
+  # shellcheck disable=SC2031
+  if [ -n "$E2E_NATIVE_SWITCH_DIR" ] && [ "${MINIMAL_BIN:-}" = "$E2E_LANE_MINIMAL_BIN" ]; then
+    ts_env=(env "MINIMAL_BIN=$E2E_NATIVE_SWITCH_DIR")
+  fi
+  # shellcheck disable=SC2086
+  (cd "$TASK_SEED_DIR" \
+    && exec ${ts_env[@]+"${ts_env[@]}"} min ${E2E_MINIMAL_ARGS:-} task run e2e-stoptask \
+      >"$WORK/task-stop.out" 2>"$WORK/task-stop.err") &
+  ts_pid=$!
+  ts_name=""
+  for _ in $(seq 1 120); do
+    ts_name="$(grep -o 'Running task e2e-stoptask in box [^ .]*' "$WORK/task-stop.err" 2>/dev/null \
+      | head -n1)"
+    ts_name="${ts_name#Running task e2e-stoptask in box }"
+    [ -n "$ts_name" ] && break
+    sleep 0.5
+  done
+  if [ -z "$ts_name" ]; then
+    echo "::error::'min task run e2e-stoptask' did not name its box"
+    cat "$WORK/task-stop.err" 2>/dev/null || true
+    kill "$ts_pid" 2>/dev/null || true
+    fail
+  fi
+  for _ in $(seq 1 120); do
+    grep -q 'TASK-UP' "$WORK/task-stop.out" 2>/dev/null && break
+    sleep 0.5
+  done
+  if ! grep -q 'TASK-UP' "$WORK/task-stop.out" 2>/dev/null; then
+    echo "::error::task e2e-stoptask never reported TASK-UP in the box $ts_name"
+    cat "$WORK/task-stop.out" 2>/dev/null || true
+    mnl box stop "$ts_name" >/dev/null 2>&1 || true
+    kill "$ts_pid" 2>/dev/null || true
+    fail
+  fi
+  # Long enough for the trap to be armed at the wait.
+  sleep 3
+  if ! mnl box stop "$ts_name" </dev/null >"$WORK/task-stop-stop.out" 2>"$WORK/task-stop-stop.err"; then
+    echo "::error::'min box stop $ts_name' failed while the task was running"
+    cat "$WORK/task-stop-stop.err" 2>/dev/null || true
+    kill "$ts_pid" 2>/dev/null || true
+    fail
+  fi
+  # The client ends with the task's relayed exit. A client still connected
+  # after the stop is the regression this proof catches, so the wait is
+  # bounded and a miss fails with the client's output.
+  ts_deadline=$((SECONDS + 60))
+  while kill -0 "$ts_pid" 2>/dev/null && [ "$SECONDS" -lt "$ts_deadline" ]; do
+    sleep 0.5
+  done
+  if kill -0 "$ts_pid" 2>/dev/null; then
+    echo "::error::'min task run e2e-stoptask' was still running 60s after 'min box stop $ts_name'"
+    echo "--- task stdout ---"; cat "$WORK/task-stop.out" 2>/dev/null || true
+    echo "--- task stderr ---"; cat "$WORK/task-stop.err" 2>/dev/null || true
+    kill "$ts_pid" 2>/dev/null || true
+    wait "$ts_pid" 2>/dev/null || true
+    fail
+  fi
+  wait "$ts_pid"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "::error::'min task run e2e-stoptask' exited $rc after 'min box stop' (expected 0)"
+    echo "--- task stdout ---"; cat "$WORK/task-stop.out" 2>/dev/null || true
+    echo "--- task stderr ---"; cat "$WORK/task-stop.err" 2>/dev/null || true
+    fail
+  fi
+  if ! grep -q 'TASK-TERM' "$WORK/task-stop.out" 2>/dev/null; then
+    echo "::error::the task never saw the stop's TERM (no TASK-TERM in its output)"
+    echo "--- task stdout ---"; cat "$WORK/task-stop.out" 2>/dev/null || true
+    echo "--- task stderr ---"; cat "$WORK/task-stop.err" 2>/dev/null || true
+    fail
+  fi
+  if grep -q 'TASK-NOT-STOPPED' "$WORK/task-stop.out" 2>/dev/null; then
+    echo "::error::the task outlived the stop (TASK-NOT-STOPPED printed after the wait)"
+    echo "--- task stdout ---"; cat "$WORK/task-stop.out" 2>/dev/null || true
+    fail
+  fi
+  # `min ls` prints only the state; `min box show` prints the exit code the
+  # record keeps.
+  ts_shown="$(mnl box show "$ts_name" </dev/null 2>&1)" || ts_shown=""
+  ts_state="$(printf '%s\n' "$ts_shown" | sed -n 's/^State: *//p' | tr -d '\r')"
+  ts_code="$(printf '%s\n' "$ts_shown" | sed -n 's/^Exit code: *//p' | tr -d '\r')"
+  if [ "$ts_state" != stopped ] || [ "$ts_code" != 0 ]; then
+    echo "::error::stopped task box $ts_name is recorded as state '${ts_state:-<none>}', exit code '${ts_code:-<none>}' (expected stopped, 0)"
+    echo "--- min box show $ts_name ---"; printf '%s\n' "$ts_shown"
+    fail
+  fi
+  task_kept_check e2e-stoptask "$WORK/task-stop.err"
+  echo "task run box-stop: task container signalled, run exits 0, record kept OK"
 
   # The step that ran a declared task inside a running session is gone: the
   # CLI no longer has that verb, and no box verb replaces it yet.

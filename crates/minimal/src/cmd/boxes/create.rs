@@ -3923,7 +3923,7 @@ pub(crate) fn stamp_session_spec_as(
 /// The project root to record for an activation from `dir`. Tarball sync
 /// already resolved it as `upload_root`, so it is reused. Otherwise the root
 /// is resolved here. `CheckProject` already refuses a `minimal.toml` that does
-/// not load under every `--sync` mode, before `PlanUpload` runs, so an error
+/// not load, with or without an upload, before `PlanUpload` runs, so an error
 /// here is not expected and propagates.
 ///
 /// # Errors
@@ -3942,7 +3942,7 @@ fn activation_project_root(
 /// The workspace upload a create planned, so the upload step holds one value
 /// instead of a root and a decision that are only meaningful together.
 enum UploadPlan {
-    /// `--sync none`: the daemon composes against an empty workspace.
+    /// `skip_upload`: the daemon composes against an empty workspace.
     Skip,
     /// The tree to stream, and what the upload gate decided about it.
     Workspace {
@@ -4365,25 +4365,21 @@ pub(crate) async fn activate_box(
     // skew override, which is what lets an operator proceed.
     request.must_match_version = version_assertion();
 
-    // `--sync` defaults to tarball; `sync_explicit` records whether the
-    // user actually typed the flag, which distinguishes a deliberate
-    // `--sync tarball` (the escape hatch that force-uploads an empty dir
-    // or `$HOME`) from the implicit default.
-    let sync_explicit = args.sync.is_some();
-
     // Resolve the upload root before opening the daemon connection: a
     // malformed mfile in an ancestor should fail loudly before we create a
     // session on the daemon, so we don't leak a draft session. Resolved
     // before the loadout prep, which checks the project's own hooks and sizes
     // the finalize budget against the project root — not the directory the
-    // command was invoked from. Only needed for tarball sync, the default:
-    // `--sync none` skips the upload entirely (#770).
-    let upload_root = match args.sync.unwrap_or(SyncMode::Tarball) {
-        SyncMode::None => None,
-        SyncMode::Tarball => Some(resolve_upload_root(&utf8_path)?),
+    // command was invoked from. Every start from the command line uploads
+    // (BCLI-042 removed `--sync`); only an internal start that sets
+    // `skip_upload` goes without one.
+    let upload_root = if args.skip_upload {
+        None
+    } else {
+        Some(resolve_upload_root(&utf8_path)?)
     };
-    // The record's project root (BOX-001), set on the request below under
-    // every `--sync` mode, `none` included.
+    // The record's project root (BOX-001), set on the request below with
+    // or without an upload.
     let project_root = activation_project_root(upload_root.as_deref(), &utf8_path)?;
 
     let (
@@ -4438,10 +4434,10 @@ pub(crate) async fn activate_box(
             // Scaffold-offer a missing `minimal.toml` only after the loadouts
             // resolve and compose: a bad `--loadout` must error before anything
             // prints, so the user is never told the session is proceeding and
-            // then that it is not. `--sync none` never sends a `minimal.toml`,
-            // so offering to create one there would only write a file the
-            // session then ignores.
-            if offer_scaffold && !matches!(args.sync, Some(SyncMode::None)) {
+            // then that it is not. A start without an upload never sends a
+            // `minimal.toml`, so offering to create one there would only write
+            // a file the session then ignores.
+            if offer_scaffold && !args.skip_upload {
                 offer_mfile_scaffold(
                     &utf8_path,
                     global,
@@ -4521,12 +4517,8 @@ pub(crate) async fn activate_box(
                 return Ok::<_, anyhow::Error>(UploadPlan::Skip);
             };
             let headless = args.no_prompt || global.no_input || !can_prompt_interactively();
-            let decision = decide_workspace_upload(
-                &root,
-                sync_explicit,
-                headless,
-                std::env::home_dir().as_deref(),
-            );
+            let decision =
+                decide_workspace_upload(&root, headless, std::env::home_dir().as_deref());
             // Only a hooks-enabled activation refuses: `--no-hooks` already
             // disabled the project's hooks, so it cannot drop any by surprise.
             if !args.no_hooks {
@@ -5157,22 +5149,15 @@ pub(crate) async fn activate_box(
     // workspace holds the user's files — `ConfigureLoadout`'s compose
     // reads the mfile (and any local `packages/`, `stacks/`,
     // `profiles/` used by graph resolution) off that workspace, so it
-    // has to run before `ConfigureLoadout`. `--sync none` opts out;
+    // has to run before `ConfigureLoadout`. `skip_upload` opts out;
     // the daemon then composes against an empty workspace and the
     // caller is on their own for getting files there.
     ActivationStep::UploadFiles
         .run(async {
             match upload_plan {
-                UploadPlan::Skip => {
-                    // `--sync none` skips the upload, so the daemon composes against
-                    // an empty workspace and the project's `minimal.toml` — packages,
-                    // vars, patches, hooks — is silently dropped. Say so when there
-                    // is a config to lose, so the default-config session is not a
-                    // surprise.
-                    if let Some(notice) = sync_none_notice(&utf8_path) {
-                        eprintln!("{notice}");
-                    }
-                }
+                // An internal start without an upload: the daemon composes
+                // against an empty workspace.
+                UploadPlan::Skip => {}
                 UploadPlan::Workspace { root, decision } => {
                     // `--no-hooks` already disabled the project's hooks, so a
                     // skip cannot drop anything by surprise and says nothing
@@ -6113,7 +6098,7 @@ mod tests {
         let args = ActivateArgs {
             name: Some("grant-box".into()),
             path: Some(project.path().to_string_lossy().into_owned()),
-            sync: None,
+            skip_upload: false,
             network: Some(CliNetworkMode::OwnIp),
             ingress: Vec::new(),
             dynamic_ingress: None,
@@ -6602,7 +6587,7 @@ mod tests {
         let args = ActivateArgs {
             name: Some("broken-box".into()),
             path: Some(project.path().to_string_lossy().into_owned()),
-            sync: None,
+            skip_upload: false,
             network: Some(CliNetworkMode::OwnIp),
             ingress: Vec::new(),
             dynamic_ingress: None,

@@ -606,6 +606,52 @@ pub struct SwitchClient {
     /// addresses ([`Self::allowing_self_allocation`]).
     #[cfg(test)]
     allow_self_allocation: bool,
+    /// The leases a native finalize drew before the box's first attach, each
+    /// with the declared forwards bound toward it, so a program on the host
+    /// reaches the box's declared ports as soon as it is active. The box's
+    /// first attach takes the lease and the forwards
+    /// ([`Self::attach_drawn`], [`Self::attach_handed`],
+    /// [`Self::take_activation_forwards`]). The box's stop or destroy releases
+    /// them when no attach took them ([`Self::release_activation_bind`]).
+    activation_binds: Vec<ActivationBind>,
+    /// How many times this supervisor spawned gvproxy. A forward lives in
+    /// the gvproxy that bound it, so a lease drawn under an earlier spawn
+    /// has lost its activation forwards.
+    spawns: u64,
+    /// Whether a test serves this switch's control socket itself, so
+    /// [`Self::ensure_running`] spawns nothing ([`Self::serve_externally`]).
+    #[cfg(test)]
+    served_externally: bool,
+}
+
+/// One box's lease and the declared forwards a native finalize bound toward
+/// it, before any attach ([`SwitchClient::draw_for_activation`]).
+struct ActivationBind {
+    /// The box the lease was drawn for.
+    session: boxes::SessionId,
+    /// The lease. It counts as one attach from the draw on, so the switch
+    /// runs while the forwards stand.
+    lease: PtaskLease,
+    /// The declared forwards bound toward the lease.
+    forwards: Vec<policy::PortForwarder>,
+    /// Whether an attach took the lease. Its forwards are then the attach's
+    /// to take, and the box's stop leaves them alone.
+    claimed: bool,
+    /// [`SwitchClient::spawns`] when the forwards were bound. A later
+    /// spawn means the gvproxy that held them exited.
+    spawn: u64,
+}
+
+impl std::fmt::Debug for ActivationBind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActivationBind")
+            .field("session", &self.session)
+            .field("lease", &self.lease)
+            .field("forwards", &self.forwards.len())
+            .field("claimed", &self.claimed)
+            .field("spawn", &self.spawn)
+            .finish()
+    }
 }
 
 impl SwitchClient {
@@ -641,6 +687,10 @@ impl SwitchClient {
             hostname_proxy_stranded: std::collections::HashSet::new(),
             #[cfg(test)]
             allow_self_allocation: false,
+            activation_binds: Vec::new(),
+            spawns: 0,
+            #[cfg(test)]
+            served_externally: false,
         }
     }
 
@@ -749,6 +799,25 @@ impl SwitchClient {
     pub(crate) fn allowing_self_allocation(mut self) -> Self {
         self.allow_self_allocation = true;
         self
+    }
+
+    /// Lets a test serve this switch's control socket itself: the switch
+    /// spawns no gvproxy and takes the socket the test binds as running.
+    #[cfg(test)]
+    pub(crate) fn serve_externally(&mut self) {
+        self.served_externally = true;
+    }
+
+    /// The control channel this switch is reached on: its control socket
+    /// for a switch this daemon spawns, the host shuttle's vsock port for
+    /// the VM host's.
+    fn control_channel(&self) -> policy::ControlChannel {
+        match self.transport {
+            SwitchTransport::LocalSpawn => policy::ControlChannel::Unix(self.control_socket()),
+            SwitchTransport::HostShuttle { cid, port } => {
+                policy::ControlChannel::Vsock { cid, port }
+            }
+        }
     }
 
     /// Whether this switch may draw an address of its own: only when it
@@ -882,6 +951,15 @@ impl SwitchClient {
     /// handed address; propagates config-write, spawn, and socket-readiness
     /// failures as [`Self::attach`] does.
     pub async fn attach_handed(&mut self, handed: Ipv4Addr) -> Result<AttachResult, NetError> {
+        // The box's first attach after a native finalize drew its lease at
+        // this address takes that lease, and the forwards bound toward it.
+        if let Some(index) = self
+            .activation_binds
+            .iter()
+            .position(|bind| !bind.claimed && bind.lease.ip == handed)
+        {
+            return self.claim_activation_lease(index).await;
+        }
         let lease = self.allocator.hand(handed)?;
         // DM2 spawns + configures gvproxy locally; DM1/3/4 (HostShuttle) leaves
         // gvproxy to `minvmd` on the host, so skip the spawn/config steps and
@@ -937,6 +1015,168 @@ impl SwitchClient {
         Err(NetError::TaskSlotsBusy { slots: slots.len() })
     }
 
+    /// Attaches a box whose creator handed it no switch address. The lease
+    /// a native finalize drew for `session` is taken when one stands
+    /// ([`Self::draw_for_activation`]). Otherwise this draws, as
+    /// [`Self::attach`] does.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::attach`].
+    pub async fn attach_drawn(
+        &mut self,
+        session: Option<boxes::SessionId>,
+    ) -> Result<AttachResult, NetError> {
+        if let Some(index) = session.and_then(|session| {
+            self.activation_binds
+                .iter()
+                .position(|bind| !bind.claimed && bind.session == session)
+        }) {
+            return self.claim_activation_lease(index).await;
+        }
+        self.attach().await
+    }
+
+    /// Hands the lease of `activation_binds[index]` to the attach that
+    /// asks for it. The lease counts as an attach since its draw, so the
+    /// count does not move.
+    async fn claim_activation_lease(&mut self, index: usize) -> Result<AttachResult, NetError> {
+        if matches!(self.transport, SwitchTransport::LocalSpawn) {
+            self.ensure_running().await?;
+        }
+        let spawns = self.spawns;
+        let bind = &mut self.activation_binds[index];
+        bind.claimed = true;
+        let lease = bind.lease;
+        // The gvproxy that held the activation forwards exited, and the one
+        // running now has none of them. The attach then binds every declared
+        // port again, as it does when no forward stands.
+        if bind.spawn != spawns && !bind.forwards.is_empty() {
+            tracing::warn!(
+                ip = %lease.ip,
+                session_id = %bind.session,
+                forwards = bind.forwards.len(),
+                "the switch restarted after the box's activation; \
+                 the attach binds its declared ports again"
+            );
+            bind.forwards.clear();
+        }
+        tracing::info!(
+            ip = %lease.ip,
+            epoch = lease.epoch,
+            session_id = %bind.session,
+            forwards = bind.forwards.len(),
+            attached = self.attached,
+            "attached OwnIp PTask to gvproxy switch at the lease its activation drew"
+        );
+        let exit_signal = self.exit_tx.subscribe();
+        Ok(AttachResult { lease, exit_signal })
+    }
+
+    /// The lease a finalize drew for `session` before any attach, while
+    /// one stands.
+    #[must_use]
+    pub fn activation_lease(&self, session: boxes::SessionId) -> Option<PtaskLease> {
+        self.activation_binds
+            .iter()
+            .find(|bind| bind.session == session)
+            .map(|bind| bind.lease)
+    }
+
+    /// Draws `session`'s lease when a native finalize binds its declared
+    /// forwards, before the box's first attach: at `handed` when the
+    /// creator handed the box a switch address, else from the daemon's
+    /// reserve. The switch starts, and the lease counts as an attach, so
+    /// the forwards bound toward it stand until the box's first attach
+    /// takes the lease or its stop releases it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::attach_handed`] or [`Self::attach`]. A lease drawn for a
+    /// switch that then cannot start is released.
+    pub async fn draw_for_activation(
+        &mut self,
+        session: boxes::SessionId,
+        handed: Option<Ipv4Addr>,
+    ) -> Result<PtaskLease, NetError> {
+        let lease = match handed {
+            Some(handed) => self.allocator.hand(handed)?,
+            None if self.self_allocates() => self.allocator.allocate()?,
+            None => return Err(NetError::SelfAllocationRetired),
+        };
+        if matches!(self.transport, SwitchTransport::LocalSpawn) {
+            let started = match self.write_config().await {
+                Ok(()) => self.ensure_running().await,
+                Err(e) => Err(e),
+            };
+            if let Err(e) = started {
+                self.allocator.release(lease);
+                return Err(e);
+            }
+        }
+        self.attached += 1;
+        tracing::info!(
+            ip = %lease.ip,
+            epoch = lease.epoch,
+            session_id = %session,
+            attached = self.attached,
+            "drew a box's switch lease at its activation"
+        );
+        self.activation_binds.push(ActivationBind {
+            session,
+            lease,
+            forwards: Vec::new(),
+            claimed: false,
+            spawn: self.spawns,
+        });
+        Ok(lease)
+    }
+
+    /// Keeps the declared forwards a finalize bound toward `session`'s
+    /// activation lease, for the box's first attach to take.
+    pub(crate) fn record_activation_forwards(
+        &mut self,
+        session: boxes::SessionId,
+        forwards: Vec<policy::PortForwarder>,
+    ) {
+        if let Some(bind) = self
+            .activation_binds
+            .iter_mut()
+            .find(|bind| bind.session == session)
+        {
+            bind.forwards.extend(forwards);
+        }
+    }
+
+    /// Takes the forwards bound at activation toward `lease`, once the
+    /// attach that took the lease adopts them.
+    pub(crate) fn take_activation_forwards(
+        &mut self,
+        lease: PtaskLease,
+    ) -> Option<Vec<policy::PortForwarder>> {
+        let index = self
+            .activation_binds
+            .iter()
+            .position(|bind| bind.claimed && bind.lease == lease)?;
+        Some(self.activation_binds.remove(index).forwards)
+    }
+
+    /// Takes `session`'s activation lease and its forwards when no attach
+    /// took them: the box stopped, or its finalize failed. The caller
+    /// unbinds the forwards, then gives the lease back with
+    /// [`Self::detach`].
+    pub(crate) fn release_activation_bind(
+        &mut self,
+        session: boxes::SessionId,
+    ) -> Option<(PtaskLease, Vec<policy::PortForwarder>)> {
+        let index = self
+            .activation_binds
+            .iter()
+            .position(|bind| !bind.claimed && bind.session == session)?;
+        let bind = self.activation_binds.remove(index);
+        Some((bind.lease, bind.forwards))
+    }
+
     /// Records that a PTask detached, withdrawing its lease with it (T66):
     /// a lease's life is its attachment's, handed or drawn alike — a task
     /// sandbox's self-drawn address ends with the sandbox the way a
@@ -954,6 +1194,18 @@ impl SwitchClient {
     ///
     /// Propagates teardown failures from [`stop`](Self::stop).
     pub async fn detach(&mut self, released: PtaskLease) -> Result<(), NetError> {
+        // An attach that took a lease drawn at activation and failed before
+        // it took the forwards leaves them here: they go with the lease.
+        if let Some(index) = self
+            .activation_binds
+            .iter()
+            .position(|bind| bind.lease == released)
+        {
+            let bind = self.activation_binds.remove(index);
+            if !bind.forwards.is_empty() {
+                policy::release_declared_ingress(&self.control_channel(), &bind.forwards).await;
+            }
+        }
         self.attached = self.attached.saturating_sub(1);
         if self.allocator.release(released) {
             // The box on that lease is gone: it no longer needs a restart to
@@ -1023,6 +1275,18 @@ impl SwitchClient {
             }
         }
 
+        #[cfg(test)]
+        if self.served_externally {
+            return Ok(());
+        }
+        // A switch binary that is not there cannot start. Fail before the
+        // socket is cleared, so a failed start leaves the socket as it was.
+        if self.binary.is_absolute() && !self.binary.exists() {
+            return Err(NetError::Spawn {
+                path: self.binary.clone(),
+                source: io::Error::from_raw_os_error(libc::ENOENT),
+            });
+        }
         let sock = self.control_socket();
         // A stale socket from a previous run blocks gvproxy's own bind. If it
         // cannot be cleared, fail now rather than let `wait_for_socket` mistake
@@ -1058,6 +1322,7 @@ impl SwitchClient {
             source,
         })?;
         self.child = Some(child);
+        self.spawns += 1;
 
         // If the control socket never appears, tear the half-started child down
         // so its timeout cannot leave gvproxy orphaned and a later attach does

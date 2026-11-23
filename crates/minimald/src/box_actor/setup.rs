@@ -666,14 +666,16 @@ impl BoxActor {
                 // the box stays at the fallback, and a watcher reports the
                 // held port in the daemon log ([`Self::watch_fallback_landing`]).
                 // At a node's shared address the port is yielded too
-                // (NET-129). Then the daemon checks the ports that something
-                // outside the registry holds. On a native host the forwarder
-                // binds in the daemon's own network namespace, so the daemon
-                // probes. On a VM-backed host the forwarder binds on the host
-                // OS, so a probe here proves nothing: the daemon binds the
-                // forwards at publish instead, toward the switch address the
-                // host handed the box, and a held port fails that bind with
-                // the same refusal. The check is skipped when activate hooks
+                // (NET-129). Then the daemon binds the forwards at publish, so
+                // a program on the host reaches the declared ports before any
+                // attach, and a port that something outside the registry
+                // holds fails that bind with the same refusal. On a VM-backed
+                // host the bind goes toward the switch address the host
+                // handed the box. On a native host the daemon draws the box's
+                // lease here and binds toward it. The box's first attach
+                // takes that lease and adopts the forwards. A native switch
+                // that cannot start falls back to a probe of the ports, and
+                // the first attach binds them. The check is skipped when activate hooks
                 // run: their launch binds the forwards, and a taken port
                 // fails that apply with the same refusal.
                 #[cfg(target_os = "linux")]
@@ -753,28 +755,105 @@ impl BoxActor {
                             // address has no forward to bind yet. Its
                             // first attach binds the forwards.
                             (true, None) => {}
+                            // A native host: draw the box's lease now and
+                            // bind at publish, toward that lease. The box's
+                            // first attach takes the lease and adopts the
+                            // forwards ([`crate::net::SwitchClient::attach_drawn`]).
                             (false, _) => {
-                                let yielded: Vec<u16> =
-                                    yielded_ports.iter().map(|c| c.port).collect();
-                                // The probe binds each port and pauses between
-                                // binds of a held one, so on the blocking pool.
-                                let in_use = {
-                                    let control = control.clone();
-                                    let ingress = ingress.clone();
-                                    crate::traced::spawn_blocking(move || {
-                                        crate::net::policy::host_ports_in_use(
-                                            &control, published, &ingress, &yielded,
+                                let drawn = {
+                                    let mut switch = self.net_switch.lock().await;
+                                    // A retried finalize finds its lease and
+                                    // its forwards standing.
+                                    if switch.activation_lease(record.id).is_some() {
+                                        None
+                                    } else {
+                                        Some(
+                                            switch
+                                                .draw_for_activation(record.id, switch_address)
+                                                .await,
                                         )
-                                    })
-                                    .await
-                                    .map_err(std::io::Error::other)?
+                                    }
                                 };
-                                if let Some(&port) = in_use.first() {
-                                    refusal = Some(minimald_rpc::PortInUseRefusal {
-                                        port,
-                                        box_port: box_port(port),
-                                        holder: holder_of(port),
-                                    });
+                                match drawn {
+                                    None => {}
+                                    Some(Ok(lease)) => {
+                                        match crate::net::policy::bind_declared_at_publish(
+                                            &control,
+                                            published,
+                                            lease.ip,
+                                            ingress,
+                                            &yielded_ports,
+                                            &holder_of,
+                                        )
+                                        .await
+                                        {
+                                            Ok(forwards) => {
+                                                for forwarder in &forwards {
+                                                    let (host, port) =
+                                                        forwarder.host_port().unwrap_or(("", 0));
+                                                    tracing::info!(
+                                                        host,
+                                                        port,
+                                                        session_id = %record.id,
+                                                        switch_address = %lease.ip,
+                                                        "bound declared ingress port at the box's activation"
+                                                    );
+                                                }
+                                                self.net_switch
+                                                    .lock()
+                                                    .await
+                                                    .record_activation_forwards(
+                                                        record.id, forwards,
+                                                    );
+                                            }
+                                            Err(e) => {
+                                                // The bind rolled its forwards
+                                                // back. The lease goes too.
+                                                self.release_activation_forwards().await;
+                                                match crate::net::policy::port_in_use_refusal(&e) {
+                                                    Some(held) => refusal = Some(held),
+                                                    None => return Err(e),
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // A switch that cannot start binds
+                                    // nothing here. The probe still refuses a
+                                    // held port, and the first attach binds
+                                    // the forwards or says why it cannot.
+                                    // gominimal/minimal#3716 tracks failing
+                                    // the finalize here instead (NET-121).
+                                    Some(Err(e)) => {
+                                        tracing::warn!(
+                                            session_id = %record.id,
+                                            error = %e,
+                                            "the switch did not start at the box's activation; \
+                                             the box's first attach binds its declared ports"
+                                        );
+                                        let yielded: Vec<u16> =
+                                            yielded_ports.iter().map(|c| c.port).collect();
+                                        // The probe binds each port and pauses
+                                        // between binds of a held one, so on
+                                        // the blocking pool.
+                                        let in_use = {
+                                            let control = control.clone();
+                                            let ingress = ingress.clone();
+                                            crate::traced::spawn_blocking(move || {
+                                                crate::net::policy::host_ports_in_use(
+                                                    &control, published, &ingress, &yielded,
+                                                )
+                                            })
+                                            .await
+                                            .map_err(std::io::Error::other)?
+                                        };
+                                        if let Some(&port) = in_use.first() {
+                                            refusal = Some(minimald_rpc::PortInUseRefusal {
+                                                port,
+                                                box_port: box_port(port),
+                                                holder: holder_of(port),
+                                            });
+                                        }
+                                    }
                                 }
                             }
                         }
