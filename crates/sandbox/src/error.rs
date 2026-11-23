@@ -50,6 +50,10 @@ pub enum ExecutionError {
     NetworkIsolationUnavailable,
     #[error("Execution cancelled")]
     Cancelled,
+    /// The run's spawn hook ([`crate::SpawnHook`]) refused a process it
+    /// started. The process was killed, and no later invocation ran.
+    #[error("{0}")]
+    SpawnRefused(#[source] std::io::Error),
 }
 
 /// Renders [`ExecutionError::InvocationFailed`]'s multi-line message.
