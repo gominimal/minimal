@@ -729,7 +729,7 @@ async fn reject_unsupported_exec(channel: Channel<Msg>, reason: String) {
 /// comes from [`minimald_rpc::exec::ExecParseError`], which already names the
 /// form that was asked for and the ones this daemon serves.
 fn unsupported_command_message(reason: &str) -> String {
-    format!("minimald: {reason}\n")
+    format!("{reason}\n")
 }
 
 /// The tracing span an in-session exec runs under, mirroring the `rpc` span in

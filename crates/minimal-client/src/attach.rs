@@ -1289,7 +1289,7 @@ pub fn checked_remote_command(command: &[String]) -> anyhow::Result<Option<Strin
         && wire.len() >= MAX_EXEC_COMMAND_BYTES
     {
         anyhow::bail!(
-            "the command is {} bytes once encoded; min session exec needs it under {} KiB once encoded; pass large data on stdin or in a file under /workbench",
+            "the command is {} bytes once encoded; min box exec needs it under {} KiB once encoded; pass large data on stdin or in a file under /workbench",
             wire.len(),
             MAX_EXEC_COMMAND_BYTES / 1024,
         );

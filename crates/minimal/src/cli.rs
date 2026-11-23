@@ -73,18 +73,18 @@ pub enum Command {
     // not remove it.
     Ls(LsArgs),
     // BCLI-042: no bare `min stop`. `min host stop` takes its place.
-    /// Session management subcommands
+    /// Session subcommands: the box commands for session boxes
     #[command(visible_alias = "sessions")]
     Session(SessionArgs),
     /// Loadout management subcommands
     #[command(visible_alias = "loadouts")]
     Loadout(LoadoutArgs),
-    /// Task subcommands: run declared project tasks in ephemeral sessions
+    /// Task subcommands: run the project's tasks, each in a box of its own
     #[command(visible_alias = "tasks")]
     Task(TaskArgs),
     /// Network subcommands: bring a box's services to the laptop
     Net(NetArgs),
-    /// Box subcommands: show what a box will get
+    /// Box subcommands: create, run, inspect, stop and remove boxes
     #[command(visible_alias = "boxes")]
     Box(BoxArgs),
     /// Host subcommands: the daemons on this machine that run boxes
@@ -1640,13 +1640,11 @@ pub struct ActivateArgs {
     /// `-C`/`--repo-dir`, or the current working directory when neither
     /// is given.
     pub path: Option<String>,
-    /// How to load project files into the session.
-    ///
-    /// Defaults to `tarball`. Passing `--sync tarball` explicitly is also
-    /// the escape hatch that uploads an empty directory or `$HOME`, which
-    /// are otherwise skipped without a prompt.
-    #[arg(long, value_enum)]
-    pub sync: Option<SyncMode>,
+    // Not a flag: an internal start (the VM-host routing test) that must
+    // not upload the project sets it. BCLI-042 removed `--sync`, so every
+    // start from the command line uploads the project.
+    #[arg(skip)]
+    pub skip_upload: bool,
     // The `--network` flag is shared with `min box spec`, so the two
     // cannot drift: see [`NETWORK_HELP`].
     #[arg(
@@ -1827,15 +1825,6 @@ pub enum Provider {
     // after the command ends.
     #[value(hide = true)]
     LocalMinimald,
-}
-
-/// Configuration for file sync during activation.
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
-pub enum SyncMode {
-    /// Stream a tarball of your project and unpack it into the session.
-    Tarball,
-    /// Do not populate the worktree of the session.
-    None,
 }
 
 /// CLI surface for [`boxes::NetworkMode`]. Parsed by hand in

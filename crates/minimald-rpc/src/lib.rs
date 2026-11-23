@@ -187,9 +187,9 @@ pub fn version_skew_message(cli: &str, daemon: &str) -> Option<String> {
             "This CLI is minimal {cli}, but the running minimald is {daemon}. \
              The two speak the same RPCs only when built together, so continuing \
              would fail partway through and tear down whatever it had created. \
-             Restart the daemon on the new build: run `min stop --force` (the \
-             plain stop is refused while sessions are live), then re-run this \
-             command (the daemon is started again automatically). \
+             Restart the daemon on the new build: run `min host stop <host>` \
+             (`min host list` names the host), then re-run this command (the \
+             daemon is started again automatically). \
              Set {SKEW_OVERRIDE_VAR}=1 to proceed anyway."
         )
     })
@@ -2330,7 +2330,7 @@ impl std::fmt::Display for HeldNameRefusal {
             Some(holder) => write!(
                 f,
                 "{head}{name}{taken}{holder_name}` ({holder}){holds} \
-                 Rename that session with `min session rename {holder} <new-name>`, \
+                 Rename that session with `min box rename {holder} <new-name>`, \
                  or choose another name.",
             ),
             None => write!(

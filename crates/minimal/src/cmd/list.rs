@@ -71,7 +71,7 @@ pub(crate) fn bare_activate_args() -> ActivateArgs {
     ActivateArgs {
         name: None,
         path: None,
-        sync: None,
+        skip_upload: false,
         network: None,
         ingress: Vec::new(),
         dynamic_ingress: None,
