@@ -26632,3 +26632,41 @@ fn exit_code_table_refusal_codes() {
         assert_eq!(code, row, "{outcome}");
     }
 }
+
+/// BCLI-034: `box_host_client` on a host this process did not select types
+/// a stopped host and an unreachable host as `HostUnreachable`, which
+/// `main.rs`'s `failure_exit_code` ends with 7. Each keeps its text.
+#[tokio::test]
+async fn exit_code_table_box_host_client_host_unreachable() {
+    let stopped = address_host(LOCAL_MINVMD_PROVIDER, "local-minvmd0", false);
+    let err = box_host_client(&stopped)
+        .await
+        .err()
+        .expect("a stopped host gives no client");
+    assert!(
+        err.downcast_ref::<client::box_registration::HostUnreachable>()
+            .is_some(),
+        "{err:#}"
+    );
+    assert_eq!(err.to_string(), "Host local-minvmd0 is not running.");
+
+    // A socket path longer than the kernel accepts fails the connect with
+    // an error that is neither refused nor missing: the probe's
+    // unreachable arm.
+    let unreachable = LocalHost {
+        provider: LOCAL_MINVMD_PROVIDER,
+        host: "beta.local-minvmd0".to_owned(),
+        sock: std::path::PathBuf::from(format!("/{}/ssh.sock", "x".repeat(200))),
+        selected: false,
+    };
+    let err = box_host_client(&unreachable)
+        .await
+        .err()
+        .expect("an unreachable host gives no client");
+    assert!(
+        err.downcast_ref::<client::box_registration::HostUnreachable>()
+            .is_some(),
+        "{err:#}"
+    );
+    assert_eq!(err.to_string(), "Could not reach host beta.local-minvmd0.");
+}

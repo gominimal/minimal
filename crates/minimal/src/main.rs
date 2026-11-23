@@ -2091,6 +2091,23 @@ mod tests {
                 "host_unreachable",
                 7,
             ),
+            // `min box` on a host that is not running, and on one that did
+            // not answer its probe, as `address.rs` types them.
+            (
+                minimal_client::box_registration::HostUnreachable::error(
+                    "Host local-minvmd0 is not running.",
+                ),
+                "host_unreachable",
+                7,
+            ),
+            (
+                minimal_client::box_registration::HostUnreachable::over(
+                    anyhow::anyhow!("connect to daemon at /x/ssh.sock: refused"),
+                    "Could not reach host local-minvmd0.",
+                ),
+                "host_unreachable",
+                7,
+            ),
             (
                 daemon(boxes::core::bep::GITHUB_SIGN_IN_REQUIRED, 3),
                 "github_sign_in_required",
