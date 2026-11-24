@@ -906,6 +906,9 @@ struct EntrySpec {
     /// the order it applies them, for a task entry too. Empty for a sealed
     /// box, which selects no loadout.
     loadouts: Option<Vec<String>>,
+    /// The expander's warnings about `env_vars` names that look like a
+    /// secret's (BOX-231). Only `min box spec` prints them (BCLI-084).
+    secret_name_warnings: Vec<mfile::expand::SecretNameWarning>,
 }
 
 /// `min box spec <entry>` (BCLI-021): the entry's expanded spec in the
@@ -972,7 +975,17 @@ fn entry_spec(
             write_document(&serde_json_lenient::Value::Object(doc), format, &mut text)?;
         }
     }
-    tracing::info!(verb = "box spec", entry = %rendered.entry, outcome = "ok");
+    // BCLI-084, BOX-231: each warning goes to stderr, so stdout stays the
+    // spec in every `-o` format. No other command prints them.
+    for warning in &rendered.secret_name_warnings {
+        eprintln!("warning: {warning}");
+    }
+    tracing::info!(
+        verb = "box spec",
+        entry = %rendered.entry,
+        secret_name_warnings = rendered.secret_name_warnings.len(),
+        outcome = "ok"
+    );
     out.extend_from_slice(&text);
     Ok(())
 }
@@ -1020,6 +1033,7 @@ fn expand_entry(
     // same read.
     let (expansion, read_rules) = expand_with_store_rules(Some(global), entry, &mut layers)?;
     let store_ids = store_reference_ids(&expansion.spec);
+    let secret_name_warnings = expansion.report.secret_name_warnings.clone();
     let mut spec = expansion.spec;
     let mut sources = std::collections::BTreeMap::new();
     for (key, origin) in &expansion.report.values {
@@ -1246,6 +1260,7 @@ fn expand_entry(
             sources,
             proxy_rows: Vec::new(),
             loadouts,
+            secret_name_warnings,
         });
     }
     let bep: BepSettings = network
@@ -1292,6 +1307,7 @@ fn expand_entry(
         sources,
         proxy_rows: rows_text,
         loadouts,
+        secret_name_warnings,
     })
 }
 
