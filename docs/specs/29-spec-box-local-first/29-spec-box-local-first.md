@@ -322,6 +322,14 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimald in_box_root_cannot_write_record_or_log
 
+- **BOX-232** THE SYSTEM SHALL write a box's stored spec readable and writable only by the user that runs `minimald`, under a box directory and a store directory that only that user can enter, whatever the user's umask.
+  tier:     T0
+  verify:   cargo nextest run -p boxes spec_json_is_written_owner_only
+  <!-- Karl, 2026-11-24 (gominimal/minimal#3761): the stored spec holds every `env_vars` value as written (BOX-230), so on a shared host it must not be readable by another local user. On unix this is mode 0600 for the file and 0700 for the directories. -->
+  - WHEN the store opens and finds a stored spec, or a box or store directory, that users other than the one running `minimald` can read or enter THE SYSTEM SHALL restrict it to that user before it serves any request.
+    tier:   T0
+    verify: cargo nextest run -p boxes store_open_tightens_an_existing_wide_spec_json
+
 - **BOX-045** THE SYSTEM SHALL retain a box's events stream across stop and exit and delete it only when the box is reaped (BOX-019, BOX-021).
   tier:     T0
   verify:   cargo nextest run -p minimald events_survive_stop_deleted_on_rm
