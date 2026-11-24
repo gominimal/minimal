@@ -1701,6 +1701,57 @@ async fn box_spec_entry_prints_legacy_session_hint_on_stderr() {
     );
 }
 
+/// BCLI-084, BOX-231: `min box spec <entry>` prints one stderr line for
+/// each variable whose name looks like a secret's, here a loadout's
+/// literal `GITHUB_TOKEN`. Stdout stays the spec, so `-o json` parses.
+#[tokio::test]
+async fn box_spec_entry_prints_secret_name_warnings_on_stderr() {
+    let (_daemon, args) = setup().await;
+    let minimal_dir = args.minimal_dir.clone().expect("setup points at a tempdir");
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "[sessions.dev]\nenv_vars = { EDITOR = \"hx\" }\n",
+    )
+    .unwrap();
+    // The user's `default` loadout, which a start selects with no flag.
+    let config_dir = tempfile::TempDir::new().unwrap();
+    let loadouts = config_dir.path().join("minimal").join("loadouts");
+    std::fs::create_dir_all(&loadouts).unwrap();
+    let loadout_file = loadouts.join("default.toml");
+    std::fs::write(&loadout_file, "[env_vars]\nGITHUB_TOKEN = \"x\"\n").unwrap();
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .current_dir(project.path())
+        .env("MIN_PROVIDER", "local")
+        .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
+        .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+        .arg("--no-input")
+        .args(["box", "spec", "dev", "-o", "json"])
+        .env_remove("RUST_LOG")
+        .output()
+        .await
+        .expect("the min binary should be invocable");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "min box spec must succeed: stdout={stdout} stderr={stderr}"
+    );
+    let line = format!(
+        "warning: The name of the variable GITHUB_TOKEN in env_vars looks like a secret's. \
+         The loadout `default` ({}) sets its value. min saves this value with the box as \
+         written. To keep a secret out of the box, set it in a [secrets] entry.",
+        loadout_file.display()
+    );
+    let lines: Vec<&str> = stderr.lines().filter(|l| l.contains("secret")).collect();
+    assert_eq!(lines, [line.as_str()], "stderr={stderr}");
+    assert!(!stdout.contains("warning:"), "stdout={stdout}");
+    let doc: serde_json_lenient::Value =
+        serde_json_lenient::from_str(&stdout).expect("-o json stdout parses as JSON");
+    assert_eq!(doc["entry"], "dev", "stdout={stdout}");
+}
+
 // --- box rm (BCLI-042 removed `min session destroy`) ---
 
 #[tokio::test]

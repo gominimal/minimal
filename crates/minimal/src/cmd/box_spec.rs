@@ -906,6 +906,9 @@ struct EntrySpec {
     /// the order it applies them, for a task entry too. Empty for a sealed
     /// box, which selects no loadout.
     loadouts: Option<Vec<String>>,
+    /// The variables whose name looks like a secret's, for stderr
+    /// (BOX-231, BCLI-084).
+    secret_name_warnings: Vec<mfile::expand::SecretNameWarning>,
 }
 
 /// `min box spec <entry>` (BCLI-021): the entry's expanded spec in the
@@ -972,9 +975,89 @@ fn entry_spec(
             write_document(&serde_json_lenient::Value::Object(doc), format, &mut text)?;
         }
     }
-    tracing::info!(verb = "box spec", entry = %rendered.entry, outcome = "ok");
+    // BCLI-084, BOX-231: one stderr line for each variable whose name
+    // looks like a secret's. No other command prints them, so nothing
+    // prints before an interactive shell.
+    for warning in &rendered.secret_name_warnings {
+        eprintln!("warning: {}", secret_name_line(warning));
+    }
+    tracing::info!(
+        verb = "box spec",
+        entry = %rendered.entry,
+        outcome = "ok",
+        secret_name_warnings = rendered.secret_name_warnings.len()
+    );
     out.extend_from_slice(&text);
     Ok(())
+}
+
+/// The stderr line for a variable whose name looks like a secret's
+/// (BOX-231), without the `warning: ` prefix.
+fn secret_name_line(warning: &mfile::expand::SecretNameWarning) -> String {
+    let mut layer = warning.layer.clone();
+    if let Some(first) = layer.get(..1) {
+        let upper = first.to_ascii_uppercase();
+        layer.replace_range(..1, &upper);
+    }
+    // A loadout's words name the loadout, not its file. The other layers'
+    // words name the file already.
+    if warning.origin.layer == mfile::expand::Layer::Loadouts
+        && let Some(file) = &warning.file
+    {
+        layer = format!("{layer} ({})", file.display());
+    }
+    format!(
+        "The name of the variable {name} in env_vars looks like a secret's. {layer} sets \
+         its value. min saves this value with the box as written. To keep a secret out \
+         of the box, set it in a [secrets] entry.",
+        name = warning.name
+    )
+}
+
+/// The secret-name warnings of the expansion that `min box start` makes
+/// for `entry`: with the type's defaults, the selected `loadouts` without
+/// the variables that the user policy ignores, and this process's values
+/// for `inherit` names (BOX-231).
+fn start_secret_name_warnings(
+    global: &GlobalArgs,
+    doc: &toml::Table,
+    entry: &mfile::entry::BoxEntry,
+    layers: &mfile::expand::Layers,
+    loadouts: &[boxes::core::loadout::Loadout],
+) -> anyhow::Result<Vec<mfile::expand::SecretNameWarning>> {
+    let policy = crate::config::read_user_policy(global)?;
+    let ignore = policy.vars().ignore();
+    let mut whole = layers.clone();
+    whole.loadouts = loadouts
+        .iter()
+        .map(|loadout| crate::loadout_layer(loadout, Some(ignore)))
+        .collect::<anyhow::Result<_>>()?;
+    let builtin = || {
+        entry
+            .box_type
+            .as_deref()
+            .and_then(mfile::box_types::builtin)
+            .map(|root| {
+                (
+                    vec![(root.to_owned(), mfile::box_types::builtin_defaults(root))],
+                    vec![(root.to_owned(), mfile::box_types::builtin_constraints(root))],
+                )
+            })
+            .unwrap_or_default()
+    };
+    (whole.type_defaults, whole.type_constraints) = match mfile::box_types::BoxTypes::from_file(doc)
+        .ok()
+        .and_then(|types| mfile::expand::expandable_type(entry, &types).ok())
+    {
+        Some(resolved) => (resolved.defaults, resolved.constraints),
+        None => builtin(),
+    };
+    whole.host_vars = mfile::expand::inherited_var_names(entry, &whole)
+        .into_iter()
+        .filter_map(|name| std::env::var(&name).ok().map(|value| (name, value)))
+        .collect();
+    let expansion = mfile::expand::expand(entry, &whole)?;
+    Ok(expansion.report.secret_name_warnings)
 }
 
 /// Expands `entry` of the project at `project` as `min box start` does,
@@ -1107,6 +1190,22 @@ fn expand_entry(
             .map(|loadout| loadout.name().as_ref().to_owned())
             .collect(),
     );
+    // BOX-231: the warnings come from the expansion that the start makes,
+    // with the selected loadouts, so a loadout's variable is named too.
+    // The printed spec stays the one above: folding a loadout's values
+    // into it is #3236. A failure here leaves the project's warnings.
+    let secret_name_warnings =
+        match start_secret_name_warnings(global, &doc, entry, &layers, &active.loadouts) {
+            Ok(warnings) => warnings,
+            Err(error) => {
+                tracing::debug!(
+                    entry = %entry.name,
+                    error = %format!("{error:#}"),
+                    "the expansion with the loadouts failed; warning on the project's variables"
+                );
+                expansion.report.secret_name_warnings.clone()
+            }
+        };
     let mut ingress_sources = vec![COMMAND_LINE.to_owned()];
     let (mode, mode_source, egress, ingress) = if box_type == boxes::TASK_BOX_TYPE {
         let project_egress = super::box_verbs::task_project_egress(&root, &entry.name)?;
@@ -1246,6 +1345,7 @@ fn expand_entry(
             sources,
             proxy_rows: Vec::new(),
             loadouts,
+            secret_name_warnings,
         });
     }
     let bep: BepSettings = network
@@ -1292,6 +1392,7 @@ fn expand_entry(
         sources,
         proxy_rows: rows_text,
         loadouts,
+        secret_name_warnings,
     })
 }
 
