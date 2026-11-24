@@ -376,6 +376,7 @@ pub(crate) async fn complete_own_ip_attach(
         policy.and_then(|p| p.ingress.as_ref()),
         gate.as_ref(),
         own_address,
+        handed_from_host,
     )
     .await
 }
@@ -511,6 +512,7 @@ async fn finish_own_ip_attach(
     ingress: Option<&boxes::IngressPolicy>,
     gate: Option<&Arc<BoxGate>>,
     own_address: Option<&crate::net::provider::OwnAddressReporter>,
+    handed_from_host: bool,
 ) -> io::Result<OwnIpGuard> {
     let lease_ip = lease.ip;
     // The host loopback address this box's declaration publishes on (NET-010):
@@ -688,7 +690,24 @@ async fn finish_own_ip_attach(
     // registry name is a different story: finalize registered it before any
     // of this, so it is the failed bind's own rollback that withdraws it
     // above — the name is never left standing for a port that refused.
-    let host_ids = dns::host_ids_for(switch.lock().await.host_id());
+    //
+    // A task launch (no `own_address`) at an address the VM host handed
+    // registers no name. The host files that address as a task row, which
+    // holds no name (NET-138's task rows), so the host's egress gate refuses
+    // a zone record for it and closes the request without an answer. A task
+    // launch owns no name of its own (`ungated_name` in
+    // `complete_own_ip_attach`). A native daemon's task still registers, as
+    // before: its gvproxy is its own and takes the record.
+    let host_ids = if own_address.is_none() && handed_from_host {
+        tracing::debug!(
+            session = session_name,
+            switch_address = %lease_ip,
+            "a task run at an address the VM host handed registers no *.min.internal name"
+        );
+        Vec::new()
+    } else {
+        dns::host_ids_for(switch.lock().await.host_id())
+    };
     // A success is logged too: a sibling's lookup from inside a box that
     // fails reads this pair to tell a missing record from a lost reply.
     for host_id in host_ids {
@@ -2801,6 +2820,69 @@ mod tests {
             .expect("the dropped run's slot is free again");
         assert_eq!(again.lease.ip, slots[0]);
         fake.abort();
+    }
+
+    /// NET-138: a task run at an address the VM host handed registers no
+    /// `*.min.internal` name. The host files the address as a task row that
+    /// holds no name, and its gate refuses the zone record by closing the
+    /// request unanswered, which the daemon read as an empty status line. A
+    /// task the daemon drew its own address for, as a native daemon does,
+    /// still registers.
+    #[tokio::test]
+    async fn a_task_at_a_handed_address_registers_no_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for (socket, handed_from_host) in [("handed.sock", true), ("drawn.sock", false)] {
+            let scenario = attach_scenario(&dir, socket);
+            // Recorded as each request is decided, before its answer is
+            // written, so every request the attach made is here once the
+            // attach returns.
+            let paths = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let seen = Arc::clone(&paths);
+            let (events_tx, _events_rx) = mpsc::channel(64);
+            let (handed_tx, _handed_rx) = mpsc::channel(4);
+            let fake = spawn_control_channel_deciding(
+                scenario.control_path.clone(),
+                move |path, _| {
+                    seen.lock().unwrap().push(path.to_string());
+                    ok()
+                },
+                events_tx,
+                handed_tx,
+            );
+            let switch = vm_host_switch();
+            let slots = [Ipv4Addr::new(100, 64, 128, 20)];
+            let attached = switch
+                .lock()
+                .await
+                .attach_task_slot(&slots)
+                .await
+                .expect("the slot is free");
+            let guard = crate::net::gvproxy_network::complete_own_ip_attach(
+                &switch,
+                scenario.tap_fd,
+                ControlChannel::Unix(scenario.control_path.clone()),
+                attached.lease,
+                "web-task",
+                None,
+                None,
+                handed_from_host,
+            )
+            .await
+            .expect("the task's attach completes");
+            let registered = paths
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p == "/services/dns/add");
+            assert_eq!(
+                registered,
+                !handed_from_host,
+                "a task registers a name only where its daemon drew the address \
+                 (handed from the host: {handed_from_host})"
+            );
+            drop(guard);
+            fake.abort();
+        }
     }
 
     /// NET-129, first-come at a shared address: a box whose declared port
