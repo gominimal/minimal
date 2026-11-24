@@ -70,14 +70,14 @@ After this ships, a developer on a stock install with no identity plane runs ses
 - **BOX-004** THE SYSTEM SHALL give a box name on a host to at most one box that is created or renamed under this rule, from the creation or rename that gives it the name until the box is reaped or renamed, whatever the state of the box.
   tier:     T1
   verify:   cargo nextest run -p boxes name_belongs_to_one_box_on_host_until_reaped_or_renamed
-  property: For every store of records made before this rule and every sequence of create (written or derived name), stop, exit, resume, restart, rename and reap operations on one host, no record that a creation or rename under this rule named has a name, compared without regard to case (BOX-217), that another retained record has, and a name becomes free exactly when the record that has it is reaped or renamed.
+  property: For every store of records made before this rule and every sequence of create (written or derived name), stop, exit, resume, restart, rename and reap operations on one host, no record that a creation or rename under this rule named has a name, compared without regard to case (BOX-217), that another retained record has, and a name becomes free exactly when the last retained record that has it is reaped or renamed.
   <!-- "created or renamed under this rule" carries gominimal/arch#187's exception for boxes created before this rule, which may still share a name (BOX-223, BOX-005). -->
 
 - **BOX-163** WHEN a box is created THE SYSTEM SHALL name it with the requested name that the client sends, exactly as written, and otherwise with the derived name that BOX-211 to BOX-213 give.
   tier:     T0
   verify:   cargo nextest run -p minimald create_names_box_written_exactly_else_derived
   <!-- The name is a creation argument, never read from the spec (BOX-227; Karl's decision of 2026-11-23, with the architect's verbal agreement (gominimal/arch#195)). `min` sends `--name`, else the entry's `[box] name`, as the requested name (spec 28). -->
-  - IF a creation under a written name finds that a box on the same host has that name, running or stopped, THEN THE SYSTEM SHALL refuse the creation with exit 2 and a message that says the name is taken, names that box and gives its state only where the caller may read that box (Gatehouse `BoxRead`) and otherwise says only that the name is taken, and SHALL create nothing.
+  - IF a creation under a written name finds that a box on the same host has that name, in any state, THEN THE SYSTEM SHALL refuse the creation with exit 2 and a message that says the name is taken, names that box and gives its state only where the caller may read that box (Gatehouse `BoxRead`) and otherwise says only that the name is taken, and SHALL create nothing.
     tier:   T0
     verify: cargo nextest run -p minimald create_under_written_name_any_box_has_refused_exit2_names_box
     <!-- The message carries only the situation. The remedies (the verb back into that box, `min box rm <name>`, `--name <other>`) are commands, so BCLI-069 carries them. The BoxRead limit is the architecture's (Box names, "A host that several people use"). -->
@@ -155,14 +155,20 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p mfile written_name_not_label_reserved_or_id_form_exit3
   <!-- A written name from `--name` is refused with exit 3 as one from `[box] name` is (Karl, 2026-11-23). An entry named `self` stays refused by BOX-046's sub-bullet. -->
+  - WHEN a creation reaches `minimald` with a requested name THE SYSTEM SHALL apply this requirement's rules to the name in `minimald`, whatever client sent the creation, and refuse a name that breaks one with exit 3 before it assigns any name (BOX-220).
+    tier:   T0
+    verify: cargo nextest run -p minimald daemon_refuses_requested_name_breaking_box007_exit3
 
 - **BOX-010** WHEN a box is renamed THE SYSTEM SHALL change only the alias, leave `box_id`, spec, events and filesystem unchanged, and record a `renamed` event carrying the old and new names.
   tier:     T1
   verify:   cargo nextest run -p boxes rename_changes_only_alias_and_records_event
   property: For every box and every successful rename, rename leaves id, spec and filesystem path equal before and after, preserves every prior event, and appends exactly one `renamed` event.
-  - IF the new name is one that another box on the same host has, running or stopped, or breaks a rule of BOX-007, THEN THE SYSTEM SHALL refuse the rename with exit 2 and a message that, where another box has the name, names that box and gives its state only where the caller may read that box (Gatehouse `BoxRead`) and otherwise says only that the name is taken, or quotes the name and says which rule of BOX-007 it breaks, and SHALL leave the box, its name and its events unchanged.
+  - IF the new name is one that another box on the same host has, in any state, THEN THE SYSTEM SHALL refuse the rename with exit 2 and a message that names that box and gives its state only where the caller may read that box (Gatehouse `BoxRead`) and otherwise says only that the name is taken, and SHALL leave the box, its name and its events unchanged.
     tier:   T0
-    verify: cargo nextest run -p boxes rename_to_taken_or_reserved_name_refused_exit2_holder_only_with_box_read
+    verify: cargo nextest run -p boxes rename_to_taken_name_refused_exit2_holder_only_with_box_read
+  - IF the new name breaks a rule of BOX-007 THEN THE SYSTEM SHALL refuse the rename with exit 3 and a message that quotes the name and says which rule it breaks, as BOX-007 does for a creation, and SHALL leave the box, its name and its events unchanged.
+    tier:   T0
+    verify: cargo nextest run -p boxes rename_to_name_breaking_box007_refused_exit3
 
 - **BOX-011** THE SYSTEM SHALL hold every box record in exactly one of the states `pending`, `materializing`, `running`, `stopped` or `exited`, and give each `stopped` or `exited` record the `reason`, `exit_code` and `signal` that the table under this requirement states for how the box ended.
   tier:     T2
@@ -327,6 +333,9 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimald list_returns_every_retained_record_with_state_project_and_entry
   <!-- The `min box list` table shows the entry but not the project name or the origin; the `min/v1/box` objects carry all three (spec 28; Karl, 2026-11-23). No field says a name took a number: a trailing `-<n>` on a derived name shows it. -->
+  - WHERE a record was made before it carried a project name, an entry name or a name origin THE SYSTEM SHALL return each missing field as absent, as it returns a missing project root, in the listing and in BOX-159's read alike.
+    tier:   T0
+    verify: cargo nextest run -p minimald legacy_record_lists_and_reads_missing_name_fields_as_absent
   - WHERE a listing is scoped to a project THE SYSTEM SHALL return only the records whose project root, as BOX-001 records it, is that project's.
     tier:   T0
     verify: cargo nextest run -p minimald list_scoped_to_project_reads_project_root
