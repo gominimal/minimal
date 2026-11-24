@@ -216,12 +216,15 @@ async fn manager_over(state: &std::path::Path, cache: &std::path::Path) -> BoxMa
     let daemon_ctx = Arc::new(mctx::DaemonContext::init(mctx_config).unwrap());
     // `false`: these tests run the default the build ships, not the
     // opt-out.
-    BoxManager::init(
+    // The proxy identity is read under the state directory, so a proxy
+    // that publishes on the test host does not change what a test sees.
+    BoxManager::init_with_bep_identity(
         daemon_abs(&state),
         daemon_abs(&cache),
         daemon_ctx,
         switch,
         false,
+        Some(published_identity_path(&state)),
     )
     .await
     .unwrap()
@@ -6685,7 +6688,7 @@ fn publish_root(state: &std::path::Path, root: &str) {
         root_certificate: Some(root.to_owned()),
         ..Default::default()
     }
-    .publish(&state.join(".minimal/bep/identity.json"))
+    .publish(&published_identity_path(state))
     .unwrap();
 }
 
@@ -6767,7 +6770,7 @@ async fn create_refuses_a_root_certificate_when_the_published_identity_is_unusab
     const MADE_UP: &str = "-----BEGIN CERTIFICATE-----\nRkFLRQ==\n-----END CERTIFICATE-----\n";
     for damaged in [false, true] {
         let (state, _cache, mngr) = manager().await;
-        let path = state.path().join(".minimal/bep/identity.json");
+        let path = published_identity_path(state.path());
         bep::publish::Identity::default().publish(&path).unwrap();
         if damaged {
             std::fs::write(&path, "not json").unwrap();

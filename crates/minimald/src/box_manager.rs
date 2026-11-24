@@ -1999,16 +1999,12 @@ fn unenrolled_broker_refusal(
     ))
 }
 
-/// Where the node-local proxy publishes its identity:
-/// `~/.minimal/bep/identity.json` under the daemon's home, the path `min`
-/// reads it from. Tests read it under the state directory, so a proxy on
-/// the test host does not change what a test sees.
-fn published_identity_path(state_dir: &DaemonAbsPath) -> Option<std::path::PathBuf> {
-    const RELATIVE: &str = ".minimal/bep/identity.json";
-    if cfg!(test) {
-        return Some(state_dir.as_utf8_path().as_std_path().join(RELATIVE));
-    }
-    std::env::home_dir().map(|home| home.join(RELATIVE))
+/// Where the node-local proxy publishes its identity, under `home`:
+/// `.minimal/bep/identity.json`, the path `min` reads it from.
+/// [`BoxManager::init`] passes the daemon's home. A test passes its own
+/// directory, so a proxy on the test host does not change what it sees.
+fn published_identity_path(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".minimal/bep/identity.json")
 }
 
 /// What the daemon found where the node-local proxy publishes its
@@ -2375,6 +2371,28 @@ impl BoxManager {
         daemon_ctx: Arc<mctx::DaemonContext>,
         net_switch: Arc<Mutex<crate::net::SwitchClient>>,
         deny_all_opt_out: bool,
+    ) -> Result<BoxManagerHandle, std::io::Error> {
+        let bep_identity = std::env::home_dir().map(|home| published_identity_path(&home));
+        Self::init_with_bep_identity(
+            minimal_state_dir,
+            minimal_cache_dir,
+            daemon_ctx,
+            net_switch,
+            deny_all_opt_out,
+            bep_identity,
+        )
+        .await
+    }
+
+    /// [`BoxManager::init`], with the path where the node-local proxy
+    /// publishes its identity given by the caller, or `None` for no path.
+    async fn init_with_bep_identity(
+        minimal_state_dir: DaemonAbsPath,
+        minimal_cache_dir: DaemonAbsPath,
+        daemon_ctx: Arc<mctx::DaemonContext>,
+        net_switch: Arc<Mutex<crate::net::SwitchClient>>,
+        deny_all_opt_out: bool,
+        bep_identity: Option<std::path::PathBuf>,
     ) -> Result<BoxManagerHandle, std::io::Error> {
         let store = Store::init(minimal_state_dir.clone()).await?;
 
@@ -2787,7 +2805,6 @@ impl BoxManager {
             let serve = tracing::Instrument::instrument(serve, lifelong);
             root.in_scope(|| crate::traced::spawn(serve));
         }
-        let bep_identity = published_identity_path(&minimal_state_dir);
         let mngr = Self {
             in_shutdown,
             receiver,
@@ -7053,12 +7070,13 @@ mod create_stamp_tests {
             .build()
             .unwrap();
         let daemon_ctx = Arc::new(mctx::DaemonContext::init(mctx_config).unwrap());
-        let mngr = BoxManager::init(
+        let mngr = BoxManager::init_with_bep_identity(
             daemon_abs(state.path()),
             daemon_abs(cache.path()),
             daemon_ctx,
             switch,
             false,
+            Some(published_identity_path(state.path())),
         )
         .await
         .unwrap();
@@ -7304,12 +7322,13 @@ mod ended_box_tests {
             .build()
             .unwrap();
         let daemon_ctx = Arc::new(mctx::DaemonContext::init(mctx_config).unwrap());
-        let mngr = BoxManager::init(
+        let mngr = BoxManager::init_with_bep_identity(
             daemon_abs(state.path()),
             daemon_abs(cache.path()),
             daemon_ctx,
             switch,
             false,
+            Some(published_identity_path(state.path())),
         )
         .await
         .unwrap();
