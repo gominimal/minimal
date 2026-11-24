@@ -283,7 +283,7 @@ pub async fn cmd_session_setup_zed(
 /// the log.
 pub(crate) async fn cmd_typed_box_list(
     global: &GlobalArgs,
-    args: BoxListArgs,
+    args: TypedBoxListArgs,
     box_type: &str,
     verb: &'static str,
 ) -> Result<(), anyhow::Error> {

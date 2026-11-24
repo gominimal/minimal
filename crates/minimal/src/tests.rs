@@ -2052,7 +2052,7 @@ fn no_provider_defaults_to_the_host_backend() {
 #[test]
 fn session_list_spellings_reach_box_list() {
     use clap::Parser as _;
-    let list_args = |args: &[&str]| -> BoxListArgs {
+    let list_args = |args: &[&str]| -> TypedBoxListArgs {
         match Cli::try_parse_from(args).unwrap().command {
             Some(Command::Session(SessionArgs {
                 command: SessionCommand::List(a),

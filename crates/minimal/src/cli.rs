@@ -229,7 +229,7 @@ pub enum SessionCommand {
     /// `min box list` lists boxes. `--all` lists the session boxes of every
     /// project
     #[command(visible_alias = "ls")]
-    List(BoxListArgs),
+    List(TypedBoxListArgs),
     // BCLI-042: no `activate`, `destroy`, `exec`, `rename`, `policy`,
     // `hooks` or `run` here. They fail as unknown commands.
     /// Create a box from a session entry of the project and attach this
@@ -676,6 +676,20 @@ pub struct BoxListArgs {
     /// or its name
     #[arg(long, value_name = "BOX", add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub parent: Option<String>,
+    /// Write the boxes as a JSON array, one object for each box, and
+    /// nothing else
+    #[arg(short = 'o', long = "output", value_enum)]
+    pub output: Option<BoxListOutputFormat>,
+}
+
+// BCLI-030: `min session list` and `min task list` are `min box list` for
+// one Box Type, so they take neither `--type` nor `--parent`.
+#[derive(Debug, Args)]
+pub struct TypedBoxListArgs {
+    /// List the boxes of every project, not only the boxes of the current
+    /// project
+    #[arg(long)]
+    pub all: bool,
     /// Write the boxes as a JSON array, one object for each box, and
     /// nothing else
     #[arg(short = 'o', long = "output", value_enum)]
@@ -1264,7 +1278,7 @@ pub enum TaskCommand {
     /// `min box list` lists boxes. A task that ended shows its exit code,
     /// as `exited (exit 3)`, until `min box prune` removes it. `--all`
     /// lists the tasks of every project
-    List(BoxListArgs),
+    List(TypedBoxListArgs),
     /// Show what a task printed, from its start. `-f` keeps showing new
     /// output until the task's box is removed or the command is interrupted
     Logs(BoxLogsArgs),

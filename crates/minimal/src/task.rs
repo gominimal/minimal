@@ -22,7 +22,7 @@ use anyhow::{Context as _, bail};
 use tokio::io::AsyncWriteExt as _;
 use tracing::Instrument as _;
 
-use crate::{BoxListArgs, BoxRmArgs, BoxRunArgs, BoxStopArgs, GlobalArgs, TaskRunArgs};
+use crate::{BoxRmArgs, BoxRunArgs, BoxStopArgs, GlobalArgs, TaskRunArgs, TypedBoxListArgs};
 
 /// A task's non-zero exit status, carried as a typed error so `main.rs` can
 /// downcast it and terminate with the task's own code instead of printing an
@@ -1483,7 +1483,10 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
 /// only the task boxes of the current project, or of every project. The
 /// daemon keeps a task's record after the task ends, so an exited task
 /// stays in the list until `min box prune` or `min box rm` removes it.
-pub async fn cmd_task_list(global: &GlobalArgs, args: BoxListArgs) -> Result<(), anyhow::Error> {
+pub async fn cmd_task_list(
+    global: &GlobalArgs,
+    args: TypedBoxListArgs,
+) -> Result<(), anyhow::Error> {
     crate::cmd::cmd_typed_box_list(global, args, boxes::TASK_BOX_TYPE, "task list").await
 }
 
