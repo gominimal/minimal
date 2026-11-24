@@ -1215,39 +1215,67 @@ fn log_diagnostics(path: Option<&Path>, content_hash: Option<u64>, lines: &[Stri
 /// caller that owns the screen (the `min dash` TUI) can show the lines with
 /// the error. The CLI loaders print the lines on stderr and return the error.
 #[derive(Debug)]
-pub struct Refusal {
-    /// Why the file did not load.
-    pub error: Error,
+pub struct Refusal(Box<RefusalParts>);
+
+#[derive(Debug)]
+struct RefusalParts {
+    error: Error,
     diagnostics: Vec<String>,
     file: Option<PathBuf>,
     content_hash: Option<u64>,
 }
 
 impl Refusal {
+    fn new(
+        error: Error,
+        diagnostics: Vec<String>,
+        file: Option<PathBuf>,
+        content_hash: Option<u64>,
+    ) -> Self {
+        Self(Box::new(RefusalParts {
+            error,
+            diagnostics,
+            file,
+            content_hash,
+        }))
+    }
+
+    /// Why the file did not load.
+    #[must_use]
+    pub fn error(&self) -> &Error {
+        &self.0.error
+    }
+
+    /// Why the file did not load, without the lines.
+    #[must_use]
+    pub fn into_error(self) -> Error {
+        self.0.error
+    }
+
     /// The lines the refused file has for the person, in the order the
     /// parse found them. Nothing printed them.
     #[must_use]
     pub fn diagnostics(&self) -> &[String] {
-        &self.diagnostics
+        &self.0.diagnostics
     }
 
     /// The path of the refused file, when the load read one.
     #[must_use]
     pub fn file_path(&self) -> Option<&Path> {
-        self.file.as_deref()
+        self.0.file.as_deref()
     }
 
     /// The hash of the bytes of the refused file. [`print_diagnostics`]
     /// keys on it.
     #[must_use]
     pub fn content_hash(&self) -> Option<u64> {
-        self.content_hash
+        self.0.content_hash
     }
 
     /// Prints [`Refusal::diagnostics`] on stderr, each line on its first
     /// print in this process for this file and content.
     pub fn print_diagnostics(&self) {
-        print_diagnostics(self.file.as_deref(), self.content_hash, &self.diagnostics);
+        print_diagnostics(self.file_path(), self.0.content_hash, &self.0.diagnostics);
     }
 
     /// Prints the lines, then gives the error for the caller to print after
@@ -1255,24 +1283,19 @@ impl Refusal {
     #[must_use]
     pub fn print_and_into_error(self) -> Error {
         self.print_diagnostics();
-        self.error
+        self.into_error()
     }
 }
 
 impl From<Error> for Refusal {
     fn from(error: Error) -> Self {
-        Self {
-            error,
-            diagnostics: Vec::new(),
-            file: None,
-            content_hash: None,
-        }
+        Self::new(error, Vec::new(), None, None)
     }
 }
 
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.error.fmt(f)
+        self.0.error.fmt(f)
     }
 }
 
@@ -1480,7 +1503,7 @@ impl File {
     pub fn from_dir_recursive_quiet<P: AsRef<Path>>(dir: P) -> Result<Self, Refusal> {
         match Self::from_dir_quiet(&dir) {
             Ok(f) => Ok(f),
-            Err(r) if matches!(r.error, Error::NotFound) => {
+            Err(r) if matches!(r.error(), Error::NotFound) => {
                 // Not found at this directory, try the parent
                 if let Some(parent) = dir.as_ref().parent() {
                     // We don't traverse outside of a users HOME if its set.
@@ -1521,12 +1544,12 @@ impl File {
             }
         }
         if let Err(error) = self.check(tasks) {
-            return Err(Refusal {
+            return Err(Refusal::new(
                 error,
-                diagnostics: self.diagnostics,
-                file: self.mfile_path,
-                content_hash: self.content_hash,
-            });
+                self.diagnostics,
+                self.mfile_path,
+                self.content_hash,
+            ));
         }
         let warnings = self.unknown_field_warnings();
         self.diagnostics.extend(warnings);
@@ -1684,8 +1707,8 @@ impl File {
     /// this prints the file's diagnostics there, each once, and a refused
     /// file's hints before the caller prints the error.
     pub fn from_dir_for_graph<P: AsRef<Path>>(dir: P) -> Result<Self, Error> {
-        let file = Self::load_dir(dir.as_ref(), TaskCheck::Skip)
-            .map_err(Refusal::print_and_into_error)?;
+        let file =
+            Self::load_dir(dir.as_ref(), TaskCheck::Skip).map_err(Refusal::print_and_into_error)?;
         file.print_diagnostics();
         Ok(file)
     }
@@ -1705,11 +1728,11 @@ impl File {
         let file = Self::load_dir_by(root, TaskCheck::Refuse, Reader::Within(root)).map_err(
             |refusal| {
                 log_diagnostics(
-                    refusal.file.as_deref(),
-                    refusal.content_hash,
-                    &refusal.diagnostics,
+                    refusal.file_path(),
+                    refusal.content_hash(),
+                    refusal.diagnostics(),
                 );
-                refusal.error
+                refusal.into_error()
             },
         )?;
         log_diagnostics(
@@ -5454,11 +5477,16 @@ mod tests {
         .unwrap();
         let refusal = File::from_dir_quiet(refused.path()).expect_err("the file is refused");
         assert!(
-            matches!(refusal.error, Error::HarnessTable(_)),
+            matches!(refusal.error(), Error::HarnessTable(_)),
             "{:?}",
-            refusal.error
+            refusal.error()
         );
-        assert_eq!(refusal.diagnostics().len(), 1, "{:?}", refusal.diagnostics());
+        assert_eq!(
+            refusal.diagnostics().len(),
+            1,
+            "{:?}",
+            refusal.diagnostics()
+        );
         assert!(refusal.diagnostics()[0].starts_with("hint: "));
         assert_eq!(
             refusal.file_path(),
@@ -5471,7 +5499,7 @@ mod tests {
         // A failure that is not a refusal of the checks has no lines.
         let empty = tempdir().unwrap();
         let missing = File::from_dir_quiet(empty.path()).expect_err("no file");
-        assert!(matches!(missing.error, Error::NotFound));
+        assert!(matches!(missing.error(), Error::NotFound));
         assert!(missing.diagnostics().is_empty());
     }
 

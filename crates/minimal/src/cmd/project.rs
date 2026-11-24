@@ -92,13 +92,14 @@ pub(crate) fn offer_mfile_scaffold(
 pub(crate) fn resolve_upload_root(
     dir: &camino::Utf8Path,
 ) -> Result<camino::Utf8PathBuf, anyhow::Error> {
-    let (root, diagnostics) = resolve_upload_root_and_diagnostics(dir)?;
+    let (root, diagnostics) =
+        resolve_upload_root_and_diagnostics(dir).map_err(crate::print_file_refusal)?;
     diagnostics.print();
     Ok(root)
 }
 
 /// [`resolve_upload_root`], for a caller that owns the screen. It prints
-/// nothing.
+/// nothing. A refused file's hints come back on a [`crate::FileRefusal`].
 pub(crate) fn resolve_upload_root_quiet(
     dir: &camino::Utf8Path,
 ) -> Result<camino::Utf8PathBuf, anyhow::Error> {
@@ -106,11 +107,12 @@ pub(crate) fn resolve_upload_root_quiet(
 }
 
 /// [`resolve_upload_root`], with the lines the load of the file has for
-/// the person. It prints nothing.
+/// the person. It prints nothing. A refused file's hints come back on a
+/// [`crate::FileRefusal`].
 fn resolve_upload_root_and_diagnostics(
     dir: &camino::Utf8Path,
 ) -> Result<(camino::Utf8PathBuf, crate::FileDiagnostics), anyhow::Error> {
-    match mfile::File::from_dir_recursive(dir.as_std_path()) {
+    match mfile::File::from_dir_recursive_quiet(dir.as_std_path()) {
         Ok(f) => {
             let diagnostics = crate::FileDiagnostics::of(&f);
             let root = match f.repo_path() {
@@ -120,10 +122,16 @@ fn resolve_upload_root_and_diagnostics(
             };
             Ok((root, diagnostics))
         }
-        Err(mfile::Error::NotFound) => Ok((dir.to_path_buf(), crate::FileDiagnostics::default())),
-        Err(e) => Err(anyhow::anyhow!(
-            "found a broken {name} while walking up from {dir}: {e}",
-            name = mfile::MFILE_NAME,
+        Err(refusal) if matches!(refusal.error(), mfile::Error::NotFound) => {
+            Ok((dir.to_path_buf(), crate::FileDiagnostics::default()))
+        }
+        Err(refusal) => Err(crate::FileRefusal::wrap(
+            anyhow::anyhow!(
+                "found a broken {name} while walking up from {dir}: {e}",
+                name = mfile::MFILE_NAME,
+                e = refusal.error(),
+            ),
+            &refusal,
         )),
     }
 }
@@ -139,7 +147,9 @@ fn resolve_upload_root_and_diagnostics(
 /// this runs, so any load error here can only mean "no readable hooks to
 /// lose" and maps to zero rather than a second failure surface.
 pub(crate) fn project_lifecycle_hook_count(root: &camino::Utf8Path) -> usize {
-    match mfile::File::from_dir(root.as_std_path()) {
+    // Quiet: `min dash` calls this too, and the load before it printed or
+    // returned any hint.
+    match mfile::File::from_dir_quiet(root.as_std_path()) {
         Ok(file) => file.session.map_or(0, |s| s.lifecycle_hooks.len()),
         Err(_) => 0,
     }

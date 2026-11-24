@@ -224,7 +224,7 @@ fn session_entry_choices(dir: &camino::Utf8Path) -> EntryChoices {
     if dir.as_str().is_empty() {
         return Err("the project path is empty".to_string());
     }
-    let entries = crate::project_entries(dir).map_err(|error| format!("{error:#}"))?;
+    let entries = crate::project_entries(dir).map_err(|error| error_with_diagnostics(&error))?;
     let candidates = crate::start_candidates(&entries).map_err(|error| format!("{error:#}"))?;
     let names: Vec<String> = candidates
         .iter()
@@ -794,6 +794,17 @@ fn created_status(
         );
     }
     status
+}
+
+/// The text of `error` for the status line. A refused `minimal.toml` adds
+/// its legacy-table hints after the error. Nothing printed them over the TUI.
+fn error_with_diagnostics(error: &anyhow::Error) -> String {
+    match error.downcast_ref::<crate::FileRefusal>() {
+        Some(refusal) => {
+            with_diagnostics(format!("{:#}", refusal.error), refusal.diagnostics.lines())
+        }
+        None => format!("{error:#}"),
+    }
 }
 
 /// `status` with each of `diagnostics` after it, as one status line: the
@@ -1699,7 +1710,7 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                                 Ok(CreateOutcome::Cancelled) => {
                                     Msg::ActionDone(Ok("create cancelled".to_string()))
                                 }
-                                Err(e) => Msg::ActionDone(Err(format!("{e:#}"))),
+                                Err(e) => Msg::ActionDone(Err(error_with_diagnostics(&e))),
                             };
                             let _ = tx.send(msg).await;
                         });
@@ -2127,6 +2138,98 @@ mod tests {
         )
         .expect("the create prepares again");
         assert_eq!(again.diagnostics, prepared.diagnostics);
+    }
+
+    /// #3529: a create from `min dash` in a project whose top-level
+    /// `[session]` table sits in a file that the load refuses shows the
+    /// legacy hint with the error on the status line. The refused load
+    /// returns the hint and prints nothing on stderr, so no line lands over
+    /// the TUI.
+    #[test]
+    fn dash_create_with_legacy_session_puts_diagnostics_on_status_line_when_refused() {
+        let project = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join(mfile::MFILE_NAME),
+            "[session]\npackages = [\"git\"]\n\n[harness]\nname = \"rust\"\n",
+        )
+        .unwrap();
+        let global = crate::GlobalArgs {
+            config_dir: Some(config.path().to_path_buf()),
+            ..Default::default()
+        };
+        let (cfg, _) = crate::config::read_client_config_with_diagnostics(&global).unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(project.path().to_path_buf()).unwrap();
+
+        let (stderr, (resolved, prepared, entries)) = capture_fd2(|| {
+            (
+                // The create task's first load, as `resolve_project_off_worker`
+                // runs it.
+                crate::resolve_upload_root_quiet(&root),
+                // Its blocking half.
+                prepare_create(
+                    &cfg,
+                    &global,
+                    &root,
+                    "default".to_string(),
+                    crate::loadouts::LoadoutSelection::Defaults,
+                    boxes::core::policy::UserPolicy::default(),
+                )
+                .map(|_| ()),
+                // The create form's entry read.
+                session_entry_choices(&root),
+            )
+        });
+        assert!(
+            !stderr.contains("hint:") && !stderr.contains(mfile::MFILE_NAME),
+            "the loads print nothing over the TUI: {stderr:?}"
+        );
+
+        let error = resolved.expect_err("the file is refused");
+        let mut model = model_with(Vec::new());
+        update(
+            &mut model,
+            Msg::ActionDone(Err(error_with_diagnostics(&error))),
+        );
+        let status = model.status.clone().unwrap_or_default();
+        assert!(
+            status.starts_with("error: found a broken minimal.toml while walking up from "),
+            "{status}"
+        );
+        assert!(status.contains("[harness]"), "the error: {status}");
+        assert_eq!(status.matches("; hint: ").count(), 1, "the hint: {status}");
+        assert!(status.contains("[session]"), "the hint: {status}");
+        assert!(!status.contains('\n'), "one status line: {status:?}");
+
+        let prepared = error_with_diagnostics(&prepared.expect_err("the create is refused"));
+        assert!(
+            prepared.starts_with("Cannot start the box: the project's minimal.toml does not load"),
+            "{prepared}"
+        );
+        assert_eq!(prepared.matches("; hint: ").count(), 1, "{prepared}");
+        let entries = entries.expect_err("the form reads no entries");
+        assert_eq!(entries.matches("; hint: ").count(), 1, "{entries}");
+    }
+
+    /// Runs `f` with fd 2 pointed at a file, and returns what reached fd 2.
+    /// A line that the dashboard printed on stderr lands there, over the TUI.
+    fn capture_fd2<T>(f: impl FnOnce() -> T) -> (String, T) {
+        use std::io::{Read as _, Seek as _};
+        struct Restore(std::os::fd::OwnedFd);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                nix::unistd::dup2_stderr(&self.0).expect("restore stderr");
+            }
+        }
+        let mut file = tempfile::tempfile().expect("a stderr capture file");
+        let restore = Restore(nix::unistd::dup(std::io::stderr()).expect("dup stderr"));
+        nix::unistd::dup2_stderr(&file).expect("redirect stderr");
+        let result = f();
+        drop(restore);
+        let mut text = String::new();
+        file.rewind().expect("rewind the capture");
+        file.read_to_string(&mut text).expect("read the capture");
+        (text, result)
     }
 
     fn id(n: u128) -> SessionId {

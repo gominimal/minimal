@@ -504,8 +504,12 @@ pub(crate) fn check_project_hooks(
     use boxes::core::lifecyclehook::{HookScript, HookScriptBody};
     use boxes::core::source::{ProvenancedHook, Source};
 
-    let Ok(mfile) = mfile::File::from_dir(project_root.as_utf8_path().as_std_path()) else {
-        return Ok(());
+    let mfile = match mfile::File::from_dir_quiet(project_root.as_utf8_path().as_std_path()) {
+        Ok(mfile) => mfile,
+        Err(refusal) => {
+            diagnostics.add_refusal(&refusal);
+            return Ok(());
+        }
     };
     diagnostics.add(&mfile);
     let Some(session) = mfile.session.as_ref() else {
@@ -590,7 +594,8 @@ pub(crate) fn activate_hook_budget(
         .filter_map(|h| h.on_activate())
         .map(|s| s.timeout())
         .sum();
-    let project: Duration = mfile::File::from_dir(project_root.as_std_path())
+    let project: Duration = mfile::File::from_dir_quiet(project_root.as_std_path())
+        .map_err(|refusal| diagnostics.add_refusal(&refusal))
         .ok()
         .and_then(|f| {
             diagnostics.add(&f);

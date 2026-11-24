@@ -1005,6 +1005,15 @@ impl FileDiagnostics {
         diagnostics
     }
 
+    /// The legacy-table hints of a refused load.
+    pub(crate) fn of_refusal(refusal: &mfile::Refusal) -> Self {
+        Self {
+            file: refusal.file_path().map(std::path::Path::to_path_buf),
+            content_hash: refusal.content_hash(),
+            lines: refusal.diagnostics().to_vec(),
+        }
+    }
+
     /// Adds each line of `file` that this does not hold yet, in order.
     pub(crate) fn add(&mut self, file: &mfile::File) {
         if self.file.is_none() {
@@ -1012,6 +1021,16 @@ impl FileDiagnostics {
             self.content_hash = file.content_hash();
         }
         add_file_diagnostics(&mut self.lines, file.diagnostics());
+    }
+
+    /// Adds each hint of a refused load that this does not hold yet, in
+    /// order.
+    pub(crate) fn add_refusal(&mut self, refusal: &mfile::Refusal) {
+        if self.file.is_none() {
+            self.file = refusal.file_path().map(std::path::Path::to_path_buf);
+            self.content_hash = refusal.content_hash();
+        }
+        add_file_diagnostics(&mut self.lines, refusal.diagnostics());
     }
 
     /// The lines, in the order the loads found them.
@@ -1026,6 +1045,58 @@ impl FileDiagnostics {
     }
 }
 
+/// An error from a load of the project's `minimal.toml` that the quiet
+/// helpers return, with the lines the refused file has for the person. The
+/// quiet helpers print nothing: `min dash` shows the lines with the error
+/// on its status line. A CLI caller prints them through
+/// [`print_file_refusal`].
+#[derive(Debug)]
+pub(crate) struct FileRefusal {
+    /// The error the caller shows.
+    pub(crate) error: anyhow::Error,
+    /// The refused file's legacy-table hints.
+    pub(crate) diagnostics: FileDiagnostics,
+}
+
+impl FileRefusal {
+    /// `error`, with the hints of `refusal` when it has any.
+    pub(crate) fn wrap(error: anyhow::Error, refusal: &mfile::Refusal) -> anyhow::Error {
+        if refusal.diagnostics().is_empty() {
+            return error;
+        }
+        Self {
+            error,
+            diagnostics: FileDiagnostics::of_refusal(refusal),
+        }
+        .into()
+    }
+}
+
+impl std::fmt::Display for FileRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.alternate() {
+            write!(f, "{:#}", self.error)
+        } else {
+            write!(f, "{}", self.error)
+        }
+    }
+}
+
+impl std::error::Error for FileRefusal {}
+
+/// For a CLI caller of a quiet helper: prints the hints that a
+/// [`FileRefusal`] carries on stderr, and gives back its error for the
+/// caller to print after them. Any other error comes back as it is.
+pub(crate) fn print_file_refusal(error: anyhow::Error) -> anyhow::Error {
+    match error.downcast::<FileRefusal>() {
+        Ok(refusal) => {
+            refusal.diagnostics.print();
+            refusal.error
+        }
+        Err(error) => error,
+    }
+}
+
 /// Append each of `lines` to `into` that it does not hold yet, in order.
 pub(crate) fn add_file_diagnostics(into: &mut Vec<String>, lines: &[String]) {
     for line in lines {
@@ -1036,20 +1107,33 @@ pub(crate) fn add_file_diagnostics(into: &mut Vec<String>, lines: &[String]) {
 }
 
 /// The bytes of the project's `minimal.toml` for `project`, or `None` when
-/// the project has none.
+/// the project has none. A refused file prints its hints on stderr.
 fn project_file_bytes(project: &camino::Utf8Path) -> anyhow::Result<Option<Vec<u8>>> {
-    Ok(project_file_read(project)?.0)
+    Ok(project_file_read(project).map_err(print_file_refusal)?.0)
 }
 
 /// [`project_file_bytes`], with the lines the load has for the person: its
-/// legacy-table hints and unknown-field warnings. It prints nothing.
+/// legacy-table hints and unknown-field warnings. It prints nothing. A
+/// refused file's hints come back on a [`FileRefusal`].
 fn project_file_read(
     project: &camino::Utf8Path,
 ) -> anyhow::Result<(Option<Vec<u8>>, FileDiagnostics)> {
-    let file = match mfile::File::from_dir_recursive(project.as_std_path()) {
+    let file = match mfile::File::from_dir_recursive_quiet(project.as_std_path()) {
         Ok(file) => file,
-        Err(mfile::Error::NotFound) => return Ok((None, FileDiagnostics::default())),
-        Err(error) => return Err(ProjectFileInvalid { error }.into()),
+        Err(refusal) if matches!(refusal.error(), mfile::Error::NotFound) => {
+            return Ok((None, FileDiagnostics::default()));
+        }
+        Err(refusal) => {
+            let diagnostics = FileDiagnostics::of_refusal(&refusal);
+            let error = ProjectFileInvalid {
+                error: refusal.into_error(),
+            }
+            .into();
+            if diagnostics.lines().is_empty() {
+                return Err(error);
+            }
+            return Err(FileRefusal { error, diagnostics }.into());
+        }
     };
     let diagnostics = FileDiagnostics::of(&file);
     let Some(root) = file.repo_path() else {
@@ -1105,7 +1189,8 @@ pub async fn cmd_box_start(global: &GlobalArgs, args: BoxStartArgs) -> Result<()
 /// stdin closed, and the start prints one hint.
 pub async fn start_entry(global: &GlobalArgs, start: StartEntry) -> Result<(), anyhow::Error> {
     let project = command_project_dir(global)?;
-    let (entries, diagnostics) = project_entries_and_diagnostics(&project)?;
+    let (entries, diagnostics) =
+        project_entries_and_diagnostics(&project).map_err(print_file_refusal)?;
     diagnostics.print();
     let has_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let plan = plan_start(&start, &entries, has_terminal).inspect_err(|error| {
@@ -1420,7 +1505,8 @@ pub(crate) fn session_loadout_mode(
     entry: Option<&str>,
     named: &[String],
 ) -> anyhow::Result<mfile::expand::LoadoutMode> {
-    let (mode, diagnostics) = session_loadout_mode_and_diagnostics(project, entry, named)?;
+    let (mode, diagnostics) =
+        session_loadout_mode_and_diagnostics(project, entry, named).map_err(print_file_refusal)?;
     diagnostics.print();
     Ok(mode)
 }
@@ -1472,7 +1558,7 @@ pub(crate) fn task_loadout_mode(
     project: &camino::Utf8Path,
     task: &str,
 ) -> anyhow::Result<mfile::expand::LoadoutMode> {
-    let (bytes, diagnostics) = project_file_read(project)?;
+    let (bytes, diagnostics) = project_file_read(project).map_err(print_file_refusal)?;
     diagnostics.print();
     let declared = match &bytes {
         Some(bytes) => mfile::entry::read_entries(bytes)
