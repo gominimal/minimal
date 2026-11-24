@@ -27056,9 +27056,13 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     fi
     echo "run: the task is inside its box and printed $PO_RUN_MARKER"
     po_task_ls="$(mnl ls 2>/dev/null)"
-    po_task_box="$(printf '%s\n' "$po_task_ls" | grep -o 'e2e-port-run-[0-9][0-9]*' | head -n1)"
+    # A task box with no requested name is `<project>-<task>-<n>` (BOX-211).
+    # Match the whole name: the bare `e2e-port-run-<n>` tail names no box,
+    # so `min box show` on it never reads the run's own state.
+    po_task_label="$(basename "$PO_TASK_SEED_DIR" | tr 'A-Z._' 'a-z--')"
+    po_task_box="$(printf '%s\n' "$po_task_ls" | grep -o "$po_task_label-e2e-port-run-[0-9][0-9]*" | head -n1)"
     if [ -z "$po_task_box" ]; then
-      echo "::error::the run's box was not listed while its task ran"
+      echo "::error::the run's box $po_task_label-e2e-port-run-<n> was not listed while its task ran"
       echo "--- min ls ---"; printf '%s\n' "$po_task_ls"
       fail
     fi
