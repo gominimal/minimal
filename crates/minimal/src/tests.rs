@@ -963,23 +963,41 @@ async fn removed_session_verbs_fail_as_unknown_commands() {
         no_input: true,
         ..Default::default()
     };
-    for (argv, flag) in [
+    // BCLI-026: the box verb refuses a `--path` after the entry's name the
+    // same way, and its refusal names the box verb.
+    for (argv, flag, verb) in [
         (
             &["min", "task", "run", "build", "--path", "sub/dir"][..],
             "--path",
+            "task",
         ),
-        (&["min", "task", "run", "build", "--path=sub/dir"], "--path"),
+        (
+            &["min", "task", "run", "build", "--path=sub/dir"],
+            "--path",
+            "task",
+        ),
+        (
+            &["min", "box", "run", "build", "--path", "sub/dir"],
+            "--path",
+            "box",
+        ),
+        (
+            &["min", "box", "run", "build", "--path=sub/dir"],
+            "--path",
+            "box",
+        ),
     ] {
         let cli = Cli::try_parse_from(argv).unwrap_or_else(|err| panic!("{argv:?}: {err}"));
-        let Some(Command::Task(TaskArgs {
-            command: TaskCommand::Run(run),
-        })) = cli.command
-        else {
-            panic!("{argv:?} parses as a task run");
-        };
-        let err = task::cmd_task_run(&global, run)
-            .await
-            .expect_err("a task run with --path is refused");
+        let err = match cli.command {
+            Some(Command::Task(TaskArgs {
+                command: TaskCommand::Run(run),
+            })) => task::cmd_task_run(&global, run).await,
+            Some(Command::Box(BoxArgs {
+                command: BoxCommand::Run(run),
+            })) => task::cmd_box_run(&global, run).await,
+            _ => panic!("{argv:?} parses as a task run or a box run"),
+        }
+        .expect_err("a run with --path is refused");
         let refusal = err
             .downcast_ref::<task::RunFlagMisplaced>()
             .unwrap_or_else(|| panic!("{argv:?}: {err:#}"));
@@ -987,9 +1005,9 @@ async fn removed_session_verbs_fail_as_unknown_commands() {
         assert_eq!(
             refusal.to_string(),
             format!(
-                "Cannot run build: min task run has no {flag} flag. Run min -C <dir> task run \
-                 build to run the task in the project at <dir>, or put -- between build and \
-                 its arguments to pass {flag} to the task."
+                "Cannot run build: min {verb} run has no {flag} flag. Run min -C <dir> {verb} \
+                 run build to run the task in the project at <dir>, or put -- between build \
+                 and its arguments to pass {flag} to the task."
             ),
             "{argv:?}"
         );
@@ -2785,7 +2803,6 @@ async fn run_pty_entry_exit2_hints_start_new() {
             &global,
             BoxRunArgs {
                 entry: "default".into(),
-                path: None,
                 detach: false,
                 network: None,
                 egress: EgressArgs::default(),
@@ -2884,7 +2901,6 @@ fn run_and_start_new_request_fresh_instance() {
     });
     let box_run = task::RunEntry::from(BoxRunArgs {
         entry: "build".into(),
-        path: None,
         detach: false,
         network: Some(CliNetworkMode::OwnIp),
         egress,
@@ -3246,7 +3262,6 @@ async fn unattached_start_closes_stdin_and_hints_run_logs_wait() {
         task::RunEntry {
             verb: task::RunVerb::Box,
             entry: "build".into(),
-            path: None,
             detach: true,
             args: vec![],
             network: None,
@@ -26583,6 +26598,14 @@ fn box_verbs_exist_with_arch_flags() {
             );
         }
     }
+    // `min box run` takes no `--path`, hidden or visible. `-C` names the
+    // project.
+    assert!(
+        !model_verb("box", "run")
+            .get_arguments()
+            .any(|arg| arg.get_long() == Some("path")),
+        "`min box run` takes no --path"
+    );
 
     // Each verb parses a command line that uses its flags.
     for argv in [
@@ -26910,6 +26933,37 @@ fn docs_name_aliases_only_in_one_migration_note() {
     ] {
         assert!(note.contains(old), "the note names {old}");
     }
+}
+
+// BCLI-026: `min box run` takes no `--path`. The parser refuses it before
+// the entry's name with the usage exit code, and `-C <dir>` names the
+// project in its place.
+#[test]
+fn box_run_path_flag_is_refused() {
+    use clap::Parser as _;
+    use clap::error::ErrorKind;
+
+    for argv in [
+        &["min", "box", "run", "--path", ".", "check"][..],
+        &["min", "box", "run", "--path=.", "check"],
+    ] {
+        let Err(err) = Cli::try_parse_from(argv) else {
+            panic!("{argv:?}: --path is refused");
+        };
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument, "{argv:?}: {err}");
+        assert_eq!(err.exit_code(), 2, "{argv:?}: {err}");
+        assert!(
+            err.to_string().contains("unexpected argument '--path"),
+            "{argv:?}: {err}"
+        );
+    }
+
+    let cli = Cli::try_parse_from(["min", "-C", "/tmp", "box", "run", "check"])
+        .expect("`-C` names the project of a box run");
+    assert_eq!(
+        cli.global_args.repo_dir,
+        Some(std::path::PathBuf::from("/tmp"))
+    );
 }
 
 // BCLI-043: `min session setup-zed` stays hidden, with the arguments it

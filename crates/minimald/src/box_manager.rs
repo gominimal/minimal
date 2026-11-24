@@ -2035,20 +2035,119 @@ fn unenrolled_broker_refusal(
     ))
 }
 
+/// Where the node-local proxy publishes its identity, under `home`:
+/// `.minimal/bep/identity.json`, the path `min` reads it from.
+/// [`BoxManager::init`] passes the daemon's home. A test passes its own
+/// directory, so a proxy on the test host does not change what it sees.
+fn published_identity_path(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".minimal/bep/identity.json")
+}
+
+/// What the daemon found where the node-local proxy publishes its
+/// identity, for the create gate of BOX-081.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PublishedRoot {
+    /// No identity file is there, or the daemon has no path to look at.
+    /// That is the case on a microVM guest, where the proxy publishes on
+    /// the host. The gate checks only the certificate's shape.
+    Absent,
+    /// The root certificate in the published identity.
+    Root(String),
+    /// An identity file is there, but the daemon cannot use it: another
+    /// user can change it, it is not valid JSON, it was not read, or it
+    /// carries no root certificate. The gate does not fall back to the
+    /// shape check, so nothing matches.
+    Unusable,
+}
+
+impl PublishedRoot {
+    /// A short name for the log, without the certificate itself.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Root(_) => "root",
+            Self::Unusable => "unusable",
+        }
+    }
+}
+
+/// What the node-local proxy published at `path`. Only a missing file
+/// (or no path) makes the gate advisory. Any other read error makes the
+/// identity [`PublishedRoot::Unusable`], so a damaged file or one with the
+/// wrong owner does not let a made-up certificate through. An identity with
+/// no root certificate is unusable too: it names no root, so no
+/// certificate can match it.
+fn published_root_certificate(path: Option<&std::path::Path>) -> PublishedRoot {
+    let Some(path) = path else {
+        return PublishedRoot::Absent;
+    };
+    match bep::publish::Identity::read(path) {
+        Ok(identity) => match identity.root_certificate {
+            Some(root) => PublishedRoot::Root(root),
+            None => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "the published identity carries no root certificate, so the create \
+                     gate counts no root certificate as the proxy's"
+                );
+                PublishedRoot::Unusable
+            }
+        },
+        Err(bep::publish::PublishError::Io { ref source, .. }) if source.kind() == NotFound => {
+            PublishedRoot::Absent
+        }
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "could not use the published identity, so the create gate counts no root \
+                 certificate as the proxy's"
+            );
+            PublishedRoot::Unusable
+        }
+    }
+}
+
+/// The DER bytes of the one certificate in `pem`, or `None` when `pem` is
+/// not one PEM certificate.
+fn certificate_der(pem: &str) -> Option<Vec<u8>> {
+    bep::publish::Identity {
+        root_certificate: Some(pem.to_owned()),
+        ..Default::default()
+    }
+    .root_certificate_der()
+    .ok()
+}
+
 /// Whether `certificate` counts as the node-local proxy's root
-/// certificate for the BOX-081 gate. This daemon has no fact of its own
-/// about the proxy: on a microVM host the proxy runs beside the host
-/// daemon, outside this guest. So the gate takes the certificate the
-/// caller read from the proxy's published identity, and it accepts only
-/// one well-formed certificate block. An empty or malformed value counts
-/// as no certificate, and the brokered secret is refused.
+/// certificate for the BOX-081 gate. On a microVM host the proxy runs
+/// beside the host daemon, outside this guest. So the gate takes the
+/// certificate the caller read from the proxy's published identity, and
+/// it accepts only one well-formed certificate block. An empty or
+/// malformed value counts as no certificate, and the brokered secret is
+/// refused.
 ///
-/// The daemon cannot compare the value with a proxy root it knows, so the
-/// check is advisory: it trusts the caller. A caller that sends a made-up
-/// certificate passes it. Even then, only a GitHub grant passes, because
-/// a node-local proxy serves no other brokered secret.
-fn proxy_root_certificate(certificate: Option<&str>) -> bool {
-    certificate.is_some_and(crate::env::is_one_certificate)
+/// `published` is what this daemon found where the proxy publishes its
+/// identity. When it reads a root (a native host), the certificate counts
+/// only when it is that root, and a made-up certificate is refused. When
+/// an identity file is there but unusable, or it carries no root, no
+/// certificate counts. Only with no published identity file is the check
+/// advisory: it trusts the caller, and a made-up certificate passes it.
+/// Even then, only a GitHub grant passes, because a node-local proxy
+/// serves no other brokered secret.
+fn proxy_root_certificate(certificate: Option<&str>, published: &PublishedRoot) -> bool {
+    let Some(certificate) = certificate.filter(|c| crate::env::is_one_certificate(c)) else {
+        return false;
+    };
+    match published {
+        // An identity with a root that is not one PEM certificate names
+        // no root to match, so nothing matches it.
+        PublishedRoot::Root(root) => {
+            certificate_der(root).is_some_and(|root| Some(root) == certificate_der(certificate))
+        }
+        PublishedRoot::Unusable => false,
+        PublishedRoot::Absent => true,
+    }
 }
 
 /// The exit code of a create that the admission check of BOX-160 refused:
@@ -2291,6 +2390,12 @@ pub struct BoxManager {
     /// so each one resolves its own effective egress (NET-074) the same way
     /// the RPC path does.
     deny_all_opt_out: bool,
+
+    /// Where the node-local proxy publishes its identity, or `None` when
+    /// the daemon has no home to look in. On a microVM guest the path
+    /// names no file, because the proxy publishes on the host. The create
+    /// gate of BOX-081 reads it (see [`proxy_root_certificate`]).
+    bep_identity: Option<std::path::PathBuf>,
 }
 
 impl BoxManager {
@@ -2302,6 +2407,28 @@ impl BoxManager {
         daemon_ctx: Arc<mctx::DaemonContext>,
         net_switch: Arc<Mutex<crate::net::SwitchClient>>,
         deny_all_opt_out: bool,
+    ) -> Result<BoxManagerHandle, std::io::Error> {
+        let bep_identity = std::env::home_dir().map(|home| published_identity_path(&home));
+        Self::init_with_bep_identity(
+            minimal_state_dir,
+            minimal_cache_dir,
+            daemon_ctx,
+            net_switch,
+            deny_all_opt_out,
+            bep_identity,
+        )
+        .await
+    }
+
+    /// [`BoxManager::init`], with the path where the node-local proxy
+    /// publishes its identity given by the caller, or `None` for no path.
+    async fn init_with_bep_identity(
+        minimal_state_dir: DaemonAbsPath,
+        minimal_cache_dir: DaemonAbsPath,
+        daemon_ctx: Arc<mctx::DaemonContext>,
+        net_switch: Arc<Mutex<crate::net::SwitchClient>>,
+        deny_all_opt_out: bool,
+        bep_identity: Option<std::path::PathBuf>,
     ) -> Result<BoxManagerHandle, std::io::Error> {
         let store = Store::init(minimal_state_dir.clone()).await?;
 
@@ -2732,6 +2859,7 @@ impl BoxManager {
             #[cfg(target_os = "linux")]
             loopback,
             deny_all_opt_out,
+            bep_identity,
         };
 
         // The manager's mainloop runs in its root (see above). Each
@@ -4595,15 +4723,24 @@ impl BoxManager {
         // box and the secret is a GitHub grant. The refusal comes before the record exists, so it leaves no
         // record, id or name behind. A certificate that is not one
         // well-formed block does not count as the proxy's.
-        let proxy_serves = proxy_root_certificate(config.root_certificate.as_deref());
+        // Where this daemon can read the proxy's published identity, the
+        // certificate must also be that identity's root. An identity file
+        // that is there but unusable counts no certificate as the root.
+        let published = match config.root_certificate {
+            Some(_) => published_root_certificate(self.bep_identity.as_deref()),
+            None => PublishedRoot::Absent,
+        };
+        let proxy_serves = proxy_root_certificate(config.root_certificate.as_deref(), &published);
         if config.root_certificate.is_some() && !proxy_serves {
             tracing::info!(
                 session_name = config
                     .name
                     .as_deref()
                     .unwrap_or(crate::rpc::ANONYMOUS_SESSION),
+                published_identity = published.label(),
                 "the create carries a root certificate that is not one well-formed \
-                 certificate block, so no node-local proxy counts as serving the box"
+                 certificate block, or not the root in the proxy's published identity, \
+                 so no node-local proxy counts as serving the box"
             );
         }
         if let Some((refusal, grants)) = spec
@@ -6975,12 +7112,13 @@ mod create_stamp_tests {
             .build()
             .unwrap();
         let daemon_ctx = Arc::new(mctx::DaemonContext::init(mctx_config).unwrap());
-        let mngr = BoxManager::init(
+        let mngr = BoxManager::init_with_bep_identity(
             daemon_abs(state.path()),
             daemon_abs(cache.path()),
             daemon_ctx,
             switch,
             false,
+            Some(published_identity_path(state.path())),
         )
         .await
         .unwrap();
@@ -7226,12 +7364,13 @@ mod ended_box_tests {
             .build()
             .unwrap();
         let daemon_ctx = Arc::new(mctx::DaemonContext::init(mctx_config).unwrap());
-        let mngr = BoxManager::init(
+        let mngr = BoxManager::init_with_bep_identity(
             daemon_abs(state.path()),
             daemon_abs(cache.path()),
             daemon_ctx,
             switch,
             false,
+            Some(published_identity_path(state.path())),
         )
         .await
         .unwrap();

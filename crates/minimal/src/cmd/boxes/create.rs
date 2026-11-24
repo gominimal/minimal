@@ -955,7 +955,6 @@ pub(crate) fn plan_start(
             run: crate::task::RunEntry {
                 verb: crate::task::RunVerb::Box,
                 entry: entry.name.clone(),
-                path: None,
                 detach: true,
                 args: Vec::new(),
                 network: start.overrides.network,
