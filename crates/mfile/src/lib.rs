@@ -1168,6 +1168,9 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
+/// A file's path and the hash of its content.
+type FileKey = (PathBuf, Option<u64>);
+
 /// Whether a load from disk prints its diagnostics on stderr. It is on by
 /// default, so every command that loads a `minimal.toml` shows its
 /// legacy-table hints and unknown-field warnings. A caller that owns the
@@ -1183,13 +1186,6 @@ pub fn print_diagnostics_on_load(print: bool) {
     PRINT_ON_LOAD.store(print, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Whether a load from disk prints its diagnostics on stderr: see
-/// [`print_diagnostics_on_load`].
-#[must_use]
-pub fn prints_diagnostics_on_load() -> bool {
-    PRINT_ON_LOAD.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// Whether this is the first time this process hands out the diagnostics of
 /// the file at `path` with this content.
 ///
@@ -1200,8 +1196,6 @@ pub fn prints_diagnostics_on_load() -> bool {
 /// `File`, not a re-read: a file replaced between parse and report must not
 /// silence the report of the replacement. A file with no path is always due.
 fn diagnostics_due(path: Option<&Path>, content_hash: Option<u64>) -> bool {
-    /// A file's path and the hash of its content.
-    type FileKey = (PathBuf, Option<u64>);
     static REPORTED_FILES: LazyLock<Mutex<HashSet<FileKey>>> =
         LazyLock::new(|| Mutex::new(HashSet::new()));
     let Some(path) = path else {
@@ -1424,7 +1418,7 @@ impl File {
     /// that. The record is apart from the one [`File::diagnostics_once`]
     /// keeps, so a print does not use up what a caller hands out.
     fn diagnostics_due_to_print(&self) -> Vec<String> {
-        static PRINTED_FILES: LazyLock<Mutex<HashSet<(PathBuf, Option<u64>)>>> =
+        static PRINTED_FILES: LazyLock<Mutex<HashSet<FileKey>>> =
             LazyLock::new(|| Mutex::new(HashSet::new()));
         let Some(path) = self.mfile_path.as_deref() else {
             return self.diagnostics.clone();

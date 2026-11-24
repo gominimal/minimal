@@ -1551,12 +1551,7 @@ pub(crate) async fn run_entry(
     // before the run creates anything. A broken file is left to
     // `declared_task`, which names it.
     match mfile::File::from_dir_recursive(utf8_path.as_std_path()) {
-        Ok(file) => {
-            // The load prints nothing: its legacy-table hints and
-            // unknown-field warnings print here, on stderr, each once.
-            crate::print_file_diagnostics(file.diagnostics());
-            refuse_terminal_entry(Some(&file), &args.entry)?;
-        }
+        Ok(file) => refuse_terminal_entry(Some(&file), &args.entry)?,
         Err(mfile::Error::NotFound) => refuse_terminal_entry(None, &args.entry)?,
         Err(_) => {}
     }
@@ -2361,17 +2356,7 @@ pub(crate) fn task_activation_inputs(
     } else {
         crate::loadouts::HookPrep::StageOnly
     };
-    let inputs = crate::loadouts::prepare_activation_inputs(
-        global,
-        project,
-        selection,
-        hook_prep,
-        Some(policy),
-    )?;
-    // The loads of the project's minimal.toml print nothing. Its legacy-table
-    // hints and unknown-field warnings print here, on stderr, each once.
-    crate::print_file_diagnostics(&inputs.diagnostics);
-    Ok(inputs)
+    crate::loadouts::prepare_activation_inputs(global, project, selection, hook_prep, Some(policy))
 }
 
 #[cfg(test)]

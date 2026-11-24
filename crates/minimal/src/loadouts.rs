@@ -495,7 +495,8 @@ pub(crate) fn stage_loadout_hook_scripts(
 /// duplicating it here would report the same fault twice.
 ///
 /// The load's legacy-table hints and unknown-field warnings go to
-/// `diagnostics`. It prints none of them.
+/// `diagnostics`. The load prints them on stderr unless `min dash` turned
+/// that off.
 pub(crate) fn check_project_hooks(
     project_root: &paths::HostAbsPath,
     diagnostics: &mut Vec<String>,
@@ -573,7 +574,8 @@ pub(crate) fn check_project_hooks(
 /// project's `minimal.toml` is read the same way [`check_project_hooks`]
 /// reads it; an unreadable or session-less file contributes nothing. The
 /// load's legacy-table hints and unknown-field warnings go to
-/// `diagnostics`, and it prints none of them.
+/// `diagnostics`. The load prints them on stderr unless `min dash` turned
+/// that off.
 pub(crate) fn activate_hook_budget(
     active: &ActiveLoadouts,
     project_root: &camino::Utf8Path,
@@ -694,8 +696,8 @@ pub struct ActivationInputs {
     /// The active loadouts' names, for the CLI's "Applying loadouts" line.
     pub loadout_names: Vec<String>,
     /// The project `minimal.toml`'s legacy-table hints and unknown-field
-    /// warnings, each once. Nothing printed them: the CLI prints them on
-    /// stderr, and the dashboard puts them on its status line.
+    /// warnings, each once. The CLI's loads print them on stderr. The
+    /// dashboard turns that off and puts them on its status line.
     pub diagnostics: Vec<String>,
 }
 
