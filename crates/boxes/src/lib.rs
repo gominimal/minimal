@@ -1878,19 +1878,39 @@ pub mod box_name {
         root.trim_end_matches('/').rsplit('/').next().unwrap_or("")
     }
 
+    /// The project part of a derived name, as one DNS label: ASCII letters
+    /// and digits lowercased, and each run of other characters as one `-`,
+    /// with no `-` at either end. A project with nothing left is `box`, so
+    /// `cafébar` gives `caf-bar` and `日本` gives `box`.
+    fn project_label(project: &str) -> String {
+        let mut label = String::with_capacity(project.len());
+        for c in project.chars() {
+            if c.is_ascii_alphanumeric() {
+                label.push(c.to_ascii_lowercase());
+            } else if !label.is_empty() && !label.ends_with('-') {
+                label.push('-');
+            }
+        }
+        let label = label.trim_end_matches('-');
+        if label.is_empty() {
+            "box".to_string()
+        } else {
+            label.to_string()
+        }
+    }
+
     /// The name the Box Host derives for a box created with no requested
     /// name (BOX-211, BOX-213): the project name for the default entry
     /// (`entry` is `None`), else `<project>-<entry>`, and then `-<n>` for
-    /// the `n`th fresh instance. Each part is cleaned to DNS label
-    /// characters. The name fits [`BOX_NAME_MAX`] octets: the project is
-    /// cut first, then the entry, and the instance number never. A project
-    /// that cleans to nothing leaves the entry alone, and a name with
-    /// nothing left is `box`.
+    /// the `n`th fresh instance. The project is cleaned as
+    /// [`project_label`] cleans it, and the entry to DNS label characters.
+    /// The name fits [`BOX_NAME_MAX`] octets: the project is cut first,
+    /// then the entry, and the instance number never.
     #[must_use]
     pub fn derived_box_name(project: &str, entry: Option<&str>, instance: Option<usize>) -> String {
         let suffix = instance.map(|n| format!("-{n}")).unwrap_or_default();
         let budget = BOX_NAME_MAX.saturating_sub(suffix.len());
-        let project = label_chars(project);
+        let project = project_label(project);
         let entry = entry.map(label_chars).filter(|entry| !entry.is_empty());
         let base = match entry {
             None => cut_label(&project, budget).to_string(),
@@ -1909,6 +1929,37 @@ pub mod box_name {
             base.as_str()
         };
         format!("{base}{suffix}")
+    }
+
+    /// The entry a session spec names when it names none of its own. A
+    /// box of this entry takes the project name alone.
+    pub const DEFAULT_ENTRY: &str = "default";
+
+    /// The name a create with no requested name gives its box (BOX-211):
+    /// [`derived_box_name`] of the last component of `project_root` and
+    /// the `entry` of the stored `spec`. A spec with no readable `entry`,
+    /// a spec of [`DEFAULT_ENTRY`], or no spec takes the project name
+    /// alone. Only the `entry` key is read, so a spec that does not parse
+    /// as a v0 spec still gives a name. The Box Host, `min box start` and
+    /// `min dash` all name an unnamed box through this one function.
+    #[must_use]
+    pub fn create_derived_name(
+        project_root: &str,
+        spec: Option<&serde_json_lenient::Value>,
+        instance: Option<usize>,
+    ) -> String {
+        let entry = spec
+            .and_then(|spec| spec.get("entry"))
+            .and_then(serde_json_lenient::Value::as_str)
+            .filter(|entry| *entry != DEFAULT_ENTRY);
+        derived_box_name(project_name_of_root(project_root), entry, instance)
+    }
+
+    /// The `[box] name` a stored `spec` carries, when it carries one.
+    #[must_use]
+    pub fn spec_box_name(spec: Option<&serde_json_lenient::Value>) -> Option<&str> {
+        spec.and_then(|spec| spec.get("name"))
+            .and_then(serde_json_lenient::Value::as_str)
     }
 
     /// What a name check reads of one retained record on one host.
@@ -3659,7 +3710,10 @@ mod tests {
         /// fresh instance's number is never cut.
         #[test]
         fn derived_name_fits_63_cutting_project_then_entry_never_number() {
-            use super::super::box_name::{BOX_NAME_MAX, derived_box_name, project_name_of_root};
+            use super::super::box_name::{
+                BOX_NAME_MAX, DEFAULT_ENTRY, create_derived_name, derived_box_name,
+                project_name_of_root, spec_box_name,
+            };
 
             assert_eq!(derived_box_name("Web_App", None, None), "web-app");
             assert_eq!(derived_box_name("web", Some("lint"), None), "web-lint");
@@ -3694,13 +3748,31 @@ mod tests {
             );
 
             // Parts that clean to nothing.
-            assert_eq!(derived_box_name("日本", Some("lint"), None), "lint");
+            assert_eq!(derived_box_name("日本", Some("lint"), None), "box-lint");
+            assert_eq!(derived_box_name("My_App.v2", None, None), "my-app-v2");
+            assert_eq!(derived_box_name("cafébar", None, None), "caf-bar");
+            assert_eq!(derived_box_name("a--b", Some("x"), None), "a-b-x");
             assert_eq!(derived_box_name("日本", None, None), "box");
             assert_eq!(derived_box_name("", None, Some(2)), "box-2");
 
             assert_eq!(project_name_of_root("/home/me/web/"), "web");
             assert_eq!(project_name_of_root("/home/me/web"), "web");
             assert_eq!(project_name_of_root("/"), "");
+
+            // The create's name: the root's last component and the spec's
+            // entry, with the default entry naming the project alone.
+            let spec = |entry: &str| serde_json_lenient::json!({ "entry": entry, "name": "api" });
+            assert_eq!(
+                create_derived_name("/home/me/web", Some(&spec("lint")), None),
+                "web-lint"
+            );
+            assert_eq!(
+                create_derived_name("/home/me/web", Some(&spec(DEFAULT_ENTRY)), None),
+                "web"
+            );
+            assert_eq!(create_derived_name("/home/me/web", None, Some(2)), "web-2");
+            assert_eq!(spec_box_name(Some(&spec("lint"))), Some("api"));
+            assert_eq!(spec_box_name(None), None);
         }
 
         fn status() -> impl Strategy<Value = BoxState> {
