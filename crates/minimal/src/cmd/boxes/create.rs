@@ -3214,7 +3214,9 @@ fn store_grants(
 /// The authorities to register with the proxy as the box's declared egress
 /// (BEP-022). A box whose egress admits every name lists none, so a GitHub
 /// grant registers the module's hosts for it, and each store grant registers
-/// its rule's upstream hosts (BEP-036), or the proxy would refuse them.
+/// its rule's upstream authorities (BEP-036), or the proxy would refuse them.
+/// A store authority keeps its port, since the proxy reads a bare host as
+/// port 443 and compares the whole authority.
 fn proxy_egress(
     egress: Option<&boxes::EgressPolicy>,
     network: boxes::NetworkMode,
@@ -3234,10 +3236,7 @@ fn proxy_egress(
     let stores = store_grants
         .iter()
         .flat_map(|store| store.rule.upstream.iter())
-        .map(|authority| {
-            bep::handle::parse_authority(authority)
-                .map_or_else(|| authority.to_ascii_lowercase(), |parsed| parsed.host)
-        });
+        .map(|authority| authority.to_ascii_lowercase());
     let mut hosts: Vec<String> = Vec::new();
     for host in github.chain(stores) {
         if !hosts.contains(&host) {
@@ -6498,8 +6497,9 @@ mod tests {
     }
 
     /// BEP-022, BEP-036: a `host_ip` box with no `egress` section and one
-    /// store rule registers that rule's upstream host with the proxy. An
-    /// `own_ip` box and a box with a section register what they list.
+    /// store rule registers that rule's upstream authorities with the proxy,
+    /// each with its port. An `own_ip` box and a box with a section register
+    /// what they list.
     #[test]
     fn host_ip_store_box_with_no_egress_section_registers_the_rule_upstream() {
         let store = crate::mint::StoreGrant {
@@ -6515,10 +6515,22 @@ mod tests {
             },
         };
         let stores = std::slice::from_ref(&store);
-        assert_eq!(
-            proxy_egress(None, boxes::NetworkMode::HostNet, false, stores),
-            ["api.example.com"]
-        );
+        let registered = proxy_egress(None, boxes::NetworkMode::HostNet, false, stores);
+        assert_eq!(registered, ["api.example.com", "api.example.com:8443"]);
+        // The proxy parses each registered authority as this does, so the
+        // rule's `:8443` upstream is inside the box's declared egress.
+        let admitted: Vec<_> = registered
+            .iter()
+            .map(|text| bep::handle::parse_authority(text).expect("authority"))
+            .collect();
+        assert!(admitted.contains(&bep::redeem::Authority {
+            host: "api.example.com".to_string(),
+            port: 8443,
+        }));
+        assert!(admitted.contains(&bep::redeem::Authority {
+            host: "api.example.com".to_string(),
+            port: 443,
+        }));
         assert!(proxy_egress(None, boxes::NetworkMode::OwnIp, false, stores).is_empty());
 
         let mut with_github: Vec<String> = bep::module::GITHUB
@@ -6527,6 +6539,7 @@ mod tests {
             .map(|authority| authority.host.to_string())
             .collect();
         with_github.push("api.example.com".into());
+        with_github.push("api.example.com:8443".into());
         assert_eq!(
             proxy_egress(None, boxes::NetworkMode::HostNet, true, stores),
             with_github
