@@ -444,16 +444,19 @@ entry's first argument. An argument that has the name of a flag goes after
 ### `box list`
 
 ```
-min box list [--all] [-o json]
+min box list [--all] [--type <TYPE>] [--parent <BOX>] [-o json]
 ```
 
 Lists the boxes of the current project, in any state. Each row shows the
 box's id, name, type, parent, project and state, how a stopped or exited box
-ended, and the provider and host the box runs on.
+ended, and the provider and host the box runs on. `--type` and `--parent`
+keep only the boxes that match. When you give both, a box must match both.
 
 | Flag | Short | Description |
 |------|-------|-------------|
 | `--all` | | List the boxes of every project |
+| `--type <TYPE>` | | List only the boxes of this type, such as `session` or `task` |
+| `--parent <BOX>` | | List only the child boxes of this box: its id, the start of its id, or its name |
 | `--output json` | `-o` | Write the boxes as one JSON array, one object for each box, and nothing else |
 
 ### `box attach`
