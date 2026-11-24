@@ -139,6 +139,7 @@ fn sample_config() -> minimald_rpc::BoxConfig {
         creating_verb: minimald_rpc::CreatingVerb::Session,
         project_root: None,
         host_ip_registration: None,
+        project_name: None,
     }
 }
 
@@ -1633,6 +1634,7 @@ async fn rename_of_unroutable_session_leaves_other_routes_alone() {
     config.name = None;
     config.network = boxes::NetworkMode::NoNet;
     config.project_path = HostAbsPath::try_new(unroutable_dir.to_str().unwrap()).unwrap();
+    config.project_name = Some("app".to_string());
     let unroutable_id = create_active_session_with(&mngr, config).await;
     set_record_state(
         state.path(),
@@ -1645,6 +1647,7 @@ async fn rename_of_unroutable_session_leaves_other_routes_alone() {
     config.name = None;
     config.network = boxes::NetworkMode::HostNet;
     config.project_path = HostAbsPath::try_new(routable_dir.to_str().unwrap()).unwrap();
+    config.project_name = Some("app".to_string());
     // Finalizing the loadout registers the "app" route.
     let _routable_id = create_active_session_with(&mngr, config).await;
     let handle = session(&mngr, unroutable_id).await;
@@ -3812,11 +3815,12 @@ async fn retained_session_survives_restart_then_lists_reads_and_resumes() {
     assert_eq!(listed(&mut client, left).await.state, "stopped");
 }
 
-/// A create request with no name of its own, as a client that names its
-/// box through the spec sends it.
+/// A create request with no name of its own, from the project `proj`, as
+/// a client sends it when neither `--name` nor the entry names the box.
 fn unnamed_config() -> minimald_rpc::BoxConfig {
     let mut config = sample_config();
     config.name = None;
+    config.project_name = Some("proj".to_string());
     config
 }
 
@@ -4029,6 +4033,7 @@ fn derived_name_is_project_for_default_else_project_dash_entry() {
     );
 
     let mut rooted = unnamed_config();
+    rooted.project_name = None;
     rooted.project_path = HostAbsPath::try_new("/home/me/Web.App/sub").unwrap();
     rooted.project_root = Some(HostAbsPath::try_new("/home/me/Web.App").unwrap());
     assert_eq!(
@@ -4043,6 +4048,115 @@ fn derived_name_is_project_for_default_else_project_dash_entry() {
         creation_name(&named, Some(&spec("lint"))),
         ("Exact".to_string(), NameSource::Request)
     );
+}
+
+/// The bytes of the stored spec beside box `id`'s record.
+fn stored_spec_bytes(state: &std::path::Path, id: SessionId) -> Vec<u8> {
+    for dir in std::fs::read_dir(state.join("sessions")).unwrap() {
+        let dir = dir.unwrap().path();
+        let Ok(record) = std::fs::read_to_string(dir.join("record.json")) else {
+            continue;
+        };
+        if record.contains(&id.to_string()) {
+            return std::fs::read(dir.join(boxes::store::SPEC_FILE)).unwrap();
+        }
+    }
+    panic!("no record of {id}");
+}
+
+/// BOX-216: a create whose project name is not a DNS label is refused with
+/// exit 3 before any name is derived. The name is never converted, and
+/// the refusal files nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_refuses_project_name_not_dns_label_exit3() {
+    let log = crate::test_harness::captured_log();
+    let (_state, _cache, mngr) = manager().await;
+    for bad in ["Web App", "-web", "web-", "", "a_b", "caf\u{e9}"] {
+        for named in [None, Some("dev")] {
+            let mut config = as_task(unnamed_config());
+            config.project_name = Some(bad.to_string());
+            config.name = named.map(str::to_string);
+            let err = mngr
+                .create_box_with_spec(config, Some(task_spec("lint", None)), None, None)
+                .await
+                .expect_err("the project name is not a DNS label");
+            let refusal = err
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<ProjectNameRefusal>())
+                .unwrap_or_else(|| panic!("the refusal is the project name's: {err}"));
+            assert_eq!(refusal.name, bad);
+            assert_eq!(refusal.exit_code(), 3);
+            assert_eq!(admission_refusal(&err), Some(3), "the reply carries exit 3");
+            let text = err.to_string();
+            assert!(text.contains("[project] name"), "{text}");
+            assert!(text.contains(&format!("{bad:?}")), "{text}");
+            assert!(
+                text.contains("1 to 63 ASCII letters, digits and `-`, with no `-` at either end"),
+                "{text}"
+            );
+        }
+    }
+    assert!(
+        mngr.list_boxes(None).await.unwrap().is_empty(),
+        "a refused create files nothing"
+    );
+    assert!(
+        log.contents()
+            .contains("refused a create whose project name is not a DNS label"),
+        "the daemon log names the refusal"
+    );
+
+    // A DNS label with upper-case letters is a valid project name.
+    let mut config = as_task(unnamed_config());
+    config.project_name = Some("Web".to_string());
+    let id = mngr
+        .create_box_with_spec(config, Some(task_spec("lint", None)), None, None)
+        .await
+        .expect("a DNS label is accepted");
+    assert_eq!(record_name(&mngr, id).await.as_deref(), Some("web-lint"));
+}
+
+/// BOX-211: a box's name is never read from its stored spec. A spec's
+/// `[box] name` names no box, and a rename changes the record's name and
+/// leaves the stored spec as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn box_name_never_read_from_stored_spec_rename_changes_record_only() {
+    let (state, _cache, mngr) = manager().await;
+    let spec = task_spec("lint", Some("from-spec"));
+    let id = mngr
+        .create_box_with_spec(as_task(unnamed_config()), Some(spec.clone()), None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        record_name(&mngr, id).await.as_deref(),
+        Some("proj-lint"),
+        "the spec's [box] name does not name the box"
+    );
+    let before = stored_spec_bytes(state.path(), id);
+    assert_eq!(
+        serde_json_lenient::from_slice::<serde_json_lenient::Value>(&before).unwrap(),
+        spec
+    );
+
+    rename_box(&mngr, id, "renamed").await;
+    assert_eq!(record_name(&mngr, id).await.as_deref(), Some("renamed"));
+    assert_eq!(
+        stored_spec_bytes(state.path(), id),
+        before,
+        "a rename leaves the stored spec as it was"
+    );
+
+    // A requested name wins over the spec's `[box] name` too.
+    let named = mngr
+        .create_box_with_spec(
+            named_task("asked"),
+            Some(task_spec("lint", Some("from-spec"))),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(record_name(&mngr, named).await.as_deref(), Some("asked"));
 }
 
 /// BOX-163: a create that asks for no fresh instance, under a name a

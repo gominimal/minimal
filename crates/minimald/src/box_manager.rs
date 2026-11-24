@@ -440,35 +440,73 @@ impl NameSource {
     }
 }
 
-/// What a derived box name comes from (BOX-211): the project root, else
-/// the project path, and the stored spec, whose `entry` names the entry.
-#[derive(Debug, Clone, Copy)]
+/// What a derived box name comes from (BOX-211): the project name the
+/// request carries, else its project root's directory name converted
+/// (BOX-215), and the stored spec, whose `entry` names the entry. The
+/// spec's `[box] name` and the request's project path are never read.
+#[derive(Debug, Clone)]
 struct DerivedName<'a> {
-    root: &'a str,
+    project: String,
     spec: Option<&'a serde_json_lenient::Value>,
 }
 
 impl<'a> DerivedName<'a> {
-    /// The parts of a create's derived name: the project root (else the
-    /// project path) and the spec.
-    fn of(
-        config: &'a minimald_rpc::BoxConfig,
-        spec: Option<&'a serde_json_lenient::Value>,
-    ) -> Self {
-        let root = config
-            .project_root
-            .as_ref()
-            .unwrap_or(&config.project_path)
-            .as_str();
-        Self { root, spec }
+    /// The parts of a create's derived name: the project name and the spec.
+    fn of(config: &minimald_rpc::BoxConfig, spec: Option<&'a serde_json_lenient::Value>) -> Self {
+        let project = boxes::box_name::request_project_name(
+            config.project_name.as_deref(),
+            config.project_root.as_ref().map(paths::HostAbsPath::as_str),
+        );
+        Self { project, spec }
     }
 
     /// The name, with the `n`th fresh instance's number when `instance` is
     /// set. The client derives the same name through the same function.
     fn name(&self, instance: Option<usize>) -> String {
-        boxes::box_name::create_derived_name(self.root, self.spec, instance)
+        boxes::box_name::create_derived_name(&self.project, self.spec, instance)
     }
 }
+
+/// The refusal of a create whose project name is not a DNS label
+/// (BOX-216). The daemon never converts the name the client sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectNameRefusal {
+    /// The project name the request carried.
+    pub(crate) name: String,
+}
+
+impl ProjectNameRefusal {
+    /// The exit code of the refusal: 3, a configuration error.
+    pub(crate) const EXIT_CODE: i32 = 3;
+
+    /// The exit code of the refusal.
+    pub(crate) fn exit_code(&self) -> i32 {
+        Self::EXIT_CODE
+    }
+
+    /// The refusal of `config`'s project name, when it is not a DNS label.
+    fn of(config: &minimald_rpc::BoxConfig) -> Option<Self> {
+        config
+            .project_name
+            .as_ref()
+            .filter(|name| !boxes::box_name::is_dns_label(name))
+            .map(|name| Self { name: name.clone() })
+    }
+}
+
+impl std::fmt::Display for ProjectNameRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "[project] name is {:?}, which is not a DNS label. A DNS label \
+             holds 1 to 63 ASCII letters, digits and `-`, with no `-` at \
+             either end. Change [project] name in minimal.toml to a DNS label.",
+            self.name
+        )
+    }
+}
+
+impl std::error::Error for ProjectNameRefusal {}
 
 /// The name a create gives its box (BOX-211): the request's name exactly
 /// as written, else the name derived from the project and the entry. A
@@ -2144,10 +2182,13 @@ fn proxy_root_certificate(certificate: Option<&str>, published: &PublishedRoot) 
 
 /// The exit code of a create that the admission check of BOX-160 refused:
 /// the error carries a [`RootConstraintRefusal`] or an
-/// [`UnknownRootRefusal`]. `None` for any other error.
+/// [`UnknownRootRefusal`], or a [`ProjectNameRefusal`] (BOX-216). `None`
+/// for any other error.
 pub(crate) fn admission_refusal(error: &std::io::Error) -> Option<u8> {
     let inner = error.get_ref()?;
     let code = if let Some(refusal) = inner.downcast_ref::<RootConstraintRefusal>() {
+        refusal.exit_code()
+    } else if let Some(refusal) = inner.downcast_ref::<ProjectNameRefusal>() {
         refusal.exit_code()
     } else {
         inner.downcast_ref::<UnknownRootRefusal>()?.exit_code()
@@ -4614,6 +4655,19 @@ impl BoxManager {
                 minimald_rpc::SHUTDOWN_REFUSAL,
             ));
         }
+        // BOX-216: a project name that is not a DNS label is refused before
+        // any name is derived from it, and it is never converted.
+        if let Some(refusal) = ProjectNameRefusal::of(&config) {
+            tracing::info!(
+                project_name = %refusal.name,
+                exit_code = refusal.exit_code(),
+                "refused a create whose project name is not a DNS label"
+            );
+            return Err(BoxManagerError::new(
+                std::io::ErrorKind::InvalidData,
+                refusal,
+            ));
+        }
         // NET-079: a host that decides per box refuses a host-address
         // declaration naming rules its classifier cannot enforce — a denied
         // range, a narrowing allow list — and refuses it here, before
@@ -7005,6 +7059,7 @@ mod host_ip_mint_name_tests {
             creating_verb: minimald_rpc::CreatingVerb::Session,
             project_root: None,
             host_ip_registration: None,
+            project_name: None,
         }
     }
 
@@ -7141,6 +7196,7 @@ mod create_stamp_tests {
             creating_verb: minimald_rpc::CreatingVerb::Session,
             project_root: None,
             host_ip_registration: None,
+            project_name: None,
         }
     }
 
@@ -7386,6 +7442,7 @@ mod ended_box_tests {
             creating_verb: minimald_rpc::CreatingVerb::Session,
             project_root: None,
             host_ip_registration: None,
+            project_name: None,
         }
     }
 

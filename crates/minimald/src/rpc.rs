@@ -3981,11 +3981,12 @@ mod create_naming_tests {
     use crate::test_harness::{TestClient, TestServer, create_session_req};
 
     /// A create with no name on the request and a task spec whose entry is
-    /// `entry`, so the daemon derives the box's name from the project,
-    /// `tmp`, and the entry: `tmp-<entry>` (BOX-211).
+    /// `entry`, so the daemon derives the box's name from the project name
+    /// the request carries, `web`, and the entry: `web-<entry>` (BOX-211).
     fn entry_req(entry: &str, fresh_instance: bool) -> CreateSessionRequest {
         let mut request = create_session_req("unused", "/tmp");
         request.config.name = None;
+        request.config.project_name = Some("web".to_string());
         // A `task` spec is created under the task verb (BOX-160).
         request.config.creating_verb = minimald_rpc::CreatingVerb::Task;
         let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
@@ -4023,10 +4024,10 @@ mod create_naming_tests {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
         let holder = create(&mut client, &entry_req("dev", false)).await;
-        assert_eq!(name_of(&server, holder).await.as_deref(), Some("tmp-dev"));
+        assert_eq!(name_of(&server, holder).await.as_deref(), Some("web-dev"));
 
         let error = match client
-            .call::<CreateSession>(&create_session_req("tmp-dev", "/tmp"))
+            .call::<CreateSession>(&create_session_req("web-dev", "/tmp"))
             .await
         {
             CreateSessionReply::Err { error, .. } => error,
@@ -4037,9 +4038,9 @@ mod create_naming_tests {
         assert_eq!(
             refusal,
             HeldNameRefusal {
-                name: "tmp-dev".to_string(),
+                name: "web-dev".to_string(),
                 holder: Some(holder),
-                holder_name: "tmp-dev".to_string(),
+                holder_name: "web-dev".to_string(),
             }
         );
         assert_eq!(HeldNameRefusal::EXIT_CODE, 2);
@@ -4065,13 +4066,13 @@ mod create_naming_tests {
         let dev = create(&mut client, &entry_req("dev", false)).await;
         let first = create(&mut client, &entry_req("dev", true)).await;
         let second = create(&mut client, &entry_req("dev", true)).await;
-        assert_eq!(name_of(&server, dev).await.as_deref(), Some("tmp-dev"));
-        assert_eq!(name_of(&server, first).await.as_deref(), Some("tmp-dev-1"));
-        assert_eq!(name_of(&server, second).await.as_deref(), Some("tmp-dev-2"));
+        assert_eq!(name_of(&server, dev).await.as_deref(), Some("web-dev"));
+        assert_eq!(name_of(&server, first).await.as_deref(), Some("web-dev-1"));
+        assert_eq!(name_of(&server, second).await.as_deref(), Some("web-dev-2"));
 
         // A fresh instance with no running holder still takes a suffix.
         let web = create(&mut client, &entry_req("web", true)).await;
-        assert_eq!(name_of(&server, web).await.as_deref(), Some("tmp-web-1"));
+        assert_eq!(name_of(&server, web).await.as_deref(), Some("web-web-1"));
     }
 
     /// A task entry that is not a DNS label, such as `build_all`, names a
@@ -4083,13 +4084,67 @@ mod create_naming_tests {
         let build = create(&mut client, &entry_req("build_all", true)).await;
         assert_eq!(
             name_of(&server, build).await.as_deref(),
-            Some("tmp-build-all-1")
+            Some("web-build-all-1")
         );
         let lint = create(&mut client, &entry_req("CI.Lint", true)).await;
         assert_eq!(
             name_of(&server, lint).await.as_deref(),
-            Some("tmp-ci-lint-1")
+            Some("web-ci-lint-1")
         );
+    }
+
+    /// BOX-211, BOX-214: a create with no written name takes its name from
+    /// the project name on the request and the spec's entry, under every
+    /// creating verb. The request's project path and the spec's `[box]
+    /// name` are never read. With no project name, the project root's
+    /// directory name is converted, and with neither the project is `box`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_without_written_name_derives_from_project_and_entry_for_every_client() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_req = |entry: &str| {
+            let mut request = create_session_req("unused", "/tmp/elsewhere");
+            request.config.name = None;
+            request.config.project_name = Some("web".to_string());
+            let mut spec =
+                mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+            spec.entry = entry.to_string();
+            spec.name = Some("from-spec".to_string());
+            request.spec = Some(serde_json_lenient::to_value(&spec).expect("a spec serializes"));
+            request
+        };
+
+        // `min box start` and `min dash`: the session verb.
+        let default = create(
+            &mut client,
+            &session_req(mfile::spec::DEFAULT_SESSION_ENTRY),
+        )
+        .await;
+        assert_eq!(name_of(&server, default).await.as_deref(), Some("web"));
+        let dev = create(&mut client, &session_req("dev")).await;
+        assert_eq!(name_of(&server, dev).await.as_deref(), Some("web-dev"));
+
+        // `min task run`: the task verb, from the same project name.
+        let mut task = entry_req("lint", false);
+        let mut spec: mfile::spec::BoxSpec =
+            serde_json_lenient::from_value(task.spec.take().expect("a spec")).unwrap();
+        spec.name = Some("from-spec".to_string());
+        task.spec = Some(serde_json_lenient::to_value(&spec).unwrap());
+        let lint = create(&mut client, &task).await;
+        assert_eq!(name_of(&server, lint).await.as_deref(), Some("web-lint"));
+
+        // A client that sends no project name: the root's directory name.
+        let mut rooted = session_req("api");
+        rooted.config.project_name = None;
+        rooted.config.project_root = Some(paths::HostAbsPath::try_new("/home/me/My Repo").unwrap());
+        let api = create(&mut client, &rooted).await;
+        assert_eq!(name_of(&server, api).await.as_deref(), Some("my-repo-api"));
+
+        // Neither a project name nor a root: the project is `box`.
+        let mut bare = session_req("ci");
+        bare.config.project_name = None;
+        let ci = create(&mut client, &bare).await;
+        assert_eq!(name_of(&server, ci).await.as_deref(), Some("box-ci"));
     }
 }
 

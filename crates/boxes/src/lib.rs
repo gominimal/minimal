@@ -3811,8 +3811,14 @@ mod tests {
 
             // The project name a request gives: its own, else the root's
             // directory name converted, else `box`.
-            assert_eq!(request_project_name(Some("api"), Some("/home/me/web")), "api");
-            assert_eq!(request_project_name(None, Some("/home/me/My Web")), "my-web");
+            assert_eq!(
+                request_project_name(Some("api"), Some("/home/me/web")),
+                "api"
+            );
+            assert_eq!(
+                request_project_name(None, Some("/home/me/My Web")),
+                "my-web"
+            );
             assert_eq!(request_project_name(None, None), "box");
 
             // The create's name: the project name and the spec's entry,

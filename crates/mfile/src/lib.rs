@@ -6939,7 +6939,10 @@ bash = \"true\"
 
     /// Writes `body` as the `minimal.toml` of a project directory named
     /// `name` and loads it.
-    fn load_named_project(name: &std::ffi::OsStr, body: &str) -> (Result<File, Error>, tempfile::TempDir) {
+    fn load_named_project(
+        name: &std::ffi::OsStr,
+        body: &str,
+    ) -> (Result<File, Error>, tempfile::TempDir) {
         let parent = tempdir().unwrap();
         let root = parent.path().join(name);
         std::fs::create_dir(&root).unwrap();
@@ -6951,8 +6954,7 @@ bash = \"true\"
     // else the project root's directory name, converted.
     #[test]
     fn project_name_declared_else_root_directory() {
-        let (file, _dir) =
-            load_named_project("My Repo".as_ref(), "[project]\nname = \"web\"\n");
+        let (file, _dir) = load_named_project("My Repo".as_ref(), "[project]\nname = \"web\"\n");
         let file = file.expect("the file loads");
         assert_eq!(file.project_name().as_deref(), Some("web"));
         assert!(
@@ -7012,8 +7014,7 @@ bash = \"true\"
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
-            let (file, _dir) =
-                load_named_project(std::ffi::OsStr::from_bytes(b"Proj\xffOne"), "");
+            let (file, _dir) = load_named_project(std::ffi::OsStr::from_bytes(b"Proj\xffOne"), "");
             assert_eq!(
                 file.expect("the file loads").project_name().as_deref(),
                 Some("proj-one")
@@ -7026,12 +7027,23 @@ bash = \"true\"
     // rule. It is never converted.
     #[test]
     fn invalid_project_name_exit3_not_converted() {
-        for bad in ["Web App", "-web", "web-", "", "caf\u{e9}", "a_b", &"a".repeat(64)] {
+        for bad in [
+            "Web App",
+            "-web",
+            "web-",
+            "",
+            "caf\u{e9}",
+            "a_b",
+            &"a".repeat(64),
+        ] {
             let body = format!("[project]\nname = {bad:?}\n");
             let (file, _dir) = load_named_project("web".as_ref(), &body);
             let err = file.expect_err("the name is not a DNS label");
             assert_eq!(err.exit_code(), Some(3), "{err}");
-            assert!(matches!(&err, Error::InvalidProjectName(v) if v == bad), "{err:?}");
+            assert!(
+                matches!(&err, Error::InvalidProjectName(v) if v == bad),
+                "{err:?}"
+            );
             let msg = err.to_string();
             assert!(msg.contains("[project] name"), "{msg}");
             assert!(msg.contains(&format!("{bad:?}")), "{msg}");

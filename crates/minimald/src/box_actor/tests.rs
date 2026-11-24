@@ -6485,6 +6485,7 @@ async fn a_restored_hostname_collision_is_refused_on_resume() {
         }
         let mut request = crate::test_harness::create_session_req("unused", project);
         request.config.name = name.map(str::to_string);
+        request.config.project_root = Some(request.config.project_path.clone());
         let id = client.call::<CreateSession>(&request).await.unwrap().id;
         crate::test_harness::unwrap_ready(
             client
@@ -6576,6 +6577,7 @@ async fn a_restored_session_sharing_another_sessions_registry_name_is_refused_on
         }
         let mut request = crate::test_harness::create_session_req("unused", project);
         request.config.name = name.map(str::to_string);
+        request.config.project_root = Some(request.config.project_path.clone());
         let id = client.call::<CreateSession>(&request).await.unwrap().id;
         crate::test_harness::unwrap_ready(
             client
@@ -16009,6 +16011,9 @@ async fn create_box_with_spec(
     if name.is_none() {
         req.config.name = None;
     }
+    // An unnamed box takes its name from the project root (BOX-215), as a
+    // client sends it, and never from the project path.
+    req.config.project_root = Some(req.config.project_path.clone());
     req.config.creating_verb = verb;
     req.spec = spec;
     let id = client.call::<CreateSession>(&req).await.unwrap().id;
