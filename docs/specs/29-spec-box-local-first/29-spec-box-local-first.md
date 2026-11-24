@@ -103,11 +103,11 @@ After this ships, a developer on a stock install with no identity plane runs ses
   - WHERE the Box Host is a VM on an un-enrolled host THE SYSTEM SHALL assign the name in the in-VM daemon, not in the VM host daemon that mints the `box_id` (BOX-002).
     tier:   T0
     verify: cargo nextest run -p minvmd vm_host_mints_id_in_vm_daemon_assigns_name
-  - WHERE a creation carries no requested name and no expanded spec (the path of BOX-001's sub-bullet) THE SYSTEM SHALL derive the name as BOX-211 states, taking the entry as `default` for a session box and as the task's name for a task box, and taking the project name from the request or, where the request carries none, from the project root's directory name converted as BOX-215 states.
+    <!-- runs on the VM lane (NET-107) -->
+  - WHERE a creation carries no requested name and no expanded spec (the path of BOX-001's sub-bullet) THE SYSTEM SHALL derive the name as BOX-211 states, taking the entry as `default` for a session box and as the task's name for a task box, and taking the project name from the request or, where the request carries none, from the project root's directory name converted as BOX-215 states, and `box` where the request carries neither a project name nor a project root.
     tier:   T0
     verify: cargo nextest run -p minimald create_without_spec_derives_name_from_default_entry_and_project_root
     <!-- The architecture's example: `min session start` in `~/src/research` creates `research` (Box names, "Written or derived"). -->
-    <!-- runs on the VM lane (NET-107) -->
 
 - **BOX-218** WHEN a box is created THE SYSTEM SHALL assign its name and write its record in `pending` in one step, before it materializes anything, testing the name against every record on the host in any state.
   tier:     T0
@@ -388,7 +388,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
 - **BOX-229** THE SYSTEM SHALL carry with the expanded spec that the client sends and the daemon stores, as the v0 key `entry` and outside the canonical `box.toml` bytes that BOX-145 pins, the name of the entry the spec comes from: `default` for the implicit default session (BOX-165), the declared name for a session entry, and the task's name for a task.
   tier:     T0
   verify:   cargo nextest run -p mfile expanded_spec_entry_names_its_entry
-  <!-- BOX-220 reads it, and BOX-158 and BOX-159 return it as the entry name. `box.toml` has no top-level `entry` key, and `crates/mfile/src/spec.rs` lists `entry` among the v0 keys that gominimal/minimal#2410 removes. BOX-229 binds #2410 only when gominimal/arch#195 adds `entry` to `box.toml` and the Box Spec block. Until then the canonical bytes and BOX-145's golden vectors do not contain it; if arch#195 adds it, the vectors are re-pinned with that change. -->
+  <!-- BOX-220 reads it, and BOX-158 and BOX-159 return it as the entry name. `box.toml` has no top-level `entry` key, and `crates/mfile/src/spec.rs` lists `entry` among the v0 keys that gominimal/minimal#2410 removes. Until gominimal/arch#195 settles where `entry` lives, the v0 key is the carrier the daemon reads, and BOX-229 holds on it today. If arch#195 adds `entry` to `box.toml` and the Box Spec block, #2410 keeps it there when it removes the v0 keys; otherwise BOX-229 moves to the carrier arch#195 names. Until then the canonical bytes and BOX-145's golden vectors do not contain it; if arch#195 adds it, the vectors are re-pinned with that change. -->
 
 - **BOX-214** THE SYSTEM SHALL take the project name from `[project] name` where the project's `minimal.toml` declares it, and otherwise from the name of the project root directory, converted as BOX-215 states.
   tier:     T0
