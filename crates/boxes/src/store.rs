@@ -275,13 +275,32 @@ impl DiskBox {
     pub fn store_spec(&self, spec: &[u8]) -> Result<(), std::io::Error> {
         let dir = self.root_path();
         let dir = dir.as_utf8_path();
-        std::fs::create_dir_all(dir)?;
+        create_owner_only_dir_all(dir)?;
         // One source for the path: the file this writes is the one
         // `spec_path` reports and the daemon logs.
         let dest = self.spec_path();
         let dest = dest.as_utf8_path();
         let tmp = dir.join("spec.json.tmp");
-        std::fs::write(&tmp, spec)?;
+        // BOX-232: the spec holds every env_vars value as written, so it is
+        // owner-only whatever the umask, as the record files are.
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        // A temporary file left by a crash keeps its old mode on open, so
+        // set the mode on the handle too.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::io::Write::write_all(&mut file, spec)?;
+        file.sync_all()?;
+        drop(file);
 
         #[cfg(target_os = "linux")]
         common::renameat2::renameat2_cwd(tmp.as_std_path(), dest.as_std_path(), 0)?;
@@ -1298,6 +1317,71 @@ fn log_unknown_reason(record: &Record) {
     }
 }
 
+/// Creates `dir` and any missing parents owner-only (0o700 on unix),
+/// whatever the umask (BOX-232). An existing directory keeps its mode:
+/// [`DiskLoader::new`] tightens those at store open.
+fn create_owner_only_dir_all(dir: &camino::Utf8Path) -> Result<(), std::io::Error> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
+}
+
+/// Sets `path` to `mode` when its mode grants any bit outside `mode`
+/// (BOX-232). Returns whether it changed the mode. A missing path is not
+/// an error. A symlink is left alone.
+#[cfg(unix)]
+fn tighten_mode(path: &std::path::Path, mode: u32) -> Result<bool, std::io::Error> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if meta.file_type().is_symlink() {
+        return Ok(false);
+    }
+    let old = meta.permissions().mode() & 0o7777;
+    if old & !mode == 0 {
+        return Ok(false);
+    }
+    // Fail closed: a path left readable by other users must not be served
+    // (BOX-232). The error names the path so the operator can fix it.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!(
+                "cannot restrict {} to owner-only (mode {old:o}): {e}",
+                path.display()
+            ),
+        )
+    })?;
+    tracing::debug!(
+        path = %path.display(),
+        old_mode = format_args!("{old:o}"),
+        new_mode = format_args!("{mode:o}"),
+        "tightened a box store path to owner-only",
+    );
+    Ok(true)
+}
+
+/// Restricts the sessions directory, each box directory under it and each
+/// box's spec file to the daemon's user (BOX-232). An earlier release
+/// wrote them with the umask's mode. Returns how many paths it changed.
+#[cfg(unix)]
+fn tighten_store_modes(sessions_dir: &camino::Utf8Path) -> Result<usize, std::io::Error> {
+    let mut tightened = usize::from(tighten_mode(sessions_dir.as_std_path(), 0o700)?);
+    for (_, box_dir) in enumerate_session_dirs(sessions_dir)? {
+        tightened += usize::from(tighten_mode(&box_dir, 0o700)?);
+        tightened += usize::from(tighten_mode(&box_dir.join(SPEC_FILE), 0o600)?);
+    }
+    Ok(tightened)
+}
+
 /// Enumerate the immediate session subdirectories under `sessions_dir`.
 /// Missing dir is treated as empty (the parent `DiskLoader::new` has
 /// already ensured the dir exists, but a race during init is harmless).
@@ -1348,7 +1432,26 @@ impl DiskLoader {
     /// I/O error if the sessions directory can't be created or
     /// `index.json` can't be read.
     pub fn new(minimal_dir: DaemonAbsPath) -> Result<Self, std::io::Error> {
-        std::fs::create_dir_all(minimal_dir.as_utf8_path().join("sessions"))?;
+        let sessions_dir = minimal_dir.as_utf8_path().join("sessions");
+        if let Some(parent) = sessions_dir.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        create_owner_only_dir_all(&sessions_dir)?;
+        // BOX-232: restrict what an earlier release left readable before
+        // the store serves any request.
+        #[cfg(unix)]
+        {
+            let tightened = tighten_store_modes(&sessions_dir)?;
+            if tightened > 0 {
+                tracing::info!(
+                    sessions_dir = %sessions_dir,
+                    tightened,
+                    "box store opened; tightened paths to owner-only",
+                );
+            } else {
+                tracing::debug!(sessions_dir = %sessions_dir, tightened, "box store opened");
+            }
+        }
         let index_file = minimal_dir.as_utf8_path().join("sessions/index.json");
         let index = if std::fs::exists(&index_file)? {
             read_index(&index_file)?
@@ -1706,7 +1809,7 @@ impl DiskLoader {
     /// serialized `record.json` behind.
     fn write_record(&mut self, short: &String, record: &Record) -> Result<(), std::io::Error> {
         let session_dir = self.minimal_dir.as_utf8_path().join("sessions").join(short);
-        std::fs::create_dir_all(&session_dir)?;
+        create_owner_only_dir_all(&session_dir)?;
         let record_file = session_dir.join("record.json");
         let tmp_file = session_dir.join("record.json.tmp");
 
@@ -2246,7 +2349,7 @@ impl Loader for DiskLoader {
             .as_utf8_path()
             .join("sessions")
             .join(&short);
-        std::fs::create_dir_all(&session_dir)?;
+        create_owner_only_dir_all(&session_dir)?;
         let dest = session_dir.join("composition.json");
         let tmp = session_dir.join("composition.json.tmp");
 
@@ -2285,7 +2388,7 @@ impl Loader for DiskLoader {
             .as_utf8_path()
             .join("sessions")
             .join(&short);
-        std::fs::create_dir_all(&session_dir)?;
+        create_owner_only_dir_all(&session_dir)?;
         let dest = session_dir.join("delta-baseline.json");
         let tmp = session_dir.join("delta-baseline.json.tmp");
 
@@ -2423,6 +2526,115 @@ mod tests {
 
         loader.delete(&key).unwrap();
         assert!(!record_dir.join(SPEC_FILE).exists());
+    }
+
+    /// The permission bits of `path`.
+    #[cfg(unix)]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    /// Runs `f` with the process umask set to `mask`, then restores it.
+    /// The umask is process-wide, so the tests that read modes take a lock.
+    #[cfg(unix)]
+    fn with_umask<T>(mask: u16, f: impl FnOnce() -> T) -> T {
+        // `mode_t` is u32 on Linux and u16 on macOS. std links libc, so
+        // the symbol is there without a `libc` dependency.
+        #[cfg(target_os = "linux")]
+        type ModeT = u32;
+        #[cfg(not(target_os = "linux"))]
+        type ModeT = u16;
+        unsafe extern "C" {
+            fn umask(mask: ModeT) -> ModeT;
+        }
+        static UMASK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let mask = ModeT::from(mask);
+        let _guard = UMASK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: umask has no preconditions and cannot fail.
+        let old = unsafe { umask(mask) };
+        let out = f();
+        // SAFETY: as above.
+        unsafe { umask(old) };
+        out
+    }
+
+    /// BOX-232: under a permissive umask the stored spec is owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn spec_json_is_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = TempDir::new().unwrap();
+        let spec_path = with_umask(0o022, || {
+            let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+            let key = loader.create(sample_record()).unwrap();
+            let object = loader.get(&key).unwrap();
+            object.store_spec(br#"{"box":{"type":"session"}}"#).unwrap();
+            // A rewrite over a wide temporary file left by a crash is
+            // owner-only too.
+            let tmp_spec = object.root_path().as_utf8_path().join("spec.json.tmp");
+            std::fs::write(&tmp_spec, b"{}").unwrap();
+            std::fs::set_permissions(&tmp_spec, std::fs::Permissions::from_mode(0o644)).unwrap();
+            object.store_spec(br#"{"box":{"type":"task"}}"#).unwrap();
+            object.spec_path()
+        });
+        assert_eq!(mode_of(spec_path.as_utf8_path().as_std_path()), 0o600);
+    }
+
+    /// BOX-232: under a permissive umask the sessions directory and each
+    /// box directory are created owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn store_directories_are_created_owner_only() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp).as_utf8_path().join("state");
+        let root_abs = DaemonAbsPath::try_new(root.as_str()).unwrap();
+        let box_dir = with_umask(0o022, || {
+            let mut loader = DiskLoader::new(root_abs).unwrap();
+            let key = loader.create(sample_record()).unwrap();
+            loader.get(&key).unwrap().root_path()
+        });
+        assert_eq!(mode_of(root.join("sessions").as_std_path()), 0o700);
+        assert_eq!(mode_of(box_dir.as_utf8_path().as_std_path()), 0o700);
+    }
+
+    /// BOX-232: a spec file and directories that an earlier release wrote
+    /// with the umask's mode are owner-only after the store opens.
+    #[cfg(unix)]
+    #[test]
+    fn store_open_tightens_an_existing_wide_spec_json() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = TempDir::new().unwrap();
+        let (sessions_dir, box_dir, spec_path) = {
+            let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+            let key = loader.create(sample_record()).unwrap();
+            let object = loader.get(&key).unwrap();
+            object.store_spec(b"{}").unwrap();
+            (
+                loader_dir(&tmp).as_utf8_path().join("sessions"),
+                object.root_path().as_utf8_path().to_owned(),
+                object.spec_path().as_utf8_path().to_owned(),
+            )
+        };
+        let widen = |p: &camino::Utf8Path, mode: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        widen(&spec_path, 0o644);
+        widen(&box_dir, 0o755);
+        widen(&sessions_dir, 0o755);
+
+        let loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        assert_eq!(mode_of(spec_path.as_std_path()), 0o600);
+        assert_eq!(mode_of(box_dir.as_std_path()), 0o700);
+        assert_eq!(mode_of(sessions_dir.as_std_path()), 0o700);
+        assert_eq!(loader.index.iter().count(), 1);
+
+        // A path already tighter than owner-only is left as it is.
+        widen(&spec_path, 0o400);
+        DiskLoader::new(loader_dir(&tmp)).unwrap();
+        assert_eq!(mode_of(spec_path.as_std_path()), 0o400);
     }
 
     /// BOX-155, BOX-164: the box's output log sits beside its record, the
