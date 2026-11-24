@@ -1999,20 +1999,83 @@ fn unenrolled_broker_refusal(
     ))
 }
 
+/// Where the node-local proxy publishes its identity:
+/// `~/.minimal/bep/identity.json` under the daemon's home, the path `min`
+/// reads it from. Tests read it under the state directory, so a proxy on
+/// the test host does not change what a test sees.
+fn published_identity_path(state_dir: &DaemonAbsPath) -> Option<std::path::PathBuf> {
+    const RELATIVE: &str = ".minimal/bep/identity.json";
+    if cfg!(test) {
+        return Some(state_dir.as_utf8_path().as_std_path().join(RELATIVE));
+    }
+    std::env::home_dir().map(|home| home.join(RELATIVE))
+}
+
+/// The root certificate in the identity the node-local proxy published at
+/// `path`, or `None` when the daemon cannot read one there. That is the
+/// case on a microVM guest, where the proxy publishes on the host.
+fn published_root_certificate(path: Option<&std::path::Path>) -> Option<String> {
+    let path = path?;
+    match bep::publish::Identity::read(path) {
+        Ok(identity) => {
+            if identity.root_certificate.is_none() {
+                tracing::debug!(
+                    path = %path.display(),
+                    "the published identity carries no root certificate, so the create \
+                     gate checks only the certificate's shape"
+                );
+            }
+            identity.root_certificate
+        }
+        Err(bep::publish::PublishError::Io { ref source, .. }) if source.kind() == NotFound => None,
+        Err(error) => {
+            tracing::info!(
+                path = %path.display(),
+                %error,
+                "could not read the published identity, so the create gate checks only \
+                 the certificate's shape"
+            );
+            None
+        }
+    }
+}
+
+/// The DER bytes of the one certificate in `pem`, or `None` when `pem` is
+/// not one PEM certificate.
+fn certificate_der(pem: &str) -> Option<Vec<u8>> {
+    bep::publish::Identity {
+        root_certificate: Some(pem.to_owned()),
+        ..Default::default()
+    }
+    .root_certificate_der()
+    .ok()
+}
+
 /// Whether `certificate` counts as the node-local proxy's root
-/// certificate for the BOX-081 gate. This daemon has no fact of its own
-/// about the proxy: on a microVM host the proxy runs beside the host
-/// daemon, outside this guest. So the gate takes the certificate the
-/// caller read from the proxy's published identity, and it accepts only
-/// one well-formed certificate block. An empty or malformed value counts
-/// as no certificate, and the brokered secret is refused.
+/// certificate for the BOX-081 gate. On a microVM host the proxy runs
+/// beside the host daemon, outside this guest. So the gate takes the
+/// certificate the caller read from the proxy's published identity, and
+/// it accepts only one well-formed certificate block. An empty or
+/// malformed value counts as no certificate, and the brokered secret is
+/// refused.
 ///
-/// The daemon cannot compare the value with a proxy root it knows, so the
-/// check is advisory: it trusts the caller. A caller that sends a made-up
-/// certificate passes it. Even then, only a GitHub grant passes, because
-/// a node-local proxy serves no other brokered secret.
-fn proxy_root_certificate(certificate: Option<&str>) -> bool {
-    certificate.is_some_and(crate::env::is_one_certificate)
+/// `published` is the root certificate in the identity the proxy
+/// published, when this daemon can read it (a native host). Then the
+/// certificate counts only when it is that root, and a made-up
+/// certificate is refused. With no published identity the check is
+/// advisory: it trusts the caller, and a made-up certificate passes it.
+/// Even then, only a GitHub grant passes, because a node-local proxy
+/// serves no other brokered secret.
+fn proxy_root_certificate(certificate: Option<&str>, published: Option<&str>) -> bool {
+    let Some(certificate) = certificate.filter(|c| crate::env::is_one_certificate(c)) else {
+        return false;
+    };
+    match published.map(certificate_der) {
+        // An identity with a root that is not one PEM certificate names
+        // no root to match, so nothing matches it.
+        Some(published) => published.is_some() && published == certificate_der(certificate),
+        None => true,
+    }
 }
 
 /// The exit code of a create that the admission check of BOX-160 refused:
@@ -2255,6 +2318,12 @@ pub struct BoxManager {
     /// so each one resolves its own effective egress (NET-074) the same way
     /// the RPC path does.
     deny_all_opt_out: bool,
+
+    /// Where the node-local proxy publishes its identity, or `None` when
+    /// the daemon has no home to look in. On a microVM guest the path
+    /// names no file, because the proxy publishes on the host. The create
+    /// gate of BOX-081 reads it (see [`proxy_root_certificate`]).
+    bep_identity: Option<std::path::PathBuf>,
 }
 
 impl BoxManager {
@@ -2678,6 +2747,7 @@ impl BoxManager {
             let serve = tracing::Instrument::instrument(serve, lifelong);
             root.in_scope(|| crate::traced::spawn(serve));
         }
+        let bep_identity = published_identity_path(&minimal_state_dir);
         let mngr = Self {
             in_shutdown,
             receiver,
@@ -2696,6 +2766,7 @@ impl BoxManager {
             #[cfg(target_os = "linux")]
             loopback,
             deny_all_opt_out,
+            bep_identity,
         };
 
         // The manager's mainloop runs in its root (see above). Each
@@ -4553,15 +4624,24 @@ impl BoxManager {
         // box and the secret is a GitHub grant. The refusal comes before the record exists, so it leaves no
         // record, id or name behind. A certificate that is not one
         // well-formed block does not count as the proxy's.
-        let proxy_serves = proxy_root_certificate(config.root_certificate.as_deref());
+        // Where this daemon can read the proxy's published identity, the
+        // certificate must also be that identity's root.
+        let published = config
+            .root_certificate
+            .as_ref()
+            .and_then(|_| published_root_certificate(self.bep_identity.as_deref()));
+        let proxy_serves =
+            proxy_root_certificate(config.root_certificate.as_deref(), published.as_deref());
         if config.root_certificate.is_some() && !proxy_serves {
             tracing::info!(
                 session_name = config
                     .name
                     .as_deref()
                     .unwrap_or(crate::rpc::ANONYMOUS_SESSION),
+                published_identity = published.is_some(),
                 "the create carries a root certificate that is not one well-formed \
-                 certificate block, so no node-local proxy counts as serving the box"
+                 certificate block, or not the root in the proxy's published identity, \
+                 so no node-local proxy counts as serving the box"
             );
         }
         if let Some((refusal, grants)) = spec
