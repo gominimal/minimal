@@ -378,7 +378,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     <!-- optional-feature; BOX-227: the Box Host never reads a box's name from its spec. So two people who start one entry get one digest, whatever they call their boxes -->
     tier:   T0
     verify: cargo nextest run -p minimal create_name_flag_leaves_expanded_spec_unchanged
-  - IF a create verb runs under a written name, from `--name` or the entry's `[box] name`, that a box on the same host has, running or stopped, THEN THE SYSTEM SHALL report BOX-163's refusal with exit 2 and create nothing. The message SHALL say that the name is taken. Where the caller holds Gatehouse `BoxRead` on that box, it SHALL name that box, its state and the verb that goes back into it where one fits: `min box attach <name>` for a box whose spec sets `pty_enabled` and `min box restart <name>` for one whose spec sets `lifetime = "until_stopped"`. It SHALL name `min box rm <name>`, which frees the name, and `--name <other>`, which starts another box from the entry.
+  - IF a create verb runs under a written name, from `--name` or the entry's `[box] name`, that a box on the same host has, in any state, THEN THE SYSTEM SHALL report BOX-163's refusal with exit 2 and create nothing. The message SHALL say that the name is taken. Where the caller holds Gatehouse `BoxRead` on that box, it SHALL name that box, its state and the verb that goes back into it where one fits: `min box attach <name>` for a box whose spec sets `pty_enabled` and `min box restart <name>` for one whose spec sets `lifetime = "until_stopped"`. It SHALL name `min box rm <name>`, which frees the name, and `--name <other>`, which starts another box from the entry.
     <!-- unwanted; the architecture's naming rule (gominimal/arch#186): Minimal never changes a written name, because a script, a URL or another box's egress rule addresses it -->
     tier:   T0
     verify: cargo nextest run -p minimal create_written_name_held_exit2_names_holder_and_next_steps
@@ -581,7 +581,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
   tier:     T0
   verify:   cargo nextest run -p minimal box_wait_exec_returns_exec_code
 
-- **BCLI-058** WHEN `min box rename <box> <name>` runs THE SYSTEM SHALL rename the box as BOX-010 defines, reporting BOX-010's refusal with exit 2 naming the holder.
+- **BCLI-058** WHEN `min box rename <box> <name>` runs THE SYSTEM SHALL rename the box as BOX-010 defines. It SHALL report BOX-010's refusals: exit 2 when a box on the host has the new name, in any state, naming that box where the caller holds Gatehouse `BoxRead` on it, and exit 3 when the new name breaks a rule of BOX-007.
   tier:     T0
   verify:   cargo nextest run -p minimal box_rename_renames_as_box_010
   - IF `min box rename` is refused because the new name is taken and the caller does not hold Gatehouse `BoxRead` on the box that has it THEN THE SYSTEM SHALL say in the refusal only that the name is taken, and name no box, no state and no verb that goes back into it.
