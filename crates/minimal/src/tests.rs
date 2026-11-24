@@ -3436,7 +3436,8 @@ fn create_verbs_name_flag_overrides_box_name() {
         "the activation marks its create before it sends it"
     );
 
-    // Without `--name`, a named session entry names the box.
+    // Without `--name` or a `[box] name`, the box takes the name the
+    // daemon derives from the project and the entry (BOX-211).
     let entries = start_entries("[sessions.dev]\n");
     let StartPlan::Session { options, .. } =
         plan_start(&typed_start(StartVerb::Session, None), &entries, true).unwrap()
@@ -3453,7 +3454,13 @@ fn create_verbs_name_flag_overrides_box_name() {
     );
     request.config.name = minimal_client::box_name::request_name(None);
     stamp_session_spec_as(&mut request, root, options.entry.as_deref(), None, None).unwrap();
-    assert_eq!(created_box_name(&request).as_deref(), Some("dev"));
+    let derived = boxes::box_name::derived_box_name(
+        boxes::box_name::project_name_of_root(root.as_str()),
+        Some("dev"),
+        None,
+    );
+    assert!(derived.ends_with("-dev"), "{derived}");
+    assert_eq!(created_box_name(&request), Some(derived));
 
     // A task entry's box takes a generated name, so `--name` is refused
     // before anything is created, not dropped.
