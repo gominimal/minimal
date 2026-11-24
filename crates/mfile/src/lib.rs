@@ -2609,7 +2609,11 @@ impl File {
                 }
             }
             if !unknown.is_empty() {
-                warn(format!("unknown fields in {}: {}", shown, unknown.join(",")));
+                warn(format!(
+                    "unknown fields in {}: {}",
+                    shown,
+                    unknown.join(",")
+                ));
                 was_unknown_fields = true;
             }
         }
@@ -4938,7 +4942,8 @@ mod tests {
         )
         .unwrap();
 
-        let capture = Diags::of(&File::from_dir(dir.path()).expect("a timeout in the grammar loads"));
+        let capture =
+            Diags::of(&File::from_dir(dir.path()).expect("a timeout in the grammar loads"));
 
         let out = capture.contents();
         assert!(!out.contains("unknown fields"), "{out}");
