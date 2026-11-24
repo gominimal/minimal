@@ -523,15 +523,15 @@ After this ships, a developer on a stock install with no identity plane runs ses
   verify: cargo nextest run -p mfile non_posix_env_var_name_refused_exit3
   <!-- decided 2026-11-19: `[[vars_lenient]]` was the opt-in for other names and no shipped loadout or example uses it; a per-variable opt-in can be added later without breaking a project, while accepting every name now could not be narrowed later -->
 
-- **BOX-230** THE SYSTEM SHALL store each `env_vars` value of every layer, a loadout's included, in the expanded spec as written, and SHALL treat it as a value that is not secret, since only a `[secrets]` entry carries a secret (BOX-080).
+- **BOX-230** THE SYSTEM SHALL store, for each `env_vars` name, the value that survives BOX-180's merge across the layers, a loadout's included, in the expanded spec as written, and SHALL treat it as a value that is not secret, since only a `[secrets]` entry carries a secret (BOX-080).
   tier:     T0
   verify:   cargo nextest run -p mfile loadout_env_var_literal_stored_as_written
   <!-- Karl's decision of 2026-11-24 (gominimal/minimal#3210): a literal is not a secret by definition. The record stores it, and `min box spec` shows it. -->
 
-- **BOX-231** WHEN an entry is expanded and an `env_vars` table of any layer sets a variable whose name contains, without regard to case, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `API_KEY`, `APIKEY`, `PRIVATE_KEY` or `CREDENTIAL` THE SYSTEM SHALL report a warning beside the spec that names the variable and the file that sets it, says that its value is stored in the box record and shown by `min box spec`, and says that a `[secrets]` entry keeps a secret out of the record.
+- **BOX-231** WHEN an entry is expanded and an `env_vars` table of any layer sets a variable whose name contains, without regard to case, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `API_KEY`, `APIKEY`, `PRIVATE_KEY` or `CREDENTIAL` THE SYSTEM SHALL report a warning beside the spec that names the variable and the file that sets it, says that its value is stored in the box record and shown by `min box spec`, and says that a `[secrets]` entry keeps a secret out of the record, and SHALL continue the expansion.
   tier:     T0
   verify:   cargo nextest run -p mfile credential_like_env_var_name_warns
-  <!-- The warning prints in `min box spec` only, so nothing prints before an interactive shell (AGENTS.md; Karl, 2026-11-24). It never stops the expansion. BCLI-021 renders it. -->
+  <!-- The warning prints in `min box spec` only, so nothing prints before an interactive shell (AGENTS.md; Karl, 2026-11-24). BCLI-021 renders it (spec 28). -->
 
 - **BOX-166** WHERE the `loadout_mode` that BOX-064's layers up to and including the entry set is `sealed` THE SYSTEM SHALL apply no loadout at BOX-064's selected-loadouts layer.
   tier:     T0
