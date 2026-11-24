@@ -27,7 +27,7 @@ use serde::Serialize;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use diagnostics::redact::{
-    is_sensitive_key, masked_process_env, redact_json, redaction_placeholder, scrub_secrets,
+    is_sensitive_flag, masked_process_env, redact_json, scrub_argv_element, scrub_secrets,
 };
 use diagnostics::{BundleSink, BundleWriter, LOG_TAIL_CAP, Redaction};
 
@@ -907,43 +907,42 @@ fn redact_event_lines(bytes: &[u8]) -> (Vec<u8>, bool) {
 /// a credential inside a value: an exec event's `argv` is a list of strings
 /// the client sent, and an argument can be a header, a URL or a token.
 ///
-/// In a list, the string after a long flag whose name is a sensitive key
-/// (`--token`, then its value) is masked whole, because the two elements
-/// are scrubbed apart and the value alone need not look like a credential.
-/// A string that is one assignment under a sensitive name (`--token=x`,
-/// `PASSWORD=two words`) has its whole value masked, spaces included: the
-/// list gives the argument's true bounds, which a log line does not, so
-/// nothing after the first space is left behind.
+/// The strings of a list are scrubbed as the elements of an argv, with
+/// [`scrub_argv_element`], the rule the process table of a bundle uses too:
+/// the string after a sensitive flag (`--token`, then its value) is masked
+/// whole, and an assignment under a sensitive name (`-password=two words`)
+/// keeps its name and loses its whole value. That function states the rule.
 ///
-/// Both rules read a name as [`is_sensitive_key`] does, by the parts it
-/// holds. A flag such as `--keyring` or `--author` is therefore masked too,
-/// with its value: the bundle loses that argument and keeps no secret, the
-/// same choice the key redaction makes for a record's members.
+/// Both read a name as [`diagnostics::redact::is_sensitive_key`] does, by the
+/// parts it holds. A flag such as `--keyring` or `--author` is therefore
+/// masked too, with its value: the bundle loses that argument and keeps no
+/// secret, the same choice the key redaction makes for a record's members.
 fn scrub_event_strings(value: &mut serde_json_lenient::Value) -> bool {
     use serde_json_lenient::Value;
+    use std::borrow::Cow;
     match value {
         Value::String(text) => match scrub_secrets(text) {
-            std::borrow::Cow::Owned(clean) => {
+            Cow::Owned(clean) => {
                 *text = clean;
                 true
             }
-            std::borrow::Cow::Borrowed(_) => false,
+            Cow::Borrowed(_) => false,
         },
         Value::Array(items) => {
             let mut changed = false;
-            let mut mask_next = false;
+            let mut after_sensitive_flag = false;
             for item in items.iter_mut() {
-                let masked = mask_next && item.is_string();
-                mask_next = item.as_str().is_some_and(is_sensitive_flag);
-                if masked {
-                    *item = redaction_placeholder(item);
-                    changed = true;
-                } else if let Some(clean) = item.as_str().and_then(scrub_sensitive_assignment) {
-                    *item = Value::String(clean);
-                    changed = true;
-                } else {
-                    changed |= scrub_event_strings(item);
+                let flag = item.as_str().is_some_and(is_sensitive_flag);
+                match item {
+                    Value::String(text) => {
+                        if let Cow::Owned(clean) = scrub_argv_element(after_sensitive_flag, text) {
+                            *text = clean;
+                            changed = true;
+                        }
+                    }
+                    other => changed |= scrub_event_strings(other),
                 }
+                after_sensitive_flag = flag;
             }
             changed
         }
@@ -955,56 +954,6 @@ fn scrub_event_strings(value: &mut serde_json_lenient::Value) -> bool {
             changed
         }
         _ => false,
-    }
-}
-
-/// True for a long flag with no value of its own whose name is a sensitive
-/// key: `--token`, `--api-key`. Not `--token=x`, and not `-t`.
-fn is_sensitive_flag(arg: &str) -> bool {
-    arg.strip_prefix("--")
-        .is_some_and(|name| !name.is_empty() && !name.contains('=') && is_sensitive_key(name))
-}
-
-/// `name=value` with its whole value masked, when the argument is one
-/// assignment whose name is a sensitive key and the value is not already a
-/// placeholder. `None` otherwise, and the argument goes to the log scrub.
-///
-/// The name must have the form of an environment variable or of a long flag
-/// ([`is_assignment_name`]). A shell line, a header or a URL with a
-/// sensitive word before its first `=` has neither form, so the log scrub
-/// reads the whole of it, the part before the `=` included.
-fn scrub_sensitive_assignment(arg: &str) -> Option<String> {
-    let (name, value) = arg.split_once('=')?;
-    if !is_assignment_name(name)
-        || value.is_empty()
-        || value.starts_with("<redacted:len=")
-        || !is_sensitive_key(name)
-    {
-        return None;
-    }
-    let masked = redaction_placeholder(&serde_json_lenient::Value::String(value.to_owned()));
-    Some(format!(
-        "{name}={}",
-        masked.as_str().unwrap_or("<redacted>")
-    ))
-}
-
-/// True for the name of an environment variable (`API_TOKEN`: a letter or
-/// `_`, then letters, digits and `_`) and for a long flag (`--api-token`:
-/// `--`, a letter or digit, then letters, digits, `-`, `_` and `.`). ASCII
-/// only, so no separator of a URL, a path or a header is in a name.
-fn is_assignment_name(name: &str) -> bool {
-    match name.strip_prefix("--") {
-        Some(flag) => {
-            flag.starts_with(|c: char| c.is_ascii_alphanumeric())
-                && flag
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-        }
-        None => {
-            name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
-                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        }
     }
 }
 
@@ -1887,6 +1836,83 @@ mod tests {
         assert_eq!(entry["redaction"], "scrubbed");
     }
 
+    /// An events file over the cap travels as its tail, scrubbed like the
+    /// whole file, and the manifest says both: `tail-capped-scrubbed`. The
+    /// argument is an assignment under a one-dash name whose value has
+    /// spaces, and no word of the value travels.
+    #[tokio::test]
+    async fn diag_bundle_scrubs_a_capped_events_tail() {
+        use std::io::Write as _;
+
+        let server = TestServer::new().await;
+        {
+            let mut client = server.connect().await;
+            crate::test_harness::create_configured_session(&mut client, "diag-capped", "/tmp")
+                .await;
+        }
+        let state_dir = server.state.minimal_state_dir().await;
+        let sessions_dir = state_dir.as_utf8_path().as_std_path().join("sessions");
+        let events_path = std::fs::read_dir(&sessions_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path().join(boxes::events::EVENTS_FILE))
+            .find(|path| path.exists())
+            .expect("the box should have an events file");
+        let created = std::fs::read(&events_path).unwrap();
+        let mut event: boxes::events::BoxEvent =
+            serde_json_lenient::from_slice(created.split(|b| *b == b'\n').next().unwrap()).unwrap();
+        event.kind = boxes::events::BoxEventType::ExecStarted;
+        event.data.insert(
+            boxes::events::exec_data::ARGV.to_owned(),
+            serde_json_lenient::json!(["tool", "-password=correct horse battery staple"]),
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&events_path)
+            .unwrap();
+        // One line longer than the cap, so the tail starts inside it and the
+        // read drops it whole.
+        let mut filler = vec![b'x'; usize::try_from(MAX_SESSION_FILE_BYTES).unwrap() + 1];
+        filler.push(b'\n');
+        file.write_all(&filler).unwrap();
+        file.write_all(&event.to_line().unwrap()).unwrap();
+        drop(file);
+
+        let files = fetch_bundle(&server).await;
+        let bundled = files
+            .iter()
+            .find(|(path, _)| path.ends_with(boxes::events::EVENTS_FILE))
+            .map(|(_, contents)| String::from_utf8(contents.clone()).unwrap())
+            .expect("the box's events file should be bundled");
+        for word in ["correct", "horse", "battery", "staple"] {
+            assert!(
+                !bundled.contains(word),
+                "{word} travels in the bundle: {bundled}"
+            );
+        }
+        let lines: Vec<&str> = bundled.lines().collect();
+        assert_eq!(lines.len(), 1, "only the tail's whole lines: {bundled}");
+        let exec: serde_json_lenient::Value = serde_json_lenient::from_str(lines[0]).unwrap();
+        assert_eq!(exec["data"]["argv"][1], "-password=<redacted:len=28>");
+
+        let manifest = files
+            .iter()
+            .find(|(path, _)| path.ends_with("manifest.json"))
+            .map(|(_, contents)| String::from_utf8(contents.clone()).unwrap())
+            .expect("the bundle has a manifest");
+        let manifest: serde_json_lenient::Value = serde_json_lenient::from_str(&manifest).unwrap();
+        let entry = manifest["collected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| {
+                entry["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with(boxes::events::EVENTS_FILE))
+            })
+            .expect("the manifest lists the events file");
+        assert_eq!(entry["redaction"], "tail-capped-scrubbed");
+    }
+
     /// The scrub of an event's strings changes nothing in an event with no
     /// credential, and says so, so its file stays recorded as redacted by
     /// key.
@@ -1902,10 +1928,12 @@ mod tests {
     }
 
     /// An argument that is one assignment under a sensitive name loses its
-    /// whole value, spaces included, and keeps its name. A shell line or a
-    /// header with a sensitive word before its first `=` is not taken for an
-    /// assignment: it goes to the log scrub, which finds the credential in
-    /// it. An already masked value is left as it is.
+    /// whole value, spaces included, and keeps its name, whatever form the
+    /// name has: two dashes, one dash, a `-D` property, a dotted key, or a
+    /// variable inside a flag's value. A shell line or a header with a
+    /// sensitive word before an `=` is not taken for an assignment: it goes
+    /// to the log scrub, which finds the credential in it. An already masked
+    /// value is left as it is, and a value that only starts like one is not.
     #[test]
     fn scrub_event_strings_masks_the_whole_value_of_a_sensitive_assignment() {
         let mut event = serde_json_lenient::json!({
@@ -1916,10 +1944,16 @@ mod tests {
                 "--jobs=4",
                 "curl -H 'Authorization: Bearer ghp_shellLineExample0123' https://example.test/?q=1",
                 "--secret=<redacted:len=3>",
+                "-password=correct horse battery staple",
+                "-Dpassword=a b",
+                "db.password=a b",
+                "--env=API_TOKEN=a b",
+                "--password=<redacted:len=3> tail",
             ]},
         });
         assert!(scrub_event_strings(&mut event));
         let argv = event["data"]["argv"].as_array().unwrap();
+        assert_eq!(argv.len(), 11, "the argv keeps its length: {argv:?}");
         assert_eq!(argv[1], "--password=<redacted:len=28>");
         assert_eq!(argv[2], "API_TOKEN=<redacted:len=3>");
         assert_eq!(argv[3], "--jobs=4");
@@ -1927,12 +1961,16 @@ mod tests {
         assert!(!shell.contains("ghp_shellLineExample0123"), "{shell}");
         assert!(shell.starts_with("curl -H "), "{shell}");
         assert_eq!(argv[5], "--secret=<redacted:len=3>");
+        assert_eq!(argv[6], "-password=<redacted:len=28>");
+        assert_eq!(argv[7], "-Dpassword=<redacted:len=3>");
+        assert_eq!(argv[8], "db.password=<redacted:len=3>");
+        assert_eq!(argv[9], "--env=API_TOKEN=<redacted:len=3>");
+        assert_eq!(argv[10], "--password=<redacted:len=21>");
     }
 
-    /// A URL is not an assignment, whatever word stands before its first
-    /// `=`: its user name can hold `token` or `auth`. It goes to the log
-    /// scrub, which masks the userinfo. Only the name of an environment
-    /// variable or of a long flag makes an assignment.
+    /// A URL is not an assignment, whatever word stands before an `=`: its
+    /// user name can hold `token` or `auth`. It goes to the log scrub, which
+    /// masks the userinfo.
     #[test]
     fn scrub_event_strings_sends_a_url_to_the_log_scrub() {
         let mut event = serde_json_lenient::json!({
@@ -1951,46 +1989,36 @@ mod tests {
         let second = argv[3].as_str().unwrap();
         assert!(!second.contains("anotherPassword4567"), "{second}");
         assert!(second.ends_with("@example.test/o/r.git?a=b"), "{second}");
-
-        for name in [
-            "API_TOKEN",
-            "_secret",
-            "--api-key",
-            "--db.password",
-            "--2fa-token",
-        ] {
-            assert!(is_assignment_name(name), "{name}");
-        }
-        for name in [
-            "",
-            "--",
-            "-t",
-            "---token",
-            "2TOKEN",
-            "https://token@host/?a",
-            "/etc/token",
-            "token:x",
-            "tok en",
-            "tökén",
-        ] {
-            assert!(!is_assignment_name(name), "{name}");
-        }
     }
 
-    /// The value after a sensitive long flag is masked whole; the flag that
-    /// follows it is not taken for a value, and a flag with no following
-    /// string masks nothing.
+    /// The value after a sensitive flag is masked whole, after two dashes
+    /// and after one. A long flag right after a sensitive flag is not taken
+    /// for its value, and a flag with no following string masks nothing.
     #[test]
     fn scrub_event_strings_masks_the_value_after_a_sensitive_flag() {
         let mut event = serde_json_lenient::json!({
-            "data": {"argv": ["tool", "--api-key", "abc", "--verbose", "--token"]},
+            "data": {"argv": [
+                "tool",
+                "--api-key",
+                "abc",
+                "--verbose",
+                "-token",
+                "value",
+                "--token",
+                "--verbose",
+                "--token",
+            ]},
         });
         assert!(scrub_event_strings(&mut event));
         let argv = event["data"]["argv"].as_array().unwrap();
         assert_eq!(argv[1], "--api-key");
         assert_eq!(argv[2], "<redacted:len=3>");
         assert_eq!(argv[3], "--verbose");
-        assert_eq!(argv[4], "--token");
+        assert_eq!(argv[4], "-token");
+        assert_eq!(argv[5], "<redacted:len=5>");
+        assert_eq!(argv[6], "--token");
+        assert_eq!(argv[7], "--verbose");
+        assert_eq!(argv[8], "--token");
     }
 
     /// An unreadable `sessions/` is a fact about the bundle, not an empty

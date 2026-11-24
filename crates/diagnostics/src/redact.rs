@@ -3,7 +3,8 @@
 //! Shared by the CLI-side diagnostic bundler and the daemon-side
 //! diagnostic RPC so both apply identical rules, over both formats the
 //! producers read (JSON and TOML), plus the process-environment masking
-//! both sides use for their `env.json`. Redaction is deliberately
+//! both sides use for their `env.json` and the scrub of an argv whose
+//! element boundaries are known ([`scrub_argv`]). Redaction is deliberately
 //! conservative: false positives (masking a harmless value) are
 //! acceptable, false negatives (leaking a secret) are not.
 
@@ -513,6 +514,109 @@ fn find_sensitive_flag_value(input: &str) -> Option<CredentialMatch> {
                 end: start + value.len(),
             });
         }
+    }
+    None
+}
+
+/// Scrubs an argv whose element boundaries are known (a process's
+/// `/proc/<pid>/cmdline`, the argv an exec request carried), one element at
+/// a time with [`scrub_argv_element`]. Each element stays one element, so
+/// the result has the length of `argv`.
+///
+/// Every bundle producer that holds a true argv scrubs it here, so they
+/// apply one rule.
+#[must_use]
+pub fn scrub_argv<S: AsRef<str>>(argv: &[S]) -> Vec<Cow<'_, str>> {
+    let mut after_sensitive_flag = false;
+    argv.iter()
+        .map(|arg| {
+            let arg: &str = arg.as_ref();
+            let clean = scrub_argv_element(after_sensitive_flag, arg);
+            after_sensitive_flag = is_sensitive_flag(arg);
+            clean
+        })
+        .collect()
+}
+
+/// Scrubs one true argv element. `after_sensitive_flag` says the element
+/// before it is a [sensitive flag](is_sensitive_flag).
+///
+/// - After a sensitive flag (`--token`, then this element), the whole
+///   element is masked, unless it is a long flag itself (`--verbose`).
+/// - An assignment under a sensitive name keeps its name and has its whole
+///   value masked, spaces included. The rule: an element is such an
+///   assignment when, at one of its `=`, the text before it holds no
+///   whitespace, `:`, `/` or `@` and is a sensitive key ([`is_sensitive_key`]),
+///   and its value is everything after the first such `=`. So
+///   `-password=two words`, `-Dpassword=x`, `db.password=x` and
+///   `--env=API_TOKEN=x` are assignments, and a URL, a path, a header or a
+///   shell line is not.
+/// - Any other element goes to [`scrub_secrets`] whole, which masks the
+///   userinfo of a URL, a header value and the known token shapes in it.
+///
+/// A value that is exactly a redaction placeholder is left as it is, so
+/// scrubbing twice equals scrubbing once.
+#[must_use]
+pub fn scrub_argv_element(after_sensitive_flag: bool, arg: &str) -> Cow<'_, str> {
+    if after_sensitive_flag && !is_long_flag(arg) && !is_redaction_placeholder(arg) {
+        return Cow::Owned(format!("<redacted:len={}>", arg.len()));
+    }
+    match scrub_sensitive_assignment(arg) {
+        Some(clean) => Cow::Owned(clean),
+        None => scrub_secrets(arg),
+    }
+}
+
+/// True for an argv element that is a flag with no value of its own whose
+/// name is a sensitive key: `--token`, `--api-key`, and the one-dash form Go
+/// tools use, `-token`. Not `--token=x`, which is an assignment. A name with
+/// whitespace, `:`, `/` or `@` is no flag.
+#[must_use]
+pub fn is_sensitive_flag(arg: &str) -> bool {
+    arg.strip_prefix("--")
+        .or_else(|| arg.strip_prefix('-'))
+        .is_some_and(|name| {
+            !name.is_empty() && !name.contains('=') && is_argv_name(name) && is_sensitive_key(name)
+        })
+}
+
+/// True for `--` followed by a letter or digit: the start of a long flag.
+fn is_long_flag(arg: &str) -> bool {
+    arg.strip_prefix("--")
+        .is_some_and(|name| name.starts_with(|c: char| c.is_ascii_alphanumeric()))
+}
+
+/// True when `name` holds none of the separators of a URL, a path or a
+/// header (whitespace, `:`, `/`, `@`), so it can name a flag or a variable.
+fn is_argv_name(name: &str) -> bool {
+    !name.contains(|c: char| c.is_whitespace() || matches!(c, ':' | '/' | '@'))
+}
+
+/// True when `s` is exactly a placeholder [`redaction_placeholder`] writes
+/// for a string: `<redacted:len=N>`.
+fn is_redaction_placeholder(s: &str) -> bool {
+    s.strip_prefix("<redacted:len=")
+        .and_then(|rest| rest.strip_suffix('>'))
+        .is_some_and(|len| !len.is_empty() && len.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// `name=<redacted:len=N>` when `arg` is an assignment under a sensitive
+/// name, as [`scrub_argv_element`] states the rule; `None` otherwise.
+fn scrub_sensitive_assignment(arg: &str) -> Option<String> {
+    for (at, _) in arg.match_indices('=') {
+        let (name, rest) = arg.split_at(at);
+        if !is_argv_name(name) {
+            // Every longer name holds the same separator.
+            return None;
+        }
+        if !is_sensitive_key(name) {
+            continue;
+        }
+        let value = rest.strip_prefix('=').unwrap_or(rest);
+        if value.is_empty() || is_redaction_placeholder(value) {
+            return None;
+        }
+        return Some(format!("{name}=<redacted:len={}>", value.len()));
     }
     None
 }
@@ -1467,6 +1571,114 @@ mod tests {
         let input = "curl -H 'Authorization: Bearer abc123' https://user:pw@host/";
         let once = scrub_secrets(input);
         let twice = scrub_secrets(&once);
+        assert_eq!(once, twice);
+    }
+
+    /// An assignment under a sensitive name loses its whole value whatever
+    /// form the name has, as long as it holds no whitespace, `:`, `/` or `@`.
+    #[test]
+    fn scrub_argv_element_masks_an_assignment_in_any_name_form() {
+        for (arg, masked) in [
+            (
+                "-password=correct horse battery staple",
+                "-password=<redacted:len=28>",
+            ),
+            (
+                "--password=correct horse battery staple",
+                "--password=<redacted:len=28>",
+            ),
+            ("API_TOKEN=a b", "API_TOKEN=<redacted:len=3>"),
+            ("-Dpassword=a b", "-Dpassword=<redacted:len=3>"),
+            ("db.password=a b", "db.password=<redacted:len=3>"),
+            ("--env=API_TOKEN=a b", "--env=API_TOKEN=<redacted:len=3>"),
+            ("--db-password=\"a b\"", "--db-password=<redacted:len=5>"),
+            (
+                "--password=<redacted:len=3> b",
+                "--password=<redacted:len=18>",
+            ),
+        ] {
+            assert_eq!(scrub_argv_element(false, arg), masked, "{arg}");
+        }
+    }
+
+    /// A name with a separator of a URL, a path or a header is no
+    /// assignment: the element goes to [`scrub_secrets`] whole, which masks
+    /// the userinfo of a URL. A clean element is borrowed unchanged.
+    #[test]
+    fn scrub_argv_element_sends_a_url_or_a_shell_line_to_scrub_secrets() {
+        let url = scrub_argv_element(
+            false,
+            "https://x-access-token:argvUrlPassword0123@example.test/r.git?ref=main",
+        );
+        assert!(!url.contains("argvUrlPassword0123"), "{url}");
+        assert!(url.ends_with("@example.test/r.git?ref=main"), "{url}");
+
+        let shell = scrub_argv_element(false, "FOO=1 make all");
+        assert!(matches!(shell, Cow::Borrowed(_)), "{shell}");
+        for clean in ["--jobs=4", "--token=", "task-runner"] {
+            assert!(
+                matches!(scrub_argv_element(false, clean), Cow::Borrowed(_)),
+                "{clean}"
+            );
+        }
+    }
+
+    /// The element after a sensitive flag, with two dashes or one, is masked
+    /// whole, unless it is a long flag itself. A single letter names nothing.
+    #[test]
+    fn scrub_argv_masks_the_value_after_a_sensitive_flag() {
+        let argv = [
+            "tool",
+            "-token",
+            "value",
+            "--api-key",
+            "a b",
+            "--token",
+            "--verbose",
+            "-p",
+            "8080",
+        ];
+        let scrubbed = scrub_argv(&argv);
+        assert_eq!(
+            scrubbed,
+            [
+                "tool",
+                "-token",
+                "<redacted:len=5>",
+                "--api-key",
+                "<redacted:len=3>",
+                "--token",
+                "--verbose",
+                "-p",
+                "8080",
+            ]
+        );
+        for flag in ["--token", "-token", "--api-key", "-password"] {
+            assert!(is_sensitive_flag(flag), "{flag}");
+        }
+        for arg in ["--token=x", "-p", "-", "--", "-token:x", "-a/token"] {
+            assert!(!is_sensitive_flag(arg), "{arg}");
+        }
+    }
+
+    /// Scrubbing an argv twice equals scrubbing it once.
+    #[test]
+    fn scrub_argv_is_idempotent() {
+        let argv = [
+            "-password=correct horse battery staple",
+            "--token",
+            "value",
+            "https://x-access-token:pw@example.test/?ref=main",
+            "--password=<redacted:len=3> b",
+        ];
+        let once: Vec<String> = scrub_argv(&argv)
+            .into_iter()
+            .map(Cow::into_owned)
+            .collect();
+        let twice: Vec<String> = scrub_argv(&once)
+            .into_iter()
+            .map(Cow::into_owned)
+            .collect();
         assert_eq!(once, twice);
     }
 }
