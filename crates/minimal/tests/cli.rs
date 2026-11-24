@@ -1701,6 +1701,53 @@ async fn box_spec_entry_prints_legacy_session_hint_on_stderr() {
     );
 }
 
+/// BCLI-084, BOX-230, BOX-231: `min box spec <entry>` prints one stderr
+/// line for each `env_vars` name that looks like a secret's, and stdout
+/// stays the spec, with the value as written, under `-o json`.
+#[tokio::test]
+async fn box_spec_entry_prints_secret_name_warnings_on_stderr() {
+    let (_daemon, args) = setup().await;
+    let minimal_dir = args.minimal_dir.clone().expect("setup points at a tempdir");
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "[sessions.dev]\nenv_vars = { GITHUB_TOKEN = \"x\", EDITOR = \"hx\" }\n",
+    )
+    .unwrap();
+    let config_dir = tempfile::TempDir::new().unwrap();
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .current_dir(project.path())
+        .env("MIN_PROVIDER", "local")
+        .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
+        .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+        .arg("--no-input")
+        .args(["box", "spec", "dev", "-o", "json"])
+        .env_remove("RUST_LOG")
+        .output()
+        .await
+        .expect("the min binary should be invocable");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "min box spec dev: stdout={stdout} stderr={stderr}"
+    );
+    let line = "warning: the variable GITHUB_TOKEN in `env_vars` has a name that looks \
+                like a secret's. `[sessions.dev]` in minimal.toml sets it. A box from this \
+                entry stores its value as written in the box's spec. Put a secret value in \
+                a `[secrets]` entry to keep it out of the spec.\n";
+    assert_eq!(
+        stderr.matches(line).count(),
+        1,
+        "one warning line on stderr: {stderr}"
+    );
+    assert_eq!(stderr.matches("warning:").count(), 1, "{stderr}");
+    let doc: serde_json_lenient::Value =
+        serde_json_lenient::from_str(stdout.trim()).expect("stdout parses as JSON");
+    assert_eq!(doc["spec"]["env_vars"]["GITHUB_TOKEN"], "x", "{stdout}");
+}
+
 // --- box rm (BCLI-042 removed `min session destroy`) ---
 
 #[tokio::test]
