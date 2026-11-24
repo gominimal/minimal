@@ -378,7 +378,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     <!-- optional-feature; BOX-227: the Box Host never reads a box's name from its spec. So two people who start one entry get one digest, whatever they call their boxes -->
     tier:   T0
     verify: cargo nextest run -p minimal create_name_flag_leaves_expanded_spec_unchanged
-  - IF a create verb runs under a written name, from `--name` or the entry's `[box] name`, that a box on the same host has, running or stopped, THEN THE SYSTEM SHALL report BOX-163's refusal with exit 2 and create nothing. The message SHALL say that the name is taken, and name that box and its state. It SHALL name the next steps: the verb that goes back into that box where one fits, `min session attach <name>` for a box whose spec sets `pty_enabled` and `min box restart <name>` for one whose spec sets `lifetime = "until_stopped"`, then `min box rm <name>`, which frees the name, and `--name <other>`, which starts another box from the entry.
+  - IF a create verb runs under a written name, from `--name` or the entry's `[box] name`, that a box on the same host has, running or stopped, THEN THE SYSTEM SHALL report BOX-163's refusal with exit 2 and create nothing. The message SHALL say that the name is taken. Where the caller holds Gatehouse `BoxRead` on that box, it SHALL name that box, its state and the verb that goes back into it where one fits: `min box attach <name>` for a box whose spec sets `pty_enabled` and `min box restart <name>` for one whose spec sets `lifetime = "until_stopped"`. It SHALL name `min box rm <name>`, which frees the name, and `--name <other>`, which starts another box from the entry.
     <!-- unwanted; the architecture's naming rule (gominimal/arch#186): Minimal never changes a written name, because a script, a URL or another box's egress rule addresses it -->
     tier:   T0
     verify: cargo nextest run -p minimal create_written_name_held_exit2_names_holder_and_next_steps
@@ -406,7 +406,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     tier:   T0
     verify: cargo nextest run -p minimal create_request_carries_project_name_and_entry
 
-- **BCLI-081** WHERE a create verb does not attach this terminal to the box, WHEN the Box Host reports that the box took a number (BOX-221) THE SYSTEM SHALL print one line on stderr. The line SHALL name the name the box took and the name it did not get. Where a box on the host has that name, the line SHALL say so, and name that box, its state and the verb that fits it: `min session attach <name>` for a box whose spec sets `pty_enabled`, `min box restart <name>` for one whose spec sets `lifetime = "until_stopped"`, else `min box logs <name>`. It SHALL also name `min box prune`, which removes stopped boxes.
+- **BCLI-081** WHERE a create verb does not attach this terminal to the box, WHEN the Box Host reports that the box took a number (BOX-221) THE SYSTEM SHALL print one line on stderr. The line SHALL name the name the box took and the name it did not get. Where a box on the host has that name and the caller holds Gatehouse `BoxRead` on it, the line SHALL say so, and name that box, its state and the verb that fits it: `min box attach <name>` for a box whose spec sets `pty_enabled`, `min box restart <name>` for one whose spec sets `lifetime = "until_stopped"`, else `min box logs <name>`. It SHALL also name `min box prune`, which removes stopped boxes.
   <!-- optional-feature; the architecture's naming rule (gominimal/arch#186) announces a numbered box on stderr, and gominimal/arch#195 point 2 keeps that line off an interactive start (BCLI-082) -->
   tier:     T0
   verify:   cargo nextest run -p minimal unattached_create_numbered_prints_one_stderr_line
@@ -414,7 +414,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     <!-- unwanted; the architecture's naming rule: a reserved label or the form of a box id counts as taken, so the box of a project in a directory named `self` is `self-1` -->
     tier:   T0
     verify: cargo nextest run -p minimal unattached_create_numbered_excluded_name_names_no_box
-  - IF a numbered box's derived name is taken and the caller does not hold Gatehouse `BoxRead` on the box that has it THEN THE SYSTEM SHALL say in the line only that the box took a number because the name is taken, and name no box, no state and no verb.
+  - IF a numbered box's derived name is taken and the caller does not hold Gatehouse `BoxRead` on the box that has it THEN THE SYSTEM SHALL say in the line that the box took a number because the name is taken. The line SHALL still name the name the box took and `min box prune`, and name no other box, no state and no verb for the box that has the name.
     <!-- unwanted; the architecture's shared-host rule, as for BCLI-069's refusal -->
     tier:   T0
     verify: cargo nextest run -p minimal unattached_create_numbered_without_box_read_names_no_box
