@@ -1011,8 +1011,8 @@ fn put_picked_entry(
     let entry = crate::pick_session_start_entry(&entries, picked.name.as_deref())?.name;
     // The form's mode acts as `--network`, so it would replace the entry's
     // `network.mode`. An entry whose declared mode differs is refused, and
-    // the request gets no spec and no expansion. This refusal is narrower
-    // than layer 7 of docs/architecture.md, and it is temporary: it stays
+    // the request gets no spec and no expansion. This refusal is interim. It
+    // is narrower than layer 7 of docs/architecture.md, and it stays only
     // until the create form preselects the entry's declared `network.mode`
     // (gominimal/minimal#3774).
     let egress = crate::project_egress(&dir, Some(&entry))?;
