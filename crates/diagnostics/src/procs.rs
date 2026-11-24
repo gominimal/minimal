@@ -682,8 +682,7 @@ mod tests {
         let argv = ["min", "--password=hunter two", "--port=8080", "--flag"];
         let scrubbed = scrub_argv(&argv);
         assert_eq!(
-            scrubbed[1],
-            "--password=<redacted:len=10>",
+            scrubbed[1], "--password=<redacted:len=10>",
             "a value with spaces must not be half-masked"
         );
         assert_eq!(scrubbed[2], "--port=8080", "non-sensitive kept");

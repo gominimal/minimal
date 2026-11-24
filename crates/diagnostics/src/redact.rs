@@ -1671,14 +1671,8 @@ mod tests {
             "https://x-access-token:pw@example.test/?ref=main",
             "--password=<redacted:len=3> b",
         ];
-        let once: Vec<String> = scrub_argv(&argv)
-            .into_iter()
-            .map(Cow::into_owned)
-            .collect();
-        let twice: Vec<String> = scrub_argv(&once)
-            .into_iter()
-            .map(Cow::into_owned)
-            .collect();
+        let once: Vec<String> = scrub_argv(&argv).into_iter().map(Cow::into_owned).collect();
+        let twice: Vec<String> = scrub_argv(&once).into_iter().map(Cow::into_owned).collect();
         assert_eq!(once, twice);
     }
 }
