@@ -2971,7 +2971,12 @@ impl File {
         if let Some(name) = self.declared_project_name()? {
             return Ok(name.to_string());
         }
-        Ok(self.repo_path().and_then(Path::file_name).map_or_else(
+        // A root reached through `..` or `.` has no file name of its own, so
+        // it is resolved first: from `/work/web/sub`, `..` names `web`.
+        let root = self
+            .repo_path()
+            .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
+        Ok(root.as_deref().and_then(Path::file_name).map_or_else(
             || boxes::box_name::NO_PROJECT_NAME.to_string(),
             |dir| boxes::box_name::project_name_from_dir_bytes(dir.as_encoded_bytes()),
         ))
@@ -5075,6 +5080,19 @@ mod tests {
         // A file not loaded from disk has no root directory.
         let file = File::from_toml_bytes(b"").unwrap();
         assert_eq!(file.project_name().unwrap(), "box");
+    }
+
+    /// BOX-214: a project root reached through `..` takes the name of the
+    /// directory it resolves to, not `box`.
+    #[test]
+    fn project_name_resolves_a_relative_root() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("web");
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(root.join(MFILE_NAME), "").unwrap();
+        let file = File::from_dir(sub.join("..")).unwrap();
+        assert_eq!(file.project_name().unwrap(), "web");
     }
 
     /// BOX-215: a directory name's bytes convert to one DNS label, and a
