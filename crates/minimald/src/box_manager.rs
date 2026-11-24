@@ -2011,31 +2011,64 @@ fn published_identity_path(state_dir: &DaemonAbsPath) -> Option<std::path::PathB
     std::env::home_dir().map(|home| home.join(RELATIVE))
 }
 
-/// The root certificate in the identity the node-local proxy published at
-/// `path`, or `None` when the daemon cannot read one there. That is the
-/// case on a microVM guest, where the proxy publishes on the host.
-fn published_root_certificate(path: Option<&std::path::Path>) -> Option<String> {
-    let path = path?;
+/// What the daemon found where the node-local proxy publishes its
+/// identity, for the create gate of BOX-081.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PublishedRoot {
+    /// No identity is there, or it carries no root certificate. That is
+    /// the case on a microVM guest, where the proxy publishes on the
+    /// host. The gate checks only the certificate's shape.
+    Absent,
+    /// The root certificate in the published identity.
+    Root(String),
+    /// An identity file is there, but the daemon cannot use it: another
+    /// user can change it, it is not valid JSON, or it was not read. The
+    /// gate does not fall back to the shape check, so nothing matches.
+    Unusable,
+}
+
+impl PublishedRoot {
+    /// A short name for the log, without the certificate itself.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Root(_) => "root",
+            Self::Unusable => "unusable",
+        }
+    }
+}
+
+/// What the node-local proxy published at `path`. Only a missing file
+/// (or no path) makes the gate advisory. Any other read error makes the
+/// identity [`PublishedRoot::Unusable`], so a damaged file or one with the
+/// wrong owner does not let a made-up certificate through.
+fn published_root_certificate(path: Option<&std::path::Path>) -> PublishedRoot {
+    let Some(path) = path else {
+        return PublishedRoot::Absent;
+    };
     match bep::publish::Identity::read(path) {
-        Ok(identity) => {
-            if identity.root_certificate.is_none() {
+        Ok(identity) => match identity.root_certificate {
+            Some(root) => PublishedRoot::Root(root),
+            None => {
                 tracing::debug!(
                     path = %path.display(),
                     "the published identity carries no root certificate, so the create \
                      gate checks only the certificate's shape"
                 );
+                PublishedRoot::Absent
             }
-            identity.root_certificate
+        },
+        Err(bep::publish::PublishError::Io { ref source, .. }) if source.kind() == NotFound => {
+            PublishedRoot::Absent
         }
-        Err(bep::publish::PublishError::Io { ref source, .. }) if source.kind() == NotFound => None,
         Err(error) => {
-            tracing::info!(
+            tracing::warn!(
                 path = %path.display(),
                 %error,
-                "could not read the published identity, so the create gate checks only \
-                 the certificate's shape"
+                "could not use the published identity, so the create gate counts no root \
+                 certificate as the proxy's"
             );
-            None
+            PublishedRoot::Unusable
         }
     }
 }
@@ -2059,22 +2092,26 @@ fn certificate_der(pem: &str) -> Option<Vec<u8>> {
 /// malformed value counts as no certificate, and the brokered secret is
 /// refused.
 ///
-/// `published` is the root certificate in the identity the proxy
-/// published, when this daemon can read it (a native host). Then the
-/// certificate counts only when it is that root, and a made-up
-/// certificate is refused. With no published identity the check is
+/// `published` is what this daemon found where the proxy publishes its
+/// identity. When it reads a root (a native host), the certificate counts
+/// only when it is that root, and a made-up certificate is refused. When
+/// an identity file is there but unusable, no certificate counts. Only
+/// with no published identity, or one with no root, is the check
 /// advisory: it trusts the caller, and a made-up certificate passes it.
 /// Even then, only a GitHub grant passes, because a node-local proxy
 /// serves no other brokered secret.
-fn proxy_root_certificate(certificate: Option<&str>, published: Option<&str>) -> bool {
+fn proxy_root_certificate(certificate: Option<&str>, published: &PublishedRoot) -> bool {
     let Some(certificate) = certificate.filter(|c| crate::env::is_one_certificate(c)) else {
         return false;
     };
-    match published.map(certificate_der) {
+    match published {
         // An identity with a root that is not one PEM certificate names
         // no root to match, so nothing matches it.
-        Some(published) => published.is_some() && published == certificate_der(certificate),
-        None => true,
+        PublishedRoot::Root(root) => {
+            certificate_der(root).is_some_and(|root| Some(root) == certificate_der(certificate))
+        }
+        PublishedRoot::Unusable => false,
+        PublishedRoot::Absent => true,
     }
 }
 
@@ -4625,20 +4662,20 @@ impl BoxManager {
         // record, id or name behind. A certificate that is not one
         // well-formed block does not count as the proxy's.
         // Where this daemon can read the proxy's published identity, the
-        // certificate must also be that identity's root.
-        let published = config
-            .root_certificate
-            .as_ref()
-            .and_then(|_| published_root_certificate(self.bep_identity.as_deref()));
-        let proxy_serves =
-            proxy_root_certificate(config.root_certificate.as_deref(), published.as_deref());
+        // certificate must also be that identity's root. An identity file
+        // that is there but unusable counts no certificate as the root.
+        let published = match config.root_certificate {
+            Some(_) => published_root_certificate(self.bep_identity.as_deref()),
+            None => PublishedRoot::Absent,
+        };
+        let proxy_serves = proxy_root_certificate(config.root_certificate.as_deref(), &published);
         if config.root_certificate.is_some() && !proxy_serves {
             tracing::info!(
                 session_name = config
                     .name
                     .as_deref()
                     .unwrap_or(crate::rpc::ANONYMOUS_SESSION),
-                published_identity = published.is_some(),
+                published_identity = published.label(),
                 "the create carries a root certificate that is not one well-formed \
                  certificate block, or not the root in the proxy's published identity, \
                  so no node-local proxy counts as serving the box"

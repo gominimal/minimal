@@ -6755,6 +6755,21 @@ async fn create_refuses_a_root_certificate_that_is_not_the_published_root() {
             .unwrap()
             .is_some()
     );
+
+    // An identity file that is there but damaged does not make the check
+    // advisory: no certificate counts as the root, the published one too.
+    std::fs::write(state.path().join(".minimal/bep/identity.json"), "not json").unwrap();
+    for (entry, certificate) in [("damaged-made-up", MADE_UP), ("damaged-root", PUBLISHED)] {
+        let err = create_with_grant(&mngr, entry, certificate)
+            .await
+            .expect_err("a damaged published identity refuses the create");
+        assert_eq!(
+            unenrolled_refusal(&err)
+                .expect("the error is the un-enrolled refusal")
+                .exit_code(),
+            5
+        );
+    }
 }
 
 // D3279, BOX-081: with no published identity, and with one that carries no
