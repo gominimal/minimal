@@ -225,10 +225,15 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
   <!-- event-driven; BOX-180: up to and including the entry, the most specific layer that sets a name wins, and each selected loadout adds the names it sets -->
   tier:     T0
   verify:   cargo nextest run -p minimal box_spec_renders_merged_vars_once_with_layer
-  - WHERE any selected loadout sets a variable THE SYSTEM SHALL withhold the variable's value, even where a project layer or the entry sets the same value. The render SHALL tell the person which loadout sets the variable, and that its value is withheld. It SHALL never render the value in clear, and it SHALL name no issue. Only a variable that no selected loadout sets SHALL keep the rendering of BCLI-077.
-    <!-- optional-feature; fails closed: withholding follows which layers set the variable, never a comparison of values, so a value that BOX-183 lets through because a project layer sets it equally is still withheld. Nothing marks a loadout literal as a secret yet, and gominimal/minimal#3210 decides how one is stored and marked, so BCLI-063 holds with no exception (Open questions) -->
+
+- **BCLI-084** WHEN `min box spec <entry>` renders an expanded spec for which the expander reports BOX-231 warnings THE SYSTEM SHALL print each warning on stderr. Each warning SHALL name the variable and the layer that set it, say that its name looks like a secret's and that its value is stored as written, and name `[secrets]` as the place for a secret value.
+  <!-- event-driven; BOX-230 and BOX-231 (gominimal/minimal#3756): a loadout's literal `env_vars` value is not a secret, and the expander warns on a name that looks like one. stderr keeps stdout to the spec, so `-o json` and `-o yaml` stay parseable. The exact text is written in the plan task and pinned in the test -->
+  tier:     T0
+  verify:   cargo nextest run -p minimal box_spec_entry_prints_secret_name_warnings_on_stderr
+  - THE SYSTEM SHALL print BOX-231's warnings only from `min box spec`, and never before the box shell on an interactive start or attach.
+    <!-- ubiquitous; the AGENTS.md rule for the box shell: the shell's first paint replaces anything printed before it, so an advisory goes to a surface that stays. `min box spec` is that surface -->
     tier:   T0
-    verify: cargo nextest run -p minimal box_spec_withholds_loadout_set_var_values
+    verify: cargo nextest run -p minimal secret_name_warnings_print_only_from_box_spec
 
 - **BCLI-078** IF expanding an entry fails under BOX-172, BOX-174, BOX-181, BOX-182, BOX-183, BOX-206 or BOX-207 THEN THE SYSTEM SHALL fail `min box spec <entry>`, `min box start`, `min box run`, `min session start` and `min task run` with exit 3, and print the error that requirement states. It SHALL create nothing and render nothing.
   <!-- unwanted; spec 29 states each refusal's content, and this requirement binds the commands that print it. What each error tells the person:
@@ -265,10 +270,6 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     <!-- optional-feature; gominimal/arch#195: `[box] name` stays a key of the entry, read only at creation as the requested name (BCLI-079). After a rename it differs from the box's name -->
     tier:   T0
     verify: cargo nextest run -p minimal box_spec_box_labels_box_name_as_default_request
-  - WHERE a stored spec's `loadout_mode` is `open` THE SYSTEM SHALL withhold the value of every variable in `min box spec <box>`. The render SHALL tell the person that the value is withheld. It SHALL also tell them that `min box spec <entry>` shows where the variable comes from in the current project, which can differ from where it came from when the box was created. It SHALL never render a variable's value in clear, and it SHALL name no issue.
-    <!-- optional-feature; fails closed, as BCLI-077 does for the entry form. The stored spec (BOX-068) does not record which layer or loadout set a variable: BOX-161's provenance sits beside the expanded spec and never in its bytes, and the record does not keep which loadouts were selected. So the box form cannot tell a loadout-set value from the project's, and withholds them all. A `sealed` box applied no loadout (BOX-166), so its variables keep the box form's normal render. The BOX amendment that keeps each variable's origin is gominimal/minimal#3255, a Rollout dependency -->
-    tier:   T0
-    verify: cargo nextest run -p minimal box_spec_box_withholds_vars_of_open_box
 
 - **BCLI-023** THE SYSTEM SHALL render every section of a spec in `min box spec` whether or not the current host enforces it.
   tier:     T0
@@ -738,7 +739,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
 
 **Spec 18's NET-140 is amended to BCLI-024's `--deny-all-egress` rule.** NET-140's comment on main says the flag conflicts with every `--allow-*` and `--deny-*` flag. The owner ruled on 2026-11-09 that only `--allow-subnets` and `--allow-dns-hosts` conflict with it. `--allow-protocols` and `--deny-subnets` only narrow, and apply after it. gominimal/minimal#3220 amends spec 18 to that rule, so the two specs agree on main.
 
-**BCLI-022's variable render needs each stored variable's origin.** The stored spec (BOX-068) does not record which layer or loadout set a variable, and BOX-161's provenance never enters it. So `min box spec <box>` withholds every variable value of a box whose `loadout_mode` is `open`. A BOX amendment that keeps each variable's origin in the stored spec, as BOX-179 keeps a hook's declarer, would let the box form withhold only loadout-set values. gominimal/minimal#3255 tracks that amendment to `docs/specs/29-spec-box-local-first`. gominimal/minimal#3210 stays the question of whether a loadout's literal values are stored and how a loadout marks one as a secret. Until #3255 lands, the box form keeps failing closed.
+**A loadout's literal value is not a secret, so `min box spec` renders it.** A loadout can set a variable to a literal value, and the box record stores it as written (BOX-230). Only a `[secrets]` value is a secret, and BCLI-063 writes it as a reference only. So `min box spec <entry>` and `min box spec <box>` render every `env_vars` value in clear, whichever layer or loadout set it. The risk is a secret written as a literal in error. BCLI-084 carries it: `min box spec <entry>` prints BOX-231's warning for a variable whose name looks like a secret's, and points to `[secrets]`. `min box spec <box>` prints no warning, so the check is the entry form, before a box starts.
 
 **BCLI-022's declarer column needs a BOX field.** The ruling on gominimal/minimal#2877 keeps each lifecycle hook's declarer in the stored spec. Today BOX-064 merges every layer's `lifecycle_hooks` into one list, and BOX-161 reports provenance only at expansion, by layer. BOX-179 in gominimal/minimal#3177 names the field that keeps the declarer: a `declared_by` table in each stored hook. BCLI-022's hook rows depend on it.
 
@@ -761,6 +762,5 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
 
 ## Open questions
 
-- [NEEDS CLARIFICATION (MEDIUM): when can BCLI-077 stop withholding a loadout-set variable value? A loadout can set a variable to a literal value, and BOX-068 stores the expanded spec in the record. Until gominimal/minimal#3210 decides whether that literal is stored and how a loadout marks it as a secret, BCLI-077 withholds every loadout-set value, so BCLI-063 holds. What #3210 must settle before BCLI-077 can render any loadout-set value in clear is open.]
 - [NEEDS CLARIFICATION (MEDIUM): nesting has no owner. The BOX Non-goals name gominimal/inbox#568, which closed as a duplicate, and gominimal/inbox#572 closed as not planned. `min box wait --parent` and `--parent self` wait on whichever spec or epic takes nesting up.]
 - [NEEDS CLARIFICATION (MEDIUM): `min box sync`, `min box port`, `min box add`, `min host create|pause|resume|rm` and `min provider show|add|rm|login|use` have no owner. The architecture names them, BPA defines the provider operations under the host and provider verbs, and BPA names this spec for the grammar. gominimal/minimal#2868 decides which spec owns each verb and schedules them.]
