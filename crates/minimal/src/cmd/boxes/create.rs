@@ -987,6 +987,23 @@ fn command_project_dir(global: &GlobalArgs) -> Result<camino::Utf8PathBuf, anyho
         .map_err(|_| anyhow::anyhow!("Project path is not valid UTF-8"))
 }
 
+/// Print each of `lines` on stderr, on its first print in this process
+/// only. A command loads its project's `minimal.toml` many times, and each
+/// load returns the same legacy-table hints and unknown-field warnings, so
+/// this prints each of them once.
+pub(crate) fn print_file_diagnostics(lines: &[String]) {
+    static PRINTED: std::sync::Mutex<std::collections::BTreeSet<String>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let mut printed = PRINTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for line in lines {
+        if printed.insert(line.clone()) {
+            eprintln!("{line}");
+        }
+    }
+}
+
 /// Append each of `lines` to `into` that it does not hold yet, in order.
 pub(crate) fn add_file_diagnostics(into: &mut Vec<String>, lines: &[String]) {
     for line in lines {
@@ -1003,8 +1020,7 @@ fn project_file_bytes(project: &camino::Utf8Path) -> anyhow::Result<Option<Vec<u
 }
 
 /// [`project_file_bytes`], with the lines the load has for the person: its
-/// legacy-table hints and unknown-field warnings. The load prints them on
-/// stderr unless `min dash` turned that off.
+/// legacy-table hints and unknown-field warnings. It prints nothing.
 fn project_file_read(project: &camino::Utf8Path) -> anyhow::Result<(Option<Vec<u8>>, Vec<String>)> {
     let file = match mfile::File::from_dir_recursive(project.as_std_path()) {
         Ok(file) => file,
@@ -1038,8 +1054,7 @@ pub(crate) fn project_entries(
 }
 
 /// [`project_entries`], with the lines the load of the file has for the
-/// person. The load prints them on stderr unless `min dash` turned that
-/// off.
+/// person. It prints nothing.
 fn project_entries_and_diagnostics(
     project: &camino::Utf8Path,
 ) -> anyhow::Result<(Vec<mfile::entry::BoxEntry>, Vec<String>)> {
@@ -1066,8 +1081,8 @@ pub async fn cmd_box_start(global: &GlobalArgs, args: BoxStartArgs) -> Result<()
 /// stdin closed, and the start prints one hint.
 pub async fn start_entry(global: &GlobalArgs, start: StartEntry) -> Result<(), anyhow::Error> {
     let project = command_project_dir(global)?;
-    // The load printed its minimal.toml hints and warnings on stderr.
-    let (entries, _diagnostics) = project_entries_and_diagnostics(&project)?;
+    let (entries, diagnostics) = project_entries_and_diagnostics(&project)?;
+    print_file_diagnostics(&diagnostics);
     let has_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let plan = plan_start(&start, &entries, has_terminal).inspect_err(|error| {
         tracing::info!(verb = start.verb.command(), %error, "the start was refused before it created a box");
@@ -1381,15 +1396,14 @@ pub(crate) fn session_loadout_mode(
     entry: Option<&str>,
     named: &[String],
 ) -> anyhow::Result<mfile::expand::LoadoutMode> {
-    // The load printed its minimal.toml hints and warnings on stderr.
-    let (mode, _diagnostics) = session_loadout_mode_and_diagnostics(project, entry, named)?;
+    let (mode, diagnostics) = session_loadout_mode_and_diagnostics(project, entry, named)?;
+    print_file_diagnostics(&diagnostics);
     Ok(mode)
 }
 
 /// [`session_loadout_mode`], with the lines the load of the project's
 /// `minimal.toml` has for the person, for a caller that shows them on its
-/// own surface (the `min dash` status line). The load prints them on stderr
-/// unless `min dash` turned that off.
+/// own surface (the `min dash` status line). It prints nothing.
 ///
 /// # Errors
 ///
@@ -1434,8 +1448,8 @@ pub(crate) fn task_loadout_mode(
     project: &camino::Utf8Path,
     task: &str,
 ) -> anyhow::Result<mfile::expand::LoadoutMode> {
-    // The load printed its minimal.toml hints and warnings on stderr.
-    let (bytes, _diagnostics) = project_file_read(project)?;
+    let (bytes, diagnostics) = project_file_read(project)?;
+    print_file_diagnostics(&diagnostics);
     let declared = match &bytes {
         Some(bytes) => mfile::entry::read_entries(bytes)
             .map_err(|error| ProjectFileInvalid { error })?
@@ -4541,6 +4555,7 @@ pub(crate) async fn activate_box(
                 hooks,
                 None,
             )?;
+            print_file_diagnostics(&inputs.diagnostics);
             // BOX-064, BOX-179: the gated loadouts again, whole, for the
             // selected-loadouts layer of the entry's expansion. The read
             // above already refused a missing or malformed one.

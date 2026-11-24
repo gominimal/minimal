@@ -1359,10 +1359,6 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
         // then spawns `ssh -tt` reading /dev/null, the #953 hang.
         anyhow::bail!("min dash requires an interactive terminal on stdin and stdout");
     }
-    // #3529: a load of a minimal.toml prints its hints and warnings on
-    // stderr, over the dashboard. Each load keeps them on the file instead,
-    // and the dashboard puts them on its status line.
-    mfile::print_diagnostics_on_load(false);
 
     // Gated before the terminal is taken over, so a skewed daemon refuses the
     // dashboard the same way it refuses `min ls` — plain message, terminal

@@ -1090,11 +1090,10 @@ pub struct File {
     #[serde(skip)]
     layout: Option<Layout>,
     /// The lines a load has for the person: the legacy-table hints and the
-    /// unknown-field warnings, in the order the load found them. A load from
-    /// disk prints them on stderr by default (see
-    /// [`print_diagnostics_on_load`]). A caller that turns that off reads
-    /// them with [`File::diagnostics`] or [`File::diagnostics_once`] and puts
-    /// them on its own surface.
+    /// unknown-field warnings, in the order the load found them. The load
+    /// prints none of them. The caller reads them with
+    /// [`File::diagnostics`] or [`File::diagnostics_once`] and puts them on
+    /// its own surface.
     #[serde(skip)]
     diagnostics: Vec<String>,
 }
@@ -1168,24 +1167,6 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
-/// A file's path and the hash of its content.
-type FileKey = (PathBuf, Option<u64>);
-
-/// Whether a load from disk prints its diagnostics on stderr. It is on by
-/// default, so every command that loads a `minimal.toml` shows its
-/// legacy-table hints and unknown-field warnings. A caller that owns the
-/// screen turns it off with [`print_diagnostics_on_load`] and reads
-/// [`File::diagnostics`] instead.
-static PRINT_ON_LOAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
-/// Sets whether a load from disk prints its legacy-table hints and
-/// unknown-field warnings on stderr, for the rest of this process. Each
-/// load keeps them on [`File::diagnostics`] either way. `min dash` turns
-/// printing off, because a line on stderr draws over its screen.
-pub fn print_diagnostics_on_load(print: bool) {
-    PRINT_ON_LOAD.store(print, std::sync::atomic::Ordering::Relaxed);
-}
-
 /// Whether this is the first time this process hands out the diagnostics of
 /// the file at `path` with this content.
 ///
@@ -1196,6 +1177,8 @@ pub fn print_diagnostics_on_load(print: bool) {
 /// `File`, not a re-read: a file replaced between parse and report must not
 /// silence the report of the replacement. A file with no path is always due.
 fn diagnostics_due(path: Option<&Path>, content_hash: Option<u64>) -> bool {
+    /// A file's path and the hash of its content.
+    type FileKey = (PathBuf, Option<u64>);
     static REPORTED_FILES: LazyLock<Mutex<HashSet<FileKey>>> =
         LazyLock::new(|| Mutex::new(HashSet::new()));
     let Some(path) = path else {
@@ -1315,9 +1298,7 @@ impl File {
     /// serde's internal enum name.
     ///
     /// It then reads the legacy tables (BOX-050, BOX-051, BOX-052) and
-    /// keeps one hint for each on the file's diagnostics. It prints nothing:
-    /// a load from disk prints them after its checks, unless the process
-    /// turned that off with [`print_diagnostics_on_load`].
+    /// keeps one hint for each on the file's diagnostics. It prints nothing.
     fn parse(bytes: &[u8], path: Option<&Path>) -> Result<Self, Error> {
         let mut file = Self::deserialize_bytes(bytes, path)?;
         let hints = legacy::settle(&mut file, legacy::this_release(), path)?;
@@ -1398,45 +1379,12 @@ impl File {
         self.check(tasks)?;
         let warnings = self.unknown_field_warnings();
         self.diagnostics.extend(warnings);
-        if PRINT_ON_LOAD.load(std::sync::atomic::Ordering::Relaxed) {
-            self.print_due_diagnostics(&mut std::io::stderr());
-        }
         Ok(self)
-    }
-
-    /// Writes each line of [`File::diagnostics_due_to_print`] to `out`.
-    /// A line that cannot be written (a closed stderr) is not a reason to
-    /// fail the load.
-    fn print_due_diagnostics(&self, out: &mut dyn std::io::Write) {
-        for line in self.diagnostics_due_to_print() {
-            let _ = writeln!(out, "{line}");
-        }
-    }
-
-    /// The diagnostics a load prints: all of them, the first time this
-    /// process prints for this file's path and content, and none after
-    /// that. The record is apart from the one [`File::diagnostics_once`]
-    /// keeps, so a print does not use up what a caller hands out.
-    fn diagnostics_due_to_print(&self) -> Vec<String> {
-        static PRINTED_FILES: LazyLock<Mutex<HashSet<FileKey>>> =
-            LazyLock::new(|| Mutex::new(HashSet::new()));
-        let Some(path) = self.mfile_path.as_deref() else {
-            return self.diagnostics.clone();
-        };
-        if self.diagnostics.is_empty()
-            || !PRINTED_FILES
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert((path.to_path_buf(), self.content_hash))
-        {
-            return Vec::new();
-        }
-        self.diagnostics.clone()
     }
 
     /// The lines this load has for the person, in the order it found them:
     /// a `hint:` line for each legacy table, then each `warning:` about an
-    /// unknown field and its `help:` line.
+    /// unknown field and its `help:` line. Nothing printed them.
     #[must_use]
     pub fn diagnostics(&self) -> &[String] {
         &self.diagnostics
@@ -2609,7 +2557,6 @@ impl File {
     /// The warnings about the fields this version does not read, each as the
     /// line the person sees: `warning: …`, and a last `help:` line when a
     /// field is unknown. It prints nothing, and logs each line at debug.
-    /// [`File::init_toml`] prints them, unless printing is off.
     fn unknown_field_warnings(&self) -> Vec<String> {
         // BOX-028: an entry's `hooks_on_resume` stays in its `extra`, where
         // the spec reads it, and is not an unknown key.
@@ -5135,17 +5082,12 @@ mod tests {
         assert!(diagnostics_due(None, old), "every time");
     }
 
-    /// #3529: a load keeps the legacy-table hints and the unknown-field
-    /// warnings on the `File`. With printing off it prints nothing, so a
-    /// caller that owns the screen (the `min dash` TUI) can put them on its
-    /// own surface. Every load returns them; `diagnostics_once` hands them
-    /// out once. With printing on, as for every other command, a load
-    /// prints them once for each path and content.
+    /// #3529: a parse keeps the legacy-table hints and the unknown-field
+    /// warnings on the `File` and prints nothing, so a caller that owns the
+    /// screen (the `min dash` TUI) can put them on its own surface. Every
+    /// load returns them; `diagnostics_once` hands them out once.
     #[test]
     fn legacy_hints_are_returned_not_printed() {
-        // Only this test turns printing off. No other test reads what a
-        // load prints, so the process-wide switch does not race them.
-        print_diagnostics_on_load(false);
         let dir = tempdir().unwrap();
         std::fs::write(
             dir.path().join(MFILE_NAME),
@@ -5184,15 +5126,6 @@ mod tests {
 
         assert_eq!(first.diagnostics_once(), lines);
         assert!(second.diagnostics_once().is_empty(), "handed out once");
-
-        // Neither load printed: the print record for the file is unused.
-        let mut printed = Vec::new();
-        first.print_due_diagnostics(&mut printed);
-        let printed = String::from_utf8(printed).unwrap();
-        assert_eq!(printed, format!("{}\n", lines.join("\n")));
-        let mut again = Vec::new();
-        second.print_due_diagnostics(&mut again);
-        assert!(again.is_empty(), "printed once for the path and content");
 
         // A parse with no path keeps the hint too.
         let bare = File::from_toml_bytes(b"[session]\npackages = [\"git\"]\n").unwrap();
