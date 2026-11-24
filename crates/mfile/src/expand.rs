@@ -244,6 +244,38 @@ pub struct SecretNameWarning {
     /// the loadout's file for a loadout. `None` for a layer that no file
     /// holds, such as a built-in type or a command-line flag.
     pub file: Option<std::path::PathBuf>,
+    /// What the spec stores for the variable.
+    pub stored: StoredVar,
+}
+
+/// What the expanded spec stores for a variable of `env_vars`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoredVar {
+    /// A value, as written.
+    Literal,
+    /// `{ inherit = true }` with no `default`: no value.
+    Inherit,
+    /// `{ inherit = true, default = ... }`: the default, as written.
+    InheritWithDefault,
+}
+
+impl StoredVar {
+    /// The shape of `value`, a variable of `env_vars` as a layer writes it.
+    #[must_use]
+    pub fn of(value: &toml::Value) -> Self {
+        match value {
+            toml::Value::Table(t)
+                if t.get("inherit").and_then(toml::Value::as_bool) == Some(true) =>
+            {
+                if t.contains_key("default") {
+                    Self::InheritWithDefault
+                } else {
+                    Self::Inherit
+                }
+            }
+            _ => Self::Literal,
+        }
+    }
 }
 
 impl std::fmt::Display for SecretNameWarning {
@@ -259,10 +291,27 @@ impl std::fmt::Display for SecretNameWarning {
             }
             _ => write!(f, "{} sets it. ", self.layer)?,
         }
+        // BOX-230 stores the value as written. An inherit with no default
+        // has no value in the spec, so the text says what the spec holds.
+        match self.stored {
+            StoredVar::Literal => write!(
+                f,
+                "A box from this entry stores its value as written in the box's spec. "
+            )?,
+            StoredVar::Inherit => {
+                return write!(
+                    f,
+                    "The box's spec stores `{{ inherit = true }}` for it, not a value."
+                );
+            }
+            StoredVar::InheritWithDefault => write!(
+                f,
+                "A box from this entry stores its `default` as written in the box's spec. "
+            )?,
+        }
         write!(
             f,
-            "A box from this entry stores its value as written in the box's spec. \
-             Put a secret value in a `[secrets]` entry to keep it out of the spec."
+            "Put a secret value in a `[secrets]` entry to keep it out of the spec."
         )
     }
 }
@@ -1388,6 +1437,7 @@ fn secret_name_warnings(entry: &BoxEntry, loadouts: &[LoadoutLayer], expansion: 
             _ => Some(std::path::PathBuf::from(crate::MFILE_NAME)),
         };
         let layer = layer_words(entry, Some(origin));
+        let stored = StoredVar::of(&vars[name]);
         tracing::debug!(
             rule = "BOX-231",
             variable = %name,
@@ -1399,6 +1449,7 @@ fn secret_name_warnings(entry: &BoxEntry, loadouts: &[LoadoutLayer], expansion: 
             origin: origin.clone(),
             layer,
             file,
+            stored,
         });
     }
 }
@@ -3694,6 +3745,40 @@ mod tests {
         let w = &e.report.secret_name_warnings[1];
         assert_eq!((w.name.as_str(), w.file.as_ref()), ("MY_SECRET", None));
         assert!(w.to_string().contains("the loadout `l` sets it. "), "{w}");
+        // An inherit stores no value, so the text does not say "as written".
+        let inherit = expand_in(
+            "[sessions.dev]\nenv_vars = { GH_TOKEN = { inherit = true }, \
+             NPM_TOKEN = { inherit = true, default = \"d\" } }\n",
+            "dev",
+            Layers::default(),
+        )
+        .unwrap();
+        let text: Vec<(StoredVar, String)> = inherit
+            .report
+            .secret_name_warnings
+            .iter()
+            .map(|w| (w.stored, w.to_string()))
+            .collect();
+        assert_eq!(
+            text,
+            [
+                (
+                    StoredVar::Inherit,
+                    "the variable GH_TOKEN in `env_vars` has a name that looks like a \
+                     secret's. `[sessions.dev]` in minimal.toml sets it. The box's spec \
+                     stores `{ inherit = true }` for it, not a value."
+                        .to_owned()
+                ),
+                (
+                    StoredVar::InheritWithDefault,
+                    "the variable NPM_TOKEN in `env_vars` has a name that looks like a \
+                     secret's. `[sessions.dev]` in minimal.toml sets it. A box from this \
+                     entry stores its `default` as written in the box's spec. Put a secret \
+                     value in a `[secrets]` entry to keep it out of the spec."
+                        .to_owned()
+                ),
+            ]
+        );
         // No secret-like name, no warning.
         let plain = expand_in(
             "[sessions.dev]\nenv_vars = { EDITOR = \"hx\" }\n",
