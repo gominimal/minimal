@@ -301,8 +301,9 @@ host-address box on a native Linux host shares the host's network namespace. No
 switch or gate stands between it and the host, and the `[host-exposures]`
 table does not apply to it. It reaches host services directly. Where the host's
 classifier is installed, the box's own egress rules bound that reach, and a
-deny-all box reaches only the box DNS resolver. When an own-address
-box gets the deny-all default, `min session start` prints one line that says so:
+deny-all box reaches only the box-zone resolver. Where the classifier is not
+installed, nothing bounds it. When an own-address box gets the deny-all
+default, `min session start` prints one line that says so:
 
 ```
 This box can reach no external address: a --network own_ip box with no egress rules gets the deny-all default. To allow outbound traffic, activate a new session with --allow-subnets or --allow-dns-hosts, for example --allow-dns-hosts github.com.
