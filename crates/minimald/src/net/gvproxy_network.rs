@@ -2875,8 +2875,7 @@ mod tests {
                 .iter()
                 .any(|p| p == "/services/dns/add");
             assert_eq!(
-                registered,
-                !handed_from_host,
+                registered, !handed_from_host,
                 "a task registers a name only where its daemon drew the address \
                  (handed from the host: {handed_from_host})"
             );
