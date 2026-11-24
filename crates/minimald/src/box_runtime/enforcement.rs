@@ -964,32 +964,22 @@ pub(super) fn unenforced_placement_notice(
 /// leaf from its parent, so the box is in its leaf from its first process to
 /// its last.
 ///
-/// The placement is confirmed, not assumed: the leaf's own `cgroup.procs` is
-/// read back and must list the supervisor. The write and the read both name
-/// pids in the daemon's PID namespace, where `supervisor` is the pid the
-/// spawn returned. The program is still held at its start gate here, so the
-/// supervisor is alive for the read. An `Err` means the supervisor is not in
-/// the leaf.
+/// The placement is confirmed, not assumed, by the one function every
+/// launch in a box's leaf uses — this one, a sandbox run's and a task's:
+/// [`sandbox::classifier::place_supervisor`] writes the supervisor in and
+/// reads the leaf's own `cgroup.procs` back, which must list it. The program
+/// is still held at its start gate here, so the supervisor is alive for the
+/// read. An `Err` means the supervisor is not in the leaf.
 pub(super) fn place_box_processes(
     leaf: &sandbox::config::ClassifierLeaf,
     supervisor: u32,
 ) -> std::io::Result<()> {
-    sandbox::classifier::place_pid(&leaf.procs(), supervisor)?;
-    let members = std::fs::read_to_string(leaf.procs())?;
-    leaf_lists_pid(&members, supervisor)
+    sandbox::classifier::place_supervisor(leaf, supervisor)
 }
 
-/// `Ok` when `members`, the text of a leaf's `cgroup.procs`, lists `pid`:
-/// one pid per line, as the kernel writes it.
-pub(super) fn leaf_lists_pid(members: &str, pid: u32) -> std::io::Result<()> {
-    let pid_text = pid.to_string();
-    if members.lines().any(|line| line.trim() == pid_text) {
-        return Ok(());
-    }
-    Err(std::io::Error::other(format!(
-        "the cgroup does not list process {pid} after the move"
-    )))
-}
+/// `Ok` when `members`, the text of a leaf's `cgroup.procs`, lists `pid`.
+#[cfg(test)]
+pub(super) use sandbox::classifier::leaf_lists_pid;
 
 /// The error a launch fails with when the box's supervisor could not be
 /// placed in its classifier leaf (NET-079: every process of a host-address

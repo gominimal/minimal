@@ -448,8 +448,14 @@ fn every_create_session_asserts_the_daemon_build() {
             "cmd/boxes/vm_host.rs::activation_relays_no_box_id = asserts nothing",
             // The dashboard's activation: the same create, the same assertion.
             "dash/rpc.rs::activate = asserts",
+            // A unit test's request, never sent: it checks that the dashboard
+            // refuses an entry with network or secret settings.
+            "dash/rpc.rs::assert_dashboard_refuses_entry_with = asserts nothing",
             // A unit test's request, never sent: it checks the project root.
             "dash/rpc.rs::dashboard_create_from_a_subdirectory_sends_the_project_root = asserts nothing",
+            // A unit test's request, never sent: it checks that a dashboard
+            // create stores the spec `min box start` stores.
+            "dash/rpc.rs::dashboard_create_with_a_named_entry_stores_the_box_start_spec = asserts nothing",
             // Not a create the dashboard sends: the unit tests' own-address
             // config, which only a fake create closure receives.
             "dash/rpc.rs::own_ip_config = asserts nothing",

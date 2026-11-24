@@ -1014,7 +1014,9 @@ fn project_file_bytes(project: &camino::Utf8Path) -> anyhow::Result<Option<Vec<u
 
 /// The entries the project's `minimal.toml` declares. A project with no
 /// `minimal.toml` declares none.
-fn project_entries(project: &camino::Utf8Path) -> anyhow::Result<Vec<mfile::entry::BoxEntry>> {
+pub(crate) fn project_entries(
+    project: &camino::Utf8Path,
+) -> anyhow::Result<Vec<mfile::entry::BoxEntry>> {
     match project_file_bytes(project)? {
         Some(bytes) => {
             mfile::entry::read_entries(&bytes).map_err(|error| ProjectFileInvalid { error }.into())
@@ -3841,11 +3843,6 @@ pub(crate) fn registration_held_name_refusal(
 /// (BOX-068): the expansion of the project's session entry, with the
 /// request's network mode, policy and hooks choice as the flags.
 ///
-/// Known gap: the dashboard's activation in `crates/minimal/src/dash/rpc.rs`
-/// builds its own `CreateSessionRequest` and does not call this yet, so a
-/// session box created from `min dash` has no stored spec. That file is
-/// outside this change. A follow-up must call this function there.
-///
 /// # Errors
 ///
 /// Fails on a `minimal.toml` in `dir` or a parent of it that does not load.
@@ -3918,6 +3915,78 @@ pub(crate) fn stamp_session_spec_as(
         Some(expanded) => put_expanded_spec(request, &spec, &expanded.spec),
         None => put_spec(request, &spec),
     }
+}
+
+/// The session entry a create starts a box from, and what its expansion
+/// reads. `min session activate`, `min box start` and the dashboard's
+/// create fill it in. [`put_session_entry`] takes the request's network and
+/// policy from the caller, and only `activate_box` sets them from the
+/// project. #3739 makes the other callers set them from the project too.
+pub(crate) struct SessionEntryCreate<'a> {
+    /// The directory the create runs from. The spec is read from here.
+    pub(crate) dir: &'a camino::Utf8Path,
+    /// The project root, which the expansion reads and the request records.
+    pub(crate) project_root: &'a camino::Utf8Path,
+    /// The picked session entry. `None` applies the session entry pick.
+    pub(crate) entry: Option<&'a str>,
+    /// The spec's `[box] name` (BCLI-069).
+    pub(crate) box_name: Option<&'a str>,
+    /// The gated loadouts of the selected-loadouts layer (BOX-064).
+    pub(crate) selected: &'a SelectedLoadouts,
+    /// Reads the client's store rules for the spec's `[secrets]` (BOX-071).
+    pub(crate) global: Option<&'a GlobalArgs>,
+}
+
+/// Puts the session entry of `create` on a create request and its
+/// contribution, after the request's network, policy and hooks choice are
+/// set (BOX-068, BOX-179):
+///
+/// - the entry's expansion goes on `contribution.entry`, for the daemon's
+///   compose,
+/// - the project root goes on the request (BOX-001),
+/// - the spec goes on the request, through [`stamp_session_spec_as`],
+/// - the expanded hooks, each with its declarer, go on that spec.
+///
+/// # Errors
+///
+/// Fails on a `minimal.toml` that does not load or expand, when no single
+/// session entry can be picked, and on a client configuration whose store
+/// rules do not read.
+pub(crate) fn put_session_entry(
+    request: &mut minimald_rpc::CreateSessionRequest,
+    contribution: &mut boxes::wire::request::WireContribution,
+    create: &SessionEntryCreate<'_>,
+) -> Result<(), anyhow::Error> {
+    let expanded = session_box_expansion(
+        create.project_root,
+        create.entry,
+        request.config.hooks_enabled,
+        create.selected,
+    )?;
+    // The expansion logs each hook with its declarer and layer. The whole
+    // spec is not logged, because it carries loadout variable values.
+    let spec_hooks = expanded
+        .as_ref()
+        .map(BoxEntryExpansion::spec_hooks)
+        .transpose()?;
+    contribution.entry = expanded.map(|expanded| Box::new(expanded.wire));
+    set_project_root(request, create.project_root.to_path_buf())?;
+    stamp_session_spec_as(
+        request,
+        create.dir,
+        create.entry,
+        create.box_name,
+        create.global,
+    )?;
+    if let Some(hooks) = spec_hooks {
+        put_spec_hooks(request, hooks)?;
+    }
+    tracing::debug!(
+        entry = create.entry.unwrap_or("(picked)"),
+        hooks = request.config.hooks_enabled,
+        "put the session entry's spec on the create request"
+    );
+    Ok(())
 }
 
 /// The project root to record for an activation from `dir`. Tarball sync
@@ -4474,23 +4543,6 @@ pub(crate) async fn activate_box(
     use tracing::Instrument as _;
     let entry_span = tracing::info_span!("box_entry", box_type = boxes::SESSION_BOX_TYPE);
     let mut contribution = contribution;
-    let expanded = entry_span.in_scope(|| {
-        session_box_expansion(
-            &project_root,
-            options.entry.as_deref(),
-            !args.no_hooks,
-            &selected,
-        )
-    })?;
-    // The expansion logs each hook with its declarer and layer. The whole
-    // spec is not logged, because it carries loadout variable values.
-    // BOX-068, BOX-179: the expanded spec's hooks, each with its declarer,
-    // ride in the spec the daemon stores.
-    let spec_hooks = expanded
-        .as_ref()
-        .map(BoxEntryExpansion::spec_hooks)
-        .transpose()?;
-    contribution.entry = expanded.map(|expanded| Box::new(expanded.wire));
 
     // The upload decision needs no TTY — the interactive `Confirm` is answered
     // at the upload step, once the session exists — so it is resolved here,
@@ -4498,19 +4550,24 @@ pub(crate) async fn activate_box(
     // drop refuses here rather than after a session and its row exist.
     let upload_plan = ActivationStep::PlanUpload
         .run(async {
-            set_project_root(&mut request, project_root)?;
-            // BOX-068: the box's spec, after every flag and the project's
-            // policy are on the request.
-            stamp_session_spec_as(
-                &mut request,
-                &utf8_path,
-                options.entry.as_deref(),
-                options.box_name.as_deref(),
-                Some(global),
-            )?;
-            if let Some(hooks) = spec_hooks {
-                put_spec_hooks(&mut request, hooks)?;
-            }
+            // BOX-068, BOX-179: the entry's expansion, the project root, and
+            // the box's spec with its expanded hooks, after every flag and
+            // the project's policy are on the request. The dashboard's
+            // create calls the same helper.
+            entry_span.in_scope(|| {
+                put_session_entry(
+                    &mut request,
+                    &mut contribution,
+                    &SessionEntryCreate {
+                        dir: &utf8_path,
+                        project_root: &project_root,
+                        entry: options.entry.as_deref(),
+                        box_name: options.box_name.as_deref(),
+                        selected: &selected,
+                        global: Some(global),
+                    },
+                )
+            })?;
             add_vpn_network_names(&mut request, &options.vpn_network_names)?;
 
             let Some(root) = upload_root else {
@@ -5757,6 +5814,43 @@ mod tests {
         assert!(!sent.hooks_enabled, "--no-hooks reaches the spec");
         assert_eq!(sent.network.mode, boxes::NetworkMode::OwnIp);
         assert_eq!(sent.network.policy, policy);
+
+        // The shared helper that `activate_box` and the dashboard call puts
+        // the same spec and digest on the request, the project root, and
+        // the entry's expansion on the contribution.
+        let mut shared = request.clone();
+        shared.spec = None;
+        let mut contribution = boxes::wire::request::WireContribution::default();
+        put_session_entry(
+            &mut shared,
+            &mut contribution,
+            &SessionEntryCreate {
+                dir: root,
+                project_root: root,
+                entry: None,
+                box_name: None,
+                selected: &SelectedLoadouts::default(),
+                global: None,
+            },
+        )
+        .unwrap();
+        // `--no-hooks` expands no hook, so the steps `activate_box` ran
+        // inline put an empty hook list on the stamped spec.
+        let mut inline = request.clone();
+        put_spec_hooks(&mut inline, Vec::new()).unwrap();
+        assert_eq!(shared.spec, inline.spec);
+        assert_eq!(
+            shared.config.client_projection_digest(),
+            inline.config.client_projection_digest()
+        );
+        assert_eq!(
+            shared.config.project_root,
+            Some(paths::HostAbsPath::try_new(root.to_path_buf()).unwrap())
+        );
+        assert_eq!(
+            contribution.entry.as_ref().map(|entry| entry.name.as_str()),
+            Some(mfile::entry::DEFAULT_ENTRY_NAME)
+        );
 
         // The task path: the declared task's spec, through the same helper.
         let file = mfile::File::from_dir_recursive(dir.path()).unwrap();

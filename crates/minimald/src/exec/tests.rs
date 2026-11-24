@@ -645,6 +645,114 @@ async fn a_refused_task_attach_stops_the_task() {
     );
 }
 
+/// NET-079. A task in a box's leaf whose supervisor the leaf refuses stops
+/// with the cause: the process is killed and reaped, and the task fails
+/// rather than run with its supervisor outside the leaf. The stand-in leaf
+/// has no `cgroup.procs`, so it is not a cgroup at all.
+#[test]
+fn a_task_supervisor_the_leaf_refuses_stops_the_task() {
+    struct Child {
+        reaped: bool,
+    }
+    impl super::Reapable for Child {
+        fn kill_and_reap(&mut self) {
+            self.reaped = true;
+        }
+    }
+
+    let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+    let leaf = sandbox::config::ClassifierLeaf::new(tree.path().join("box-leaf"));
+    std::fs::create_dir(leaf.dir()).expect("creating the stand-in leaf");
+
+    let mut child = Child { reaped: false };
+    let err =
+        super::place_supervisor_or_reap(Some(&leaf), std::process::id(), &mut child, None::<()>)
+            .expect_err("a leaf with no cgroup.procs must refuse the supervisor");
+    assert!(child.reaped, "the task must not run on");
+    assert_eq!(
+        err.to_string(),
+        "the task did not start: Minimal could not move the task's supervisor process \
+         into the cgroup that decides the box's network access. The cgroup no longer \
+         exists. If it keeps failing, run `min bug` to collect a diagnostic bundle.",
+    );
+    assert!(!leaf.procs().exists(), "the move creates no cgroup.procs");
+
+    // A box with no leaf places nothing and leaves the process alone.
+    let mut unplaced = Child { reaped: false };
+    super::place_supervisor_or_reap(None, std::process::id(), &mut unplaced, None::<()>)
+        .expect("a box with no leaf has nothing to place");
+    assert!(!unplaced.reaped);
+}
+
+/// NET-079. A task in a box's leaf holds its program at a start gate until
+/// its supervisor is in the leaf, as a box launch and a sandbox run do.
+/// The gate goes only after the placement: on success it releases the
+/// program, and on a refusal it goes after the process is reaped, so a
+/// refused task never runs its program.
+#[test]
+fn a_task_program_waits_at_its_gate_until_the_supervisor_is_placed() {
+    use std::sync::{Arc, Mutex};
+
+    type Log = Arc<Mutex<Vec<&'static str>>>;
+    struct Child(Log);
+    impl super::Reapable for Child {
+        fn kill_and_reap(&mut self) {
+            self.0.lock().unwrap().push("reaped");
+        }
+    }
+    struct Gate(Log);
+    impl Drop for Gate {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().push("released");
+        }
+    }
+
+    let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+    let supervisor = std::process::id();
+
+    // A leaf that takes the supervisor: the gate is held through the
+    // placement and released once the leaf lists the supervisor.
+    let placed = sandbox::config::ClassifierLeaf::new(tree.path().join("placed"));
+    std::fs::create_dir(placed.dir()).expect("creating the stand-in leaf");
+    std::fs::write(placed.procs(), "").expect("a cgroup.procs that keeps what is written");
+    let log = Log::default();
+    super::place_supervisor_or_reap(
+        Some(&placed),
+        supervisor,
+        &mut Child(log.clone()),
+        Some(Gate(log.clone())),
+    )
+    .expect("a leaf that takes the supervisor");
+    assert_eq!(
+        std::fs::read_to_string(placed.procs()).expect("reading the leaf's procs"),
+        format!("{supervisor}\n"),
+        "the supervisor is in the leaf before the program starts",
+    );
+    assert_eq!(
+        *log.lock().unwrap(),
+        ["released"],
+        "the program starts once"
+    );
+
+    // A leaf that refuses the supervisor: the process is reaped while the
+    // program still waits at its gate.
+    let refused = sandbox::config::ClassifierLeaf::new(tree.path().join("refused"));
+    std::fs::create_dir(refused.dir()).expect("creating a leaf with no cgroup.procs");
+    let log = Log::default();
+    super::place_supervisor_or_reap(
+        Some(&refused),
+        supervisor,
+        &mut Child(log.clone()),
+        Some(Gate(log.clone())),
+    )
+    .expect_err("a leaf with no cgroup.procs must refuse the supervisor");
+    assert_eq!(
+        *log.lock().unwrap(),
+        ["reaped", "released"],
+        "a refused task is reaped before its gate goes, so its program never runs",
+    );
+}
+
 /// A guard whose teardown blocks until told to finish, then counts.
 struct SlowGuard {
     go: std::sync::Arc<tokio::sync::Notify>,
