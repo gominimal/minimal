@@ -2827,10 +2827,12 @@ struct ControlDecision {
 /// failed bind.
 ///
 /// A waiting forward whose listener the ledger attributes to its own
-/// address is one whose expose went unanswered
+/// address is one whose expose was written and went unanswered
 /// ([`Self::keep_unanswered_claim`]): the switch may have bound it, so the
 /// attribution stays for the waiting row's withdrawal to unbind, and the
-/// waiting record stays for the expose to be retried.
+/// waiting record stays for the expose to be retried. An expose that was
+/// never sent keeps that state only when an earlier one went unanswered;
+/// otherwise its claim is taken back out ([`Self::release_claim`]).
 #[derive(Debug, Default)]
 struct PublishedForwards {
     applied: Mutex<Vec<AppliedPublish>>,
@@ -3078,11 +3080,11 @@ impl PublishedForwards {
     /// choice of holder. `None` when the listener is held or nothing waits
     /// on it.
     ///
-    /// A listener held by a waiting forward whose expose went unanswered
-    /// ([`Self::keep_unanswered_claim`]) is claimed again by that forward,
-    /// with its attribution left as it is, so the caller's retry repeats
-    /// the expose. The claim comes back with `true` in that case, and with
-    /// `false` when it is a fresh one.
+    /// A listener held by a waiting forward whose expose was written and
+    /// went unanswered ([`Self::keep_unanswered_claim`]) is claimed again by
+    /// that forward, with its attribution left as it is, so the caller's
+    /// retry repeats the expose. The claim comes back with `true` in that
+    /// case, and with `false` when it is a fresh one.
     ///
     /// The claim is in flight until the caller's expose is answered
     /// ([`Self::settle_claim`], [`Self::release_claim`],
@@ -3174,7 +3176,8 @@ impl PublishedForwards {
         });
     }
 
-    /// The expose of a claimed waiting forward went unanswered: the switch
+    /// The expose of a claimed waiting forward was written and went
+    /// unanswered, now or on an earlier try of the same claim: the switch
     /// may have bound it. The claim is no longer in flight, and its
     /// attribution stays, so the waiting row's withdrawal unbinds the
     /// listener and no other box's publish for it is relayed meanwhile. The
@@ -3695,16 +3698,19 @@ async fn unbind_pass(
 ///
 /// The ledger never keeps a claim the switch refused: a refused expose
 /// takes the claim back out, and the forward stays waiting. An expose that
-/// went unanswered may have been bound, so its claim stays in the ledger
-/// ([`PublishedForwards::keep_unanswered_claim`]): were it taken out, the
-/// waiting row's withdrawal would unbind nothing, and a forward the switch
-/// did bind would outlive its box and serve whichever box leased the
-/// address next.
+/// was written and went unanswered may have been bound, so its claim stays
+/// in the ledger ([`PublishedForwards::keep_unanswered_claim`]): were it
+/// taken out, the waiting row's withdrawal would unbind nothing, and a
+/// forward the switch did bind would outlive its box and serve whichever
+/// box leased the address next. An expose that was never sent bound
+/// nothing: it is handled as a refusal, unless an earlier expose of this
+/// claim went unanswered, whose claim stays.
 ///
-/// The switch's answer that it already holds a forward at the listener is
-/// taken as this claim's only after its own expose went unanswered
-/// (`after_unanswered`, from [`PublishedForwards::claim_waiting`]).
-/// Otherwise that answer is handled as a refusal.
+/// `after_unanswered` ([`PublishedForwards::claim_waiting`]) says that an
+/// earlier expose of this claim was written and went unanswered. The
+/// switch's answer that it already holds a forward at the listener is taken
+/// as this claim's only then. Otherwise that answer is handled as a
+/// refusal.
 async fn apply_waiting(
     switch_sock: &std::path::Path,
     forwards: &PublishedForwards,
@@ -3762,6 +3768,20 @@ async fn apply_waiting(
                 %error,
                 "binding the waiting box's declared forwarder at its listener went \
                  unanswered; the switch may have bound it, so the ledger keeps it for that \
+                 box, and the expose is retried"
+            );
+            false
+        }
+        Err(error @ forward_revoke::ExposeError::Unsent(_)) if after_unanswered => {
+            forwards.keep_unanswered_claim(&next);
+            tracing::warn!(
+                %switch_addr,
+                box_id = %BoxIdText(&next.box_id),
+                %local,
+                %remote,
+                %error,
+                "the retried expose of the waiting box's declared forwarder at its listener \
+                 was not sent; an earlier one went unanswered, so the ledger keeps it for that \
                  box, and the expose is retried"
             );
             false
@@ -12544,6 +12564,87 @@ mod tests {
             assert_eq!(
                 forwards.lock_waiting().len(),
                 usize::from(holder.is_none()),
+                "a settled forward stops waiting, a refused one keeps waiting"
+            );
+        }
+    }
+
+    /// The switch's answer that it already holds a forward at the listener
+    /// settles a claim only once an expose of that claim was written and
+    /// went unanswered, and an expose that was never sent leaves that fact
+    /// as it found it. Each case lists, per expose, whether it reaches the
+    /// switch (`false`: the connect fails), and the switch answers the ones
+    /// that reach it in order.
+    #[tokio::test]
+    async fn an_already_bound_answer_settles_only_after_a_written_unanswered_expose() {
+        const HELD: (&str, &str) = (
+            "500 Internal Server Error",
+            "proxy already running for tcp on 127.0.0.1:8080\n",
+        );
+        const REFUSED: (&str, &str) = ("500 Internal Server Error", "bind failed\n");
+        static FIRST: [(&str, &str); 1] = [HELD];
+        static AFTER_UNANSWERED: [(&str, &str); 2] = [NO_ANSWER, HELD];
+        static AFTER_REFUSED: [(&str, &str); 2] = [REFUSED, HELD];
+        static AFTER_UNSENT: [(&str, &str); 1] = [HELD];
+        static AFTER_UNANSWERED_THEN_UNSENT: [(&str, &str); 2] = [NO_ANSWER, HELD];
+        for (answers, reaches, settled) in [
+            (&FIRST[..], &[true][..], false),
+            (&AFTER_UNANSWERED[..], &[true, true][..], true),
+            (&AFTER_REFUSED[..], &[true, true][..], false),
+            (&AFTER_UNSENT[..], &[false, true][..], false),
+            (&AFTER_UNANSWERED_THEN_UNSENT[..], &[true, false, true][..], true),
+        ] {
+            let dir = tempfile::TempDir::new().expect("a tempdir");
+            let sock = dir.path().join("switch.sock");
+            let nothing = dir.path().join("nothing.sock");
+            let (server, mut asked) = forwarder_answering(&sock, answers);
+            let (_registry, forwards, _withdrawal) = withdrawn_with_one_forward();
+            assert_eq!(
+                publish_shared(&forwards, WAITER, 18081, box_id(2)),
+                Ok(super::Admitted::Waiting)
+            );
+            let (_, first) = forwards.hand_over_at(SHARED, LEASE);
+            let mut claim = Some((
+                first
+                    .expect("the ledger has room")
+                    .expect("the waiting forward is claimed"),
+                false,
+            ));
+            let mut bound = false;
+            for (attempt, reaches_switch) in reaches.iter().enumerate() {
+                let (next, after_unanswered) = match claim.take() {
+                    Some(fresh) => fresh,
+                    None => forwards
+                        .claim_waiting(SHARED)
+                        .expect("the ledger has room")
+                        .expect("the waiting forward is claimed again"),
+                };
+                let switch = if *reaches_switch { &sock } else { &nothing };
+                bound = super::apply_waiting(
+                    switch,
+                    &forwards,
+                    &ReplyTables::new(),
+                    next,
+                    after_unanswered,
+                )
+                .await;
+                assert!(
+                    !bound || attempt + 1 == reaches.len(),
+                    "only the last expose can settle the claim"
+                );
+            }
+            server.abort();
+
+            assert_eq!(bound, settled, "{reaches:?}");
+            assert_eq!(
+                asked_so_far(&mut asked).len(),
+                reaches.iter().filter(|reaches_switch| **reaches_switch).count()
+            );
+            assert_eq!(forwards.address_of(SHARED), settled.then_some(WAITER));
+            assert!(!forwards.claim_in_flight(SHARED));
+            assert_eq!(
+                forwards.lock_waiting().len(),
+                usize::from(!settled),
                 "a settled forward stops waiting, a refused one keeps waiting"
             );
         }

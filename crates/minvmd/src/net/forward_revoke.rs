@@ -485,7 +485,9 @@ pub(crate) async fn unexpose(
 ) -> io::Result<Unexposed> {
     let body =
         serde_json_lenient::to_vec(&UnexposeBody { local, protocol }).map_err(io::Error::other)?;
-    let (status, body) = post_forwarder(switch_sock, "unexpose", &body, bound).await?;
+    let (status, body) = post_forwarder(switch_sock, "unexpose", &body, bound)
+        .await
+        .map_err(|unanswered| unanswered.error)?;
     let body = String::from_utf8_lossy(&body);
     if (200..300).contains(&status) {
         Ok(Unexposed::Unbound)
@@ -518,20 +520,27 @@ pub(crate) enum Exposed {
     AlreadyBound,
 }
 
-/// Why an expose did not come to an [`Exposed`]. The two answers a caller
-/// must tell apart: a switch that refused bound nothing, and a switch whose
-/// answer never arrived may have bound the listener all the same.
+/// Why an expose did not come to an [`Exposed`]. The answers a caller must
+/// tell apart: a switch that refused bound nothing, an expose that was never
+/// written bound nothing, and a written expose whose answer never arrived may
+/// have bound the listener all the same.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ExposeError {
     /// The switch answered with a status that refuses the expose: nothing
     /// is bound at the listener for it.
     #[error("the switch answered the expose with HTTP {status}: {body:?}")]
     Refused { status: u16, body: String },
-    /// No status was read: the connect, write or read failed, or the bound
-    /// passed. The switch may have bound the listener before the answer was
+    /// No byte of the request was written: its body did not serialize, the
+    /// connect failed, or the bound passed before the connect completed.
+    /// The switch bound nothing for it.
+    #[error("the expose was not sent: {0}")]
+    Unsent(io::Error),
+    /// The request's write began, and no status was read: the write or the
+    /// read failed, or the bound passed. A write that failed part-way counts
+    /// here. The switch may have bound the listener before the answer was
     /// lost.
     #[error("the expose went unanswered: {0}")]
-    Unanswered(#[from] io::Error),
+    Unanswered(io::Error),
     /// The forward names a protocol the switch has no spelling for: nothing
     /// was sent.
     #[error("the forward names a protocol the switch has no spelling for")]
@@ -546,9 +555,11 @@ pub(crate) enum ExposeError {
 ///
 /// # Errors
 ///
-/// [`ExposeError::Unanswered`] for the connect, write or read error and for
-/// a timeout past `bound`; [`ExposeError::Refused`] for any other status
-/// outside 2xx.
+/// [`ExposeError::Unsent`] for a body that does not serialize, a connect
+/// error, and a timeout past `bound` before the connect completed;
+/// [`ExposeError::Unanswered`] for the write or read error and a timeout
+/// past `bound` once the write began; [`ExposeError::Refused`] for any
+/// other status outside 2xx.
 pub(crate) async fn expose(
     switch_sock: &Path,
     local: &str,
@@ -561,8 +572,16 @@ pub(crate) async fn expose(
         remote,
         protocol,
     })
-    .map_err(io::Error::other)?;
-    let (status, body) = post_forwarder(switch_sock, "expose", &body, bound).await?;
+    .map_err(|error| ExposeError::Unsent(io::Error::other(error)))?;
+    let (status, body) = post_forwarder(switch_sock, "expose", &body, bound)
+        .await
+        .map_err(|unanswered| {
+            if unanswered.written {
+                ExposeError::Unanswered(unanswered.error)
+            } else {
+                ExposeError::Unsent(unanswered.error)
+            }
+        })?;
     let body = String::from_utf8_lossy(&body);
     if (200..300).contains(&status) {
         Ok(Exposed::Bound)
@@ -576,6 +595,15 @@ pub(crate) async fn expose(
     }
 }
 
+/// A forwarder exchange that came to no answer: the error, and whether the
+/// request's write had begun when it failed.
+struct NoAnswer {
+    error: io::Error,
+    /// `true` from the moment the write begins, so a write that fails
+    /// part-way counts as written.
+    written: bool,
+}
+
 /// One forwarder exchange with the switch at `switch_sock`, bounded by
 /// `bound`: `verb` posted with `body`, answered by a status and a body.
 async fn post_forwarder(
@@ -583,7 +611,7 @@ async fn post_forwarder(
     verb: &str,
     body: &[u8],
     bound: Duration,
-) -> io::Result<(u16, Vec<u8>)> {
+) -> Result<(u16, Vec<u8>), NoAnswer> {
     let mut request = format!(
         "POST /services/forwarder/{verb} HTTP/1.1\r\nHost: localhost\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
@@ -591,18 +619,25 @@ async fn post_forwarder(
     )
     .into_bytes();
     request.extend_from_slice(body);
-    tokio::time::timeout(bound, async {
+    let mut written = false;
+    let answered = tokio::time::timeout(bound, async {
         let mut switch = UnixStream::connect(switch_sock).await?;
+        written = true;
         switch.write_all(&request).await?;
         read_answer(&mut switch).await
     })
-    .await
-    .map_err(|_elapsed| {
-        io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!("the switch did not answer an {verb} within {bound:?}"),
-        )
-    })?
+    .await;
+    match answered {
+        Ok(Ok(answer)) => Ok(answer),
+        Ok(Err(error)) => Err(NoAnswer { error, written }),
+        Err(_elapsed) => Err(NoAnswer {
+            error: io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("the switch did not answer an {verb} within {bound:?}"),
+            ),
+            written,
+        }),
+    }
 }
 
 /// Reads an HTTP answer and returns its status code and its body, as much
