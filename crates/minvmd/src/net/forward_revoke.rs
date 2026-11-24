@@ -103,7 +103,7 @@ const NOT_BOUND_BODY: &str = "proxy not found";
 /// the switch goes on to name the protocol and the listener. The gate answers
 /// a publish it holds back with the same status and these words
 /// ([`held_answer`]).
-const ALREADY_BOUND_BODY: &str = "proxy already running";
+pub(crate) const ALREADY_BOUND_BODY: &str = "proxy already running";
 
 /// Whether an expose's answer says the switch already holds a forward at the
 /// listener.

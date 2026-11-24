@@ -3063,7 +3063,10 @@ impl PublishedForwards {
         };
         applied.remove(at);
         self.lock_handed().retain(|handed| *handed != listener);
-        (true, self.claim_in(&mut applied, listener))
+        // The entry just dropped was the listener's only one, so the claim
+        // is a fresh one, never the retry of an unanswered expose.
+        let claim = self.claim_in(&mut applied, listener);
+        (true, claim.map(|claimed| claimed.map(|(next, _)| next)))
     }
 
     /// Gives a listener nobody holds to the declared forward waiting on it:
@@ -3078,7 +3081,8 @@ impl PublishedForwards {
     /// A listener held by a waiting forward whose expose went unanswered
     /// ([`Self::keep_unanswered_claim`]) is claimed again by that forward,
     /// with its attribution left as it is, so the caller's retry repeats
-    /// the expose.
+    /// the expose. The claim comes back with `true` in that case, and with
+    /// `false` when it is a fresh one.
     ///
     /// The claim is in flight until the caller's expose is answered
     /// ([`Self::settle_claim`], [`Self::release_claim`],
@@ -3092,7 +3096,10 @@ impl PublishedForwards {
     /// [`LedgerFull`] when a forward waits on the free listener and the
     /// row-held side of the ledger is at its bound: it stays waiting, and
     /// the hand-over is owed a retry.
-    fn claim_waiting(&self, listener: Listener) -> Result<Option<WaitingForward>, LedgerFull> {
+    fn claim_waiting(
+        &self,
+        listener: Listener,
+    ) -> Result<Option<(WaitingForward, bool)>, LedgerFull> {
         let mut applied = self.lock();
         self.claim_in(&mut applied, listener)
     }
@@ -3101,7 +3108,7 @@ impl PublishedForwards {
         &self,
         applied: &mut Vec<AppliedPublish>,
         listener: Listener,
-    ) -> Result<Option<WaitingForward>, LedgerFull> {
+    ) -> Result<Option<(WaitingForward, bool)>, LedgerFull> {
         if let Some((_, holder, _, _, _)) = applied.iter().find(|entry| entry.0 == listener) {
             if self.lock_claiming().contains(&listener) {
                 return Ok(None);
@@ -3114,7 +3121,7 @@ impl PublishedForwards {
             if unanswered.is_some() {
                 self.lock_claiming().push(listener);
             }
-            return Ok(unanswered);
+            return Ok(unanswered.map(|forward| (forward, true)));
         }
         let Some(next) = self
             .lock_waiting()
@@ -3140,7 +3147,7 @@ impl PublishedForwards {
         }
         applied.push((listener, next.addr, next.inside, next.proto, Applied::Row));
         self.lock_claiming().push(listener);
-        Ok(Some(next))
+        Ok(Some((next, false)))
     }
 
     /// Whether the gate's own expose for `listener` is still in flight.
@@ -3656,7 +3663,9 @@ async fn unbind_pass(
                     "unbound the box's forwarder at its row's withdrawal"
                 );
                 let bound = match next {
-                    Ok(Some(next)) => apply_waiting(switch_sock, forwards, replies, next).await,
+                    Ok(Some(next)) => {
+                        apply_waiting(switch_sock, forwards, replies, next, false).await
+                    }
                     Ok(None) => true,
                     Err(LedgerFull) => false,
                 };
@@ -3691,11 +3700,17 @@ async fn unbind_pass(
 /// waiting row's withdrawal would unbind nothing, and a forward the switch
 /// did bind would outlive its box and serve whichever box leased the
 /// address next.
+///
+/// The switch's answer that it already holds a forward at the listener is
+/// taken as this claim's only after its own expose went unanswered
+/// (`after_unanswered`, from [`PublishedForwards::claim_waiting`]).
+/// Otherwise that answer is handled as a refusal.
 async fn apply_waiting(
     switch_sock: &std::path::Path,
     forwards: &PublishedForwards,
     replies: &ReplyTables,
     next: WaitingForward,
+    after_unanswered: bool,
 ) -> bool {
     let switch_addr = Ipv4Addr::from(next.addr);
     let local = forward_revoke::listener_local(next.listener.0, next.listener.1);
@@ -3712,6 +3727,15 @@ async fn apply_waiting(
             .await
         }
         None => Err(forward_revoke::ExposeError::Unspellable),
+    };
+    let exposed = match exposed {
+        Ok(forward_revoke::Exposed::AlreadyBound) if !after_unanswered => {
+            Err(forward_revoke::ExposeError::Refused {
+                status: 500,
+                body: forward_revoke::ALREADY_BOUND_BODY.to_owned(),
+            })
+        }
+        exposed => exposed,
     };
     match exposed {
         Ok(exposed) => {
@@ -3775,7 +3799,9 @@ async fn hand_over_owed(
     let mut still_owed = Vec::new();
     for listener in owed {
         let bound = match forwards.claim_waiting(listener) {
-            Ok(Some(next)) => apply_waiting(switch_sock, forwards, replies, next).await,
+            Ok(Some((next, after_unanswered))) => {
+                apply_waiting(switch_sock, forwards, replies, next, after_unanswered).await
+            }
             Ok(None) => true,
             Err(LedgerFull) => false,
         };
@@ -12461,6 +12487,68 @@ mod tests {
         }
     }
 
+    /// The switch's answer that it already holds a forward at the listener
+    /// settles a hand-over only after that claim's own expose went
+    /// unanswered. To a fresh claim, and to the claim after a refused
+    /// expose, the answer is a refusal: the attribution is taken back out,
+    /// and the forward keeps waiting.
+    #[tokio::test]
+    async fn an_already_bound_answer_settles_a_hand_over_only_after_its_unanswered_expose() {
+        const HELD: (&str, &str) = (
+            "500 Internal Server Error",
+            "proxy already running for tcp on 127.0.0.1:8080\n",
+        );
+        static FRESH: [(&str, &str); 2] = [("200 OK", ""), HELD];
+        static AFTER_UNANSWERED: [(&str, &str); 3] = [("200 OK", ""), NO_ANSWER, HELD];
+        static AFTER_REFUSED: [(&str, &str); 3] = [
+            ("200 OK", ""),
+            ("500 Internal Server Error", "bind failed\n"),
+            HELD,
+        ];
+        for (answers, holder, exposes) in [
+            (&FRESH[..], None, 3),
+            (&AFTER_UNANSWERED[..], Some(WAITER), 2),
+            (&AFTER_REFUSED[..], None, 3),
+        ] {
+            let dir = tempfile::TempDir::new().expect("a tempdir");
+            let sock = dir.path().join("switch.sock");
+            let (server, mut asked) = forwarder_answering(&sock, answers);
+            let (_registry, forwards, withdrawal) = withdrawn_with_one_forward();
+            assert_eq!(
+                publish_shared(&forwards, WAITER, 18081, box_id(2)),
+                Ok(super::Admitted::Waiting)
+            );
+
+            let kept = super::revoke_box_forwards(
+                sock,
+                Arc::clone(&forwards),
+                ReplyTables::new(),
+                withdrawal,
+                &TWO_QUICK_RETRIES,
+            )
+            .await;
+            server.abort();
+
+            assert!(kept.is_none());
+            let requests = asked_so_far(&mut asked);
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request.starts_with("POST /services/forwarder/expose "))
+                    .count(),
+                exposes,
+                "{requests:?}"
+            );
+            assert_eq!(forwards.address_of(SHARED), holder);
+            assert!(!forwards.claim_in_flight(SHARED));
+            assert_eq!(
+                forwards.lock_waiting().len(),
+                usize::from(holder.is_none()),
+                "a settled forward stops waiting, a refused one keeps waiting"
+            );
+        }
+    }
+
     /// The waiting box's row is withdrawn while the gate's expose for it is
     /// unanswered. The expose may have been bound, so the listener stays in
     /// the ledger at that box's address, and its withdrawal's next pass
@@ -12484,7 +12572,7 @@ mod tests {
 
         // The waiting box's row is withdrawn, then the expose goes unanswered.
         forwards.drop_waiting_at(WAITER);
-        assert!(!super::apply_waiting(&sock, &forwards, &ReplyTables::new(), next).await);
+        assert!(!super::apply_waiting(&sock, &forwards, &ReplyTables::new(), next, false).await);
         assert_eq!(forwards.address_of(SHARED), Some(WAITER));
         assert_eq!(
             forwards.claim_waiting(SHARED),
