@@ -1701,13 +1701,12 @@ mod tests {
         .unwrap();
         let project_path = paths::HostAbsPath::try_new(root.clone()).unwrap();
         let blank = || {
-            let mut request = CreateSessionRequest::new(
-                String::new(),
-                project_path.clone(),
-                NetworkMode::HostNet,
-                BoxPolicy::default(),
-            );
+            // The harness's request, which asserts no daemon build: each
+            // create goes to a harness daemon of this build.
+            let mut request =
+                minimald::test_harness::create_session_req("unused", project_path.as_str());
             request.config.name = None;
+            request.config.network = NetworkMode::HostNet;
             request
         };
         async fn name_on(server: &minimald::test_harness::TestServer) -> Option<String> {
