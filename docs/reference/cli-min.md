@@ -297,9 +297,11 @@ port that the `[host-exposures]` table in the client `config.toml` opens. An
 own-address box also needs an egress rule that names the host:
 `--allow-dns-hosts host.min.internal`, or an `--allow-subnets` range that covers
 the address of `host.min.internal` (see [minvmd](./cli-minvmd.md)). A
-host-address box on a native Linux host shares the host's network namespace. It
-reaches host services directly, as any host process does, and the
-`[host-exposures]` table does not apply to it. When an own-address
+host-address box on a native Linux host shares the host's network namespace. No
+switch or gate stands between it and the host, and the `[host-exposures]`
+table does not apply to it. It reaches host services directly. Where the host's
+classifier is installed, the box's own egress rules bound that reach, and a
+deny-all box reaches only the box DNS resolver. When an own-address
 box gets the deny-all default, `min session start` prints one line that says so:
 
 ```
