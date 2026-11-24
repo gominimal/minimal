@@ -336,7 +336,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
 - **BOX-158** WHEN the boxes on a host are listed THE SYSTEM SHALL return every retained record on that host, in any state, with its `box_id`, name, entry name, project name, project root, `box_type`, `parent`, whether the name is written or derived (BOX-228), and state as BOX-011 defines it.
   tier:     T0
   verify:   cargo nextest run -p minimald list_returns_every_retained_record_with_state_project_and_entry
-  <!-- The `min box list` table shows the entry but not the project name or the origin; the `min/v1/box` objects carry all three (spec 28; Karl, 2026-11-23). No field says a name took a number: a trailing `-<n>` on a derived name shows it. -->
+  <!-- The `min box list` table shows the entry, and its PROJECT column shows the project name (architecture.md "The project name"; spec 28 BCLI-001; Karl, 2026-11-24); it does not show the origin. The `min/v1/box` objects carry the entry, the project name and the origin, and their `project` stays the root (spec 28). No field says a name took a number: a trailing `-<n>` on a derived name shows it. -->
   - WHERE a record was made before it carried a project name, an entry name or a name origin THE SYSTEM SHALL return a missing project name or entry name as absent, as it returns a missing project root, and a missing name origin as `written` (BOX-228), in the listing and in BOX-159's read alike.
     tier:   T0
     verify: cargo nextest run -p minimald legacy_record_lists_and_reads_missing_name_fields_as_absent
