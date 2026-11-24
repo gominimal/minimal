@@ -89,6 +89,7 @@ pub(crate) mod drop_limiter;
 pub(crate) mod egress_gate;
 pub use egress_gate::EgressGate;
 pub mod answerer;
+pub mod answerer_log;
 mod forward_revoke;
 pub(crate) mod proxy_reclaim;
 mod shuttle;
