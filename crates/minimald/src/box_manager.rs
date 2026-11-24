@@ -440,41 +440,33 @@ impl NameSource {
     }
 }
 
-/// The parts a derived box name comes from (BOX-211): the project name and
-/// the entry. The entry is `None` for the default session entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DerivedName {
-    project: String,
-    entry: Option<String>,
+/// What a derived box name comes from (BOX-211): the project root, else
+/// the project path, and the stored spec, whose `entry` names the entry.
+#[derive(Debug, Clone, Copy)]
+struct DerivedName<'a> {
+    root: &'a str,
+    spec: Option<&'a serde_json_lenient::Value>,
 }
 
-impl DerivedName {
-    /// The parts of a create's derived name: the last component of the
-    /// project root (else of the project path) and the spec's `entry`. A
-    /// spec with no readable `entry`, or no spec, takes the default entry.
-    /// Only the `entry` key is read, so a spec that does not parse as a
-    /// v0 spec still gives a name.
-    fn of(config: &minimald_rpc::BoxConfig, spec: Option<&serde_json_lenient::Value>) -> Self {
+impl<'a> DerivedName<'a> {
+    /// The parts of a create's derived name: the project root (else the
+    /// project path) and the spec.
+    fn of(
+        config: &'a minimald_rpc::BoxConfig,
+        spec: Option<&'a serde_json_lenient::Value>,
+    ) -> Self {
         let root = config
             .project_root
             .as_ref()
             .unwrap_or(&config.project_path)
             .as_str();
-        let entry = spec
-            .and_then(|spec| spec.get("entry"))
-            .and_then(serde_json_lenient::Value::as_str)
-            .filter(|entry| *entry != mfile::spec::DEFAULT_SESSION_ENTRY)
-            .map(str::to_string);
-        Self {
-            project: boxes::box_name::project_name_of_root(root).to_string(),
-            entry,
-        }
+        Self { root, spec }
     }
 
     /// The name, with the `n`th fresh instance's number when `instance` is
-    /// set.
+    /// set. The client derives the same name through the same function.
     fn name(&self, instance: Option<usize>) -> String {
-        boxes::box_name::derived_box_name(&self.project, self.entry.as_deref(), instance)
+        boxes::box_name::create_derived_name(self.root, self.spec, instance)
     }
 }
 
@@ -500,7 +492,7 @@ fn creation_name(
 /// `retained` is the same under ASCII case. The number is never cut, so
 /// the name stays one label. Answers the name and its `n`.
 fn fresh_derived_name<'a>(
-    derived: &DerivedName,
+    derived: &DerivedName<'_>,
     retained: impl IntoIterator<Item = &'a str>,
 ) -> (String, usize) {
     let used: Vec<&str> = retained.into_iter().collect();

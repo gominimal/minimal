@@ -4008,6 +4008,11 @@ async fn create_names_box_written_exactly_else_derived() {
 #[test]
 fn derived_name_is_project_for_default_else_project_dash_entry() {
     let spec = |entry: &str| serde_json_lenient::json!({ "entry": entry });
+    assert_eq!(
+        boxes::box_name::DEFAULT_ENTRY,
+        mfile::spec::DEFAULT_SESSION_ENTRY,
+        "the shared derivation knows the spec's default entry"
+    );
     let config = unnamed_config();
     assert_eq!(
         creation_name(&config, Some(&spec(mfile::spec::DEFAULT_SESSION_ENTRY))),
