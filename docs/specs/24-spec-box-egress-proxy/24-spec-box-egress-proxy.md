@@ -549,6 +549,10 @@ Redemption
     tier:   T0
     verify: cargo nextest run -p minimal host_ip_grant_box_with_no_egress_section_registers_the_github_hosts
     <!-- the box lists no names, so an empty registration would refuse the hosts BEP-008 lets it reach -->
+  - WHEN a `host_ip` box that declares a store reference matched by a `[secret-store-rules]` rule and has no `egress` section registers with the proxy THE SYSTEM SHALL register each of the rule's upstream authorities, with its port, as part of its declared egress.
+    tier:   T0
+    verify: cargo nextest run -p minimal host_ip_store_box_with_no_egress_section_registers_the_rule_upstream
+    <!-- the box lists no names, so an empty registration would refuse the upstream BEP-036 lets it reach -->
 
 - **BEP-023** IF a request's `Host` header, or the authority of an absolute-form request target, differs from the connection authority it arrived on THEN THE SYSTEM SHALL refuse the request before substitution.
   tier:     T2
@@ -699,7 +703,11 @@ Store references
 - **BEP-036** IF a box spec declares a store reference whose registered upstream is not admitted by the box's egress THEN THE SYSTEM SHALL refuse expansion with exit 3 naming the missing host.
   tier:     T1
   verify:   cargo nextest run -p boxes prop_store_upstream_outside_egress_is_exit_3
-  property: for every box spec and every registered upstream set, expansion refuses with exit 3 iff some registered upstream is absent from the egress declaration, naming exactly the absent hosts
+  property: for every box spec and every registered upstream set, except a `host_ip` box with no `egress` section, expansion refuses with exit 3 iff some registered upstream is absent from the egress declaration, naming exactly the absent hosts
+  - WHERE a `host_ip` box has no `egress` section THE SYSTEM SHALL treat its egress as admitting every registered upstream host.
+    tier:   T0
+    verify: cargo nextest run -p boxes store_reference_with_rule_and_no_egress
+    <!-- as BEP-008 does for the GitHub hosts: such a box is allow-all, and an `own_ip` box with no `egress` section still admits no name -->
 
 - **BEP-037** IF a project `minimal.toml` contains a `[secret-store-rules]` section THEN THE SYSTEM SHALL ignore it and emit a warning.
   tier:     T0

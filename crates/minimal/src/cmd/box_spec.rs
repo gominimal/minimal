@@ -97,6 +97,7 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
     let module_hosts = crate::config::store_module_hosts();
     check_store_references(
         inputs.secrets,
+        inputs.network,
         inputs.egress,
         inputs.store_rules,
         crate::config::store_deny_set(&module_hosts),
