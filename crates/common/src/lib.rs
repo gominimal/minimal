@@ -11,6 +11,7 @@ pub use remote_storage::{
     stripped_url,
 };
 
+pub mod read_while_writing;
 #[cfg(target_os = "linux")]
 pub mod renameat2;
 

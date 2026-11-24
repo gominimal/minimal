@@ -50,5 +50,10 @@ codespan-reporting.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
 
+[dev-dependencies]
+# `test-util` (not in tokio's `full`) for `#[tokio::test(start_paused = true)]`:
+# a stuck read-ahead test reaches its bound as soon as no task can run.
+tokio = { workspace = true, features = ["test-util"] }
+
 [lints]
 workspace = true
