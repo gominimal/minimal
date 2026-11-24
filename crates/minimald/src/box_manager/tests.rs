@@ -3915,13 +3915,15 @@ async fn record_name(mngr: &BoxManagerHandle, id: SessionId) -> Option<String> {
         .name
 }
 
-/// BOX-163: a box takes the spec's `[box] name`, else its entry's name.
-/// A request with no spec keeps the name it sends.
+/// BOX-211: a box takes the request's name exactly as written, else the
+/// name derived from its project and entry, for a spec with or without
+/// `[box] name`. The spec's `[box] name` never names the box. A spec that
+/// does not parse as a v0 spec, or no spec, still gives the derived name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn create_names_box_from_box_name_else_entry() {
+async fn create_names_box_written_exactly_else_derived() {
     let (_state, _cache, mngr) = manager().await;
 
-    let named = mngr
+    let with_box_name = mngr
         .create_box_with_spec(
             as_task(unnamed_config()),
             Some(task_spec("lint", Some("dev"))),
@@ -3930,31 +3932,34 @@ async fn create_names_box_from_box_name_else_entry() {
         )
         .await
         .unwrap();
-    assert_eq!(record_name(&mngr, named).await.as_deref(), Some("dev"));
+    assert_eq!(
+        record_name(&mngr, with_box_name).await.as_deref(),
+        Some("proj-lint"),
+        "a `[box] name` in the spec does not name the box"
+    );
 
-    let entry = mngr
+    let without_box_name = mngr
         .create_box_with_spec(
             as_task(unnamed_config()),
-            Some(task_spec("lint", None)),
+            Some(task_spec("check", None)),
             None,
             None,
         )
         .await
         .unwrap();
     assert_eq!(
-        record_name(&mngr, entry).await.as_deref(),
-        Some("lint"),
-        "no `[box] name`: the entry's name"
+        record_name(&mngr, without_box_name).await.as_deref(),
+        Some("proj-check")
     );
 
-    // The spec's `[box] name` comes before a name the request sends.
+    // The request's name comes first, as written.
     let mut config = as_task(unnamed_config());
     config.name = Some("given".to_string());
     let over = mngr
         .create_box_with_spec(config, Some(task_spec("other", Some("web"))), None, None)
         .await
         .unwrap();
-    assert_eq!(record_name(&mngr, over).await.as_deref(), Some("web"));
+    assert_eq!(record_name(&mngr, over).await.as_deref(), Some("given"));
 
     let mut config = as_task(unnamed_config());
     config.name = Some("legacy".to_string());
@@ -3963,6 +3968,51 @@ async fn create_names_box_from_box_name_else_entry() {
         .await
         .unwrap();
     assert_eq!(record_name(&mngr, legacy).await.as_deref(), Some("legacy"));
+
+    // No spec and no name: the default entry's derived name.
+    let bare = mngr
+        .create_box_with_spec(as_task(unnamed_config()), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(record_name(&mngr, bare).await.as_deref(), Some("proj"));
+}
+
+/// BOX-211, BOX-213: the derived name is the project name for the default
+/// entry, else `<project>-<entry>`, from the project root when the request
+/// carries one. A spec that is not a v0 spec gives its `entry`.
+#[test]
+fn derived_name_is_project_for_default_else_project_dash_entry() {
+    let spec = |entry: &str| serde_json_lenient::json!({ "entry": entry });
+    let config = unnamed_config();
+    assert_eq!(
+        creation_name(&config, Some(&spec(mfile::spec::DEFAULT_SESSION_ENTRY))),
+        ("proj".to_string(), NameSource::Derived)
+    );
+    assert_eq!(
+        creation_name(&config, Some(&spec("Build_All"))),
+        ("proj-build-all".to_string(), NameSource::Derived)
+    );
+    assert_eq!(
+        creation_name(&config, Some(&serde_json_lenient::json!({ "v": "bad" }))),
+        ("proj".to_string(), NameSource::Derived),
+        "a spec with no readable entry takes the default entry"
+    );
+
+    let mut rooted = unnamed_config();
+    rooted.project_path = HostAbsPath::try_new("/home/me/Web.App/sub").unwrap();
+    rooted.project_root = Some(HostAbsPath::try_new("/home/me/Web.App").unwrap());
+    assert_eq!(
+        creation_name(&rooted, Some(&spec("lint"))).0,
+        "web-app-lint",
+        "the project root names the project, not the subdirectory"
+    );
+
+    let mut named = unnamed_config();
+    named.name = Some("Exact".to_string());
+    assert_eq!(
+        creation_name(&named, Some(&spec("lint"))),
+        ("Exact".to_string(), NameSource::Request)
+    );
 }
 
 /// BOX-163: a create that asks for no fresh instance, under a name a

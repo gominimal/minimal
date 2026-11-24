@@ -422,56 +422,89 @@ impl std::fmt::Display for HeldNameRefusal {
 
 impl std::error::Error for HeldNameRefusal {}
 
-/// Where a new box's name came from (BOX-163), for the create's log.
+/// Where a new box's name came from (BOX-211), for the create's log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NameSource {
-    /// The spec's `[box] name`.
-    SpecName,
-    /// The request's name, from a client that sends one beside the spec.
+    /// The request's name, as the client wrote it.
     Request,
-    /// The spec's entry.
-    Entry,
-    /// No name at all: no spec and no name on the request.
-    None,
+    /// Derived from the project name and the entry.
+    Derived,
 }
 
 impl NameSource {
     fn word(self) -> &'static str {
         match self {
-            Self::SpecName => "spec box name",
             Self::Request => "request name",
-            Self::Entry => "entry",
-            Self::None => "none",
+            Self::Derived => "project and entry",
         }
     }
 }
 
-/// The name a create gives its box (BOX-163): the expanded spec's
-/// `[box] name`, else the request's name, else the entry's name as a
-/// valid label ([`boxes::box_name::entry_box_name`]). `min` sends a
-/// request name only for `--name`. A spec the daemon cannot read as a v0 spec names nothing.
+/// The parts a derived box name comes from (BOX-211): the project name and
+/// the entry. The entry is `None` for the default session entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DerivedName {
+    project: String,
+    entry: Option<String>,
+}
+
+impl DerivedName {
+    /// The parts of a create's derived name: the last component of the
+    /// project root (else of the project path) and the spec's `entry`. A
+    /// spec with no readable `entry`, or no spec, takes the default entry.
+    /// Only the `entry` key is read, so a spec that does not parse as a
+    /// v0 spec still gives a name.
+    fn of(config: &minimald_rpc::BoxConfig, spec: Option<&serde_json_lenient::Value>) -> Self {
+        let root = config
+            .project_root
+            .as_ref()
+            .unwrap_or(&config.project_path)
+            .as_str();
+        let entry = spec
+            .and_then(|spec| spec.get("entry"))
+            .and_then(serde_json_lenient::Value::as_str)
+            .filter(|entry| *entry != mfile::spec::DEFAULT_SESSION_ENTRY)
+            .map(str::to_string);
+        Self {
+            project: boxes::box_name::project_name_of_root(root).to_string(),
+            entry,
+        }
+    }
+
+    /// The name, with the `n`th fresh instance's number when `instance` is
+    /// set.
+    fn name(&self, instance: Option<usize>) -> String {
+        boxes::box_name::derived_box_name(&self.project, self.entry.as_deref(), instance)
+    }
+}
+
+/// The name a create gives its box (BOX-211): the request's name exactly
+/// as written, else the name derived from the project and the entry. A
+/// box's name is never read from its spec, and every creator gets the
+/// same rule.
 fn creation_name(
-    requested: Option<&str>,
+    config: &minimald_rpc::BoxConfig,
     spec: Option<&serde_json_lenient::Value>,
-) -> (Option<String>, NameSource) {
-    let spec = spec.and_then(|value| {
-        serde_json_lenient::from_value::<mfile::spec::BoxSpec>(value.clone()).ok()
-    });
-    if let Some(name) = spec.as_ref().and_then(|spec| spec.name.clone()) {
-        return (Some(name), NameSource::SpecName);
+) -> (String, NameSource) {
+    match config.name.as_deref() {
+        Some(name) => (name.to_string(), NameSource::Request),
+        None => (DerivedName::of(config, spec).name(None), NameSource::Derived),
     }
-    if let Some(name) = requested {
-        return (Some(name.to_string()), NameSource::Request);
-    }
-    match spec {
-        // Only the entry is cleaned. A spec that sets `[box] name` returned
-        // above, unchanged, so the store still refuses an invalid one.
-        Some(spec) => (
-            Some(boxes::box_name::entry_box_name(&spec.entry)),
-            NameSource::Entry,
-        ),
-        None => (None, NameSource::None),
-    }
+}
+
+/// The name of a fresh instance of a derived name (BOX-163, BOX-213):
+/// the derived name with the smallest positive `n` such that no name in
+/// `retained` is the same under ASCII case. The number is never cut, so
+/// the name stays one label. Answers the name and its `n`.
+fn fresh_derived_name<'a>(
+    derived: &DerivedName,
+    retained: impl IntoIterator<Item = &'a str>,
+) -> (String, usize) {
+    let used: Vec<&str> = retained.into_iter().collect();
+    (1..)
+        .map(|n| (derived.name(Some(n)), n))
+        .find(|(name, _)| !used.iter().any(|used| used.eq_ignore_ascii_case(name)))
+        .expect("a finite set leaves a name unused")
 }
 
 /// The name of a fresh instance of `base` (BOX-163): `<base>-<n>`, with
@@ -4499,8 +4532,8 @@ impl BoxManager {
             );
             return Err(refusal);
         }
-        // BOX-163: the box takes the spec's `[box] name`, else its entry's
-        // name. The span keeps the name the request gave, so a refusal
+        // BOX-211: the box takes the request's name, else the name derived
+        // from its project and entry. The span keeps the name the request gave, so a refusal
         // reads against what the client asked for.
         let span = tracing::Span::current();
         span.record(
@@ -4510,14 +4543,21 @@ impl BoxManager {
                 .as_deref()
                 .unwrap_or(crate::rpc::ANONYMOUS_SESSION),
         );
-        let (name, source) = creation_name(config.name.as_deref(), spec.as_ref());
+        let (base, source) = creation_name(&config, spec.as_ref());
         // BEP-082: only a fresh instance registered under a creation key,
         // and only a key for its own base. See `host_ip_mint_name`.
-        let fresh_base = name.clone().filter(|_| fresh);
-        let name = match name {
-            Some(base) if fresh => {
+        let fresh_base = fresh.then(|| base.clone());
+        let name = match base {
+            base if fresh => {
                 let retained = self.retained_names().await?;
-                let (name, n) = fresh_instance_name(&base, retained.iter().map(String::as_str));
+                let retained_names = retained.iter().map(String::as_str);
+                let (name, n) = match source {
+                    NameSource::Request => fresh_instance_name(&base, retained_names),
+                    NameSource::Derived => fresh_derived_name(
+                        &DerivedName::of(&config, spec.as_ref()),
+                        retained_names,
+                    ),
+                };
                 tracing::info!(
                     base = %base,
                     name = %name,
@@ -4527,14 +4567,14 @@ impl BoxManager {
                 );
                 Some(name)
             }
-            name => name,
+            name => Some(name),
         };
         if config.name != name {
             tracing::info!(
                 name_given = ?config.name,
                 name = ?name,
                 source = source.word(),
-                "named the box from its spec"
+                "named the box from its project and entry"
             );
         }
         span.record(
