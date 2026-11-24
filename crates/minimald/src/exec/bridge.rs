@@ -402,12 +402,14 @@ pub(crate) enum ExecEnd {
 }
 
 impl ExecEnd {
-    /// The level the bridge logs this end at when it ends the command.
+    /// The level the bridge logs this end at when it ends the command, for the tests
+    /// to hold the log lines to.
     ///
     /// A client that closed its channel left on purpose, and its command
     /// ending with it is the contract (gominimal/inbox#813), so that is info.
     /// A connection that ended with no close, and an input bound that ran
     /// out, stay warnings.
+    #[cfg(test)]
     pub(super) fn log_level(self) -> tracing::Level {
         match self {
             Self::ClientClosed => tracing::Level::INFO,
