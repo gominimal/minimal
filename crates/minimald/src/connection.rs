@@ -1872,7 +1872,7 @@ mod tests {
 
         client_probe.pause_reads();
         let from_box = vec![7u8; BOX_SENDS];
-        let _box_sender = tokio::spawn(async move {
+        let _box_sender = crate::traced::spawn(async move {
             box_side.write_all(&from_box).await?;
             // Returned, not dropped: a closed box port would end the forward.
             Ok::<_, std::io::Error>(box_side)
@@ -1890,7 +1890,8 @@ mod tests {
         let (_rd, wr) = channel.split();
         let before = client_probe.writes().accepted;
         let from_client = vec![9u8; CLIENT_SENDS];
-        let _client_sender = tokio::spawn(async move { wr.data(from_client.as_slice()).await });
+        let _client_sender =
+            crate::traced::spawn(async move { wr.data(from_client.as_slice()).await });
         let _reached = tokio::time::timeout(
             wait,
             client_probe.wait_for_writes(|w| w.accepted >= before + CLIENT_SENDS),
