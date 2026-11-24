@@ -1102,12 +1102,17 @@ pub struct File {
 }
 
 /// The `[project]` table of a `minimal.toml`.
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct Project {
     /// `[project] name`: the project name a box with no name of its own is
     /// named from (BOX-214). It must be a DNS label (BOX-216).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Keys of `[project]` that this version does not know, such as a
+    /// misspelt `nmae`. The load warns about them, as it does for the
+    /// other tables' unknown fields.
+    #[serde(flatten)]
+    pub extra: HashMap<String, toml::Value>,
 }
 
 /// The entry keys that `[session]` and a task keep among their unknown
@@ -2893,6 +2898,18 @@ impl File {
                 "unknown fields in [stack] section of {}: {}",
                 shown,
                 stack.extra.keys().cloned().collect::<Vec<_>>().join(",")
+            ));
+            was_unknown_fields = true;
+        }
+        if let Some(project) = &self.project
+            && !project.extra.is_empty()
+        {
+            let mut keys: Vec<&str> = project.extra.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            warn(format!(
+                "unknown fields in [project] section of {}: {}",
+                shown,
+                keys.join(",")
             ));
             was_unknown_fields = true;
         }
@@ -5080,6 +5097,26 @@ mod tests {
         // A file not loaded from disk has no root directory.
         let file = File::from_toml_bytes(b"").unwrap();
         assert_eq!(file.project_name().unwrap(), "box");
+    }
+
+    /// An unknown key in `[project]`, such as a misspelt `nmae`, is warned
+    /// about, and the project takes the directory's name.
+    #[test]
+    fn project_unknown_key_warns_and_name_comes_from_directory() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("web");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join(MFILE_NAME), "[project]\nnmae = \"other\"\n").unwrap();
+        let file = File::from_dir(&root).unwrap();
+        assert_eq!(file.project_name().unwrap(), "web");
+        assert!(
+            file.diagnostics()
+                .iter()
+                .any(|line| line.contains("unknown fields in [project] section")
+                    && line.contains("nmae")),
+            "{:?}",
+            file.diagnostics()
+        );
     }
 
     /// BOX-214: a project root reached through `..` takes the name of the
