@@ -1187,17 +1187,34 @@ async fn an_unrequested_kill_still_warns_abnormal() {
 /// The level a box's exit is logged at. A box the daemon killed reaps with
 /// the same SIGKILL account an out-of-memory kill gives, so only the kill
 /// the daemon sent turns it into a debug line; the same account with no kill
-/// sent stays a warning, and so does a non-zero exit the command made itself.
+/// sent stays a warning.
 #[test]
 fn a_box_the_daemon_killed_logs_its_exit_at_debug() {
     let sigkill = signalled("container received signal SIGKILL");
     assert_eq!(exit_log_level(&sigkill, true), tracing::Level::DEBUG);
     assert_eq!(exit_log_level(&sigkill, false), tracing::Level::WARN);
-    assert_eq!(exit_log_level(&exited(1), false), tracing::Level::WARN);
-    // The command exited before the kill reached it: its own failure.
-    assert_eq!(exit_log_level(&exited(1), true), tracing::Level::WARN);
     assert_eq!(exit_log_level(&exited(0), false), tracing::Level::INFO);
     assert_eq!(exit_log_level(&exited(0), true), tracing::Level::INFO);
+}
+
+/// A command or task that exits with a code of its own, zero or not, has
+/// given the user its result: the exit is info, not a warning, whether or
+/// not a kill was sent after it ended.
+#[test]
+fn a_non_zero_exit_the_command_made_itself_logs_at_info() {
+    for code in [1, 2, 127, 130] {
+        assert_eq!(
+            exit_log_level(&exited(code), false),
+            tracing::Level::INFO,
+            "exit {code}"
+        );
+        // The command exited before the kill reached it: its own result.
+        assert_eq!(
+            exit_log_level(&exited(code), true),
+            tracing::Level::INFO,
+            "exit {code} after a kill was sent"
+        );
+    }
 }
 
 /// The kill flag the level rests on is set by the process handle's own
