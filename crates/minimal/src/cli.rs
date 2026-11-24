@@ -683,13 +683,18 @@ pub struct BoxListArgs {
 }
 
 // BCLI-030: `min session list` and `min task list` are `min box list` for
-// one Box Type, so they take neither `--type` nor `--parent`.
+// one Box Type, so they take the flags of `min box list` except `--type`,
+// which the noun fixes.
 #[derive(Debug, Args)]
 pub struct TypedBoxListArgs {
     /// List the boxes of every project, not only the boxes of the current
     /// project
     #[arg(long)]
     pub all: bool,
+    /// List only the child boxes of this box: its id, the start of its id,
+    /// or its name
+    #[arg(long, value_name = "BOX", add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub parent: Option<String>,
     /// Write the boxes as a JSON array, one object for each box, and
     /// nothing else
     #[arg(short = 'o', long = "output", value_enum)]

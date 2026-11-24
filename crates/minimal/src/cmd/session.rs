@@ -295,23 +295,32 @@ pub(crate) async fn cmd_typed_box_list(
     };
     ensure_daemon(global)?;
     let hosts = crate::cmd::list::local_hosts(global)?;
+    // BCLI-030: `--parent` resolves as it does for `min box list`.
+    let parent = resolve_list_parent(hosts.clone(), args.parent.as_deref(), verb)
+        .await?
+        .zip(args.parent)
+        .map(|(box_id, address)| (address, box_id));
     let mut out = std::io::stdout().lock();
     let mut err = std::io::stderr().lock();
     let request = TypedBoxList {
         box_type,
         verb,
         project_root: scope,
+        parent,
         output: args.output,
     };
     typed_box_list_on_hosts(hosts, request, &mut out, &mut err).await
 }
 
 /// What one typed listing asks for: the Box Type, the verb for the log,
-/// the project (every project when `None`) and the rendering.
+/// the project (every project when `None`), the parent and the rendering.
 pub(crate) struct TypedBoxList<'a> {
     pub(crate) box_type: &'a str,
     pub(crate) verb: &'static str,
     pub(crate) project_root: Option<paths::HostAbsPath>,
+    /// The `--parent` address as the person typed it, and the box id it
+    /// resolved to. `None` keeps boxes with any parent.
+    pub(crate) parent: Option<(String, boxes::SessionId)>,
     pub(crate) output: Option<BoxListOutputFormat>,
 }
 
@@ -349,6 +358,7 @@ pub(crate) async fn typed_box_list_on_hosts(
         box_type,
         verb,
         project_root,
+        parent,
         output,
     } = request;
     let mut listed = Vec::new();
@@ -375,10 +385,27 @@ pub(crate) async fn typed_box_list_on_hosts(
                 }),
         );
     }
+    let listed = BoxListFilter {
+        box_type: None,
+        parent: parent.as_ref().map(|(_, box_id)| *box_id),
+    }
+    .apply(listed);
     tracing::info!(verb, outcome = "ok", boxes = listed.len());
     let mut out = out;
     match output {
         Some(BoxListOutputFormat::Json) => render_box_list_json(&mut out, &listed)?,
+        None if listed.is_empty() && parent.is_some() => {
+            writeln!(
+                out,
+                "{}",
+                no_match_line(
+                    &format!("{box_type} box"),
+                    None,
+                    parent.as_ref().map(|(address, _)| address.as_str()),
+                    project_root.is_some(),
+                )
+            )?;
+        }
         None if listed.is_empty() => {
             writeln!(
                 out,

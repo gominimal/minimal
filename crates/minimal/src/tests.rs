@@ -15998,6 +15998,7 @@ async fn typed_list_on_hosts(
         box_type,
         verb: "test list",
         project_root,
+        parent: None,
         output: None,
     };
     cmd::typed_box_list_on_hosts(hosts, request, out, err).await
@@ -16049,14 +16050,30 @@ async fn type_noun_verbs_alias_box_forms() {
                 "`min {noun} {verb}` exists"
             );
         }
-        // The list, stop and rm forms take the flags of the `min box` form.
-        for verb in ["list", "stop", "rm"] {
+        // The list form takes the flags of `min box list` except `--type`,
+        // which the noun fixes.
+        let mut box_list = arg_ids(&["box", "list"]);
+        box_list.retain(|id| id != "box_type");
+        assert_eq!(
+            arg_ids(&[noun, "list"]),
+            box_list,
+            "`min {noun} list` takes the arguments of `min box list` but `--type`"
+        );
+        // The stop and rm forms take the flags of the `min box` form.
+        for verb in ["stop", "rm"] {
             assert_eq!(
                 arg_ids(&[noun, verb]),
                 arg_ids(&["box", verb]),
                 "`min {noun} {verb}` takes the arguments of `min box {verb}`"
             );
         }
+    }
+    {
+        use clap::Parser as _;
+        assert!(
+            Cli::try_parse_from(["min", "session", "list", "--type", "task"]).is_err(),
+            "`min session list --type task` does not parse"
+        );
     }
 
     let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");

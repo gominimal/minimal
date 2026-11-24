@@ -35,14 +35,7 @@ pub async fn cmd_box_list(global: &GlobalArgs, args: BoxListArgs) -> Result<(), 
     let hosts = crate::cmd::list::local_hosts(global)?;
     // BCLI-026: `--parent` names a box as every box verb does, so it
     // resolves over the same hosts before the listing reads them.
-    let parent = match args.parent.as_deref() {
-        Some(address) => Some(
-            resolve_box_on_hosts(hosts.clone(), address, "box list")
-                .await?
-                .box_id,
-        ),
-        None => None,
-    };
+    let parent = resolve_list_parent(hosts.clone(), args.parent.as_deref(), "box list").await?;
     let mut listed = Vec::new();
     for host in hosts {
         match list_host_boxes(&host, scope.clone()).await {
@@ -114,23 +107,51 @@ impl BoxListFilter<'_> {
     }
 }
 
+/// Resolves the `--parent` of a listing over `hosts` to the box id, as
+/// every box verb resolves a box. `min box list`, `min session list` and
+/// `min task list` share it (BCLI-026, BCLI-030).
+pub(crate) async fn resolve_list_parent(
+    hosts: Vec<crate::cmd::list::LocalHost>,
+    parent: Option<&str>,
+    verb: &'static str,
+) -> Result<Option<boxes::SessionId>, anyhow::Error> {
+    match parent {
+        Some(address) => Ok(Some(
+            resolve_box_on_hosts(hosts, address, verb).await?.box_id,
+        )),
+        None => Ok(None),
+    }
+}
+
 /// The line the table form prints when `--type` or `--parent` keeps no box.
 fn filtered_empty_line(args: &BoxListArgs, scoped: bool) -> String {
-    let flags: Vec<String> = args
-        .box_type
+    no_match_line(
+        "box",
+        args.box_type.as_deref(),
+        args.parent.as_deref(),
+        scoped,
+    )
+}
+
+/// The line a table listing prints when its `--type` or `--parent` keeps
+/// no `noun`: `box` for `min box list`, `session box` or `task box` for
+/// the type nouns.
+pub(crate) fn no_match_line(
+    noun: &str,
+    box_type: Option<&str>,
+    parent: Option<&str>,
+    scoped: bool,
+) -> String {
+    let flags: Vec<String> = box_type
         .iter()
         .map(|box_type| format!("--type {box_type}"))
-        .chain(
-            args.parent
-                .iter()
-                .map(|parent| format!("--parent {parent}")),
-        )
+        .chain(parent.iter().map(|parent| format!("--parent {parent}")))
         .collect();
     let flags = flags.join(" ");
     if scoped {
-        format!("No box of this project matches {flags}.")
+        format!("No {noun} of this project matches {flags}.")
     } else {
-        format!("No box on this machine matches {flags}.")
+        format!("No {noun} on this machine matches {flags}.")
     }
 }
 

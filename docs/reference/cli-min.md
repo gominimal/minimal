@@ -167,12 +167,14 @@ the CLI and scripts read its `--raw` output. It is not an alias of
 ### `session list` (alias: `min session ls`)
 
 ```
-min session list [--all] [-o json]
+min session list [--all] [--parent <BOX>] [-o json]
 ```
 
 Lists the session boxes of the current project, in any state. It is
 `min box list` limited to session boxes, with the same columns and the same
-flags. `--all` lists the session boxes of every project. `-o json`, or
+flags, except `--type`. The noun sets the type. `--all` lists the session
+boxes of every project. `--parent <BOX>` lists only the session boxes that
+are child boxes of that box. `-o json`, or
 `--output json`, writes the boxes as one JSON array. It does not take `--raw` or `--json`. Use `min ls`
 for those.
 
@@ -384,7 +386,7 @@ after `--`. To run a task of another project, give `-C <DIR>`.
 ### `task list`, `task logs`, `task stop` and `task rm`
 
 ```
-min task list [--all] [-o|--output json]
+min task list [--all] [--parent <BOX>] [-o|--output json]
 min task logs [-f|--follow] [--raw] <BOX>
 min task stop [--force | --exec <EXEC_ID>] <BOX>
 min task rm [--force] <BOX>
@@ -392,7 +394,8 @@ min task rm [--force] <BOX>
 
 These are the [`box list`](#box-list), [`box logs`](#box-logs),
 [`box stop`](#box-stop) and [`box rm`](#box-rm) commands for task boxes only,
-with the same flags. A task that ended shows its exit code in the list, such
+with the same flags. `min task list` does not take `--type`, because the
+noun sets the type. A task that ended shows its exit code in the list, such
 as `exited (exit 3)`, until `min box prune` removes it. `min task logs` does
 not take `--exec`.
 
