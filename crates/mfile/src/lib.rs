@@ -1190,6 +1190,39 @@ fn diagnostics_due(path: Option<&Path>, content_hash: Option<u64>) -> bool {
         .insert((path.to_path_buf(), content_hash))
 }
 
+/// Prints each of `lines`, the diagnostics of the `minimal.toml` at `file`,
+/// on stderr. A line prints on its first print in this process for that
+/// file only. A command loads its project's file many times, and each load
+/// returns the same lines, so this prints each of them once. The key holds
+/// the file's path, so two files that give the same line both print it.
+/// Only a caller that owns stderr calls this: `min dash` puts the lines on
+/// its status line instead.
+pub fn print_diagnostics(file: Option<&Path>, lines: &[String]) {
+    write_new_diagnostics(file, lines, &mut std::io::stderr());
+}
+
+/// Writes to `out` each of `lines` that this process did not write yet for
+/// `file`. A line that cannot be written (a closed stderr) is not a reason
+/// to fail the command.
+fn write_new_diagnostics(file: Option<&Path>, lines: &[String], out: &mut dyn std::io::Write) {
+    static PRINTED: LazyLock<Mutex<HashSet<(Option<PathBuf>, String)>>> =
+        LazyLock::new(|| Mutex::new(HashSet::new()));
+    if lines.is_empty() {
+        return;
+    }
+    // One file reached by two routes (`from_dir` and `from_dir_recursive`)
+    // keys the same.
+    let file = file.map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
+    let mut printed = PRINTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for line in lines {
+        if printed.insert((file.clone(), line.clone())) {
+            let _ = writeln!(out, "{line}");
+        }
+    }
+}
+
 /// Refuses a `state_key` from the project's own file that
 /// [`File::validate_state_component`] would refuse when the state directory
 /// is composed. An empty key means "no key": the task gets a temporary state
@@ -1402,6 +1435,12 @@ impl File {
             return Vec::new();
         }
         self.diagnostics.clone()
+    }
+
+    /// Prints [`File::diagnostics`] on stderr, each line on its first print
+    /// in this process for this file. See [`print_diagnostics`].
+    pub fn print_diagnostics(&self) {
+        print_diagnostics(self.mfile_path.as_deref(), &self.diagnostics);
     }
 
     /// Post-deserialize invariants: every declared param has a `default`,
@@ -5085,7 +5124,8 @@ mod tests {
     /// #3529: a parse keeps the legacy-table hints and the unknown-field
     /// warnings on the `File` and prints nothing, so a caller that owns the
     /// screen (the `min dash` TUI) can put them on its own surface. Every
-    /// load returns them; `diagnostics_once` hands them out once.
+    /// load returns them; `diagnostics_once` hands them out once. The CLI's
+    /// print dedups on the file path and the line.
     #[test]
     fn legacy_hints_are_returned_not_printed() {
         let dir = tempdir().unwrap();
@@ -5126,6 +5166,37 @@ mod tests {
 
         assert_eq!(first.diagnostics_once(), lines);
         assert!(second.diagnostics_once().is_empty(), "handed out once");
+
+        // The CLI's print writes each line once for each file. A second
+        // file that gives the same lines prints them too.
+        let mut printed = Vec::new();
+        write_new_diagnostics(first.file_path().map(PathBuf::as_path), lines, &mut printed);
+        write_new_diagnostics(
+            second.file_path().map(PathBuf::as_path),
+            lines,
+            &mut printed,
+        );
+        assert_eq!(
+            String::from_utf8(printed).unwrap(),
+            format!("{}\n", lines.join("\n"))
+        );
+        let other = tempdir().unwrap();
+        std::fs::write(
+            other.path().join(MFILE_NAME),
+            "[session]\npackages = [\"git\"]\n",
+        )
+        .unwrap();
+        let other = File::from_dir(other.path()).expect("the other file reads");
+        let mut printed = Vec::new();
+        write_new_diagnostics(
+            other.file_path().map(PathBuf::as_path),
+            &lines[..1],
+            &mut printed,
+        );
+        assert_eq!(
+            String::from_utf8(printed).unwrap(),
+            format!("{}\n", lines[0])
+        );
 
         // A parse with no path keeps the hint too.
         let bare = File::from_toml_bytes(b"[session]\npackages = [\"git\"]\n").unwrap();
