@@ -584,6 +584,10 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
 - **BCLI-058** WHEN `min box rename <box> <name>` runs THE SYSTEM SHALL rename the box as BOX-010 defines, reporting BOX-010's refusal with exit 2 naming the holder.
   tier:     T0
   verify:   cargo nextest run -p minimal box_rename_renames_as_box_010
+  - IF `min box rename` is refused because the new name is taken and the caller does not hold Gatehouse `BoxRead` on the box that has it THEN THE SYSTEM SHALL say in the refusal only that the name is taken, and name no box, no state and no verb that goes back into it.
+    <!-- unwanted; BOX-010 limits the holder's details to a caller with `BoxRead`, as BOX-163 does for a create (the architecture's shared-host rule) -->
+    tier:   T0
+    verify: cargo nextest run -p minimal box_rename_name_held_without_box_read_names_no_box
 
 - **BCLI-059** WHEN `min box stop <box>` runs without `--exec` THE SYSTEM SHALL stop the box as BOX-013 defines, requesting BOX-013's forced stop under `--force`.
   tier:     T0
