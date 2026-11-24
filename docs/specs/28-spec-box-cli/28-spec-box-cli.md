@@ -34,11 +34,11 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
 
 ### Verbs that read and drive the box record and spec
 
-- **BCLI-001** WHEN `min box list` runs THE SYSTEM SHALL print at least the id, name, project, entry, type, state, provider and host of each box BOX-158 lists. It SHALL scope the list to the current project unless the caller passes `--all`. Under `-o json` it SHALL write exactly the `"schema": "min/v1/box"` objects to stdout, and nothing else.
-  <!-- the entry column shows up front which entry a box came from. The list shows no name origin and no project name, for space. Its project column is the project root -->
+- **BCLI-001** WHEN `min box list` runs THE SYSTEM SHALL print at least the id, name, project root, entry, type, state, provider and host of each box BOX-158 lists. It SHALL scope the list to the current project unless the caller passes `--all`. Under `-o json` it SHALL write exactly the `"schema": "min/v1/box"` objects to stdout, and nothing else.
+  <!-- the entry column shows up front which entry a box came from. The list shows no name origin and no project name, for space. Its PROJECT column is the project root -->
   tier:     T0
   verify:   cargo nextest run -p minimal box_list_prints_columns_and_schema
-  - WHEN `min box list` or `min box show` writes a `"schema": "min/v1/box"` object THE SYSTEM SHALL include `project_name`, the project's name, `entry`, the entry the box came from, and `name_origin`, which is `"written"` for a name a person wrote and `"derived"` for a name the host derived. A record that holds no origin reads as `"written"` (BOX-228).
+  - WHEN `min box list` or `min box show` writes a `"schema": "min/v1/box"` object THE SYSTEM SHALL include `project_name`, the project's name, `entry`, the entry the box came from, and `name_origin`, which is `"written"` for a name a person wrote and `"derived"` for a name the host derived. A record that holds no origin reads as `"written"` (BOX-228). A record made before these fields writes `project_name` and `entry` as `null`, because BOX-158 returns them absent.
     <!-- event-driven; BOX-158, BOX-159 and BOX-228 carry these fields. New fields only, so an existing reader of `min/v1/box` keeps working. `project` stays the project root -->
     tier:   T0
     verify: cargo nextest run -p minimal box_json_carries_project_name_entry_and_name_origin
