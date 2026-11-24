@@ -667,6 +667,14 @@ pub struct BoxConfig {
     /// field. The daemon then records `project_path` as the root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_root: Option<paths::HostAbsPath>,
+    /// The project name the client read (BOX-214): `[project] name` where
+    /// the project declares it, else the project root directory's name
+    /// converted to a DNS label. The daemon names a box that has no
+    /// requested name from it, and refuses one that is not a DNS label.
+    /// `None` from a client that predates the field. The daemon then takes
+    /// the name of [`Self::project_root`]'s directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
     /// The name a `host_ip` grant box registered under with the VM host
     /// daemon, when that is not the name the daemon gives the box. A fresh
     /// instance registers under a creation key of its own, because the
@@ -2612,6 +2620,7 @@ impl CreateSessionRequest {
                 creating_verb: CreatingVerb::default(),
                 project_root: None,
                 host_ip_registration: None,
+                project_name: None,
             },
             must_match_version: None,
             spec: None,
