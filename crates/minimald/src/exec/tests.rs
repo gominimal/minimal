@@ -3347,6 +3347,56 @@ async fn a_starved_exec_ends_the_holder_that_is_not_draining() {
     assert_eq!(daemon_held.load(std::sync::atomic::Ordering::Acquire), 150);
 }
 
+/// A starved wait ends its victim at the daemon bound, but never over the
+/// victim's own loss: the victim's pump can send `ClientLost` after the wait
+/// chose it, and a bound written over that loss would hide it from the
+/// victim's parked output write, which would then wait on a client that is
+/// gone. Here the loss lands first and the write is polled only after both
+/// sends, as a write polled late would be; it must still see the loss. The
+/// control: an exec with no end is ended at the bound, and the bound does not
+/// give up a write the client may still take.
+#[tokio::test(start_paused = true)]
+async fn the_daemon_bound_never_replaces_a_victims_lost_client() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let (end_tx, end) = tokio::sync::watch::channel(None);
+    end_tx.send_replace(Some(super::ExecEnd::ClientLost));
+    assert!(
+        !super::end_at_the_daemon_bound(&end_tx),
+        "an end already set is kept"
+    );
+    assert_eq!(*end.borrow(), Some(super::ExecEnd::ClientLost));
+    // One byte of room, and a client that reads nothing: the write waits.
+    let (inner, _client) = duplex(1);
+    let mut channel = super::ChannelOut::new(inner);
+    let relayed = timeout(
+        Duration::from_secs(10),
+        super::write_unless_lost(&mut channel, b"output", &end),
+    )
+    .await
+    .expect("a write to a client lost before the bound is given up");
+    assert!(matches!(relayed, super::Relayed::Lost), "{relayed:?}");
+
+    let (end_tx, end) = tokio::sync::watch::channel(None);
+    assert!(
+        super::end_at_the_daemon_bound(&end_tx),
+        "an exec with no end is ended"
+    );
+    assert_eq!(
+        *end.borrow(),
+        Some(super::ExecEnd::InputHeldOver(super::HeldBound::Daemon))
+    );
+    let (inner, _client) = duplex(1);
+    let mut channel = super::ChannelOut::new(inner);
+    timeout(
+        Duration::from_secs(3600),
+        super::write_unless_lost(&mut channel, b"output", &end),
+    )
+    .await
+    .expect_err("the bound does not give up a write the client may still take");
+}
+
 /// The per-exec stall counts this exec's own reads only. Another exec
 /// releasing input all the while (which wakes every pump waiting at the
 /// daemon bound) must not restart it: a command that reads nothing at

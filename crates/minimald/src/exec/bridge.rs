@@ -909,9 +909,7 @@ pub(super) async fn pump_channel_input<M>(
                             "exec: the daemon's input budget is held by an exec that read none of it for the whole window; ending that exec, not this one",
                         );
                         victim.held.clear();
-                        victim
-                            .end
-                            .send_replace(Some(ExecEnd::InputHeldOver(HeldBound::Daemon)));
+                        end_at_the_daemon_bound(&victim.end);
                         *w = BoundWait::begin(&held);
                         continue;
                     }
@@ -943,6 +941,26 @@ pub(super) async fn pump_channel_input<M>(
             Some(_) => {}
         }
     }
+}
+
+/// Ends another exec at the daemon bound ([`ExecEnd::InputHeldOver`] with
+/// [`HeldBound::Daemon`]), unless its end is already set. Returns whether
+/// this set it.
+///
+/// The victim's own pump may have sent [`ExecEnd::ClientLost`] since the
+/// starved wait chose it. A watch keeps only its latest value, so replacing
+/// that loss would hide it from the victim's parked output write
+/// ([`until_client_lost`]), which would then wait on a client that is gone.
+/// The check and the set are one step under the watch's lock, so a loss
+/// sent at the same time is either kept or sent after, never overwritten.
+pub(super) fn end_at_the_daemon_bound(end: &watch::Sender<Option<ExecEnd>>) -> bool {
+    end.send_if_modified(|value| {
+        if value.is_some() {
+            return false;
+        }
+        *value = Some(ExecEnd::InputHeldOver(HeldBound::Daemon));
+        true
+    })
 }
 
 /// Where an exec's drain stood when its stall window began, and what it
