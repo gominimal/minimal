@@ -1205,6 +1205,77 @@ fn log_diagnostics(path: Option<&Path>, content_hash: Option<u64>, lines: &[Stri
     }
 }
 
+/// A load of a `minimal.toml` that failed, with the lines the file has for
+/// the person. When the file's checks refuse it, [`Refusal::diagnostics`]
+/// holds the legacy-table hints that its parse kept, which often explain the
+/// refusal. Any other failure holds no lines.
+///
+/// The quiet loaders ([`File::from_dir_quiet`],
+/// [`File::from_dir_recursive_quiet`]) return it and print nothing, so a
+/// caller that owns the screen (the `min dash` TUI) can show the lines with
+/// the error. The CLI loaders print the lines on stderr and return the error.
+#[derive(Debug)]
+pub struct Refusal {
+    /// Why the file did not load.
+    pub error: Error,
+    diagnostics: Vec<String>,
+    file: Option<PathBuf>,
+    content_hash: Option<u64>,
+}
+
+impl Refusal {
+    /// The lines the refused file has for the person, in the order the
+    /// parse found them. Nothing printed them.
+    #[must_use]
+    pub fn diagnostics(&self) -> &[String] {
+        &self.diagnostics
+    }
+
+    /// The path of the refused file, when the load read one.
+    #[must_use]
+    pub fn file_path(&self) -> Option<&Path> {
+        self.file.as_deref()
+    }
+
+    /// The hash of the bytes of the refused file. [`print_diagnostics`]
+    /// keys on it.
+    #[must_use]
+    pub fn content_hash(&self) -> Option<u64> {
+        self.content_hash
+    }
+
+    /// Prints [`Refusal::diagnostics`] on stderr, each line on its first
+    /// print in this process for this file and content.
+    pub fn print_diagnostics(&self) {
+        print_diagnostics(self.file.as_deref(), self.content_hash, &self.diagnostics);
+    }
+
+    /// Prints the lines, then gives the error for the caller to print after
+    /// them, as a parse printed the hints before the error.
+    #[must_use]
+    pub fn print_and_into_error(self) -> Error {
+        self.print_diagnostics();
+        self.error
+    }
+}
+
+impl From<Error> for Refusal {
+    fn from(error: Error) -> Self {
+        Self {
+            error,
+            diagnostics: Vec::new(),
+            file: None,
+            content_hash: None,
+        }
+    }
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
 /// Prints each of `lines`, the diagnostics of the `minimal.toml` at `file`,
 /// on stderr. `content_hash` is the hash of the bytes the lines came from
 /// ([`File::content_hash`]). A line prints on its first print in this
@@ -1395,36 +1466,51 @@ impl File {
     }
 
     /// Searches from the given directory backwards to load the `minimal.toml` file.
+    ///
+    /// A file that the load refuses prints its legacy-table hints on stderr,
+    /// before the caller prints the error, as [`Self::from_dir`] does. A
+    /// caller that owns the screen calls [`Self::from_dir_recursive_quiet`].
     pub fn from_dir_recursive<P: AsRef<Path>>(dir: P) -> Result<Self, Error> {
-        match Self::from_dir(&dir) {
+        Self::from_dir_recursive_quiet(dir).map_err(Refusal::print_and_into_error)
+    }
+
+    /// [`Self::from_dir_recursive`], for a caller that owns the screen (the
+    /// `min dash` TUI). It prints nothing. A refused file's legacy-table
+    /// hints come back on the [`Refusal`].
+    pub fn from_dir_recursive_quiet<P: AsRef<Path>>(dir: P) -> Result<Self, Refusal> {
+        match Self::from_dir_quiet(&dir) {
             Ok(f) => Ok(f),
-            Err(Error::NotFound) => {
+            Err(r) if matches!(r.error, Error::NotFound) => {
                 // Not found at this directory, try the parent
                 if let Some(parent) = dir.as_ref().parent() {
                     // We don't traverse outside of a users HOME if its set.
                     if let Some(home) = env::home_dir()
                         && home == parent
                     {
-                        return Err(Error::NotFound);
+                        return Err(Error::NotFound.into());
                     }
 
-                    Self::from_dir_recursive(parent)
+                    Self::from_dir_recursive_quiet(parent)
                 } else {
-                    Err(Error::NotFound)
+                    Err(Error::NotFound.into())
                 }
             }
-            Err(e) => Err(e),
+            Err(r) => Err(r),
         }
     }
 
     /// Helper to finish initialization of the structure after being deserialized.
+    ///
+    /// It prints nothing. When the checks refuse the file, the legacy-table
+    /// hints the parse kept go back on the [`Refusal`], because they often
+    /// explain the refusal.
     fn init_toml(
         mut self,
         path: &PathBuf,
         layout: Layout,
         content_hash: u64,
         tasks: TaskCheck,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, Refusal> {
         self.mfile_path = Some(path.to_path_buf());
         self.layout = Some(layout);
         self.content_hash = Some(content_hash);
@@ -1434,13 +1520,13 @@ impl File {
                 sideload.link.fixup_relative(path);
             }
         }
-        if let Err(e) = self.check(tasks) {
-            // The legacy-table hints often explain the refusal, so they print
-            // before the caller prints the error, as a parse printed them
-            // before. Only a file with a path reaches here: a load from bytes
-            // alone prints nothing.
-            self.print_diagnostics();
-            return Err(e);
+        if let Err(error) = self.check(tasks) {
+            return Err(Refusal {
+                error,
+                diagnostics: self.diagnostics,
+                file: self.mfile_path,
+                content_hash: self.content_hash,
+            });
         }
         let warnings = self.unknown_field_warnings();
         self.diagnostics.extend(warnings);
@@ -1570,7 +1656,18 @@ impl File {
 
     /// Loads the minimal file from the given directory path. The given
     /// directory must be a repository / minimalfile root.
+    ///
+    /// A file that the load refuses prints its legacy-table hints on stderr,
+    /// before the caller prints the error. A caller that owns the screen
+    /// calls [`Self::from_dir_quiet`].
     pub fn from_dir<P: AsRef<Path>>(dir: P) -> Result<Self, Error> {
+        Self::from_dir_quiet(dir).map_err(Refusal::print_and_into_error)
+    }
+
+    /// [`Self::from_dir`], for a caller that owns the screen (the `min dash`
+    /// TUI). It prints nothing. A refused file's legacy-table hints come
+    /// back on the [`Refusal`].
+    pub fn from_dir_quiet<P: AsRef<Path>>(dir: P) -> Result<Self, Refusal> {
         Self::load_dir(dir.as_ref(), TaskCheck::Refuse)
     }
 
@@ -1584,9 +1681,11 @@ impl File {
     /// gets both refusals when it loads through [`Self::from_dir`].
     ///
     /// Only `mip`'s package graph loads through here, and it owns stderr, so
-    /// this prints the file's diagnostics there, each once.
+    /// this prints the file's diagnostics there, each once, and a refused
+    /// file's hints before the caller prints the error.
     pub fn from_dir_for_graph<P: AsRef<Path>>(dir: P) -> Result<Self, Error> {
-        let file = Self::load_dir(dir.as_ref(), TaskCheck::Skip)?;
+        let file = Self::load_dir(dir.as_ref(), TaskCheck::Skip)
+            .map_err(Refusal::print_and_into_error)?;
         file.print_diagnostics();
         Ok(file)
     }
@@ -1601,8 +1700,18 @@ impl File {
     /// of the file the link points at. `root` itself is trusted.
     pub fn from_dir_within<P: AsRef<Path>>(root: P) -> Result<Self, Error> {
         let root = root.as_ref();
-        let file = Self::load_dir_by(root, TaskCheck::Refuse, Reader::Within(root))?;
-        // Only the daemon reads a box's workspace. Its log keeps the lines.
+        // Only the daemon reads a box's workspace. Its log keeps the lines,
+        // a refused file's hints as well.
+        let file = Self::load_dir_by(root, TaskCheck::Refuse, Reader::Within(root)).map_err(
+            |refusal| {
+                log_diagnostics(
+                    refusal.file.as_deref(),
+                    refusal.content_hash,
+                    &refusal.diagnostics,
+                );
+                refusal.error
+            },
+        )?;
         log_diagnostics(
             file.mfile_path.as_deref(),
             file.content_hash,
@@ -1611,17 +1720,17 @@ impl File {
         Ok(file)
     }
 
-    fn load_dir(dir: &Path, tasks: TaskCheck) -> Result<Self, Error> {
+    fn load_dir(dir: &Path, tasks: TaskCheck) -> Result<Self, Refusal> {
         Self::load_dir_by(dir, tasks, Reader::Host)
     }
 
-    fn load_dir_by(dir: &Path, tasks: TaskCheck, reader: Reader<'_>) -> Result<Self, Error> {
+    fn load_dir_by(dir: &Path, tasks: TaskCheck, reader: Reader<'_>) -> Result<Self, Refusal> {
         // Check for the minimal file at the directory root.
         let path = dir.join(MFILE_NAME);
         if let Some(file_data) = reader.read(&path)? {
             let conflicting_path = dir.join(".minimal").join(MFILE_NAME);
             if reader.exists(&conflicting_path)? {
-                return Err(Error::ConflictingLayouts(vec![path, conflicting_path]));
+                return Err(Error::ConflictingLayouts(vec![path, conflicting_path]).into());
             }
 
             return Self::init_toml(
@@ -1643,7 +1752,7 @@ impl File {
                 hash_bytes(&file_data),
                 tasks,
             ),
-            None => Err(Error::NotFound),
+            None => Err(Error::NotFound.into()),
         }
     }
 
@@ -5334,6 +5443,36 @@ mod tests {
         // A parse with no path keeps the hint too.
         let bare = File::from_toml_bytes(b"[session]\npackages = [\"git\"]\n").unwrap();
         assert_eq!(bare.diagnostics().len(), 1, "{:?}", bare.diagnostics());
+
+        // A file that the checks refuse returns its hint with the error, and
+        // the quiet load prints nothing: `min dash` shows both.
+        let refused = tempdir().unwrap();
+        std::fs::write(
+            refused.path().join(MFILE_NAME),
+            "[session]\npackages = [\"git\"]\n\n[harness]\nname = \"rust\"\n",
+        )
+        .unwrap();
+        let refusal = File::from_dir_quiet(refused.path()).expect_err("the file is refused");
+        assert!(
+            matches!(refusal.error, Error::HarnessTable(_)),
+            "{:?}",
+            refusal.error
+        );
+        assert_eq!(refusal.diagnostics().len(), 1, "{:?}", refusal.diagnostics());
+        assert!(refusal.diagnostics()[0].starts_with("hint: "));
+        assert_eq!(
+            refusal.file_path(),
+            Some(refused.path().join(MFILE_NAME).as_path())
+        );
+        let nested = refused.path().join("sub");
+        std::fs::create_dir(&nested).unwrap();
+        let walked = File::from_dir_recursive_quiet(&nested).expect_err("the walk is refused");
+        assert_eq!(walked.diagnostics(), refusal.diagnostics());
+        // A failure that is not a refusal of the checks has no lines.
+        let empty = tempdir().unwrap();
+        let missing = File::from_dir_quiet(empty.path()).expect_err("no file");
+        assert!(matches!(missing.error, Error::NotFound));
+        assert!(missing.diagnostics().is_empty());
     }
 
     /// Reads `body` as a project's `minimal.toml` and returns the warnings
