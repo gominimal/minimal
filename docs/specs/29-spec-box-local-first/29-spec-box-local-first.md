@@ -70,7 +70,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
 - **BOX-004** THE SYSTEM SHALL give a box name on a host to at most one box that is created or renamed under this rule, from the creation or rename that gives it the name until the box is reaped or renamed, whatever the state of the box.
   tier:     T1
   verify:   cargo nextest run -p boxes name_belongs_to_one_box_on_host_until_reaped_or_renamed
-  property: For every store of records made before this rule and every sequence of create (written or derived name), stop, exit, resume, restart, rename and reap operations on one host, no record that a creation or rename under this rule named has a name, compared without regard to case (BOX-217), that another retained record has, and a name becomes free exactly when the last retained record that has it is reaped or renamed.
+  property: For every store of records made before this rule and every sequence of create (written or derived name), stop, exit, resume, restart, rename and reap operations on one host, no record that a creation or rename under this rule named has a name, compared without regard to case (BOX-217), that another retained record has, and a name becomes free exactly when the last retained record that has it is reaped, or is renamed to a name that differs from it without regard to case, or when the creation that took it fails before the box first runs (BOX-219).
   <!-- "created or renamed under this rule" carries gominimal/arch#187's exception for boxes created before this rule, which may still share a name (BOX-223, BOX-005). -->
 
 - **BOX-163** WHEN a box is created THE SYSTEM SHALL name it with the requested name that the client sends, exactly as written, and otherwise with the derived name that BOX-211 to BOX-213 give.
@@ -166,7 +166,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
   - IF the new name is one that another box on the same host has, in any state, THEN THE SYSTEM SHALL refuse the rename with exit 2 and a message that names that box and gives its state only where the caller may read that box (Gatehouse `BoxRead`) and otherwise says only that the name is taken, and SHALL leave the box, its name and its events unchanged.
     tier:   T0
     verify: cargo nextest run -p boxes rename_to_taken_name_refused_exit2_holder_only_with_box_read
-  - IF the new name breaks a rule of BOX-007 THEN THE SYSTEM SHALL refuse the rename with exit 3 and a message that quotes the name and says which rule it breaks, as BOX-007 does for a creation, and SHALL leave the box, its name and its events unchanged.
+  - IF the new name breaks a rule of BOX-007 THEN THE SYSTEM SHALL refuse the rename with exit 3 and a message that quotes the name and says which rule it breaks, as BOX-007 does for a creation, before it tests the name against the host's other boxes, and SHALL leave the box, its name and its events unchanged.
     tier:   T0
     verify: cargo nextest run -p boxes rename_to_name_breaking_box007_refused_exit3
 
@@ -399,6 +399,9 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p mfile invalid_project_name_exit3_not_converted
   <!-- `[project] name` may be `self`: a derived name `self` then takes a number (BOX-212). -->
+  - WHEN a creation reaches `minimald` with a project name THE SYSTEM SHALL refuse it with exit 3, in `minimald` and whatever client sent the creation, where the project name is not a DNS label, before it derives any name (BOX-211, BOX-220).
+    tier:   T0
+    verify: cargo nextest run -p minimald daemon_refuses_project_name_not_dns_label_exit3
 
 - **BOX-224** IF a `minimal.toml` carries a top-level `[session.<name>]`, `[task.<name>]`, `[agent.<name>]`, `[service.<name>]` or `[box.<name>]` table, other than a sub-table of BOX-050's legacy `[session]` table whose name is a Box Spec key, THEN THE SYSTEM SHALL fail with exit 3 and a message that names the table and the plural table, such as `[sessions.<name>]`, that declares an entry.
   tier:     T0
