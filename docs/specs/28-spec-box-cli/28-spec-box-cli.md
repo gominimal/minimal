@@ -420,7 +420,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     verify: cargo nextest run -p minimal unattached_create_numbered_without_box_read_names_no_box
 
 - **BCLI-082** WHEN `min box start` or `min session start` attaches this terminal to a box that took a number THE SYSTEM SHALL print nothing about the box's name before the box shell.
-  <!-- event-driven; gominimal/arch#195 point 2 and the AGENTS.md rule for the box shell: the shell's first paint replaces anything printed before it -->
+  <!-- event-driven; gominimal/arch#195 point 2, decided in https://github.com/gominimal/arch/issues/195#issuecomment-7118352074 and not yet in `architecture.md`, and the AGENTS.md rule for the box shell: the shell's first paint replaces anything printed before it -->
   tier:     T0
   verify:   cargo nextest run -p minimal attached_start_numbered_prints_nothing_before_shell
 
