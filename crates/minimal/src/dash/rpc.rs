@@ -1009,6 +1009,19 @@ fn put_picked_entry(
     // not declare as a session is refused, and no entry picks one.
     let entries = crate::project_entries(&dir)?;
     let entry = crate::pick_session_start_entry(&entries, picked.name.as_deref())?.name;
+    // The form's mode acts as `--network`, so it would replace the entry's
+    // `network.mode`. An entry whose declared mode differs is refused, and
+    // the request gets no spec and no expansion.
+    if let Some(declared) = crate::project_egress(&dir, Some(&entry))?.mode
+        && declared != request.config.network
+    {
+        anyhow::bail!(
+            "the entry {entry} declares network mode {declared}, but the create form has \
+             {form}. Run min box start {entry} to start it with its own network mode.",
+            declared = declared.word(),
+            form = request.config.network.word(),
+        );
+    }
     // The entry's `[network]`, `[secrets]` and Box Egress Proxy settings,
     // through the checks `min box start` runs. The form's network mode is
     // the create's `--network`, and the form sets no other flag.
@@ -2176,16 +2189,22 @@ mod tests {
         assert!(contribution.entry.is_some());
     }
 
-    /// The form's network mode is the create's `--network`, and it
-    /// replaces the entry's `network.mode`, as the flag does.
+    /// An entry whose `network.mode` differs from the form's mode is
+    /// refused, and the request gets no spec and no expansion.
     #[test]
-    fn dashboard_create_takes_the_form_network_over_the_entry_mode() {
-        let (result, request, _) = dashboard_request_for_entry_with(
+    fn dashboard_create_refuses_an_entry_whose_network_mode_differs_from_the_form() {
+        let (result, request, contribution) = dashboard_request_for_entry_with(
             "[sessions.dev.network]\nmode = \"none\"\n",
-            NetworkMode::OwnIp,
+            NetworkMode::HostNet,
         );
-        result.expect("an entry whose network.mode differs is created");
-        assert_eq!(request.config.network, NetworkMode::OwnIp);
+        let error = result.expect_err("an entry whose network.mode differs is refused");
+        assert_eq!(
+            format!("{error:#}"),
+            "the entry dev declares network mode none, but the create form has host_ip. \
+             Run min box start dev to start it with its own network mode."
+        );
+        assert!(request.spec.is_none());
+        assert!(contribution.entry.is_none());
     }
 
     /// A store reference with no rule is refused before a create, as
