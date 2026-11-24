@@ -10,11 +10,18 @@
 //! Bytes read ahead go to the next reads, in order, before an end of stream or a read error.
 //! Writes are never buffered.
 //!
-//! Memory: a peer can only send what our channel windows allow, and the library grants window
-//! only when it processes a packet, which it does not do while it is blocked in a write. One exec
-//! channel therefore leaves about 2 MiB unread at most. At the cap ([`DEFAULT_READ_AHEAD_CAP`]
-//! unless [`ReadWhileWriting::with_cap`] says otherwise) the wrapper stops reading, which is the
-//! back-pressure a bare socket gives, and logs one warning per stall.
+//! Memory: a peer can only send what our channel windows allow (2 MiB per channel by default),
+//! and the library grants more window only when its loop processes a packet, which it does not
+//! do while it is blocked in a write. So while a write is blocked, at most about 2 MiB per open
+//! channel arrives to be read ahead. At the cap ([`DEFAULT_READ_AHEAD_CAP`] unless
+//! [`ReadWhileWriting::with_cap`] says otherwise) the wrapper stops reading, which is the
+//! back-pressure a bare socket gives, and logs one warning per stall. The storage behind the
+//! bytes held stays within a small multiple of the cap.
+//!
+//! The limit: the wait is broken only while what the peer has in flight toward this end stays
+//! below the cap. If both ends are blocked writing and each has more than the other's cap to
+//! send, both wait, as two bare ends would. With the default cap and windows that takes more
+//! than 16 channels sending at full window in both directions at once.
 //!
 //! Both directions must be driven by one task, as the library does. A blocked write registers
 //! the writing task to be woken when input arrives, which takes the place of any reader that a
@@ -26,9 +33,10 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-/// The most read-ahead bytes [`ReadWhileWriting::new`] holds unconsumed: three channels with
-/// full 2 MiB windows, plus slack.
-pub const DEFAULT_READ_AHEAD_CAP: usize = 8 * 1024 * 1024;
+/// The most read-ahead bytes [`ReadWhileWriting::new`] holds unconsumed: 16 channels with full
+/// 2 MiB windows. A peer that keeps to its windows never sends more than they allow, so the cap
+/// binds only with more channels than that, or a peer that ignores its windows.
+pub const DEFAULT_READ_AHEAD_CAP: usize = 32 * 1024 * 1024;
 
 /// The most bytes asked of the inner stream by one read.
 const READ_CHUNK: usize = 32 * 1024;
@@ -67,6 +75,9 @@ pub struct ReadWhileWriting<S> {
     end: ReadEnd,
     /// Set when a stall at the cap was logged, so each stall is logged once.
     warned_at_cap: bool,
+    /// Bytes moved to the front of `ahead` so far, read by the test of what reading ahead costs.
+    #[cfg(test)]
+    moved: usize,
 }
 
 impl<S> ReadWhileWriting<S> {
@@ -86,6 +97,8 @@ impl<S> ReadWhileWriting<S> {
             cap: cap.max(1),
             end: ReadEnd::Open,
             warned_at_cap: false,
+            #[cfg(test)]
+            moved: 0,
         }
     }
 
@@ -107,14 +120,10 @@ impl<S: AsyncRead + Unpin> ReadWhileWriting<S> {
         if !matches!(self.end, ReadEnd::Open) {
             return;
         }
-        if self.pos > 0 {
-            // Move the unconsumed bytes to the front, so the cap counts only those.
-            self.ahead.copy_within(self.pos..self.len, 0);
-            self.len -= self.pos;
-            self.pos = 0;
-        }
         loop {
-            let room = self.cap.saturating_sub(self.len);
+            // The cap counts only the unconsumed bytes, wherever they sit in `ahead`.
+            let unread = self.len - self.pos;
+            let room = self.cap.saturating_sub(unread);
             if room == 0 {
                 if !self.warned_at_cap {
                     self.warned_at_cap = true;
@@ -127,6 +136,19 @@ impl<S: AsyncRead + Unpin> ReadWhileWriting<S> {
                 return;
             }
             let want = room.min(READ_CHUNK);
+            if self.ahead.len() - self.len < want && self.pos > 0 && self.pos >= unread {
+                // Moving the unconsumed bytes to the front copies no more bytes than were
+                // consumed since the last move, so the bytes moved in all never exceed the
+                // bytes consumed, however slowly the buffer drains. Growing instead, when fewer
+                // were consumed, keeps `len` below twice the cap.
+                self.ahead.copy_within(self.pos..self.len, 0);
+                self.len = unread;
+                self.pos = 0;
+                #[cfg(test)]
+                {
+                    self.moved += unread;
+                }
+            }
             if self.ahead.len() < self.len + want {
                 self.ahead.resize(self.len + want, 0);
             }
@@ -461,5 +483,99 @@ mod tests {
             .expect("the script is over")
             .unwrap();
         assert_eq!(n, 0, "then the stream's own end");
+    }
+
+    /// A stream whose writes never progress and whose reads return what the test put in
+    /// `bytes`, or `Pending` when there is nothing. Only polled by hand.
+    #[derive(Default)]
+    struct Feed {
+        bytes: VecDeque<u8>,
+    }
+
+    impl AsyncRead for Feed {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.bytes.is_empty() {
+                return Poll::Pending;
+            }
+            let n = buf.remaining().min(self.bytes.len());
+            let taken: Vec<u8> = self.bytes.drain(..n).collect();
+            buf.put_slice(&taken);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for Feed {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// One poll of a write, by hand: it is `Pending`, so the wrapper reads ahead.
+    async fn write_once(s: &mut ReadWhileWriting<Feed>) {
+        let polled =
+            std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut *s).poll_write(cx, b"x"))).await;
+        assert!(polled.is_pending(), "the fed stream's writes never progress");
+    }
+
+    /// 1 MiB is held ahead, then the reader takes one 32 KiB packet at a time while every write
+    /// blocks again and 32 KiB more arrives, as when a peer drains slowly. The bytes moved to
+    /// the front stay within the bytes consumed, where moving everything unconsumed on every
+    /// read ahead would move about 1 MiB per packet. Every byte still comes out once, in order.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_drain_moves_no_more_bytes_than_it_consumes() {
+        const HELD: usize = 1024 * 1024;
+        const PACKET: usize = 32 * 1024;
+        const PACKETS: usize = 64;
+        let sent = pattern(HELD + PACKETS * PACKET, 11);
+        let mut s = ReadWhileWriting::new(Feed::default());
+        s.inner.bytes.extend(sent[..HELD].iter().copied());
+        write_once(&mut s).await;
+        assert_eq!(s.buffered(), HELD, "everything fed was read ahead");
+
+        let mut got = Vec::with_capacity(sent.len());
+        let mut packet = vec![0u8; PACKET];
+        for i in 0..PACKETS {
+            let n = timeout(BOUND, s.read(&mut packet))
+                .await
+                .expect("in memory")
+                .unwrap();
+            assert_eq!(n, PACKET, "a whole packet is held");
+            got.extend_from_slice(&packet[..n]);
+            let more = HELD + i * PACKET;
+            s.inner.bytes.extend(sent[more..more + PACKET].iter().copied());
+            write_once(&mut s).await;
+            assert_eq!(s.buffered(), HELD, "what arrived was read ahead");
+        }
+        assert!(
+            s.moved <= PACKETS * PACKET,
+            "moved {} bytes to consume {}",
+            s.moved,
+            PACKETS * PACKET
+        );
+
+        while got.len() < sent.len() {
+            let n = timeout(BOUND, s.read(&mut packet))
+                .await
+                .expect("in memory")
+                .unwrap();
+            got.extend_from_slice(&packet[..n]);
+        }
+        assert!(got == sent, "every byte came out once, in order");
     }
 }
