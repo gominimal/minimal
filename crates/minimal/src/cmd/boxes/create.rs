@@ -3852,8 +3852,8 @@ pub(crate) fn request_fresh_instance(request: &mut minimald_rpc::CreateSessionRe
 
 /// The name the daemon gives the box `request` creates, when the create
 /// is not a fresh instance (BOX-211): the request's name, which carries
-/// `--name` or the spec's `[box] name`, else the name the daemon derives
-/// from the project and the spec's entry
+/// `--name` or the entry's `[box] name`, else the name the daemon derives
+/// from the request's project name and the spec's entry
 /// ([`boxes::box_name::create_derived_name`]). The VM host row and the box
 /// then carry one name.
 pub(crate) fn created_box_name(request: &minimald_rpc::CreateSessionRequest) -> Option<String> {
@@ -3864,10 +3864,13 @@ pub(crate) fn created_box_name(request: &minimald_rpc::CreateSessionRequest) -> 
         .config
         .project_root
         .as_ref()
-        .unwrap_or(&request.config.project_path)
-        .as_str();
+        .unwrap_or(&request.config.project_path);
+    let project = boxes::box_name::request_project_name(
+        request.config.project_name.as_deref(),
+        Some(root.as_str()),
+    );
     Some(boxes::box_name::create_derived_name(
-        root,
+        &project,
         request.spec.as_ref(),
         None,
     ))
@@ -4095,10 +4098,9 @@ pub(crate) fn stamp_session_spec_as(
     if let Some(entry) = entry {
         spec.entry = entry.to_string();
     }
-    // `--name` or the form's name, else the entry's own `[box] name`.
-    spec.name = name
-        .map(str::to_string)
-        .or_else(|| expanded.as_ref().and_then(|e| expanded_box_name(&e.spec)));
+    // BOX-211: the box name goes on the request, never into the stored
+    // spec. A rename changes the record alone.
+    spec.name = None;
     tracing::debug!(
         entry = %spec.entry,
         lifetime = ?spec.lifetime,
@@ -4109,18 +4111,47 @@ pub(crate) fn stamp_session_spec_as(
         Some(expanded) => put_expanded_spec(request, &spec, &expanded.spec)?,
         None => put_spec(request, &spec)?,
     }
-    // BOX-211: the daemon names a box from the request alone, so the
-    // stored spec's `[box] name` goes on the request when no `--name` or
-    // form name is already there.
+    // BOX-211: the daemon names a box from the request alone: `--name` or
+    // the form's name, else the entry's own `[box] name`, else the name it
+    // derives from the project name and the entry.
     if request.config.name.is_none() {
-        request.config.name =
-            boxes::box_name::spec_box_name(request.spec.as_ref()).map(str::to_string);
-        tracing::debug!(
-            name = ?request.config.name,
-            "the request carries the spec's [box] name, when it has one"
-        );
+        request.config.name = name
+            .map(str::to_string)
+            .or_else(|| expanded.as_ref().and_then(|e| expanded_box_name(&e.spec)));
     }
+    request.config.project_name = project_name_at(dir)?;
+    tracing::debug!(
+        name = ?request.config.name,
+        project_name = ?request.config.project_name,
+        "the request carries the box name, when one is written, and the project name"
+    );
     Ok(())
+}
+
+/// The project name of the project at `dir` (BOX-214): `[project] name`,
+/// else the project root directory's name converted to a DNS label. `None`
+/// for a directory with no `minimal.toml`, whose box the daemon names from
+/// the directory.
+///
+/// # Errors
+///
+/// Fails with exit 3 on a `minimal.toml` that does not load, and on a
+/// `[project] name` that is not a DNS label (BOX-216).
+pub(crate) fn project_name_at(dir: &camino::Utf8Path) -> anyhow::Result<Option<String>> {
+    let file = match mfile::File::from_dir_recursive_quiet(dir.as_std_path()) {
+        Ok(file) => file,
+        Err(refusal) if matches!(refusal.error(), mfile::Error::NotFound) => return Ok(None),
+        Err(refusal) => {
+            return Err(ProjectFileInvalid {
+                error: refusal.into_error(),
+            }
+            .into());
+        }
+    };
+    let name = file
+        .project_name()
+        .map_err(|error| ProjectFileInvalid { error })?;
+    Ok(Some(name))
 }
 
 /// The `[box] name` an entry's expansion declares, when it declares one.
@@ -4638,7 +4669,8 @@ pub(crate) async fn activate_box(
         minimald_rpc::CreateSessionRequest::new(String::new(), abs_path.clone(), network, policy);
     request.config.name = request_name(args.name.as_deref());
     // BCLI-070: `--new` asks for a fresh instance, `<name>-<n>`. The
-    // spec's `[box] name`, when `--name` gives one, is the base of the name.
+    // spec stamp puts `--name` or the entry's `[box] name` back on the
+    // request, as the base of the name.
     if options.fresh_instance {
         request_fresh_instance(&mut request);
     }

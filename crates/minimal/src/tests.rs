@@ -1926,12 +1926,96 @@ fn entry_name_registers_and_creates_under_one_cleaned_name() {
     assert_eq!(
         created_box_name(&request),
         Some(boxes::box_name::create_derived_name(
-            "/home/u/code/foo",
+            "foo",
             request.spec.as_ref(),
             None
         )),
         "the row's name is the daemon's name for the entry"
     );
+}
+
+/// BOX-211, BOX-214: a start's create request carries the project name and
+/// the entry, and the box name only when one is written: `--name`, else
+/// the entry's `[box] name`. The stored spec never carries a name, so a
+/// box with no written name in a project with `[project] name = "web"` is
+/// named `web`, or `web-<entry>` for an entry other than the default.
+#[test]
+fn create_request_carries_project_name_and_entry() {
+    let project = tempfile::tempdir().unwrap();
+    let root = camino::Utf8Path::from_path(project.path())
+        .unwrap()
+        .join("My Checkout");
+    std::fs::create_dir(&root).unwrap();
+    let request = |text: &str, entry: Option<&str>, name: Option<&str>| {
+        std::fs::write(root.join(mfile::MFILE_NAME), text).unwrap();
+        let mut request = minimald_rpc::CreateSessionRequest::new(
+            String::new(),
+            paths::HostAbsPath::try_new(root.clone()).unwrap(),
+            boxes::NetworkMode::HostNet,
+            boxes::BoxPolicy::default(),
+        );
+        request.config.name = minimal_client::box_name::request_name(name);
+        stamp_session_spec_as(&mut request, &root, entry, name, None).unwrap();
+        let spec = request.spec.clone().expect("the start stores a spec");
+        assert_eq!(
+            boxes::box_name::spec_box_name(Some(&spec)),
+            None,
+            "the stored spec carries no name: {spec}"
+        );
+        request
+    };
+
+    let default = request("[project]\nname = \"web\"\n", None, None);
+    assert_eq!(default.config.project_name.as_deref(), Some("web"));
+    assert_eq!(default.config.name, None);
+    assert_eq!(created_box_name(&default).as_deref(), Some("web"));
+
+    let named = "[project]\nname = \"web\"\n[sessions.dev]\n";
+    let dev = request(named, Some("dev"), None);
+    assert_eq!(dev.config.project_name.as_deref(), Some("web"));
+    assert_eq!(dev.config.name, None);
+    let spec: mfile::spec::BoxSpec =
+        serde_json_lenient::from_value(dev.spec.clone().unwrap()).unwrap();
+    assert_eq!(spec.entry, "dev");
+    assert_eq!(created_box_name(&dev).as_deref(), Some("web-dev"));
+
+    // `--name` goes on the request as written.
+    let flagged = request(named, Some("dev"), Some("X"));
+    assert_eq!(flagged.config.name.as_deref(), Some("X"));
+    assert_eq!(flagged.config.project_name.as_deref(), Some("web"));
+
+    // The entry's `[box] name` goes on the request, not into the spec.
+    let boxed = "[project]\nname = \"web\"\n[sessions.dev.box]\nname = \"api\"\n";
+    let entry_named = request(boxed, Some("dev"), None);
+    assert_eq!(entry_named.config.name.as_deref(), Some("api"));
+    assert_eq!(
+        request(boxed, Some("dev"), Some("X"))
+            .config
+            .name
+            .as_deref(),
+        Some("X")
+    );
+
+    // With no `[project] name`, the root directory's name is converted.
+    let plain = request("[sessions.dev]\n", Some("dev"), None);
+    assert_eq!(plain.config.project_name.as_deref(), Some("my-checkout"));
+    assert_eq!(created_box_name(&plain).as_deref(), Some("my-checkout-dev"));
+
+    // A `[project] name` that is not a DNS label refuses the start.
+    std::fs::write(
+        root.join(mfile::MFILE_NAME),
+        "[project]\nname = \"my_app\"\n",
+    )
+    .unwrap();
+    let mut refused = minimald_rpc::CreateSessionRequest::new(
+        String::new(),
+        paths::HostAbsPath::try_new(root.clone()).unwrap(),
+        boxes::NetworkMode::HostNet,
+        boxes::BoxPolicy::default(),
+    );
+    let error = stamp_session_spec_as(&mut refused, &root, None, None, None)
+        .expect_err("an invalid [project] name refuses the start");
+    assert!(format!("{error:#}").contains("[project] name"), "{error:#}");
 }
 
 #[test]
@@ -3394,13 +3478,12 @@ fn create_verbs_name_flag_overrides_box_name() {
         .unwrap();
         assert_eq!(created_box_name(&request).as_deref(), Some("api"));
 
-        // `--new`: no name of the client's on the request, and the spec's
-        // `[box] name` is the base the daemon numbers.
-        request_fresh_instance(&mut request);
-        assert_eq!(request.config.name, None);
+        // The stored spec carries no name (BOX-211).
         let spec: mfile::spec::BoxSpec =
             serde_json_lenient::from_value(request.spec.clone().unwrap()).unwrap();
-        assert_eq!(spec.name.as_deref(), Some("api"));
+        assert_eq!(spec.name, None);
+        request_fresh_instance(&mut request);
+        assert_eq!(request.config.name, None);
 
         // A planned start with `--new` asks the activation for a fresh
         // instance. A start without it does not.
