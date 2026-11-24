@@ -769,7 +769,13 @@ impl Drop for HeldInputReader {
 /// queued, bounded per exec and for the daemon as a whole
 /// ([`HeldInputLimits`]): past either, the queue is cleared (its bytes
 /// released at once), the command sees EOF, and `end` carries the bound so
-/// the bridge ends the exec under that reason.
+/// the bridge ends the exec under that reason. The pump then goes on reading
+/// the channel, dropping its data, so a client lost after the bound is still
+/// seen: the bound does not give up a write of output under way, and the
+/// loss is what does ([`until_client_lost`]). A loss replaces the bound.
+/// A command that never started when its wait at a bound ran out
+/// ([`ExecEnd::InputHeldUnstarted`]) has no write under way, and there the
+/// pump returns, letting go of the channel.
 ///
 /// `Eof` closes the held input (the command sees EOF once it has read what
 /// is queued) but keeps watching the channel: `min task run` from a
@@ -923,7 +929,12 @@ pub(super) async fn pump_channel_input<M>(
                     );
                     held.clear();
                     end.send_replace(Some(ExecEnd::InputHeldOver(bound)));
-                    return;
+                    // The channel is still watched, as after `Eof`: a write
+                    // of output under way when the bound came finishes for a
+                    // live client, and only a loss seen here gives it up if
+                    // the client goes instead. What arrives is dropped.
+                    open = false;
+                    break;
                 }
             }
             Some(russh::ChannelMsg::Eof) => {

@@ -2383,6 +2383,98 @@ async fn an_input_bound_during_a_parked_output_write_ends_the_exec_once_the_writ
     );
 }
 
+/// A client lost after an input bound still ends the exec whose output write
+/// waits on it. The bound does not give the write up (the client may still
+/// take it), so the loss is what must, and the pump has to go on reading the
+/// channel past the bound to see it. Pump and bridge are wired as in
+/// `ExecTask::run`: the command's output waits on a client that reads nothing,
+/// its input passes the exec's cap meanwhile, and then the channel closes. A
+/// pump that returned at the bound would leave the loss unseen and the write
+/// waiting for good, and this test would fail on its timeout (read from the
+/// code; the pump that returned was not run against this test).
+#[tokio::test(start_paused = true)]
+async fn a_client_lost_after_an_input_bound_ends_an_exec_whose_output_write_waits() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let (
+        process,
+        MockEndpoints {
+            stdin_reader: _stdin_reader,
+            mut stdout_writer,
+            stderr_writer: _stderr_writer,
+            ctrl,
+        },
+    ) = build_mock();
+    let parked = Arc::new(tokio::sync::Notify::new());
+    let (mut bridge_stdout, _client_stdout) = watched_channel(1, &parked);
+    let (mut bridge_stderr, _client_stderr) = duplex(64 * 1024);
+    let (msg_tx, msgs) = msg_stream();
+    let limits = super::HeldInputLimits {
+        per_exec: 200,
+        ..unlimited()
+    };
+    let (held, mut bridge_stdin) = held_with(limits);
+    let (end_tx, end_rx) = tokio::sync::watch::channel(None);
+    let mut end = end_rx.clone();
+    let _pump = tokio::spawn(super::pump_channel_input(msgs, Arc::clone(&held), end_tx));
+
+    let mut bridge_task = tokio::spawn(async move {
+        bridge(
+            "test",
+            process,
+            &mut bridge_stdin,
+            &mut bridge_stdout,
+            &mut bridge_stderr,
+            end_rx,
+            super::UnreadStdin::Keep,
+        )
+        .await
+    });
+
+    // The command keeps its output open, so only the end can end the exec.
+    stdout_writer.write_all(b"output").await.unwrap();
+    timeout(Duration::from_secs(10), parked.notified())
+        .await
+        .expect("the bridge's write of the output waits on the client");
+
+    // Nothing reads the input while the write waits: the third 100 bytes
+    // pass the 200-byte cap, and the stall ends the exec at the bound.
+    for _ in 0..3 {
+        msg_tx.send(data(100, 7)).unwrap();
+    }
+    timeout(Duration::from_secs(10), end.changed())
+        .await
+        .expect("the input passes the cap while the write waits")
+        .unwrap();
+    assert_eq!(
+        *end.borrow(),
+        Some(super::ExecEnd::InputHeldOver(super::HeldBound::Exec))
+    );
+    timeout(Duration::from_secs(3600), &mut bridge_task)
+        .await
+        .expect_err("an input bound does not give up a write the client may still take");
+    assert!(
+        !ctrl.was_killed(),
+        "the command runs until the write is done or the client is lost"
+    );
+
+    msg_tx.send(russh::ChannelMsg::Close).unwrap();
+    let exit = timeout(Duration::from_secs(10), bridge_task)
+        .await
+        .expect("a client lost after the bound must end the exec whose write waits on it")
+        .unwrap();
+    // A killed mock waits back Ok(None), which the bridge maps to 1.
+    assert_eq!(exit, 1);
+    assert!(
+        ctrl.was_killed(),
+        "the command is killed when its client is lost"
+    );
+    assert_eq!(*end.borrow(), Some(super::ExecEnd::ClientLost));
+    assert_eq!(held.held_bytes(), 0, "nothing stays charged");
+}
+
 /// A channel writer with the flaw of russh's `ChannelTx`, whose
 /// `poll_write` (`channels/io/tx.rs`) reuses a send it has started: a write
 /// that has to wait first takes its bytes and keeps them with the send, and
@@ -2785,7 +2877,8 @@ async fn pump_takes_the_channel_while_the_command_reads_nothing() {
 /// Past the exec's cap a running command that reads nothing for the
 /// stall ends rather than holding more: the end reason names the bound,
 /// the queue is cleared and released at once (not when the exec
-/// finishes), and the command's stdin reads EOF.
+/// finishes), and the command's stdin reads EOF. The pump does not let go
+/// of the channel at the bound: a client lost after it is still seen.
 #[tokio::test]
 async fn pump_ends_the_exec_when_the_held_input_passes_the_cap() {
     use std::time::Duration;
@@ -2816,10 +2909,6 @@ async fn pump_ends_the_exec_when_the_held_input_passes_the_cap() {
         *end_rx.borrow(),
         Some(super::ExecEnd::InputHeldOver(super::HeldBound::Exec))
     );
-    timeout(Duration::from_secs(10), pump)
-        .await
-        .expect("the pump returns")
-        .unwrap();
     assert_eq!(held.held_bytes(), 0, "cleared and released on overflow");
     assert_eq!(
         limits
@@ -2837,6 +2926,21 @@ async fn pump_ends_the_exec_when_the_held_input_passes_the_cap() {
         "nothing is fed after the clear: {}",
         got.len()
     );
+
+    // The pump goes on watching the channel: data after the bound is
+    // dropped uncharged, and a close is still seen as the client's loss.
+    msg_tx.send(data(100, 7)).unwrap();
+    msg_tx.send(russh::ChannelMsg::Close).unwrap();
+    timeout(Duration::from_secs(10), end_rx.changed())
+        .await
+        .expect("a close after the bound must still signal client loss")
+        .unwrap();
+    assert_eq!(*end_rx.borrow(), Some(super::ExecEnd::ClientLost));
+    timeout(Duration::from_secs(10), pump)
+        .await
+        .expect("the pump returns once the client is lost")
+        .unwrap();
+    assert_eq!(held.held_bytes(), 0, "nothing after the bound is charged");
 }
 
 /// Before the command starts a bound is a wait, not an end: the pump
