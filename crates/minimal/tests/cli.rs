@@ -4868,9 +4868,17 @@ async fn task_run_exits_with_held_open_stdin_pipe() {
         String::from_utf8_lossy(&stdout)
     );
     let stderr = String::from_utf8_lossy(&stderr);
+    // A task box with no requested name is `<project>-<task>-<n>`
+    // (BOX-211). The project is the tempdir's last path component.
+    let root = project.path().to_string_lossy();
+    let box_name = boxes::box_name::derived_box_name(
+        boxes::box_name::project_name_of_root(&root),
+        Some("e2e-echo"),
+        Some(1),
+    );
     assert!(
-        stderr.contains("Running task e2e-echo in box e2e-echo-1"),
-        "task run must reach its box's entrypoint: stderr={stderr}"
+        stderr.contains(&format!("Running task e2e-echo in box {box_name}")),
+        "task run must reach its box's entrypoint as {box_name}: stderr={stderr}"
     );
     // The entrypoint never started, so the client removes the box and
     // keeps nothing.

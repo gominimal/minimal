@@ -482,7 +482,7 @@ fn every_create_session_asserts_the_daemon_build() {
             "tests.rs::create_verbs_name_flag_overrides_box_name = asserts nothing",
             "tests.rs::create_verbs_name_flag_overrides_box_name = asserts nothing",
             // A unit test's request, never sent: it checks the box's name.
-            "tests.rs::created_box_name_is_the_entry_without_a_typed_name = asserts nothing",
+            "tests.rs::created_box_name_is_the_request_name_else_derived = asserts nothing",
             // A unit test's request, never sent: it checks the cleaned entry name.
             "tests.rs::entry_name_registers_and_creates_under_one_cleaned_name = asserts nothing",
             // A unit test's request, never sent: it checks the session spec's packages.
@@ -1876,11 +1876,12 @@ fn own_address_held_name_refusal_exits_2_and_names_the_holder() {
     );
 }
 
-/// BOX-163: with no `--name`, the create carries no name and the box takes
-/// its entry's name. Nothing mints `<dir>-<hex>`. A `[box] name` in the
-/// spec comes first, then `--name`.
+/// BOX-211: the name the client registers a box under is the request's
+/// name, which carries `--name` or the spec's `[box] name`, else the name
+/// the daemon derives from the project and the spec's entry. Nothing mints
+/// `<dir>-<hex>`.
 #[test]
-fn created_box_name_is_the_entry_without_a_typed_name() {
+fn created_box_name_is_the_request_name_else_derived() {
     let mut request = minimald_rpc::CreateSessionRequest::new(
         String::new(),
         paths::HostAbsPath::try_new("/home/u/code/foo").unwrap(),
@@ -1888,26 +1889,27 @@ fn created_box_name_is_the_entry_without_a_typed_name() {
         boxes::BoxPolicy::default(),
     );
     request.config.name = minimal_client::box_name::request_name(None);
-    assert_eq!(created_box_name(&request), None, "no spec, no name");
+    assert_eq!(
+        created_box_name(&request).as_deref(),
+        Some("foo"),
+        "no spec: the project name"
+    );
 
     let mut spec = mfile::spec::BoxSpec::for_session(None, spec_flags(&request));
     put_spec(&mut request, &spec).unwrap();
-    assert_eq!(
-        created_box_name(&request).as_deref(),
-        Some(mfile::spec::DEFAULT_SESSION_ENTRY)
-    );
+    assert_eq!(created_box_name(&request).as_deref(), Some("foo"));
+
+    spec.entry = "lint".to_string();
+    put_spec(&mut request, &spec).unwrap();
+    assert_eq!(created_box_name(&request).as_deref(), Some("foo-lint"));
 
     request.config.name = minimal_client::box_name::request_name(Some("api"));
     assert_eq!(created_box_name(&request).as_deref(), Some("api"));
-
-    spec.name = Some("web".to_string());
-    put_spec(&mut request, &spec).unwrap();
-    assert_eq!(created_box_name(&request).as_deref(), Some("web"));
 }
 
-/// BOX-163: the VM host row and the box carry one name. For an entry such
+/// BOX-211: the VM host row and the box carry one name. For an entry such
 /// as `My App`, the client registers the row under the name the daemon
-/// gives the box, because both sides clean the entry with one function.
+/// gives the box, because both sides derive it with one function.
 #[test]
 fn entry_name_registers_and_creates_under_one_cleaned_name() {
     let mut request = minimald_rpc::CreateSessionRequest::new(
@@ -1920,10 +1922,14 @@ fn entry_name_registers_and_creates_under_one_cleaned_name() {
     let mut spec = mfile::spec::BoxSpec::for_session(None, spec_flags(&request));
     spec.entry = "My App".to_string();
     put_spec(&mut request, &spec).unwrap();
-    assert_eq!(created_box_name(&request).as_deref(), Some("myapp"));
+    assert_eq!(created_box_name(&request).as_deref(), Some("foo-myapp"));
     assert_eq!(
-        created_box_name(&request).as_deref(),
-        Some(boxes::box_name::entry_box_name(&spec.entry).as_str()),
+        created_box_name(&request),
+        Some(boxes::box_name::create_derived_name(
+            "/home/u/code/foo",
+            request.spec.as_ref(),
+            None
+        )),
         "the row's name is the daemon's name for the entry"
     );
 }
@@ -3430,7 +3436,8 @@ fn create_verbs_name_flag_overrides_box_name() {
         "the activation marks its create before it sends it"
     );
 
-    // Without `--name`, a named session entry names the box.
+    // Without `--name` or a `[box] name`, the box takes the name the
+    // daemon derives from the project and the entry (BOX-211).
     let entries = start_entries("[sessions.dev]\n");
     let StartPlan::Session { options, .. } =
         plan_start(&typed_start(StartVerb::Session, None), &entries, true).unwrap()
@@ -3447,7 +3454,13 @@ fn create_verbs_name_flag_overrides_box_name() {
     );
     request.config.name = minimal_client::box_name::request_name(None);
     stamp_session_spec_as(&mut request, root, options.entry.as_deref(), None, None).unwrap();
-    assert_eq!(created_box_name(&request).as_deref(), Some("dev"));
+    let derived = boxes::box_name::derived_box_name(
+        boxes::box_name::project_name_of_root(root.as_str()),
+        Some("dev"),
+        None,
+    );
+    assert!(derived.ends_with("-dev"), "{derived}");
+    assert_eq!(created_box_name(&request), Some(derived));
 
     // A task entry's box takes a generated name, so `--name` is refused
     // before anything is created, not dropped.

@@ -143,6 +143,11 @@ pub(crate) fn put_task_spec(
     vpn_network_names: &[String],
 ) -> Result<(), anyhow::Error> {
     if let Some(spec) = spec {
+        if let Some(expanded) = expanded
+            && spec.name.is_none()
+        {
+            spec.name = crate::expanded_box_name(expanded);
+        }
         if let Some(expanded) = expanded {
             take_expanded_exports(spec, expanded);
             // The expansion holds the names `[defaults]` and the task's
@@ -151,6 +156,12 @@ pub(crate) fn put_task_spec(
             crate::put_expanded_spec(request, spec, expanded)?;
         } else {
             crate::put_spec(request, spec)?;
+        }
+        // BOX-211: the daemon names a box from the request alone, so the
+        // stored spec's `[box] name` goes on the request as the fresh base.
+        if request.config.name.is_none() {
+            request.config.name =
+                boxes::box_name::spec_box_name(request.spec.as_ref()).map(str::to_string);
         }
     } else {
         // An interactive task sends no spec: the task type denies a

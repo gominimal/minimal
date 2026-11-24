@@ -3981,7 +3981,8 @@ mod create_naming_tests {
     use crate::test_harness::{TestClient, TestServer, create_session_req};
 
     /// A create with no name on the request and a task spec whose entry is
-    /// `entry`, so the daemon names the box from the entry.
+    /// `entry`, so the daemon derives the box's name from the project,
+    /// `tmp`, and the entry: `tmp-<entry>` (BOX-211).
     fn entry_req(entry: &str, fresh_instance: bool) -> CreateSessionRequest {
         let mut request = create_session_req("unused", "/tmp");
         request.config.name = None;
@@ -4022,10 +4023,10 @@ mod create_naming_tests {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
         let holder = create(&mut client, &entry_req("dev", false)).await;
-        assert_eq!(name_of(&server, holder).await.as_deref(), Some("dev"));
+        assert_eq!(name_of(&server, holder).await.as_deref(), Some("tmp-dev"));
 
         let error = match client
-            .call::<CreateSession>(&create_session_req("dev", "/tmp"))
+            .call::<CreateSession>(&create_session_req("tmp-dev", "/tmp"))
             .await
         {
             CreateSessionReply::Err { error, .. } => error,
@@ -4036,9 +4037,9 @@ mod create_naming_tests {
         assert_eq!(
             refusal,
             HeldNameRefusal {
-                name: "dev".to_string(),
+                name: "tmp-dev".to_string(),
                 holder: Some(holder),
-                holder_name: "dev".to_string(),
+                holder_name: "tmp-dev".to_string(),
             }
         );
         assert_eq!(HeldNameRefusal::EXIT_CODE, 2);
@@ -4054,8 +4055,9 @@ mod create_naming_tests {
         );
     }
 
-    /// A fresh instance takes `<name>-<n>`, with the smallest `n` that no
-    /// retained record uses, while a running box holds `<name>`.
+    /// A fresh instance takes the derived `<project>-<entry>-<n>`, with the
+    /// smallest `n` that no retained record uses, while a running box
+    /// holds `<project>-<entry>`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_session_fresh_instance_takes_the_smallest_unused_suffix() {
         let server = TestServer::new().await;
@@ -4063,13 +4065,13 @@ mod create_naming_tests {
         let dev = create(&mut client, &entry_req("dev", false)).await;
         let first = create(&mut client, &entry_req("dev", true)).await;
         let second = create(&mut client, &entry_req("dev", true)).await;
-        assert_eq!(name_of(&server, dev).await.as_deref(), Some("dev"));
-        assert_eq!(name_of(&server, first).await.as_deref(), Some("dev-1"));
-        assert_eq!(name_of(&server, second).await.as_deref(), Some("dev-2"));
+        assert_eq!(name_of(&server, dev).await.as_deref(), Some("tmp-dev"));
+        assert_eq!(name_of(&server, first).await.as_deref(), Some("tmp-dev-1"));
+        assert_eq!(name_of(&server, second).await.as_deref(), Some("tmp-dev-2"));
 
         // A fresh instance with no running holder still takes a suffix.
         let web = create(&mut client, &entry_req("web", true)).await;
-        assert_eq!(name_of(&server, web).await.as_deref(), Some("web-1"));
+        assert_eq!(name_of(&server, web).await.as_deref(), Some("tmp-web-1"));
     }
 
     /// A task entry that is not a DNS label, such as `build_all`, names a
@@ -4081,10 +4083,13 @@ mod create_naming_tests {
         let build = create(&mut client, &entry_req("build_all", true)).await;
         assert_eq!(
             name_of(&server, build).await.as_deref(),
-            Some("build-all-1")
+            Some("tmp-build-all-1")
         );
         let lint = create(&mut client, &entry_req("CI.Lint", true)).await;
-        assert_eq!(name_of(&server, lint).await.as_deref(), Some("ci-lint-1"));
+        assert_eq!(
+            name_of(&server, lint).await.as_deref(),
+            Some("tmp-ci-lint-1")
+        );
     }
 }
 

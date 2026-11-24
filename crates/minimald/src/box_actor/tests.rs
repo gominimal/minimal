@@ -6458,9 +6458,10 @@ async fn a_restored_session_that_fails_to_resume_does_not_stop_the_others() {
     );
 }
 
-/// Two restored sessions whose box names fold to one hostname (two unnamed
-/// sessions whose project directories' basenames differ only in case). The
-/// restart sets both `stopped` (BOX-154). The first attach resumes its box
+/// Two restored sessions whose box names fold to one hostname: the first
+/// takes the name derived from its project, `foldapp`, and the second asks
+/// for `FoldApp` once the first is stopped. The restart sets both
+/// `stopped` (BOX-154). The first attach resumes its box
 /// and routes the name. The second attach is refused with exit status 2
 /// (BOX-025), so the name does not move.
 #[cfg(target_os = "linux")]
@@ -6470,12 +6471,20 @@ async fn a_restored_hostname_collision_is_refused_on_resume() {
     use minimald_rpc::{CreateSession, Errorable, FinalizeSession, FinalizeSessionRequest};
 
     let capture = crate::test_harness::captured_log();
-    let server = TestServer::new().await;
+    let mut server = TestServer::new().await;
     let mut client = server.connect().await;
     let mut ids = Vec::new();
-    for project in ["/x/FoldApp", "/y/foldapp"] {
+    for (project, name) in [("/x/FoldApp", None), ("/y/foldapp", Some("FoldApp"))] {
+        // The store refuses a name a running box holds, so the first box
+        // stops in a restart before the second takes the same name.
+        if !ids.is_empty() {
+            server = restart(server, client).await;
+            client = server.connect().await;
+            let manager = server.state.sessions_manager().await;
+            assert_eq!(manager.resume_active_sessions().await.unwrap(), 0);
+        }
         let mut request = crate::test_harness::create_session_req("unused", project);
-        request.config.name = None;
+        request.config.name = name.map(str::to_string);
         let id = client.call::<CreateSession>(&request).await.unwrap().id;
         crate::test_harness::unwrap_ready(
             client
@@ -6513,7 +6522,7 @@ async fn a_restored_hostname_collision_is_refused_on_resume() {
         .expect("the first attach resumes its box");
     assert_eq!(
         route_owner(&server, "foldapp.min.internal").await,
-        Some("FoldApp".to_owned()),
+        Some("foldapp".to_owned()),
         "the name routes for the resumed box"
     );
     assert_resume_refused(
@@ -6521,13 +6530,13 @@ async fn a_restored_hostname_collision_is_refused_on_resume() {
         &mut client,
         ids[1],
         RecordState::Stopped(StopEnding::AtDaemonStart),
-        &["The running session `FoldApp` holds the name `foldapp`"],
+        &["The running session `foldapp` holds the name `FoldApp`"],
         2,
     )
     .await;
     assert_eq!(
         route_owner(&server, "foldapp.min.internal").await,
-        Some("FoldApp".to_owned()),
+        Some("foldapp".to_owned()),
         "the refused resume does not move the name"
     );
     let logged = capture.contents();
@@ -6535,14 +6544,15 @@ async fn a_restored_hostname_collision_is_refused_on_resume() {
         logged
             .lines()
             .any(|line| line.contains("resume: a running box holds the name")
-                && line.contains("holder=FoldApp")),
+                && line.contains("holder=foldapp")),
         "the refusal is logged naming the holder, got: {logged}"
     );
 }
 /// Two restored sessions that share one registry name outright: two unnamed
-/// sessions whose project directories share a basename, the pair the
-/// store's name-uniqueness check never sees. The restart sets both
-/// `stopped` (BOX-154). The first attach resumes its box and routes the
+/// sessions whose project directories share a basename, so both take the
+/// derived name `twins`. The second is created while the first is
+/// stopped, which the store's name-uniqueness check allows. The restart
+/// sets both `stopped` (BOX-154). The first attach resumes its box and routes the
 /// name. The second attach is refused with exit status 2 (BOX-025), so the
 /// name does not move.
 #[cfg(target_os = "linux")]
@@ -6552,12 +6562,20 @@ async fn a_restored_session_sharing_another_sessions_registry_name_is_refused_on
     use minimald_rpc::{CreateSession, Errorable, FinalizeSession, FinalizeSessionRequest};
 
     let capture = crate::test_harness::captured_log();
-    let server = TestServer::new().await;
+    let mut server = TestServer::new().await;
     let mut client = server.connect().await;
     let mut ids = Vec::new();
-    for project in ["/a/twins", "/b/twins"] {
+    for (project, name) in [("/a/twins", None), ("/b/twins", None)] {
+        // The store refuses a name a running box holds, so the first box
+        // stops in a restart before the second takes the same name.
+        if !ids.is_empty() {
+            server = restart(server, client).await;
+            client = server.connect().await;
+            let manager = server.state.sessions_manager().await;
+            assert_eq!(manager.resume_active_sessions().await.unwrap(), 0);
+        }
         let mut request = crate::test_harness::create_session_req("unused", project);
-        request.config.name = None;
+        request.config.name = name.map(str::to_string);
         let id = client.call::<CreateSession>(&request).await.unwrap().id;
         crate::test_harness::unwrap_ready(
             client

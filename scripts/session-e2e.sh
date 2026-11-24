@@ -7150,16 +7150,21 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   mkdir -p "$TASK_SEED_DIR/sub/inner"
   : > "$TASK_SEED_DIR/sub/inner/marker"
 
+  # The project part of a task box's derived name (BOX-211): the seed
+  # directory's last component as a DNS label, so `mnlt.AbC123` is
+  # `mnlt-abc123`. mktemp fills the template with letters and digits only.
+  TASK_PROJECT_LABEL="$(basename "$TASK_SEED_DIR" | tr 'A-Z._' 'a-z--')"
+
   # task_kept_check <task> <stderr file>: the run's stderr names the kept
-  # box `<task>-<n>`, `min ls` lists it, and `min box rm` removes it. The
-  # box can still read running for a moment after the run returns, so the
-  # rm is retried briefly before it counts as a failure.
+  # box `<project>-<task>-<n>`, `min ls` lists it, and `min box rm`
+  # removes it. The box can still read running for a moment after the run
+  # returns, so the rm is retried briefly before it counts as a failure.
   task_kept_check() {
     local tk_task="$1" tk_err="$2" tk_name tk_ls tk_i
-    tk_name="$(grep -o "Kept box $tk_task-[0-9][0-9]*" "$tk_err" | head -n1)"
+    tk_name="$(grep -o "Kept box $TASK_PROJECT_LABEL-$tk_task-[0-9][0-9]*" "$tk_err" | head -n1)"
     tk_name="${tk_name#Kept box }"
     if [ -z "$tk_name" ]; then
-      echo "::error::'min task run $tk_task' did not name its kept box"
+      echo "::error::'min task run $tk_task' did not name its kept box $TASK_PROJECT_LABEL-$tk_task-<n>"
       echo "--- task stderr ---"; cat "$tk_err" 2>/dev/null || true
       fail
     fi
@@ -27051,9 +27056,13 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     fi
     echo "run: the task is inside its box and printed $PO_RUN_MARKER"
     po_task_ls="$(mnl ls 2>/dev/null)"
-    po_task_box="$(printf '%s\n' "$po_task_ls" | grep -o 'e2e-port-run-[0-9][0-9]*' | head -n1)"
+    # A task box with no requested name is `<project>-<task>-<n>` (BOX-211).
+    # Match the whole name: the bare `e2e-port-run-<n>` tail names no box,
+    # so `min box show` on it never reads the run's own state.
+    po_task_label="$(basename "$PO_TASK_SEED_DIR" | tr 'A-Z._' 'a-z--')"
+    po_task_box="$(printf '%s\n' "$po_task_ls" | grep -o "$po_task_label-e2e-port-run-[0-9][0-9]*" | head -n1)"
     if [ -z "$po_task_box" ]; then
-      echo "::error::the run's box was not listed while its task ran"
+      echo "::error::the run's box $po_task_label-e2e-port-run-<n> was not listed while its task ran"
       echo "--- min ls ---"; printf '%s\n' "$po_task_ls"
       fail
     fi
