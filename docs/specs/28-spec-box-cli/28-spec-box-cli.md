@@ -5,7 +5,7 @@ owner: mitodrummer
 epic: gominimal/inbox#731
 arch: https://github.com/gominimal/arch/blob/949521619eead5acc31a8dbb33c889ba92ff0073/architecture.md
 arch_sha: "949521619eead5acc31a8dbb33c889ba92ff0073"
-updated: 2026-11-10
+updated: 2026-11-24
 ---
 
 # BCLI — The box grammar (`min box`, the type nouns, and the migration from the session verbs)
@@ -220,6 +220,15 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     <!-- optional-feature; fails closed: withholding follows which layers set the variable, never a comparison of values, so a value that BOX-183 lets through because a project layer sets it equally is still withheld. Nothing marks a loadout literal as a secret yet, and gominimal/minimal#3210 decides how one is stored and marked, so BCLI-063 holds with no exception (Open questions) -->
     tier:   T0
     verify: cargo nextest run -p minimal box_spec_withholds_loadout_set_var_values
+
+- **BCLI-084** WHEN `min box spec <entry>` renders an expanded spec for which the expander reports BOX-231 warnings THE SYSTEM SHALL print each warning on stderr. Each warning SHALL name the variable and the layer that set it, say that its name looks like a secret's and that its value is stored as written, and name `[secrets]` as the place for a secret value.
+  <!-- event-driven; BOX-230 and BOX-231 (gominimal/minimal#3756): a loadout's literal `env_vars` value is not a secret, and the expander warns on a name that looks like one. stderr keeps stdout to the spec, so `-o json` and `-o yaml` stay parseable. The exact text is written in the plan task and pinned in the test -->
+  tier:     T0
+  verify:   cargo nextest run -p minimal box_spec_entry_prints_secret_name_warnings_on_stderr
+  - THE SYSTEM SHALL print BOX-231's warnings only from `min box spec`, and never before the box shell on an interactive start or attach.
+    <!-- ubiquitous; the AGENTS.md rule for the box shell: the shell's first paint replaces anything printed before it, so an advisory goes to a surface that stays. `min box spec` is that surface -->
+    tier:   T0
+    verify: cargo nextest run -p minimal secret_name_warnings_print_only_from_box_spec
 
 - **BCLI-078** IF expanding an entry fails under BOX-172, BOX-174, BOX-181, BOX-182, BOX-183, BOX-206 or BOX-207 THEN THE SYSTEM SHALL fail `min box spec <entry>`, `min box start`, `min box run`, `min session start` and `min task run` with exit 3, and print the error that requirement states. It SHALL create nothing and render nothing.
   <!-- unwanted; spec 29 states each refusal's content, and this requirement binds the commands that print it. What each error tells the person:
