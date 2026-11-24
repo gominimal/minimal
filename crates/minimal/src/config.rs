@@ -35,7 +35,27 @@ pub fn resolve_minimal_config_dir(global: &GlobalArgs) -> PathBuf {
 pub fn read_client_config(
     global: &GlobalArgs,
 ) -> Result<boxes::client::config::Config, anyhow::Error> {
-    Ok(read_client_and_org_config(global, false)?.0)
+    let (config, lines) = read_client_config_with_diagnostics(global)?;
+    print_lines(&lines);
+    Ok(config)
+}
+
+/// [`read_client_config`], returning the organization-file error and the
+/// refused store rules as lines for the caller to show, and printing
+/// nothing: the `min dash` TUI owns the screen. A line is returned on the
+/// first read in a process only, as [`read_client_config`] prints it.
+pub fn read_client_config_with_diagnostics(
+    global: &GlobalArgs,
+) -> Result<(boxes::client::config::Config, Vec<String>), anyhow::Error> {
+    let (config, _, lines) = read_client_and_org_config(global, false)?;
+    Ok((config, lines))
+}
+
+/// Print `lines` on stderr, one to a line.
+fn print_lines(lines: &[String]) {
+    for line in lines {
+        eprintln!("{line}");
+    }
 }
 
 /// Read the client config and the `[secret-store-rules]` of the user and
@@ -59,17 +79,20 @@ pub fn read_client_config(
 pub fn read_client_config_and_store_rules(
     global: &GlobalArgs,
 ) -> Result<(boxes::client::config::Config, StoreRules), anyhow::Error> {
-    read_client_and_org_config(global, true)
+    let (config, rules, lines) = read_client_and_org_config(global, true)?;
+    print_lines(&lines);
+    Ok((config, rules))
 }
 
 /// [`read_client_config_and_store_rules`], with an organization file that
 /// is not read or does not parse fatal only when `org_required` is set.
 /// The merge is [`boxes::client::config::read_client_store_rules`], the
-/// same one `bep serve` redeems under.
+/// same one `bep serve` redeems under. It prints nothing: the lines for the
+/// person come back last, each on its first read in a process only.
 fn read_client_and_org_config(
     global: &GlobalArgs,
     org_required: bool,
-) -> Result<(boxes::client::config::Config, StoreRules), anyhow::Error> {
+) -> Result<(boxes::client::config::Config, StoreRules, Vec<String>), anyhow::Error> {
     let user = resolve_minimal_config_dir(global).join("config.toml");
     let org_path = Path::new(ORGANIZATION_CONFIG_PATH);
     let module_hosts = store_module_hosts();
@@ -79,36 +102,38 @@ fn read_client_and_org_config(
         store_deny_set(&module_hosts),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut lines = Vec::new();
     if let Some(e) = &read.organization_error {
         if org_required {
             anyhow::bail!("{e}");
         }
-        report_org_read_error_once(e);
+        lines.extend(org_read_error_once(e));
     }
     for path in [org_path, user.as_path()] {
-        print_refusals_once(&read.refused, path);
+        lines.extend(refusals_once(&read.refused, path));
     }
-    Ok((read.config, read.rules))
+    Ok((read.config, read.rules, lines))
 }
 
-/// Print, on its first call in this process, that the organization file
-/// was not read and that its secret-store rules do not apply.
-fn report_org_read_error_once(error: &boxes::client::config::ConfigError) {
-    static PRINTED: std::sync::Once = std::sync::Once::new();
+/// On its first call in this process, the text that says the organization
+/// file was not read and that its secret-store rules do not apply.
+fn org_read_error_once(error: &boxes::client::config::ConfigError) -> Option<String> {
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     tracing::debug!(file = ORGANIZATION_CONFIG_PATH, %error, "organization config not read");
-    PRINTED.call_once(|| {
-        eprintln!(
-            "Minimal did not use {ORGANIZATION_CONFIG_PATH}: {error}\n\
-             The secret-store rules in that file do not apply to this command.\n\
-             Correct or remove {ORGANIZATION_CONFIG_PATH}, and then run the command again."
-        );
-    });
+    if REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    Some(format!(
+        "Minimal did not use {ORGANIZATION_CONFIG_PATH}: {error}\n\
+         The secret-store rules in that file do not apply to this command.\n\
+         Correct or remove {ORGANIZATION_CONFIG_PATH}, and then run the command again."
+    ))
 }
 
-/// Print the refusals in `refused` that name `path` on stderr, on the
-/// first read of `path` in this process only, and log one debug line
-/// naming each one.
-fn print_refusals_once(refused: &[boxes::core::bep::StoreRuleRefused], path: &Path) {
+/// The refusals in `refused` that name `path`, one line each, on the first
+/// read of `path` in this process only. It logs one debug line naming each
+/// one on every read.
+fn refusals_once(refused: &[boxes::core::bep::StoreRuleRefused], path: &Path) -> Vec<String> {
     static PRINTED: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
         std::sync::Mutex::new(std::collections::BTreeSet::new());
     let first = PRINTED
@@ -125,11 +150,10 @@ fn print_refusals_once(refused: &[boxes::core::bep::StoreRuleRefused], path: &Pa
             .collect::<Vec<_>>(),
         "read [secret-store-rules]"
     );
-    if first {
-        for refusal in refused {
-            eprintln!("{refusal}");
-        }
+    if !first {
+        return Vec::new();
     }
+    refused.iter().map(ToString::to_string).collect()
 }
 
 /// Read the client config at `path` and take its `[secret-store-rules]`

@@ -870,6 +870,7 @@ async fn dashboard_activate_uploads_loadout_patches() {
         initial_policy: Default::default(),
         compose_options: Default::default(),
         loadout_names: Vec::new(),
+        diagnostics: Vec::new(),
     };
     let activated = minimal::dash::rpc::activate(
         &sock,

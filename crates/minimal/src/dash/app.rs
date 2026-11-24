@@ -277,6 +277,9 @@ pub enum Msg {
         package_check_skipped: bool,
         /// The deny-all egress default binds the new box (NET-074).
         egress_deny_all_default: bool,
+        /// The project `minimal.toml`'s legacy-table hints and unknown-field
+        /// warnings, for the status line. Nothing printed them over the TUI.
+        diagnostics: Vec<String>,
     },
     /// A create paused for the undeclared non-VCS upload confirm: the
     /// background task holds the create and awaits the user's answer on
@@ -310,8 +313,9 @@ pub enum UploadAnswer {
 
 /// What a finished create task got.
 enum CreateOutcome {
-    /// The box was created and activated.
-    Created(rpc::Activated),
+    /// The box was created and activated, with the project file's hints
+    /// and warnings for the status line.
+    Created(rpc::Activated, Vec<String>),
     /// The user called the create off at the upload confirm.
     Cancelled,
 }
@@ -716,11 +720,11 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             upload,
             package_check_skipped,
             egress_deny_all_default,
+            diagnostics,
         } => {
-            model.status = Some(created_status(
-                upload,
-                package_check_skipped,
-                egress_deny_all_default,
+            model.status = Some(with_diagnostics(
+                created_status(upload, package_check_skipped, egress_deny_all_default),
+                &diagnostics,
             ));
             model.pending_focus = Some((host, id));
             vec![Effect::Refresh]
@@ -790,6 +794,19 @@ fn created_status(
         );
     }
     status
+}
+
+/// `status` with each of `diagnostics` after it, as one status line: the
+/// dashboard owns the terminal, so a line printed on stderr would land over
+/// the TUI. A line's own line breaks become spaces.
+fn with_diagnostics(status: String, diagnostics: &[String]) -> String {
+    diagnostics.iter().fold(status, |mut status, line| {
+        if !status.is_empty() {
+            status.push_str("; ");
+        }
+        status.push_str(&line.split_whitespace().collect::<Vec<_>>().join(" "));
+        status
+    })
 }
 
 fn update_key(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
@@ -1263,13 +1280,72 @@ fn show_pending_confirm(model: &mut Model, pending: &mut VecDeque<PendingConfirm
 /// `root`. The mode of that session entry is read before any loadout, as
 /// `min box start` reads it, so a sealed box reads no default loadout
 /// (BOX-171, BOX-175).
+///
+/// The load of the project's `minimal.toml` prints nothing. Its legacy-table
+/// hints and unknown-field warnings come back beside the selection, for the
+/// status line.
 fn create_loadout_selection(
     root: &camino::Utf8Path,
     entry: &str,
     loadouts: crate::loadouts::LoadoutSelection,
-) -> anyhow::Result<crate::loadouts::LoadoutSelection> {
-    let mode = crate::session_loadout_mode(root, Some(entry), &[])?;
-    Ok(crate::loadouts::gate_selection(loadouts, mode))
+) -> anyhow::Result<(crate::loadouts::LoadoutSelection, Vec<String>)> {
+    let (mode, diagnostics) = crate::session_loadout_mode_and_diagnostics(root, Some(entry), &[])?;
+    Ok((crate::loadouts::gate_selection(loadouts, mode), diagnostics))
+}
+
+/// What a dashboard create resolves on this machine before it reaches the
+/// daemon, through the same CLI helpers `min session activate` uses.
+struct PreparedCreate {
+    inputs: crate::loadouts::ActivationInputs,
+    decision: crate::UploadDecision,
+    picked: rpc::PickedEntry,
+    /// The project `minimal.toml`'s legacy-table hints and unknown-field
+    /// warnings, each once, for the status line.
+    diagnostics: Vec<String>,
+}
+
+/// The blocking half of a dashboard create of `entry` in the project at
+/// `root`: the loadout selection, the activation inputs, the picked entry
+/// and the upload decision. It prints nothing, because the TUI owns the
+/// terminal. The loads' hints and warnings come back in
+/// [`PreparedCreate::diagnostics`].
+fn prepare_create(
+    client_config: &boxes::client::config::Config,
+    global: &crate::GlobalArgs,
+    root: &camino::Utf8Path,
+    entry: String,
+    loadouts: crate::loadouts::LoadoutSelection,
+    user_policy: boxes::core::policy::UserPolicy,
+) -> anyhow::Result<PreparedCreate> {
+    let (loadouts, mut diagnostics) = create_loadout_selection(root, &entry, loadouts)?;
+    let inputs = crate::loadouts::prepare_activation_inputs_with_config(
+        client_config,
+        global,
+        root,
+        loadouts.clone(),
+        crate::loadouts::HookPrep::Enforce,
+        Some(user_policy),
+    )?;
+    crate::add_file_diagnostics(&mut diagnostics, &inputs.diagnostics);
+    // BOX-064, BOX-179: the gated loadouts again, whole, for the
+    // selected-loadouts layer of the entry's expansion, as `min session
+    // activate` reads them.
+    let picked = rpc::PickedEntry {
+        name: Some(entry),
+        selected: crate::SelectedLoadouts {
+            loadouts: crate::loadouts::resolve_active_loadouts(loadouts, client_config, global)?
+                .loadouts,
+            ignore: Some(inputs.user_policy.vars().ignore().clone()),
+        },
+        global: Some(global.clone()),
+    };
+    let decision = crate::decide_workspace_upload(root, false, std::env::home_dir().as_deref());
+    Ok(PreparedCreate {
+        inputs,
+        decision,
+        picked,
+        diagnostics,
+    })
 }
 
 /// Entry point for `min dash`: discover hosts, then drive the
@@ -1303,12 +1379,18 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
     // at each create. A default loadout that cannot be resolved fails here
     // for the same reason; the create task resolves and stages them again
     // against the create's own project root.
-    let client_config = crate::config::read_client_config(&global)?;
+    // The read prints nothing: the alternate screen would wipe it. Its lines
+    // go on the status line once the dashboard is up.
+    let (client_config, config_diagnostics) =
+        crate::config::read_client_config_with_diagnostics(&global)?;
     let user_policy = crate::config::read_user_policy(&global)?;
     crate::loadouts::resolve_active_loadouts(opts.loadouts.clone(), &client_config, &global)?;
     let mut last_rediscovery = std::time::Instant::now();
     let saved = state::load(opts.minimal_dir.as_deref());
     let mut model = Model::new(Utc::now());
+    if !config_diagnostics.is_empty() {
+        model.status = Some(with_diagnostics(String::new(), &config_diagnostics));
+    }
     model.pending_focus = saved
         .last_session_id
         .as_deref()
@@ -1518,46 +1600,23 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                                 // not stall the runtime.
                                 let (upload_root, _) =
                                     rpc::resolve_project_off_worker(abs.as_utf8_path()).await?;
-                                let (inputs, decision, picked) = {
+                                let PreparedCreate {
+                                    inputs,
+                                    decision,
+                                    picked,
+                                    diagnostics,
+                                } = {
                                     let global_blocking = global.clone();
                                     let root = upload_root.clone();
                                     tokio::task::spawn_blocking(move || {
-                                        let loadouts =
-                                            create_loadout_selection(&root, &entry, loadouts)?;
-                                        let inputs =
-                                            crate::loadouts::prepare_activation_inputs_with_config(
-                                                &client_config,
-                                                &global_blocking,
-                                                &root,
-                                                loadouts.clone(),
-                                                crate::loadouts::HookPrep::Enforce,
-                                                Some(user_policy),
-                                            )?;
-                                        // BOX-064, BOX-179: the gated loadouts
-                                        // again, whole, for the selected-loadouts
-                                        // layer of the entry's expansion, as
-                                        // `min session activate` reads them.
-                                        let picked = rpc::PickedEntry {
-                                            name: Some(entry),
-                                            selected: crate::SelectedLoadouts {
-                                                loadouts: crate::loadouts::resolve_active_loadouts(
-                                                    loadouts,
-                                                    &client_config,
-                                                    &global_blocking,
-                                                )?
-                                                .loadouts,
-                                                ignore: Some(
-                                                    inputs.user_policy.vars().ignore().clone(),
-                                                ),
-                                            },
-                                            global: Some(global_blocking),
-                                        };
-                                        let decision = crate::decide_workspace_upload(
+                                        prepare_create(
+                                            &client_config,
+                                            &global_blocking,
                                             &root,
-                                            false,
-                                            std::env::home_dir().as_deref(),
-                                        );
-                                        Ok::<_, anyhow::Error>((inputs, decision, picked))
+                                            entry,
+                                            loadouts,
+                                            user_policy,
+                                        )
                                     })
                                     .await
                                     .context("preparing the session create")??
@@ -1614,21 +1673,25 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                                     picked,
                                 )
                                 .await
-                                .map(CreateOutcome::Created)
+                                .map(|activated| CreateOutcome::Created(activated, diagnostics))
                             }
                             .await;
                             let msg = match result {
-                                Ok(CreateOutcome::Created(rpc::Activated {
-                                    id,
-                                    upload,
-                                    package_check_skipped,
-                                    egress_deny_all_default,
-                                })) => Msg::Created {
+                                Ok(CreateOutcome::Created(
+                                    rpc::Activated {
+                                        id,
+                                        upload,
+                                        package_check_skipped,
+                                        egress_deny_all_default,
+                                    },
+                                    diagnostics,
+                                )) => Msg::Created {
                                     host,
                                     id,
                                     upload,
                                     package_check_skipped,
                                     egress_deny_all_default,
+                                    diagnostics,
                                 },
                                 Ok(CreateOutcome::Cancelled) => {
                                     Msg::ActionDone(Ok("create cancelled".to_string()))
@@ -1959,7 +2022,8 @@ mod tests {
             "default",
             crate::loadouts::LoadoutSelection::Defaults,
         )
-        .expect("a sealed entry decides its mode");
+        .expect("a sealed entry decides its mode")
+        .0;
         assert!(
             matches!(selection, crate::loadouts::LoadoutSelection::None),
             "{selection:?}"
@@ -1973,11 +2037,93 @@ mod tests {
             "default",
             crate::loadouts::LoadoutSelection::Defaults,
         )
-        .expect("an open entry decides its mode");
+        .expect("an open entry decides its mode")
+        .0;
         assert!(
             crate::loadouts::resolve_active_loadouts(selection, &cfg, &global).is_err(),
             "an open create reads the broken default"
         );
+    }
+
+    /// #3529: a box created from `min dash` in a project with a top-level
+    /// `[session]` table and an unknown task field shows the legacy hint and
+    /// the unknown-field warning on the status line. The loads of the file
+    /// print nothing, so no line lands over the TUI.
+    #[test]
+    fn dash_create_with_legacy_session_puts_diagnostics_on_status_line() {
+        let project = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join(mfile::MFILE_NAME),
+            "[session]\npackages = [\"git\"]\n\n[tasks.lint]\nbash = \"true\"\ncolour = 1\n",
+        )
+        .unwrap();
+        let global = crate::GlobalArgs {
+            config_dir: Some(config.path().to_path_buf()),
+            ..Default::default()
+        };
+        let (cfg, config_lines) =
+            crate::config::read_client_config_with_diagnostics(&global).unwrap();
+        assert!(config_lines.is_empty(), "{config_lines:?}");
+        let root = camino::Utf8PathBuf::from_path_buf(project.path().to_path_buf()).unwrap();
+
+        // The create task's blocking half, as the dashboard runs it.
+        let prepared = prepare_create(
+            &cfg,
+            &global,
+            &root,
+            "default".to_string(),
+            crate::loadouts::LoadoutSelection::Defaults,
+            boxes::core::policy::UserPolicy::default(),
+        )
+        .expect("the create prepares");
+        let lines = &prepared.diagnostics;
+        assert_eq!(
+            lines.iter().filter(|l| l.starts_with("hint: ")).count(),
+            1,
+            "the [session] hint, once: {lines:?}"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.as_str() == "warning: unknown fields in task lint: colour")
+                .count(),
+            1,
+            "the warning, once: {lines:?}"
+        );
+
+        let mut model = model_with(Vec::new());
+        update(
+            &mut model,
+            Msg::Created {
+                host: "host".to_string(),
+                id: id(4),
+                upload: crate::WorkspaceUpload::Uploaded,
+                package_check_skipped: false,
+                egress_deny_all_default: false,
+                diagnostics: prepared.diagnostics.clone(),
+            },
+        );
+        let status = model.status.clone().unwrap_or_default();
+        assert!(status.starts_with("session created; hint: "), "{status}");
+        assert!(
+            status.contains("; warning: unknown fields in task lint: colour"),
+            "{status}"
+        );
+        assert!(!status.contains('\n'), "one status line: {status:?}");
+
+        // A second create of the same project shows them again: the
+        // dashboard is one long process, and each create has its own line.
+        let again = prepare_create(
+            &cfg,
+            &global,
+            &root,
+            "default".to_string(),
+            crate::loadouts::LoadoutSelection::Defaults,
+            boxes::core::policy::UserPolicy::default(),
+        )
+        .expect("the create prepares again");
+        assert_eq!(again.diagnostics, prepared.diagnostics);
     }
 
     fn id(n: u128) -> SessionId {
@@ -2049,6 +2195,7 @@ mod tests {
                 upload: crate::WorkspaceUpload::Uploaded,
                 package_check_skipped: false,
                 egress_deny_all_default: true,
+                diagnostics: Vec::new(),
             },
         );
         let status = model.status.clone().unwrap_or_default();
@@ -2069,6 +2216,7 @@ mod tests {
                 upload: crate::WorkspaceUpload::Uploaded,
                 package_check_skipped: false,
                 egress_deny_all_default: false,
+                diagnostics: Vec::new(),
             },
         );
         assert_eq!(model.status.as_deref(), Some("session created"));
@@ -2089,6 +2237,7 @@ mod tests {
                     upload,
                     package_check_skipped: false,
                     egress_deny_all_default: false,
+                    diagnostics: Vec::new(),
                 },
             );
             model.status.clone().unwrap_or_default()
