@@ -972,10 +972,6 @@ pub struct PickedEntry {
     pub(crate) selected: crate::SelectedLoadouts,
     /// Reads the client's store rules for the spec's `[secrets]` (BOX-071).
     pub(crate) global: Option<crate::GlobalArgs>,
-    /// The mode the user picked in the form's Network field, which acts as
-    /// `--network`. `None` leaves the entry's `network.mode`, as
-    /// `min box start <entry>` with no `--network` does.
-    pub(crate) network: Option<NetworkMode>,
 }
 
 impl PickedEntry {
@@ -1014,16 +1010,14 @@ fn put_picked_entry(
     let entries = crate::project_entries(&dir)?;
     let entry = crate::pick_session_start_entry(&entries, picked.name.as_deref())?.name;
     // The entry's `[network]`, `[secrets]` and Box Egress Proxy settings,
-    // through the checks `min box start` runs. A network mode the user
-    // picked in the form is the create's `--network`. An unpicked one
-    // leaves the entry's `network.mode`, and the form sets no other flag.
+    // through the checks `min box start` runs. The form's network mode is
+    // the create's `--network`, and the form sets no other flag.
     let global = picked.global.clone().unwrap_or_default();
     let mut args = crate::cli::ActivateArgs::unflagged();
-    args.network = picked
-        .network
-        .map(|mode| crate::cli::parse_network_mode(mode.word()))
-        .transpose()
-        .map_err(|error| anyhow::anyhow!(error))?;
+    args.network = Some(
+        crate::cli::parse_network_mode(request.config.network.word())
+            .map_err(|error| anyhow::anyhow!(error))?,
+    );
     let checks = crate::check_project(
         &global,
         &mut args,
@@ -2126,7 +2120,7 @@ mod tests {
     /// builds, or its refusal, and the request as the refusal leaves it.
     fn dashboard_request_for_entry_with(
         table: &str,
-        network: Option<NetworkMode>,
+        network: NetworkMode,
     ) -> (
         Result<BoxGrants, anyhow::Error>,
         CreateSessionRequest,
@@ -2142,7 +2136,7 @@ mod tests {
         let mut request = CreateSessionRequest::new(
             String::new(),
             paths::HostAbsPath::try_new(root.clone()).unwrap(),
-            network.unwrap_or(NetworkMode::HostNet),
+            network,
             BoxPolicy::default(),
         );
         let mut contribution = boxes::wire::request::WireContribution::default();
@@ -2154,7 +2148,6 @@ mod tests {
                 no_input: true,
                 ..Default::default()
             }),
-            network,
             ..PickedEntry::default()
         };
         let result = put_picked_entry(&mut request, &mut contribution, &root, &picked);
@@ -2166,7 +2159,7 @@ mod tests {
         let (result, request, contribution) = dashboard_request_for_entry_with(
             "[sessions.dev.network]\nmode = \"own_ip\"\n\n\
              [sessions.dev.network.egress]\nallow_dns_hosts = [\"github.com\"]\n",
-            None,
+            NetworkMode::OwnIp,
         );
         result.expect("an entry with network.egress is created");
         let egress = request
@@ -2183,30 +2176,15 @@ mod tests {
         assert!(contribution.entry.is_some());
     }
 
-    /// A network mode the user picked in the form is the create's
-    /// `--network`, and it replaces the entry's `network.mode`, as the
-    /// flag does.
+    /// The form's network mode is the create's `--network`, and it
+    /// replaces the entry's `network.mode`, as the flag does.
     #[test]
-    fn dashboard_create_takes_the_picked_form_network_over_the_entry_mode() {
+    fn dashboard_create_takes_the_form_network_over_the_entry_mode() {
         let (result, request, _) = dashboard_request_for_entry_with(
             "[sessions.dev.network]\nmode = \"none\"\n",
-            Some(NetworkMode::OwnIp),
+            NetworkMode::OwnIp,
         );
         result.expect("an entry whose network.mode differs is created");
-        assert_eq!(request.config.network, NetworkMode::OwnIp);
-    }
-
-    /// With no network mode picked in the form, the box takes the entry's
-    /// `network.mode` and its `network.ingress`, as `min box start <entry>`
-    /// gives them, whatever mode the request started with.
-    #[test]
-    fn dashboard_create_keeps_the_entry_mode_when_the_form_network_is_unpicked() {
-        let (result, request, _) = dashboard_request_for_entry_with(
-            "[sessions.dev.network]\nmode = \"own_ip\"\n\
-             ingress = [{ proto = \"tcp\", port = 8080 }]\n",
-            None,
-        );
-        result.expect("an own_ip entry with network.ingress is created");
         assert_eq!(request.config.network, NetworkMode::OwnIp);
     }
 
@@ -2219,7 +2197,7 @@ mod tests {
              [sessions.dev.network.bep]\nsteering = \"proxy_env\"\n\n\
              [sessions.dev.secrets.NPM_TOKEN]\nsource = \"store\"\n\
              store = \"keychain\"\nid = \"npm-token\"\n",
-            None,
+            NetworkMode::OwnIp,
         );
         let error = result.expect_err("a store reference with no rule is refused");
         assert!(format!("{error:#}").contains("npm-token"), "{error:#}");

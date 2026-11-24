@@ -92,10 +92,6 @@ pub struct CreateForm {
     pub entries_for: Option<String>,
     /// Index into [`NETWORK_MODES`].
     pub net_idx: usize,
-    /// Whether the user changed the Network field. Only a changed field
-    /// acts as `--network`, so an untouched one keeps the entry's
-    /// `network.mode`.
-    pub net_picked: bool,
     pub field: CreateField,
 }
 
@@ -120,7 +116,6 @@ impl CreateForm {
             entry_idx: 0,
             entries_for: None,
             net_idx: 0,
-            net_picked: false,
             field: CreateField::Name,
         }
     }
@@ -341,9 +336,6 @@ pub enum Effect {
         /// The session entry the form picked.
         entry: String,
         network: NetworkMode,
-        /// Whether the user picked `network` in the form, so that it acts
-        /// as `--network`.
-        network_picked: bool,
     },
     /// Suspend the TUI, attach to the session over ssh, and resume when the
     /// user detaches.
@@ -1055,17 +1047,14 @@ fn update_modal(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
                 // Left/right cycle the network mode when that field is focused.
                 (KeyCode::Left, CreateField::Network) => {
                     form.net_idx = (form.net_idx + NETWORK_MODES.len() - 1) % NETWORK_MODES.len();
-                    form.net_picked = true;
                     model.action = Some(Action::Create(form));
                 }
                 (KeyCode::Right, CreateField::Network) => {
                     form.net_idx = (form.net_idx + 1) % NETWORK_MODES.len();
-                    form.net_picked = true;
                     model.action = Some(Action::Create(form));
                 }
                 (KeyCode::Char(' '), CreateField::Network) => {
                     form.net_idx = (form.net_idx + 1) % NETWORK_MODES.len();
-                    form.net_picked = true;
                     model.action = Some(Action::Create(form));
                 }
                 // Enter advances through the fields and submits on the last.
@@ -1141,7 +1130,6 @@ fn update_modal(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
                         path: form.path.trim().to_string(),
                         entry,
                         network: NETWORK_MODES[form.net_idx],
-                        network_picked: form.net_picked,
                     }];
                 }
                 _ => {
@@ -1364,7 +1352,6 @@ fn prepare_create(
             ignore: Some(inputs.user_policy.vars().ignore().clone()),
         },
         global: Some(global.clone()),
-        network: None,
     };
     let decision = crate::decide_workspace_upload(root, false, std::env::home_dir().as_deref());
     Ok(PreparedCreate {
@@ -1590,7 +1577,6 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                     path,
                     entry,
                     network,
-                    network_picked,
                 } => match hosts.iter().find(|p| p.label == host) {
                     Some(p) => {
                         let sock = p.sock.clone();
@@ -1631,7 +1617,7 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                                 let PreparedCreate {
                                     inputs,
                                     decision,
-                                    mut picked,
+                                    picked,
                                     diagnostics,
                                 } = {
                                     let global_blocking = global.clone();
@@ -1649,10 +1635,6 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                                     .await
                                     .context("preparing the session create")??
                                 };
-                                // A mode the user picked in the form acts as
-                                // `--network`. An untouched field keeps the
-                                // entry's `network.mode`.
-                                picked.network = network_picked.then_some(network);
                                 // The undeclared non-VCS root gets the CLI's
                                 // confirm here, through the TUI, before the
                                 // session is created: a form pre-filled with
@@ -2639,33 +2621,10 @@ mod tests {
             e,
             Effect::Create {
                 network: NetworkMode::HostNet,
-                network_picked: false,
                 ..
             }
         )));
         assert!(model.action.is_none());
-    }
-
-    /// A network mode the user cycles to in the form is a picked one, which
-    /// the create applies as `--network`.
-    #[test]
-    fn create_form_marks_a_cycled_network_as_picked() {
-        let mut model = two_hosts();
-        let reads = update(&mut model, key(KeyCode::Char('n')));
-        run_reads(&mut model, reads);
-        update(&mut model, key(KeyCode::Enter)); // name -> path
-        update(&mut model, key(KeyCode::Enter)); // path -> entry
-        update(&mut model, key(KeyCode::Enter)); // entry -> network
-        update(&mut model, key(KeyCode::Right)); // host_net -> own_ip
-        let effects = update(&mut model, key(KeyCode::Enter)); // submit
-        assert!(effects.iter().any(|e| matches!(
-            e,
-            Effect::Create {
-                network: NetworkMode::OwnIp,
-                network_picked: true,
-                ..
-            }
-        )));
     }
 
     /// Runs the entry reads in `effects` here, as the run loop does on a
