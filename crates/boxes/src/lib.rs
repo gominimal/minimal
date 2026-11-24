@@ -1903,7 +1903,11 @@ pub mod box_name {
                 }
             }
         };
-        let base = if base.is_empty() { "box" } else { base.as_str() };
+        let base = if base.is_empty() {
+            "box"
+        } else {
+            base.as_str()
+        };
         format!("{base}{suffix}")
     }
 

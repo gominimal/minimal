@@ -4045,23 +4045,13 @@ async fn create_with_name_held_by_running_box_refused_exit2_names_holder() {
     let log = crate::test_harness::captured_log();
     let (state, _cache, mngr) = manager().await;
     let holder = mngr
-        .create_box_with_spec(
-            named_task("dev"),
-            Some(task_spec("dev", None)),
-            None,
-            None,
-        )
+        .create_box_with_spec(named_task("dev"), Some(task_spec("dev", None)), None, None)
         .await
         .unwrap();
 
     for asked in ["dev", "DEV"] {
         let err = mngr
-            .create_box_with_spec(
-                named_task(asked),
-                Some(task_spec("lint", None)),
-                None,
-                None,
-            )
+            .create_box_with_spec(named_task(asked), Some(task_spec("lint", None)), None, None)
             .await
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::AlreadyExists, "{err}");
@@ -4110,12 +4100,7 @@ async fn create_with_name_held_by_running_box_refused_exit2_names_holder() {
     )
     .await;
     let reuse = mngr
-        .create_box_with_spec(
-            named_task("dev"),
-            Some(task_spec("dev", None)),
-            None,
-            None,
-        )
+        .create_box_with_spec(named_task("dev"), Some(task_spec("dev", None)), None, None)
         .await
         .expect("a stopped holder leaves the name free");
     assert_ne!(reuse, holder);
@@ -4155,7 +4140,10 @@ async fn box_name_is_refused_unchanged_and_entry_is_cleaned() {
         )
         .await
         .expect("an entry name is cleaned into a label");
-    assert_eq!(record_name(&mngr, id).await.as_deref(), Some("proj-build-all"));
+    assert_eq!(
+        record_name(&mngr, id).await.as_deref(),
+        Some("proj-build-all")
+    );
 }
 
 /// BOX-163, BOX-211: a fresh instance takes the derived name and `-<n>`,
@@ -4270,12 +4258,7 @@ async fn stopped_dev_and_new_dev_keep_ids_through_rename() {
 
     // Stop a box named `dev`.
     let old = mngr
-        .create_box_with_spec(
-            named_task("dev"),
-            Some(task_spec("dev", None)),
-            None,
-            None,
-        )
+        .create_box_with_spec(named_task("dev"), Some(task_spec("dev", None)), None, None)
         .await
         .unwrap();
     assert_eq!(answers_to(&mngr, "dev").await, Some(old));
@@ -4289,12 +4272,7 @@ async fn stopped_dev_and_new_dev_keep_ids_through_rename() {
 
     // Start a new `dev`: the stopped one leaves the name free.
     let new = mngr
-        .create_box_with_spec(
-            named_task("dev"),
-            Some(task_spec("dev", None)),
-            None,
-            None,
-        )
+        .create_box_with_spec(named_task("dev"), Some(task_spec("dev", None)), None, None)
         .await
         .expect("a stopped `dev` does not hold the name");
     assert_ne!(new, old, "the new `dev` has an id of its own");
@@ -8001,12 +7979,7 @@ async fn client_and_daemon_digests_match_vectors_and_mismatch_refused() {
         let mut config = config_for(verb_type, client);
         config.name = Some(format!("golden-{n}"));
         let id = mngr
-            .create_box_with_spec(
-                config,
-                Some(wire.clone()),
-                None,
-                None,
-            )
+            .create_box_with_spec(config, Some(wire.clone()), None, None)
             .await
             .unwrap_or_else(|e| panic!("{name}: equal digests create the box: {e}"));
         let record = mngr

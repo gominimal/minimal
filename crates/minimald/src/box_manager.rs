@@ -488,7 +488,10 @@ fn creation_name(
 ) -> (String, NameSource) {
     match config.name.as_deref() {
         Some(name) => (name.to_string(), NameSource::Request),
-        None => (DerivedName::of(config, spec).name(None), NameSource::Derived),
+        None => (
+            DerivedName::of(config, spec).name(None),
+            NameSource::Derived,
+        ),
     }
 }
 
@@ -4553,10 +4556,9 @@ impl BoxManager {
                 let retained_names = retained.iter().map(String::as_str);
                 let (name, n) = match source {
                     NameSource::Request => fresh_instance_name(&base, retained_names),
-                    NameSource::Derived => fresh_derived_name(
-                        &DerivedName::of(&config, spec.as_ref()),
-                        retained_names,
-                    ),
+                    NameSource::Derived => {
+                        fresh_derived_name(&DerivedName::of(&config, spec.as_ref()), retained_names)
+                    }
                 };
                 tracing::info!(
                     base = %base,
