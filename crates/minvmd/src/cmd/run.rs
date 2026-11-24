@@ -6064,13 +6064,19 @@ mod tests {
             Err(MirrorBindError::Failed(_))
         ));
         assert_eq!(ledger.dials(unsent, 8080), None);
-        assert!(matches!(binder.bind(unsent, 8080), Err(MirrorBindError::Failed(_))));
+        assert!(matches!(
+            binder.bind(unsent, 8080),
+            Err(MirrorBindError::Failed(_))
+        ));
         requests.recv().expect("the expose after the unsent one");
         assert_eq!(ledger.dials(unsent, 8080), None);
 
         // Written and unanswered, then not sent: the note stays through the
         // unsent try, and the next answer that the switch holds it is bound.
-        assert!(matches!(binder.bind(kept, 8080), Err(MirrorBindError::Unanswered(_))));
+        assert!(matches!(
+            binder.bind(kept, 8080),
+            Err(MirrorBindError::Unanswered(_))
+        ));
         requests.recv().expect("the unanswered expose");
         assert!(matches!(
             unreachable.bind(kept, 8080),

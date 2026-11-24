@@ -12610,7 +12610,11 @@ mod tests {
             (&AFTER_UNANSWERED[..], &[true, true][..], true),
             (&AFTER_REFUSED[..], &[true, true][..], false),
             (&AFTER_UNSENT[..], &[false, true][..], false),
-            (&AFTER_UNANSWERED_THEN_UNSENT[..], &[true, false, true][..], true),
+            (
+                &AFTER_UNANSWERED_THEN_UNSENT[..],
+                &[true, false, true][..],
+                true,
+            ),
         ] {
             let dir = tempfile::TempDir::new().expect("a tempdir");
             let sock = dir.path().join("switch.sock");
@@ -12656,7 +12660,10 @@ mod tests {
             assert_eq!(bound, settled, "{reaches:?}");
             assert_eq!(
                 asked_so_far(&mut asked).len(),
-                reaches.iter().filter(|reaches_switch| **reaches_switch).count()
+                reaches
+                    .iter()
+                    .filter(|reaches_switch| **reaches_switch)
+                    .count()
             );
             assert_eq!(forwards.address_of(SHARED), settled.then_some(WAITER));
             assert!(!forwards.claim_in_flight(SHARED));
@@ -12690,7 +12697,11 @@ mod tests {
         );
         assert_eq!(forwards.address_of(SHARED), None);
         assert!(!forwards.claim_in_flight(SHARED));
-        assert_eq!(forwards.lock_waiting().len(), 1, "the forward keeps waiting");
+        assert_eq!(
+            forwards.lock_waiting().len(),
+            1,
+            "the forward keeps waiting"
+        );
 
         // The retry claims it again, as a fresh claim, and binds it.
         static ANSWERS: [(&str, &str); 1] = [("200 OK", "")];
