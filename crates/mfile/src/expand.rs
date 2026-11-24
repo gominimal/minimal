@@ -298,12 +298,10 @@ impl std::fmt::Display for SecretNameWarning {
                 f,
                 "A box from this entry stores its value as written in the box's spec. "
             )?,
-            StoredVar::Inherit => {
-                return write!(
-                    f,
-                    "The box's spec stores `{{ inherit = true }}` for it, not a value."
-                );
-            }
+            StoredVar::Inherit => write!(
+                f,
+                "The box's spec stores `{{ inherit = true }}` for it, not a value. "
+            )?,
             StoredVar::InheritWithDefault => write!(
                 f,
                 "A box from this entry stores its `default` as written in the box's spec. "
@@ -3766,7 +3764,8 @@ mod tests {
                     StoredVar::Inherit,
                     "the variable GH_TOKEN in `env_vars` has a name that looks like a \
                      secret's. `[sessions.dev]` in minimal.toml sets it. The box's spec \
-                     stores `{ inherit = true }` for it, not a value."
+                     stores `{ inherit = true }` for it, not a value. Put a secret \
+                     value in a `[secrets]` entry to keep it out of the spec."
                         .to_owned()
                 ),
                 (
