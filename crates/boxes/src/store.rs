@@ -1349,7 +1349,17 @@ fn tighten_mode(path: &std::path::Path, mode: u32) -> Result<bool, std::io::Erro
     if old & !mode == 0 {
         return Ok(false);
     }
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    // Fail closed: a path left readable by other users must not be served
+    // (BOX-232). The error names the path so the operator can fix it.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!(
+                "cannot restrict {} to owner-only (mode {old:o}): {e}",
+                path.display()
+            ),
+        )
+    })?;
     tracing::debug!(
         path = %path.display(),
         old_mode = format_args!("{old:o}"),
