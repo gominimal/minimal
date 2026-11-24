@@ -401,10 +401,10 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
   <!-- event-driven; BOX-220 takes the entry part of a derived name from the stored spec's top-level `entry` field, which BOX-229 defines -->
   tier:     T0
   verify:   cargo nextest run -p minimal create_without_name_sends_no_requested_name
-  - WHEN a create verb sends a create request THE SYSTEM SHALL include the project's name in it.
-    <!-- event-driven; BOX-220: the project's name is the project part of a derived name, and the client knows it -->
+  - WHEN a create verb sends a create request THE SYSTEM SHALL include the project's name in it, and send the expanded spec with the top-level `entry` that BOX-229 writes.
+    <!-- event-driven; BOX-220: the project's name and the entry are the two parts of a derived name, and the client knows both. The architecture's "Box names" has the client send them, and the Box Host assign the name -->
     tier:   T0
-    verify: cargo nextest run -p minimal create_request_carries_project_name
+    verify: cargo nextest run -p minimal create_request_carries_project_name_and_entry
 
 - **BCLI-081** WHERE a create verb does not attach this terminal to the box, WHEN the Box Host reports that the box took a number (BOX-221) THE SYSTEM SHALL print one line on stderr. The line SHALL name the name the box took and the name it did not get. Where a box on the host has that name, the line SHALL say so, and name that box, its state and the verb that fits it: `min session attach <name>` for a box whose spec sets `pty_enabled`, `min box restart <name>` for one whose spec sets `lifetime = "until_stopped"`, else `min box logs <name>`. It SHALL also name `min box prune`, which removes stopped boxes.
   <!-- optional-feature; the architecture's naming rule (gominimal/arch#186) announces a numbered box on stderr, and gominimal/arch#195 point 2 keeps that line off an interactive start (BCLI-082) -->
