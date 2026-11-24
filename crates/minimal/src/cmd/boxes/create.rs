@@ -2969,7 +2969,7 @@ pub(crate) fn proxy_absence(
 
 /// The file the host daemon writes the proxy's output to: `bep.log` in its
 /// host directory, beside the proxy's listener socket.
-fn proxy_log_path(minimal_dir: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+pub(crate) fn proxy_log_path(minimal_dir: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
     minimal_client::resolve_host_dir(minimal_dir, true)
         .ok()
         .map(|dir| dir.join("bep.log"))
@@ -3433,7 +3433,7 @@ fn proxy_egress(
 // Each argument is one fact the activation already holds, and a struct
 // for one caller only moves the list.
 #[allow(clippy::too_many_arguments)]
-async fn mint_into_request(
+pub(crate) async fn mint_into_request(
     request: &mut minimald_rpc::CreateSessionRequest,
     box_name: Option<&str>,
     registered_id: Option<minimald_rpc::BoxId>,
@@ -4135,8 +4135,8 @@ pub(crate) fn expanded_box_name(expanded: &toml::Table) -> Option<String> {
 /// The session entry a create starts a box from, and what its expansion
 /// reads. `min session activate`, `min box start` and the dashboard's
 /// create fill it in. [`put_session_entry`] takes the request's network and
-/// policy from the caller, and only `activate_box` sets them from the
-/// project. #3739 makes the other callers set them from the project too.
+/// policy from the caller. `activate_box` and the dashboard's create set
+/// them from the project, through [`check_project`].
 pub(crate) struct SessionEntryCreate<'a> {
     /// The directory the create runs from. The spec is read from here.
     pub(crate) dir: &'a camino::Utf8Path,
@@ -4487,6 +4487,157 @@ async fn report_expander_skew(client: &mut client::Client) {
     }
 }
 
+/// Where the project checks of a create can reach the person.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProjectPrompts {
+    /// A command line: a start with no terminal prints each legacy-key
+    /// hint, and a store rule that asks puts its question on the terminal.
+    Terminal,
+    /// `min dash`: the TUI owns the screen, so each hint goes to the log
+    /// and a store rule that asks is refused, as a start that cannot ask.
+    Dashboard,
+}
+
+/// What the project checks give a create request: its policy, and the
+/// GitHub grants and accepted store references the create mints after the
+/// box registers.
+#[derive(Debug)]
+pub(crate) struct ProjectChecks {
+    pub(crate) policy: boxes::BoxPolicy,
+    pub(crate) github_grants: Vec<String>,
+    pub(crate) store_grants: Vec<crate::mint::StoreGrant>,
+}
+
+/// The `CheckProject` step of a create from the entry `entry` of the
+/// project at `project`, which `activate_box` and the `min dash` create
+/// share: the entry's `[network]`, `[secrets]` and Box Egress Proxy
+/// settings, with the flags (`flag_overrides` and `quic443`) over them.
+/// Sets `args.network` to the box's mode, so a later
+/// [`ActivateArgs::network_mode`] gives it. Every refusal comes before
+/// anything is created.
+///
+/// # Errors
+///
+/// Fails on a `minimal.toml` that does not load, on network settings the
+/// box cannot have, and on a grant the box cannot be given.
+pub(crate) fn check_project(
+    global: &GlobalArgs,
+    args: &mut ActivateArgs,
+    project: &camino::Utf8Path,
+    entry: Option<&str>,
+    quic443: Option<boxes::core::bep::Quic443>,
+    flag_overrides: (Vec<boxes::PortMapping>, Option<boxes::EgressPolicy>),
+    prompts: ProjectPrompts,
+) -> Result<ProjectChecks, anyhow::Error> {
+    let (port_mappings, egress) = flag_overrides;
+    let (project_bep, project_secrets, project_env, project_quic443) =
+        project_bep_and_grants(project, entry)?;
+    // NET-060: the project's egress, with each field a flag names
+    // replaced by the flag.
+    let mut project_egress = project_egress(project, entry)?;
+    let (network, port_mappings) = session_box_network(args, &mut project_egress, port_mappings)?;
+    // Every later read of `args.network` sees the box's mode.
+    args.network = Some(network);
+    // A legacy key spelling still loads. A start with no terminal
+    // prints its hint, and an interactive start logs it, so no line
+    // prints before the box shell.
+    let headless = prompts == ProjectPrompts::Terminal
+        && (args.no_prompt || global.no_input || !can_prompt_interactively());
+    for hint in &project_egress.hints {
+        if headless {
+            eprintln!("{hint}");
+        } else {
+            tracing::warn!(hint = %hint, "the project's network keys use a legacy spelling");
+        }
+    }
+    let egress = session_effective_egress(project_egress, egress, network.into(), &args.egress)?;
+    tracing::debug!(
+        egress = ?egress.policy,
+        sources = ?egress.sources,
+        "the create request's effective egress"
+    );
+    let mut policy = boxes::BoxPolicy {
+        // NET-134: the lane is the box's own declaration, never a default —
+        // a box that did not ask for a credentialed upstream keeps every
+        // frame it sends to the proxy's address refused at the host-side
+        // gate, whatever its egress rules say.
+        credentialed_upstream: credentialed_upstream_for(
+            args.credentialed_upstream,
+            &project_bep,
+            &project_secrets,
+        ),
+        // BEP-018: the declared stance is a setting of every box, lane
+        // or not, so a declared `block` reaches the gate of a box with
+        // no credentialed upstream.
+        // BCLI-024: `--quic443` replaces the declared stance.
+        quic443: quic443.or(project_quic443),
+        ..network_override_policy(args, port_mappings, egress.policy)
+    };
+
+    // BEP-008/009/010/017/056: a box spec with a grant it cannot honour is
+    // refused here, before the daemon starts and before anything is created.
+    // BEP-057: the client configuration is read only when a grant needs the
+    // acknowledgement, so a box with no narrow grant never depends on it.
+    let full_breadth_acknowledged = project_secrets
+        .values()
+        .any(boxes::core::bep::SecretGrant::is_narrower_than_full)
+        && crate::config::full_breadth_acknowledged(global)?;
+    let (network, box_zone_resolver) = creation_host(daemon_host_kind(global), args);
+    refuse_unhonourable_grants(
+        network,
+        policy.egress.as_ref(),
+        &project_bep,
+        &project_secrets,
+        full_breadth_acknowledged,
+        box_zone_resolver,
+        &project_env,
+    )?;
+    // BEP-034/035/036: each store reference needs a rule that admits
+    // it, inside the box's egress, before anything is created.
+    let can_ask = prompts == ProjectPrompts::Terminal
+        && !global.no_input
+        && crate::can_prompt_interactively();
+    // BEP-032: each accepted reference gets a store handle, sealed
+    // as a `store` member at the mint below.
+    let accepted_store_rules = check_store_grants(
+        global,
+        &project_secrets,
+        network,
+        policy.egress.as_ref(),
+        can_ask,
+    )?;
+    let store_grants = store_grants(&project_secrets, &accepted_store_rules)?;
+    // BEP-062: a `dns` or `both` box resolves each accepted rule's
+    // upstream to the proxy, so the gate needs the authorities.
+    put_store_upstreams(&mut policy, &accepted_store_rules);
+    // Gatehouse §6.2, BEP-003: a GitHub grant needs a node-local
+    // proxy, and then a held sign-in. Only the item's metadata is
+    // read, and nothing asks for a sign-in.
+    let identity = crate::mint::identity_path();
+    let control = crate::mint::control_path();
+    // The proxy program is the one `min secret` names: `bep` beside
+    // the `minvmd` on PATH, unless MINVMD_BEP_BIN gives it.
+    let binary = bep::store::proxy_binary_on_path(
+        std::env::var_os(bep::store::PROXY_BIN_ENV).as_deref(),
+        std::env::var_os("PATH").as_deref(),
+    );
+    let github_grants = check_github_grants(
+        &project_secrets,
+        proxy_absence(
+            identity.as_deref(),
+            control.as_deref(),
+            binary,
+            proxy_log_path(global.minimal_dir.as_deref()),
+        ),
+        &bep::signin::HostKeychain,
+    )?;
+    Ok(ProjectChecks {
+        policy,
+        github_grants,
+        store_grants,
+    })
+}
+
 /// The activation flow that bare `min` and `min session start` share.
 /// `options` carries `offer_scaffold`, which gates the `minimal.toml`
 /// scaffold offer.
@@ -4518,104 +4669,21 @@ pub(crate) async fn activate_box(
             Ok::<_, anyhow::Error>((utf8_path, abs_path, port_mappings, egress))
         })
         .await?;
-    let (policy, github_grants, store_grants) = ActivationStep::CheckProject
+    let ProjectChecks {
+        policy,
+        github_grants,
+        store_grants,
+    } = ActivationStep::CheckProject
         .run(async {
-            let (project_bep, project_secrets, project_env, project_quic443) =
-                project_bep_and_grants(&utf8_path, options.entry.as_deref())?;
-            // NET-060: the project's egress, with each field a flag names
-            // replaced by the flag.
-            let mut project_egress = project_egress(&utf8_path, options.entry.as_deref())?;
-            let (network, port_mappings) =
-                session_box_network(&args, &mut project_egress, port_mappings)?;
-            // Every later read of `args.network` sees the box's mode.
-            args.network = Some(network);
-            // A legacy key spelling still loads. A start with no terminal
-            // prints its hint, and an interactive start logs it, so no line
-            // prints before the box shell.
-            let headless = args.no_prompt || global.no_input || !can_prompt_interactively();
-            for hint in &project_egress.hints {
-                if headless {
-                    eprintln!("{hint}");
-                } else {
-                    tracing::warn!(hint = %hint, "the project's network keys use a legacy spelling");
-                }
-            }
-            let egress =
-                session_effective_egress(project_egress, egress, network.into(), &args.egress)?;
-            tracing::debug!(
-                egress = ?egress.policy,
-                sources = ?egress.sources,
-                "the create request's effective egress"
-            );
-            let mut policy = boxes::BoxPolicy {
-                // NET-134: the lane is the box's own declaration, never a default —
-                // a box that did not ask for a credentialed upstream keeps every
-                // frame it sends to the proxy's address refused at the host-side
-                // gate, whatever its egress rules say.
-                credentialed_upstream: credentialed_upstream_for(
-                    args.credentialed_upstream,
-                    &project_bep,
-                    &project_secrets,
-                ),
-                // BEP-018: the declared stance is a setting of every box, lane
-                // or not, so a declared `block` reaches the gate of a box with
-                // no credentialed upstream.
-                // BCLI-024: `--quic443` replaces the declared stance.
-                quic443: options.quic443.or(project_quic443),
-                ..network_override_policy(&args, port_mappings, egress.policy)
-            };
-
-            // BEP-008/009/010/017/056: a box spec with a grant it cannot honour is
-            // refused here, before the daemon starts and before anything is created.
-            // BEP-057: the client configuration is read only when a grant needs the
-            // acknowledgement, so a box with no narrow grant never depends on it.
-            let full_breadth_acknowledged = project_secrets
-                .values()
-                .any(boxes::core::bep::SecretGrant::is_narrower_than_full)
-                && crate::config::full_breadth_acknowledged(global)?;
-            let (network, box_zone_resolver) = creation_host(daemon_host_kind(global), &args);
-            refuse_unhonourable_grants(
-                network,
-                policy.egress.as_ref(),
-                &project_bep,
-                &project_secrets,
-                full_breadth_acknowledged,
-                box_zone_resolver,
-                &project_env,
-            )?;
-            // BEP-034/035/036: each store reference needs a rule that admits
-            // it, inside the box's egress, before anything is created.
-            let can_ask = !global.no_input && crate::can_prompt_interactively();
-            // BEP-032: each accepted reference gets a store handle, sealed
-            // as a `store` member at the mint below.
-            let accepted_store_rules =
-                check_store_grants(global, &project_secrets, network, policy.egress.as_ref(), can_ask)?;
-            let store_grants = store_grants(&project_secrets, &accepted_store_rules)?;
-            // BEP-062: a `dns` or `both` box resolves each accepted rule's
-            // upstream to the proxy, so the gate needs the authorities.
-            put_store_upstreams(&mut policy, &accepted_store_rules);
-            // Gatehouse §6.2, BEP-003: a GitHub grant needs a node-local
-            // proxy, and then a held sign-in. Only the item's metadata is
-            // read, and nothing asks for a sign-in.
-            let identity = crate::mint::identity_path();
-            let control = crate::mint::control_path();
-            // The proxy program is the one `min secret` names: `bep` beside
-            // the `minvmd` on PATH, unless MINVMD_BEP_BIN gives it.
-            let binary = bep::store::proxy_binary_on_path(
-                std::env::var_os(bep::store::PROXY_BIN_ENV).as_deref(),
-                std::env::var_os("PATH").as_deref(),
-            );
-            let github_grants = check_github_grants(
-                &project_secrets,
-                proxy_absence(
-                    identity.as_deref(),
-                    control.as_deref(),
-                    binary,
-                    proxy_log_path(global.minimal_dir.as_deref()),
-                ),
-                &bep::signin::HostKeychain,
-            )?;
-            Ok::<_, anyhow::Error>((policy, github_grants, store_grants))
+            check_project(
+                global,
+                &mut args,
+                &utf8_path,
+                options.entry.as_deref(),
+                options.quic443,
+                (port_mappings, egress),
+                ProjectPrompts::Terminal,
+            )
         })
         .await?;
     ActivationStep::StartDaemon
