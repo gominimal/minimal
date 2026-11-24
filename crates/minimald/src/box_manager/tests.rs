@@ -216,12 +216,15 @@ async fn manager_over(state: &std::path::Path, cache: &std::path::Path) -> BoxMa
     let daemon_ctx = Arc::new(mctx::DaemonContext::init(mctx_config).unwrap());
     // `false`: these tests run the default the build ships, not the
     // opt-out.
-    BoxManager::init(
+    // The proxy identity is read under the state directory, so a proxy
+    // that publishes on the test host does not change what a test sees.
+    BoxManager::init_with_bep_identity(
         daemon_abs(&state),
         daemon_abs(&cache),
         daemon_ctx,
         switch,
         false,
+        Some(published_identity_path(&state)),
     )
     .await
     .unwrap()
@@ -6676,6 +6679,148 @@ async fn broker_secret_unenrolled_exit5() {
         assert!(line.contains("exit_code=5"), "{line}");
         assert!(line.contains("identity=\"none\""), "{line}");
     }
+}
+
+/// Publishes an identity whose root certificate is `root`, where the
+/// manager over `state` reads the node-local proxy's identity.
+fn publish_root(state: &std::path::Path, root: &str) {
+    bep::publish::Identity {
+        root_certificate: Some(root.to_owned()),
+        ..Default::default()
+    }
+    .publish(&published_identity_path(state))
+    .unwrap();
+}
+
+/// Creates a task box whose spec carries one GitHub grant, with
+/// `certificate` as the create's root certificate.
+async fn create_with_grant(
+    mngr: &BoxManagerHandle,
+    entry: &str,
+    certificate: &str,
+) -> Result<SessionId, std::io::Error> {
+    let mut config = as_task(unnamed_config());
+    config.root_certificate = Some(certificate.to_owned());
+    let secrets = serde_json_lenient::json!({ "gh": broker_secret() });
+    mngr.create_box_with_spec(config, Some(spec_with_secrets(entry, secrets)), None, None)
+        .await
+}
+
+// D3279, BOX-081: where the daemon reads the proxy's published identity, a
+// well-formed certificate that is not its root does not count as the
+// proxy's. The GitHub grant is refused with exit 5 and
+// `gatehouse_unenrolled_node`, and no record is filed. The published root
+// passes, also in another PEM line layout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_refuses_a_root_certificate_that_is_not_the_published_root() {
+    let (state, _cache, mngr) = manager().await;
+    const PUBLISHED: &str = "-----BEGIN CERTIFICATE-----\nUk9PVA==\n-----END CERTIFICATE-----\n";
+    const MADE_UP: &str = "-----BEGIN CERTIFICATE-----\nRkFLRQ==\n-----END CERTIFICATE-----\n";
+    publish_root(state.path(), PUBLISHED);
+
+    let err = create_with_grant(&mngr, "made-up", MADE_UP)
+        .await
+        .expect_err("a certificate that is not the published root is refused");
+    let refusal = unenrolled_refusal(&err).expect("the error is the un-enrolled refusal");
+    assert_eq!(refusal.exit_code(), 5);
+    assert_eq!(
+        refusal
+            .refusals
+            .iter()
+            .map(|r| r.code())
+            .collect::<Vec<_>>(),
+        vec![Some(boxes::core::bep::GATEHOUSE_UNENROLLED_NODE)]
+    );
+    assert!(
+        mngr.list_boxes(None).await.unwrap().is_empty(),
+        "a refused create files no record"
+    );
+
+    let id = create_with_grant(&mngr, "published", PUBLISHED)
+        .await
+        .expect("the published root passes");
+    assert!(
+        mngr.get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let id = create_with_grant(
+        &mngr,
+        "reflowed",
+        "-----BEGIN CERTIFICATE-----\r\nUk9P\r\nVA==\r\n-----END CERTIFICATE-----",
+    )
+    .await
+    .expect("the published root passes in another line layout");
+    assert!(
+        mngr.get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+// D3279, BOX-081: an identity file that is there but that the daemon cannot
+// use does not make the check advisory. One with no root certificate names no
+// root, and one that is not JSON names nothing. No certificate counts as the
+// proxy's root, the GitHub grant is refused with exit 5 and
+// `gatehouse_unenrolled_node`, and no record is filed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_refuses_a_root_certificate_when_the_published_identity_is_unusable() {
+    const MADE_UP: &str = "-----BEGIN CERTIFICATE-----\nRkFLRQ==\n-----END CERTIFICATE-----\n";
+    for damaged in [false, true] {
+        let (state, _cache, mngr) = manager().await;
+        let path = published_identity_path(state.path());
+        bep::publish::Identity::default().publish(&path).unwrap();
+        if damaged {
+            std::fs::write(&path, "not json").unwrap();
+        }
+        let err = create_with_grant(&mngr, "made-up", MADE_UP)
+            .await
+            .expect_err("an unusable published identity refuses the create");
+        let refusal = unenrolled_refusal(&err).expect("the error is the un-enrolled refusal");
+        assert_eq!(refusal.exit_code(), 5, "damaged: {damaged}");
+        assert_eq!(
+            refusal
+                .refusals
+                .iter()
+                .map(|r| r.code())
+                .collect::<Vec<_>>(),
+            vec![Some(boxes::core::bep::GATEHOUSE_UNENROLLED_NODE)],
+            "damaged: {damaged}"
+        );
+        assert!(
+            mngr.list_boxes(None).await.unwrap().is_empty(),
+            "damaged: {damaged}: a refused create files no record"
+        );
+    }
+}
+
+// D3279, BOX-081: with no published identity file, the daemon cannot
+// compare. The check stays advisory: any well-formed certificate passes, and
+// a malformed one is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_without_a_published_identity_checks_only_the_certificate_shape() {
+    const MADE_UP: &str = "-----BEGIN CERTIFICATE-----\nRkFLRQ==\n-----END CERTIFICATE-----\n";
+    let (_state, _cache, mngr) = manager().await;
+    let id = create_with_grant(&mngr, "made-up", MADE_UP)
+        .await
+        .unwrap_or_else(|e| panic!("a well-formed certificate passes: {e}"));
+    assert!(
+        mngr.get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let err = create_with_grant(&mngr, "malformed", "not a certificate")
+        .await
+        .expect_err("a malformed certificate is refused");
+    assert_eq!(
+        unenrolled_refusal(&err)
+            .expect("the error is the un-enrolled refusal")
+            .exit_code(),
+        5
+    );
 }
 
 // BCLI-021, BCLI-078: the daemon gets a spec from any entry, and not the
