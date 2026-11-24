@@ -7151,12 +7151,12 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   : > "$TASK_SEED_DIR/sub/inner/marker"
 
   # task_kept_check <task> <stderr file>: the run's stderr names the kept
-  # box `<task>-<n>`, `min ls` lists it, and `min box rm` removes it. The
+  # box `<project>-<task>-<n>`, `min ls` lists it, and `min box rm` removes it. The
   # box can still read running for a moment after the run returns, so the
   # rm is retried briefly before it counts as a failure.
   task_kept_check() {
     local tk_task="$1" tk_err="$2" tk_name tk_ls tk_i
-    tk_name="$(grep -o "Kept box $tk_task-[0-9][0-9]*" "$tk_err" | head -n1)"
+    tk_name="$(grep -oE "Kept box [a-z0-9-]*$tk_task-[0-9]+" "$tk_err" | head -n1)"
     tk_name="${tk_name#Kept box }"
     if [ -z "$tk_name" ]; then
       echo "::error::'min task run $tk_task' did not name its kept box"
@@ -27051,7 +27051,7 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     fi
     echo "run: the task is inside its box and printed $PO_RUN_MARKER"
     po_task_ls="$(mnl ls 2>/dev/null)"
-    po_task_box="$(printf '%s\n' "$po_task_ls" | grep -o 'e2e-port-run-[0-9][0-9]*' | head -n1)"
+    po_task_box="$(printf '%s\n' "$po_task_ls" | grep -oE '[a-z0-9-]*e2e-port-run-[0-9]+' | head -n1)"
     if [ -z "$po_task_box" ]; then
       echo "::error::the run's box was not listed while its task ran"
       echo "--- min ls ---"; printf '%s\n' "$po_task_ls"

@@ -4868,8 +4868,16 @@ async fn task_run_exits_with_held_open_stdin_pipe() {
         String::from_utf8_lossy(&stdout)
     );
     let stderr = String::from_utf8_lossy(&stderr);
+    // The box takes the name the Box Host derives from the project and the
+    // task: `<project>-e2e-echo-1` (BOX-211).
+    let project_name = project
+        .path()
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .expect("a tempdir has a UTF-8 name");
+    let box_name = boxes::box_name::derived_box_name(project_name, Some("e2e-echo"), Some(1));
     assert!(
-        stderr.contains("Running task e2e-echo in box e2e-echo-1"),
+        stderr.contains(&format!("Running task e2e-echo in box {box_name}")),
         "task run must reach its box's entrypoint: stderr={stderr}"
     );
     // The entrypoint never started, so the client removes the box and
