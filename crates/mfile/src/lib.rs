@@ -1091,9 +1091,9 @@ pub struct File {
     layout: Option<Layout>,
     /// The lines a load has for the person: the legacy-table hints and the
     /// unknown-field warnings, in the order the load found them. The load
-    /// prints none of them. The caller reads them with
-    /// [`File::diagnostics`] or [`File::diagnostics_once`] and puts them on
-    /// its own surface.
+    /// prints none of them, unless a check refuses the file or the loader
+    /// is one that owns stderr. The caller reads them with
+    /// [`File::diagnostics`] and puts them on its own surface.
     #[serde(skip)]
     diagnostics: Vec<String>,
 }
@@ -1167,46 +1167,69 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
-/// Whether this is the first time this process hands out the diagnostics of
-/// the file at `path` with this content.
+/// Whether this is the first time this process logs the diagnostics of the
+/// file at `path` with this content.
 ///
 /// One command parses the same file many times, so without this a single
-/// `min session activate` prints each line once per parse. The key holds the
-/// content as well as the path, so the long-lived `minimald` reports the lines
-/// again after the file is edited. The hash is of the bytes that produced the
-/// `File`, not a re-read: a file replaced between parse and report must not
-/// silence the report of the replacement. A file with no path is always due.
+/// load logs each line once per parse. The key holds the content as well as
+/// the path, so the long-lived `minimald` logs the lines again after the file
+/// is edited. The hash is of the bytes that produced the `File`, not a
+/// re-read: a file replaced between parse and log must not silence the log of
+/// the replacement. A file with no path is always due.
 fn diagnostics_due(path: Option<&Path>, content_hash: Option<u64>) -> bool {
     /// A file's path and the hash of its content.
     type FileKey = (PathBuf, Option<u64>);
-    static REPORTED_FILES: LazyLock<Mutex<HashSet<FileKey>>> =
+    static LOGGED_FILES: LazyLock<Mutex<HashSet<FileKey>>> =
         LazyLock::new(|| Mutex::new(HashSet::new()));
     let Some(path) = path else {
         return true;
     };
-    REPORTED_FILES
+    LOGGED_FILES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert((path.to_path_buf(), content_hash))
 }
 
+/// Logs each of `lines`, the diagnostics of the `minimal.toml` at `path`, as
+/// a warn-level record, once for each (path, content) in this process. The
+/// loaders that only the daemon calls ([`File::from_dir_within`] and the
+/// wire path's [`File::validate`]) log the lines. They print nothing, so the
+/// record in the daemon's log is where the lines stay.
+fn log_diagnostics(path: Option<&Path>, content_hash: Option<u64>, lines: &[String]) {
+    if lines.is_empty() || !diagnostics_due(path, content_hash) {
+        return;
+    }
+    let shown = path.map_or_else(|| MFILE_NAME.to_owned(), |p| p.display().to_string());
+    for line in lines {
+        tracing::warn!(file = %shown, "{line}");
+    }
+}
+
 /// Prints each of `lines`, the diagnostics of the `minimal.toml` at `file`,
-/// on stderr. A line prints on its first print in this process for that
-/// file only. A command loads its project's file many times, and each load
-/// returns the same lines, so this prints each of them once. The key holds
-/// the file's path, so two files that give the same line both print it.
-/// Only a caller that owns stderr calls this: `min dash` puts the lines on
-/// its status line instead.
-pub fn print_diagnostics(file: Option<&Path>, lines: &[String]) {
-    write_new_diagnostics(file, lines, &mut std::io::stderr());
+/// on stderr. `content_hash` is the hash of the bytes the lines came from
+/// ([`File::content_hash`]). A line prints on its first print in this
+/// process for that file and content only. A command loads its project's
+/// file many times, and each load returns the same lines, so this prints
+/// each of them once. The key holds the file's path, so two files that give
+/// the same line both print it. It holds the content too, so the long-lived
+/// `minimald` prints a line again after the file is fixed and then broken
+/// the same way. Only a caller that owns stderr calls this: `min dash` puts
+/// the lines on its status line instead.
+pub fn print_diagnostics(file: Option<&Path>, content_hash: Option<u64>, lines: &[String]) {
+    write_new_diagnostics(file, content_hash, lines, &mut std::io::stderr());
 }
 
 /// Writes to `out` each of `lines` that this process did not write yet for
-/// `file`. A line that cannot be written (a closed stderr) is not a reason
-/// to fail the command.
-fn write_new_diagnostics(file: Option<&Path>, lines: &[String], out: &mut dyn std::io::Write) {
-    /// A file's path and one of its lines.
-    type PrintedLine = (Option<PathBuf>, String);
+/// `file` with this content. A line that cannot be written (a closed stderr)
+/// is not a reason to fail the command.
+fn write_new_diagnostics(
+    file: Option<&Path>,
+    content_hash: Option<u64>,
+    lines: &[String],
+    out: &mut dyn std::io::Write,
+) {
+    /// A file's path, the hash of its content, and one of its lines.
+    type PrintedLine = (Option<PathBuf>, Option<u64>, String);
     static PRINTED: LazyLock<Mutex<HashSet<PrintedLine>>> =
         LazyLock::new(|| Mutex::new(HashSet::new()));
     if lines.is_empty() {
@@ -1219,7 +1242,7 @@ fn write_new_diagnostics(file: Option<&Path>, lines: &[String], out: &mut dyn st
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     for line in lines {
-        if printed.insert((file.clone(), line.clone())) {
+        if printed.insert((file.clone(), content_hash, line.clone())) {
             let _ = writeln!(out, "{line}");
         }
     }
@@ -1411,7 +1434,14 @@ impl File {
                 sideload.link.fixup_relative(path);
             }
         }
-        self.check(tasks)?;
+        if let Err(e) = self.check(tasks) {
+            // The legacy-table hints often explain the refusal, so they print
+            // before the caller prints the error, as a parse printed them
+            // before. Only a file with a path reaches here: a load from bytes
+            // alone prints nothing.
+            self.print_diagnostics();
+            return Err(e);
+        }
         let warnings = self.unknown_field_warnings();
         self.diagnostics.extend(warnings);
         Ok(self)
@@ -1425,24 +1455,21 @@ impl File {
         &self.diagnostics
     }
 
-    /// [`File::diagnostics`], on the first call in this process for this
-    /// file's path and content, and nothing after that. A command that loads
-    /// the same file several times prints each line once with this. A file
-    /// with no path returns its lines every time.
+    /// The hash of the bytes this file was loaded from, if it was loaded
+    /// from disk. [`print_diagnostics`] keys on it.
     #[must_use]
-    pub fn diagnostics_once(&self) -> Vec<String> {
-        if self.diagnostics.is_empty()
-            || !diagnostics_due(self.mfile_path.as_deref(), self.content_hash)
-        {
-            return Vec::new();
-        }
-        self.diagnostics.clone()
+    pub fn content_hash(&self) -> Option<u64> {
+        self.content_hash
     }
 
     /// Prints [`File::diagnostics`] on stderr, each line on its first print
-    /// in this process for this file. See [`print_diagnostics`].
+    /// in this process for this file and content. See [`print_diagnostics`].
     pub fn print_diagnostics(&self) {
-        print_diagnostics(self.mfile_path.as_deref(), &self.diagnostics);
+        print_diagnostics(
+            self.mfile_path.as_deref(),
+            self.content_hash,
+            &self.diagnostics,
+        );
     }
 
     /// Post-deserialize invariants: every declared param has a `default`,
@@ -1465,7 +1492,14 @@ impl File {
     /// directory name, or [`Error::InvalidSpecKey`] if `[session]` or a task
     /// sets a `timeout` that is not a duration.
     pub fn validate(&self) -> Result<(), Error> {
-        self.check(TaskCheck::Refuse)
+        self.check(TaskCheck::Refuse)?;
+        // The wire path prints nothing: the daemon's log keeps the warnings.
+        log_diagnostics(
+            self.mfile_path.as_deref(),
+            self.content_hash,
+            &self.unknown_field_warnings(),
+        );
+        Ok(())
     }
 
     /// [`Self::validate`], with the interactive-task and state-key refusals
@@ -1548,8 +1582,13 @@ impl File {
     /// package repository can still declare `interactive = true` tasks or
     /// such a key, and the user cannot fix that file. The project's own file
     /// gets both refusals when it loads through [`Self::from_dir`].
+    ///
+    /// Only `mip`'s package graph loads through here, and it owns stderr, so
+    /// this prints the file's diagnostics there, each once.
     pub fn from_dir_for_graph<P: AsRef<Path>>(dir: P) -> Result<Self, Error> {
-        Self::load_dir(dir.as_ref(), TaskCheck::Skip)
+        let file = Self::load_dir(dir.as_ref(), TaskCheck::Skip)?;
+        file.print_diagnostics();
+        Ok(file)
     }
 
     /// [`File::from_dir`] for a directory that someone other than the caller
@@ -1562,7 +1601,14 @@ impl File {
     /// of the file the link points at. `root` itself is trusted.
     pub fn from_dir_within<P: AsRef<Path>>(root: P) -> Result<Self, Error> {
         let root = root.as_ref();
-        Self::load_dir_by(root, TaskCheck::Refuse, Reader::Within(root))
+        let file = Self::load_dir_by(root, TaskCheck::Refuse, Reader::Within(root))?;
+        // Only the daemon reads a box's workspace. Its log keeps the lines.
+        log_diagnostics(
+            file.mfile_path.as_deref(),
+            file.content_hash,
+            &file.diagnostics,
+        );
+        Ok(file)
     }
 
     fn load_dir(dir: &Path, tasks: TaskCheck) -> Result<Self, Error> {
@@ -4682,37 +4728,104 @@ mod tests {
         assert!(hook.description().is_some());
     }
 
-    /// The once-per-path dedup of the diagnostics must key on (path,
-    /// content), not path alone: a long-lived process loads the same file
-    /// repeatedly, and an edited file must warn again. This test loads the
-    /// file through `from_dir` and counts the warnings `diagnostics_once`
-    /// hands out.
+    /// The once-per-path dedup of the warn-level log must key on (path,
+    /// content), not path alone: a long-lived process validates the same
+    /// file repeatedly, and an edited file must warn again. This test drives
+    /// the public `validate` path and counts the warnings it logs.
     #[test]
-    fn diagnostics_once_rewarns_when_file_content_changes() {
+    fn validate_rewarns_when_file_content_changes() {
         let dir = tempdir().unwrap();
         let path = dir.path().join(MFILE_NAME);
 
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
         let warned = |contents: &str| {
             std::fs::write(&path, contents).unwrap();
             let file = File::from_dir(dir.path()).unwrap();
             file.validate().unwrap();
-            file.diagnostics_once()
-                .iter()
-                .filter(|line| line.contains("unknown fields in"))
+            capture
+                .contents()
+                .lines()
+                .filter(|line| line.contains("WARN") && line.contains("unknown fields in"))
                 .count()
         };
 
-        // The first load of a file with an unknown field warns once.
+        // The first validation of a file with an unknown field warns once.
         assert_eq!(warned("[unknown_top_level]\nkey = \"v\"\n"), 1);
 
-        // A second load of the unchanged file does not warn again.
-        assert_eq!(warned("[unknown_top_level]\nkey = \"v\"\n"), 0);
+        // A second validation of the unchanged file does not warn again.
+        assert_eq!(warned("[unknown_top_level]\nkey = \"v\"\n"), 1);
 
         // Editing the file (new content) warns again.
         assert_eq!(
             warned("[unknown_top_level]\nkey = \"v\"\nother = \"w\"\n"),
-            1
+            2
         );
+        drop(guard);
+    }
+
+    /// The daemon's confined read of a box's workspace prints nothing and
+    /// keeps a warn-level log record of the file's diagnostics.
+    #[test]
+    fn from_dir_within_logs_the_diagnostics_at_warn() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MFILE_NAME),
+            "[tasks.lint]\nbash = \"true\"\ncolour = 1\n",
+        )
+        .unwrap();
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        File::from_dir_within(dir.path()).expect("the file reads");
+        drop(guard);
+        let log = capture.contents();
+        assert!(
+            log.lines()
+                .any(|l| l.contains("WARN") && l.contains("unknown fields in task lint: colour")),
+            "{log}"
+        );
+    }
+
+    /// The `mip` graph load prints the file's diagnostics, and a load that a
+    /// check refuses prints the legacy-table hints before the error. Each
+    /// print goes through the shared once-per-line set, so a later write of
+    /// the same lines for the same file and content writes nothing.
+    #[test]
+    fn graph_load_and_refused_load_print_the_hints() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+        std::fs::write(&path, "[session]\npackages = [\"git\"]\n").unwrap();
+        let graph = File::from_dir_for_graph(dir.path()).expect("the file reads");
+        let mut printed = Vec::new();
+        write_new_diagnostics(
+            Some(&path),
+            graph.content_hash(),
+            graph.diagnostics(),
+            &mut printed,
+        );
+        assert!(printed.is_empty(), "the graph load printed them");
+
+        // `[harness]` fails the check after the parse found the hint.
+        let refused = b"[session]\npackages = [\"git\"]\n\n[harness]\nuse = \"rust\"\n";
+        std::fs::write(&path, refused).unwrap();
+        let err = File::from_dir(dir.path()).unwrap_err();
+        assert!(matches!(err, Error::HarnessTable(_)), "{err:?}");
+        let hints = File::from_toml_bytes(refused)
+            .unwrap()
+            .diagnostics()
+            .to_vec();
+        assert_eq!(hints.len(), 1, "{hints:?}");
+        let mut printed = Vec::new();
+        write_new_diagnostics(Some(&path), Some(hash_bytes(refused)), &hints, &mut printed);
+        assert!(printed.is_empty(), "the refused load printed the hint");
     }
 
     /// `[harness]` is the pre-v0.5.0 name of `[stack]` and no longer parses:
@@ -5126,8 +5239,8 @@ mod tests {
     /// #3529: a parse keeps the legacy-table hints and the unknown-field
     /// warnings on the `File` and prints nothing, so a caller that owns the
     /// screen (the `min dash` TUI) can put them on its own surface. Every
-    /// load returns them; `diagnostics_once` hands them out once. The CLI's
-    /// print dedups on the file path and the line.
+    /// load returns them. The CLI's print dedups on the file path, its
+    /// content and the line.
     #[test]
     fn legacy_hints_are_returned_not_printed() {
         let dir = tempdir().unwrap();
@@ -5166,15 +5279,18 @@ mod tests {
         );
         assert_eq!(second.diagnostics(), lines, "every load returns them");
 
-        assert_eq!(first.diagnostics_once(), lines);
-        assert!(second.diagnostics_once().is_empty(), "handed out once");
-
-        // The CLI's print writes each line once for each file. A second
-        // file that gives the same lines prints them too.
+        // The CLI's print writes each line once for each file and content.
+        // A second file that gives the same lines prints them too.
         let mut printed = Vec::new();
-        write_new_diagnostics(first.file_path().map(PathBuf::as_path), lines, &mut printed);
+        write_new_diagnostics(
+            first.file_path().map(PathBuf::as_path),
+            first.content_hash(),
+            lines,
+            &mut printed,
+        );
         write_new_diagnostics(
             second.file_path().map(PathBuf::as_path),
+            second.content_hash(),
             lines,
             &mut printed,
         );
@@ -5192,6 +5308,21 @@ mod tests {
         let mut printed = Vec::new();
         write_new_diagnostics(
             other.file_path().map(PathBuf::as_path),
+            other.content_hash(),
+            &lines[..1],
+            &mut printed,
+        );
+        assert_eq!(
+            String::from_utf8(printed).unwrap(),
+            format!("{}\n", lines[0])
+        );
+
+        // The same file with other content prints the same line again: the
+        // daemon warns again after a file is fixed and broken the same way.
+        let mut printed = Vec::new();
+        write_new_diagnostics(
+            first.file_path().map(PathBuf::as_path),
+            first.content_hash().map(|hash| hash.wrapping_add(1)),
             &lines[..1],
             &mut printed,
         );
@@ -5203,7 +5334,6 @@ mod tests {
         // A parse with no path keeps the hint too.
         let bare = File::from_toml_bytes(b"[session]\npackages = [\"git\"]\n").unwrap();
         assert_eq!(bare.diagnostics().len(), 1, "{:?}", bare.diagnostics());
-        assert_eq!(bare.diagnostics_once(), bare.diagnostics());
     }
 
     /// Reads `body` as a project's `minimal.toml` and returns the warnings

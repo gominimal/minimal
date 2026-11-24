@@ -993,6 +993,7 @@ fn command_project_dir(global: &GlobalArgs) -> Result<camino::Utf8PathBuf, anyho
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileDiagnostics {
     file: Option<std::path::PathBuf>,
+    content_hash: Option<u64>,
     lines: Vec<String>,
 }
 
@@ -1008,6 +1009,7 @@ impl FileDiagnostics {
     pub(crate) fn add(&mut self, file: &mfile::File) {
         if self.file.is_none() {
             self.file = file.file_path().cloned();
+            self.content_hash = file.content_hash();
         }
         add_file_diagnostics(&mut self.lines, file.diagnostics());
     }
@@ -1018,9 +1020,9 @@ impl FileDiagnostics {
     }
 
     /// Prints the lines on stderr, each on its first print in this process
-    /// for this file.
+    /// for this file and content.
     pub(crate) fn print(&self) {
-        mfile::print_diagnostics(self.file.as_deref(), &self.lines);
+        mfile::print_diagnostics(self.file.as_deref(), self.content_hash, &self.lines);
     }
 }
 
