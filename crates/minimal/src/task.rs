@@ -483,7 +483,7 @@ pub(crate) fn misplaced_run_flag<'a>(typed: &[String], args: &'a [String]) -> Op
 /// before any `--` ([`misplaced_run_flag`] reads `typed` and `args` the
 /// same way). Neither `min task run` (BCLI-042) nor `min box run`
 /// (BCLI-026) takes `--path`, but clap reads every token after the entry's
-/// name as an argument, so `min box run build --path sub/dir` parses. The
+/// name as an argument, so a `--path` after `min box run build` parses. The
 /// run refuses it, as the parser refuses `--path` before the entry's name.
 pub(crate) fn removed_task_path_flag<'a>(typed: &[String], args: &'a [String]) -> Option<&'a str> {
     let before_args = typed

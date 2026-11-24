@@ -963,8 +963,8 @@ async fn removed_session_verbs_fail_as_unknown_commands() {
         no_input: true,
         ..Default::default()
     };
-    // BCLI-026: `min box run` refuses `--path` after the entry's name the
-    // same way, and the refusal names `min box run`.
+    // BCLI-026: the box verb refuses a `--path` after the entry's name the
+    // same way, and its refusal names the box verb.
     for (argv, flag, verb) in [
         (
             &["min", "task", "run", "build", "--path", "sub/dir"][..],
