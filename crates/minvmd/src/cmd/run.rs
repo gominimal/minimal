@@ -527,10 +527,17 @@ const MIRROR_SWITCH_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// forwarder answers are one status line and a short body.
 const MIRROR_SWITCH_MAX_ANSWER: usize = 16 * 1024;
 
-/// The body gvproxy's forwarder answers an expose with when it already
-/// holds a forward at the listener: the goal state holds.
+/// How the body starts that gvproxy's forwarder answers an expose with when
+/// it already holds a forward at the listener (it goes on to name the
+/// protocol and the listener): the goal state holds.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 const SWITCH_ALREADY_BOUND: &str = "proxy already running";
+
+/// Whether the body of a 500 says the switch already holds the forward.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn switch_already_bound(answer: &str) -> bool {
+    answer.trim_start().starts_with(SWITCH_ALREADY_BOUND)
+}
 
 /// The body gvproxy's forwarder answers an unexpose with when it holds no
 /// forward at the listener: the goal state holds.
@@ -579,7 +586,7 @@ impl crate::box_registry::MirrorBinder for SwitchMirrorBinder {
         );
         let result = match post_switch_forwarder(&self.switch_sock, "expose", &body) {
             Ok((status, _)) if (200..300).contains(&status) => Ok(()),
-            Ok((500, answer)) if answer.trim() == SWITCH_ALREADY_BOUND => Ok(()),
+            Ok((500, answer)) if switch_already_bound(&answer) => Ok(()),
             Ok((_, answer)) if answer.contains("address already in use") => {
                 Err(MirrorBindError::Occupied)
             }
@@ -3125,7 +3132,7 @@ pub(crate) fn proxy_reclaim_publisher(
         );
         let result = match post_switch_forwarder(&switch_sock, "expose", &body) {
             Ok((status, _)) if (200..300).contains(&status) => Ok(()),
-            Ok((500, answer)) if answer.trim() == SWITCH_ALREADY_BOUND && !noted => Ok(()),
+            Ok((500, answer)) if switch_already_bound(&answer) && !noted => Ok(()),
             Ok((status, answer)) => Err(format!(
                 "the switch answered the expose with HTTP {status}: {:?}",
                 answer.trim()
@@ -3927,6 +3934,19 @@ mod tests {
             crate::box_registry::home_proxy_control().as_deref()
         );
         assert!(registry.proxy_control().is_some());
+    }
+
+    #[test]
+    fn the_switchs_whole_answer_for_a_held_listener_is_recognised() {
+        use super::switch_already_bound;
+        assert!(switch_already_bound(
+            "proxy already running for tcp on 100.64.0.2:8080\n"
+        ));
+        assert!(switch_already_bound("proxy already running\n"));
+        assert!(!switch_already_bound(
+            "listen tcp :8080: bind: address already in use\n"
+        ));
+        assert!(!switch_already_bound(""));
     }
 
     #[cfg(not(minvmd_libkrun))]

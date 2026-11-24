@@ -98,11 +98,18 @@ pub(crate) const CHALLENGE_WINDOW: Duration = Duration::from_millis(500);
 /// already holds.
 const NOT_BOUND_BODY: &str = "proxy not found";
 
-/// The body gvproxy answers an expose with when a forward is already bound
-/// at the listener (`PortsForwarder::Expose`, as an HTTP 500). The gate
-/// answers a publish it holds back with the same status and body
-/// ([`held_answer`]), so the guest reads what the switch itself would say.
+/// How the body starts that gvproxy answers an expose with when a forward is
+/// already bound at the listener (`PortsForwarder::Expose`, as an HTTP 500):
+/// the switch goes on to name the protocol and the listener. The gate answers
+/// a publish it holds back with the same status and these words
+/// ([`held_answer`]).
 const ALREADY_BOUND_BODY: &str = "proxy already running";
+
+/// Whether an expose's answer says the switch already holds a forward at the
+/// listener.
+fn already_bound(status: u16, body: &str) -> bool {
+    status == 500 && body.trim_start().starts_with(ALREADY_BOUND_BODY)
+}
 
 /// The whole answer gvproxy gives an expose of a listener it already holds,
 /// as the daemon's client reads it: the status, and a body framed by its
@@ -559,7 +566,7 @@ pub(crate) async fn expose(
     let body = String::from_utf8_lossy(&body);
     if (200..300).contains(&status) {
         Ok(Exposed::Bound)
-    } else if status == 500 && body.trim() == ALREADY_BOUND_BODY {
+    } else if already_bound(status, &body) {
         Ok(Exposed::AlreadyBound)
     } else {
         Err(ExposeError::Refused {
@@ -828,6 +835,26 @@ pub(crate) async fn inject(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn the_switchs_whole_answer_for_a_held_listener_reads_as_already_bound() {
+        assert!(already_bound(
+            500,
+            "proxy already running for tcp on 127.0.0.1:8080\n"
+        ));
+        assert!(already_bound(
+            500,
+            "proxy already running for udp on 127.0.64.3:53\n"
+        ));
+        // The gate's own answer for a publish it holds back.
+        assert!(already_bound(500, "proxy already running\n"));
+        assert!(!already_bound(
+            500,
+            "listen tcp 127.0.0.1:8080: bind: address already in use\n"
+        ));
+        assert!(!already_bound(404, "proxy already running\n"));
+        assert!(!already_bound(500, ""));
+    }
     use tracing::Instrument as _;
 
     const BOX: [u8; 4] = [100, 64, 0, 9];
