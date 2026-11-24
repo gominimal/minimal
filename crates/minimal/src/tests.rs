@@ -2070,7 +2070,7 @@ fn no_provider_defaults_to_the_host_backend() {
 #[test]
 fn session_list_spellings_reach_box_list() {
     use clap::Parser as _;
-    let list_args = |args: &[&str]| -> BoxListArgs {
+    let list_args = |args: &[&str]| -> TypedBoxListArgs {
         match Cli::try_parse_from(args).unwrap().command {
             Some(Command::Session(SessionArgs {
                 command: SessionCommand::List(a),
@@ -16013,6 +16013,7 @@ async fn typed_list_on_hosts(
         box_type,
         verb: "test list",
         project_root,
+        parent: None,
         output: None,
     };
     cmd::typed_box_list_on_hosts(hosts, request, out, err).await
@@ -16064,14 +16065,30 @@ async fn type_noun_verbs_alias_box_forms() {
                 "`min {noun} {verb}` exists"
             );
         }
-        // The list, stop and rm forms take the flags of the `min box` form.
-        for verb in ["list", "stop", "rm"] {
+        // The list form takes the flags of `min box list` except `--type`,
+        // which the noun fixes.
+        let mut box_list = arg_ids(&["box", "list"]);
+        box_list.retain(|id| id != "box_type");
+        assert_eq!(
+            arg_ids(&[noun, "list"]),
+            box_list,
+            "`min {noun} list` takes the arguments of `min box list` but `--type`"
+        );
+        // The stop and rm forms take the flags of the `min box` form.
+        for verb in ["stop", "rm"] {
             assert_eq!(
                 arg_ids(&[noun, verb]),
                 arg_ids(&["box", verb]),
                 "`min {noun} {verb}` takes the arguments of `min box {verb}`"
             );
         }
+    }
+    {
+        use clap::Parser as _;
+        assert!(
+            Cli::try_parse_from(["min", "session", "list", "--type", "task"]).is_err(),
+            "`min session list --type task` does not parse"
+        );
     }
 
     let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
@@ -26520,7 +26537,7 @@ fn box_verbs_exist_with_arch_flags() {
     // The architecture's flags that are not in the model yet, each with the
     // issue that delivers it. When one of them lands, this test fails until
     // the flag moves from this table to `expected`.
-    const DEFERRED_ARCH_FLAGS: [(&str, &str, &str); 5] = [
+    const DEFERRED_ARCH_FLAGS: [(&str, &str, &str); 3] = [
         (
             "run",
             "--name",
@@ -26535,16 +26552,6 @@ fn box_verbs_exist_with_arch_flags() {
             "run",
             "--loadout",
             "https://github.com/gominimal/minimal/issues/3237",
-        ),
-        (
-            "list",
-            "--type",
-            "https://github.com/gominimal/minimal/issues/3714",
-        ),
-        (
-            "list",
-            "--parent",
-            "https://github.com/gominimal/minimal/issues/3714",
         ),
     ];
 
@@ -26568,7 +26575,7 @@ fn box_verbs_exist_with_arch_flags() {
             "run",
             &["--detach", "--network", "--no-loadouts", "--no-hooks"],
         ),
-        ("list", &["--all", "--output"]),
+        ("list", &["--all", "--type", "--parent", "--output"]),
         ("show", &["--network", "--output"]),
         ("spec", &["--output", "--network", "--loadout"]),
         ("stop", &["--force", "--exec"]),
@@ -26634,6 +26641,7 @@ fn box_verbs_exist_with_arch_flags() {
             "a",
         ],
         &["box", "list", "--all", "-o", "json"],
+        &["box", "list", "--type", "task", "--parent", "web"],
         &["box", "show", "web", "--network", "-o", "json"],
         &["box", "spec", "web", "-o", "yaml"],
         &["box", "spec"],
