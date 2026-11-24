@@ -963,23 +963,41 @@ async fn removed_session_verbs_fail_as_unknown_commands() {
         no_input: true,
         ..Default::default()
     };
-    for (argv, flag) in [
+    // BCLI-026: `min box run` refuses `--path` after the entry's name the
+    // same way, and the refusal names `min box run`.
+    for (argv, flag, verb) in [
         (
             &["min", "task", "run", "build", "--path", "sub/dir"][..],
             "--path",
+            "task",
         ),
-        (&["min", "task", "run", "build", "--path=sub/dir"], "--path"),
+        (
+            &["min", "task", "run", "build", "--path=sub/dir"],
+            "--path",
+            "task",
+        ),
+        (
+            &["min", "box", "run", "build", "--path", "sub/dir"],
+            "--path",
+            "box",
+        ),
+        (
+            &["min", "box", "run", "build", "--path=sub/dir"],
+            "--path",
+            "box",
+        ),
     ] {
         let cli = Cli::try_parse_from(argv).unwrap_or_else(|err| panic!("{argv:?}: {err}"));
-        let Some(Command::Task(TaskArgs {
-            command: TaskCommand::Run(run),
-        })) = cli.command
-        else {
-            panic!("{argv:?} parses as a task run");
-        };
-        let err = task::cmd_task_run(&global, run)
-            .await
-            .expect_err("a task run with --path is refused");
+        let err = match cli.command {
+            Some(Command::Task(TaskArgs {
+                command: TaskCommand::Run(run),
+            })) => task::cmd_task_run(&global, run).await,
+            Some(Command::Box(BoxArgs {
+                command: BoxCommand::Run(run),
+            })) => task::cmd_box_run(&global, run).await,
+            _ => panic!("{argv:?} parses as a task run or a box run"),
+        }
+        .expect_err("a run with --path is refused");
         let refusal = err
             .downcast_ref::<task::RunFlagMisplaced>()
             .unwrap_or_else(|| panic!("{argv:?}: {err:#}"));
@@ -987,9 +1005,9 @@ async fn removed_session_verbs_fail_as_unknown_commands() {
         assert_eq!(
             refusal.to_string(),
             format!(
-                "Cannot run build: min task run has no {flag} flag. Run min -C <dir> task run \
-                 build to run the task in the project at <dir>, or put -- between build and \
-                 its arguments to pass {flag} to the task."
+                "Cannot run build: min {verb} run has no {flag} flag. Run min -C <dir> {verb} \
+                 run build to run the task in the project at <dir>, or put -- between build \
+                 and its arguments to pass {flag} to the task."
             ),
             "{argv:?}"
         );
