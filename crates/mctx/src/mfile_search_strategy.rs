@@ -20,8 +20,16 @@ pub enum MFileSearchStrategy {
 }
 
 impl MFileSearchStrategy {
-    /// Find the mfile according to the strategy
+    /// Find the mfile according to the strategy. It prints the file's
+    /// legacy-table hints and unknown-field warnings on stderr, each once
+    /// for the file.
     pub fn find_mfile(&self) -> Result<mfile::File, Error> {
+        let file = self.load_mfile()?;
+        file.print_diagnostics();
+        Ok(file)
+    }
+
+    fn load_mfile(&self) -> Result<mfile::File, Error> {
         match self {
             Self::Override(path) => mfile::File::from_dir(path).map_err(|e| e.into()),
             Self::Within(root) => mfile::File::from_dir_within(root).map_err(Error::MFile),

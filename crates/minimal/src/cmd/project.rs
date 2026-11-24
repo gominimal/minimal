@@ -86,19 +86,52 @@ pub(crate) fn offer_mfile_scaffold(
 /// config inside the session workspace. Any other mfile error (malformed
 /// TOML, I/O) is propagated: a broken config in an ancestor should fail
 /// loudly rather than silently uploading a subdir with no config.
+///
+/// It prints the file's legacy-table hints and unknown-field warnings on
+/// stderr. `min dash` calls [`resolve_upload_root_quiet`] instead.
 pub(crate) fn resolve_upload_root(
     dir: &camino::Utf8Path,
 ) -> Result<camino::Utf8PathBuf, anyhow::Error> {
-    match mfile::File::from_dir_recursive(dir.as_std_path()) {
-        Ok(f) => match f.repo_path() {
-            Some(root) => Ok(camino::Utf8PathBuf::from_path_buf(root.to_path_buf())
-                .unwrap_or_else(|_| dir.to_path_buf())),
-            None => Ok(dir.to_path_buf()),
-        },
-        Err(mfile::Error::NotFound) => Ok(dir.to_path_buf()),
-        Err(e) => Err(anyhow::anyhow!(
-            "found a broken {name} while walking up from {dir}: {e}",
-            name = mfile::MFILE_NAME,
+    let (root, diagnostics) =
+        resolve_upload_root_and_diagnostics(dir).map_err(crate::print_file_refusal)?;
+    diagnostics.print();
+    Ok(root)
+}
+
+/// [`resolve_upload_root`], for a caller that owns the screen. It prints
+/// nothing. A refused file's hints come back on a [`crate::FileRefusal`].
+pub(crate) fn resolve_upload_root_quiet(
+    dir: &camino::Utf8Path,
+) -> Result<camino::Utf8PathBuf, anyhow::Error> {
+    Ok(resolve_upload_root_and_diagnostics(dir)?.0)
+}
+
+/// [`resolve_upload_root`], with the lines the load of the file has for
+/// the person. It prints nothing. A refused file's hints come back on a
+/// [`crate::FileRefusal`].
+fn resolve_upload_root_and_diagnostics(
+    dir: &camino::Utf8Path,
+) -> Result<(camino::Utf8PathBuf, crate::FileDiagnostics), anyhow::Error> {
+    match mfile::File::from_dir_recursive_quiet(dir.as_std_path()) {
+        Ok(f) => {
+            let diagnostics = crate::FileDiagnostics::of(&f);
+            let root = match f.repo_path() {
+                Some(root) => camino::Utf8PathBuf::from_path_buf(root.to_path_buf())
+                    .unwrap_or_else(|_| dir.to_path_buf()),
+                None => dir.to_path_buf(),
+            };
+            Ok((root, diagnostics))
+        }
+        Err(refusal) if matches!(refusal.error(), mfile::Error::NotFound) => {
+            Ok((dir.to_path_buf(), crate::FileDiagnostics::default()))
+        }
+        Err(refusal) => Err(crate::FileRefusal::wrap(
+            anyhow::anyhow!(
+                "found a broken {name} while walking up from {dir}: {e}",
+                name = mfile::MFILE_NAME,
+                e = refusal.error(),
+            ),
+            &refusal,
         )),
     }
 }
@@ -114,7 +147,9 @@ pub(crate) fn resolve_upload_root(
 /// this runs, so any load error here can only mean "no readable hooks to
 /// lose" and maps to zero rather than a second failure surface.
 pub(crate) fn project_lifecycle_hook_count(root: &camino::Utf8Path) -> usize {
-    match mfile::File::from_dir(root.as_std_path()) {
+    // Quiet: `min dash` calls this too, and the load before it printed or
+    // returned any hint.
+    match mfile::File::from_dir_quiet(root.as_std_path()) {
         Ok(file) => file.session.map_or(0, |s| s.lifecycle_hooks.len()),
         Err(_) => 0,
     }
@@ -929,9 +964,12 @@ fn find_init_mfile(
         mfile::File::from_dir(dir)
     };
     match found {
-        Ok(file) => file.file_path().cloned().ok_or_else(|| {
-            anyhow::anyhow!("the minimal.toml found from {} has no path", dir.display())
-        }),
+        Ok(file) => {
+            file.print_diagnostics();
+            file.file_path().cloned().ok_or_else(|| {
+                anyhow::anyhow!("the minimal.toml found from {} has no path", dir.display())
+            })
+        }
         Err(mfile::Error::NotFound) => Err(InitRefusal {
             code: 1,
             message: format!(

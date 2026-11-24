@@ -1089,6 +1089,13 @@ pub struct File {
     /// What layout this repo/layer is using, if loaded from disk.
     #[serde(skip)]
     layout: Option<Layout>,
+    /// The lines a load has for the person: the legacy-table hints and the
+    /// unknown-field warnings, in the order the load found them. The load
+    /// prints none of them, unless a check refuses the file or the loader
+    /// is one that owns stderr. The caller reads them with
+    /// [`File::diagnostics`] and puts them on its own surface.
+    #[serde(skip)]
+    diagnostics: Vec<String>,
 }
 
 /// The entry keys that `[session]` and a task keep among their unknown
@@ -1160,24 +1167,179 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
-/// Whether to print the legacy-table hints for this read of a file.
+/// Whether this is the first time this process logs the diagnostics of the
+/// file at `path` with this content.
 ///
 /// One command parses the same file many times, so without this a single
-/// `min session activate` prints each hint once per parse. A file's hints
-/// print the first time this process reads a given (path, content). The
-/// key holds the content as well as the path, as in
-/// [`File::warn_unknown_fields`], so the long-lived `minimald` prints them
-/// again after the file is edited. A read with no path always prints.
-fn legacy_hints_due(path: Option<&Path>, bytes: &[u8]) -> bool {
-    static HINTED_FILES: LazyLock<Mutex<HashSet<(PathBuf, u64)>>> =
+/// load logs each line once per parse. The key holds the content as well as
+/// the path, so the long-lived `minimald` logs the lines again after the file
+/// is edited. The hash is of the bytes that produced the `File`, not a
+/// re-read: a file replaced between parse and log must not silence the log of
+/// the replacement. A file with no path is always due.
+fn diagnostics_due(path: Option<&Path>, content_hash: Option<u64>) -> bool {
+    /// A file's path and the hash of its content.
+    type FileKey = (PathBuf, Option<u64>);
+    static LOGGED_FILES: LazyLock<Mutex<HashSet<FileKey>>> =
         LazyLock::new(|| Mutex::new(HashSet::new()));
     let Some(path) = path else {
         return true;
     };
-    HINTED_FILES
+    LOGGED_FILES
         .lock()
-        .unwrap()
-        .insert((path.to_path_buf(), hash_bytes(bytes)))
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((path.to_path_buf(), content_hash))
+}
+
+/// Logs each of `lines`, the diagnostics of the `minimal.toml` at `path`, as
+/// a warn-level record, once for each (path, content) in this process. The
+/// loaders that only the daemon calls ([`File::from_dir_within`] and the
+/// wire path's [`File::validate`]) log the lines. They print nothing, so the
+/// record in the daemon's log is where the lines stay.
+fn log_diagnostics(path: Option<&Path>, content_hash: Option<u64>, lines: &[String]) {
+    if lines.is_empty() || !diagnostics_due(path, content_hash) {
+        return;
+    }
+    let shown = path.map_or_else(|| MFILE_NAME.to_owned(), |p| p.display().to_string());
+    for line in lines {
+        tracing::warn!(file = %shown, "{line}");
+    }
+}
+
+/// A load of a `minimal.toml` that failed, with the lines the file has for
+/// the person. When the file's checks refuse it, [`Refusal::diagnostics`]
+/// holds the legacy-table hints that its parse kept, which often explain the
+/// refusal. Any other failure holds no lines.
+///
+/// The quiet loaders ([`File::from_dir_quiet`],
+/// [`File::from_dir_recursive_quiet`]) return it and print nothing, so a
+/// caller that owns the screen (the `min dash` TUI) can show the lines with
+/// the error. The CLI loaders print the lines on stderr and return the error.
+#[derive(Debug)]
+pub struct Refusal(Box<RefusalParts>);
+
+#[derive(Debug)]
+struct RefusalParts {
+    error: Error,
+    diagnostics: Vec<String>,
+    file: Option<PathBuf>,
+    content_hash: Option<u64>,
+}
+
+impl Refusal {
+    fn new(
+        error: Error,
+        diagnostics: Vec<String>,
+        file: Option<PathBuf>,
+        content_hash: Option<u64>,
+    ) -> Self {
+        Self(Box::new(RefusalParts {
+            error,
+            diagnostics,
+            file,
+            content_hash,
+        }))
+    }
+
+    /// Why the file did not load.
+    #[must_use]
+    pub fn error(&self) -> &Error {
+        &self.0.error
+    }
+
+    /// Why the file did not load, without the lines.
+    #[must_use]
+    pub fn into_error(self) -> Error {
+        self.0.error
+    }
+
+    /// The lines the refused file has for the person, in the order the
+    /// parse found them. Nothing printed them.
+    #[must_use]
+    pub fn diagnostics(&self) -> &[String] {
+        &self.0.diagnostics
+    }
+
+    /// The path of the refused file, when the load read one.
+    #[must_use]
+    pub fn file_path(&self) -> Option<&Path> {
+        self.0.file.as_deref()
+    }
+
+    /// The hash of the bytes of the refused file. [`print_diagnostics`]
+    /// keys on it.
+    #[must_use]
+    pub fn content_hash(&self) -> Option<u64> {
+        self.0.content_hash
+    }
+
+    /// Prints [`Refusal::diagnostics`] on stderr, each line on its first
+    /// print in this process for this file and content.
+    pub fn print_diagnostics(&self) {
+        print_diagnostics(self.file_path(), self.0.content_hash, &self.0.diagnostics);
+    }
+
+    /// Prints the lines, then gives the error for the caller to print after
+    /// them, as a parse printed the hints before the error.
+    #[must_use]
+    pub fn print_and_into_error(self) -> Error {
+        self.print_diagnostics();
+        self.into_error()
+    }
+}
+
+impl From<Error> for Refusal {
+    fn from(error: Error) -> Self {
+        Self::new(error, Vec::new(), None, None)
+    }
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.error.fmt(f)
+    }
+}
+
+/// Prints each of `lines`, the diagnostics of the `minimal.toml` at `file`,
+/// on stderr. `content_hash` is the hash of the bytes the lines came from
+/// ([`File::content_hash`]). A line prints on its first print in this
+/// process for that file and content only. A command loads its project's
+/// file many times, and each load returns the same lines, so this prints
+/// each of them once. The key holds the file's path, so two files that give
+/// the same line both print it. It holds the content too, so the long-lived
+/// `minimald` prints a line again after the file is fixed and then broken
+/// the same way. Only a caller that owns stderr calls this: `min dash` puts
+/// the lines on its status line instead.
+pub fn print_diagnostics(file: Option<&Path>, content_hash: Option<u64>, lines: &[String]) {
+    write_new_diagnostics(file, content_hash, lines, &mut std::io::stderr());
+}
+
+/// Writes to `out` each of `lines` that this process did not write yet for
+/// `file` with this content. A line that cannot be written (a closed stderr)
+/// is not a reason to fail the command.
+fn write_new_diagnostics(
+    file: Option<&Path>,
+    content_hash: Option<u64>,
+    lines: &[String],
+    out: &mut dyn std::io::Write,
+) {
+    /// A file's path, the hash of its content, and one of its lines.
+    type PrintedLine = (Option<PathBuf>, Option<u64>, String);
+    static PRINTED: LazyLock<Mutex<HashSet<PrintedLine>>> =
+        LazyLock::new(|| Mutex::new(HashSet::new()));
+    if lines.is_empty() {
+        return;
+    }
+    // One file reached by two routes (`from_dir` and `from_dir_recursive`)
+    // keys the same.
+    let file = file.map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
+    let mut printed = PRINTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for line in lines {
+        if printed.insert((file.clone(), content_hash, line.clone())) {
+            let _ = writeln!(out, "{line}");
+        }
+    }
 }
 
 /// Refuses a `state_key` from the project's own file that
@@ -1288,28 +1450,12 @@ impl File {
     /// serde's internal enum name.
     ///
     /// It then reads the legacy tables (BOX-050, BOX-051, BOX-052) and
-    /// prints one hint on stderr for each, the first time this process reads
-    /// the file (see [`legacy_hints_due`]).
+    /// keeps one hint for each on the file's diagnostics. It prints nothing.
     fn parse(bytes: &[u8], path: Option<&Path>) -> Result<Self, Error> {
-        Self::parse_to(bytes, path, &mut std::io::stderr())
-    }
-
-    /// [`File::parse`], writing the legacy hints to `hints_out` rather than
-    /// stderr, so a test can read what a parse prints.
-    fn parse_to(
-        bytes: &[u8],
-        path: Option<&Path>,
-        hints_out: &mut dyn std::io::Write,
-    ) -> Result<Self, Error> {
         let mut file = Self::deserialize_bytes(bytes, path)?;
         let hints = legacy::settle(&mut file, legacy::this_release(), path)?;
-        if !hints.is_empty() && legacy_hints_due(path, bytes) {
-            for legacy in hints {
-                // A hint that cannot be written (a closed stderr) is not a
-                // reason to fail the read.
-                let _ = writeln!(hints_out, "{legacy}");
-            }
-        }
+        file.diagnostics
+            .extend(hints.into_iter().map(|legacy| legacy.to_string()));
         Ok(file)
     }
 
@@ -1343,36 +1489,51 @@ impl File {
     }
 
     /// Searches from the given directory backwards to load the `minimal.toml` file.
+    ///
+    /// A file that the load refuses prints its legacy-table hints on stderr,
+    /// before the caller prints the error, as [`Self::from_dir`] does. A
+    /// caller that owns the screen calls [`Self::from_dir_recursive_quiet`].
     pub fn from_dir_recursive<P: AsRef<Path>>(dir: P) -> Result<Self, Error> {
-        match Self::from_dir(&dir) {
+        Self::from_dir_recursive_quiet(dir).map_err(Refusal::print_and_into_error)
+    }
+
+    /// [`Self::from_dir_recursive`], for a caller that owns the screen (the
+    /// `min dash` TUI). It prints nothing. A refused file's legacy-table
+    /// hints come back on the [`Refusal`].
+    pub fn from_dir_recursive_quiet<P: AsRef<Path>>(dir: P) -> Result<Self, Refusal> {
+        match Self::from_dir_quiet(&dir) {
             Ok(f) => Ok(f),
-            Err(Error::NotFound) => {
+            Err(r) if matches!(r.error(), Error::NotFound) => {
                 // Not found at this directory, try the parent
                 if let Some(parent) = dir.as_ref().parent() {
                     // We don't traverse outside of a users HOME if its set.
                     if let Some(home) = env::home_dir()
                         && home == parent
                     {
-                        return Err(Error::NotFound);
+                        return Err(Error::NotFound.into());
                     }
 
-                    Self::from_dir_recursive(parent)
+                    Self::from_dir_recursive_quiet(parent)
                 } else {
-                    Err(Error::NotFound)
+                    Err(Error::NotFound.into())
                 }
             }
-            Err(e) => Err(e),
+            Err(r) => Err(r),
         }
     }
 
     /// Helper to finish initialization of the structure after being deserialized.
+    ///
+    /// It prints nothing. When the checks refuse the file, the legacy-table
+    /// hints the parse kept go back on the [`Refusal`], because they often
+    /// explain the refusal.
     fn init_toml(
         mut self,
         path: &PathBuf,
         layout: Layout,
         content_hash: u64,
         tasks: TaskCheck,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, Refusal> {
         self.mfile_path = Some(path.to_path_buf());
         self.layout = Some(layout);
         self.content_hash = Some(content_hash);
@@ -1382,8 +1543,42 @@ impl File {
                 sideload.link.fixup_relative(path);
             }
         }
-        self.check(tasks)?;
+        if let Err(error) = self.check(tasks) {
+            return Err(Refusal::new(
+                error,
+                self.diagnostics,
+                self.mfile_path,
+                self.content_hash,
+            ));
+        }
+        let warnings = self.unknown_field_warnings();
+        self.diagnostics.extend(warnings);
         Ok(self)
+    }
+
+    /// The lines this load has for the person, in the order it found them:
+    /// a `hint:` line for each legacy table, then each `warning:` about an
+    /// unknown field and its `help:` line. Nothing printed them.
+    #[must_use]
+    pub fn diagnostics(&self) -> &[String] {
+        &self.diagnostics
+    }
+
+    /// The hash of the bytes this file was loaded from, if it was loaded
+    /// from disk. [`print_diagnostics`] keys on it.
+    #[must_use]
+    pub fn content_hash(&self) -> Option<u64> {
+        self.content_hash
+    }
+
+    /// Prints [`File::diagnostics`] on stderr, each line on its first print
+    /// in this process for this file and content. See [`print_diagnostics`].
+    pub fn print_diagnostics(&self) {
+        print_diagnostics(
+            self.mfile_path.as_deref(),
+            self.content_hash,
+            &self.diagnostics,
+        );
     }
 
     /// Post-deserialize invariants: every declared param has a `default`,
@@ -1406,7 +1601,14 @@ impl File {
     /// directory name, or [`Error::InvalidSpecKey`] if `[session]` or a task
     /// sets a `timeout` that is not a duration.
     pub fn validate(&self) -> Result<(), Error> {
-        self.check(TaskCheck::Refuse)
+        self.check(TaskCheck::Refuse)?;
+        // The wire path prints nothing: the daemon's log keeps the warnings.
+        log_diagnostics(
+            self.mfile_path.as_deref(),
+            self.content_hash,
+            &self.unknown_field_warnings(),
+        );
+        Ok(())
     }
 
     /// [`Self::validate`], with the interactive-task and state-key refusals
@@ -1428,7 +1630,7 @@ impl File {
             return Err(Error::HarnessTable(self.mfile_path.clone()));
         }
         // serde takes one action key as `task.action` and leaves any other in
-        // `task.extra`. Refuse the task here, before `warn_unknown_fields`
+        // `task.extra`. Refuse the task here, before `unknown_field_warnings`
         // would misreport the extra action key as unknown and suggest an
         // upgrade.
         for (task_name, task) in &self.tasks {
@@ -1472,13 +1674,23 @@ impl File {
             );
             check_entry_timeout(&layer, &task.extra)?;
         }
-        self.warn_unknown_fields();
         Ok(())
     }
 
     /// Loads the minimal file from the given directory path. The given
     /// directory must be a repository / minimalfile root.
+    ///
+    /// A file that the load refuses prints its legacy-table hints on stderr,
+    /// before the caller prints the error. A caller that owns the screen
+    /// calls [`Self::from_dir_quiet`].
     pub fn from_dir<P: AsRef<Path>>(dir: P) -> Result<Self, Error> {
+        Self::from_dir_quiet(dir).map_err(Refusal::print_and_into_error)
+    }
+
+    /// [`Self::from_dir`], for a caller that owns the screen (the `min dash`
+    /// TUI). It prints nothing. A refused file's legacy-table hints come
+    /// back on the [`Refusal`].
+    pub fn from_dir_quiet<P: AsRef<Path>>(dir: P) -> Result<Self, Refusal> {
         Self::load_dir(dir.as_ref(), TaskCheck::Refuse)
     }
 
@@ -1490,8 +1702,15 @@ impl File {
     /// package repository can still declare `interactive = true` tasks or
     /// such a key, and the user cannot fix that file. The project's own file
     /// gets both refusals when it loads through [`Self::from_dir`].
+    ///
+    /// Only `mip`'s package graph loads through here, and it owns stderr, so
+    /// this prints the file's diagnostics there, each once, and a refused
+    /// file's hints before the caller prints the error.
     pub fn from_dir_for_graph<P: AsRef<Path>>(dir: P) -> Result<Self, Error> {
-        Self::load_dir(dir.as_ref(), TaskCheck::Skip)
+        let file =
+            Self::load_dir(dir.as_ref(), TaskCheck::Skip).map_err(Refusal::print_and_into_error)?;
+        file.print_diagnostics();
+        Ok(file)
     }
 
     /// [`File::from_dir`] for a directory that someone other than the caller
@@ -1504,20 +1723,37 @@ impl File {
     /// of the file the link points at. `root` itself is trusted.
     pub fn from_dir_within<P: AsRef<Path>>(root: P) -> Result<Self, Error> {
         let root = root.as_ref();
-        Self::load_dir_by(root, TaskCheck::Refuse, Reader::Within(root))
+        // Only the daemon reads a box's workspace. Its log keeps the lines,
+        // a refused file's hints as well.
+        let file = Self::load_dir_by(root, TaskCheck::Refuse, Reader::Within(root)).map_err(
+            |refusal| {
+                log_diagnostics(
+                    refusal.file_path(),
+                    refusal.content_hash(),
+                    refusal.diagnostics(),
+                );
+                refusal.into_error()
+            },
+        )?;
+        log_diagnostics(
+            file.mfile_path.as_deref(),
+            file.content_hash,
+            &file.diagnostics,
+        );
+        Ok(file)
     }
 
-    fn load_dir(dir: &Path, tasks: TaskCheck) -> Result<Self, Error> {
+    fn load_dir(dir: &Path, tasks: TaskCheck) -> Result<Self, Refusal> {
         Self::load_dir_by(dir, tasks, Reader::Host)
     }
 
-    fn load_dir_by(dir: &Path, tasks: TaskCheck, reader: Reader<'_>) -> Result<Self, Error> {
+    fn load_dir_by(dir: &Path, tasks: TaskCheck, reader: Reader<'_>) -> Result<Self, Refusal> {
         // Check for the minimal file at the directory root.
         let path = dir.join(MFILE_NAME);
         if let Some(file_data) = reader.read(&path)? {
             let conflicting_path = dir.join(".minimal").join(MFILE_NAME);
             if reader.exists(&conflicting_path)? {
-                return Err(Error::ConflictingLayouts(vec![path, conflicting_path]));
+                return Err(Error::ConflictingLayouts(vec![path, conflicting_path]).into());
             }
 
             return Self::init_toml(
@@ -1539,7 +1775,7 @@ impl File {
                 hash_bytes(&file_data),
                 tasks,
             ),
-            None => Err(Error::NotFound),
+            None => Err(Error::NotFound.into()),
         }
     }
 
@@ -2537,38 +2773,13 @@ impl File {
         }
     }
 
-    fn warn_unknown_fields(&self) {
+    /// The warnings about the fields this version does not read, each as the
+    /// line the person sees: `warning: …`, and a last `help:` line when a
+    /// field is unknown. It prints nothing, and logs each line at debug.
+    fn unknown_field_warnings(&self) -> Vec<String> {
         // BOX-028: an entry's `hooks_on_resume` stays in its `extra`, where
         // the spec reads it, and is not an unknown key.
         const HOOKS_ON_RESUME_KEY: &str = "hooks_on_resume";
-
-        // One command decodes the same file several times; without this a
-        // single load prints each warning once per decode. Surface them only
-        // the first time a given path is validated in this process.
-        //
-        // The dedup key is (path, content) rather than path alone: a
-        // long-lived process (notably `minimald`) re-reads and re-validates
-        // the workspace `minimal.toml` on every session bring-up, and keying
-        // on path alone would permanently silence the warning after the first
-        // decode — even if the user edits the file and breaks it again. The
-        // content hash collapses the repeated decodes of an unchanged file
-        // while still re-warning when the file is edited or re-broken.
-        //
-        // The hash is computed from the bytes that produced `self` (see
-        // `hash_bytes`), not re-read from disk here: re-reading could hash a
-        // replacement file written between parse and validate, and then a
-        // later validation of that replacement would be wrongly suppressed.
-        if let (Some(path), Some(content_hash)) = (&self.mfile_path, self.content_hash) {
-            static WARNED_FILES: LazyLock<Mutex<HashSet<(PathBuf, u64)>>> =
-                LazyLock::new(|| Mutex::new(HashSet::new()));
-            if !WARNED_FILES
-                .lock()
-                .unwrap()
-                .insert((path.clone(), content_hash))
-            {
-                return;
-            }
-        }
 
         // A warning names the file it is about. A command can load a file
         // the user did not write (`min init` reads a fetched checkout), so a
@@ -2578,35 +2789,50 @@ impl File {
             .as_ref()
             .map_or_else(|| MFILE_NAME.to_owned(), |p| p.display().to_string());
 
+        let mut lines: Vec<String> = Vec::new();
+        let mut warn = |line: String| lines.push(format!("warning: {line}"));
         let mut was_unknown_fields = false;
         if !self.extra.is_empty() {
-            // A key that is valid at another nesting level is not really
-            // unknown; point at the correct path instead of the generic
-            // upgrade hint, which cannot fix it.
             // BEP-037: a project cannot set secret-store rules. The table is
             // ignored with its own warning, not the generic unknown-field one.
-            boxes::core::bep::warn_project_store_rules(self.extra.keys().map(String::as_str));
+            if self.extra.contains_key(boxes::core::bep::STORE_RULES_TABLE) {
+                warn(boxes::core::bep::PROJECT_STORE_RULES_IGNORED.to_owned());
+            }
             // NET-159: a project cannot open host ports to its boxes. The
             // table is ignored with its own warning, as the store rules are.
-            boxes::core::egress::warn_project_host_exposures(self.extra.keys().map(String::as_str));
+            if self
+                .extra
+                .contains_key(boxes::core::egress::HOST_EXPOSURES_TABLE)
+            {
+                warn(boxes::core::egress::PROJECT_HOST_EXPOSURES_IGNORED.to_owned());
+            }
             let mut unknown = Vec::new();
-            for key in self.extra.keys().filter(|key| {
-                *key != boxes::core::bep::STORE_RULES_TABLE
-                    && *key != boxes::core::egress::HOST_EXPOSURES_TABLE
+            let mut keys: Vec<&String> = self.extra.keys().collect();
+            keys.sort_unstable();
+            for key in keys.into_iter().filter(|key| {
+                key.as_str() != boxes::core::bep::STORE_RULES_TABLE
+                    && key.as_str() != boxes::core::egress::HOST_EXPOSURES_TABLE
                     // The entry tables and the project's Box Types are read
                     // by `entry` and `expand`, not by this struct.
                     && !entry::EntryTable::ALL.iter().any(|t| t.key() == key.as_str())
-                    && *key != BOX_TYPES_TABLE
+                    && key.as_str() != BOX_TYPES_TABLE
             }) {
+                // A key that is valid at another nesting level is not really
+                // unknown; point at the correct path instead of the generic
+                // upgrade hint, which cannot fix it.
                 match misplaced_top_level_key(key) {
-                    Some(correct) => tracing::warn!(
+                    Some(correct) => warn(format!(
                         "{key} is unknown at the top level of {shown}; did you mean {correct}?"
-                    ),
+                    )),
                     None => unknown.push(key.clone()),
                 }
             }
             if !unknown.is_empty() {
-                tracing::warn!("unknown fields in {}: {}", shown, unknown.join(","));
+                warn(format!(
+                    "unknown fields in {}: {}",
+                    shown,
+                    unknown.join(",")
+                ));
                 was_unknown_fields = true;
             }
         }
@@ -2635,43 +2861,48 @@ impl File {
             .collect();
         unknown_defaults.sort_unstable();
         if !unknown_defaults.is_empty() {
-            tracing::warn!(
+            warn(format!(
                 "unknown fields in [defaults] section of {}: {}",
                 shown,
                 unknown_defaults.join(",")
-            );
+            ));
             was_unknown_fields = true;
         }
         if let Some(p) = &self.defaults.profile {
-            tracing::warn!(
+            warn(format!(
                 "[defaults]profile = \"{p}\" defined, but profiles were removed in 0.5.1; move its packages to each task's [tasks.<name>] packages (or [stack] build_packages / runtime_packages, which apply to every task)"
-            );
+            ));
         }
         if let Some(stack) = &self.stack
             && !stack.extra.is_empty()
         {
-            tracing::warn!(
+            warn(format!(
                 "unknown fields in [stack] section of {}: {}",
                 shown,
                 stack.extra.keys().cloned().collect::<Vec<_>>().join(",")
-            );
+            ));
             was_unknown_fields = true;
         }
         if let Some(session) = &self.session
             && !session.extra.is_empty()
         {
-            boxes::core::bep::warn_project_store_rules(session.extra.keys().map(String::as_str));
+            if session
+                .extra
+                .contains_key(boxes::core::bep::STORE_RULES_TABLE)
+            {
+                warn(boxes::core::bep::PROJECT_STORE_RULES_IGNORED.to_owned());
+            }
             let unknown: Vec<&str> = unknown_entry_keys(&session.extra)
                 .into_iter()
                 .filter(|key| *key != boxes::core::bep::STORE_RULES_TABLE)
                 .filter(|key| *key != HOOKS_ON_RESUME_KEY)
                 .collect();
             if !unknown.is_empty() {
-                tracing::warn!(
+                warn(format!(
                     "unknown fields in [session] section of {}: {}",
                     shown,
                     unknown.join(",")
-                );
+                ));
                 was_unknown_fields = true;
             }
         }
@@ -2682,33 +2913,37 @@ impl File {
                 .filter(|key| *key != HOOKS_ON_RESUME_KEY)
                 .collect();
             if !unknown.is_empty() {
-                tracing::warn!(
+                warn(format!(
                     "unknown fields in task {}: {}",
                     task_name,
                     unknown.join(",")
-                );
+                ));
                 was_unknown_fields = true;
             }
             if let Some(p) = &task.profile {
-                tracing::warn!(
+                warn(format!(
                     "[tasks.{task_name}]profile = \"{p}\" defined, but profiles were removed in 0.5.1; move its packages to [tasks.{task_name}] packages"
-                );
+                ));
             }
         }
         for (output_name, output) in &self.outputs {
             if !output.extra.is_empty() {
-                tracing::warn!(
+                warn(format!(
                     "unknown fields in output {}: {}",
                     output_name,
                     output.extra.keys().cloned().collect::<Vec<_>>().join(",")
-                );
+                ));
                 was_unknown_fields = true;
             }
         }
 
         if was_unknown_fields {
-            tracing::warn!("help: do you need to update to a newer version of minimal?");
+            lines.push("help: do you need to update to a newer version of minimal?".to_owned());
         }
+        for line in &lines {
+            tracing::debug!(file = %shown, "{line}");
+        }
+        lines
     }
 
     /// Returns the path to the directory where the minimal file is located.
@@ -3418,6 +3653,7 @@ mod tests {
                 mfile_path: None,
                 content_hash: None,
                 layout: None,
+                diagnostics: Vec::new(),
             }
         )
     }
@@ -4377,7 +4613,7 @@ mod tests {
     }
 
     /// Unknown fields inside `[session]` land in `extra` for the
-    /// `warn_unknown_fields` pass to report at load-time, matching
+    /// `unknown_field_warnings` pass to report at load-time, matching
     /// how `[stack]` and `[defaults]` handle forward-compat.
     #[test]
     fn session_unknown_field_lands_in_extra() {
@@ -4624,12 +4860,12 @@ mod tests {
         assert!(hook.description().is_some());
     }
 
-    /// The once-per-path warning dedup must key on (path, content), not path
-    /// alone: a long-lived process re-validates the same file repeatedly, and
-    /// an edited file must re-warn. This test drives `warn_unknown_fields`
-    /// through the public `validate` path and counts the emitted warnings.
+    /// The once-per-path dedup of the warn-level log must key on (path,
+    /// content), not path alone: a long-lived process validates the same
+    /// file repeatedly, and an edited file must warn again. This test drives
+    /// the public `validate` path and counts the warnings it logs.
     #[test]
-    fn warn_unknown_fields_rewarns_when_file_content_changes() {
+    fn validate_rewarns_when_file_content_changes() {
         let dir = tempdir().unwrap();
         let path = dir.path().join(MFILE_NAME);
 
@@ -4639,26 +4875,89 @@ mod tests {
             .with_ansi(false)
             .finish();
         let guard = tracing::subscriber::set_default(subscriber);
-
-        let write = |contents: &str| {
+        let warned = |contents: &str| {
             std::fs::write(&path, contents).unwrap();
             let file = File::from_dir(dir.path()).unwrap();
             file.validate().unwrap();
+            capture
+                .contents()
+                .lines()
+                .filter(|line| line.contains("WARN") && line.contains("unknown fields in"))
+                .count()
         };
 
-        // First decode of a file with an unknown field warns once.
-        write("[unknown_top_level]\nkey = \"v\"\n");
-        assert_eq!(count_unknown_warnings(&capture), 1);
+        // The first validation of a file with an unknown field warns once.
+        assert_eq!(warned("[unknown_top_level]\nkey = \"v\"\n"), 1);
 
-        // Re-validating the unchanged file does not warn again.
-        write("[unknown_top_level]\nkey = \"v\"\n");
-        assert_eq!(count_unknown_warnings(&capture), 1);
+        // A second validation of the unchanged file does not warn again.
+        assert_eq!(warned("[unknown_top_level]\nkey = \"v\"\n"), 1);
 
-        // Editing the file (new content) re-warns.
-        write("[unknown_top_level]\nkey = \"v\"\nother = \"w\"\n");
-        assert_eq!(count_unknown_warnings(&capture), 2);
-
+        // Editing the file (new content) warns again.
+        assert_eq!(
+            warned("[unknown_top_level]\nkey = \"v\"\nother = \"w\"\n"),
+            2
+        );
         drop(guard);
+    }
+
+    /// The daemon's confined read of a box's workspace prints nothing and
+    /// keeps a warn-level log record of the file's diagnostics.
+    #[test]
+    fn from_dir_within_logs_the_diagnostics_at_warn() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MFILE_NAME),
+            "[tasks.lint]\nbash = \"true\"\ncolour = 1\n",
+        )
+        .unwrap();
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        File::from_dir_within(dir.path()).expect("the file reads");
+        drop(guard);
+        let log = capture.contents();
+        assert!(
+            log.lines()
+                .any(|l| l.contains("WARN") && l.contains("unknown fields in task lint: colour")),
+            "{log}"
+        );
+    }
+
+    /// The `mip` graph load prints the file's diagnostics, and a load that a
+    /// check refuses prints the legacy-table hints before the error. Each
+    /// print goes through the shared once-per-line set, so a later write of
+    /// the same lines for the same file and content writes nothing.
+    #[test]
+    fn graph_load_and_refused_load_print_the_hints() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+        std::fs::write(&path, "[session]\npackages = [\"git\"]\n").unwrap();
+        let graph = File::from_dir_for_graph(dir.path()).expect("the file reads");
+        let mut printed = Vec::new();
+        write_new_diagnostics(
+            Some(&path),
+            graph.content_hash(),
+            graph.diagnostics(),
+            &mut printed,
+        );
+        assert!(printed.is_empty(), "the graph load printed them");
+
+        // `[harness]` fails the check after the parse found the hint.
+        let refused = b"[session]\npackages = [\"git\"]\n\n[harness]\nuse = \"rust\"\n";
+        std::fs::write(&path, refused).unwrap();
+        let err = File::from_dir(dir.path()).unwrap_err();
+        assert!(matches!(err, Error::HarnessTable(_)), "{err:?}");
+        let hints = File::from_toml_bytes(refused)
+            .unwrap()
+            .diagnostics()
+            .to_vec();
+        assert_eq!(hints.len(), 1, "{hints:?}");
+        let mut printed = Vec::new();
+        write_new_diagnostics(Some(&path), Some(hash_bytes(refused)), &hints, &mut printed);
+        assert!(printed.is_empty(), "the refused load printed the hint");
     }
 
     /// `[harness]` is the pre-v0.5.0 name of `[stack]` and no longer parses:
@@ -4818,14 +5117,7 @@ mod tests {
         )
         .unwrap();
 
-        let capture = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
         let err = File::from_dir(dir.path()).expect_err("two actions must be refused");
-        drop(guard);
 
         assert!(matches!(err, Error::MultipleTaskActions(..)), "{err:?}");
         let msg = err.to_string();
@@ -4835,9 +5127,6 @@ mod tests {
         );
         assert!(msg.contains("exec") && msg.contains("bash"), "{msg}");
         assert!(msg.ends_with("); set exactly one"), "{msg}");
-        let out = capture.contents();
-        assert!(!out.contains("unknown fields in task"), "{out}");
-        assert!(!out.contains("update to a newer version"), "{out}");
     }
 
     /// BOX-049: a `timeout` that is not a duration, in `[session]` or a
@@ -4897,14 +5186,7 @@ mod tests {
         )
         .unwrap();
 
-        let capture = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        File::from_dir(dir.path()).expect("file_exports on a task loads");
-        drop(guard);
+        let capture = Diags::of(&File::from_dir(dir.path()).expect("file_exports on a task loads"));
 
         let out = capture.contents();
         assert!(!out.contains("unknown fields"), "{out}");
@@ -4922,14 +5204,7 @@ mod tests {
         )
         .unwrap();
 
-        let capture = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        File::from_dir(dir.path()).expect("secrets on a task loads");
-        drop(guard);
+        let capture = Diags::of(&File::from_dir(dir.path()).expect("secrets on a task loads"));
 
         let out = capture.contents();
         assert!(!out.contains("unknown fields"), "{out}");
@@ -4953,14 +5228,8 @@ mod tests {
         )
         .unwrap();
 
-        let capture = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        File::from_dir(dir.path()).expect("a timeout in the grammar loads");
-        drop(guard);
+        let capture =
+            Diags::of(&File::from_dir(dir.path()).expect("a timeout in the grammar loads"));
 
         let out = capture.contents();
         assert!(!out.contains("unknown fields"), "{out}");
@@ -4982,14 +5251,7 @@ mod tests {
         )
         .unwrap();
 
-        let capture = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        File::from_dir(dir.path()).expect("a task network table loads");
-        drop(guard);
+        let capture = Diags::of(&File::from_dir(dir.path()).expect("a task network table loads"));
 
         let out = capture.contents();
         assert!(!out.contains("unknown fields"), "{out}");
@@ -5027,14 +5289,7 @@ mod tests {
         ] {
             let dir = tempdir().unwrap();
             std::fs::write(dir.path().join(MFILE_NAME), body).unwrap();
-            let capture = CaptureWriter::default();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(capture.clone())
-                .with_ansi(false)
-                .finish();
-            let guard = tracing::subscriber::set_default(subscriber);
-            File::from_dir(dir.path()).expect("the file still reads");
-            drop(guard);
+            let capture = Diags::of(&File::from_dir(dir.path()).expect("the file still reads"));
             let out = capture.contents();
             assert!(
                 out.contains(boxes::core::bep::PROJECT_STORE_RULES_IGNORED),
@@ -5054,14 +5309,7 @@ mod tests {
             "[host-exposures.web]\nport = 8080\n",
         )
         .unwrap();
-        let capture = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        File::from_dir(dir.path()).expect("the file still reads");
-        drop(guard);
+        let capture = Diags::of(&File::from_dir(dir.path()).expect("the file still reads"));
         let out = capture.contents();
         assert_eq!(
             out.matches(boxes::core::egress::PROJECT_HOST_EXPOSURES_IGNORED)
@@ -5082,14 +5330,7 @@ mod tests {
         ] {
             let dir = tempdir().unwrap();
             std::fs::write(dir.path().join(MFILE_NAME), body).unwrap();
-            let capture = CaptureWriter::default();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(capture.clone())
-                .with_ansi(false)
-                .finish();
-            let guard = tracing::subscriber::set_default(subscriber);
-            File::from_dir(dir.path()).expect("the file reads");
-            drop(guard);
+            let capture = Diags::of(&File::from_dir(dir.path()).expect("the file reads"));
             let out = capture.contents();
             assert_eq!(count_unknown_warnings(&capture), 0, "{body}: {out}");
         }
@@ -5100,72 +5341,166 @@ mod tests {
             "[session]\nhooks_on_resume = true\nbogus = 1\n",
         )
         .unwrap();
-        let capture = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        File::from_dir(dir.path()).expect("the file reads");
-        drop(guard);
+        let capture = Diags::of(&File::from_dir(dir.path()).expect("the file reads"));
         let out = capture.contents();
         assert!(out.contains("unknown fields in [session] section"), "{out}");
         assert!(out.contains("bogus"), "{out}");
         assert!(!out.contains("hooks_on_resume"), "{out}");
     }
 
-    /// #3190: a file's legacy-table hints print on the first read of a
-    /// given (path, content) in this process, not on every read. An edit
-    /// prints them again, and a read with no path always prints.
+    /// #3190: a file's diagnostics are handed out on the first ask for a
+    /// given (path, content) in this process, not on every ask. An edit
+    /// hands them out again, and a file with no path always does.
     #[test]
-    fn legacy_hints_print_once_per_path_and_content() {
+    fn diagnostics_are_due_once_per_path_and_content() {
         let dir = tempdir().unwrap();
         let path = dir.path().join(MFILE_NAME);
-        let old = b"[session]\npackages = [\"git\"]\n";
-        let new = b"[session]\npackages = [\"git\", \"jq\"]\n";
-        assert!(legacy_hints_due(Some(&path), old), "first read prints");
+        let old = Some(hash_bytes(b"[session]\npackages = [\"git\"]\n"));
+        let new = Some(hash_bytes(b"[session]\npackages = [\"git\", \"jq\"]\n"));
+        assert!(diagnostics_due(Some(&path), old), "first read reports");
         assert!(
-            !legacy_hints_due(Some(&path), old),
+            !diagnostics_due(Some(&path), old),
             "second read of the same file is quiet"
         );
-        assert!(legacy_hints_due(Some(&path), new), "an edit prints again");
-        assert!(!legacy_hints_due(Some(&path), new), "and only once");
-        assert!(legacy_hints_due(None, old), "a read with no path prints");
-        assert!(legacy_hints_due(None, old), "every time");
+        assert!(diagnostics_due(Some(&path), new), "an edit reports again");
+        assert!(!diagnostics_due(Some(&path), new), "and only once");
+        assert!(diagnostics_due(None, old), "a read with no path reports");
+        assert!(diagnostics_due(None, old), "every time");
     }
 
-    /// #3190, end to end through the parse: reading the same legacy file
-    /// twice prints its hint once, an edit prints it again, and a read with
-    /// no path prints it on every read.
+    /// #3529: a parse keeps the legacy-table hints and the unknown-field
+    /// warnings on the `File` and prints nothing, so a caller that owns the
+    /// screen (the `min dash` TUI) can put them on its own surface. Every
+    /// load returns them. The CLI's print dedups on the file path, its
+    /// content and the line.
     #[test]
-    fn parse_prints_a_files_legacy_hint_once_until_it_changes() {
-        // A `[session]` table is the one legacy table here, so a read that
-        // prints prints exactly one `hint:` line.
-        let printed = |bytes: &[u8], path: Option<&Path>| {
-            let mut out = Vec::new();
-            File::parse_to(bytes, path, &mut out).expect("the file parses");
-            let out = String::from_utf8(out).unwrap();
-            out.lines().filter(|l| l.starts_with("hint: ")).count()
-        };
+    fn legacy_hints_are_returned_not_printed() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join(MFILE_NAME);
-        let old = b"[session]\npackages = [\"git\"]\n";
-        let new = b"[session]\npackages = [\"git\", \"jq\"]\n";
+        std::fs::write(
+            dir.path().join(MFILE_NAME),
+            "[session]\npackages = [\"git\"]\n\n[tasks.lint]\nbash = \"true\"\ncolour = 1\n",
+        )
+        .unwrap();
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let first = File::from_dir(dir.path()).expect("the file reads");
+        let second = File::from_dir(dir.path()).expect("the file reads again");
+        drop(guard);
 
+        // Nothing reached the log at warn or above.
+        assert!(capture.contents().is_empty(), "{}", capture.contents());
+
+        let lines = first.diagnostics();
         assert_eq!(
-            printed(old, Some(&path)),
+            lines.iter().filter(|l| l.starts_with("hint: ")).count(),
             1,
-            "the first read prints the hint"
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&"warning: unknown fields in task lint: colour".to_owned()),
+            "{lines:?}"
         );
         assert_eq!(
-            printed(old, Some(&path)),
-            0,
-            "a second read of the same file is quiet"
+            lines.last().map(String::as_str),
+            Some("help: do you need to update to a newer version of minimal?"),
+            "{lines:?}"
         );
-        assert_eq!(printed(new, Some(&path)), 1, "an edit prints it again");
-        assert_eq!(printed(new, Some(&path)), 0, "and only once");
-        assert_eq!(printed(old, None), 1, "a read with no path prints");
-        assert_eq!(printed(old, None), 1, "on every read");
+        assert_eq!(second.diagnostics(), lines, "every load returns them");
+
+        // The CLI's print writes each line once for each file and content.
+        // A second file that gives the same lines prints them too.
+        let mut printed = Vec::new();
+        write_new_diagnostics(
+            first.file_path().map(PathBuf::as_path),
+            first.content_hash(),
+            lines,
+            &mut printed,
+        );
+        write_new_diagnostics(
+            second.file_path().map(PathBuf::as_path),
+            second.content_hash(),
+            lines,
+            &mut printed,
+        );
+        assert_eq!(
+            String::from_utf8(printed).unwrap(),
+            format!("{}\n", lines.join("\n"))
+        );
+        let other = tempdir().unwrap();
+        std::fs::write(
+            other.path().join(MFILE_NAME),
+            "[session]\npackages = [\"git\"]\n",
+        )
+        .unwrap();
+        let other = File::from_dir(other.path()).expect("the other file reads");
+        let mut printed = Vec::new();
+        write_new_diagnostics(
+            other.file_path().map(PathBuf::as_path),
+            other.content_hash(),
+            &lines[..1],
+            &mut printed,
+        );
+        assert_eq!(
+            String::from_utf8(printed).unwrap(),
+            format!("{}\n", lines[0])
+        );
+
+        // The same file with other content prints the same line again: the
+        // daemon warns again after a file is fixed and broken the same way.
+        let mut printed = Vec::new();
+        write_new_diagnostics(
+            first.file_path().map(PathBuf::as_path),
+            first.content_hash().map(|hash| hash.wrapping_add(1)),
+            &lines[..1],
+            &mut printed,
+        );
+        assert_eq!(
+            String::from_utf8(printed).unwrap(),
+            format!("{}\n", lines[0])
+        );
+
+        // A parse with no path keeps the hint too.
+        let bare = File::from_toml_bytes(b"[session]\npackages = [\"git\"]\n").unwrap();
+        assert_eq!(bare.diagnostics().len(), 1, "{:?}", bare.diagnostics());
+
+        // A file that the checks refuse returns its hint with the error, and
+        // the quiet load prints nothing: `min dash` shows both.
+        let refused = tempdir().unwrap();
+        std::fs::write(
+            refused.path().join(MFILE_NAME),
+            "[session]\npackages = [\"git\"]\n\n[harness]\nname = \"rust\"\n",
+        )
+        .unwrap();
+        let refusal = File::from_dir_quiet(refused.path()).expect_err("the file is refused");
+        assert!(
+            matches!(refusal.error(), Error::HarnessTable(_)),
+            "{:?}",
+            refusal.error()
+        );
+        assert_eq!(
+            refusal.diagnostics().len(),
+            1,
+            "{:?}",
+            refusal.diagnostics()
+        );
+        assert!(refusal.diagnostics()[0].starts_with("hint: "));
+        assert_eq!(
+            refusal.file_path(),
+            Some(refused.path().join(MFILE_NAME).as_path())
+        );
+        let nested = refused.path().join("sub");
+        std::fs::create_dir(&nested).unwrap();
+        let walked = File::from_dir_recursive_quiet(&nested).expect_err("the walk is refused");
+        assert_eq!(walked.diagnostics(), refusal.diagnostics());
+        // A failure that is not a refusal of the checks has no lines.
+        let empty = tempdir().unwrap();
+        let missing = File::from_dir_quiet(empty.path()).expect_err("no file");
+        assert!(matches!(missing.error(), Error::NotFound));
+        assert!(missing.diagnostics().is_empty());
     }
 
     /// Reads `body` as a project's `minimal.toml` and returns the warnings
@@ -5174,14 +5509,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join(MFILE_NAME);
         std::fs::write(&path, body).unwrap();
-        let capture = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        File::from_dir(dir.path()).expect("the file reads");
-        drop(guard);
+        let capture = Diags::of(&File::from_dir(dir.path()).expect("the file reads"));
         (capture.contents(), path, dir)
     }
 
@@ -5240,7 +5568,21 @@ bash = \"true\"
         );
     }
 
-    fn count_unknown_warnings(capture: &CaptureWriter) -> usize {
+    /// The diagnostics of a load, joined into one text, for the tests that
+    /// look for a line in them.
+    struct Diags(String);
+
+    impl Diags {
+        fn of(file: &File) -> Self {
+            Self(file.diagnostics().join("\n"))
+        }
+
+        fn contents(&self) -> String {
+            self.0.clone()
+        }
+    }
+
+    fn count_unknown_warnings(capture: &Diags) -> usize {
         capture
             .contents()
             .lines()

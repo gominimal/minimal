@@ -420,6 +420,7 @@ fn project_file_bytes(project: &Path) -> anyhow::Result<Option<(PathBuf, Vec<u8>
         Err(mfile::Error::NotFound) => return Ok(None),
         Err(error) => return Err(crate::ProjectFileInvalid { error }.into()),
     };
+    file.print_diagnostics();
     let Some(root) = file.repo_path() else {
         return Ok(None);
     };
@@ -447,7 +448,7 @@ fn project_rows(global: &GlobalArgs, args: &BoxSpecArgs, out: &mut Vec<u8>) -> a
     // This parse only maps a missing or invalid project file to its
     // message. The expansion below loads the file again.
     match mfile::File::from_dir_recursive(&project) {
-        Ok(_) => {}
+        Ok(file) => file.print_diagnostics(),
         Err(mfile::Error::NotFound) => anyhow::bail!(
             "No {} found in {} or its parent directories.",
             mfile::MFILE_NAME,
