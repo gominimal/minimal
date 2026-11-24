@@ -5,7 +5,7 @@ owner: mitodrummer
 epic: gominimal/inbox#731
 arch: https://github.com/gominimal/arch/blob/949521619eead5acc31a8dbb33c889ba92ff0073/architecture.md
 arch_sha: "949521619eead5acc31a8dbb33c889ba92ff0073"
-updated: 2026-11-24
+updated: 2026-11-10
 ---
 
 # BCLI — The box grammar (`min box`, the type nouns, and the migration from the session verbs)
