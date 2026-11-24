@@ -11,6 +11,9 @@ license.workspace = true
 anyhow.workspace = true
 async-compression.workspace = true
 async-tar.workspace = true
+# The transport wrapper that keeps the SSH session loop reading while it
+# writes. Already in the build through boxes.
+common.workspace = true
 constcat.workspace = true
 indicatif.workspace = true
 # `libc` is only for the winsize ioctls (TIOCGWINSZ/TIOCSWINSZ) in

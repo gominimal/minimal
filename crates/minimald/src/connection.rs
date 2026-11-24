@@ -185,6 +185,9 @@ impl Connection {
             serv,
         })));
 
+        // Reads ahead while a write is blocked, so this end and a client whose
+        // session loop also writes before it reads cannot wait on each other.
+        let s = common::read_while_writing::ReadWhileWriting::new(s);
         // A handshake failure (e.g. a client that connects then drops) must not
         // propagate as a panic: in the guest, minimald is pid-1, so a panic here
         // kills init and takes down the whole VM. Surface the error so the accept

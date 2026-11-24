@@ -390,18 +390,27 @@ impl Client {
 
     /// The SSH handshake over an already-connected stream: version exchange
     /// and `none` auth as `username`, bounded by [`HANDSHAKE_TIMEOUT`] — a
-    /// connect is not proof anyone is home (#730).
-    async fn handshake(
-        stream: tokio::net::UnixStream,
+    /// connect is not proof anyone is home (#730). The stream is the
+    /// daemon's Unix socket in the product; tests pass an in-memory pipe.
+    async fn handshake<S>(
+        stream: S,
         username: &str,
         sock_path: &Path,
-    ) -> Result<russh::client::Handle<MinimalClientHandler>, anyhow::Error> {
+    ) -> Result<russh::client::Handle<MinimalClientHandler>, anyhow::Error>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         // The client deliberately runs without keepalives: a laptop closed
         // for an hour should reconnect transparently on wake rather than have
         // the link torn down mid-sleep. The server's long-interval keepalive
         // is the only liveness mechanism, and it no longer reaps
         // idle-but-alive sessions.
         let config = Arc::new(russh::client::Config::default());
+        // The library's session loop writes its whole send buffer before it
+        // reads again, and so may the daemon's, including a VM guest that
+        // predates this. Reading ahead while a write is blocked keeps the two
+        // from waiting on each other.
+        let stream = common::read_while_writing::ReadWhileWriting::new(stream);
         let handshake = async {
             let mut handle = russh::client::connect_stream(config, stream, MinimalClientHandler)
                 .await
@@ -3240,5 +3249,213 @@ mod rpc_status_tests {
         );
         drop(client);
         server.abort();
+    }
+}
+
+/// The stall the transport wrapper ends. The library's session loop, on the client and on the
+/// daemon alike, writes its whole send buffer before it reads again. Over a pipe far smaller
+/// than a channel window, an exec that relays stdin and stdout at once puts both loops in that
+/// write, each waiting for the other to read. These run a stand-in daemon that echoes 16 MiB,
+/// with the wrapper on one end only.
+#[cfg(test)]
+mod duplex_transport_tests {
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use russh::ChannelMsg;
+
+    /// The in-memory pipe's buffer each way: the size of a macOS Unix socket's, where the stall
+    /// was seen, and far below one channel window (2 MiB).
+    const PIPE_BYTES: usize = 8 * 1024;
+
+    /// What the client sends and the stand-in daemon echoes.
+    const PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+
+    /// The bound on one echo. Real time: the library's own timers run here.
+    const BOUND: Duration = Duration::from_secs(60);
+
+    /// The bound on the control, which is expected to reach it.
+    const CONTROL_BOUND: Duration = Duration::from_secs(20);
+
+    const STALLED: &str = "the echo stalled: both session loops are waiting for the other to read";
+
+    /// `len` bytes with a period of 251 (a prime), so a dropped, repeated or swapped chunk does
+    /// not compare equal.
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// A stand-in daemon whose session channels echo like `cat`: every byte that arrives goes
+    /// back, then exit status 0, EOF and close once the client's EOF has arrived. Its read side
+    /// never waits on its write side (an unbounded queue joins them, as the daemon's input pump
+    /// holds stdin), so a stall can only come from the transport.
+    struct Echo;
+
+    impl russh::server::Handler for Echo {
+        type Error = russh::Error;
+
+        async fn auth_none(&mut self, _: &str) -> Result<russh::server::Auth, Self::Error> {
+            Ok(russh::server::Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            channel: russh::Channel<russh::server::Msg>,
+            reply: russh::server::ChannelOpenHandle,
+            _: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            let (mut rd, wr) = channel.split();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+            tokio::spawn(async move {
+                // Read until the channel ends; the client's EOF ends the echo queue.
+                let mut tx = Some(tx);
+                while let Some(msg) = rd.wait().await {
+                    match msg {
+                        ChannelMsg::Data { data } => {
+                            if let Some(tx) = &tx {
+                                drop(tx.send(data.to_vec()));
+                            }
+                        }
+                        ChannelMsg::Eof => tx = None,
+                        _ => {}
+                    }
+                }
+            });
+            tokio::spawn(async move {
+                while let Some(data) = rx.recv().await {
+                    if wr.data(data.as_slice()).await.is_err() {
+                        return;
+                    }
+                }
+                drop(wr.exit_status(0).await);
+                drop(wr.eof().await);
+                drop(wr.close().await);
+            });
+            Ok(())
+        }
+    }
+
+    /// Runs the stand-in daemon's side of a connection over `stream`, through the wrapper when
+    /// `wrap` is set.
+    fn serve(stream: tokio::io::DuplexStream, wrap: bool) {
+        let key = russh::keys::PrivateKey::random(
+            &mut russh::keys::key::safe_rng(),
+            russh::keys::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let config = Arc::new(russh::server::Config {
+            keys: vec![key],
+            auth_rejection_time_initial: Some(Duration::ZERO),
+            ..Default::default()
+        });
+        tokio::spawn(async move {
+            let session = if wrap {
+                let stream = common::read_while_writing::ReadWhileWriting::new(stream);
+                russh::server::run_stream(config, stream, Echo).await
+            } else {
+                russh::server::run_stream(config, stream, Echo).await
+            };
+            if let Ok(session) = session {
+                drop(session.await);
+            }
+        });
+    }
+
+    /// A client without the wrapper, as a CLI built before it was.
+    async fn bare_client(
+        stream: tokio::io::DuplexStream,
+    ) -> russh::client::Handle<crate::MinimalClientHandler> {
+        let config = Arc::new(russh::client::Config::default());
+        let mut handle = russh::client::connect_stream(config, stream, crate::MinimalClientHandler)
+            .await
+            .unwrap();
+        let auth = handle.authenticate_none("minimal-cli").await.unwrap();
+        assert!(auth.success(), "the stand-in daemon accepts `none`");
+        handle
+    }
+
+    /// Sends `payload` on a fresh session channel while reading the echo, as `min box exec`
+    /// relays stdin and stdout at once. Returns what came back and the exit status.
+    async fn round_trip(
+        handle: &russh::client::Handle<crate::MinimalClientHandler>,
+        payload: Arc<Vec<u8>>,
+    ) -> (Vec<u8>, Option<u32>) {
+        let (mut rd, wr) = handle.channel_open_session().await.unwrap().split();
+        let writer = tokio::spawn(async move {
+            wr.data(payload.as_slice()).await.unwrap();
+            wr.eof().await.unwrap();
+        });
+        let mut echoed = Vec::with_capacity(PAYLOAD_BYTES);
+        let mut exit_status = None;
+        while let Some(msg) = rd.wait().await {
+            match msg {
+                ChannelMsg::Data { data } => echoed.extend_from_slice(&data),
+                ChannelMsg::ExitStatus { exit_status: code } => exit_status = Some(code),
+                ChannelMsg::Eof => break,
+                _ => {}
+            }
+        }
+        writer.await.unwrap();
+        (echoed, exit_status)
+    }
+
+    fn check(payload: &[u8], echoed: &[u8], exit_status: Option<u32>) {
+        assert_eq!(echoed.len(), payload.len(), "every byte came back");
+        assert!(echoed == payload, "the bytes came back in order");
+        assert_eq!(exit_status, Some(0), "and then the exit status");
+    }
+
+    /// The client wrapped, the daemon bare (as a VM guest built before this change): the echo
+    /// completes, through the real wiring in [`crate::Client::handshake`].
+    #[tokio::test]
+    async fn the_client_alone_breaks_the_wait() {
+        let (client_end, daemon_end) = tokio::io::duplex(PIPE_BYTES);
+        serve(daemon_end, false);
+        let payload = Arc::new(pattern(PAYLOAD_BYTES));
+        let echo = async {
+            let handle = crate::Client::handshake(client_end, "minimal-cli", Path::new("duplex"))
+                .await
+                .unwrap();
+            round_trip(&handle, payload.clone()).await
+        };
+        let (echoed, exit_status) = tokio::time::timeout(BOUND, echo).await.expect(STALLED);
+        check(&payload, &echoed, exit_status);
+    }
+
+    /// The daemon wrapped, the client bare (as a CLI built before this change): the echo
+    /// completes. The daemon's own wiring is the same call in minimald's
+    /// `Connection::from_stream`, which this crate cannot reach, so the stand-in wraps its end
+    /// the same way.
+    #[tokio::test]
+    async fn the_daemon_alone_breaks_the_wait() {
+        let (client_end, daemon_end) = tokio::io::duplex(PIPE_BYTES);
+        serve(daemon_end, true);
+        let payload = Arc::new(pattern(PAYLOAD_BYTES));
+        let echo = async {
+            let handle = bare_client(client_end).await;
+            round_trip(&handle, payload.clone()).await
+        };
+        let (echoed, exit_status) = tokio::time::timeout(BOUND, echo).await.expect(STALLED);
+        check(&payload, &echoed, exit_status);
+    }
+
+    /// The control: neither end wrapped. Whether this stalls depends on when each session loop
+    /// runs, so it is not run by default. Run it by hand to see the stall the two tests above
+    /// end.
+    #[tokio::test]
+    #[ignore = "the stall depends on scheduling; run by hand as the control"]
+    async fn bare_ends_can_wait_on_each_other() {
+        let (client_end, daemon_end) = tokio::io::duplex(PIPE_BYTES);
+        serve(daemon_end, false);
+        let payload = Arc::new(pattern(PAYLOAD_BYTES));
+        let echo = async {
+            let handle = bare_client(client_end).await;
+            round_trip(&handle, payload.clone()).await
+        };
+        if tokio::time::timeout(CONTROL_BOUND, echo).await.is_ok() {
+            panic!("two bare ends finished the echo: this pipe did not reproduce the stall");
+        }
     }
 }
