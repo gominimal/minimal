@@ -1,7 +1,8 @@
 //! `min box list`: the box records the daemon of each local host keeps for
 //! the current project, or for every project with `--all`, in any state
 //! (BOX-158, rendered as BCLI-001 and BCLI-051 pull it forward into the
-//! first slice).
+//! first slice). `--type` and `--parent` keep only the matching boxes
+//! (BCLI-026).
 
 use super::*;
 
@@ -32,6 +33,16 @@ pub async fn cmd_box_list(global: &GlobalArgs, args: BoxListArgs) -> Result<(), 
     ensure_daemon(global)?;
     let scoped = scope.is_some();
     let hosts = crate::cmd::list::local_hosts(global)?;
+    // BCLI-026: `--parent` names a box as every box verb does, so it
+    // resolves over the same hosts before the listing reads them.
+    let parent = match args.parent.as_deref() {
+        Some(address) => Some(
+            resolve_box_on_hosts(hosts.clone(), address, "box list")
+                .await?
+                .box_id,
+        ),
+        None => None,
+    };
     let mut listed = Vec::new();
     for host in hosts {
         match list_host_boxes(&host, scope.clone()).await {
@@ -55,13 +66,72 @@ pub async fn cmd_box_list(global: &GlobalArgs, args: BoxListArgs) -> Result<(), 
             }
         }
     }
+    let filter = BoxListFilter {
+        box_type: args.box_type.as_deref(),
+        parent,
+    };
+    let listed = filter.apply(listed);
     tracing::info!(verb = "box list", outcome = "ok", boxes = listed.len());
     let mut out = std::io::stdout().lock();
     match args.output {
         Some(BoxListOutputFormat::Json) => render_box_list_json(&mut out, &listed)?,
+        None if listed.is_empty() && filter.is_set() => {
+            writeln!(out, "{}", filtered_empty_line(&args, scoped))?;
+        }
         None => render_box_list(&mut out, &listed, scoped)?,
     }
     Ok(())
+}
+
+/// What `--type` and `--parent` keep of a listing (BCLI-026).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct BoxListFilter<'a> {
+    /// Keep only the boxes of this type.
+    pub box_type: Option<&'a str>,
+    /// Keep only the children of this box.
+    pub parent: Option<boxes::SessionId>,
+}
+
+impl BoxListFilter<'_> {
+    /// Whether either flag is set.
+    pub(crate) fn is_set(&self) -> bool {
+        self.box_type.is_some() || self.parent.is_some()
+    }
+
+    /// The records of `listed` that match every set flag, in order.
+    pub(crate) fn apply(&self, listed: Vec<ListedBox>) -> Vec<ListedBox> {
+        listed
+            .into_iter()
+            .filter(|listed| {
+                self.box_type
+                    .is_none_or(|box_type| listed.record.box_type.as_deref() == Some(box_type))
+            })
+            .filter(|listed| {
+                self.parent
+                    .is_none_or(|parent| listed.record.parent == Some(parent))
+            })
+            .collect()
+    }
+}
+
+/// The line the table form prints when `--type` or `--parent` keeps no box.
+fn filtered_empty_line(args: &BoxListArgs, scoped: bool) -> String {
+    let flags: Vec<String> = args
+        .box_type
+        .iter()
+        .map(|box_type| format!("--type {box_type}"))
+        .chain(
+            args.parent
+                .iter()
+                .map(|parent| format!("--parent {parent}")),
+        )
+        .collect();
+    let flags = flags.join(" ");
+    if scoped {
+        format!("No box of this project matches {flags}.")
+    } else {
+        format!("No box on this machine matches {flags}.")
+    }
 }
 
 /// The stderr line for a host whose boxes the listing could not read.
@@ -369,6 +439,116 @@ mod tests {
             lifetime: None,
             build_boxes: Vec::new(),
         }
+    }
+
+    // BCLI-026: `min box list --type task` keeps the task boxes and drops
+    // the boxes of every other type, and a record with no type.
+    #[test]
+    fn box_list_type_keeps_that_box_type() {
+        let task = entry(
+            "0199e0a0-0000-7000-8000-000000000001",
+            None,
+            "task",
+            "running",
+        );
+        let session = entry(
+            "0199e0a0-0000-7000-8000-000000000002",
+            Some("web"),
+            "session",
+            "running",
+        );
+        let mut untyped = entry(
+            "0199e0a0-0000-7000-8000-000000000003",
+            None,
+            "task",
+            "stopped",
+        );
+        untyped.box_type = None;
+        let listed = vec![local(task.clone()), local(session.clone()), local(untyped)];
+
+        let filter = BoxListFilter {
+            box_type: Some("task"),
+            parent: None,
+        };
+        assert!(filter.is_set());
+        assert_eq!(filter.apply(listed.clone()), vec![local(task)]);
+
+        let filter = BoxListFilter {
+            box_type: Some("session"),
+            parent: None,
+        };
+        assert_eq!(filter.apply(listed.clone()), vec![local(session)]);
+
+        // No flag keeps every record.
+        let filter = BoxListFilter::default();
+        assert!(!filter.is_set());
+        assert_eq!(filter.apply(listed.clone()), listed);
+    }
+
+    // BCLI-026: `min box list --parent <box>` keeps the children of that box
+    // only: not the box itself, not a box with no parent, and not the
+    // children of another box. With `--type` too, both must match.
+    #[test]
+    fn box_list_parent_keeps_its_children() {
+        let parent_id = "0199e0a0-0000-7000-8000-000000000001";
+        let other_id = "0199e0a0-0000-7000-8000-000000000002";
+        let parent = entry(parent_id, Some("web"), "session", "running");
+        let other = entry(other_id, Some("api"), "session", "running");
+        let child = |id: &str, box_type: &str, of: &str| {
+            let mut child = entry(id, None, box_type, "running");
+            child.parent = Some(boxes::SessionId::parse_str(of).unwrap());
+            child
+        };
+        let task_child = child("0199e0a0-0000-7000-8000-000000000003", "task", parent_id);
+        let session_child = child("0199e0a0-0000-7000-8000-000000000004", "session", parent_id);
+        let other_child = child("0199e0a0-0000-7000-8000-000000000005", "task", other_id);
+        let listed: Vec<ListedBox> = [
+            parent,
+            other,
+            task_child.clone(),
+            session_child.clone(),
+            other_child,
+        ]
+        .into_iter()
+        .map(local)
+        .collect();
+
+        let filter = BoxListFilter {
+            box_type: None,
+            parent: Some(boxes::SessionId::parse_str(parent_id).unwrap()),
+        };
+        assert_eq!(
+            filter.apply(listed.clone()),
+            vec![local(task_child.clone()), local(session_child)]
+        );
+
+        let filter = BoxListFilter {
+            box_type: Some("task"),
+            parent: Some(boxes::SessionId::parse_str(parent_id).unwrap()),
+        };
+        assert_eq!(filter.apply(listed), vec![local(task_child)]);
+
+        // The table form names the flags when they keep no box.
+        let args = BoxListArgs {
+            all: false,
+            box_type: Some("task".to_string()),
+            parent: Some("web".to_string()),
+            output: None,
+        };
+        assert_eq!(
+            filtered_empty_line(&args, true),
+            "No box of this project matches --type task --parent web."
+        );
+        let args = BoxListArgs {
+            all: true,
+            box_type: None,
+            parent: Some("web".to_string()),
+            output: None,
+        };
+        assert_eq!(
+            filtered_empty_line(&args, false),
+            "No box on this machine matches --parent web."
+        );
     }
 
     /// NET-171, BOX-210: a running build box lists under its requesting box

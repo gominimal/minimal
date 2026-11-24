@@ -661,13 +661,21 @@ pub enum TypeOutputFormat {
     Toml,
 }
 
-// BOX-158 (BCLI-001, BCLI-051): `min box list [--all] [-o json]`.
+// BOX-158 (BCLI-001, BCLI-051): `min box list [--all] [-o json]`, and
+// BCLI-026's `--type <name>` and `--parent <box>`.
 #[derive(Debug, Args)]
 pub struct BoxListArgs {
     /// List the boxes of every project, not only the boxes of the current
     /// project
     #[arg(long)]
     pub all: bool,
+    /// List only the boxes of this type, such as `session` or `task`
+    #[arg(long = "type", value_name = "TYPE", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub box_type: Option<String>,
+    /// List only the child boxes of this box: its id, the start of its id,
+    /// or its name
+    #[arg(long, value_name = "BOX", add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub parent: Option<String>,
     /// Write the boxes as a JSON array, one object for each box, and
     /// nothing else
     #[arg(short = 'o', long = "output", value_enum)]

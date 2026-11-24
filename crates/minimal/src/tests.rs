@@ -26446,7 +26446,7 @@ fn box_verbs_exist_with_arch_flags() {
     // The architecture's flags that are not in the model yet, each with the
     // issue that delivers it. When one of them lands, this test fails until
     // the flag moves from this table to `expected`.
-    const DEFERRED_ARCH_FLAGS: [(&str, &str, &str); 5] = [
+    const DEFERRED_ARCH_FLAGS: [(&str, &str, &str); 3] = [
         (
             "run",
             "--name",
@@ -26461,16 +26461,6 @@ fn box_verbs_exist_with_arch_flags() {
             "run",
             "--loadout",
             "https://github.com/gominimal/minimal/issues/3237",
-        ),
-        (
-            "list",
-            "--type",
-            "https://github.com/gominimal/minimal/issues/3714",
-        ),
-        (
-            "list",
-            "--parent",
-            "https://github.com/gominimal/minimal/issues/3714",
         ),
     ];
 
@@ -26494,7 +26484,7 @@ fn box_verbs_exist_with_arch_flags() {
             "run",
             &["--detach", "--network", "--no-loadouts", "--no-hooks"],
         ),
-        ("list", &["--all", "--output"]),
+        ("list", &["--all", "--type", "--parent", "--output"]),
         ("show", &["--network", "--output"]),
         ("spec", &["--output", "--network", "--loadout"]),
         ("stop", &["--force", "--exec"]),
@@ -26552,6 +26542,7 @@ fn box_verbs_exist_with_arch_flags() {
             "a",
         ],
         &["box", "list", "--all", "-o", "json"],
+        &["box", "list", "--type", "task", "--parent", "web"],
         &["box", "show", "web", "--network", "-o", "json"],
         &["box", "spec", "web", "-o", "yaml"],
         &["box", "spec"],

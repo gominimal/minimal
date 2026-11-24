@@ -1219,7 +1219,12 @@ mod tests {
             let cli = minimal::Cli {
                 global_args: minimal::GlobalArgs::default(),
                 command: Some(Command::Box(minimal::BoxArgs {
-                    command: minimal::BoxCommand::List(minimal::BoxListArgs { all: false, output }),
+                    command: minimal::BoxCommand::List(minimal::BoxListArgs {
+                        all: false,
+                        box_type: None,
+                        parent: None,
+                        output,
+                    }),
                 })),
             };
             assert_eq!(machine_output_mode(&cli), machine);
