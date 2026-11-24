@@ -552,7 +552,10 @@ const SWITCH_NOT_BOUND: &str = "proxy not found";
 /// Each bind goes through the egress gate's publish ledger at the node's
 /// switch address ([`crate::net::egress_gate::MirrorLedger`]), noted before
 /// the expose. So the gate tracks the connections the forward carries and
-/// admits the node's replies on them. An unbind closes the listener first,
+/// admits the node's replies on them. The switch's `proxy already running`
+/// answer counts as bound only when the ledger already held this bind, as
+/// in [`proxy_reclaim_publisher`]; otherwise the bind fails and its note
+/// goes. An unbind closes the listener first,
 /// then drops the note and resets the connections the gate tracked at that
 /// port, and no other port's.
 #[derive(Debug)]
@@ -586,7 +589,7 @@ impl crate::box_registry::MirrorBinder for SwitchMirrorBinder {
         );
         let result = match post_switch_forwarder(&self.switch_sock, "expose", &body) {
             Ok((status, _)) if (200..300).contains(&status) => Ok(()),
-            Ok((500, answer)) if switch_already_bound(&answer) => Ok(()),
+            Ok((500, answer)) if switch_already_bound(&answer) && !noted => Ok(()),
             Ok((_, answer)) if answer.contains("address already in use") => {
                 Err(MirrorBindError::Occupied)
             }
@@ -5937,6 +5940,62 @@ mod tests {
             None,
             "the unbind drops the note"
         );
+    }
+
+    // NET-138: the switch's answer for a listener it already holds counts as
+    // bound only when the ledger already held this bind. A bind that made its
+    // note fails on that answer and drops the note; the retry of a bind whose
+    // expose went unanswered, whose note stayed, takes it as bound.
+    #[test]
+    fn switch_mirror_binder_takes_already_running_only_for_a_bind_it_noted_before() {
+        use crate::box_registry::{MirrorBindError, MirrorBinder as _};
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let sock = dir.path().join("switch.sock");
+        let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+        let _entered = runtime.enter();
+        let registry = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
+        let node = std::net::Ipv4Addr::new(192, 168, 127, 2);
+        let binder = super::SwitchMirrorBinder {
+            switch_sock: sock.clone(),
+            node,
+            table: registry.table(),
+        };
+        let ledger =
+            crate::net::egress_gate::TestMirrorLedger::attach(&registry.table(), sock.clone());
+        let fresh = std::net::Ipv4Addr::new(127, 0, 64, 9);
+        let retried = std::net::Ipv4Addr::new(127, 0, 64, 10);
+
+        // No switch serves yet: the expose goes unanswered and its note stays.
+        assert!(matches!(
+            binder.bind(retried, 8080),
+            Err(MirrorBindError::Unanswered(_))
+        ));
+        assert_eq!(ledger.dials(retried, 8080), Some(node));
+
+        let requests = fake_switch(
+            &sock,
+            vec![
+                (500, "proxy already running for tcp on 127.0.64.9:8080\n"),
+                (500, "proxy already running for tcp on 127.0.64.10:8080\n"),
+            ],
+        );
+        assert!(
+            matches!(binder.bind(fresh, 8080), Err(MirrorBindError::Failed(_))),
+            "a listener the switch holds for a forward the ledger did not hold is not this bind"
+        );
+        requests.recv().expect("the first expose");
+        assert_eq!(
+            ledger.dials(fresh, 8080),
+            None,
+            "the failed bind drops the note it made"
+        );
+        assert_eq!(
+            binder.bind(retried, 8080),
+            Ok(()),
+            "the retry of an unanswered bind finds its forward in place"
+        );
+        requests.recv().expect("the retried expose");
+        assert_eq!(ledger.dials(retried, 8080), Some(node));
     }
 
     // NET-138: the upkeep opens the node's mirror only while the whole-range
