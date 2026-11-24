@@ -1843,6 +1843,70 @@ pub mod box_name {
         }
     }
 
+    /// The longest box name: one DNS label (BOX-213).
+    pub const BOX_NAME_MAX: usize = 63;
+
+    /// `text` as DNS label characters, uncapped: ASCII letters and digits
+    /// lowercased, `-`, `_` and `.` as `-`, other characters dropped, and
+    /// no `-` at either end.
+    fn label_chars(text: &str) -> String {
+        let filtered: String = text
+            .chars()
+            .filter_map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    Some(c.to_ascii_lowercase())
+                } else if matches!(c, '-' | '_' | '.') {
+                    Some('-')
+                } else {
+                    None
+                }
+            })
+            .collect();
+        filtered.trim_matches('-').to_string()
+    }
+
+    /// The first `max` octets of the ASCII label `label`, with no `-` left
+    /// at the end.
+    fn cut_label(label: &str, max: usize) -> &str {
+        label[..label.len().min(max)].trim_end_matches('-')
+    }
+
+    /// The project name of a project root path: its last path component.
+    /// An empty string when the path has none, as for `/`.
+    #[must_use]
+    pub fn project_name_of_root(root: &str) -> &str {
+        root.trim_end_matches('/').rsplit('/').next().unwrap_or("")
+    }
+
+    /// The name the Box Host derives for a box created with no requested
+    /// name (BOX-211, BOX-213): the project name for the default entry
+    /// (`entry` is `None`), else `<project>-<entry>`, and then `-<n>` for
+    /// the `n`th fresh instance. Each part is cleaned to DNS label
+    /// characters. The name fits [`BOX_NAME_MAX`] octets: the project is
+    /// cut first, then the entry, and the instance number never. A project
+    /// that cleans to nothing leaves the entry alone, and a name with
+    /// nothing left is `box`.
+    #[must_use]
+    pub fn derived_box_name(project: &str, entry: Option<&str>, instance: Option<usize>) -> String {
+        let suffix = instance.map(|n| format!("-{n}")).unwrap_or_default();
+        let budget = BOX_NAME_MAX.saturating_sub(suffix.len());
+        let project = label_chars(project);
+        let entry = entry.map(label_chars).filter(|entry| !entry.is_empty());
+        let base = match entry {
+            None => cut_label(&project, budget).to_string(),
+            Some(entry) => {
+                let entry = cut_label(&entry, budget);
+                let room = budget.saturating_sub(entry.len() + 1);
+                match cut_label(&project, room) {
+                    "" => entry.to_string(),
+                    project => format!("{project}-{entry}"),
+                }
+            }
+        };
+        let base = if base.is_empty() { "box" } else { base.as_str() };
+        format!("{base}{suffix}")
+    }
+
     /// What a name check reads of one retained record on one host.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct NamedBox {
@@ -3584,6 +3648,55 @@ mod tests {
             assert_eq!(entry_box_name(""), "box");
             assert_eq!(entry_box_name("\t日本\t"), "box");
             assert_eq!(entry_box_name("-_."), "box");
+        }
+
+        /// BOX-211, BOX-213: a derived name is one label of at most 63
+        /// octets. The project is cut first, then the entry, and the
+        /// fresh instance's number is never cut.
+        #[test]
+        fn derived_name_fits_63_cutting_project_then_entry_never_number() {
+            use super::super::box_name::{BOX_NAME_MAX, derived_box_name, project_name_of_root};
+
+            assert_eq!(derived_box_name("Web_App", None, None), "web-app");
+            assert_eq!(derived_box_name("web", Some("lint"), None), "web-lint");
+            assert_eq!(derived_box_name("web", Some("lint"), Some(3)), "web-lint-3");
+
+            // The project is cut first.
+            let project = "p".repeat(70);
+            let name = derived_box_name(&project, Some("lint"), None);
+            assert_eq!(name, format!("{}-lint", "p".repeat(58)));
+            assert_eq!(name.len(), BOX_NAME_MAX);
+
+            // The number keeps its digits, and the project gives the room.
+            let name = derived_box_name(&project, Some("lint"), Some(12));
+            assert_eq!(name, format!("{}-lint-12", "p".repeat(55)));
+            assert_eq!(name.len(), BOX_NAME_MAX);
+
+            // A project alone is cut to the label.
+            let name = derived_box_name(&project, None, Some(7));
+            assert_eq!(name, format!("{}-7", "p".repeat(61)));
+
+            // With no room for the project, the entry is cut next.
+            let entry = "e".repeat(80);
+            let name = derived_box_name("web", Some(&entry), Some(100));
+            assert_eq!(name, format!("{}-100", "e".repeat(59)));
+            assert_eq!(name.len(), BOX_NAME_MAX);
+
+            // A cut never leaves a `-` before the next part.
+            let project = format!("{}_x", "p".repeat(57));
+            assert_eq!(
+                derived_box_name(&project, Some("lint"), None),
+                format!("{}-lint", "p".repeat(57))
+            );
+
+            // Parts that clean to nothing.
+            assert_eq!(derived_box_name("日本", Some("lint"), None), "lint");
+            assert_eq!(derived_box_name("日本", None, None), "box");
+            assert_eq!(derived_box_name("", None, Some(2)), "box-2");
+
+            assert_eq!(project_name_of_root("/home/me/web/"), "web");
+            assert_eq!(project_name_of_root("/home/me/web"), "web");
+            assert_eq!(project_name_of_root("/"), "");
         }
 
         fn status() -> impl Strategy<Value = BoxState> {
