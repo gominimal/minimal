@@ -1432,6 +1432,67 @@ mod tests {
         assert_eq!(server.join().unwrap().len(), 1);
     }
 
+    /// BEP-005 from the dashboard: a create whose entry declares a GitHub
+    /// grant runs the mint for the registered row before any create is
+    /// sent. A host that hands back no box id gives the mint no id to mint
+    /// for, so the mint refuses, names the grant, and withdraws the row by
+    /// the name and the pair the registration handed back. The refusal is
+    /// reached before the mint reads the home directory, so the test does
+    /// not depend on a proxy on this host.
+    #[tokio::test]
+    async fn dashboard_create_with_grants_withdraws_the_row_when_the_mint_fails() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let host_dir = vm_host_dir(&dir);
+        let ssh_sock = host_dir.join("ssh.sock");
+        let addresses = boxes::BoxAddresses {
+            switch_address: std::net::Ipv4Addr::new(100, 64, 0, 5),
+            loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 2),
+        };
+        let server = fake_vm_host(
+            &host_dir.join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
+            vec![
+                // A host that predates ids registers the box with no id.
+                minimald_rpc::BoxControlReply::Addresses(addresses),
+                minimald_rpc::BoxControlReply::Addresses(addresses),
+            ],
+        );
+        let grants = BoxGrants {
+            github: vec!["GH_TOKEN".to_string()],
+            ..BoxGrants::default()
+        };
+        let failed = create_registering(
+            &ssh_sock,
+            own_ip_config(dir.path(), Some("web")),
+            None,
+            &grants,
+            &mut (),
+            |(), _config| -> CreateFuture<'_> {
+                panic!("no create is sent for a box whose grants were not minted")
+            },
+        )
+        .await;
+        let error = match failed {
+            Ok(_) => panic!("the failed mint is the dashboard's error"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            error.contains("GH_TOKEN"),
+            "the refusal names the grant it could not mint: {error}"
+        );
+        let lines = server.join().unwrap();
+
+        assert_eq!(lines.len(), 2, "a registration, then its withdrawal");
+        let request: minimald_rpc::BoxControlRequest =
+            serde_json_lenient::from_str(lines[1].trim()).expect("the request is the wire type");
+        let minimald_rpc::BoxControlRequest::Withdraw(request) = request else {
+            panic!("the row the failed mint abandons goes by the withdraw verb");
+        };
+        assert_eq!(request.name, "web", "the mint withdraws the row's name");
+        assert_eq!(request.switch_address, addresses.switch_address);
+        assert_eq!(request.loopback_address, addresses.loopback_address);
+        assert_eq!(request.box_id, None, "the host handed back no id");
+    }
+
     /// On a native host an own-address create is the plain create it always
     /// was: nothing registers, the name stays as the form gave it, and the
     /// create carries no addresses — even though native minimald's answerer
