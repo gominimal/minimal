@@ -3786,6 +3786,24 @@ async fn apply_waiting(
             );
             false
         }
+        Err(error @ forward_revoke::ExposeError::Unsent(_)) => {
+            if forwards.release_claim(&next)
+                && !forwards.still_published(next.addr, next.inside, next.proto)
+            {
+                replies.end_port_at(next.addr, next.proto, next.inside);
+            }
+            tracing::warn!(
+                %switch_addr,
+                box_id = %BoxIdText(&next.box_id),
+                %local,
+                %remote,
+                %error,
+                "the expose of the waiting box's declared forwarder at its listener was not \
+                 sent, so the switch was not reached; the ledger holds no forward for it, and \
+                 it stays waiting for a retry"
+            );
+            false
+        }
         Err(error) => {
             if forwards.release_claim(&next)
                 && !forwards.still_published(next.addr, next.inside, next.proto)
@@ -12648,6 +12666,44 @@ mod tests {
                 "a settled forward stops waiting, a refused one keeps waiting"
             );
         }
+    }
+
+    /// A fresh claim whose expose was not sent is taken back out, and the
+    /// forward keeps waiting: the hand-over's retry claims it again as a
+    /// fresh claim and binds it.
+    #[tokio::test]
+    async fn an_unsent_hand_over_expose_is_claimed_again_by_the_retry() {
+        let dir = tempfile::TempDir::new().expect("a tempdir");
+        let sock = dir.path().join("switch.sock");
+        let nothing = dir.path().join("nothing.sock");
+        let (_registry, forwards, _withdrawal) = withdrawn_with_one_forward();
+        assert_eq!(
+            publish_shared(&forwards, WAITER, 18081, box_id(2)),
+            Ok(super::Admitted::Waiting)
+        );
+        let (_, first) = forwards.hand_over_at(SHARED, LEASE);
+        let first = first
+            .expect("the ledger has room")
+            .expect("the waiting forward is claimed");
+        assert!(
+            !super::apply_waiting(&nothing, &forwards, &ReplyTables::new(), first, false).await
+        );
+        assert_eq!(forwards.address_of(SHARED), None);
+        assert!(!forwards.claim_in_flight(SHARED));
+        assert_eq!(forwards.lock_waiting().len(), 1, "the forward keeps waiting");
+
+        // The retry claims it again, as a fresh claim, and binds it.
+        static ANSWERS: [(&str, &str); 1] = [("200 OK", "")];
+        let (server, mut asked) = forwarder_answering(&sock, &ANSWERS);
+        let still_owed =
+            super::hand_over_owed(&sock, &forwards, &ReplyTables::new(), vec![SHARED]).await;
+        server.abort();
+        assert!(still_owed.is_empty(), "the retry bound it");
+        let requests = asked_so_far(&mut asked);
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert!(requests[0].starts_with("POST /services/forwarder/expose "));
+        assert_eq!(forwards.address_of(SHARED), Some(WAITER));
+        assert!(forwards.lock_waiting().is_empty());
     }
 
     /// The waiting box's row is withdrawn while the gate's expose for it is
