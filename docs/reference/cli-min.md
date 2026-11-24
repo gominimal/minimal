@@ -431,7 +431,6 @@ box's. Each run creates a new box, named `<ENTRY>-<n>`.
 | Flag | Description |
 |------|-------------|
 | `--detach` | Start the box, print its id and return. The box gets no input |
-| `--path <PATH>` | The project directory. The default is the directory that `-C` names, else the current directory |
 | `--network <none\|host_ip\|own_ip>` | The box's network mode, as on [`task run`](#task-run) |
 
 The command also takes the egress flags, `--dynamic-ingress`,
@@ -439,7 +438,7 @@ The command also takes the egress flags, `--dynamic-ingress`,
 `--vpn-network-names`, `--no-loadouts` and `--no-hooks`, as
 [`session start`](#session-start) describes them. Put the flags before the
 entry's first argument. An argument that has the name of a flag goes after
-`--`.
+`--`. To run an entry of another project, give `-C <DIR>`.
 
 ### `box list`
 

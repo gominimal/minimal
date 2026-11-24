@@ -2785,7 +2785,6 @@ async fn run_pty_entry_exit2_hints_start_new() {
             &global,
             BoxRunArgs {
                 entry: "default".into(),
-                path: None,
                 detach: false,
                 network: None,
                 egress: EgressArgs::default(),
@@ -2884,7 +2883,6 @@ fn run_and_start_new_request_fresh_instance() {
     });
     let box_run = task::RunEntry::from(BoxRunArgs {
         entry: "build".into(),
-        path: None,
         detach: false,
         network: Some(CliNetworkMode::OwnIp),
         egress,
@@ -3246,7 +3244,6 @@ async fn unattached_start_closes_stdin_and_hints_run_logs_wait() {
         task::RunEntry {
             verb: task::RunVerb::Box,
             entry: "build".into(),
-            path: None,
             detach: true,
             args: vec![],
             network: None,
@@ -26524,6 +26521,14 @@ fn box_verbs_exist_with_arch_flags() {
             );
         }
     }
+    // `min box run` takes no `--path`, hidden or visible. `-C` names the
+    // project.
+    assert!(
+        !model_verb("box", "run")
+            .get_arguments()
+            .any(|arg| arg.get_long() == Some("path")),
+        "`min box run` takes no --path"
+    );
 
     // Each verb parses a command line that uses its flags.
     for argv in [
@@ -26851,6 +26856,37 @@ fn docs_name_aliases_only_in_one_migration_note() {
     ] {
         assert!(note.contains(old), "the note names {old}");
     }
+}
+
+// BCLI-026: `min box run` takes no `--path`. The parser refuses it before
+// the entry's name with the usage exit code, and `-C <dir>` names the
+// project in its place.
+#[test]
+fn box_run_path_flag_is_refused() {
+    use clap::Parser as _;
+    use clap::error::ErrorKind;
+
+    for argv in [
+        &["min", "box", "run", "--path", ".", "check"][..],
+        &["min", "box", "run", "--path=.", "check"],
+    ] {
+        let Err(err) = Cli::try_parse_from(argv) else {
+            panic!("{argv:?}: --path is refused");
+        };
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument, "{argv:?}: {err}");
+        assert_eq!(err.exit_code(), 2, "{argv:?}: {err}");
+        assert!(
+            err.to_string().contains("unexpected argument '--path"),
+            "{argv:?}: {err}"
+        );
+    }
+
+    let cli = Cli::try_parse_from(["min", "-C", "/tmp", "box", "run", "check"])
+        .expect("`-C` names the project of a box run");
+    assert_eq!(
+        cli.global_args.repo_dir,
+        Some(std::path::PathBuf::from("/tmp"))
+    );
 }
 
 // BCLI-043: `min session setup-zed` stays hidden, with the arguments it

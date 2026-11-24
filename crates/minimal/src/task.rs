@@ -708,7 +708,6 @@ impl RunVerb {
 pub(crate) struct RunEntry {
     pub verb: RunVerb,
     pub entry: String,
-    pub path: Option<String>,
     pub detach: bool,
     pub network: Option<crate::CliNetworkMode>,
     pub egress: crate::EgressArgs,
@@ -722,9 +721,6 @@ impl From<TaskRunArgs> for RunEntry {
         Self {
             verb: RunVerb::Task,
             entry: args.task,
-            // BCLI-042: `min task run` takes no `--path`. `-C` names the
-            // project.
-            path: None,
             detach: args.detach,
             network: args.network,
             egress: args.egress,
@@ -739,7 +735,6 @@ impl From<BoxRunArgs> for RunEntry {
         Self {
             verb: RunVerb::Box,
             entry: args.entry,
-            path: args.path,
             detach: args.detach,
             network: args.network,
             egress: args.egress,
@@ -1529,13 +1524,12 @@ pub(crate) async fn run_entry(
     {
         return Err(RunFlagMisplaced::removed_path(&args.entry, arg).into());
     }
-    // Same project-path resolution as `activate_box`: explicit path, then
-    // `-C`/`--repo-dir`, then the cwd.
-    let effective_path = match (&args.path, &global.repo_dir) {
-        (Some(p), _) => std::path::PathBuf::from(p),
-        (None, Some(dir)) => dir.clone(),
-        (None, None) => std::path::PathBuf::from("."),
-    };
+    // BCLI-026, BCLI-042: neither verb takes `--path`. The project is
+    // `-C`/`--repo-dir`, else the cwd.
+    let effective_path = global
+        .repo_dir
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
     let project_path = std::fs::canonicalize(&effective_path)
         .with_context(|| format!("Cannot resolve project path '{}'", effective_path.display()))?;
     let utf8_path = camino::Utf8PathBuf::from_path_buf(project_path)
@@ -2392,7 +2386,7 @@ mod tests {
             spec.entrypoint,
             mfile::spec::Entrypoint::Exec(argv.map(String::from).to_vec())
         );
-        // The in-box run reads `--path` as the task's, not as its own flag.
+        // The run inside the box reads `--path` as the task's, not as its own flag.
         let cli = <crate::cli::Cli as clap::Parser>::try_parse_from(argv).expect("the argv parses");
         let Some(crate::cli::Command::Task(crate::cli::TaskArgs {
             command: crate::cli::TaskCommand::Run(run),
