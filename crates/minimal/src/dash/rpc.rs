@@ -1012,13 +1012,24 @@ fn put_picked_entry(
     // The form's mode acts as `--network`, so it would replace the entry's
     // `network.mode`. An entry whose declared mode differs is refused, and
     // the request gets no spec and no expansion.
-    if let Some(declared) = crate::project_egress(&dir, Some(&entry))?.mode
+    let egress = crate::project_egress(&dir, Some(&entry))?;
+    if let Some(declared) = egress.mode
         && declared != request.config.network
     {
         anyhow::bail!(
             "the entry {entry} declares network mode {declared}, but the create form has \
              {form}. Run min box start {entry} to start it with its own network mode.",
             declared = declared.word(),
+            form = request.config.network.word(),
+        );
+    }
+    // `check_project` reads the form's mode as a `--network` flag, so its
+    // ingress refusal names a flag the dashboard does not have. Refuse
+    // here with the form's own next step.
+    if egress.ingress.is_some() && request.config.network != boxes::NetworkMode::OwnIp {
+        anyhow::bail!(
+            "the entry {entry} sets network.ingress, but the create form has {form}, so the \
+             box cannot publish ports. Pick own_ip in the create form.",
             form = request.config.network.word(),
         );
     }
@@ -2202,6 +2213,25 @@ mod tests {
             format!("{error:#}"),
             "the entry dev declares network mode none, but the create form has host_ip. \
              Run min box start dev to start it with its own network mode."
+        );
+        assert!(request.spec.is_none());
+        assert!(contribution.entry.is_none());
+    }
+
+    /// An entry with `network.ingress` and no `network.mode` is refused
+    /// when the form's mode is not `own_ip`, with a next step in the form,
+    /// not a `--network` flag the dashboard does not have.
+    #[test]
+    fn dashboard_create_refuses_an_entry_with_ingress_off_own_ip() {
+        let (result, request, contribution) = dashboard_request_for_entry_with(
+            "[sessions.dev.network]\ningress = [{ port = 8080 }]\n",
+            NetworkMode::HostNet,
+        );
+        let error = result.expect_err("an entry with ingress off own_ip is refused");
+        assert_eq!(
+            format!("{error:#}"),
+            "the entry dev sets network.ingress, but the create form has host_ip, so the box \
+             cannot publish ports. Pick own_ip in the create form."
         );
         assert!(request.spec.is_none());
         assert!(contribution.entry.is_none());
