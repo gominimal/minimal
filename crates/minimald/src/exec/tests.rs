@@ -2118,7 +2118,10 @@ async fn a_channel_write_waits_on_the_client_until_it_is_lost() {
             .expect("a write that waits on a lost client is given up")
     };
     assert!(matches!(relayed, super::Relayed::Lost), "{relayed:?}");
-    assert!(channel.is_cut(), "a write given up part way cuts the channel");
+    assert!(
+        channel.is_cut(),
+        "a write given up part way cuts the channel"
+    );
     let relayed = super::write_unless_lost(&mut channel, b"more", &end).await;
     assert!(matches!(relayed, super::Relayed::Cut), "{relayed:?}");
 
@@ -2126,7 +2129,10 @@ async fn a_channel_write_waits_on_the_client_until_it_is_lost() {
     let mut roomy = super::ChannelOut::new(roomy);
     let relayed = super::write_unless_lost(&mut roomy, b"output", &end).await;
     assert!(matches!(relayed, super::Relayed::Written), "{relayed:?}");
-    assert!(!roomy.is_cut(), "a write that finished leaves the channel whole");
+    assert!(
+        !roomy.is_cut(),
+        "a write that finished leaves the channel whole"
+    );
     drop(roomy);
     let mut got = Vec::new();
     client.read_to_end(&mut got).await.unwrap();
@@ -2212,8 +2218,18 @@ async fn a_slow_client_gets_all_output_and_the_status_of_a_command_that_exits_mi
         .expect("a slow client must get the whole output and the status");
     assert_eq!(exit.unwrap(), 3, "the command's own status");
     assert!(!ctrl.was_killed(), "a slow client is not a lost one");
-    assert!(got_out == out, "stdout: {} of {} bytes", got_out.len(), out.len());
-    assert!(got_err == err, "stderr: {} of {} bytes", got_err.len(), err.len());
+    assert!(
+        got_out == out,
+        "stdout: {} of {} bytes",
+        got_out.len(),
+        out.len()
+    );
+    assert!(
+        got_err == err,
+        "stderr: {} of {} bytes",
+        got_err.len(),
+        err.len()
+    );
 }
 
 /// A destroy reaches a command whose output write waits on the client: the
@@ -2344,7 +2360,10 @@ async fn an_input_bound_during_a_parked_output_write_ends_the_exec_once_the_writ
     timeout(Duration::from_secs(3600), &mut bridge_task)
         .await
         .expect_err("an input bound does not give up a write the client may still take");
-    assert!(!ctrl.was_killed(), "the command runs until the write is done");
+    assert!(
+        !ctrl.was_killed(),
+        "the command runs until the write is done"
+    );
 
     let mut got = [0u8; 6];
     timeout(Duration::from_secs(10), client_stdout.read_exact(&mut got))
@@ -2358,7 +2377,10 @@ async fn an_input_bound_during_a_parked_output_write_ends_the_exec_once_the_writ
         .unwrap();
     // A killed mock waits back Ok(None), which the bridge maps to 1.
     assert_eq!(exit, 1);
-    assert!(ctrl.was_killed(), "the bridge ends the command for the bound");
+    assert!(
+        ctrl.was_killed(),
+        "the bridge ends the command for the bound"
+    );
 }
 
 /// A channel writer with the flaw of russh's `ChannelTx`, whose
@@ -2481,7 +2503,10 @@ async fn a_channel_given_up_part_way_is_not_written_again() {
     timeout(Duration::from_secs(5), bounded.write(b"output"))
         .await
         .expect_err("the write waits on a client that reads nothing");
-    assert!(bounded.is_cut(), "a write dropped part way cuts the channel");
+    assert!(
+        bounded.is_cut(),
+        "a write dropped part way cuts the channel"
+    );
 
     // The control.
     let (inner, session) = held_chunk_channel(&parked);
@@ -2498,7 +2523,10 @@ async fn a_channel_given_up_part_way_is_not_written_again() {
             .expect("the write finishes once the session takes it")
     };
     assert!(matches!(relayed, super::Relayed::Written), "{relayed:?}");
-    assert!(!whole.is_cut(), "a write that finished leaves the channel whole");
+    assert!(
+        !whole.is_cut(),
+        "a write that finished leaves the channel whole"
+    );
     let relayed = whole.write(b"second").await;
     assert!(matches!(relayed, super::Relayed::Written), "{relayed:?}");
     assert_eq!(session.sent(), b"first second");
@@ -2508,7 +2536,11 @@ async fn a_channel_given_up_part_way_is_not_written_again() {
 /// sends a status, so the test can act between the bridge's kill and what
 /// the bridge writes once the command is gone. `start_kill` wakes `killed`.
 struct ExitsWhenTold {
-    stdio: Option<(tokio::io::DuplexStream, tokio::io::DuplexStream, tokio::io::DuplexStream)>,
+    stdio: Option<(
+        tokio::io::DuplexStream,
+        tokio::io::DuplexStream,
+        tokio::io::DuplexStream,
+    )>,
     status: tokio::sync::watch::Receiver<Option<i32>>,
     killed: std::sync::Arc<tokio::sync::Notify>,
 }
@@ -2524,7 +2556,11 @@ impl super::Process for ExitsWhenTold {
 
     // Cancel-safe: `wait_for` is.
     async fn wait(&mut self) -> std::io::Result<Option<i32>> {
-        let status = self.status.wait_for(Option::is_some).await.map(|status| *status);
+        let status = self
+            .status
+            .wait_for(Option::is_some)
+            .await
+            .map(|status| *status);
         Ok(status.ok().flatten())
     }
 

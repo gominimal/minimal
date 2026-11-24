@@ -1860,7 +1860,10 @@ mod tests {
             .authenticate_none(&session_id.to_string())
             .await
             .unwrap();
-        assert!(auth.success(), "auth_none should succeed on a local transport");
+        assert!(
+            auth.success(),
+            "auth_none should succeed on a local transport"
+        );
         let channel = handle
             .channel_open_direct_tcpip("127.0.0.1", port.into(), "127.0.0.1", 0)
             .await

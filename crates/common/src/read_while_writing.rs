@@ -470,7 +470,10 @@ mod tests {
             .await
             .expect_err("nobody reads what this end writes, so its write must stay blocked");
         assert_eq!(a.buffered(), 1024, "reading ahead stopped at the cap");
-        assert!(!peer.is_finished(), "so the peer is still blocked in its write");
+        assert!(
+            !peer.is_finished(),
+            "so the peer is still blocked in its write"
+        );
 
         let mut got = Vec::new();
         timeout(BOUND, a.read_to_end(&mut got))
@@ -507,7 +510,11 @@ mod tests {
         let _elapsed = timeout(BOUND, a.write_all(&[0u8; 4096]))
             .await
             .expect_err("nobody reads what this end writes, so its write must stay blocked");
-        assert_eq!(a.buffered(), 3000, "everything the peer sent was read ahead");
+        assert_eq!(
+            a.buffered(),
+            3000,
+            "everything the peer sent was read ahead"
+        );
         assert!(
             matches!(a.end, ReadEnd::Eof),
             "and the peer's shutdown was seen while reading ahead"
@@ -588,7 +595,11 @@ mod tests {
         let polled =
             std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut s).poll_write(cx, b"x"))).await;
         assert!(polled.is_pending(), "the scripted write never progresses");
-        assert_eq!(s.buffered(), 3, "the bytes before the error were read ahead");
+        assert_eq!(
+            s.buffered(),
+            3,
+            "the bytes before the error were read ahead"
+        );
 
         let mut buf = [0u8; 16];
         let n = timeout(BOUND, s.read(&mut buf))
@@ -653,7 +664,10 @@ mod tests {
     async fn write_once(s: &mut ReadWhileWriting<Feed>) {
         let polled =
             std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut *s).poll_write(cx, b"x"))).await;
-        assert!(polled.is_pending(), "the fed stream's writes never progress");
+        assert!(
+            polled.is_pending(),
+            "the fed stream's writes never progress"
+        );
     }
 
     /// 1 MiB is held ahead, then the reader takes one 32 KiB packet at a time while every write
@@ -681,7 +695,9 @@ mod tests {
             assert_eq!(n, PACKET, "a whole packet is held");
             got.extend_from_slice(&packet[..n]);
             let more = HELD + i * PACKET;
-            s.inner.bytes.extend(sent[more..more + PACKET].iter().copied());
+            s.inner
+                .bytes
+                .extend(sent[more..more + PACKET].iter().copied());
             write_once(&mut s).await;
             assert_eq!(s.buffered(), HELD, "what arrived was read ahead");
         }
