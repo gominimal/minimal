@@ -1089,6 +1089,13 @@ pub struct File {
     /// What layout this repo/layer is using, if loaded from disk.
     #[serde(skip)]
     layout: Option<Layout>,
+    /// The lines a load has for the person: the legacy-table hints and the
+    /// unknown-field warnings, in the order the load found them. The load
+    /// prints none of them. The caller reads them with
+    /// [`File::diagnostics`] or [`File::diagnostics_once`] and puts them on
+    /// its own surface.
+    #[serde(skip)]
+    diagnostics: Vec<String>,
 }
 
 /// The entry keys that `[session]` and a task keep among their unknown
@@ -1160,24 +1167,27 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
-/// Whether to print the legacy-table hints for this read of a file.
+/// Whether this is the first time this process hands out the diagnostics of
+/// the file at `path` with this content.
 ///
 /// One command parses the same file many times, so without this a single
-/// `min session activate` prints each hint once per parse. A file's hints
-/// print the first time this process reads a given (path, content). The
-/// key holds the content as well as the path, as in
-/// [`File::warn_unknown_fields`], so the long-lived `minimald` prints them
-/// again after the file is edited. A read with no path always prints.
-fn legacy_hints_due(path: Option<&Path>, bytes: &[u8]) -> bool {
-    static HINTED_FILES: LazyLock<Mutex<HashSet<(PathBuf, u64)>>> =
+/// `min session activate` prints each line once per parse. The key holds the
+/// content as well as the path, so the long-lived `minimald` reports the lines
+/// again after the file is edited. The hash is of the bytes that produced the
+/// `File`, not a re-read: a file replaced between parse and report must not
+/// silence the report of the replacement. A file with no path is always due.
+fn diagnostics_due(path: Option<&Path>, content_hash: Option<u64>) -> bool {
+    /// A file's path and the hash of its content.
+    type FileKey = (PathBuf, Option<u64>);
+    static REPORTED_FILES: LazyLock<Mutex<HashSet<FileKey>>> =
         LazyLock::new(|| Mutex::new(HashSet::new()));
     let Some(path) = path else {
         return true;
     };
-    HINTED_FILES
+    REPORTED_FILES
         .lock()
-        .unwrap()
-        .insert((path.to_path_buf(), hash_bytes(bytes)))
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((path.to_path_buf(), content_hash))
 }
 
 /// Refuses a `state_key` from the project's own file that
@@ -1288,28 +1298,12 @@ impl File {
     /// serde's internal enum name.
     ///
     /// It then reads the legacy tables (BOX-050, BOX-051, BOX-052) and
-    /// prints one hint on stderr for each, the first time this process reads
-    /// the file (see [`legacy_hints_due`]).
+    /// keeps one hint for each on the file's diagnostics. It prints nothing.
     fn parse(bytes: &[u8], path: Option<&Path>) -> Result<Self, Error> {
-        Self::parse_to(bytes, path, &mut std::io::stderr())
-    }
-
-    /// [`File::parse`], writing the legacy hints to `hints_out` rather than
-    /// stderr, so a test can read what a parse prints.
-    fn parse_to(
-        bytes: &[u8],
-        path: Option<&Path>,
-        hints_out: &mut dyn std::io::Write,
-    ) -> Result<Self, Error> {
         let mut file = Self::deserialize_bytes(bytes, path)?;
         let hints = legacy::settle(&mut file, legacy::this_release(), path)?;
-        if !hints.is_empty() && legacy_hints_due(path, bytes) {
-            for legacy in hints {
-                // A hint that cannot be written (a closed stderr) is not a
-                // reason to fail the read.
-                let _ = writeln!(hints_out, "{legacy}");
-            }
-        }
+        file.diagnostics
+            .extend(hints.into_iter().map(|legacy| legacy.to_string()));
         Ok(file)
     }
 
@@ -1383,7 +1377,31 @@ impl File {
             }
         }
         self.check(tasks)?;
+        let warnings = self.unknown_field_warnings();
+        self.diagnostics.extend(warnings);
         Ok(self)
+    }
+
+    /// The lines this load has for the person, in the order it found them:
+    /// a `hint:` line for each legacy table, then each `warning:` about an
+    /// unknown field and its `help:` line. Nothing printed them.
+    #[must_use]
+    pub fn diagnostics(&self) -> &[String] {
+        &self.diagnostics
+    }
+
+    /// [`File::diagnostics`], on the first call in this process for this
+    /// file's path and content, and nothing after that. A command that loads
+    /// the same file several times prints each line once with this. A file
+    /// with no path returns its lines every time.
+    #[must_use]
+    pub fn diagnostics_once(&self) -> Vec<String> {
+        if self.diagnostics.is_empty()
+            || !diagnostics_due(self.mfile_path.as_deref(), self.content_hash)
+        {
+            return Vec::new();
+        }
+        self.diagnostics.clone()
     }
 
     /// Post-deserialize invariants: every declared param has a `default`,
@@ -1428,7 +1446,7 @@ impl File {
             return Err(Error::HarnessTable(self.mfile_path.clone()));
         }
         // serde takes one action key as `task.action` and leaves any other in
-        // `task.extra`. Refuse the task here, before `warn_unknown_fields`
+        // `task.extra`. Refuse the task here, before `unknown_field_warnings`
         // would misreport the extra action key as unknown and suggest an
         // upgrade.
         for (task_name, task) in &self.tasks {
@@ -1472,7 +1490,6 @@ impl File {
             );
             check_entry_timeout(&layer, &task.extra)?;
         }
-        self.warn_unknown_fields();
         Ok(())
     }
 
@@ -2537,38 +2554,13 @@ impl File {
         }
     }
 
-    fn warn_unknown_fields(&self) {
+    /// The warnings about the fields this version does not read, each as the
+    /// line the person sees: `warning: …`, and a last `help:` line when a
+    /// field is unknown. It prints nothing, and logs each line at debug.
+    fn unknown_field_warnings(&self) -> Vec<String> {
         // BOX-028: an entry's `hooks_on_resume` stays in its `extra`, where
         // the spec reads it, and is not an unknown key.
         const HOOKS_ON_RESUME_KEY: &str = "hooks_on_resume";
-
-        // One command decodes the same file several times; without this a
-        // single load prints each warning once per decode. Surface them only
-        // the first time a given path is validated in this process.
-        //
-        // The dedup key is (path, content) rather than path alone: a
-        // long-lived process (notably `minimald`) re-reads and re-validates
-        // the workspace `minimal.toml` on every session bring-up, and keying
-        // on path alone would permanently silence the warning after the first
-        // decode — even if the user edits the file and breaks it again. The
-        // content hash collapses the repeated decodes of an unchanged file
-        // while still re-warning when the file is edited or re-broken.
-        //
-        // The hash is computed from the bytes that produced `self` (see
-        // `hash_bytes`), not re-read from disk here: re-reading could hash a
-        // replacement file written between parse and validate, and then a
-        // later validation of that replacement would be wrongly suppressed.
-        if let (Some(path), Some(content_hash)) = (&self.mfile_path, self.content_hash) {
-            static WARNED_FILES: LazyLock<Mutex<HashSet<(PathBuf, u64)>>> =
-                LazyLock::new(|| Mutex::new(HashSet::new()));
-            if !WARNED_FILES
-                .lock()
-                .unwrap()
-                .insert((path.clone(), content_hash))
-            {
-                return;
-            }
-        }
 
         // A warning names the file it is about. A command can load a file
         // the user did not write (`min init` reads a fetched checkout), so a
@@ -2578,35 +2570,46 @@ impl File {
             .as_ref()
             .map_or_else(|| MFILE_NAME.to_owned(), |p| p.display().to_string());
 
+        let mut lines: Vec<String> = Vec::new();
+        let mut warn = |line: String| lines.push(format!("warning: {line}"));
         let mut was_unknown_fields = false;
         if !self.extra.is_empty() {
-            // A key that is valid at another nesting level is not really
-            // unknown; point at the correct path instead of the generic
-            // upgrade hint, which cannot fix it.
             // BEP-037: a project cannot set secret-store rules. The table is
             // ignored with its own warning, not the generic unknown-field one.
-            boxes::core::bep::warn_project_store_rules(self.extra.keys().map(String::as_str));
+            if self.extra.contains_key(boxes::core::bep::STORE_RULES_TABLE) {
+                warn(boxes::core::bep::PROJECT_STORE_RULES_IGNORED.to_owned());
+            }
             // NET-159: a project cannot open host ports to its boxes. The
             // table is ignored with its own warning, as the store rules are.
-            boxes::core::egress::warn_project_host_exposures(self.extra.keys().map(String::as_str));
+            if self
+                .extra
+                .contains_key(boxes::core::egress::HOST_EXPOSURES_TABLE)
+            {
+                warn(boxes::core::egress::PROJECT_HOST_EXPOSURES_IGNORED.to_owned());
+            }
             let mut unknown = Vec::new();
-            for key in self.extra.keys().filter(|key| {
-                *key != boxes::core::bep::STORE_RULES_TABLE
-                    && *key != boxes::core::egress::HOST_EXPOSURES_TABLE
+            let mut keys: Vec<&String> = self.extra.keys().collect();
+            keys.sort_unstable();
+            for key in keys.into_iter().filter(|key| {
+                key.as_str() != boxes::core::bep::STORE_RULES_TABLE
+                    && key.as_str() != boxes::core::egress::HOST_EXPOSURES_TABLE
                     // The entry tables and the project's Box Types are read
                     // by `entry` and `expand`, not by this struct.
                     && !entry::EntryTable::ALL.iter().any(|t| t.key() == key.as_str())
-                    && *key != BOX_TYPES_TABLE
+                    && key.as_str() != BOX_TYPES_TABLE
             }) {
+                // A key that is valid at another nesting level is not really
+                // unknown; point at the correct path instead of the generic
+                // upgrade hint, which cannot fix it.
                 match misplaced_top_level_key(key) {
-                    Some(correct) => tracing::warn!(
+                    Some(correct) => warn(format!(
                         "{key} is unknown at the top level of {shown}; did you mean {correct}?"
-                    ),
+                    )),
                     None => unknown.push(key.clone()),
                 }
             }
             if !unknown.is_empty() {
-                tracing::warn!("unknown fields in {}: {}", shown, unknown.join(","));
+                warn(format!("unknown fields in {}: {}", shown, unknown.join(",")));
                 was_unknown_fields = true;
             }
         }
@@ -2635,43 +2638,48 @@ impl File {
             .collect();
         unknown_defaults.sort_unstable();
         if !unknown_defaults.is_empty() {
-            tracing::warn!(
+            warn(format!(
                 "unknown fields in [defaults] section of {}: {}",
                 shown,
                 unknown_defaults.join(",")
-            );
+            ));
             was_unknown_fields = true;
         }
         if let Some(p) = &self.defaults.profile {
-            tracing::warn!(
+            warn(format!(
                 "[defaults]profile = \"{p}\" defined, but profiles were removed in 0.5.1; move its packages to each task's [tasks.<name>] packages (or [stack] build_packages / runtime_packages, which apply to every task)"
-            );
+            ));
         }
         if let Some(stack) = &self.stack
             && !stack.extra.is_empty()
         {
-            tracing::warn!(
+            warn(format!(
                 "unknown fields in [stack] section of {}: {}",
                 shown,
                 stack.extra.keys().cloned().collect::<Vec<_>>().join(",")
-            );
+            ));
             was_unknown_fields = true;
         }
         if let Some(session) = &self.session
             && !session.extra.is_empty()
         {
-            boxes::core::bep::warn_project_store_rules(session.extra.keys().map(String::as_str));
+            if session
+                .extra
+                .contains_key(boxes::core::bep::STORE_RULES_TABLE)
+            {
+                warn(boxes::core::bep::PROJECT_STORE_RULES_IGNORED.to_owned());
+            }
             let unknown: Vec<&str> = unknown_entry_keys(&session.extra)
                 .into_iter()
                 .filter(|key| *key != boxes::core::bep::STORE_RULES_TABLE)
                 .filter(|key| *key != HOOKS_ON_RESUME_KEY)
                 .collect();
             if !unknown.is_empty() {
-                tracing::warn!(
+                warn(format!(
                     "unknown fields in [session] section of {}: {}",
                     shown,
                     unknown.join(",")
-                );
+                ));
                 was_unknown_fields = true;
             }
         }
@@ -2682,33 +2690,37 @@ impl File {
                 .filter(|key| *key != HOOKS_ON_RESUME_KEY)
                 .collect();
             if !unknown.is_empty() {
-                tracing::warn!(
+                warn(format!(
                     "unknown fields in task {}: {}",
                     task_name,
                     unknown.join(",")
-                );
+                ));
                 was_unknown_fields = true;
             }
             if let Some(p) = &task.profile {
-                tracing::warn!(
+                warn(format!(
                     "[tasks.{task_name}]profile = \"{p}\" defined, but profiles were removed in 0.5.1; move its packages to [tasks.{task_name}] packages"
-                );
+                ));
             }
         }
         for (output_name, output) in &self.outputs {
             if !output.extra.is_empty() {
-                tracing::warn!(
+                warn(format!(
                     "unknown fields in output {}: {}",
                     output_name,
                     output.extra.keys().cloned().collect::<Vec<_>>().join(",")
-                );
+                ));
                 was_unknown_fields = true;
             }
         }
 
         if was_unknown_fields {
-            tracing::warn!("help: do you need to update to a newer version of minimal?");
+            lines.push("help: do you need to update to a newer version of minimal?".to_owned());
         }
+        for line in &lines {
+            tracing::debug!(file = %shown, "{line}");
+        }
+        lines
     }
 
     /// Returns the path to the directory where the minimal file is located.
@@ -3418,6 +3430,7 @@ mod tests {
                 mfile_path: None,
                 content_hash: None,
                 layout: None,
+                diagnostics: Vec::new(),
             }
         )
     }
@@ -4377,7 +4390,7 @@ mod tests {
     }
 
     /// Unknown fields inside `[session]` land in `extra` for the
-    /// `warn_unknown_fields` pass to report at load-time, matching
+    /// `unknown_field_warnings` pass to report at load-time, matching
     /// how `[stack]` and `[defaults]` handle forward-compat.
     #[test]
     fn session_unknown_field_lands_in_extra() {
@@ -4624,41 +4637,37 @@ mod tests {
         assert!(hook.description().is_some());
     }
 
-    /// The once-per-path warning dedup must key on (path, content), not path
-    /// alone: a long-lived process re-validates the same file repeatedly, and
-    /// an edited file must re-warn. This test drives `warn_unknown_fields`
-    /// through the public `validate` path and counts the emitted warnings.
+    /// The once-per-path dedup of the diagnostics must key on (path,
+    /// content), not path alone: a long-lived process loads the same file
+    /// repeatedly, and an edited file must warn again. This test loads the
+    /// file through `from_dir` and counts the warnings `diagnostics_once`
+    /// hands out.
     #[test]
-    fn warn_unknown_fields_rewarns_when_file_content_changes() {
+    fn diagnostics_once_rewarns_when_file_content_changes() {
         let dir = tempdir().unwrap();
         let path = dir.path().join(MFILE_NAME);
 
-        let capture = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-
-        let write = |contents: &str| {
+        let warned = |contents: &str| {
             std::fs::write(&path, contents).unwrap();
             let file = File::from_dir(dir.path()).unwrap();
             file.validate().unwrap();
+            file.diagnostics_once()
+                .iter()
+                .filter(|line| line.contains("unknown fields in"))
+                .count()
         };
 
-        // First decode of a file with an unknown field warns once.
-        write("[unknown_top_level]\nkey = \"v\"\n");
-        assert_eq!(count_unknown_warnings(&capture), 1);
+        // The first load of a file with an unknown field warns once.
+        assert_eq!(warned("[unknown_top_level]\nkey = \"v\"\n"), 1);
 
-        // Re-validating the unchanged file does not warn again.
-        write("[unknown_top_level]\nkey = \"v\"\n");
-        assert_eq!(count_unknown_warnings(&capture), 1);
+        // A second load of the unchanged file does not warn again.
+        assert_eq!(warned("[unknown_top_level]\nkey = \"v\"\n"), 0);
 
-        // Editing the file (new content) re-warns.
-        write("[unknown_top_level]\nkey = \"v\"\nother = \"w\"\n");
-        assert_eq!(count_unknown_warnings(&capture), 2);
-
-        drop(guard);
+        // Editing the file (new content) warns again.
+        assert_eq!(
+            warned("[unknown_top_level]\nkey = \"v\"\nother = \"w\"\n"),
+            1
+        );
     }
 
     /// `[harness]` is the pre-v0.5.0 name of `[stack]` and no longer parses:
@@ -4818,14 +4827,7 @@ mod tests {
         )
         .unwrap();
 
-        let capture = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
         let err = File::from_dir(dir.path()).expect_err("two actions must be refused");
-        drop(guard);
 
         assert!(matches!(err, Error::MultipleTaskActions(..)), "{err:?}");
         let msg = err.to_string();
@@ -4835,9 +4837,6 @@ mod tests {
         );
         assert!(msg.contains("exec") && msg.contains("bash"), "{msg}");
         assert!(msg.ends_with("); set exactly one"), "{msg}");
-        let out = capture.contents();
-        assert!(!out.contains("unknown fields in task"), "{out}");
-        assert!(!out.contains("update to a newer version"), "{out}");
     }
 
     /// BOX-049: a `timeout` that is not a duration, in `[session]` or a
@@ -4897,14 +4896,7 @@ mod tests {
         )
         .unwrap();
 
-        let capture = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        File::from_dir(dir.path()).expect("file_exports on a task loads");
-        drop(guard);
+        let capture = Diags::of(&File::from_dir(dir.path()).expect("file_exports on a task loads"));
 
         let out = capture.contents();
         assert!(!out.contains("unknown fields"), "{out}");
@@ -4922,14 +4914,7 @@ mod tests {
         )
         .unwrap();
 
-        let capture = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        File::from_dir(dir.path()).expect("secrets on a task loads");
-        drop(guard);
+        let capture = Diags::of(&File::from_dir(dir.path()).expect("secrets on a task loads"));
 
         let out = capture.contents();
         assert!(!out.contains("unknown fields"), "{out}");
@@ -4953,14 +4938,7 @@ mod tests {
         )
         .unwrap();
 
-        let capture = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        File::from_dir(dir.path()).expect("a timeout in the grammar loads");
-        drop(guard);
+        let capture = Diags::of(&File::from_dir(dir.path()).expect("a timeout in the grammar loads"));
 
         let out = capture.contents();
         assert!(!out.contains("unknown fields"), "{out}");
@@ -4982,14 +4960,7 @@ mod tests {
         )
         .unwrap();
 
-        let capture = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        File::from_dir(dir.path()).expect("a task network table loads");
-        drop(guard);
+        let capture = Diags::of(&File::from_dir(dir.path()).expect("a task network table loads"));
 
         let out = capture.contents();
         assert!(!out.contains("unknown fields"), "{out}");
@@ -5027,14 +4998,7 @@ mod tests {
         ] {
             let dir = tempdir().unwrap();
             std::fs::write(dir.path().join(MFILE_NAME), body).unwrap();
-            let capture = CaptureWriter::default();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(capture.clone())
-                .with_ansi(false)
-                .finish();
-            let guard = tracing::subscriber::set_default(subscriber);
-            File::from_dir(dir.path()).expect("the file still reads");
-            drop(guard);
+            let capture = Diags::of(&File::from_dir(dir.path()).expect("the file still reads"));
             let out = capture.contents();
             assert!(
                 out.contains(boxes::core::bep::PROJECT_STORE_RULES_IGNORED),
@@ -5054,14 +5018,7 @@ mod tests {
             "[host-exposures.web]\nport = 8080\n",
         )
         .unwrap();
-        let capture = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        File::from_dir(dir.path()).expect("the file still reads");
-        drop(guard);
+        let capture = Diags::of(&File::from_dir(dir.path()).expect("the file still reads"));
         let out = capture.contents();
         assert_eq!(
             out.matches(boxes::core::egress::PROJECT_HOST_EXPOSURES_IGNORED)
@@ -5082,14 +5039,7 @@ mod tests {
         ] {
             let dir = tempdir().unwrap();
             std::fs::write(dir.path().join(MFILE_NAME), body).unwrap();
-            let capture = CaptureWriter::default();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(capture.clone())
-                .with_ansi(false)
-                .finish();
-            let guard = tracing::subscriber::set_default(subscriber);
-            File::from_dir(dir.path()).expect("the file reads");
-            drop(guard);
+            let capture = Diags::of(&File::from_dir(dir.path()).expect("the file reads"));
             let out = capture.contents();
             assert_eq!(count_unknown_warnings(&capture), 0, "{body}: {out}");
         }
@@ -5100,72 +5050,82 @@ mod tests {
             "[session]\nhooks_on_resume = true\nbogus = 1\n",
         )
         .unwrap();
-        let capture = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        File::from_dir(dir.path()).expect("the file reads");
-        drop(guard);
+        let capture = Diags::of(&File::from_dir(dir.path()).expect("the file reads"));
         let out = capture.contents();
         assert!(out.contains("unknown fields in [session] section"), "{out}");
         assert!(out.contains("bogus"), "{out}");
         assert!(!out.contains("hooks_on_resume"), "{out}");
     }
 
-    /// #3190: a file's legacy-table hints print on the first read of a
-    /// given (path, content) in this process, not on every read. An edit
-    /// prints them again, and a read with no path always prints.
+    /// #3190: a file's diagnostics are handed out on the first ask for a
+    /// given (path, content) in this process, not on every ask. An edit
+    /// hands them out again, and a file with no path always does.
     #[test]
-    fn legacy_hints_print_once_per_path_and_content() {
+    fn diagnostics_are_due_once_per_path_and_content() {
         let dir = tempdir().unwrap();
         let path = dir.path().join(MFILE_NAME);
-        let old = b"[session]\npackages = [\"git\"]\n";
-        let new = b"[session]\npackages = [\"git\", \"jq\"]\n";
-        assert!(legacy_hints_due(Some(&path), old), "first read prints");
+        let old = Some(hash_bytes(b"[session]\npackages = [\"git\"]\n"));
+        let new = Some(hash_bytes(b"[session]\npackages = [\"git\", \"jq\"]\n"));
+        assert!(diagnostics_due(Some(&path), old), "first read reports");
         assert!(
-            !legacy_hints_due(Some(&path), old),
+            !diagnostics_due(Some(&path), old),
             "second read of the same file is quiet"
         );
-        assert!(legacy_hints_due(Some(&path), new), "an edit prints again");
-        assert!(!legacy_hints_due(Some(&path), new), "and only once");
-        assert!(legacy_hints_due(None, old), "a read with no path prints");
-        assert!(legacy_hints_due(None, old), "every time");
+        assert!(diagnostics_due(Some(&path), new), "an edit reports again");
+        assert!(!diagnostics_due(Some(&path), new), "and only once");
+        assert!(diagnostics_due(None, old), "a read with no path reports");
+        assert!(diagnostics_due(None, old), "every time");
     }
 
-    /// #3190, end to end through the parse: reading the same legacy file
-    /// twice prints its hint once, an edit prints it again, and a read with
-    /// no path prints it on every read.
+    /// #3529: a parse keeps the legacy-table hints and the unknown-field
+    /// warnings on the `File` and prints nothing, so a caller that owns the
+    /// screen (the `min dash` TUI) can put them on its own surface. Every
+    /// load returns them; `diagnostics_once` hands them out once.
     #[test]
-    fn parse_prints_a_files_legacy_hint_once_until_it_changes() {
-        // A `[session]` table is the one legacy table here, so a read that
-        // prints prints exactly one `hint:` line.
-        let printed = |bytes: &[u8], path: Option<&Path>| {
-            let mut out = Vec::new();
-            File::parse_to(bytes, path, &mut out).expect("the file parses");
-            let out = String::from_utf8(out).unwrap();
-            out.lines().filter(|l| l.starts_with("hint: ")).count()
-        };
+    fn legacy_hints_are_returned_not_printed() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join(MFILE_NAME);
-        let old = b"[session]\npackages = [\"git\"]\n";
-        let new = b"[session]\npackages = [\"git\", \"jq\"]\n";
+        std::fs::write(
+            dir.path().join(MFILE_NAME),
+            "[session]\npackages = [\"git\"]\n\n[tasks.lint]\nbash = \"true\"\ncolour = 1\n",
+        )
+        .unwrap();
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let first = File::from_dir(dir.path()).expect("the file reads");
+        let second = File::from_dir(dir.path()).expect("the file reads again");
+        drop(guard);
 
+        // Nothing reached the log at warn or above.
+        assert!(capture.contents().is_empty(), "{}", capture.contents());
+
+        let lines = first.diagnostics();
         assert_eq!(
-            printed(old, Some(&path)),
+            lines.iter().filter(|l| l.starts_with("hint: ")).count(),
             1,
-            "the first read prints the hint"
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&"warning: unknown fields in task lint: colour".to_owned()),
+            "{lines:?}"
         );
         assert_eq!(
-            printed(old, Some(&path)),
-            0,
-            "a second read of the same file is quiet"
+            lines.last().map(String::as_str),
+            Some("help: do you need to update to a newer version of minimal?"),
+            "{lines:?}"
         );
-        assert_eq!(printed(new, Some(&path)), 1, "an edit prints it again");
-        assert_eq!(printed(new, Some(&path)), 0, "and only once");
-        assert_eq!(printed(old, None), 1, "a read with no path prints");
-        assert_eq!(printed(old, None), 1, "on every read");
+        assert_eq!(second.diagnostics(), lines, "every load returns them");
+
+        assert_eq!(first.diagnostics_once(), lines);
+        assert!(second.diagnostics_once().is_empty(), "handed out once");
+
+        // A parse with no path keeps the hint too.
+        let bare = File::from_toml_bytes(b"[session]\npackages = [\"git\"]\n").unwrap();
+        assert_eq!(bare.diagnostics().len(), 1, "{:?}", bare.diagnostics());
+        assert_eq!(bare.diagnostics_once(), bare.diagnostics());
     }
 
     /// Reads `body` as a project's `minimal.toml` and returns the warnings
@@ -5174,14 +5134,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join(MFILE_NAME);
         std::fs::write(&path, body).unwrap();
-        let capture = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        File::from_dir(dir.path()).expect("the file reads");
-        drop(guard);
+        let capture = Diags::of(&File::from_dir(dir.path()).expect("the file reads"));
         (capture.contents(), path, dir)
     }
 
@@ -5240,7 +5193,21 @@ bash = \"true\"
         );
     }
 
-    fn count_unknown_warnings(capture: &CaptureWriter) -> usize {
+    /// The diagnostics of a load, joined into one text, for the tests that
+    /// look for a line in them.
+    struct Diags(String);
+
+    impl Diags {
+        fn of(file: &File) -> Self {
+            Self(file.diagnostics().join("\n"))
+        }
+
+        fn contents(&self) -> String {
+            self.0.clone()
+        }
+    }
+
+    fn count_unknown_warnings(capture: &Diags) -> usize {
         capture
             .contents()
             .lines()
