@@ -474,6 +474,10 @@ fn every_create_session_asserts_the_daemon_build() {
             "tests.rs::create_box_on = asserts",
             // Not a client path: the mint unit tests' create-request fixture.
             "tests.rs::create_request = asserts",
+            // Unit test requests, never sent: they check what a start puts
+            // on its create request.
+            "tests.rs::create_request_carries_project_name_and_entry = asserts nothing",
+            "tests.rs::create_request_carries_project_name_and_entry = asserts nothing",
             // A test's request, sent only to the in-process test daemon,
             // which is this build: it checks the stored projection digests.
             "tests.rs::create_stores_client_digest_equal_to_daemon_digest = asserts nothing",
