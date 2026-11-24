@@ -2015,15 +2015,16 @@ fn published_identity_path(state_dir: &DaemonAbsPath) -> Option<std::path::PathB
 /// identity, for the create gate of BOX-081.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PublishedRoot {
-    /// No identity is there, or it carries no root certificate. That is
-    /// the case on a microVM guest, where the proxy publishes on the
-    /// host. The gate checks only the certificate's shape.
+    /// No identity file is there, or the daemon has no path to look at.
+    /// That is the case on a microVM guest, where the proxy publishes on
+    /// the host. The gate checks only the certificate's shape.
     Absent,
     /// The root certificate in the published identity.
     Root(String),
     /// An identity file is there, but the daemon cannot use it: another
-    /// user can change it, it is not valid JSON, or it was not read. The
-    /// gate does not fall back to the shape check, so nothing matches.
+    /// user can change it, it is not valid JSON, it was not read, or it
+    /// carries no root certificate. The gate does not fall back to the
+    /// shape check, so nothing matches.
     Unusable,
 }
 
@@ -2041,7 +2042,9 @@ impl PublishedRoot {
 /// What the node-local proxy published at `path`. Only a missing file
 /// (or no path) makes the gate advisory. Any other read error makes the
 /// identity [`PublishedRoot::Unusable`], so a damaged file or one with the
-/// wrong owner does not let a made-up certificate through.
+/// wrong owner does not let a made-up certificate through. An identity with
+/// no root certificate is unusable too: it names no root, so no
+/// certificate can match it.
 fn published_root_certificate(path: Option<&std::path::Path>) -> PublishedRoot {
     let Some(path) = path else {
         return PublishedRoot::Absent;
@@ -2050,12 +2053,12 @@ fn published_root_certificate(path: Option<&std::path::Path>) -> PublishedRoot {
         Ok(identity) => match identity.root_certificate {
             Some(root) => PublishedRoot::Root(root),
             None => {
-                tracing::debug!(
+                tracing::warn!(
                     path = %path.display(),
                     "the published identity carries no root certificate, so the create \
-                     gate checks only the certificate's shape"
+                     gate counts no root certificate as the proxy's"
                 );
-                PublishedRoot::Absent
+                PublishedRoot::Unusable
             }
         },
         Err(bep::publish::PublishError::Io { ref source, .. }) if source.kind() == NotFound => {
@@ -2095,8 +2098,8 @@ fn certificate_der(pem: &str) -> Option<Vec<u8>> {
 /// `published` is what this daemon found where the proxy publishes its
 /// identity. When it reads a root (a native host), the certificate counts
 /// only when it is that root, and a made-up certificate is refused. When
-/// an identity file is there but unusable, no certificate counts. Only
-/// with no published identity, or one with no root, is the check
+/// an identity file is there but unusable, or it carries no root, no
+/// certificate counts. Only with no published identity file is the check
 /// advisory: it trusts the caller, and a made-up certificate passes it.
 /// Even then, only a GitHub grant passes, because a node-local proxy
 /// serves no other brokered secret.
