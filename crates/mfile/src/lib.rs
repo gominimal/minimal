@@ -847,6 +847,15 @@ pub struct Stdlib {
     pub minimum_version: Option<String>,
 }
 
+/// The `[project]` section: what the project calls itself.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct Project {
+    /// The project name a box name is derived from (BOX-214). It must be
+    /// one DNS label (BOX-216), and it is never converted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
 /// The `[cache]` section: how this project reads the shared remote cache.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct CacheSettings {
@@ -1073,6 +1082,9 @@ pub struct File {
     /// this project. Consumed by the `ProjectComposable` at
     /// `CreateSession` time.
     pub session: Option<Session>,
+    /// What the project calls itself: `[project] name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<Project>,
 
     /// Any fields which are not understood by this version of minimal.
     #[serde(flatten)]
@@ -1628,6 +1640,13 @@ impl File {
         // the load here, at the config, where the fix is still visible.
         if self.extra.contains_key("harness") {
             return Err(Error::HarnessTable(self.mfile_path.clone()));
+        }
+        // BOX-216: a `[project] name` that is not a DNS label is refused,
+        // never converted.
+        if let Some(name) = self.project.as_ref().and_then(|p| p.name.as_ref())
+            && !boxes::box_name::is_dns_label(name)
+        {
+            return Err(Error::InvalidProjectName(name.clone()));
         }
         // serde takes one action key as `task.action` and leaves any other in
         // `task.extra`. Refuse the task here, before `unknown_field_warnings`
@@ -2946,6 +2965,21 @@ impl File {
         lines
     }
 
+    /// The project name (BOX-214): `[project] name` where the file
+    /// declares it, else the name of the project root directory converted
+    /// as [`boxes::box_name::directory_project_name`] converts it. `None`
+    /// for a file that declares no name and was not loaded from disk.
+    #[must_use]
+    pub fn project_name(&self) -> Option<String> {
+        if let Some(name) = self.project.as_ref().and_then(|p| p.name.as_ref()) {
+            return Some(name.clone());
+        }
+        let dir = self.repo_path()?.file_name()?;
+        Some(boxes::box_name::directory_project_name(
+            dir.as_encoded_bytes(),
+        ))
+    }
+
     /// Returns the path to the directory where the minimal file is located.
     pub fn dir_path(&self) -> Option<&Path> {
         match &self.mfile_path {
@@ -3649,6 +3683,7 @@ mod tests {
                 stdlib: Default::default(),
                 cache: Default::default(),
                 session: None,
+                project: None,
                 extra: HashMap::new(),
                 mfile_path: None,
                 content_hash: None,
@@ -6900,5 +6935,116 @@ bash = \"true\"
             }
         }
         assert!(checked > 0);
+    }
+
+    /// Writes `body` as the `minimal.toml` of a project directory named
+    /// `name` and loads it.
+    fn load_named_project(name: &std::ffi::OsStr, body: &str) -> (Result<File, Error>, tempfile::TempDir) {
+        let parent = tempdir().unwrap();
+        let root = parent.path().join(name);
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join(MFILE_NAME), body).unwrap();
+        (File::from_dir(&root), parent)
+    }
+
+    // BOX-214: the project name is `[project] name` where it is declared,
+    // else the project root's directory name, converted.
+    #[test]
+    fn project_name_declared_else_root_directory() {
+        let (file, _dir) =
+            load_named_project("My Repo".as_ref(), "[project]\nname = \"web\"\n");
+        let file = file.expect("the file loads");
+        assert_eq!(file.project_name().as_deref(), Some("web"));
+        assert!(
+            !file.diagnostics().iter().any(|l| l.contains("unknown")),
+            "[project] is a known table: {:?}",
+            file.diagnostics()
+        );
+
+        let (file, _dir) = load_named_project("My Repo".as_ref(), "");
+        assert_eq!(
+            file.expect("the file loads").project_name().as_deref(),
+            Some("my-repo")
+        );
+
+        // A `[project]` table without a name takes the directory name.
+        let (file, _dir) = load_named_project("api_v2".as_ref(), "[project]\n");
+        assert_eq!(
+            file.expect("the file loads").project_name().as_deref(),
+            Some("api-v2")
+        );
+
+        // A file not read from disk has no directory to name it.
+        assert_eq!(File::default().project_name(), None);
+    }
+
+    // BOX-215: a directory name's bytes convert to one DNS label: ASCII
+    // letters lowercased, each other run as one `-`, cut to 63, `-`
+    // trimmed, and `box` when nothing is left.
+    #[test]
+    fn project_name_from_directory_bytes_is_dns_label() {
+        use boxes::box_name::{directory_project_name, is_dns_label};
+
+        let cases: &[(&[u8], &str)] = &[
+            (b"Web", "web"),
+            (b"My  Web__App", "my-web-app"),
+            (b"--a.b--", "a-b"),
+            ("caf\u{e9}bar".as_bytes(), "caf-bar"),
+            ("\u{65e5}\u{672c}".as_bytes(), "box"),
+            (b"\xff\xfeweb\x80", "web"),
+            (b"", "box"),
+            (b"...", "box"),
+        ];
+        for (dir, want) in cases {
+            let got = directory_project_name(dir);
+            assert_eq!(got, *want, "{dir:?}");
+            assert!(is_dns_label(&got), "{got}");
+        }
+        // The cut comes before the trim, so no `-` is left at the end.
+        let long = format!("{}_{}", "a".repeat(62), "b".repeat(10));
+        let got = directory_project_name(long.as_bytes());
+        assert_eq!(got, "a".repeat(62));
+        assert!(is_dns_label(&got));
+        let got = directory_project_name("x".repeat(100).as_bytes());
+        assert_eq!(got.len(), 63);
+
+        // A root directory whose name is not UTF-8 still gives a label.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let (file, _dir) =
+                load_named_project(std::ffi::OsStr::from_bytes(b"Proj\xffOne"), "");
+            assert_eq!(
+                file.expect("the file loads").project_name().as_deref(),
+                Some("proj-one")
+            );
+        }
+    }
+
+    // BOX-216: a `[project] name` that is not a DNS label fails with exit
+    // 3 and a message that names the key, quotes the value and states the
+    // rule. It is never converted.
+    #[test]
+    fn invalid_project_name_exit3_not_converted() {
+        for bad in ["Web App", "-web", "web-", "", "caf\u{e9}", "a_b", &"a".repeat(64)] {
+            let body = format!("[project]\nname = {bad:?}\n");
+            let (file, _dir) = load_named_project("web".as_ref(), &body);
+            let err = file.expect_err("the name is not a DNS label");
+            assert_eq!(err.exit_code(), Some(3), "{err}");
+            assert!(matches!(&err, Error::InvalidProjectName(v) if v == bad), "{err:?}");
+            let msg = err.to_string();
+            assert!(msg.contains("[project] name"), "{msg}");
+            assert!(msg.contains(&format!("{bad:?}")), "{msg}");
+            assert!(
+                msg.contains("1 to 63 ASCII letters, digits and `-`, with no `-` at either end"),
+                "{msg}"
+            );
+        }
+        // Upper-case letters are a DNS label, so they load as declared.
+        let (file, _dir) = load_named_project("x".as_ref(), "[project]\nname = \"Web-2\"\n");
+        assert_eq!(
+            file.expect("the file loads").project_name().as_deref(),
+            Some("Web-2")
+        );
     }
 }
