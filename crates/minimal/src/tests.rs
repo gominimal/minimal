@@ -1877,18 +1877,24 @@ fn own_address_held_name_refusal_exits_2_and_names_the_holder() {
 }
 
 /// BOX-211: the name the client registers a box under is the request's
-/// name, which carries `--name` or the spec's `[box] name`, else the name
-/// the daemon derives from the project and the spec's entry. Nothing mints
-/// `<dir>-<hex>`.
+/// name, which carries `--name` or the entry's `[box] name`, else the name
+/// the daemon derives from the request's project name and the spec's
+/// entry. Nothing mints `<dir>-<hex>`.
 #[test]
 fn created_box_name_is_the_request_name_else_derived() {
     let mut request = minimald_rpc::CreateSessionRequest::new(
         String::new(),
-        paths::HostAbsPath::try_new("/home/u/code/foo").unwrap(),
+        paths::HostAbsPath::try_new("/home/u/code/bar").unwrap(),
         boxes::NetworkMode::HostNet,
         boxes::BoxPolicy::default(),
     );
     request.config.name = minimal_client::box_name::request_name(None);
+    // The project path never names the box. The project root does when the
+    // request carries no project name, and the project name wins.
+    assert_eq!(created_box_name(&request).as_deref(), Some("box"));
+    request.config.project_root = Some(paths::HostAbsPath::try_new("/home/u/code/Baz").unwrap());
+    assert_eq!(created_box_name(&request).as_deref(), Some("baz"));
+    request.config.project_name = Some("foo".to_string());
     assert_eq!(
         created_box_name(&request).as_deref(),
         Some("foo"),
@@ -1907,6 +1913,92 @@ fn created_box_name_is_the_request_name_else_derived() {
     assert_eq!(created_box_name(&request).as_deref(), Some("api"));
 }
 
+/// BOX-211, BOX-214: a create request carries `--name`, else the entry's
+/// `[box] name`, as its name, and always the project name and the entry.
+/// The stored spec carries no name, so a box with no written name takes
+/// `<project>` or `<project>-<entry>`.
+#[test]
+fn create_request_carries_project_name_and_entry() {
+    let parent = tempfile::tempdir().unwrap();
+    let put = |root: &camino::Utf8Path, entry: Option<&str>, name: Option<&str>| {
+        let mut request = minimald_rpc::CreateSessionRequest::new(
+            String::new(),
+            paths::HostAbsPath::try_new(root.to_owned()).unwrap(),
+            boxes::NetworkMode::HostNet,
+            boxes::BoxPolicy::default(),
+        );
+        request.config.name = minimal_client::box_name::request_name(name);
+        crate::put_session_entry(
+            &mut request,
+            &mut boxes::wire::request::WireContribution::default(),
+            &crate::SessionEntryCreate {
+                dir: root,
+                project_root: root,
+                entry,
+                box_name: name,
+                selected: &crate::SelectedLoadouts::default(),
+                global: None,
+            },
+        )
+        .unwrap();
+        let spec: mfile::spec::BoxSpec =
+            serde_json_lenient::from_value(request.spec.clone().expect("a spec")).unwrap();
+        assert_eq!(spec.name, None, "the stored spec carries no name");
+        (request, spec.entry)
+    };
+
+    let root = camino::Utf8PathBuf::from_path_buf(parent.path().join("My Repo")).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(
+        root.join("minimal.toml"),
+        "[project]\nname = \"web\"\n\n[sessions.default]\n\n[sessions.dev]\n\n\
+         [sessions.api]\n[sessions.api.box]\nname = \"api-box\"\n",
+    )
+    .unwrap();
+
+    // No written name: the project name and the entry name the box.
+    let (request, entry) = put(&root, None, None);
+    assert_eq!(request.config.project_name.as_deref(), Some("web"));
+    assert_eq!(request.config.name, None);
+    assert_eq!(entry, mfile::spec::DEFAULT_SESSION_ENTRY);
+    assert_eq!(created_box_name(&request).as_deref(), Some("web"));
+
+    let (request, entry) = put(&root, Some("dev"), None);
+    assert_eq!(request.config.project_name.as_deref(), Some("web"));
+    assert_eq!(request.config.name, None);
+    assert_eq!(entry, "dev");
+    assert_eq!(created_box_name(&request).as_deref(), Some("web-dev"));
+
+    // The entry's `[box] name` goes on the request, not in the spec.
+    let (request, entry) = put(&root, Some("api"), None);
+    assert_eq!(request.config.name.as_deref(), Some("api-box"));
+    assert_eq!(request.config.project_name.as_deref(), Some("web"));
+    assert_eq!(entry, "api");
+
+    // `--name` wins over the entry's `[box] name`.
+    let (request, _) = put(&root, Some("api"), Some("X"));
+    assert_eq!(request.config.name.as_deref(), Some("X"));
+    assert_eq!(created_box_name(&request).as_deref(), Some("X"));
+
+    // With no `[project] name`, the root's directory name, converted.
+    std::fs::write(root.join("minimal.toml"), "[sessions.dev]\n").unwrap();
+    let (request, _) = put(&root, Some("dev"), None);
+    assert_eq!(request.config.project_name.as_deref(), Some("my-repo"));
+    assert_eq!(created_box_name(&request).as_deref(), Some("my-repo-dev"));
+
+    // A `[project] name` that is not a DNS label refuses the create.
+    std::fs::write(root.join("minimal.toml"), "[project]\nname = \"Web App\"\n").unwrap();
+    let mut request = minimald_rpc::CreateSessionRequest::new(
+        String::new(),
+        paths::HostAbsPath::try_new(root.clone()).unwrap(),
+        boxes::NetworkMode::HostNet,
+        boxes::BoxPolicy::default(),
+    );
+    let error = stamp_session_spec_as(&mut request, &root, None, None, None)
+        .expect_err("the project name is not a DNS label");
+    assert!(format!("{error:#}").contains("[project] name"), "{error:#}");
+}
+
 /// BOX-211: the VM host row and the box carry one name. For an entry such
 /// as `My App`, the client registers the row under the name the daemon
 /// gives the box, because both sides derive it with one function.
@@ -1919,6 +2011,7 @@ fn entry_name_registers_and_creates_under_one_cleaned_name() {
         boxes::BoxPolicy::default(),
     );
     request.config.name = minimal_client::box_name::request_name(None);
+    request.config.project_name = Some("foo".to_string());
     let mut spec = mfile::spec::BoxSpec::for_session(None, spec_flags(&request));
     spec.entry = "My App".to_string();
     put_spec(&mut request, &spec).unwrap();
@@ -1926,7 +2019,7 @@ fn entry_name_registers_and_creates_under_one_cleaned_name() {
     assert_eq!(
         created_box_name(&request),
         Some(boxes::box_name::create_derived_name(
-            "/home/u/code/foo",
+            "foo",
             request.spec.as_ref(),
             None
         )),
@@ -3394,13 +3487,26 @@ fn create_verbs_name_flag_overrides_box_name() {
         .unwrap();
         assert_eq!(created_box_name(&request).as_deref(), Some("api"));
 
-        // `--new`: no name of the client's on the request, and the spec's
-        // `[box] name` is the base the daemon numbers.
-        request_fresh_instance(&mut request);
-        assert_eq!(request.config.name, None);
+        // The stored spec carries no name (BOX-211).
         let spec: mfile::spec::BoxSpec =
             serde_json_lenient::from_value(request.spec.clone().unwrap()).unwrap();
-        assert_eq!(spec.name.as_deref(), Some("api"));
+        assert_eq!(spec.name, None);
+
+        // `--new`: the activation marks the request a fresh instance before
+        // it puts the entry on it, so `--name` is the base the daemon
+        // numbers, on the request.
+        request_fresh_instance(&mut request);
+        assert_eq!(request.config.name, None);
+        stamp_session_spec_as(
+            &mut request,
+            root,
+            options.entry.as_deref(),
+            options.box_name.as_deref(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(request.config.name.as_deref(), Some("api"));
+        assert!(request.fresh_instance);
 
         // A planned start with `--new` asks the activation for a fresh
         // instance. A start without it does not.

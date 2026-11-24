@@ -3852,22 +3852,24 @@ pub(crate) fn request_fresh_instance(request: &mut minimald_rpc::CreateSessionRe
 
 /// The name the daemon gives the box `request` creates, when the create
 /// is not a fresh instance (BOX-211): the request's name, which carries
-/// `--name` or the spec's `[box] name`, else the name the daemon derives
-/// from the project and the spec's entry
+/// `--name` or the entry's `[box] name`, else the name the daemon derives
+/// from the request's project name and the spec's entry
 /// ([`boxes::box_name::create_derived_name`]). The VM host row and the box
 /// then carry one name.
 pub(crate) fn created_box_name(request: &minimald_rpc::CreateSessionRequest) -> Option<String> {
     if let Some(name) = request.config.name.clone() {
         return Some(name);
     }
-    let root = request
-        .config
-        .project_root
-        .as_ref()
-        .unwrap_or(&request.config.project_path)
-        .as_str();
+    let project = boxes::box_name::request_project_name(
+        request.config.project_name.as_deref(),
+        request
+            .config
+            .project_root
+            .as_ref()
+            .map(paths::HostAbsPath::as_str),
+    );
     Some(boxes::box_name::create_derived_name(
-        root,
+        &project,
         request.spec.as_ref(),
         None,
     ))
@@ -4095,10 +4097,9 @@ pub(crate) fn stamp_session_spec_as(
     if let Some(entry) = entry {
         spec.entry = entry.to_string();
     }
-    // `--name` or the form's name, else the entry's own `[box] name`.
-    spec.name = name
-        .map(str::to_string)
-        .or_else(|| expanded.as_ref().and_then(|e| expanded_box_name(&e.spec)));
+    // BOX-211: the stored spec carries no name. The daemon never reads a
+    // box's name from it.
+    spec.name = None;
     tracing::debug!(
         entry = %spec.entry,
         lifetime = ?spec.lifetime,
@@ -4109,18 +4110,54 @@ pub(crate) fn stamp_session_spec_as(
         Some(expanded) => put_expanded_spec(request, &spec, &expanded.spec)?,
         None => put_spec(request, &spec)?,
     }
-    // BOX-211: the daemon names a box from the request alone, so the
-    // stored spec's `[box] name` goes on the request when no `--name` or
-    // form name is already there.
+    // BOX-211: the daemon names a box from the request alone. The request
+    // carries `--name` or the form's name, else the entry's `[box] name`,
+    // and the project name it derives a name from when it carries neither.
     if request.config.name.is_none() {
-        request.config.name =
-            boxes::box_name::spec_box_name(request.spec.as_ref()).map(str::to_string);
-        tracing::debug!(
-            name = ?request.config.name,
-            "the request carries the spec's [box] name, when it has one"
-        );
+        request.config.name = name
+            .map(str::to_string)
+            .or_else(|| expanded.as_ref().and_then(|e| expanded_box_name(&e.spec)));
     }
+    request.config.project_name = Some(request_project_name(
+        dir,
+        request.config.project_root.as_ref(),
+    )?);
+    tracing::debug!(
+        name = ?request.config.name,
+        project_name = ?request.config.project_name,
+        "the request carries the box's name, when one is written, and the project name"
+    );
     Ok(())
+}
+
+/// The project name a create from `dir` sends (BOX-214): the project's
+/// `[project] name`, else its root directory's name converted to a DNS
+/// label. With no `minimal.toml`, `root`, else `dir`, is the directory.
+///
+/// # Errors
+///
+/// Fails with exit 3 on a `minimal.toml` that does not load, which
+/// includes a `[project] name` that is not a DNS label (BOX-216).
+fn request_project_name(
+    dir: &camino::Utf8Path,
+    root: Option<&paths::HostAbsPath>,
+) -> anyhow::Result<String> {
+    match mfile::File::from_dir_recursive_quiet(dir.as_std_path()) {
+        Ok(file) => {
+            if let Some(name) = file.project_name() {
+                return Ok(name);
+            }
+        }
+        Err(refusal) if matches!(refusal.error(), mfile::Error::NotFound) => {}
+        Err(refusal) => {
+            return Err(ProjectFileInvalid {
+                error: refusal.into_error(),
+            }
+            .into());
+        }
+    }
+    let root = root.map_or(dir.as_str(), paths::HostAbsPath::as_str);
+    Ok(boxes::box_name::request_project_name(None, Some(root)))
 }
 
 /// The `[box] name` an entry's expansion declares, when it declares one.

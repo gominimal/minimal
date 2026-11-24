@@ -785,12 +785,9 @@ async fn create_registering<C: Send>(
     };
     let control_sock = control_sock_beside(sock);
     let registers = config.network == NetworkMode::OwnIp && vm_host_control_sock(sock).is_some();
-    // BOX-211: a blank form name takes the entry's `[box] name`, sent on
-    // the request whether or not the box registers. With neither, a box
-    // that registers takes the derived name.
-    if config.name.is_none() {
-        config.name = boxes::box_name::spec_box_name(spec).map(str::to_string);
-    }
+    // BOX-211: a blank form name already took the entry's `[box] name` on
+    // the request. With neither, a box that registers takes the name the
+    // daemon derives from the project name the request carries.
     if registers && config.name.is_none() {
         config.name = Some(derived_name(&config, spec));
     }
@@ -858,12 +855,11 @@ async fn create_registering<C: Send>(
 /// ([`boxes::box_name::create_derived_name`]). A box registered under it
 /// is the box the daemon names.
 fn derived_name(config: &BoxConfig, spec: Option<&serde_json_lenient::Value>) -> String {
-    let root = config
-        .project_root
-        .as_ref()
-        .unwrap_or(&config.project_path)
-        .as_str();
-    boxes::box_name::create_derived_name(root, spec, None)
+    let project = boxes::box_name::request_project_name(
+        config.project_name.as_deref(),
+        config.project_root.as_ref().map(paths::HostAbsPath::as_str),
+    );
+    boxes::box_name::create_derived_name(&project, spec, None)
 }
 
 /// A session the dashboard created and activated.
@@ -1093,6 +1089,8 @@ mod tests {
         )
         .config;
         config.name = name.map(str::to_string);
+        // The project name the dashboard's create carries (BOX-214).
+        config.project_name = Some("web-app".to_string());
         config
     }
 
