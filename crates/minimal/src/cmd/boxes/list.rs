@@ -63,17 +63,63 @@ pub async fn cmd_box_list(global: &GlobalArgs, args: BoxListArgs) -> Result<(), 
         box_type: args.box_type.as_deref(),
         parent,
     };
-    let listed = filter.apply(listed);
-    tracing::info!(verb = "box list", outcome = "ok", boxes = listed.len());
+    // The filter keeps rows, so a running build box matches as a row of
+    // its own (BCLI-026, NET-171).
+    let rows = filter.rows(&listed);
+    tracing::info!(verb = "box list", outcome = "ok", boxes = rows.len());
     let mut out = std::io::stdout().lock();
     match args.output {
-        Some(BoxListOutputFormat::Json) => render_box_list_json(&mut out, &listed)?,
-        None if listed.is_empty() && filter.is_set() => {
+        Some(BoxListOutputFormat::Json) => render_box_rows_json(&mut out, &rows)?,
+        None if rows.is_empty() && filter.is_set() => {
             writeln!(out, "{}", filtered_empty_line(&args, scoped))?;
         }
-        None => render_box_list(&mut out, &listed, scoped)?,
+        None => render_box_rows(&mut out, &rows, scoped)?,
     }
     Ok(())
+}
+
+/// One row of a listing: a box record, or a running build box that the
+/// record of its requesting box carries (NET-171).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoxRow<'a> {
+    /// The box the record describes.
+    Record(&'a ListedBox),
+    /// A running build box of the record's box.
+    Build(&'a ListedBox, &'a minimald_rpc::RunningBuildBox),
+}
+
+impl BoxRow<'_> {
+    /// The Box Type the row prints.
+    pub(crate) fn box_type(&self) -> Option<&str> {
+        match self {
+            Self::Record(listed) => listed.record.box_type.as_deref(),
+            Self::Build(..) => Some(boxes::BUILD_BOX_TYPE),
+        }
+    }
+
+    /// The parent the row prints: a build box's parent is its requesting box.
+    pub(crate) fn parent(&self) -> Option<boxes::SessionId> {
+        match self {
+            Self::Record(listed) => listed.record.parent,
+            Self::Build(listed, _) => Some(listed.record.box_id),
+        }
+    }
+}
+
+/// Every row of `listed`, in order: each record, then its build boxes.
+pub(crate) fn box_rows(listed: &[ListedBox]) -> Vec<BoxRow<'_>> {
+    listed
+        .iter()
+        .flat_map(|listed| {
+            std::iter::once(BoxRow::Record(listed)).chain(
+                listed
+                    .record
+                    .build_boxes
+                    .iter()
+                    .map(move |build| BoxRow::Build(listed, build)),
+            )
+        })
+        .collect()
 }
 
 /// What `--type` and `--parent` keep of a listing (BCLI-026).
@@ -91,18 +137,31 @@ impl BoxListFilter<'_> {
         self.box_type.is_some() || self.parent.is_some()
     }
 
-    /// The records of `listed` that match every set flag, in order.
+    /// Whether `row` matches every set flag.
+    pub(crate) fn keeps(&self, row: &BoxRow<'_>) -> bool {
+        self.box_type
+            .is_none_or(|box_type| row.box_type() == Some(box_type))
+            && self
+                .parent
+                .is_none_or(|parent| row.parent() == Some(parent))
+    }
+
+    /// The rows of `listed` that match every set flag, in order. A build
+    /// box matches on its own type and its requesting box.
+    pub(crate) fn rows<'a>(&self, listed: &'a [ListedBox]) -> Vec<BoxRow<'a>> {
+        box_rows(listed)
+            .into_iter()
+            .filter(|row| self.keeps(row))
+            .collect()
+    }
+
+    /// The records of `listed` whose own row matches every set flag, in
+    /// order. A kept record keeps its build boxes, as `min task list`
+    /// prints them.
     pub(crate) fn apply(&self, listed: Vec<ListedBox>) -> Vec<ListedBox> {
         listed
             .into_iter()
-            .filter(|listed| {
-                self.box_type
-                    .is_none_or(|box_type| listed.record.box_type.as_deref() == Some(box_type))
-            })
-            .filter(|listed| {
-                self.parent
-                    .is_none_or(|parent| listed.record.parent == Some(parent))
-            })
+            .filter(|listed| self.keeps(&BoxRow::Record(listed)))
             .collect()
     }
 }
@@ -307,7 +366,16 @@ pub(crate) fn render_box_list(
     boxes: &[ListedBox],
     scoped: bool,
 ) -> std::io::Result<()> {
-    if boxes.is_empty() {
+    render_box_rows(out, &box_rows(boxes), scoped)
+}
+
+/// Writes `rows` as the table [`render_box_list`] describes.
+pub(crate) fn render_box_rows(
+    out: &mut impl std::io::Write,
+    rows: &[BoxRow<'_>],
+    scoped: bool,
+) -> std::io::Result<()> {
+    if rows.is_empty() {
         if scoped {
             return writeln!(out, "{EMPTY_PROJECT_LIST}");
         }
@@ -316,44 +384,39 @@ pub(crate) fn render_box_list(
     let header = [
         "ID", "NAME", "TYPE", "PARENT", "PROJECT", "STATE", "PROVIDER", "HOST",
     ];
-    let rows: Vec<[String; 8]> = boxes
+    let rows: Vec<[String; 8]> = rows
         .iter()
-        .flat_map(|listed| {
-            let entry = &listed.record;
-            let project = entry
-                .project_root
-                .as_ref()
-                .map_or_else(|| NO_VALUE.to_string(), |root| root.to_string());
-            let own = [
-                entry.box_id.to_string(),
-                entry.name.clone().unwrap_or_else(|| NO_VALUE.to_string()),
-                entry
-                    .box_type
-                    .clone()
-                    .unwrap_or_else(|| NO_VALUE.to_string()),
-                entry
-                    .parent
-                    .map_or_else(|| NO_VALUE.to_string(), |parent| parent.to_string()),
-                project.clone(),
-                box_state_label(entry),
-                listed.provider.clone(),
-                listed.host.clone(),
-            ];
-            // NET-171: a build box has no record, so its row names its
-            // package and its requesting box.
-            let builds = entry.build_boxes.iter().map(move |build| {
+        .map(|row| match *row {
+            BoxRow::Record(listed) => {
+                let entry = &listed.record;
                 [
-                    NO_VALUE.to_string(),
-                    build.package.clone(),
-                    boxes::BUILD_BOX_TYPE.to_string(),
                     entry.box_id.to_string(),
-                    project.clone(),
-                    "running".to_string(),
+                    entry.name.clone().unwrap_or_else(|| NO_VALUE.to_string()),
+                    entry
+                        .box_type
+                        .clone()
+                        .unwrap_or_else(|| NO_VALUE.to_string()),
+                    entry
+                        .parent
+                        .map_or_else(|| NO_VALUE.to_string(), |parent| parent.to_string()),
+                    project_cell(entry),
+                    box_state_label(entry),
                     listed.provider.clone(),
                     listed.host.clone(),
                 ]
-            });
-            std::iter::once(own).chain(builds)
+            }
+            // NET-171: a build box has no record, so its row names its
+            // package and its requesting box.
+            BoxRow::Build(listed, build) => [
+                NO_VALUE.to_string(),
+                build.package.clone(),
+                boxes::BUILD_BOX_TYPE.to_string(),
+                listed.record.box_id.to_string(),
+                project_cell(&listed.record),
+                "running".to_string(),
+                listed.provider.clone(),
+                listed.host.clone(),
+            ],
         })
         .collect();
     let mut widths = header.map(str::len);
@@ -378,6 +441,14 @@ pub(crate) fn render_box_list(
         writeln!(out, "{}", line(row.each_ref().map(String::as_str)))?;
     }
     Ok(())
+}
+
+/// The PROJECT cell of a record and of its build boxes.
+fn project_cell(entry: &minimald_rpc::BoxListingEntry) -> String {
+    entry
+        .project_root
+        .as_ref()
+        .map_or_else(|| NO_VALUE.to_string(), |root| root.to_string())
 }
 
 /// One box as its `"schema": "min/v1/box"` object. A value the record
@@ -406,25 +477,32 @@ pub(crate) fn render_box_list_json(
     out: &mut impl std::io::Write,
     boxes: &[ListedBox],
 ) -> std::io::Result<()> {
-    let objects: Vec<serde_json_lenient::Value> = boxes
+    render_box_rows_json(out, &box_rows(boxes))
+}
+
+/// Writes `rows` as the JSON array [`render_box_list_json`] describes.
+pub(crate) fn render_box_rows_json(
+    out: &mut impl std::io::Write,
+    rows: &[BoxRow<'_>],
+) -> std::io::Result<()> {
+    let objects: Vec<serde_json_lenient::Value> = rows
         .iter()
-        .flat_map(|listed| {
-            std::iter::once(box_json(listed)).chain(listed.record.build_boxes.iter().map(|build| {
-                serde_json_lenient::json!({
-                    "schema": BOX_SCHEMA,
-                    "id": null,
-                    "name": build.package,
-                    "type": boxes::BUILD_BOX_TYPE,
-                    "state": "running",
-                    "provider": listed.provider,
-                    "host": listed.host,
-                    "parent": listed.record.box_id.to_string(),
-                    "project": listed.record.project_root.as_ref().map(|r| r.to_string()),
-                    "reason": null,
-                    "exit_code": null,
-                    "signal": null,
-                })
-            }))
+        .map(|row| match *row {
+            BoxRow::Record(listed) => box_json(listed),
+            BoxRow::Build(listed, build) => serde_json_lenient::json!({
+                "schema": BOX_SCHEMA,
+                "id": null,
+                "name": build.package,
+                "type": boxes::BUILD_BOX_TYPE,
+                "state": "running",
+                "provider": listed.provider,
+                "host": listed.host,
+                "parent": listed.record.box_id.to_string(),
+                "project": listed.record.project_root.as_ref().map(|r| r.to_string()),
+                "reason": null,
+                "exit_code": null,
+                "signal": null,
+            }),
         })
         .collect();
     serde_json_lenient::to_writer_pretty(&mut *out, &objects)?;
@@ -443,6 +521,47 @@ mod tests {
             host: "local0".to_string(),
             record: entry,
         }
+    }
+
+    /// `entry` with one running build box of `package`.
+    fn building(mut entry: BoxListingEntry, package: &str) -> BoxListingEntry {
+        entry.build_boxes = vec![minimald_rpc::RunningBuildBox {
+            package: package.to_string(),
+            egress: None,
+            granted: true,
+            no_network: false,
+        }];
+        entry
+    }
+
+    /// The table and the `-o json` array that `filter` gives for `listed`.
+    fn filtered(
+        filter: BoxListFilter<'_>,
+        listed: &[ListedBox],
+    ) -> (String, serde_json_lenient::Value) {
+        let rows = filter.rows(listed);
+        let mut table = Vec::new();
+        render_box_rows(&mut table, &rows, false).unwrap();
+        let mut json = Vec::new();
+        render_box_rows_json(&mut json, &rows).unwrap();
+        (
+            String::from_utf8(table).unwrap(),
+            serde_json_lenient::from_slice(&json).unwrap(),
+        )
+    }
+
+    /// The `type` and `name` of each object of a `-o json` array.
+    fn types_and_names(json: &serde_json_lenient::Value) -> Vec<(String, String)> {
+        json.as_array()
+            .unwrap()
+            .iter()
+            .map(|object| {
+                (
+                    object["type"].as_str().unwrap_or("").to_string(),
+                    object["name"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect()
     }
 
     fn entry(id: &str, name: Option<&str>, box_type: &str, state: &str) -> BoxListingEntry {
@@ -492,18 +611,77 @@ mod tests {
             parent: None,
         };
         assert!(filter.is_set());
-        assert_eq!(filter.apply(listed.clone()), vec![local(task)]);
+        assert_eq!(filter.apply(listed.clone()), vec![local(task.clone())]);
 
         let filter = BoxListFilter {
             box_type: Some("session"),
             parent: None,
         };
-        assert_eq!(filter.apply(listed.clone()), vec![local(session)]);
+        assert_eq!(filter.apply(listed.clone()), vec![local(session.clone())]);
 
         // No flag keeps every record.
         let filter = BoxListFilter::default();
         assert!(!filter.is_set());
         assert_eq!(filter.apply(listed.clone()), listed);
+
+        // A running build box is a row of its own: `--type task` drops it,
+        // and `--type build` keeps only it, in the table and in JSON.
+        let listed = vec![local(task), local(building(session.clone(), "claude-code"))];
+        let (table, json) = filtered(
+            BoxListFilter {
+                box_type: Some("task"),
+                parent: None,
+            },
+            &listed,
+        );
+        assert!(!table.contains("claude-code"), "{table}");
+        assert!(!table.contains(" build "), "{table}");
+        assert_eq!(
+            types_and_names(&json),
+            vec![("task".to_string(), String::new())]
+        );
+
+        let (table, json) = filtered(
+            BoxListFilter {
+                box_type: Some("build"),
+                parent: None,
+            },
+            &listed,
+        );
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(lines.len(), 2, "a header and the build row: {table}");
+        assert!(lines[1].contains("claude-code"), "{table}");
+        assert!(lines[1].contains(" build "), "{table}");
+        assert_eq!(
+            types_and_names(&json),
+            vec![("build".to_string(), "claude-code".to_string())]
+        );
+
+        // `--type session` keeps the session box and not its build box.
+        let (table, json) = filtered(
+            BoxListFilter {
+                box_type: Some("session"),
+                parent: None,
+            },
+            &listed,
+        );
+        assert!(!table.contains("claude-code"), "{table}");
+        assert_eq!(
+            types_and_names(&json),
+            vec![("session".to_string(), "web".to_string())]
+        );
+
+        // With no build box running, `--type build` keeps no row, so the
+        // table prints the no-match line.
+        let idle = vec![local(session)];
+        assert!(
+            BoxListFilter {
+                box_type: Some("build"),
+                parent: None,
+            }
+            .rows(&idle)
+            .is_empty()
+        );
     }
 
     // BCLI-026: `min box list --parent <box>` keeps the children of that box
@@ -547,7 +725,65 @@ mod tests {
             box_type: Some("task"),
             parent: Some(boxes::SessionId::parse_str(parent_id).unwrap()),
         };
-        assert_eq!(filter.apply(listed), vec![local(task_child)]);
+        assert_eq!(filter.apply(listed), vec![local(task_child.clone())]);
+
+        // `--parent <box>` keeps the build boxes of that box, and not those
+        // of its children or of another box, in the table and in JSON.
+        let listed: Vec<ListedBox> = [
+            building(
+                entry(parent_id, Some("web"), "session", "running"),
+                "claude-code",
+            ),
+            building(
+                entry(other_id, Some("api"), "session", "running"),
+                "ripgrep",
+            ),
+            building(task_child.clone(), "jq"),
+        ]
+        .into_iter()
+        .map(local)
+        .collect();
+        let (table, json) = filtered(
+            BoxListFilter {
+                box_type: None,
+                parent: Some(boxes::SessionId::parse_str(parent_id).unwrap()),
+            },
+            &listed,
+        );
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(
+            lines.len(),
+            3,
+            "a header, the build box, the child: {table}"
+        );
+        assert!(lines[1].contains("claude-code"), "{table}");
+        assert!(
+            lines[2].starts_with("0199e0a0-0000-7000-8000-000000000003"),
+            "{table}"
+        );
+        assert!(!table.contains("ripgrep"), "{table}");
+        assert!(!table.contains("jq"), "{table}");
+        assert_eq!(
+            types_and_names(&json),
+            vec![
+                ("build".to_string(), "claude-code".to_string()),
+                ("task".to_string(), String::new()),
+            ]
+        );
+        assert_eq!(json[0]["parent"], parent_id);
+
+        // `--parent` with `--type build` keeps only that box's build boxes.
+        let (_, json) = filtered(
+            BoxListFilter {
+                box_type: Some("build"),
+                parent: Some(boxes::SessionId::parse_str(parent_id).unwrap()),
+            },
+            &listed,
+        );
+        assert_eq!(
+            types_and_names(&json),
+            vec![("build".to_string(), "claude-code".to_string())]
+        );
 
         // The table form names the flags when they keep no box.
         let args = BoxListArgs {
