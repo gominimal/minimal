@@ -641,6 +641,7 @@ pub fn load_types(
             .into());
         }
     };
+    file.print_diagnostics();
     let Some(path) = file.file_path() else {
         return Ok(BoxTypes::default());
     };

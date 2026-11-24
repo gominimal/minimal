@@ -987,20 +987,41 @@ fn command_project_dir(global: &GlobalArgs) -> Result<camino::Utf8PathBuf, anyho
         .map_err(|_| anyhow::anyhow!("Project path is not valid UTF-8"))
 }
 
-/// Print each of `lines` on stderr, on its first print in this process
-/// only. A command loads its project's `minimal.toml` many times, and each
-/// load returns the same legacy-table hints and unknown-field warnings, so
-/// this prints each of them once.
-pub(crate) fn print_file_diagnostics(lines: &[String]) {
-    static PRINTED: std::sync::Mutex<std::collections::BTreeSet<String>> =
-        std::sync::Mutex::new(std::collections::BTreeSet::new());
-    let mut printed = PRINTED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    for line in lines {
-        if printed.insert(line.clone()) {
-            eprintln!("{line}");
+/// The legacy-table hints and unknown-field warnings of a project's
+/// `minimal.toml`, each once, with the path of the file that gave them.
+/// The CLI prints them on stderr. `min dash` puts the lines on its status
+/// line.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileDiagnostics {
+    file: Option<std::path::PathBuf>,
+    lines: Vec<String>,
+}
+
+impl FileDiagnostics {
+    /// The diagnostics of `file`.
+    pub(crate) fn of(file: &mfile::File) -> Self {
+        let mut diagnostics = Self::default();
+        diagnostics.add(file);
+        diagnostics
+    }
+
+    /// Adds each line of `file` that this does not hold yet, in order.
+    pub(crate) fn add(&mut self, file: &mfile::File) {
+        if self.file.is_none() {
+            self.file = file.file_path().cloned();
         }
+        add_file_diagnostics(&mut self.lines, file.diagnostics());
+    }
+
+    /// The lines, in the order the loads found them.
+    pub(crate) fn lines(&self) -> &[String] {
+        &self.lines
+    }
+
+    /// Prints the lines on stderr, each on its first print in this process
+    /// for this file.
+    pub(crate) fn print(&self) {
+        mfile::print_diagnostics(self.file.as_deref(), &self.lines);
     }
 }
 
@@ -1021,13 +1042,15 @@ fn project_file_bytes(project: &camino::Utf8Path) -> anyhow::Result<Option<Vec<u
 
 /// [`project_file_bytes`], with the lines the load has for the person: its
 /// legacy-table hints and unknown-field warnings. It prints nothing.
-fn project_file_read(project: &camino::Utf8Path) -> anyhow::Result<(Option<Vec<u8>>, Vec<String>)> {
+fn project_file_read(
+    project: &camino::Utf8Path,
+) -> anyhow::Result<(Option<Vec<u8>>, FileDiagnostics)> {
     let file = match mfile::File::from_dir_recursive(project.as_std_path()) {
         Ok(file) => file,
-        Err(mfile::Error::NotFound) => return Ok((None, Vec::new())),
+        Err(mfile::Error::NotFound) => return Ok((None, FileDiagnostics::default())),
         Err(error) => return Err(ProjectFileInvalid { error }.into()),
     };
-    let diagnostics = file.diagnostics().to_vec();
+    let diagnostics = FileDiagnostics::of(&file);
     let Some(root) = file.repo_path() else {
         return Ok((None, diagnostics));
     };
@@ -1057,7 +1080,7 @@ pub(crate) fn project_entries(
 /// person. It prints nothing.
 fn project_entries_and_diagnostics(
     project: &camino::Utf8Path,
-) -> anyhow::Result<(Vec<mfile::entry::BoxEntry>, Vec<String>)> {
+) -> anyhow::Result<(Vec<mfile::entry::BoxEntry>, FileDiagnostics)> {
     match project_file_read(project)? {
         (Some(bytes), diagnostics) => {
             let entries =
@@ -1082,7 +1105,7 @@ pub async fn cmd_box_start(global: &GlobalArgs, args: BoxStartArgs) -> Result<()
 pub async fn start_entry(global: &GlobalArgs, start: StartEntry) -> Result<(), anyhow::Error> {
     let project = command_project_dir(global)?;
     let (entries, diagnostics) = project_entries_and_diagnostics(&project)?;
-    print_file_diagnostics(&diagnostics);
+    diagnostics.print();
     let has_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let plan = plan_start(&start, &entries, has_terminal).inspect_err(|error| {
         tracing::info!(verb = start.verb.command(), %error, "the start was refused before it created a box");
@@ -1397,7 +1420,7 @@ pub(crate) fn session_loadout_mode(
     named: &[String],
 ) -> anyhow::Result<mfile::expand::LoadoutMode> {
     let (mode, diagnostics) = session_loadout_mode_and_diagnostics(project, entry, named)?;
-    print_file_diagnostics(&diagnostics);
+    diagnostics.print();
     Ok(mode)
 }
 
@@ -1412,7 +1435,7 @@ pub(crate) fn session_loadout_mode_and_diagnostics(
     project: &camino::Utf8Path,
     entry: Option<&str>,
     named: &[String],
-) -> anyhow::Result<(mfile::expand::LoadoutMode, Vec<String>)> {
+) -> anyhow::Result<(mfile::expand::LoadoutMode, FileDiagnostics)> {
     let (bytes, diagnostics) = project_file_read(project)?;
     let entry = match &bytes {
         Some(bytes) => {
@@ -1449,7 +1472,7 @@ pub(crate) fn task_loadout_mode(
     task: &str,
 ) -> anyhow::Result<mfile::expand::LoadoutMode> {
     let (bytes, diagnostics) = project_file_read(project)?;
-    print_file_diagnostics(&diagnostics);
+    diagnostics.print();
     let declared = match &bytes {
         Some(bytes) => mfile::entry::read_entries(bytes)
             .map_err(|error| ProjectFileInvalid { error })?
@@ -4555,7 +4578,7 @@ pub(crate) async fn activate_box(
                 hooks,
                 None,
             )?;
-            print_file_diagnostics(&inputs.diagnostics);
+            inputs.diagnostics.print();
             // BOX-064, BOX-179: the gated loadouts again, whole, for the
             // selected-loadouts layer of the entry's expansion. The read
             // above already refused a missing or malformed one.

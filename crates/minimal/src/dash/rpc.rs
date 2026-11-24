@@ -878,7 +878,9 @@ pub(super) async fn resolve_project_off_worker(
 ) -> Result<(camino::Utf8PathBuf, bool), anyhow::Error> {
     let dir = dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let root = crate::resolve_upload_root(&dir)?;
+        // The TUI owns the screen: the create puts the file's hints on the
+        // status line.
+        let root = crate::resolve_upload_root_quiet(&dir)?;
         let repo = minimal_client::file_upload::is_vcs_root(root.as_std_path());
         Ok::<_, anyhow::Error>((root, repo))
     })

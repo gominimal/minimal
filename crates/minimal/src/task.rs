@@ -1554,7 +1554,7 @@ pub(crate) async fn run_entry(
         Ok(file) => {
             // The load prints nothing: its legacy-table hints and
             // unknown-field warnings print here, on stderr, each once.
-            crate::print_file_diagnostics(file.diagnostics());
+            file.print_diagnostics();
             refuse_terminal_entry(Some(&file), &args.entry)?;
         }
         Err(mfile::Error::NotFound) => refuse_terminal_entry(None, &args.entry)?,
@@ -2370,7 +2370,7 @@ pub(crate) fn task_activation_inputs(
     )?;
     // The loads of the project's minimal.toml print nothing. Its legacy-table
     // hints and unknown-field warnings print here, on stderr, each once.
-    crate::print_file_diagnostics(&inputs.diagnostics);
+    inputs.diagnostics.print();
     Ok(inputs)
 }
 

@@ -1290,7 +1290,10 @@ fn create_loadout_selection(
     loadouts: crate::loadouts::LoadoutSelection,
 ) -> anyhow::Result<(crate::loadouts::LoadoutSelection, Vec<String>)> {
     let (mode, diagnostics) = crate::session_loadout_mode_and_diagnostics(root, Some(entry), &[])?;
-    Ok((crate::loadouts::gate_selection(loadouts, mode), diagnostics))
+    Ok((
+        crate::loadouts::gate_selection(loadouts, mode),
+        diagnostics.lines().to_vec(),
+    ))
 }
 
 /// What a dashboard create resolves on this machine before it reaches the
@@ -1326,7 +1329,7 @@ fn prepare_create(
         crate::loadouts::HookPrep::Enforce,
         Some(user_policy),
     )?;
-    crate::add_file_diagnostics(&mut diagnostics, &inputs.diagnostics);
+    crate::add_file_diagnostics(&mut diagnostics, inputs.diagnostics.lines());
     // BOX-064, BOX-179: the gated loadouts again, whole, for the
     // selected-loadouts layer of the entry's expansion, as `min session
     // activate` reads them.

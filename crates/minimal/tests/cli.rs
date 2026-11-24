@@ -870,7 +870,7 @@ async fn dashboard_activate_uploads_loadout_patches() {
         initial_policy: Default::default(),
         compose_options: Default::default(),
         loadout_names: Vec::new(),
-        diagnostics: Vec::new(),
+        diagnostics: Default::default(),
     };
     let activated = minimal::dash::rpc::activate(
         &sock,
@@ -1656,6 +1656,48 @@ async fn loadout_list_warning_goes_to_stderr_not_stdout() {
     assert!(
         !stdout.contains("warning:"),
         "a plain-mode warning must not pollute stdout, got: {stdout}"
+    );
+}
+
+/// #3529: `min dash` puts a `minimal.toml`'s legacy-table hints on its
+/// status line, and every other command still prints them on stderr. Driven
+/// through the compiled binary, because the contract is which stream the
+/// process writes to. `min box spec <entry>` loads the file more than once,
+/// and the hint prints once.
+#[tokio::test]
+async fn box_spec_entry_prints_legacy_session_hint_on_stderr() {
+    let (_daemon, args) = setup().await;
+    let minimal_dir = args.minimal_dir.clone().expect("setup points at a tempdir");
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "[session]\npackages = [\"git\"]\n",
+    )
+    .unwrap();
+    let config_dir = tempfile::TempDir::new().unwrap();
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .current_dir(project.path())
+        .env("MIN_PROVIDER", "local")
+        .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
+        .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+        .arg("--no-input")
+        .args(["box", "spec", "default"])
+        .env_remove("RUST_LOG")
+        .output()
+        .await
+        .expect("the min binary should be invocable");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let hint = "hint: Rename `[session]` to `[defaults.session]` in minimal.toml.";
+    assert_eq!(
+        stderr.matches(hint).count(),
+        1,
+        "the legacy hint must print once on stderr: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        !stdout.contains("hint:"),
+        "the hint must not reach stdout: {stdout}"
     );
 }
 

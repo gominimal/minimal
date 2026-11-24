@@ -1205,7 +1205,9 @@ pub fn print_diagnostics(file: Option<&Path>, lines: &[String]) {
 /// `file`. A line that cannot be written (a closed stderr) is not a reason
 /// to fail the command.
 fn write_new_diagnostics(file: Option<&Path>, lines: &[String], out: &mut dyn std::io::Write) {
-    static PRINTED: LazyLock<Mutex<HashSet<(Option<PathBuf>, String)>>> =
+    /// A file's path and one of its lines.
+    type PrintedLine = (Option<PathBuf>, String);
+    static PRINTED: LazyLock<Mutex<HashSet<PrintedLine>>> =
         LazyLock::new(|| Mutex::new(HashSet::new()));
     if lines.is_empty() {
         return;

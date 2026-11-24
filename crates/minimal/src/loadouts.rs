@@ -498,7 +498,7 @@ pub(crate) fn stage_loadout_hook_scripts(
 /// `diagnostics`. It prints none of them.
 pub(crate) fn check_project_hooks(
     project_root: &paths::HostAbsPath,
-    diagnostics: &mut Vec<String>,
+    diagnostics: &mut crate::FileDiagnostics,
 ) -> Result<(), anyhow::Error> {
     use boxes::client::hookscripts::{ScriptAnchors, stage_external_scripts};
     use boxes::core::lifecyclehook::{HookScript, HookScriptBody};
@@ -507,7 +507,7 @@ pub(crate) fn check_project_hooks(
     let Ok(mfile) = mfile::File::from_dir(project_root.as_utf8_path().as_std_path()) else {
         return Ok(());
     };
-    crate::add_file_diagnostics(diagnostics, mfile.diagnostics());
+    diagnostics.add(&mfile);
     let Some(session) = mfile.session.as_ref() else {
         return Ok(());
     };
@@ -578,7 +578,7 @@ pub(crate) fn activate_hook_budget(
     active: &ActiveLoadouts,
     project_root: &camino::Utf8Path,
     hooks_enabled: bool,
-    diagnostics: &mut Vec<String>,
+    diagnostics: &mut crate::FileDiagnostics,
 ) -> Duration {
     if !hooks_enabled {
         return Duration::ZERO;
@@ -593,7 +593,7 @@ pub(crate) fn activate_hook_budget(
     let project: Duration = mfile::File::from_dir(project_root.as_std_path())
         .ok()
         .and_then(|f| {
-            crate::add_file_diagnostics(diagnostics, f.diagnostics());
+            diagnostics.add(&f);
             f.session
         })
         .map(|s| {
@@ -696,7 +696,7 @@ pub struct ActivationInputs {
     /// The project `minimal.toml`'s legacy-table hints and unknown-field
     /// warnings, each once. Nothing printed them: the CLI prints them on
     /// stderr, and the dashboard puts them on its status line.
-    pub diagnostics: Vec<String>,
+    pub diagnostics: crate::FileDiagnostics,
 }
 
 impl ActivationInputs {
@@ -815,7 +815,7 @@ pub(crate) fn prepare_activation_inputs_with_config(
     // The project's hooks reach the daemon inside the uploaded mfile, so they
     // never pass through the staging above; the checks a staging pass would
     // have made are still worth making here, for the callers that ask.
-    let mut diagnostics = Vec::new();
+    let mut diagnostics = crate::FileDiagnostics::default();
     if hooks == HookPrep::Enforce {
         check_project_hooks(project, &mut diagnostics)?;
     }
@@ -1317,11 +1317,11 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
         let root = camino::Utf8Path::from_path(tmp.path()).unwrap();
 
         assert_eq!(
-            activate_hook_budget(&active, root, true, &mut Vec::new()),
+            activate_hook_budget(&active, root, true, &mut Default::default()),
             Duration::from_secs(90),
         );
         assert_eq!(
-            activate_hook_budget(&active, root, false, &mut Vec::new()),
+            activate_hook_budget(&active, root, false, &mut Default::default()),
             Duration::ZERO,
             "--no-hooks contributes no budget",
         );
