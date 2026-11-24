@@ -1689,7 +1689,11 @@ pub(super) const DRAIN_GRACE: Duration = Duration::from_millis(100);
 /// Each write to `sink` is raced against the client's loss
 /// ([`write_unless_lost`]): the process is gone, so a write is all that
 /// holds the drain, and a client lost while it waits ends the drain rather
-/// than holding the bridge.
+/// than holding the bridge. An input bound set by then does not stop the
+/// drain: a bound ends a command that is still running, and this one has
+/// exited, so what it wrote is still the caller's. A live client gets it as
+/// a slow client gets any output, and a client lost after the bound is still
+/// seen ([`pump_channel_input`] keeps reading the channel past a bound).
 ///
 /// Sets `*open = false` on EOF or a read error. Returns `false` if a
 /// write to the SSH channel failed, or the client was lost while one
