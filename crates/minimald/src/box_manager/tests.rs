@@ -697,6 +697,14 @@ async fn resume_teardown_keeps_the_route_of_a_same_named_box() {
     config.network = boxes::NetworkMode::HostNet;
     config.project_path = HostAbsPath::try_new(plain_dir.to_str().unwrap()).unwrap();
     let plain = create_active_session_with(&mngr, config).await;
+    // Both boxes take the derived name `app`. The store refuses a name a
+    // running box holds, so the first one stops before the second is made.
+    set_record_state(
+        state.path(),
+        plain,
+        boxes::core::record::RecordState::Stopped(boxes::core::record::StopEnding::AtDaemonStart),
+    )
+    .await;
 
     let mut config = run_owned_config();
     config.name = None;
@@ -1605,11 +1613,12 @@ async fn denying_verdict_faults_and_leaves_session_resumable() {
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rename_of_unroutable_session_leaves_other_routes_alone() {
-    let (_state, _cache, mngr) = manager().await;
+    let (state, _cache, mngr) = manager().await;
 
     // Two unnamed sessions whose projects share the basename "app":
-    // both derive the registry name "app". Only the HostNet one
-    // registers a route when its actor spawns.
+    // both derive the name "app". Only the HostNet one registers a
+    // route when its actor spawns. The store refuses a name a running
+    // box holds, so the NoNet one is made first and stopped.
     let routable_project = TempDir::new().unwrap();
     let routable_dir = routable_project.path().join("app");
     std::fs::create_dir_all(&routable_dir).unwrap();
@@ -1619,16 +1628,22 @@ async fn rename_of_unroutable_session_leaves_other_routes_alone() {
 
     let mut config = sample_config();
     config.name = None;
+    config.network = boxes::NetworkMode::NoNet;
+    config.project_path = HostAbsPath::try_new(unroutable_dir.to_str().unwrap()).unwrap();
+    let unroutable_id = create_active_session_with(&mngr, config).await;
+    set_record_state(
+        state.path(),
+        unroutable_id,
+        boxes::core::record::RecordState::Stopped(boxes::core::record::StopEnding::AtDaemonStart),
+    )
+    .await;
+
+    let mut config = sample_config();
+    config.name = None;
     config.network = boxes::NetworkMode::HostNet;
     config.project_path = HostAbsPath::try_new(routable_dir.to_str().unwrap()).unwrap();
     // Finalizing the loadout registers the "app" route.
     let _routable_id = create_active_session_with(&mngr, config).await;
-
-    let mut config = sample_config();
-    config.name = None;
-    config.network = boxes::NetworkMode::NoNet;
-    config.project_path = HostAbsPath::try_new(unroutable_dir.to_str().unwrap()).unwrap();
-    let unroutable_id = create_active_session_with(&mngr, config).await;
     let handle = session(&mngr, unroutable_id).await;
 
     handle
@@ -3809,6 +3824,13 @@ fn as_task(mut config: minimald_rpc::BoxConfig) -> minimald_rpc::BoxConfig {
     config
 }
 
+/// A task create request that asks for `name` (BOX-211).
+fn named_task(name: &str) -> minimald_rpc::BoxConfig {
+    let mut config = as_task(unnamed_config());
+    config.name = Some(name.to_string());
+    config
+}
+
 /// The JSON spec of a `[tasks.<entry>]` box, with `name` as its
 /// `[box] name` when set.
 fn task_spec(entry: &str, name: Option<&str>) -> serde_json_lenient::Value {
@@ -4024,7 +4046,7 @@ async fn create_with_name_held_by_running_box_refused_exit2_names_holder() {
     let (state, _cache, mngr) = manager().await;
     let holder = mngr
         .create_box_with_spec(
-            as_task(unnamed_config()),
+            named_task("dev"),
             Some(task_spec("dev", None)),
             None,
             None,
@@ -4035,8 +4057,8 @@ async fn create_with_name_held_by_running_box_refused_exit2_names_holder() {
     for asked in ["dev", "DEV"] {
         let err = mngr
             .create_box_with_spec(
-                as_task(unnamed_config()),
-                Some(task_spec("lint", Some(asked))),
+                named_task(asked),
+                Some(task_spec("lint", None)),
                 None,
                 None,
             )
@@ -4089,7 +4111,7 @@ async fn create_with_name_held_by_running_box_refused_exit2_names_holder() {
     .await;
     let reuse = mngr
         .create_box_with_spec(
-            as_task(unnamed_config()),
+            named_task("dev"),
             Some(task_spec("dev", None)),
             None,
             None,
@@ -4100,20 +4122,20 @@ async fn create_with_name_held_by_running_box_refused_exit2_names_holder() {
     assert_eq!(record_name(&mngr, reuse).await.as_deref(), Some("dev"));
 }
 
-/// BOX-163: only the entry is cleaned into a label. A `[box] name` is
-/// taken unchanged, so an invalid one is refused, not rewritten.
+/// BOX-211: only the derived name is cleaned into a label. A requested
+/// name is taken unchanged, so an invalid one is refused, not rewritten.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn box_name_is_refused_unchanged_and_entry_is_cleaned() {
     let (_state, _cache, mngr) = manager().await;
     let refused = mngr
         .create_box_with_spec(
-            as_task(unnamed_config()),
-            Some(task_spec("lint", Some("My_Box"))),
+            named_task("My_Box"),
+            Some(task_spec("lint", None)),
             None,
             None,
         )
         .await
-        .expect_err("an invalid `[box] name` is refused");
+        .expect_err("an invalid requested name is refused");
     let text = format!("{refused:#}");
     assert!(
         text.contains("invalid box name") && text.contains("DNS label"),
@@ -4133,12 +4155,12 @@ async fn box_name_is_refused_unchanged_and_entry_is_cleaned() {
         )
         .await
         .expect("an entry name is cleaned into a label");
-    assert_eq!(record_name(&mngr, id).await.as_deref(), Some("build-all"));
+    assert_eq!(record_name(&mngr, id).await.as_deref(), Some("proj-build-all"));
 }
 
-/// BOX-163: a fresh instance is named `<name>-<n>`, with the smallest `n`
-/// no retained record on the host uses, whether or not a running box
-/// holds `<name>`. A stopped record keeps its suffix used.
+/// BOX-163, BOX-211: a fresh instance takes the derived name and `-<n>`,
+/// with the smallest `n` no retained record on the host uses, whether or
+/// not a running box holds the derived name. A stopped record keeps its suffix used.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fresh_instance_creation_named_smallest_unused_suffix() {
     let log = crate::test_harness::captured_log();
@@ -4159,7 +4181,7 @@ async fn fresh_instance_creation_named_smallest_unused_suffix() {
         }
     };
 
-    // A running `dev` holds the name: a fresh run is not refused.
+    // A running `proj-dev` holds the name: a fresh run is not refused.
     let dev = mngr
         .create_box_with_spec(
             as_task(unnamed_config()),
@@ -4169,14 +4191,14 @@ async fn fresh_instance_creation_named_smallest_unused_suffix() {
         )
         .await
         .unwrap();
-    assert_eq!(fresh("dev").await, "dev-1");
-    assert_eq!(fresh("dev").await, "dev-2");
+    assert_eq!(fresh("dev").await, "proj-dev-1");
+    assert_eq!(fresh("dev").await, "proj-dev-2");
 
     // A gap is filled first, and a stopped record still uses its suffix.
     let three = mngr
         .create_box_with_spec(
-            as_task(unnamed_config()),
-            Some(task_spec("lint", Some("Dev-4"))),
+            named_task("Proj-Dev-4"),
+            Some(task_spec("lint", None)),
             None,
             None,
         )
@@ -4188,21 +4210,21 @@ async fn fresh_instance_creation_named_smallest_unused_suffix() {
         boxes::core::record::RecordState::Stopped(boxes::core::record::StopEnding::AtDaemonStart),
     )
     .await;
-    assert_eq!(fresh("dev").await, "dev-3");
+    assert_eq!(fresh("dev").await, "proj-dev-3");
     assert_eq!(
         fresh("dev").await,
-        "dev-5",
-        "a stopped `Dev-4` keeps 4 used"
+        "proj-dev-5",
+        "a stopped `Proj-Dev-4` keeps 4 used"
     );
 
     // With no box of the name at all, a fresh run still takes a suffix.
-    assert_eq!(fresh("web").await, "web-1");
-    assert_eq!(record_name(&mngr, dev).await.as_deref(), Some("dev"));
+    assert_eq!(fresh("web").await, "proj-web-1");
+    assert_eq!(record_name(&mngr, dev).await.as_deref(), Some("proj-dev"));
 
     let logged = log.contents();
     assert!(
         logged.lines().any(|line| line.contains("named a fresh box")
-            && line.contains("dev-5")
+            && line.contains("proj-dev-5")
             && line.contains("suffix=5")),
         "the daemon log names the suffix:\n{logged}"
     );
@@ -4249,7 +4271,7 @@ async fn stopped_dev_and_new_dev_keep_ids_through_rename() {
     // Stop a box named `dev`.
     let old = mngr
         .create_box_with_spec(
-            as_task(unnamed_config()),
+            named_task("dev"),
             Some(task_spec("dev", None)),
             None,
             None,
@@ -4268,7 +4290,7 @@ async fn stopped_dev_and_new_dev_keep_ids_through_rename() {
     // Start a new `dev`: the stopped one leaves the name free.
     let new = mngr
         .create_box_with_spec(
-            as_task(unnamed_config()),
+            named_task("dev"),
             Some(task_spec("dev", None)),
             None,
             None,
@@ -4542,8 +4564,8 @@ async fn fresh_instance_mint_finds_its_registration_after_the_rename() {
     };
     let mut created = Vec::new();
     for key in [
-        "dev~00112233445566778899aabbccddeeff",
-        "dev~ffeeddccbbaa99887766554433221100",
+        "proj-dev~00112233445566778899aabbccddeeff",
+        "proj-dev~ffeeddccbbaa99887766554433221100",
     ] {
         let id = mngr
             .create_fresh_box_with_spec(grant_config(key), Some(task_spec("dev", None)), None, None)
@@ -4561,8 +4583,8 @@ async fn fresh_instance_mint_finds_its_registration_after_the_rename() {
     assert_eq!(
         created,
         vec![
-            (first, Some("dev-1".to_string())),
-            (second, Some("dev-2".to_string())),
+            (first, Some("proj-dev-1".to_string())),
+            (second, Some("proj-dev-2".to_string())),
         ],
         "each fresh instance takes its own id under its `<base>-<n>` name"
     );
@@ -7973,10 +7995,14 @@ async fn client_and_daemon_digests_match_vectors_and_mismatch_refused() {
         config
     };
 
-    for (name, verb_type, wire, client, golden) in &cases {
+    for (n, (name, verb_type, wire, client, golden)) in cases.iter().enumerate() {
+        // Each box asks for a name of its own: the specs share a project,
+        // so their derived names can collide (BOX-211).
+        let mut config = config_for(verb_type, client);
+        config.name = Some(format!("golden-{n}"));
         let id = mngr
             .create_box_with_spec(
-                config_for(verb_type, client),
+                config,
                 Some(wire.clone()),
                 None,
                 None,
