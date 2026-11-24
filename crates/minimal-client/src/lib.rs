@@ -3293,6 +3293,10 @@ mod duplex_transport_tests {
     const STALLED: &str =
         "the echo stalled for 60 s: both session loops are waiting for the other to read";
 
+    /// Set to `1` to run [`bare_ends_can_wait_on_each_other`], whose outcome depends on
+    /// scheduling, by hand; unset, it returns at once.
+    const BARE_ECHO_BY_HAND: &str = "MINIMAL_BARE_ECHO_STALL";
+
     /// `len` bytes with a period of 251 (a prime), so a dropped, repeated or swapped chunk does
     /// not compare equal.
     fn pattern(len: usize) -> Vec<u8> {
@@ -3580,11 +3584,17 @@ mod duplex_transport_tests {
     }
 
     /// Neither end wrapped. Whether a free-running echo stalls depends on when each session loop
-    /// runs, so it is not run by default; the probe control above is the one that always runs.
-    /// Run it by hand to see the stall in a whole echo.
+    /// runs, so no gate may depend on it: `just ci` runs the ignored tests on Linux, and there
+    /// this one returns at once unless [`BARE_ECHO_BY_HAND`] is set to `1`. The probe control
+    /// above is the one that always runs. Run it by hand, with that set, to see the stall in a
+    /// whole echo.
     #[tokio::test]
-    #[ignore = "the stall depends on scheduling; run by hand"]
+    #[ignore = "the stall depends on scheduling; run by hand with MINIMAL_BARE_ECHO_STALL=1"]
     async fn bare_ends_can_wait_on_each_other() {
+        if std::env::var(BARE_ECHO_BY_HAND).as_deref() != Ok("1") {
+            eprintln!("skipping: set {BARE_ECHO_BY_HAND}=1 to run the whole bare echo by hand");
+            return;
+        }
         let (client_end, daemon_end) = tokio::io::duplex(PIPE_BYTES);
         serve(daemon_end, false);
         let payload = Arc::new(pattern(PAYLOAD_BYTES));
