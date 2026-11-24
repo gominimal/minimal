@@ -1699,7 +1699,7 @@ mod tests {
         std::fs::write(
             root.join(mfile::MFILE_NAME),
             "[sessions.default]\npackages = []\n\n[sessions.dev]\npackages = []\n\n\
-             [sessions.api]\npackages = []\n[sessions.api.box]\nname = \"api-box\"\n",
+             [sessions.api]\npackages = []\n[sessions.api.box]\nname = \"web\"\n",
         )
         .unwrap();
         let project_path = paths::HostAbsPath::try_new(root.clone()).unwrap();
@@ -1724,7 +1724,7 @@ mod tests {
         for (entry, expected) in [
             (None, "web-app"),
             (Some("dev"), "web-app-dev"),
-            (Some("api"), "api-box"),
+            (Some("api"), "web"),
         ] {
             // `min box start [dev]`: the plan the CLI makes, then the
             // shared helper with the plan's options, as `activate_box`
