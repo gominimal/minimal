@@ -343,6 +343,41 @@ impl PtyOp {
     }
 }
 
+/// The level a pty-master failure is logged at.
+///
+/// A `read(2)` on the master that fails with [`EIO_ON_EXIT`] is how a
+/// session ends on Linux: the last slave fd closed, whether the shell exited
+/// or was killed. That is debug, and the reap that follows says which
+/// ([`pty_reap_log_level`]). Every other failure is a warning: a readiness
+/// error, a failed write, or another errno can leave a live process behind.
+pub(super) fn pty_err_log_level(op: PtyOp, e: &std::io::Error) -> tracing::Level {
+    if matches!(op, PtyOp::Read) && shell_is_already_gone(e) {
+        tracing::Level::DEBUG
+    } else {
+        tracing::Level::WARN
+    }
+}
+
+/// The level of the reap that follows a pty/step error the daemon did not
+/// ask for (a kill it sent is logged as a requested teardown).
+///
+/// Info when the master reported [`EIO_ON_EXIT`] and the reap found an exit
+/// the process made on its own: the ordinary end of a session. A warning
+/// when the error was anything else, when the process ended on a signal or
+/// a container failure, or when the reap failed and there is no account.
+pub(super) fn pty_reap_log_level(
+    pty_err: Option<&std::io::Error>,
+    exit: Option<&ExitReason>,
+) -> tracing::Level {
+    let terminal_closed = pty_err.is_some_and(shell_is_already_gone);
+    let ended_on_its_own = exit.is_some_and(|exit| !exit.is_abnormal());
+    if terminal_closed && ended_on_its_own {
+        tracing::Level::INFO
+    } else {
+        tracing::Level::WARN
+    }
+}
+
 /// A message from the binding (user terminal) to the shell process / host.
 ///
 /// Every message tags the generation of the [`Binding`] that sent it. The
