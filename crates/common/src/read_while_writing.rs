@@ -245,6 +245,129 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for ReadWhileWriting<S> {
     }
 }
 
+/// Scaffolding for tests of the code that wires [`ReadWhileWriting`] in. A [`test_util::Probe`]
+/// sits between a session loop and its transport, so a test can make one end stop reading and
+/// see when the other end's writes block or go through. The `test-util` cargo feature builds it
+/// for other crates' tests; no normal build has it.
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_util {
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
+
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use tokio::sync::watch;
+
+    /// What a [`Probe`] has seen of the writes to its stream.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Writes {
+        /// Bytes the stream accepted, in all.
+        pub accepted: usize,
+        /// Whether the latest write returned `Pending`: the writer waits for room, which only a
+        /// read by the other end makes.
+        pub blocked: bool,
+    }
+
+    /// A stream that passes reads and writes through to `inner` and reports the writes to its
+    /// [`ProbeHandle`], which can also stop this end reading for good.
+    pub struct Probe<S> {
+        inner: S,
+        reads_paused: Arc<AtomicBool>,
+        writes: watch::Sender<Writes>,
+    }
+
+    /// The test's side of a [`Probe`].
+    pub struct ProbeHandle {
+        reads_paused: Arc<AtomicBool>,
+        writes: watch::Receiver<Writes>,
+    }
+
+    impl<S> Probe<S> {
+        /// Wraps `inner`. Reads go through until [`ProbeHandle::pause_reads`].
+        pub fn new(inner: S) -> (Self, ProbeHandle) {
+            let reads_paused = Arc::new(AtomicBool::new(false));
+            let (tx, rx) = watch::channel(Writes::default());
+            let probe = Self {
+                inner,
+                reads_paused: Arc::clone(&reads_paused),
+                writes: tx,
+            };
+            let handle = ProbeHandle {
+                reads_paused,
+                writes: rx,
+            };
+            (probe, handle)
+        }
+    }
+
+    impl ProbeHandle {
+        /// From now on every read of the probed stream returns `Pending`, so the end that reads
+        /// it never reads again: the peer that provably does not read. Reads are not resumed.
+        pub fn pause_reads(&self) {
+            self.reads_paused.store(true, Ordering::SeqCst);
+        }
+
+        /// The writes seen so far.
+        pub fn writes(&self) -> Writes {
+            *self.writes.borrow()
+        }
+
+        /// Waits until `done` holds for the writes seen; false if the probe was dropped first.
+        pub async fn wait_for_writes(&mut self, done: impl FnMut(&Writes) -> bool) -> bool {
+            self.writes.wait_for(done).await.is_ok()
+        }
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for Probe<S> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            if this.reads_paused.load(Ordering::SeqCst) {
+                // No waker is kept: reads stay paused for good, and whatever else wakes the
+                // reading task finds this read still pending.
+                return Poll::Pending;
+            }
+            Pin::new(&mut this.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for Probe<S> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            let polled = Pin::new(&mut this.inner).poll_write(cx, buf);
+            match &polled {
+                Poll::Ready(Ok(n)) => {
+                    let n = *n;
+                    this.writes.send_modify(|w| {
+                        w.accepted += n;
+                        w.blocked = false;
+                    });
+                }
+                Poll::Pending => this.writes.send_modify(|w| w.blocked = true),
+                Poll::Ready(Err(_)) => {}
+            }
+            polled
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;

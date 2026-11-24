@@ -174,6 +174,25 @@ impl Connection {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        // Reads ahead while a write is blocked, so this end and a client whose
+        // session loop also writes before it reads cannot wait on each other.
+        let s = common::read_while_writing::ReadWhileWriting::new(s);
+        Self::over_transport(s, c, serv, is_local).await
+    }
+
+    /// [`Self::from_stream`] over `s` as given, without reading ahead: how a
+    /// daemon built before the wrapper served a connection. Every accept goes
+    /// through `from_stream`; a test calls this directly, as the control that
+    /// shows the wait the wrapper ends.
+    async fn over_transport<S>(
+        s: S,
+        c: Arc<RuConfig>,
+        serv: ServerStateHandle,
+        is_local: bool,
+    ) -> Result<(ConnectionHandle, RunningSession<ConnectionHandler>), ConnectionError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let h = ConnectionHandle(Arc::new(Mutex::new(Self {
             auth: if is_local { Auth::Local } else { Auth::Pending },
             ssh_username: None,
@@ -185,9 +204,6 @@ impl Connection {
             serv,
         })));
 
-        // Reads ahead while a write is blocked, so this end and a client whose
-        // session loop also writes before it reads cannot wait on each other.
-        let s = common::read_while_writing::ReadWhileWriting::new(s);
         // A handshake failure (e.g. a client that connects then drops) must not
         // propagate as a panic: in the guest, minimald is pid-1, so a panic here
         // kills init and takes down the whole VM. Surface the error so the accept
@@ -1760,6 +1776,147 @@ mod tests {
         assert!(
             line.contains(&format!("port={port}")),
             "the open line must name the box port, got: {line}"
+        );
+    }
+
+    /// The in-memory transport's buffer each way in the read-ahead tests: far below one
+    /// channel window (2 MiB).
+    const PIPE_BYTES: usize = 8 * 1024;
+
+    /// What the box port sends through the forward while the client has stopped reading: far
+    /// more than the pipe holds, and within the client's window.
+    const BOX_SENDS: usize = 256 * 1024;
+
+    /// What the client sends while the daemon is blocked writing: far more than the pipe holds,
+    /// and within the daemon's window and read-ahead cap.
+    const CLIENT_SENDS: usize = 1024 * 1024;
+
+    /// The bound on each wait the read-ahead test expects to end.
+    const READ_AHEAD_BOUND: Duration = Duration::from_secs(30);
+
+    /// How long the read-ahead control watches for bytes that by construction cannot move.
+    const READ_AHEAD_CONTROL_WAIT: Duration = Duration::from_secs(2);
+
+    /// A forward whose client stops reading while the box port sends [`BOX_SENDS`], so the
+    /// daemon's session loop is blocked in its write; then the client sends [`CLIENT_SENDS`].
+    /// Returns how many bytes the client's transport accepted after that, waiting up to `wait`
+    /// for all of them. The client is bare, as a CLI built before the read-ahead wrapper.
+    ///
+    /// With `through_from_stream`, the daemon's end is served by [`Connection::from_stream`],
+    /// as every accept is; without, by [`Connection::over_transport`], bare. A bare daemon
+    /// blocked in a write never reads again, so at most the pipe's [`PIPE_BYTES`] can be
+    /// accepted. That holds by construction, not by timing: nothing reads the daemon's end
+    /// while its write is blocked.
+    async fn client_progress_while_the_daemon_is_blocked(
+        through_from_stream: bool,
+        wait: Duration,
+    ) -> usize {
+        use common::read_while_writing::test_util::Probe;
+
+        use crate::test_harness::{TestServer, create_session_req};
+
+        let box_port = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = box_port.local_addr().unwrap().port();
+        let server = TestServer::new().await;
+        let req = create_session_req("read-ahead", "/tmp");
+        let session_id = server
+            .state
+            .sessions_manager()
+            .await
+            .create_session(req.config, None)
+            .await
+            .unwrap();
+
+        let russh_config = Arc::new(russh::server::Config {
+            keys: vec![server.state.host_key().await.unwrap()],
+            auth_rejection_time_initial: Some(Duration::ZERO),
+            ..Default::default()
+        });
+        let (client_end, daemon_end) = tokio::io::duplex(PIPE_BYTES);
+        let (client_end, mut client_probe) = Probe::new(client_end);
+        let (daemon_end, mut daemon_probe) = Probe::new(daemon_end);
+        let server_setup = {
+            let state = server.state.clone();
+            async move {
+                let served = if through_from_stream {
+                    Connection::from_stream(daemon_end, russh_config, state, true).await
+                } else {
+                    Connection::over_transport(daemon_end, russh_config, state, true).await
+                };
+                let (_conn, session_fut) = served.expect("handshake over the in-memory pipe");
+                crate::traced::spawn(session_fut);
+            }
+        };
+        let client_setup = russh::client::connect_stream(
+            Arc::new(russh::client::Config::default()),
+            client_end,
+            ForwardHandler,
+        );
+        let (_, handle) = tokio::join!(server_setup, client_setup);
+        let mut handle = handle.unwrap();
+        let auth = handle
+            .authenticate_none(&session_id.to_string())
+            .await
+            .unwrap();
+        assert!(auth.success(), "auth_none should succeed on a local transport");
+        let channel = handle
+            .channel_open_direct_tcpip("127.0.0.1", port.into(), "127.0.0.1", 0)
+            .await
+            .expect("the forward opens");
+        let (mut box_side, _) = box_port.accept().await.unwrap();
+
+        client_probe.pause_reads();
+        let from_box = vec![7u8; BOX_SENDS];
+        let _box_sender = tokio::spawn(async move {
+            box_side.write_all(&from_box).await?;
+            // Returned, not dropped: a closed box port would end the forward.
+            Ok::<_, std::io::Error>(box_side)
+        });
+        let blocked = tokio::time::timeout(
+            READ_AHEAD_BOUND,
+            daemon_probe.wait_for_writes(|w| w.blocked),
+        )
+        .await;
+        assert!(
+            matches!(blocked, Ok(true)),
+            "the daemon's write must block on a client that does not read"
+        );
+
+        let (_rd, wr) = channel.split();
+        let before = client_probe.writes().accepted;
+        let from_client = vec![9u8; CLIENT_SENDS];
+        let _client_sender = tokio::spawn(async move { wr.data(from_client.as_slice()).await });
+        let _reached = tokio::time::timeout(
+            wait,
+            client_probe.wait_for_writes(|w| w.accepted >= before + CLIENT_SENDS),
+        )
+        .await;
+        client_probe.writes().accepted - before
+    }
+
+    /// The daemon's wiring in `Connection::from_stream`: while its session loop is blocked
+    /// writing to a client that has stopped reading, it still takes in what the client sends,
+    /// so a bare client's write goes through.
+    #[tokio::test]
+    async fn from_stream_reads_while_its_write_is_blocked() {
+        let accepted = client_progress_while_the_daemon_is_blocked(true, READ_AHEAD_BOUND).await;
+        assert!(
+            accepted >= CLIENT_SENDS,
+            "the client got {accepted} of {CLIENT_SENDS} bytes out to the daemon"
+        );
+    }
+
+    /// The control for the test above: the same daemon served bare, blocked in a write, takes
+    /// in no more than the pipe holds. This is what shows that test needs the wrapper.
+    #[tokio::test]
+    async fn a_bare_daemon_blocked_in_a_write_reads_nothing() {
+        let accepted =
+            client_progress_while_the_daemon_is_blocked(false, READ_AHEAD_CONTROL_WAIT).await;
+        assert!(
+            accepted <= PIPE_BYTES,
+            "a bare daemon blocked in a write read {accepted} bytes, more than the pipe holds"
         );
     }
 

@@ -39,6 +39,8 @@ tracing.workspace = true
 version.workspace = true
 
 [dev-dependencies]
+# The transport probe the read-ahead wiring tests put under each session loop.
+common = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 # A layer that reads the `client.rpc` span's status in the RPC tests.
 tracing-subscriber.workspace = true

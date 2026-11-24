@@ -7,6 +7,11 @@ license.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+# `read_while_writing::test_util`: the probe that tests of the read-ahead wiring put between a
+# session loop and its transport. Only other crates' dev-dependencies turn it on.
+test-util = []
+
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
