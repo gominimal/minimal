@@ -1206,10 +1206,12 @@ async fn an_exec_ended_by_shutdown_writes_the_notice_to_stderr() {
 
         let (closed_stdin_w, mut bridge_stdin) = duplex(64);
         drop(closed_stdin_w);
-        let (mut bridge_stdout, _client_stdout) = duplex(64 * 1024);
-        let (mut bridge_stderr, mut client_stderr) = duplex(64 * 1024);
+        let (bridge_stdout, _client_stdout) = duplex(64 * 1024);
+        let (bridge_stderr, mut client_stderr) = duplex(64 * 1024);
 
         let bridge_task = crate::traced::spawn(async move {
+            let mut bridge_stdout = super::ChannelOut::new(bridge_stdout);
+            let mut bridge_stderr = super::ChannelOut::new(bridge_stderr);
             let (exit, _late) = bridge_noting_reason(
                 "test",
                 process,
@@ -1271,12 +1273,14 @@ async fn an_exec_ended_by_destroy_writes_the_notice_to_stderr() {
 
         let (closed_stdin_w, mut bridge_stdin) = duplex(64);
         drop(closed_stdin_w);
-        let (mut bridge_stdout, _client_stdout) = duplex(64 * 1024);
-        let (mut bridge_stderr, mut client_stderr) = duplex(64 * 1024);
+        let (bridge_stdout, _client_stdout) = duplex(64 * 1024);
+        let (bridge_stderr, mut client_stderr) = duplex(64 * 1024);
         let destroyed = CancellationToken::new();
 
         let token = destroyed.clone();
         let bridge_task = crate::traced::spawn(async move {
+            let mut bridge_stdout = super::ChannelOut::new(bridge_stdout);
+            let mut bridge_stderr = super::ChannelOut::new(bridge_stderr);
             let (exit, _late) = bridge_noting_reason(
                 "test",
                 process,
@@ -1349,11 +1353,13 @@ async fn a_task_ending_during_a_destroy_gets_no_destroy_notice() {
     ) = build_mock();
     let (closed_stdin_w, mut bridge_stdin) = duplex(64);
     drop(closed_stdin_w);
-    let (mut bridge_stdout, _client_stdout) = duplex(64 * 1024);
-    let (mut bridge_stderr, mut client_stderr) = duplex(64 * 1024);
+    let (bridge_stdout, _client_stdout) = duplex(64 * 1024);
+    let (bridge_stderr, mut client_stderr) = duplex(64 * 1024);
 
     let token = destroy_signal::<TaskExec>(|| destroyed.clone());
     let bridge_task = crate::traced::spawn(async move {
+        let mut bridge_stdout = super::ChannelOut::new(bridge_stdout);
+        let mut bridge_stderr = super::ChannelOut::new(bridge_stderr);
         let (exit, _late) = bridge_noting_reason(
             "test",
             process,
@@ -1421,12 +1427,14 @@ async fn an_exec_that_exits_on_its_own_gets_no_notice() {
 
         let (closed_stdin_w, mut bridge_stdin) = duplex(64);
         drop(closed_stdin_w);
-        let (mut bridge_stdout, _client_stdout) = duplex(64 * 1024);
-        let (mut bridge_stderr, mut client_stderr) = duplex(64 * 1024);
+        let (bridge_stdout, _client_stdout) = duplex(64 * 1024);
+        let (bridge_stderr, mut client_stderr) = duplex(64 * 1024);
         let destroyed = CancellationToken::new();
 
         let token = destroyed.clone();
         let bridge_task = crate::traced::spawn(async move {
+            let mut bridge_stdout = super::ChannelOut::new(bridge_stdout);
+            let mut bridge_stderr = super::ChannelOut::new(bridge_stderr);
             let (exit, _late) = bridge_noting_reason(
                 "test",
                 process,
@@ -2075,35 +2083,50 @@ async fn a_lost_client_ends_an_exec_whose_output_write_waits_on_it() {
 }
 
 /// The race behind every channel write of the bridge: a write the client
-/// has not taken waits for as long as the exec runs, so a slow client is
-/// never cut off; it is given up once the exec's end is set; and a write
-/// the channel has room for still goes through after the end.
+/// has not taken waits for as long as the client is there, so a slow client
+/// is never cut off, and an input bound does not give it up either; it is
+/// given up once the client is lost, which cuts the channel; and a write
+/// the channel has room for still goes through after the loss.
 #[tokio::test(start_paused = true)]
-async fn a_channel_write_waits_on_the_client_until_the_exec_ends() {
+async fn a_channel_write_waits_on_the_client_until_it_is_lost() {
     use std::time::Duration;
     use tokio::time::timeout;
 
     // One byte of room, and a client that reads nothing.
-    let (mut channel, _client) = duplex(1);
-    let (end_tx, mut end) = tokio::sync::watch::channel(None);
+    let (inner, _client) = duplex(1);
+    let mut channel = super::ChannelOut::new(inner);
+    let (end_tx, end) = tokio::sync::watch::channel(None);
 
-    // The control: with no end, the write is still waiting an hour later
-    // (the clock is paused, so the hour passes at once).
-    let write = super::write_unless_ended(&mut channel, b"output", &mut end);
-    timeout(Duration::from_secs(3600), write)
-        .await
-        .expect_err("a write the client has not taken waits while the exec runs");
+    let relayed = {
+        // One write, polled through every step: the channel is cut once a
+        // write is dropped part way, so each step must not drop it.
+        let mut write = std::pin::pin!(super::write_unless_lost(&mut channel, b"output", &end));
+        // The control: with no end, the write is still waiting an hour
+        // later (the clock is paused, so the hour passes at once).
+        timeout(Duration::from_secs(3600), &mut write)
+            .await
+            .expect_err("a write the client has not taken waits while the client is there");
+        // An input bound ends the exec between writes, not during one.
+        let bound = super::ExecEnd::InputHeldOver(super::HeldBound::Exec);
+        end_tx.send(Some(bound)).unwrap();
+        timeout(Duration::from_secs(3600), &mut write)
+            .await
+            .expect_err("an input bound does not give up a write the client may still take");
+        end_tx.send(Some(super::ExecEnd::ClientLost)).unwrap();
+        timeout(Duration::from_secs(10), write)
+            .await
+            .expect("a write that waits on a lost client is given up")
+    };
+    assert!(matches!(relayed, super::Relayed::Lost), "{relayed:?}");
+    assert!(channel.is_cut(), "a write given up part way cuts the channel");
+    let relayed = super::write_unless_lost(&mut channel, b"more", &end).await;
+    assert!(matches!(relayed, super::Relayed::Cut), "{relayed:?}");
 
-    end_tx.send(Some(super::ExecEnd::ClientLost)).unwrap();
-    let write = super::write_unless_ended(&mut channel, b"output", &mut end);
-    let relayed = timeout(Duration::from_secs(10), write)
-        .await
-        .expect("a write that waits on a lost client is given up");
-    assert!(matches!(relayed, super::Relayed::Ended), "{relayed:?}");
-
-    let (mut roomy, mut client) = duplex(64);
-    let relayed = super::write_unless_ended(&mut roomy, b"output", &mut end).await;
+    let (roomy, mut client) = duplex(64);
+    let mut roomy = super::ChannelOut::new(roomy);
+    let relayed = super::write_unless_lost(&mut roomy, b"output", &end).await;
     assert!(matches!(relayed, super::Relayed::Written), "{relayed:?}");
+    assert!(!roomy.is_cut(), "a write that finished leaves the channel whole");
     drop(roomy);
     let mut got = Vec::new();
     client.read_to_end(&mut got).await.unwrap();
@@ -2114,8 +2137,8 @@ async fn a_channel_write_waits_on_the_client_until_the_exec_ends() {
 /// bridge's write of its stdout waits on a client that has read none of it,
 /// and the client, reading sixteen bytes at a time from then on, still gets
 /// every byte of stdout and stderr and the command's own status. The exit is
-/// seen during the write and must not cut the write, or the drain after it,
-/// short.
+/// seen during the write (the test checks that before the client reads) and
+/// must not cut the write, or the drain after it, short.
 #[tokio::test]
 async fn a_slow_client_gets_all_output_and_the_status_of_a_command_that_exits_mid_write() {
     use std::sync::Arc;
@@ -2165,6 +2188,11 @@ async fn a_slow_client_gets_all_output_and_the_status_of_a_command_that_exits_mi
     drop(stdout_writer);
     drop(stderr_writer);
     ctrl.signal_exit(3).await;
+    // Nothing has been read, so the write of stdout still waits: the exit
+    // can only be seen by the wait the parked write polls.
+    timeout(Duration::from_secs(10), ctrl.wait_returned())
+        .await
+        .expect("the exit is seen while the bridge's write of stdout waits on the client");
 
     // The bridge owns its channel ends, so both reads see EOF once it returns.
     let read_all = async {
@@ -2211,14 +2239,16 @@ async fn a_destroy_ends_a_command_whose_output_write_waits_on_the_client() {
         },
     ) = build_mock();
     let parked = Arc::new(tokio::sync::Notify::new());
-    let (mut bridge_stdout, _client_stdout) = watched_channel(1, &parked);
-    let (mut bridge_stderr, mut client_stderr) = duplex(64 * 1024);
+    let (bridge_stdout, _client_stdout) = watched_channel(1, &parked);
+    let (bridge_stderr, mut client_stderr) = duplex(64 * 1024);
     let (_client_stdin, mut bridge_stdin) = duplex(64);
     let (lost_tx, lost_rx) = tokio::sync::watch::channel(None);
     let destroyed = CancellationToken::new();
 
     let token = destroyed.clone();
     let bridge_task = tokio::spawn(async move {
+        let mut bridge_stdout = super::ChannelOut::new(bridge_stdout);
+        let mut bridge_stderr = super::ChannelOut::new(bridge_stderr);
         let (exit, _late) = bridge_noting_reason(
             "test",
             process,
@@ -2260,6 +2290,320 @@ async fn a_destroy_ends_a_command_whose_output_write_waits_on_the_client() {
         "stderr was {:?}",
         String::from_utf8_lossy(&err),
     );
+}
+
+/// An input bound reached while the bridge's write of output waits on the
+/// client does not give the write up: the client is still there, and an
+/// input bound ends the exec between writes, as it did before writes were
+/// raced, so the client gets the rest of the output (and, in `run`, the
+/// notice that names the bound). Once the client has read it, the bridge
+/// sees the end and ends the command. A race that marked the end seen
+/// would leave the exec running, and this test would fail on its timeout.
+#[tokio::test(start_paused = true)]
+async fn an_input_bound_during_a_parked_output_write_ends_the_exec_once_the_write_is_done() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let (
+        process,
+        MockEndpoints {
+            stdin_reader: _stdin_reader,
+            mut stdout_writer,
+            stderr_writer: _stderr_writer,
+            ctrl,
+        },
+    ) = build_mock();
+    let parked = Arc::new(tokio::sync::Notify::new());
+    let (mut bridge_stdout, mut client_stdout) = watched_channel(1, &parked);
+    let (mut bridge_stderr, _client_stderr) = duplex(64 * 1024);
+    let (_client_stdin, mut bridge_stdin) = duplex(64);
+    let (end_tx, end_rx) = tokio::sync::watch::channel(None);
+
+    let mut bridge_task = tokio::spawn(async move {
+        bridge(
+            "test",
+            process,
+            &mut bridge_stdin,
+            &mut bridge_stdout,
+            &mut bridge_stderr,
+            end_rx,
+            super::UnreadStdin::Keep,
+        )
+        .await
+    });
+
+    // The command keeps its output open, so only the end can end the exec.
+    stdout_writer.write_all(b"output").await.unwrap();
+    timeout(Duration::from_secs(10), parked.notified())
+        .await
+        .expect("the bridge's write of the output waits on the client");
+
+    let bound = super::ExecEnd::InputHeldOver(super::HeldBound::Exec);
+    end_tx.send(Some(bound)).unwrap();
+    timeout(Duration::from_secs(3600), &mut bridge_task)
+        .await
+        .expect_err("an input bound does not give up a write the client may still take");
+    assert!(!ctrl.was_killed(), "the command runs until the write is done");
+
+    let mut got = [0u8; 6];
+    timeout(Duration::from_secs(10), client_stdout.read_exact(&mut got))
+        .await
+        .expect("the client gets the rest of the output")
+        .unwrap();
+    assert_eq!(&got, b"output");
+    let exit = timeout(Duration::from_secs(10), bridge_task)
+        .await
+        .expect("the input bound ends the exec once the write is done")
+        .unwrap();
+    // A killed mock waits back Ok(None), which the bridge maps to 1.
+    assert_eq!(exit, 1);
+    assert!(ctrl.was_killed(), "the bridge ends the command for the bound");
+}
+
+/// A channel writer with the flaw of russh's `ChannelTx`, whose
+/// `poll_write` (`channels/io/tx.rs`) reuses a send it has started: a write
+/// that has to wait first takes its bytes and keeps them with the send, and
+/// the next `poll_write` finishes that kept send, whatever bytes it is
+/// given, and reports the kept bytes' length. The session takes nothing
+/// until the test sets `taking`, and wakes no writer when it does, so only
+/// a later poll finds out. Every write that has to wait wakes `parked`.
+struct HeldChunkChannel {
+    kept: Option<Vec<u8>>,
+    taking: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    sent: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    parked: std::sync::Arc<tokio::sync::Notify>,
+}
+
+/// What a test keeps of a [`HeldChunkChannel`]: what makes the session take
+/// messages, and what it has sent.
+struct HeldChunkHandles {
+    taking: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    sent: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl HeldChunkHandles {
+    /// Lets the session take messages again; no writer is woken.
+    fn start_taking(&self) {
+        self.taking.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Every byte the session has taken so far.
+    fn sent(&self) -> Vec<u8> {
+        self.sent.lock().unwrap().clone()
+    }
+}
+
+/// A [`HeldChunkChannel`] whose session takes nothing yet, and its handles.
+fn held_chunk_channel(
+    parked: &std::sync::Arc<tokio::sync::Notify>,
+) -> (HeldChunkChannel, HeldChunkHandles) {
+    let handles = HeldChunkHandles {
+        taking: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        sent: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+    };
+    let channel = HeldChunkChannel {
+        kept: None,
+        taking: std::sync::Arc::clone(&handles.taking),
+        sent: std::sync::Arc::clone(&handles.sent),
+        parked: std::sync::Arc::clone(parked),
+    };
+    (channel, handles)
+}
+
+impl tokio::io::AsyncWrite for HeldChunkChannel {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let chunk = self.kept.take().unwrap_or_else(|| buf.to_vec());
+        if self.taking.load(std::sync::atomic::Ordering::SeqCst) {
+            let n = chunk.len();
+            self.sent.lock().unwrap().extend_from_slice(&chunk);
+            return std::task::Poll::Ready(Ok(n));
+        }
+        self.kept = Some(chunk);
+        self.parked.notify_one();
+        std::task::Poll::Pending
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// A channel is not written to again once a write to it was given up part
+/// way. The writer here keeps the bytes of a write that waits, as russh's
+/// does, and hands them to the next write: the notice below, written
+/// through it, would send the old 20 bytes in its place and report 20
+/// written for its 6, and `write_all` would panic splitting it at 20. A
+/// write dropped part way, as the bound on the exit notice drops one, cuts
+/// the channel too. The control: a write that waited and then finished
+/// leaves the channel whole, and the next write goes out as written.
+#[tokio::test(start_paused = true)]
+async fn a_channel_given_up_part_way_is_not_written_again() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let parked = Arc::new(tokio::sync::Notify::new());
+    let (inner, session) = held_chunk_channel(&parked);
+    let mut channel = super::ChannelOut::new(inner);
+    // The client is already lost: the write is polled first, keeps its
+    // bytes and waits, and is then given up.
+    let (_lost_tx, lost) = tokio::sync::watch::channel(Some(super::ExecEnd::ClientLost));
+    let relayed = super::write_unless_lost(&mut channel, b"twenty bytes of data", &lost).await;
+    assert!(matches!(relayed, super::Relayed::Lost), "{relayed:?}");
+    assert!(channel.is_cut());
+    // The session takes messages again, but nothing reaches it.
+    session.start_taking();
+    let relayed = channel.write(b"notice").await;
+    assert!(matches!(relayed, super::Relayed::Cut), "{relayed:?}");
+    let relayed = super::write_unless_lost(&mut channel, b"notice", &lost).await;
+    assert!(matches!(relayed, super::Relayed::Cut), "{relayed:?}");
+    let sent = session.sent();
+    assert!(sent.is_empty(), "sent {:?}", String::from_utf8_lossy(&sent));
+
+    // Dropped part way: the client reads nothing, and the bound runs out.
+    let (inner, _client) = duplex(1);
+    let mut bounded = super::ChannelOut::new(inner);
+    timeout(Duration::from_secs(5), bounded.write(b"output"))
+        .await
+        .expect_err("the write waits on a client that reads nothing");
+    assert!(bounded.is_cut(), "a write dropped part way cuts the channel");
+
+    // The control.
+    let (inner, session) = held_chunk_channel(&parked);
+    let mut whole = super::ChannelOut::new(inner);
+    let (_here_tx, here) = tokio::sync::watch::channel(None);
+    let relayed = {
+        let mut write = std::pin::pin!(super::write_unless_lost(&mut whole, b"first ", &here));
+        timeout(Duration::from_secs(5), &mut write)
+            .await
+            .expect_err("the write waits for the session");
+        session.start_taking();
+        timeout(Duration::from_secs(5), write)
+            .await
+            .expect("the write finishes once the session takes it")
+    };
+    assert!(matches!(relayed, super::Relayed::Written), "{relayed:?}");
+    assert!(!whole.is_cut(), "a write that finished leaves the channel whole");
+    let relayed = whole.write(b"second").await;
+    assert!(matches!(relayed, super::Relayed::Written), "{relayed:?}");
+    assert_eq!(session.sent(), b"first second");
+}
+
+/// A command that a kill does not end: `wait` returns only once the test
+/// sends a status, so the test can act between the bridge's kill and what
+/// the bridge writes once the command is gone. `start_kill` wakes `killed`.
+struct ExitsWhenTold {
+    stdio: Option<(tokio::io::DuplexStream, tokio::io::DuplexStream, tokio::io::DuplexStream)>,
+    status: tokio::sync::watch::Receiver<Option<i32>>,
+    killed: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl super::Process for ExitsWhenTold {
+    type Stdin = tokio::io::DuplexStream;
+    type Stdout = tokio::io::DuplexStream;
+    type Stderr = tokio::io::DuplexStream;
+
+    fn take_stdio(&mut self) -> Option<(Self::Stdin, Self::Stdout, Self::Stderr)> {
+        self.stdio.take()
+    }
+
+    // Cancel-safe: `wait_for` is.
+    async fn wait(&mut self) -> std::io::Result<Option<i32>> {
+        let status = self.status.wait_for(Option::is_some).await.map(|status| *status);
+        Ok(status.ok().flatten())
+    }
+
+    fn start_kill(&mut self) -> std::io::Result<()> {
+        self.killed.notify_one();
+        Ok(())
+    }
+}
+
+/// inbox#1302, the cut: once a write to a channel is given up part way, the
+/// bridge writes nothing more through that writer. The command's stderr
+/// write waits in a writer that keeps its bytes ([`HeldChunkChannel`]); the
+/// client's loss gives it up and the bridge kills the command. Before the
+/// command is reaped the session takes messages again, as a russh session
+/// does once the input it was stuck delivering is let go. The shutdown
+/// notice that is then due would, through that writer, send the kept 64
+/// bytes and report 64 written for its 56, and `write_all` would panic. It
+/// is not written, and nothing else is sent.
+#[tokio::test(start_paused = true)]
+async fn nothing_is_written_through_a_channel_after_a_write_to_it_was_given_up() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let (stdin_bridge, _stdin_test) = duplex(64);
+    let (stdout_bridge, _stdout_test) = duplex(64);
+    let (stderr_bridge, mut stderr_test) = duplex(1024);
+    let (status_tx, status) = tokio::sync::watch::channel(None);
+    let killed = Arc::new(tokio::sync::Notify::new());
+    let process = ExitsWhenTold {
+        stdio: Some((stdin_bridge, stdout_bridge, stderr_bridge)),
+        status,
+        killed: Arc::clone(&killed),
+    };
+    let parked = Arc::new(tokio::sync::Notify::new());
+    let (stderr_channel, session) = held_chunk_channel(&parked);
+    let (stdout_channel, _client_stdout) = duplex(64 * 1024);
+    let (_client_stdin, mut bridge_stdin) = duplex(64);
+    let (lost_tx, lost_rx) = tokio::sync::watch::channel(None);
+
+    let bridge_task = tokio::spawn(async move {
+        let mut stdout_channel = super::ChannelOut::new(stdout_channel);
+        let mut stderr_channel = super::ChannelOut::new(stderr_channel);
+        let (exit, _late) = bridge_noting_reason(
+            "test",
+            futures::stream::iter(vec![Ok(process)]),
+            &mut bridge_stdin,
+            &mut stdout_channel,
+            &mut stderr_channel,
+            lost_rx,
+            super::UnreadStdin::Keep,
+            None,
+            || true,
+        )
+        .await;
+        (exit, stderr_channel.is_cut())
+    });
+
+    stderr_test.write_all(&[b'x'; 64]).await.unwrap();
+    timeout(Duration::from_secs(10), parked.notified())
+        .await
+        .expect("the bridge's write of stderr waits on the session");
+    lost_tx.send(Some(super::ExecEnd::ClientLost)).unwrap();
+    timeout(Duration::from_secs(10), killed.notified())
+        .await
+        .expect("a client lost during the write has its command killed");
+    // The session takes messages again; then the command ends as the kill
+    // has it, 128 + SIGKILL, during a shutdown, so the shutdown notice is due.
+    session.start_taking();
+    status_tx.send(Some(137)).unwrap();
+
+    let (exit, cut) = timeout(Duration::from_secs(10), bridge_task)
+        .await
+        .expect("the exec ends once its command does")
+        .expect("the bridge must not panic on a channel it gave a write up on");
+    assert_eq!(exit, 137, "the command's own status");
+    assert!(cut, "the given-up write cut the stderr channel");
+    let sent = session.sent();
+    assert!(sent.is_empty(), "sent {:?}", String::from_utf8_lossy(&sent));
 }
 
 /// A fresh daemon count for one test (the real one is a process-wide
@@ -2586,9 +2930,11 @@ async fn an_end_while_the_command_is_starting_ends_the_exec_at_once() {
     .boxed();
     let (end_tx, end_rx) = tokio::sync::watch::channel(None);
     let (_stdin_w, mut stdin_r) = duplex(64);
-    let (mut w, _client_w) = duplex(1024);
-    let (mut e, _client_e) = duplex(1024);
+    let (w, _client_w) = duplex(1024);
+    let (e, _client_e) = duplex(1024);
     let bridged = tokio::spawn(async move {
+        let mut w = super::ChannelOut::new(w);
+        let mut e = super::ChannelOut::new(e);
         super::bridge_until_end(
             "test",
             starting,
@@ -5994,10 +6340,12 @@ impl super::Process for FailedSandbox {
 /// pass the notice on.
 #[tokio::test]
 async fn a_sandbox_failure_reaches_the_client_stderr() {
-    let (mut bridge_stdout, mut client_stdout) = duplex(64 * 1024);
-    let (mut bridge_stderr, mut client_stderr) = duplex(64 * 1024);
+    let (bridge_stdout, mut client_stdout) = duplex(64 * 1024);
+    let (bridge_stderr, mut client_stderr) = duplex(64 * 1024);
     let (client_stdin, mut stdin) = duplex(64);
     drop(client_stdin);
+    let mut bridge_stdout = super::ChannelOut::new(bridge_stdout);
+    let mut bridge_stderr = super::ChannelOut::new(bridge_stderr);
     let (status, _late) = bridge_noting_reason(
         "test",
         futures::stream::iter(vec![Ok(FailedSandbox)]),
