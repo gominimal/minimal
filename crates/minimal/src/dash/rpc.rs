@@ -558,6 +558,7 @@ pub async fn activate(
     let (created, mut row) = create_registering(
         sock,
         request.config.clone(),
+        request.spec.as_ref(),
         &mut client,
         |client, config| {
             let mut request = request.clone();
@@ -760,9 +761,11 @@ type CreateFuture<'c> = std::pin::Pin<
 /// box registers first, through the client library the CLI registers
 /// through, and the create carries the addresses the registration handed
 /// back, since the in-VM daemon refuses an own-address box with none. A
-/// box the form left unnamed that registers takes the default session
-/// entry's name, because the row is registered under the name and the
-/// daemon must give the box the same one (BOX-163). Nothing mints a name:
+/// box the form left unnamed that registers takes the name the daemon
+/// derives from the project and the entry in `spec` ([`derived_name`]),
+/// because the row is registered under the name and the daemon must give
+/// the box the same one (BOX-211). A box that does not register goes
+/// unnamed, and the daemon derives the same name. Nothing mints a name:
 /// a name that a live row or a running box holds refuses the create,
 /// naming the holder. Every failure after the row exists withdraws it,
 /// with its id.
@@ -772,6 +775,7 @@ type CreateFuture<'c> = std::pin::Pin<
 async fn create_registering<C: Send>(
     sock: &Path,
     mut config: BoxConfig,
+    spec: Option<&serde_json_lenient::Value>,
     client: &mut C,
     mut create: impl for<'c> FnMut(&'c mut C, BoxConfig) -> CreateFuture<'c>,
 ) -> anyhow::Result<(minimald_rpc::CreateSessionResponse, BoxRow)> {
@@ -781,12 +785,13 @@ async fn create_registering<C: Send>(
     let control_sock = control_sock_beside(sock);
     let registers = config.network == NetworkMode::OwnIp && vm_host_control_sock(sock).is_some();
     if registers && config.name.is_none() {
-        config.name = Some(mfile::spec::DEFAULT_SESSION_ENTRY.to_string());
+        config.name = Some(derived_name(&config, spec));
     }
     tracing::info!(
         requested_name = ?config.name,
         registers,
-        "dashboard create: the request carries only the form's name or the entry's"
+        "dashboard create: the request carries the form's name, else the \
+         derived name when the box registers, else none"
     );
     let mut row = BoxRow {
         control_sock,
@@ -839,6 +844,24 @@ async fn create_registering<C: Send>(
         Err(error) => Err(error),
         Ok(minimald_rpc::CreateSessionReply::Ok(_)) => unreachable!("a created box returned above"),
     }
+}
+
+/// The name the daemon gives a create that asks for none (BOX-211): the
+/// project root's last component and the spec's `entry`, the default
+/// entry when the spec has none. `min box start` with no `--name` gets
+/// this name from the daemon, so a box registered under it is the box the
+/// daemon names.
+fn derived_name(config: &BoxConfig, spec: Option<&serde_json_lenient::Value>) -> String {
+    let root = config
+        .project_root
+        .as_ref()
+        .unwrap_or(&config.project_path)
+        .as_str();
+    let entry = spec
+        .and_then(|spec| spec.get("entry"))
+        .and_then(serde_json_lenient::Value::as_str)
+        .filter(|entry| *entry != mfile::spec::DEFAULT_SESSION_ENTRY);
+    boxes::box_name::derived_box_name(boxes::box_name::project_name_of_root(root), entry, None)
 }
 
 /// A session the dashboard created and activated.
@@ -1076,9 +1099,9 @@ mod tests {
 
     /// T66 from the dashboard: an own-address create on a VM-backed host
     /// registers the box first, through the client library the CLI
-    /// registers through — under the default session entry's name, since
+    /// registers through — under the name derived from the project, since
     /// the form left it unnamed and the row is registered under the name,
-    /// never a minted `<dir>-<hex>` name (BOX-163) — and the
+    /// never a minted `<dir>-<hex>` name (BOX-211) — and the
     /// create carries the addresses the registration handed back, never
     /// none (the in-VM daemon refuses an own-address box with none).
     #[tokio::test]
@@ -1101,6 +1124,7 @@ mod tests {
         let (_, row) = create_registering(
             &ssh_sock,
             own_ip_config(dir.path(), None),
+            None,
             &mut sent,
             |sent, config| {
                 sent.push(config);
@@ -1119,9 +1143,8 @@ mod tests {
         };
         assert!(request.hold, "the create holds its registration as a lease");
         assert_eq!(
-            request.name,
-            mfile::spec::DEFAULT_SESSION_ENTRY,
-            "an unnamed box is registered under the entry's name, not a minted one"
+            request.name, "web-app",
+            "an unnamed box is registered under the derived name, not a minted one"
         );
 
         let [config] = sent.as_slice() else {
@@ -1177,6 +1200,7 @@ mod tests {
         create_registering(
             &ssh_sock,
             own_ip_config(dir.path(), Some("web")),
+            None,
             &mut sent,
             |sent, config| {
                 sent.push(config);
@@ -1234,6 +1258,7 @@ mod tests {
         let failed = create_registering(
             &ssh_sock,
             own_ip_config(dir.path(), Some("web")),
+            None,
             &mut (),
             |(), _config| {
                 Box::pin(async {
@@ -1283,6 +1308,7 @@ mod tests {
         let failed = create_registering(
             &ssh_sock,
             own_ip_config(dir.path(), Some("web")),
+            None,
             &mut (),
             |(), _config| -> CreateFuture<'_> {
                 panic!("no create is sent for a box that did not register")
@@ -1319,6 +1345,7 @@ mod tests {
         let (_, row) = create_registering(
             &host_dir.join("ssh.sock"),
             own_ip_config(dir.path(), None),
+            None,
             &mut sent,
             |sent, config| {
                 sent.push(config);
@@ -1651,6 +1678,167 @@ mod tests {
             2,
             "the undo's retire is sent again after the first is lost"
         );
+    }
+
+    /// BOX-211: a box created from `min dash` with the name left blank takes
+    /// the name a `min box start` with no `--name` takes in the same
+    /// project: the project name for the session entry, and
+    /// `<project>-<entry>` for a picked entry. Each create goes to a daemon
+    /// of its own, so the two names do not collide. An own-address box on
+    /// a VM-backed host registers under that name too.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dash_create_blank_name_takes_box_start_name() {
+        use minimald_rpc::{CreateSession, CreateSessionReply, ListSessions};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().join("Web_App")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join(mfile::MFILE_NAME),
+            "[sessions.default]\npackages = []\n\n[sessions.dev]\npackages = []\n",
+        )
+        .unwrap();
+        let project_path = paths::HostAbsPath::try_new(root.clone()).unwrap();
+        let blank = || {
+            let mut request = CreateSessionRequest::new(
+                String::new(),
+                project_path.clone(),
+                NetworkMode::HostNet,
+                BoxPolicy::default(),
+            );
+            request.config.name = None;
+            request
+        };
+        async fn name_on(server: &minimald::test_harness::TestServer) -> Option<String> {
+            let listed = server.connect().await.call::<ListSessions>(&()).await;
+            let [only] = listed.sessions.as_slice() else {
+                panic!("one box on the daemon: {:?}", listed.sessions);
+            };
+            only.name.clone()
+        }
+
+        for (entry, expected) in [(None, "web-app"), (Some("dev"), "web-app-dev")] {
+            // `min box start [dev]`: the plan the CLI makes, then the
+            // shared helper with the plan's options, as `activate_box`
+            // calls it.
+            let entries = crate::project_entries(&root).unwrap();
+            let start = crate::StartEntry {
+                verb: crate::StartVerb::Box,
+                entry: entry.map(str::to_owned),
+                name: None,
+                new: false,
+                detach: true,
+                overrides: crate::StartOverrideArgs::default(),
+            };
+            let crate::StartPlan::Session { options, .. } =
+                crate::plan_start(&start, &entries, false).unwrap()
+            else {
+                panic!("{entry:?} is a session entry");
+            };
+            let mut started = blank();
+            crate::put_session_entry(
+                &mut started,
+                &mut boxes::wire::request::WireContribution::default(),
+                &crate::SessionEntryCreate {
+                    dir: &root,
+                    project_root: &root,
+                    entry: options.entry.as_deref(),
+                    box_name: options.box_name.as_deref(),
+                    selected: &crate::SelectedLoadouts::default(),
+                    global: None,
+                },
+            )
+            .unwrap();
+            let start_daemon = minimald::test_harness::TestServer::new().await;
+            match start_daemon
+                .connect()
+                .await
+                .call::<CreateSession>(&started)
+                .await
+            {
+                CreateSessionReply::Ok(_) => {}
+                CreateSessionReply::Err { error, .. } => panic!("min box start: {error}"),
+            }
+
+            // The dashboard's create, with the name left blank.
+            let mut dashed = blank();
+            put_picked_entry(
+                &mut dashed,
+                &mut boxes::wire::request::WireContribution::default(),
+                &root,
+                &PickedEntry::new(entry.map(str::to_owned)),
+            )
+            .unwrap();
+            let dash_daemon = minimald::test_harness::TestServer::new().await;
+            let sock = dir.path().join("ssh.sock");
+            let _ = std::fs::remove_file(&sock);
+            dash_daemon.listen_on_uds(&sock).await;
+            let mut client = dash_daemon.connect().await;
+            let request = dashed.clone();
+            create_registering(
+                &sock,
+                dashed.config.clone(),
+                dashed.spec.as_ref(),
+                &mut client,
+                |client, config| {
+                    let mut request = request.clone();
+                    request.config = config;
+                    Box::pin(async move { Ok(client.call::<CreateSession>(&request).await) })
+                },
+            )
+            .await
+            .expect("the dashboard's create");
+
+            let start_name = name_on(&start_daemon).await;
+            assert_eq!(start_name.as_deref(), Some(expected), "{entry:?}");
+            assert_eq!(
+                name_on(&dash_daemon).await,
+                start_name,
+                "{entry:?}: the dashboard's blank-name box takes the box start name"
+            );
+
+            // An own-address box on a VM-backed host registers under it.
+            let vm_dir = tempfile::TempDir::new().unwrap();
+            let host_dir = vm_host_dir(&vm_dir);
+            let server = fake_vm_host(
+                &host_dir.join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
+                vec![minimald_rpc::BoxControlReply::Registered(
+                    minimald_rpc::RegisteredBox {
+                        switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
+                        loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
+                        box_id: minimald_rpc::BoxId::from_bytes([7; 16]),
+                        task_addresses: Vec::new(),
+                    },
+                )],
+            );
+            let mut config = dashed.config.clone();
+            config.network = NetworkMode::OwnIp;
+            let mut sent = Vec::new();
+            create_registering(
+                &host_dir.join("ssh.sock"),
+                config,
+                dashed.spec.as_ref(),
+                &mut sent,
+                |sent, config| {
+                    sent.push(config);
+                    Box::pin(async { Ok(minimald_rpc::CreateSessionReply::Ok(created())) })
+                },
+            )
+            .await
+            .expect("the registered box is created");
+            let lines = server.join().unwrap();
+            let request: minimald_rpc::BoxControlRequest =
+                serde_json_lenient::from_str(lines[0].trim()).unwrap();
+            let minimald_rpc::BoxControlRequest::Register(request) = request else {
+                panic!("a registration is carried by the register verb");
+            };
+            assert_eq!(Some(request.name.as_str()), start_name.as_deref());
+            assert_eq!(
+                sent[0].name, start_name,
+                "the create asks for the same name"
+            );
+        }
     }
 
     /// BOX-001: the dashboard's create from a form path `<root>/sub` sends
