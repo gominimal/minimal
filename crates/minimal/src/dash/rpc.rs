@@ -761,7 +761,8 @@ type CreateFuture<'c> = std::pin::Pin<
 /// box registers first, through the client library the CLI registers
 /// through, and the create carries the addresses the registration handed
 /// back, since the in-VM daemon refuses an own-address box with none. A
-/// box the form left unnamed that registers takes the name the daemon
+/// box the form left unnamed takes the entry's `[box] name`. Else, a box
+/// that registers takes the name the daemon
 /// derives from the project and the entry in `spec` ([`derived_name`]),
 /// because the row is registered under the name and the daemon must give
 /// the box the same one (BOX-211). A box that does not register goes
@@ -784,6 +785,12 @@ async fn create_registering<C: Send>(
     };
     let control_sock = control_sock_beside(sock);
     let registers = config.network == NetworkMode::OwnIp && vm_host_control_sock(sock).is_some();
+    // BOX-211: a blank form name takes the entry's `[box] name`, sent on
+    // the request whether or not the box registers. With neither, a box
+    // that registers takes the derived name.
+    if config.name.is_none() {
+        config.name = boxes::box_name::spec_box_name(spec).map(str::to_string);
+    }
     if registers && config.name.is_none() {
         config.name = Some(derived_name(&config, spec));
     }
@@ -846,22 +853,17 @@ async fn create_registering<C: Send>(
     }
 }
 
-/// The name the daemon gives a create that asks for none (BOX-211): the
-/// project root's last component and the spec's `entry`, the default
-/// entry when the spec has none. `min box start` with no `--name` gets
-/// this name from the daemon, so a box registered under it is the box the
-/// daemon names.
+/// The name the daemon gives a create that asks for none (BOX-211),
+/// through the one derivation the daemon and `min box start` call
+/// ([`boxes::box_name::create_derived_name`]). A box registered under it
+/// is the box the daemon names.
 fn derived_name(config: &BoxConfig, spec: Option<&serde_json_lenient::Value>) -> String {
     let root = config
         .project_root
         .as_ref()
         .unwrap_or(&config.project_path)
         .as_str();
-    let entry = spec
-        .and_then(|spec| spec.get("entry"))
-        .and_then(serde_json_lenient::Value::as_str)
-        .filter(|entry| *entry != mfile::spec::DEFAULT_SESSION_ENTRY);
-    boxes::box_name::derived_box_name(boxes::box_name::project_name_of_root(root), entry, None)
+    boxes::box_name::create_derived_name(root, spec, None)
 }
 
 /// A session the dashboard created and activated.
@@ -1696,7 +1698,8 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(
             root.join(mfile::MFILE_NAME),
-            "[sessions.default]\npackages = []\n\n[sessions.dev]\npackages = []\n",
+            "[sessions.default]\npackages = []\n\n[sessions.dev]\npackages = []\n\n\
+             [sessions.api]\npackages = []\n[sessions.api.box]\nname = \"api-box\"\n",
         )
         .unwrap();
         let project_path = paths::HostAbsPath::try_new(root.clone()).unwrap();
@@ -1717,7 +1720,12 @@ mod tests {
             only.name.clone()
         }
 
-        for (entry, expected) in [(None, "web-app"), (Some("dev"), "web-app-dev")] {
+        // An entry's `[box] name` names the box before the derived name.
+        for (entry, expected) in [
+            (None, "web-app"),
+            (Some("dev"), "web-app-dev"),
+            (Some("api"), "api-box"),
+        ] {
             // `min box start [dev]`: the plan the CLI makes, then the
             // shared helper with the plan's options, as `activate_box`
             // calls it.

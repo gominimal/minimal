@@ -1955,10 +1955,12 @@ pub mod box_name {
         derived_box_name(project_name_of_root(project_root), entry, instance)
     }
 
-    /// The `[box] name` a stored `spec` carries, when it carries one.
+    /// The `[box] name` a stored `spec` carries at `box.name`, when it
+    /// carries one.
     #[must_use]
     pub fn spec_box_name(spec: Option<&serde_json_lenient::Value>) -> Option<&str> {
-        spec.and_then(|spec| spec.get("name"))
+        spec.and_then(|spec| spec.get("box"))
+            .and_then(|table| table.get("name"))
             .and_then(serde_json_lenient::Value::as_str)
     }
 
@@ -3761,7 +3763,7 @@ mod tests {
 
             // The create's name: the root's last component and the spec's
             // entry, with the default entry naming the project alone.
-            let spec = |entry: &str| serde_json_lenient::json!({ "entry": entry, "name": "api" });
+            let spec = |entry: &str| serde_json_lenient::json!({ "entry": entry, "box": { "name": "api" } });
             assert_eq!(
                 create_derived_name("/home/me/web", Some(&spec("lint")), None),
                 "web-lint"

@@ -3677,24 +3677,26 @@ pub(crate) fn request_fresh_instance(request: &mut minimald_rpc::CreateSessionRe
 }
 
 /// The name the daemon gives the box `request` creates, when the create
-/// is not a fresh instance (BOX-163): the spec's `[box] name`, else the
-/// request's name, else the spec's entry as the daemon cleans it
-/// ([`boxes::box_name::entry_box_name`]). `None` for a request with no spec
-/// and no name.
+/// is not a fresh instance (BOX-211): the request's name, which carries
+/// `--name` or the spec's `[box] name`, else the name the daemon derives
+/// from the project and the spec's entry
+/// ([`boxes::box_name::create_derived_name`]). The VM host row and the box
+/// then carry one name.
 pub(crate) fn created_box_name(request: &minimald_rpc::CreateSessionRequest) -> Option<String> {
-    let spec = request.spec.as_ref().and_then(|value| {
-        serde_json_lenient::from_value::<mfile::spec::BoxSpec>(value.clone()).ok()
-    });
-    if let Some(name) = spec.as_ref().and_then(|spec| spec.name.clone()) {
-        return Some(name);
-    }
     if let Some(name) = request.config.name.clone() {
         return Some(name);
     }
-    // Only the entry is cleaned, as the daemon cleans it, so the VM host
-    // row and the box carry one name. A `[box] name` or `--name` is sent
-    // unchanged above.
-    spec.map(|spec| boxes::box_name::entry_box_name(&spec.entry))
+    let root = request
+        .config
+        .project_root
+        .as_ref()
+        .unwrap_or(&request.config.project_path)
+        .as_str();
+    Some(boxes::box_name::create_derived_name(
+        root,
+        request.spec.as_ref(),
+        None,
+    ))
 }
 
 /// The creation key a fresh-instance `host_ip` grant box registers under
@@ -3919,9 +3921,10 @@ pub(crate) fn stamp_session_spec_as(
     if let Some(entry) = entry {
         spec.entry = entry.to_string();
     }
-    if let Some(name) = name {
-        spec.name = Some(name.to_string());
-    }
+    // `--name` or the form's name, else the entry's own `[box] name`.
+    spec.name = name
+        .map(str::to_string)
+        .or_else(|| expanded.as_ref().and_then(|e| expanded_box_name(&e.spec)));
     tracing::debug!(
         entry = %spec.entry,
         lifetime = ?spec.lifetime,
@@ -3929,9 +3932,30 @@ pub(crate) fn stamp_session_spec_as(
         "built the session box's spec from its expanded entry"
     );
     match &expanded {
-        Some(expanded) => put_expanded_spec(request, &spec, &expanded.spec),
-        None => put_spec(request, &spec),
+        Some(expanded) => put_expanded_spec(request, &spec, &expanded.spec)?,
+        None => put_spec(request, &spec)?,
     }
+    // BOX-211: the daemon names a box from the request alone, so the
+    // stored spec's `[box] name` goes on the request when no `--name` or
+    // form name is already there.
+    if request.config.name.is_none() {
+        request.config.name =
+            boxes::box_name::spec_box_name(request.spec.as_ref()).map(str::to_string);
+        tracing::debug!(
+            name = ?request.config.name,
+            "the request carries the spec's [box] name, when it has one"
+        );
+    }
+    Ok(())
+}
+
+/// The `[box] name` an entry's expansion declares, when it declares one.
+pub(crate) fn expanded_box_name(expanded: &toml::Table) -> Option<String> {
+    expanded
+        .get("box")
+        .and_then(|table| table.get("name"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_string)
 }
 
 /// The session entry a create starts a box from, and what its expansion
@@ -4634,13 +4658,17 @@ pub(crate) async fn activate_box(
     let kind = daemon_host_kind(global);
     let control_sock = vm_host_control_sock(kind, global.minimal_dir.as_deref());
     // The row is registered under the name the daemon will give the box
-    // (BOX-163): `--name`, else the spec's. A live row that holds it
+    // (BOX-163): `--name`, else the spec's, else the derived name. A live row that holds it
     // refuses the registration, and the refusal ends the activation.
     let mut box_name = created_box_name(&request);
     tracing::info!(
         requested_name = ?request.config.name,
         box_name = ?box_name,
-        name_source = if request.config.name.is_some() { "--name" } else { "entry" },
+        name_source = if request.config.name.is_some() {
+            "--name or [box] name"
+        } else {
+            "project and entry"
+        },
         "creating the box under the name the daemon gives it"
     );
     // BEP-082: a fresh-instance `host_ip` grant box registers under a
