@@ -333,7 +333,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimald list_returns_every_retained_record_with_state_project_and_entry
   <!-- The `min box list` table shows the entry but not the project name or the origin; the `min/v1/box` objects carry all three (spec 28; Karl, 2026-11-23). No field says a name took a number: a trailing `-<n>` on a derived name shows it. -->
-  - WHERE a record was made before it carried a project name, an entry name or a name origin THE SYSTEM SHALL return each missing field as absent, as it returns a missing project root, in the listing and in BOX-159's read alike.
+  - WHERE a record was made before it carried a project name, an entry name or a name origin THE SYSTEM SHALL return a missing project name or entry name as absent, as it returns a missing project root, and a missing name origin as `written` (BOX-228), in the listing and in BOX-159's read alike.
     tier:   T0
     verify: cargo nextest run -p minimald legacy_record_lists_and_reads_missing_name_fields_as_absent
   - WHERE a listing is scoped to a project THE SYSTEM SHALL return only the records whose project root, as BOX-001 records it, is that project's.
@@ -381,10 +381,10 @@ After this ships, a developer on a stock install with no identity plane runs ses
     tier:   T0
     verify: cargo nextest run -p mfile non_session_default_entry_blocks_implicit_default
 
-- **BOX-229** THE SYSTEM SHALL write, as the expanded spec's top-level `entry`, the name of the entry the spec comes from: `default` for the implicit default session (BOX-165), the declared name for a session entry, and the task's name for a task.
+- **BOX-229** THE SYSTEM SHALL carry with the expanded spec that the client sends and the daemon stores, as the v0 key `entry` and outside the canonical `box.toml` bytes that BOX-145 pins, the name of the entry the spec comes from: `default` for the implicit default session (BOX-165), the declared name for a session entry, and the task's name for a task.
   tier:     T0
   verify:   cargo nextest run -p mfile expanded_spec_entry_names_its_entry
-  <!-- BOX-220 reads it, and BOX-158 and BOX-159 return it as the entry name. `box.toml` has no top-level `entry` key, and `crates/mfile/src/spec.rs` lists `entry` among the v0 keys that gominimal/minimal#2410 removes. BOX-229 binds #2410 only when gominimal/arch#195 adds `entry` to `box.toml` and the Box Spec block. -->
+  <!-- BOX-220 reads it, and BOX-158 and BOX-159 return it as the entry name. `box.toml` has no top-level `entry` key, and `crates/mfile/src/spec.rs` lists `entry` among the v0 keys that gominimal/minimal#2410 removes. BOX-229 binds #2410 only when gominimal/arch#195 adds `entry` to `box.toml` and the Box Spec block. Until then the canonical bytes and BOX-145's golden vectors do not contain it; if arch#195 adds it, the vectors are re-pinned with that change. -->
 
 - **BOX-214** THE SYSTEM SHALL take the project name from `[project] name` where the project's `minimal.toml` declares it, and otherwise from the name of the project root directory, converted as BOX-215 states.
   tier:     T0
