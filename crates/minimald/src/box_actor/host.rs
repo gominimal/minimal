@@ -2255,7 +2255,57 @@ fn stop_signal_name(signal: i32) -> &'static str {
     match signal {
         libc::SIGTERM => "SIGTERM",
         libc::SIGKILL => "SIGKILL",
+        libc::SIGHUP => "SIGHUP",
         _ => "signal",
+    }
+}
+
+/// How long a graceful stop of a box whose entrypoint is its shell waits
+/// after SIGTERM before it sends SIGHUP. An interactive shell ignores
+/// SIGTERM and ends on SIGHUP, as on a closed terminal. A shell that ends on
+/// SIGTERM inside this wait records SIGTERM.
+///
+/// Interim: the SIGHUP step is the short-term option (a) of
+/// gominimal/arch#201. It is not part of the design's stop, which is
+/// SIGTERM, the grace period, then SIGKILL. A timeout (`time_out_box`,
+/// BOX-037) uses the step too. gominimal/minimal#3741 removes it, when an
+/// init runs in front of the session shell.
+const SHELL_HUP_AFTER: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// What a box runs as its entrypoint, as a stop reads it: the stop's
+/// signals depend on it.
+///
+/// Interim: only the SIGHUP step of a stop and a timeout reads it. That
+/// step is the short-term option (a) of gominimal/arch#201, not part of the
+/// design's SIGTERM, grace period, SIGKILL stop. `time_out_box` (BOX-037)
+/// uses it too. gominimal/minimal#3741 removes the step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EntrypointKind {
+    /// The box's login shell, a session's entrypoint.
+    Shell,
+    /// A program the spec names, such as a task box's relay.
+    Program,
+}
+
+impl EntrypointKind {
+    /// The kind of entrypoint a launch of `spec` starts. A box with no
+    /// stored spec starts its shell, as the launch does.
+    pub(crate) fn of_spec(spec: Option<&mfile::spec::BoxSpec>) -> Self {
+        match spec.map(|spec| &spec.entrypoint) {
+            None | Some(mfile::spec::Entrypoint::Shell) => Self::Shell,
+            Some(mfile::spec::Entrypoint::Exec(_)) => Self::Program,
+        }
+    }
+
+    /// The kind of entrypoint of a box whose held spec is `held`. `None` is
+    /// a spec never read: that box is a `Program`, so its stop sends no
+    /// interim SIGHUP (gominimal/arch#201). `Some(None)` is a box filed with
+    /// no spec, which starts its shell.
+    pub(crate) fn of_held(held: Option<Option<&mfile::spec::BoxSpec>>) -> Self {
+        match held {
+            None => Self::Program,
+            Some(spec) => Self::of_spec(spec),
+        }
     }
 }
 
@@ -2410,15 +2460,27 @@ pub(crate) async fn stop_task_containers(
 /// kill ends the box.
 ///
 /// In a real box the entrypoint is the init of the box's PID namespace. The
-/// kernel delivers SIGTERM from the daemon's namespace to that init only
-/// when the init has a handler for it. An entrypoint without a SIGTERM
-/// handler, such as a plain shell, keeps running through the grace period.
-/// The SIGKILL then ends it, and the ending stores SIGKILL. BOX-013 asks for
-/// that order: SIGTERM, the grace period, then SIGKILL to what still runs.
+/// kernel delivers a signal from the daemon's namespace to that init only
+/// when the init has a handler for it. An interactive shell has no SIGTERM
+/// handler: it ignores SIGTERM, but it handles SIGHUP. So when `kind` is
+/// [`EntrypointKind::Shell`], a graceful stop that still finds the
+/// entrypoint running [`SHELL_HUP_AFTER`] after its SIGTERM sends SIGHUP to
+/// every process in the box. The shell then ends inside the grace period,
+/// and the ending stores SIGHUP. An entrypoint that handles neither keeps
+/// running through the grace period. The SIGKILL then ends it, and the
+/// ending stores SIGKILL. BOX-013 asks for that order: SIGTERM, the grace
+/// period, then SIGKILL to what still runs.
+///
+/// Interim: the SIGHUP step is the short-term option (a) of
+/// gominimal/arch#201. It is not part of the design's SIGTERM, grace period,
+/// SIGKILL stop. The timeout path (`time_out_box`, BOX-037) uses it too.
+/// gominimal/minimal#3741 removes it, when an init runs in front of the
+/// session shell. Then `kind` goes too.
 pub(crate) async fn stop_box_processes(
     box_id: boxes::SessionId,
     processes: Option<box_runtime::BoxProcesses>,
     mut entrypoint: JoinHandle<Result<box_runtime::HostExit, std::io::Error>>,
+    kind: EntrypointKind,
     force: bool,
     grace: std::time::Duration,
     forced: &std::sync::atomic::AtomicBool,
@@ -2449,10 +2511,23 @@ pub(crate) async fn stop_box_processes(
     } else {
         signal(libc::SIGTERM);
         sent.push(libc::SIGTERM);
-        let deadline = tokio::time::Instant::now() + grace;
+        let start = tokio::time::Instant::now();
+        let deadline = start + grace;
+        let mut hup_at = (kind == EntrypointKind::Shell).then(|| start + SHELL_HUP_AFTER);
         loop {
             if ended_after.is_none() && entrypoint.is_finished() {
-                ended_after = Some(Some(libc::SIGTERM));
+                ended_after = Some(sent.last().copied());
+            }
+            if ended_after.is_none()
+                && hup_at.is_some_and(|at| tokio::time::Instant::now() >= at && at < deadline)
+            {
+                hup_at = None;
+                tracing::info!(
+                    box_id = %box_id,
+                    "stop: the box's shell is still running after SIGTERM; sending SIGHUP"
+                );
+                signal(libc::SIGHUP);
+                sent.push(libc::SIGHUP);
             }
             if ended_after.is_some() && left() == 0 {
                 break;
@@ -2479,7 +2554,7 @@ pub(crate) async fn stop_box_processes(
         );
         if ended_after.is_none() || still_running > 0 {
             if ended_after.is_none() && entrypoint.is_finished() {
-                ended_after = Some(Some(libc::SIGTERM));
+                ended_after = Some(sent.last().copied());
             }
             signal(libc::SIGKILL);
             sent.push(libc::SIGKILL);
@@ -2575,6 +2650,16 @@ fn ending_event_data(
 }
 
 impl BoxActor {
+    /// The kind of entrypoint the box's host runs, from the spec its launch
+    /// read. A launch reads the spec before it starts a host, so a box with
+    /// a host holds it. A box whose spec was never read is a `Program`: a
+    /// stop that cannot decide sends the design's SIGTERM, grace period,
+    /// SIGKILL and no interim SIGHUP (gominimal/arch#201). A box filed with
+    /// no spec starts its shell, so it is a `Shell`.
+    fn entrypoint_kind(&self) -> EntrypointKind {
+        EntrypointKind::of_held(self.held_spec.as_ref().map(|spec| spec.as_deref()))
+    }
+
     /// Stops the box and keeps its record (BOX-013): signals every process
     /// in it, tears its host down, sets the record to `stopped` with how the
     /// entrypoint ended, and records an `exited` event. One `box.stop` span
@@ -2696,6 +2781,7 @@ impl BoxActor {
                     box_id,
                     container_pid.map(box_runtime::BoxProcesses::of_container),
                     task,
+                    self.entrypoint_kind(),
                     force,
                     grace,
                     &self.weak_self.3,
@@ -2831,6 +2917,7 @@ impl BoxActor {
                     box_id,
                     container_pid.map(box_runtime::BoxProcesses::of_container),
                     task,
+                    self.entrypoint_kind(),
                     false,
                     timeout_grace(&box_id),
                     &self.weak_self.3,

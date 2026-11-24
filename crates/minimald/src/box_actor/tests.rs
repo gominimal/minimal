@@ -14765,6 +14765,7 @@ async fn stop_sends_term_then_kill_and_records_exited_stopped_with_signal() {
         SessionId::mint(),
         Some(processes),
         entrypoint,
+        super::EntrypointKind::Program,
         false,
         Duration::from_millis(500),
         &std::sync::atomic::AtomicBool::new(false),
@@ -14836,6 +14837,94 @@ async fn stop_sends_term_then_kill_and_records_exited_stopped_with_signal() {
     assert!(!exited.data.contains_key("exit_code"));
 }
 
+/// BOX-013, #3429: a graceful stop of a box whose entrypoint is its shell
+/// reaches a shell that ignores SIGTERM. The stop sends SIGHUP after the
+/// SIGTERM, the shell ends inside the grace period, no SIGKILL is sent, and
+/// the ending records SIGHUP.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_box_stop_ends_within_grace() {
+    use boxes::core::record::StopEnding;
+
+    // An interactive shell's posture: it ignores TERM and ends on HUP.
+    let child = spawn_stand_in_box("trap '' TERM");
+    let processes = crate::box_runtime::BoxProcesses::of_container(child.id());
+    let entrypoint = stand_in_entrypoint(child);
+    let grace = Duration::from_secs(10);
+
+    let started = std::time::Instant::now();
+    let outcome = super::stop_box_processes(
+        SessionId::mint(),
+        Some(processes),
+        entrypoint,
+        super::EntrypointKind::Shell,
+        false,
+        grace,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the shell ends well inside the grace period: {elapsed:?}"
+    );
+    assert_eq!(outcome.sent, vec![libc::SIGTERM, libc::SIGHUP]);
+    assert!(!outcome.sent.contains(&libc::SIGKILL));
+    assert_eq!(
+        outcome.ending,
+        StopEnding::Signalled {
+            signal: libc::SIGHUP
+        }
+    );
+    assert!(outcome.unfinished.is_none());
+    assert!(
+        processes.pids().is_empty(),
+        "no process of the box outlives the stop"
+    );
+
+    let exited = super::stopped_event_data(outcome.ending);
+    assert_eq!(exited["reason"], "stopped");
+    assert_eq!(exited["signal"], libc::SIGHUP);
+    assert!(!exited.contains_key("exit_code"));
+}
+
+/// gominimal/arch#201: a box whose spec was never read is not taken for a
+/// shell. Its stop sends the design's SIGTERM, grace period, SIGKILL and no
+/// interim SIGHUP. A box filed with no spec still starts its shell.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unread_spec_box_stop_sends_no_sighup() {
+    use boxes::core::record::StopEnding;
+
+    assert_eq!(
+        super::EntrypointKind::of_held(Some(None)),
+        super::EntrypointKind::Shell
+    );
+    let kind = super::EntrypointKind::of_held(None);
+    assert_eq!(kind, super::EntrypointKind::Program);
+
+    // A stand-in that ignores TERM: only SIGKILL ends it.
+    let child = spawn_stand_in_box("trap '' TERM");
+    let processes = crate::box_runtime::BoxProcesses::of_container(child.id());
+    let entrypoint = stand_in_entrypoint(child);
+    let outcome = super::stop_box_processes(
+        SessionId::mint(),
+        Some(processes),
+        entrypoint,
+        kind,
+        false,
+        Duration::from_millis(1500),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .await;
+    assert_eq!(outcome.sent, vec![libc::SIGTERM, libc::SIGKILL]);
+    assert_eq!(
+        outcome.ending,
+        StopEnding::Signalled {
+            signal: libc::SIGKILL
+        }
+    );
+    assert!(processes.pids().is_empty());
+}
+
 /// BOX-013: a forced stop kills every process in the box at once, without
 /// the grace period.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -14851,6 +14940,7 @@ async fn stop_force_kills_at_once() {
         SessionId::mint(),
         Some(processes),
         entrypoint,
+        super::EntrypointKind::Program,
         true,
         Duration::from_secs(60),
         &std::sync::atomic::AtomicBool::new(false),
@@ -14897,6 +14987,7 @@ async fn stop_forced_during_a_graceful_stop_kills_at_once() {
         SessionId::mint(),
         Some(processes),
         entrypoint,
+        super::EntrypointKind::Program,
         false,
         Duration::from_secs(60),
         &forced,
@@ -14939,6 +15030,7 @@ async fn stop_records_an_entrypoint_exit_125_as_its_exit_code() {
         SessionId::mint(),
         Some(processes),
         entrypoint,
+        super::EntrypointKind::Program,
         false,
         Duration::from_secs(5),
         &std::sync::atomic::AtomicBool::new(false),
