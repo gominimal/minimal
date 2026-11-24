@@ -26388,6 +26388,65 @@ fn row_not_back_names_the_box_that_holds_the_name() {
     );
 }
 
+// D3699 (NET-156, NET-160): the references say how a box reaches a host port.
+#[test]
+fn cli_reference_says_how_a_box_reaches_the_host() {
+    let docs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/reference");
+    let minvmd = std::fs::read_to_string(docs.join("cli-minvmd.md"))
+        .expect("the minvmd reference must be readable at docs/reference/cli-minvmd.md");
+    let min = std::fs::read_to_string(docs.join("cli-min.md"))
+        .expect("the min CLI reference must be readable at docs/reference/cli-min.md");
+
+    let minvmd_flat = minvmd.split_whitespace().collect::<Vec<_>>().join(" ");
+    for stale in [
+        "refusal at every port",
+        "refused at every port",
+        "issues/2990",
+    ] {
+        assert!(
+            !minvmd_flat.contains(stale),
+            "docs/reference/cli-minvmd.md still says an own-address box is refused \
+             at every port ({stale:?})"
+        );
+    }
+    assert!(
+        minvmd_flat.contains("own-address box reaches an exposure"),
+        "docs/reference/cli-minvmd.md must say an own-address box reaches an exposure"
+    );
+
+    let paragraphs: Vec<&str> = min
+        .split("\n\n")
+        .filter(|p| p.contains("`host.min.internal` included"))
+        .collect();
+    assert!(
+        !paragraphs.is_empty(),
+        "docs/reference/cli-min.md must name host.min.internal in the egress flags section"
+    );
+    for paragraph in paragraphs {
+        assert!(
+            paragraph.contains("[host-exposures]"),
+            "the cli-min.md paragraph that names host.min.internal must name \
+             [host-exposures]: {paragraph}"
+        );
+        assert!(
+            paragraph.contains("./cli-minvmd.md"),
+            "the cli-min.md paragraph that names host.min.internal must link the minvmd page"
+        );
+        // A native host-address box shares the host's namespace, so the
+        // exposure table does not bind it (design §7.1 Lanes).
+        let flat = paragraph.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("A box on a VM host, and an own-address box on any host,"),
+            "the cli-min.md sentence on [host-exposures] must scope itself to VM hosts \
+             and own-address boxes: {flat}"
+        );
+        assert!(
+            flat.contains("host-address box on a native Linux host shares the host's network"),
+            "the cli-min.md paragraph must say what a native host-address box reaches: {flat}"
+        );
+    }
+}
+
 /// The `min box` verbs BCLI-026 names, in the architecture's order.
 const BOX_VERBS: [&str; 17] = [
     "start", "run", "list", "show", "spec", "stop", "rm", "prune", "resume", "rename", "restart",
