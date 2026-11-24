@@ -291,7 +291,19 @@ operator opt-out named below restores that earlier meaning. An
 own-address box (`--network own_ip`) gets the deny-all default when it does
 not declare egress by these flags or in the project's `minimal.toml`. It
 then reaches no external address. It can still resolve names in the box zone,
-`host.min.internal` included. `min session start` prints one line saying so:
+`host.min.internal` included. The name alone opens no port on the host. A box
+on a VM host, and an own-address box on any host, reaches the host only at a
+port that the `[host-exposures]` table in the client `config.toml` opens. An
+own-address box also needs an egress rule that names the host:
+`--allow-dns-hosts host.min.internal`, or an `--allow-subnets` range that covers
+the address of `host.min.internal` (see [minvmd](./cli-minvmd.md)). A
+host-address box on a native Linux host shares the host's network namespace. No
+switch or gate stands between it and the host, and the `[host-exposures]`
+table does not apply to it. It reaches host services directly. Where the host's
+classifier is installed, the box's own egress rules bound that reach, and a
+deny-all box reaches only the box-zone resolver. Where the classifier is not
+installed, nothing bounds it. When an own-address box gets the deny-all
+default, `min session start` prints one line that says so:
 
 ```
 This box can reach no external address: a --network own_ip box with no egress rules gets the deny-all default. To allow outbound traffic, activate a new session with --allow-subnets or --allow-dns-hosts, for example --allow-dns-hosts github.com.
@@ -431,7 +443,6 @@ box's. Each run creates a new box, named `<ENTRY>-<n>`.
 | Flag | Description |
 |------|-------------|
 | `--detach` | Start the box, print its id and return. The box gets no input |
-| `--path <PATH>` | The project directory. The default is the directory that `-C` names, else the current directory |
 | `--network <none\|host_ip\|own_ip>` | The box's network mode, as on [`task run`](#task-run) |
 
 The command also takes the egress flags, `--dynamic-ingress`,
@@ -439,7 +450,7 @@ The command also takes the egress flags, `--dynamic-ingress`,
 `--vpn-network-names`, `--no-loadouts` and `--no-hooks`, as
 [`session start`](#session-start) describes them. Put the flags before the
 entry's first argument. An argument that has the name of a flag goes after
-`--`.
+`--`. To run an entry of another project, give `-C <DIR>`.
 
 ### `box list`
 
