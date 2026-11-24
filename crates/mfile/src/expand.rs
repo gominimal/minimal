@@ -201,6 +201,48 @@ pub struct ExpansionReport {
     /// Whether the expanded entry is the implicit default session entry,
     /// which the file does not declare (BOX-165).
     pub implicit: bool,
+    /// One warning for each variable of `env_vars` whose name looks like a
+    /// secret's, in name order (BOX-231). The expansion continues, and the
+    /// spec keeps the value as written (BOX-230).
+    pub secret_name_warnings: Vec<SecretNameWarning>,
+}
+
+/// A variable of the expanded spec's `env_vars` whose name looks like a
+/// secret's (BOX-231). Its value is not a secret: the spec stores it as
+/// written (BOX-230). Only a `[secrets]` entry keeps a secret out of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretNameWarning {
+    /// The variable's name.
+    pub name: String,
+    /// The layer whose value survives the merge (BOX-180).
+    pub origin: Origin,
+    /// That layer, as a message names it.
+    pub layer: String,
+    /// The file of that layer: `minimal.toml`, or the loadout's file.
+    /// `None` for a layer that no file holds, such as a built-in type's
+    /// defaults, the built-in `default` loadout, or a command-line flag.
+    pub file: Option<std::path::PathBuf>,
+}
+
+/// The parts of a variable name that make it look like a secret's, in
+/// ASCII upper case (BOX-231).
+pub const SECRET_NAME_PARTS: [&str; 8] = [
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "API_KEY",
+    "APIKEY",
+    "PRIVATE_KEY",
+    "CREDENTIAL",
+];
+
+/// Whether `name` contains one of [`SECRET_NAME_PARTS`], without regard to
+/// ASCII case (BOX-231).
+#[must_use]
+pub fn is_secret_like_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    SECRET_NAME_PARTS.iter().any(|part| upper.contains(part))
 }
 
 /// The layers of one entry that are not in the entry's own table. Each
@@ -445,6 +487,10 @@ pub fn expand(entry: &BoxEntry, layers: &Layers) -> Result<Expansion, Error> {
     check_var_tables(entry, &ordered, loadouts)?;
     let mut expansion = fold(&ordered);
     merge_vars(entry, &ordered, &layers.host_vars, &mut expansion)?;
+    // BOX-230, BOX-231: a kept variable whose name looks like a secret's
+    // gets a warning beside the spec. The spec keeps its value as written.
+    expansion.report.secret_name_warnings =
+        secret_name_warnings(entry, &expansion.report.env_vars, loadouts);
     // BOX-071: the store references carry the client's authorities, so
     // the daemon projects the same `secret_grants` from the spec it
     // receives. The omitted values the digest binds are filled by the
@@ -1291,6 +1337,64 @@ fn merge_vars(
     expansion.spec.insert(ENV_VARS_KEY.to_owned(), value);
     report.values.insert(ENV_VARS_KEY.to_owned(), value_origin);
     Ok(())
+}
+
+/// The warnings for the kept variables of `env_vars` whose name looks like
+/// a secret's, in name order (BOX-231). Each names the layer whose value
+/// survives the merge, and that layer's file.
+fn secret_name_warnings(
+    entry: &BoxEntry,
+    kept: &BTreeMap<String, Origin>,
+    loadouts: &[LoadoutLayer],
+) -> Vec<SecretNameWarning> {
+    let warnings: Vec<SecretNameWarning> = kept
+        .iter()
+        .filter(|(name, _)| is_secret_like_name(name))
+        .map(|(name, origin)| SecretNameWarning {
+            name: name.clone(),
+            origin: origin.clone(),
+            layer: layer_words(entry, Some(origin)),
+            file: layer_file(origin, loadouts),
+        })
+        .collect();
+    if !warnings.is_empty() {
+        tracing::debug!(
+            rule = "BOX-231",
+            entry = %entry.name,
+            variables = ?warnings
+                .iter()
+                .map(|w| (w.name.as_str(), w.layer.as_str()))
+                .collect::<Vec<_>>(),
+            "env_vars names that look like a secret's"
+        );
+    }
+    warnings
+}
+
+/// The file that holds `origin`'s layer: `minimal.toml` for a layer of the
+/// project file, the loadout's file for a loadout, and `None` for a layer
+/// that no file holds.
+fn layer_file(origin: &Origin, loadouts: &[LoadoutLayer]) -> Option<std::path::PathBuf> {
+    let project = || Some(std::path::PathBuf::from(crate::MFILE_NAME));
+    match origin.layer {
+        Layer::Upstream | Layer::Defaults | Layer::DefaultsType | Layer::Entry => project(),
+        Layer::TypeDefaults => {
+            let name = origin.box_type.as_deref().unwrap_or_default();
+            if BUILTIN_BOX_TYPES.contains(&name) {
+                None
+            } else {
+                project()
+            }
+        }
+        Layer::Loadouts => {
+            let name = origin.loadout.as_deref().unwrap_or_default();
+            loadouts
+                .iter()
+                .find(|l| l.name == name)
+                .and_then(|l| l.path.clone())
+        }
+        Layer::Overrides => None,
+    }
 }
 
 /// The keys whose list is an argument vector. Order and repeats are part of
@@ -3808,6 +3912,105 @@ mod tests {
                 path.display()
             )
         );
+    }
+
+    // BOX-231: a kept variable whose name looks like a secret's gets one
+    // warning, which names the layer whose value survives and its file.
+    // The expansion continues.
+    #[test]
+    fn credential_like_env_var_name_warns() {
+        for name in [
+            "GITHUB_TOKEN",
+            "my_secret",
+            "DB_PASSWORD",
+            "Passwd",
+            "OPENAI_API_KEY",
+            "apikey",
+            "SSH_PRIVATE_KEY",
+            "AWS_CREDENTIALS",
+        ] {
+            assert!(is_secret_like_name(name), "{name}");
+        }
+        for name in ["EDITOR", "PATH", "TOKE", "API", "PRIVATE", "KEY"] {
+            assert!(!is_secret_like_name(name), "{name}");
+        }
+        let file = r#"
+            [defaults]
+            env_vars = { DB_PASSWORD = "defaults", EDITOR = "hx" }
+            [sessions.dev]
+            loadout_mode = "open"
+            env_vars = { DB_PASSWORD = "entry", api_token = "t" }
+        "#;
+        let path = std::path::PathBuf::from("/l/gh.toml");
+        let layers = Layers {
+            loadouts: vec![
+                LoadoutLayer {
+                    name: "gh".to_owned(),
+                    path: Some(path.clone()),
+                    table: table("env_vars = { GITHUB_TOKEN = \"x\" }"),
+                },
+                LoadoutLayer::new("builtin", table("env_vars = { MY_SECRET = \"s\" }")),
+            ],
+            ..Layers::default()
+        };
+        let e = expand_in(file, "dev", layers).expect("the expansion continues");
+        let got: Vec<(&str, &str, Option<&std::path::Path>)> = e
+            .report
+            .secret_name_warnings
+            .iter()
+            .map(|w| (w.name.as_str(), w.layer.as_str(), w.file.as_deref()))
+            .collect();
+        let mfile = std::path::Path::new(crate::MFILE_NAME);
+        assert_eq!(
+            got,
+            [
+                (
+                    "DB_PASSWORD",
+                    "`[sessions.dev]` in minimal.toml",
+                    Some(mfile)
+                ),
+                ("GITHUB_TOKEN", "the loadout `gh`", Some(path.as_path())),
+                ("MY_SECRET", "the loadout `builtin`", None),
+                ("api_token", "`[sessions.dev]` in minimal.toml", Some(mfile)),
+            ],
+            "the surviving layer of each flagged name, in name order"
+        );
+        assert_eq!(
+            e.report.secret_name_warnings[1].origin,
+            Origin::loadout("gh")
+        );
+        assert_eq!(
+            e.report.secret_name_warnings[0].origin,
+            Origin::of(Layer::Entry),
+            "the entry's value survives the merge, not the defaults'"
+        );
+        // A name that no flagged part matches gets no warning.
+        let plain = expand_in(
+            "[sessions.dev]\nenv_vars = { EDITOR = \"hx\" }\n",
+            "dev",
+            Layers::default(),
+        )
+        .expect("expands");
+        assert!(plain.report.secret_name_warnings.is_empty());
+    }
+
+    // BOX-230: the value that survives the merge, a loadout's literal
+    // included, is in the expanded spec as written, and the spec bytes
+    // carry it. A flagged name does not change the value.
+    #[test]
+    fn loadout_env_var_literal_stored_as_written() {
+        let file = "[sessions.dev]\nloadout_mode = \"open\"\nenv_vars = { A = \"entry\" }\n";
+        let literal = "x y=\"z\"";
+        let loadout = format!("env_vars = {{ GITHUB_TOKEN = {literal:?}, EDITOR = \"hx\" }}");
+        let e = expand_in(file, "dev", vars_layers(&loadout, &[])).expect("expands");
+        assert_eq!(e.spec["env_vars"]["GITHUB_TOKEN"].as_str(), Some(literal));
+        assert_eq!(e.spec["env_vars"]["EDITOR"].as_str(), Some("hx"));
+        assert_eq!(e.spec["env_vars"]["A"].as_str(), Some("entry"));
+        assert_eq!(e.report.env_vars["GITHUB_TOKEN"], Origin::loadout("l"));
+        assert_eq!(e.report.secret_name_warnings.len(), 1);
+        let bytes = e.spec_bytes().expect("the spec serialises");
+        let back: toml::Table = toml::from_str(&bytes).expect("the bytes parse");
+        assert_eq!(back["env_vars"]["GITHUB_TOKEN"].as_str(), Some(literal));
     }
 
     // BOX-183: a loadout that gives a set name another resolved value fails
