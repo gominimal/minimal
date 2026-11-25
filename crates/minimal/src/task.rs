@@ -260,11 +260,12 @@ pub(crate) struct TaskBoxNetwork {
 /// [`crate::effective_egress`], as an activation applies them. With no flag
 /// and no declaration, the box is a `host_ip` box with the default policy.
 /// An `own_ip` box with no egress gets the deny-all default where the box
-/// is created (NET-074), as an activation's does.
+/// is created (NET-074), as an activation's does. `--network none` clears
+/// the egress and the ingress that the file declares for the task.
 ///
 /// # Errors
 ///
-/// An invalid egress flag or project file, egress on a `none` box
+/// An invalid egress flag or project file, an egress flag on a `none` box
 /// (NET-065), and `own_ip` on a host that runs boxes in a VM.
 fn task_box_network(
     project: &camino::Utf8Path,
@@ -275,7 +276,10 @@ fn task_box_network(
     kind: paths::HostKind,
 ) -> Result<TaskBoxNetwork, anyhow::Error> {
     let flag_egress = crate::flag_egress(flags)?;
-    let project_egress = crate::task_project_egress(project, task)?;
+    let mut project_egress = crate::task_project_egress(project, task)?;
+    // BCLI-024: `--network none` clears the egress and the ingress the
+    // task's layers set, as it does for a session box.
+    crate::clear_file_network_on_none_flag(&mut project_egress, network);
     let file_policy = project_egress.policy.is_some();
     let egress = crate::effective_egress(project_egress.policy, flag_egress, flags.deny_all_egress);
     tracing::debug!(
@@ -285,7 +289,7 @@ fn task_box_network(
     );
     let (mode, mode_layer) = match (network, project_egress.mode) {
         (Some(flag), _) => (flag.into(), None),
-        (None, Some(mode)) => (mode, project_egress.layer.clone()),
+        (None, Some(mode)) => (mode, project_egress.mode_layer.clone()),
         (None, None) => (
             crate::parse_network_mode(crate::NETWORK_DEFAULT)
                 .map_err(anyhow::Error::msg)?
@@ -3359,6 +3363,73 @@ mod tests {
         );
     }
 
+    /// BCLI-024, gominimal/arch#200: `min task run --network none` clears
+    /// the egress and the ingress that the task inherits, as a session
+    /// start does, and is not refused. An egress flag on a `none` box is
+    /// still refused (NET-065).
+    #[test]
+    fn network_none_flag_drops_file_egress_and_ingress_on_task_run() {
+        let (_dir, project) = project_with(
+            "[defaults.network]\nmode = \"own_ip\"\n\
+             egress = { allow_dns_hosts = [\"a.example\"] }\n\
+             ingress = [{ port = 8080 }]\n\n\
+             [tasks.build]\nexec = 'true'\n",
+        );
+        let net = box_network(&project, "build", None, &crate::EgressArgs::default())
+            .expect("the inherited network applies");
+        assert_eq!(net.mode, boxes::NetworkMode::OwnIp);
+        assert!(net.policy.egress.is_some());
+
+        let net = box_network(
+            &project,
+            "build",
+            Some(crate::CliNetworkMode::NoNet),
+            &crate::EgressArgs::default(),
+        )
+        .expect("--network none is not refused");
+        assert_eq!(net.mode, boxes::NetworkMode::NoNet);
+        assert_eq!(net.policy.egress, None);
+        assert_eq!(net.policy.ingress, None);
+
+        let flags = crate::EgressArgs {
+            allow_dns_hosts: vec!["b.example".to_owned()],
+            ..crate::EgressArgs::default()
+        };
+        box_network(
+            &project,
+            "build",
+            Some(crate::CliNetworkMode::NoNet),
+            &flags,
+        )
+        .expect_err("an egress flag on a none box is refused");
+    }
+
+    /// gominimal/arch#188: `network.mode` and `network.egress` can come
+    /// from two tables. The own_ip refusal names the table that sets the
+    /// mode, not the table that sets the egress.
+    #[test]
+    fn task_box_network_own_ip_refusal_names_the_mode_table() {
+        let (_dir, project) = project_with(
+            "[defaults.network.egress]\nallow_dns_hosts = [\"a.example\"]\n\n\
+             [tasks.coder]\nexec = 'true'\nnetwork = { mode = \"own_ip\" }\n",
+        );
+        let error = task_box_network(
+            &project,
+            "coder",
+            RunVerb::Task,
+            None,
+            &crate::EgressArgs::default(),
+            paths::HostKind::Minvmd,
+        )
+        .expect_err("own_ip is refused on a VM host");
+        assert_eq!(
+            error.to_string(),
+            "Cannot run the task: [tasks.coder] in minimal.toml sets network.mode = \"own_ip\", \
+             which is not available to `min task run` on a host that runs boxes in a VM. Run it \
+             with --network host_ip."
+        );
+    }
+
     /// NET-060, arch#166: with no `--network`, the box takes the
     /// `network.mode` the expanded entry declares, from the task's entry or
     /// a default table. `--network` overrides it.
@@ -3706,10 +3777,11 @@ mod tests {
         );
     }
 
-    /// NET-065: a `none` box refuses egress before the daemon, in the
-    /// daemon's own words, naming each place the egress came from: the
-    /// flags, `[defaults]`, `[defaults.task]` or the task's entry. With no
-    /// egress it runs.
+    /// NET-065: a `none` box refuses an egress flag before the daemon, in
+    /// the daemon's own words, naming the flags. BCLI-024: `--network none`
+    /// clears the egress that `[defaults]`, `[defaults.task]` or the task's
+    /// entry sets, so that egress alone does not refuse. With no egress it
+    /// runs.
     #[test]
     fn task_box_network_none_refuses_egress() {
         let daemon = "egress rules need network mode own_ip or host_ip (this box is none): a \
@@ -3752,17 +3824,18 @@ mod tests {
                 "[tasks.build]",
             ),
         ] {
+            // BCLI-024: `--network none` clears the egress that {layer}
+            // sets, so the box runs with no egress.
             let (_file_dir, declared) = project_with(body);
-            assert_eq!(
-                refusal(&declared, crate::EgressArgs::default()),
-                format!(
-                    "{daemon} The box's egress rules come from {layer} in minimal.toml. Run it \
-                     with --network host_ip or --network own_ip."
-                )
-            );
-            // A flag that replaces every field the file sets still leaves
-            // the file's egress, so the file is named and dropping the flag
-            // is not offered.
+            let net = box_network(
+                &declared,
+                "build",
+                Some(crate::CliNetworkMode::NoNet),
+                &crate::EgressArgs::default(),
+            )
+            .unwrap_or_else(|e| panic!("--network none clears the egress of {layer}: {e}"));
+            assert_eq!(net.policy.egress, None, "{layer}");
+            // An egress flag is still refused, and only the flag is named.
             assert_eq!(
                 refusal(
                     &declared,
@@ -3772,8 +3845,8 @@ mod tests {
                     }
                 ),
                 format!(
-                    "{daemon} The box's egress rules come from --deny-all-egress and {layer} in \
-                     minimal.toml. Run it with --network host_ip or --network own_ip."
+                    "{daemon} The box's egress rules come from --deny-all-egress. Run it with \
+                     --network host_ip or --network own_ip, or without --deny-all-egress."
                 )
             );
         }
