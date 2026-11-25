@@ -12338,8 +12338,9 @@ mod tests {
     }
 
     /// A hand-over's failed expose is retried, and the retry that binds is
-    /// attributed. A switch that answers the listener is already bound —
-    /// an earlier try's lost answer — counts as bound.
+    /// attributed. A switch that answers the listener is already bound
+    /// counts as bound after an expose of this claim that was written and
+    /// went unanswered: that try's answer was lost.
     #[tokio::test]
     async fn a_failed_hand_over_expose_is_retried_until_it_binds() {
         static BINDS: [(&str, &str); 3] = [
@@ -12349,7 +12350,7 @@ mod tests {
         ];
         static ALREADY: [(&str, &str); 3] = [
             ("200 OK", ""),
-            ("500 Internal Server Error", "transient"),
+            NO_ANSWER,
             ("500 Internal Server Error", "proxy already running\n"),
         ];
         for answers in [&BINDS, &ALREADY] {
