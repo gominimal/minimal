@@ -373,7 +373,10 @@ After this ships, a developer on a stock install with no identity plane runs ses
 - **BOX-048** THE SYSTEM SHALL merge `[defaults]` into every entry and `[defaults.<type>]` into entries of that type, unioning lists and replacing scalars and tables with the more specific layer's, except `env_vars`, which BOX-180 merges by name, and `network`, which merges by key (gominimal/arch#188): each key below `network`, such as `mode`, `egress`, `ingress` or `bep`, comes whole from the most specific layer that sets it, and a layer that sets `mode = "none"` clears the `egress` and `ingress` that it inherits.
   tier:     T1
   verify:   cargo nextest run -p mfile defaults_merge_lists_union_scalars_replace
-  property: For every pair of layers, merging unions list values in layer order, merges `env_vars` by name with the more specific layer's value for a name both set, merges `network` by key with the more specific layer's value for a key both set, and replaces other scalars and tables with the more specific layer's.
+  verify:   cargo nextest run -p mfile network_merges_by_sub_table
+  verify:   cargo nextest run -p mfile network_merges_by_sub_table_mode_none_clears_inherited_egress_and_ingress
+  verify:   cargo nextest run -p mfile network_merges_by_sub_table_mode_none_with_own_egress_is_refused
+  property: For every run of two to four layers, merging unions list values in layer order, merges `env_vars` by name with the more specific layer's value for a name both set, merges `network` by key with the more specific layer's value for a key both set, drops the inherited `egress` and `ingress` below a layer that sets `mode = "none"`, replaces every egress key, `egress` and the flat `egress_*` keys, below a layer that sets one of them, and replaces other scalars and tables with the more specific layer's.
 
 - **BOX-049** THE SYSTEM SHALL accept per-entry keys written flat (`timeout`, `pty_enabled`, and the `[machine]` and `on_oom` keys as the resources spec (gominimal/inbox#698; BRES) defines them) and keep the meaning of `packages`, `patches`, `env_vars` and `lifecycle_hooks`.
   tier:     T0
