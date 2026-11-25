@@ -377,14 +377,17 @@ These are the [`box logs`](#box-logs), [`box stop`](#box-stop) and
 min task run [OPTIONS] <TASK> [ARGS]...
 ```
 
-Runs a task that the project's `minimal.toml` declares, in a box of its own
-named `<TASK>-<n>`. The command exits with the task's exit code. The task runs
-without a terminal. Its stdin, stdout and stderr are the command's. The box
-stays when the task ends: `min box show <TASK>-<n>` shows it and
-`min box rm <TASK>-<n>` removes it.
+Runs a task that the project's `minimal.toml` declares, in a box of its own.
+The command exits with the task's exit code. The task runs without a
+terminal. Its stdin, stdout and stderr are the command's. The box takes the
+name given with `--name`, else the task's `[box] name`. Without either, the
+box is named `<project>-<TASK>`, with `-<n>` added when a box already holds
+that name. The box stays when the task ends: `min box show <NAME>` shows it
+and `min box rm <NAME>` removes it.
 
 | Flag | Description |
 |------|-------------|
+| `--name <NAME>` | Name the box. This replaces the `[box] name` in minimal.toml |
 | `--detach` | Start the box, print its id and return. The task gets no input |
 | `--network <none\|host_ip\|own_ip>` | The box's network mode. Without the flag, the task's `network.mode`, else `host_ip` |
 
@@ -441,10 +444,13 @@ min box run [OPTIONS] <ENTRY> [ARGS]...
 
 Creates a box from an entry of the project, runs it without a terminal, and
 exits with its exit code. The command's stdin, stdout and stderr are the
-box's. Each run creates a new box, named `<ENTRY>-<n>`.
+box's. The box takes the name given with `--name`, else the entry's
+`[box] name`. Without either, the box is named `<project>-<ENTRY>`, with
+`-<n>` added when a box already holds that name.
 
 | Flag | Description |
 |------|-------------|
+| `--name <NAME>` | Name the box. This replaces the `[box] name` in minimal.toml |
 | `--detach` | Start the box, print its id and return. The box gets no input |
 | `--network <none\|host_ip\|own_ip>` | The box's network mode, as on [`task run`](#task-run) |
 

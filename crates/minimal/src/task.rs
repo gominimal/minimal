@@ -143,11 +143,10 @@ pub(crate) fn put_task_spec(
     vpn_network_names: &[String],
 ) -> Result<(), anyhow::Error> {
     if let Some(spec) = spec {
-        if let Some(expanded) = expanded
-            && spec.name.is_none()
-        {
-            spec.name = crate::expanded_box_name(expanded);
-        }
+        // BOX-211, BCLI-069: the box name goes on the request, never into
+        // the stored spec. So `--name` changes neither the spec nor its
+        // projection digest.
+        spec.name = None;
         if let Some(expanded) = expanded {
             take_expanded_exports(spec, expanded);
             // The expansion holds the names `[defaults]` and the task's
@@ -157,17 +156,21 @@ pub(crate) fn put_task_spec(
         } else {
             crate::put_spec(request, spec)?;
         }
-        // BOX-211: the daemon names a box from the request alone, so the
-        // stored spec's `[box] name` goes on the request as the fresh base.
+        // BCLI-069, BCLI-079, BCLI-080: the requested name is `--name`,
+        // which the caller put on the request, else the entry's `[box]
+        // name`, else none, and the daemon derives the name (BOX-211).
         if request.config.name.is_none() {
-            request.config.name =
-                boxes::box_name::spec_box_name(request.spec.as_ref()).map(str::to_string);
+            request.config.name = expanded.and_then(crate::expanded_box_name);
         }
-    } else {
+    } else if request.config.name.is_none() {
         // An interactive task sends no spec: the task type denies a
-        // terminal. With no spec to name it, the request carries the
-        // entry's name, cleaned as the daemon cleans a spec's entry.
+        // terminal. With no spec for the daemon to derive a name from, the
+        // request carries the entry's name, cleaned as the daemon cleans a
+        // spec's entry. That name is not written by the person, so the
+        // create is a fresh instance and takes a number when the name is
+        // taken (BCLI-070).
         request.config.name = Some(interactive_task_box_name(entry));
+        request.fresh_instance = true;
     }
     // With no spec, a `--vpn-network-names` value has no place to go, so
     // the helper refuses it rather than drop it.
@@ -729,6 +732,9 @@ pub(crate) struct RunEntry {
     pub egress: crate::EgressArgs,
     /// The rest of activate's override flags (BCLI-024, BCLI-075, BCLI-076).
     pub other: crate::BoxOverrideArgs,
+    /// `--name`: the requested name of the box (BCLI-069). `None` sends
+    /// the entry's `[box] name`, else no name.
+    pub box_name: Option<String>,
     pub args: Vec<String>,
 }
 
@@ -741,6 +747,7 @@ impl From<TaskRunArgs> for RunEntry {
             network: args.network,
             egress: args.egress,
             other: args.other,
+            box_name: args.name,
             args: args.args,
         }
     }
@@ -755,6 +762,7 @@ impl From<BoxRunArgs> for RunEntry {
             network: args.network,
             egress: args.egress,
             other: args.other,
+            box_name: args.name,
             args: args.args,
         }
     }
@@ -1624,16 +1632,17 @@ pub(crate) async fn run_entry(
     // an activation (BCLI-076): the stored spec and the expanded entry then
     // carry no hook.
     //
-    // BCLI-070, BOX-163: every run is a fresh instance. The daemon names the
-    // box `<task>-<n>` from the spec's entry, with the smallest `n` no
-    // retained box uses. The client invents no name.
+    // BCLI-069, BCLI-079, BCLI-080: the request carries `--name`, else
+    // `put_task_spec` puts the entry's `[box] name` on it, else it carries
+    // no name. The daemon numbers a derived name that is taken (BCLI-070),
+    // and refuses a written name that is taken (BOX-163).
     let mut request = minimald_rpc::CreateSessionRequest::new(
         String::new(),
         abs_path.clone(),
         box_network.mode,
         box_network.policy,
     );
-    crate::request_fresh_instance(&mut request);
+    request.config.name = args.box_name.clone();
     request.config.hooks_enabled = !args.other.no_hooks;
     // Refused by a daemon of another build before it allocates anything;
     // `None` under the skew override.
@@ -1735,7 +1744,7 @@ pub(crate) async fn run_entry(
         task = %args.entry,
         requested_name = ?request.config.name,
         fresh_instance = request.fresh_instance,
-        "creating the task box as a fresh instance"
+        "creating the task box"
     );
     let resp = client
         .oneshot_rpc::<CreateSession>(request.clone())
@@ -3168,6 +3177,7 @@ mod tests {
         };
         let args = TaskRunArgs {
             task: "deploy".into(),
+            name: None,
             network: None,
             egress: crate::EgressArgs::default(),
             other: crate::BoxOverrideArgs::default(),
@@ -3217,6 +3227,7 @@ mod tests {
         };
         let args = TaskRunArgs {
             task: "build".into(),
+            name: None,
             network: None,
             egress: crate::EgressArgs::default(),
             other: crate::BoxOverrideArgs::default(),
@@ -3274,6 +3285,7 @@ mod tests {
         };
         let args = TaskRunArgs {
             task: "build".into(),
+            name: None,
             network: None,
             egress: crate::EgressArgs::default(),
             other: crate::BoxOverrideArgs::default(),
