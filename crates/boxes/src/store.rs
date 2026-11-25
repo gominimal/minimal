@@ -1931,88 +1931,43 @@ impl DiskLoader {
     }
 }
 
-/// The refusal of a creation or resume whose name a running box holds.
+/// The refusal of a creation or resume whose name another box has: in
+/// any state for a creation (BOX-007), a running box for a resume.
 fn held_name_error(name: &str, holder: &NamedBox) -> std::io::Error {
     tracing::info!(
         name,
         holder = %holder.id,
         holder_name = %holder.name,
-        "refused a name: a running box holds it",
+        holder_state = holder.state_word(),
+        "refused a name: another box has it",
     );
     std::io::Error::new(
         AlreadyExists,
         format!(
-            "a running session named `{}` already exists (session names are \
+            "the {} session `{}` already has that name (session names are \
              case-insensitive)",
+            holder.state_word(),
             holder.name
         ),
     )
 }
 
 /// Session names that collide with infrastructure names once the daemon
-/// renders them into box names (`<name>.min.internal`): `host` is the zone's
-/// fixed host row, `local` is the legacy three-label form's host-id label,
-/// `localhost` is the loopback name, and `minimald` is the node namespace's
-/// row in the zone. Refused under ASCII case folding because box names are
-/// lower-cased. The two node-row labels are read from
-/// [`crate::core::zone_answer`] so this list cannot drift from the
-/// registries that key those rows. The last entry is `self`, the name that
-/// addresses the calling box (BOX-007): a rename to it is refused by
-/// [`crate::box_name::check_rename`] before this list is read, and a
-/// creation is refused here.
+/// renders them into box names (`<name>.min.internal`). The list is
+/// [`crate::box_name::RESERVED_NAMES`], and `self` addresses the calling
+/// box (BOX-007).
+#[cfg(test)]
 const RESERVED_SESSION_NAMES: [&str; 5] = crate::box_name::RESERVED_NAMES;
 
-/// Reject a session name that would break a downstream output contract.
-///
-/// `complete-session-str` emits one `value<TAB>description` line per session
-/// and the `min ls` table renders the name verbatim; a control character —
-/// tab or newline in particular — splits one row into several, and an empty
-/// or whitespace-padded name is useless as an addressable handle. Enforced
-/// here beside the name-collision check so both name writers (`create` for
-/// `activate --name`, `save` for `rename`) share one gate. The name must
-/// also be a single DNS label (ASCII letters, digits and `-`, 1 to 63
-/// octets, no `-` at either end) because the daemon renders it into
-/// `<name>.min.internal`. A name that parses as a session UUID is refused,
-/// because the CLI resolves a UUID before a name.
+/// Refuses a written name that breaks a naming rule (BOX-007), with the
+/// one check [`crate::box_name::check_written_name`] makes: one DNS label,
+/// not reserved, and not of box-id form. A DNS label holds no whitespace
+/// and no control character, so `complete-session-str` and the `min ls`
+/// table keep one row for each box. Both name writers (`create` for a
+/// requested name, `save` for a rename) share this gate. The error is
+/// `InvalidInput` and carries the [`crate::box_name::NameRuleRefusal`].
 fn validate_session_name(name: &str) -> Result<(), std::io::Error> {
-    let invalid = |msg: &str| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("invalid box name: {msg}"),
-        )
-    };
-    if name.trim().is_empty() {
-        return Err(invalid("must not be empty or whitespace"));
-    }
-    if name.trim() != name {
-        return Err(invalid("must not have leading or trailing whitespace"));
-    }
-    if name.chars().any(char::is_control) {
-        return Err(invalid("must not contain control characters"));
-    }
-    if let Some(reserved) = RESERVED_SESSION_NAMES
-        .iter()
-        .find(|reserved| name.eq_ignore_ascii_case(reserved))
-    {
-        return Err(invalid(&format!("`{reserved}` is reserved")));
-    }
-    // Lookups try a UUID before a name, so a UUID-shaped name would be
-    // shadowed by (or shadow) the session that id belongs to.
-    if SessionId::parse_str(name).is_ok() {
-        return Err(invalid("must not be a session id"));
-    }
-    // Session names are rendered into `<name>.min.internal` box names, so a
-    // name must be a single DNS label: ASCII letters, digits and `-`, 1 to 63
-    // octets, not starting or ending with `-`.
-    let is_ldh = |c: char| c.is_ascii_alphanumeric() || c == '-';
-    if name.len() > 63 || !name.chars().all(is_ldh) || name.starts_with('-') || name.ends_with('-')
-    {
-        return Err(invalid(
-            "must be a DNS label: ASCII letters, digits and `-`, \
-             1 to 63 characters, not starting or ending with `-`",
-        ));
-    }
-    Ok(())
+    crate::box_name::check_written_name(name).map_err(std::io::Error::from)
 }
 
 impl DiskLoader {
@@ -2055,12 +2010,11 @@ impl DiskLoader {
         }
         if let Some(name) = &record.name {
             validate_session_name(name)?;
-            // BOX-004: only a running box holds a name. A stopped or exited
-            // box keeps its name and leaves it free for this one.
-            if crate::box_name::holds_name(record.status)
-                && let Some(holder) = self.running_holder(name, None)?
-            {
-                return Err(held_name_error(name, &holder));
+            // BOX-007: a stopped or exited box keeps its name, so a new box
+            // cannot take a name that any retained record has.
+            let named = self.boxes_named(name)?;
+            if let Some(holder) = crate::box_name::name_holder(&named, name, None) {
+                return Err(held_name_error(name, holder));
             }
         }
 
@@ -2224,9 +2178,12 @@ impl Loader for DiskLoader {
         if old_name != new_name
             && let Some(name) = &new_name
         {
-            // BOX-010: a new name is refused when it is `self` or a running
-            // box on this host holds it, whatever state this box is in.
-            // Same-id same-name is a no-op, not a collision.
+            // BOX-007, BOX-010: a new name is refused when it breaks a
+            // naming rule, checked first, or when another box on this host
+            // has it in any state, whatever state this box is in. Same-id
+            // same-name is a no-op, not a collision. The gate is on an
+            // actual change, so re-saving an unchanged record (a status
+            // promotion) never re-validates a name.
             let named = self.boxes_named(name)?;
             crate::box_name::check_rename(&named, id, name).map_err(|refusal| {
                 tracing::info!(
@@ -2238,10 +2195,6 @@ impl Loader for DiskLoader {
                 );
                 std::io::Error::from(refusal)
             })?;
-            // Validate a newly-assigned name at the character level. Gate on
-            // an actual change so re-saving an unchanged record (e.g. a
-            // status promotion) never re-validates a name.
-            validate_session_name(name)?;
         } else if let Some(name) = &new_name
             && crate::box_name::holds_name(record.status)
             && self.index.ids_named(name).any(|other| other != id)
@@ -3576,14 +3529,14 @@ mod tests {
     }
 
     /// BCLI-058: the refusal of a name says box, not session, and keeps
-    /// the reason. `min box rename` reads this lead to exit 2.
+    /// the reason. `min box rename` reads this lead to exit 3.
     #[test]
     fn invalid_box_name_refusal_says_box() {
         for bad in ["My_Box", "", "dot.ted"] {
             let text = validate_session_name(bad)
                 .expect_err("the name is refused")
                 .to_string();
-            assert!(text.starts_with("invalid box name: "), "{text}");
+            assert!(crate::box_name::NameRuleRefusal::is_text(&text), "{text}");
             assert!(!text.contains("session"), "{text}");
         }
     }
@@ -3647,20 +3600,14 @@ mod tests {
             record.name = Some(name.to_string());
             let err = loader.create(record).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::InvalidInput, "create `{name}`");
-            assert!(
-                err.to_string().contains("must not be a session id"),
-                "{err}"
-            );
+            assert!(err.to_string().contains("the form of a box id"), "{err}");
         }
         assert!(loader.keys().next().is_none());
 
         let key = loader.create(sample_record()).unwrap();
         let err = loader.rename(&key, uuid.to_string()).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
-        assert!(
-            err.to_string().contains("must not be a session id"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("the form of a box id"), "{err}");
         assert_eq!(loader.find_by_name("my-session").unwrap(), Some(key));
     }
 
@@ -5358,6 +5305,28 @@ mod tests {
         ]
     }
 
+    /// Any record other than `except`, in any state, whose name folds to
+    /// `name`: the records that refuse a written name (BOX-007).
+    fn model_any_holder(loader: &DiskLoader, name: &str, except: Option<SessionId>) -> bool {
+        all_records(loader).into_iter().any(|(key, r)| {
+            Some(*key.id()) != except
+                && r.name
+                    .as_deref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        })
+    }
+
+    /// Gives the record at `key` the name `name` past every name check,
+    /// as a store written before BOX-007 can hold two boxes of one name.
+    fn force_name(loader: &mut DiskLoader, key: &DiskBoxKey, name: &str) {
+        let mut record = loader.get(key).unwrap().record;
+        record.name = Some(name.to_string());
+        let short = loader.live_short(key).unwrap();
+        loader.write_record(&short, &record).unwrap();
+        loader.index.set_name(*key.id(), record.name);
+        loader.flush_index().unwrap();
+    }
+
     /// The running record other than `except` whose name folds to `name`.
     fn model_holder(
         loader: &DiskLoader,
@@ -5399,17 +5368,17 @@ mod tests {
                 } else {
                     base.to_string()
                 };
-                let holder = model_holder(loader, &name, None);
+                // BOX-007: any retained record of the name refuses it.
+                let held = model_any_holder(loader, &name, None);
                 let got = loader.create(named(&name));
-                match holder {
-                    Some(_) => assert_eq!(
+                if held {
+                    assert_eq!(
                         got.unwrap_err().kind(),
                         ErrorKind::AlreadyExists,
-                        "a running box holds `{name}`"
-                    ),
-                    None => {
-                        got.unwrap_or_else(|e| panic!("`{name}` is free: {e}"));
-                    }
+                        "a retained box has `{name}`"
+                    );
+                } else {
+                    got.unwrap_or_else(|e| panic!("`{name}` is free: {e}"));
                 }
             }
             NameOp::Stop(i) | NameOp::Exit(i) => {
@@ -5445,7 +5414,7 @@ mod tests {
                 let new_name = NAME_POOL[n];
                 let refused = new_name == "self"
                     || (record.name.as_deref() != Some(new_name)
-                        && model_holder(loader, new_name, Some(*key.id())).is_some());
+                        && model_any_holder(loader, new_name, Some(*key.id())));
                 let got = loader.rename(&key, new_name.to_string());
                 assert_eq!(got.is_err(), refused, "rename to `{new_name}`: {got:?}");
             }
@@ -5461,9 +5430,9 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(48))]
 
-        /// BOX-004: over every sequence of create, stop, exit, resume,
-        /// rename and reap on one host, no two running boxes share a name,
-        /// and a name held only by a stopped or exited box is reusable.
+        /// BOX-004, BOX-007: over every sequence of create, stop, exit,
+        /// resume, rename and reap on one host, no two running boxes share
+        /// a name, and a written name that any retained box has is refused.
         #[test]
         fn name_unique_among_running_on_host_reusable_after_stop(
             ops in prop::collection::vec(name_op(), 1..24),
@@ -5481,9 +5450,9 @@ mod tests {
         }
     }
 
-    /// BOX-004 by example: a stopped or exited box keeps its name, and a
-    /// new box reuses it. Resuming the first while the second runs is
-    /// refused.
+    /// BOX-004, BOX-007 by example: a stopped or exited box keeps its
+    /// name, and a new box cannot take it. Once the box is reaped, the
+    /// name is free.
     #[test]
     fn name_unique_among_running_on_host_reusable_after_stop_by_example() {
         let tmp = TempDir::new().unwrap();
@@ -5493,13 +5462,32 @@ mod tests {
             loader.create(named("DEV")).unwrap_err().kind(),
             ErrorKind::AlreadyExists
         );
-        set_state(&mut loader, &first, stopped());
-        let second = loader.create(named("dev")).unwrap();
-        set_state(&mut loader, &second, exited());
-        let third = loader.create(named("dev")).unwrap();
-        for key in [&first, &second, &third] {
-            assert_eq!(loader.get(key).unwrap().record.name.as_deref(), Some("dev"));
+        for state in [stopped(), exited()] {
+            set_state(&mut loader, &first, state);
+            assert_eq!(
+                loader.create(named("dev")).unwrap_err().kind(),
+                ErrorKind::AlreadyExists
+            );
         }
+        loader.delete(&first).unwrap();
+        let second = loader.create(named("dev")).unwrap();
+        assert_eq!(
+            loader.get(&second).unwrap().record.name.as_deref(),
+            Some("dev")
+        );
+    }
+
+    /// A store written before BOX-007 can keep a stopped box and a running
+    /// box of one name. Resuming the stopped one while the other runs is
+    /// refused.
+    #[test]
+    fn resume_of_a_legacy_shared_name_is_refused_while_another_runs() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let first = loader.create(named("dev")).unwrap();
+        set_state(&mut loader, &first, stopped());
+        let second = loader.create(named("dev-2")).unwrap();
+        force_name(&mut loader, &second, "dev");
         let mut resumed = loader.get(&first).unwrap().record;
         resumed.set_state(RecordState::Running);
         let err = loader.save(&first, &resumed).unwrap_err();
@@ -5515,9 +5503,12 @@ mod tests {
         let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
         assert_eq!(loader.find_by_name("dev").unwrap(), None);
 
+        // BOX-007 keeps a store from filing two boxes of one name, but a
+        // store written before it can hold them.
         let older = loader.create(named("dev")).unwrap();
         set_state(&mut loader, &older, stopped());
-        let newer = loader.create(named("dev")).unwrap();
+        let newer = loader.create(named("newer")).unwrap();
+        force_name(&mut loader, &newer, "dev");
         // The newer box runs: it answers.
         assert_eq!(loader.find_by_name("dev").unwrap(), Some(newer.clone()));
 
@@ -5533,7 +5524,8 @@ mod tests {
 
         // A stopped `Dev` does not hide a running `dev`: case folds
         // first, and the running box answers for either case.
-        let upper = loader.create(named("Dev")).unwrap();
+        let upper = loader.create(named("upper")).unwrap();
+        force_name(&mut loader, &upper, "Dev");
         set_state(&mut loader, &upper, stopped());
         set_state(&mut loader, &older, RecordState::Running);
         assert_eq!(loader.find_by_name("Dev").unwrap(), Some(older.clone()));
@@ -5723,10 +5715,10 @@ mod tests {
         }
     }
 
-    /// BOX-010: a rename to a name a running box on the host holds, or to
-    /// `self`, is refused with exit 2, naming the holder or `self`. The
-    /// box, its name and its events stay as they were. A name only a
-    /// stopped box keeps is free.
+    /// BOX-007, BOX-010: a rename to a name another box on the host has,
+    /// in any state, is refused with exit 2, naming the holder. A rename
+    /// to `self` is refused with exit 3. The box, its name and its events
+    /// stay as they were.
     #[test]
     fn rename_to_running_held_name_or_self_refused_exit2_names_holder() {
         let tmp = TempDir::new().unwrap();
@@ -5751,10 +5743,11 @@ mod tests {
             assert_eq!(refusal.exit_code(), 2);
             assert_eq!(
                 refusal,
-                &crate::box_name::RenameRefusal::HeldByRunning {
+                &crate::box_name::RenameRefusal::Held {
                     name: new_name.to_string(),
                     holder: *holder.id(),
                     holder_name: "dev".to_string(),
+                    state: "running",
                 }
             );
             let text = err.to_string();
@@ -5770,8 +5763,12 @@ mod tests {
                 .get_ref()
                 .and_then(|e| e.downcast_ref::<crate::box_name::RenameRefusal>())
                 .expect("the refusal travels in the error");
-            assert_eq!(refusal, &crate::box_name::RenameRefusal::Reserved);
-            assert_eq!(refusal.exit_code(), 2);
+            assert!(
+                matches!(refusal, crate::box_name::RenameRefusal::NameRule(_)),
+                "{refusal:?}"
+            );
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert_eq!(refusal.exit_code(), 3);
             assert!(err.to_string().contains("`self`"), "{err}");
         }
 
@@ -5779,9 +5776,46 @@ mod tests {
         assert_eq!(all_records(&loader), records_before);
         assert_eq!(events_of(&loader, &renamed), events_before);
 
-        // A name only a stopped box keeps is free.
-        loader.rename(&renamed, "api".to_string()).unwrap();
-        assert_eq!(loader.find_by_name("api").unwrap(), Some(renamed));
+        // A name only a stopped box keeps is not free either.
+        let err = loader.rename(&renamed, "API".to_string()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(
+            err.get_ref()
+                .and_then(|e| e.downcast_ref::<crate::box_name::RenameRefusal>()),
+            Some(&crate::box_name::RenameRefusal::Held {
+                name: "API".to_string(),
+                holder: *retained.id(),
+                holder_name: "api".to_string(),
+                state: "stopped",
+            })
+        );
+        assert_eq!(all_records(&loader), records_before);
+    }
+
+    /// BOX-007: a create refuses a written name that a stopped or exited
+    /// box keeps, under any case, and files nothing.
+    #[test]
+    fn create_refuses_a_written_name_a_stopped_box_has() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let kept = loader.create(named("api")).unwrap();
+        for state in [stopped(), RecordState::Running] {
+            set_state(&mut loader, &kept, state);
+            let before = all_records(&loader);
+            let err = loader.create(named("Api")).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::AlreadyExists, "{err}");
+            assert!(err.to_string().contains("`api`"), "{err}");
+            assert_eq!(all_records(&loader), before);
+        }
+        // A bad name is refused before any record is read.
+        let err = loader.create(named("self")).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.get_ref()
+                .and_then(|e| e.downcast_ref::<crate::box_name::NameRuleRefusal>())
+                .is_some(),
+            "{err}"
+        );
     }
 
     /// One operation on box ids for `nothing_keys_on_box_name`.
