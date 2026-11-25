@@ -3777,10 +3777,11 @@ mod tests {
         );
     }
 
-    /// NET-065: a `none` box refuses egress before the daemon, in the
-    /// daemon's own words, naming each place the egress came from: the
-    /// flags, `[defaults]`, `[defaults.task]` or the task's entry. With no
-    /// egress it runs.
+    /// NET-065: a `none` box refuses an egress flag before the daemon, in
+    /// the daemon's own words, naming the flags. BCLI-024: `--network none`
+    /// clears the egress that `[defaults]`, `[defaults.task]` or the task's
+    /// entry sets, so that egress alone does not refuse. With no egress it
+    /// runs.
     #[test]
     fn task_box_network_none_refuses_egress() {
         let daemon = "egress rules need network mode own_ip or host_ip (this box is none): a \
@@ -3823,17 +3824,18 @@ mod tests {
                 "[tasks.build]",
             ),
         ] {
+            // BCLI-024: `--network none` clears the egress that {layer}
+            // sets, so the box runs with no egress.
             let (_file_dir, declared) = project_with(body);
-            assert_eq!(
-                refusal(&declared, crate::EgressArgs::default()),
-                format!(
-                    "{daemon} The box's egress rules come from {layer} in minimal.toml. Run it \
-                     with --network host_ip or --network own_ip."
-                )
-            );
-            // A flag that replaces every field the file sets still leaves
-            // the file's egress, so the file is named and dropping the flag
-            // is not offered.
+            let net = box_network(
+                &declared,
+                "build",
+                Some(crate::CliNetworkMode::NoNet),
+                &crate::EgressArgs::default(),
+            )
+            .unwrap_or_else(|e| panic!("--network none clears the egress of {layer}: {e}"));
+            assert_eq!(net.policy.egress, None, "{layer}");
+            // An egress flag is still refused, and only the flag is named.
             assert_eq!(
                 refusal(
                     &declared,
@@ -3843,8 +3845,8 @@ mod tests {
                     }
                 ),
                 format!(
-                    "{daemon} The box's egress rules come from --deny-all-egress and {layer} in \
-                     minimal.toml. Run it with --network host_ip or --network own_ip."
+                    "{daemon} The box's egress rules come from --deny-all-egress. Run it with \
+                     --network host_ip or --network own_ip, or without --deny-all-egress."
                 )
             );
         }
