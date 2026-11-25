@@ -16686,6 +16686,78 @@ async fn resume_concurrent_same_name_runs_exactly_one() {
     );
 }
 
+/// BOX-007, BOX-163: a store written before the name rule can hold two
+/// boxes of one name. A daemon that opens it acts on each box by id: each
+/// resumes and stops, each is removed, and a rename to a free name goes
+/// through. A third box cannot take the name, as the rule refuses it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upgraded_store_with_two_boxes_of_one_name_acts_by_id() {
+    use minimald_rpc::{
+        CreateSession, CreateSessionReply, Errorable, HeldNameRefusal, RenameSession,
+        RenameSessionRequest, RenameSessionResponse,
+    };
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let mut ids = Vec::new();
+    for (name, project) in [("pair", "/a/pair"), ("pair-b", "/b/pair")] {
+        let id =
+            create_session_with_spec(&mut client, Some(name), project, Some(resume_spec(true)))
+                .await;
+        stop_through_daemon(&server, id).await;
+        ids.push(id);
+    }
+    let (first, second) = (ids[0], ids[1]);
+    let server = restart_renaming(server, client, second, "pair").await;
+    let mut client = server.connect().await;
+    for id in [first, second] {
+        assert_eq!(read_record(&server, id).await.name.as_deref(), Some("pair"));
+    }
+
+    // (a) Each box resumes and stops by id, one at a time.
+    for id in [first, second] {
+        attach_and_echo(&mut client, id)
+            .await
+            .unwrap_or_else(|out| panic!("{id} resumes by id: {out:?}"));
+        stop_through_daemon(&server, id).await;
+    }
+
+    // (c) A third box cannot take the name either box has.
+    let req = crate::test_harness::create_session_req("pair", "/c/pair");
+    match client.call::<CreateSession>(&req).await {
+        CreateSessionReply::Err { error, .. } => {
+            let refusal = HeldNameRefusal::from_error(&error)
+                .unwrap_or_else(|| panic!("a held-name refusal: {error}"));
+            assert_eq!(refusal.name, "pair");
+            assert_eq!(HeldNameRefusal::EXIT_CODE, 2);
+        }
+        CreateSessionReply::Ok(created) => panic!("a held name is taken: {created:?}"),
+    }
+
+    // (d) The box whose name came from the rewritten record goes first,
+    // while the other still has the name.
+    destroy_session(&mut client, second).await;
+    let manager = server.state.sessions_manager().await;
+    let gone = manager.get_record(crate::box_manager::BoxKeyPredicate::Id(second));
+    assert!(gone.await.unwrap().is_none(), "the second box is removed");
+
+    // (b) The other box renames to a free name, and is then removed.
+    let resp = client
+        .call::<RenameSession>(&RenameSessionRequest {
+            id: first,
+            new_name: "pair-a".to_string(),
+        })
+        .await;
+    assert_eq!(resp, Errorable::Ok(RenameSessionResponse));
+    assert_eq!(
+        read_record(&server, first).await.name.as_deref(),
+        Some("pair-a")
+    );
+    destroy_session(&mut client, first).await;
+    let gone = manager.get_record(crate::box_manager::BoxKeyPredicate::Id(first));
+    assert!(gone.await.unwrap().is_none(), "the first box is removed");
+}
+
 /// BOX-025: a record the name check cannot read can belong to a running
 /// box that holds the name, so the resume is refused and the box stays
 /// stopped.
