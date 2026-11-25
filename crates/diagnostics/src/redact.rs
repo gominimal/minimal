@@ -550,7 +550,8 @@ pub fn scrub_argv<S: AsRef<str>>(argv: &[S]) -> Vec<Cow<'_, str>> {
 ///   and its value is everything after the first such `=`. So
 ///   `-password=two words`, `-Dpassword=x`, `db.password=x` and
 ///   `--env=API_TOKEN=x` are assignments, and a URL, a path, a header or a
-///   shell line is not.
+///   shell line is not. The name it keeps goes to [`scrub_secrets`], so a
+///   known token in it is masked too.
 /// - Any other element goes to [`scrub_secrets`] whole, which masks the
 ///   userinfo of a URL, a header value and the known token shapes in it.
 ///
@@ -601,7 +602,8 @@ fn is_redaction_placeholder(s: &str) -> bool {
 }
 
 /// `name=<redacted:len=N>` when `arg` is an assignment under a sensitive
-/// name, as [`scrub_argv_element`] states the rule; `None` otherwise.
+/// name, as [`scrub_argv_element`] states the rule, with `name` scrubbed by
+/// [`scrub_secrets`]; `None` otherwise.
 fn scrub_sensitive_assignment(arg: &str) -> Option<String> {
     for (at, _) in arg.match_indices('=') {
         let (name, rest) = arg.split_at(at);
@@ -616,6 +618,11 @@ fn scrub_sensitive_assignment(arg: &str) -> Option<String> {
         if value.is_empty() || is_redaction_placeholder(value) {
             return None;
         }
+        // The name is kept, so it is scrubbed as any other text is: a known
+        // token before the sensitive key (`--set=note=<token>,db.password`)
+        // is masked. No shorter name ending at an `=` is sensitive, so this
+        // finds no key-value pair in it and the value mask stays the only one.
+        let name = scrub_secrets(name);
         return Some(format!("{name}=<redacted:len={}>", value.len()));
     }
     None
@@ -1598,6 +1605,27 @@ mod tests {
             ),
         ] {
             assert_eq!(scrub_argv_element(false, arg), masked, "{arg}");
+        }
+    }
+
+    /// The name a masked assignment keeps is scrubbed as any other text: a
+    /// known token in it is masked, the value is still masked whole, and a
+    /// name with no token is kept as it is. Scrubbing twice equals once.
+    #[test]
+    fn scrub_argv_element_scrubs_the_name_an_assignment_keeps() {
+        for (arg, masked) in [
+            (
+                "--set=note=ghp_EXAMPLE,db.password=hunter2",
+                "--set=note=<redacted:len=23>=<redacted:len=7>",
+            ),
+            ("--set=note=ghp_FAKE0123", "--set=note=<redacted:len=12>"),
+            ("API_TOKEN=a b", "API_TOKEN=<redacted:len=3>"),
+            ("--env=API_TOKEN=a b", "--env=API_TOKEN=<redacted:len=3>"),
+            ("db.password=hunter2", "db.password=<redacted:len=7>"),
+        ] {
+            let once = scrub_argv_element(false, arg);
+            assert_eq!(once, masked, "{arg}");
+            assert_eq!(scrub_argv_element(false, &once), once, "{arg}");
         }
     }
 
