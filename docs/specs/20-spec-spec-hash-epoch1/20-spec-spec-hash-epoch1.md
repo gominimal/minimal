@@ -6,7 +6,7 @@ owner: bryan-minimal
 epic: gominimal/inbox#583
 arch: https://github.com/gominimal/arch/blob/15b603e6afb8dd2ebf6fc15f2ec1cac1fb57a0ec/architecture.md#d31--the-build-spec-hash-keyspace-contract-and-epochs
 arch_sha: "15b603e6afb8dd2ebf6fc15f2ec1cac1fb57a0ec"
-updated: 2026-11-11
+updated: 2026-11-24
 ---
 
 # EPOCH — spec-hash epoch 1: an injective, machine-checked BuildSpec encoding
@@ -40,7 +40,9 @@ a set and every number takes its normal form (EPOCH-002, EPOCH-006). A
 spec's `tests` are outside its canonical form (EPOCH-010). An **edge** of a
 spec is identified by the epoch-1 key of the dependency it names and by the
 dependency's kind. An edge that names a subset also has the set of output
-names it selects. A spec's edges enter its encoding as a set ordered by
+names it selects. Inside a cycle no member has a key before the others, so
+there an edge names its target by the target's member digest instead
+(EPOCH-026). A spec's edges enter its encoding as a set ordered by
 those bytes, so neither the order a recipe lists them in nor a repeated
 listing is part of the canonical form. A **container's canonical form** is
 the container field list below. Its members enter it as the set of their
@@ -55,10 +57,35 @@ elements in any list, set or map, at most 8 bytes in any string, and up to 3
 arbitrary 32-byte member keys. A **bounded subset** has up to 3
 components, each an arbitrary 32-byte spec key with up to 3 output names
 of at most 8 bytes. Edges, members and components enter an encoding as
-keys.
+keys, and an edge inside a cycle as its target's member digest.
 So a harness ranges over the key bytes, never runs the hash symbolically,
 and has no dependency depth to bound. Harnesses that are exhaustive over
-bounded specs, subsets or containers state nothing beyond that domain.
+bounded specs, subsets, containers or cycle records state nothing beyond
+that domain.
+
+A **cycle** is a set of specs in which each spec depends on each other one,
+directly or through other specs, by build-input and runtime-dependency
+edges. A spec with such an edge to itself is on a cycle too. A
+replace-on-cycle edge never makes a cycle. A spec on a cycle is a
+**member** of it. An edge whose target is a member of the same cycle is
+**inside** the cycle, a self edge included, and every other edge
+**leaves** it. Two specs **mean the same** when unfolding their edges gives
+the same tree: their canonical fields are identical, and their edges pair
+up by kind and output set with edges to specs that mean the same. A
+member's **member digest** is the hash of its canonical fields and of the
+edges that leave its cycle (EPOCH-026). A **cycle record** is the set of
+its members' entries. An entry is a member digest and that member's edges
+inside the cycle, each as its kind, its output set and the member digest of
+its target. A **canonical cycle record** holds each of those sets ordered
+by its bytes, and cycle records with different canonical forms are
+canonically distinct. A **bounded cycle record** has up to 3 entries, each
+an arbitrary 32-byte member digest with up to 3 inside edges, and each edge
+has up to 3 output names of at most 8 bytes and an arbitrary 32-byte
+target digest. A member that has build steps has two builds. Its **first
+build** is used only to make the builds of its cycle, and its **final
+build** is the built package its key finds (gominimal/arch#183, build §7).
+A spec's **`replace_on_cycle` spec** is the spec its replace-on-cycle
+edge names, inline or by reference.
 The **epoch-1 context** is the Blake3 `derive_key` context string
 `minimal.dev spec-hash epoch 1`.
 
@@ -255,11 +282,12 @@ build-infra operator. Release manager.
     has no harness, since there is no width to vary
 
 - **EPOCH-005** THE SYSTEM SHALL derive an epoch-1 spec key under the
-  epoch-1 context, 32 bytes wide.
+  epoch-1 context, 32 bytes wide. A spec on no cycle is keyed from its own
+  encoding; a member of a cycle is keyed with its cycle (EPOCH-026).
   tier:     T1
   verify:   cargo nextest run -p graph epoch1_domain_separation_and_width
-  property: for all specs s: hash_1(s) == blake3_derive_key(epoch-1 context,
-    encode(s)), and len(hash_1(s)) == 32
+  property: for all specs s on no cycle: hash_1(s) ==
+    blake3_derive_key(epoch-1 context, encode(s)), and len(hash_1(s)) == 32
 
 - **EPOCH-006** WHEN the system encodes a number THE SYSTEM SHALL normalize
   negative zero to zero.
@@ -492,6 +520,132 @@ build-infra operator. Release manager.
   harness:  kani_epoch1_subset_roundtrip_bounded, exhaustive over bounded
     subsets, unwind 33
 
+- **EPOCH-025** WHEN the system keys a graph THE SYSTEM SHALL first make
+  specs that mean the same one node, so equivalent closures give one
+  preimage and one meaning has one key.
+  tier:     T0
+  verify:   cargo nextest run -p graph epoch1_equal_meaning_is_one_node
+
+- **EPOCH-026** WHEN the system keys a member of a cycle THE SYSTEM SHALL
+  key the cycle as one unit. The member digest is derived under the epoch-1
+  context from the member's canonical fields and its edges that leave the
+  cycle, each as its kind, its output set and its target's key. The cycle
+  key is derived under the epoch-1 context from the cycle's canonical
+  record. The member's key is derived under the epoch-1 context from the
+  cycle key and the member digest, 32 bytes wide. No root, traversal order,
+  index or recipe order enters any of the three.
+  tier:     T1
+  verify:   cargo nextest run -p graph epoch1_cycle_member_key_derivation
+  property: for all cycles C, members m of C: digest(m) ==
+    blake3_derive_key(epoch-1 context, encode_digest(m)), key(m) ==
+    blake3_derive_key(epoch-1 context, encode_member(blake3_derive_key(
+    epoch-1 context, encode(record(C))), digest(m))), and len(key(m)) == 32
+  - IF two members of one cycle have the same member digest after the
+    merge (EPOCH-025) THEN THE SYSTEM SHALL refuse the graph with an error
+    that names both members and where each is declared.
+    tier:   T0
+    verify: cargo nextest run -p graph epoch1_cycle_tie_is_refused
+
+- **EPOCH-027** THE SYSTEM SHALL encode canonically distinct cycle records
+  to distinct byte strings.
+  tier:     T2
+  verify:   cargo nextest run -p graph epoch1_cycle_injectivity_bounded
+  property: for all canonical cycle records a, b: a != b implies
+    encode(a) != encode(b)
+  harness:  kani_epoch1_cycle_injectivity_bounded, exhaustive over bounded
+    cycle records (up to 3 entries, each an arbitrary 32-byte member digest
+    with up to 3 inside edges, each edge with up to 3 output names of at
+    most 8 bytes and an arbitrary 32-byte target digest), unwind 33 (the
+    32-byte digest loop; output names need less)
+
+- **EPOCH-028** THE SYSTEM SHALL decode every epoch-1 cycle record
+  encoding back to the canonical form of the cycle record it encodes.
+  tier:     T2
+  verify:   cargo nextest run -p graph epoch1_cycle_roundtrip_bounded
+  property: for all bounded cycle records r: decode(encode(r)) == canon(r)
+  harness:  kani_epoch1_cycle_roundtrip_bounded, exhaustive over bounded
+    cycle records, unwind 33
+
+- **EPOCH-029** WHEN a permutation reorders the specs of a graph or the
+  edge list of a spec, or the computation starts from a different spec,
+  THE SYSTEM SHALL produce an identical key for every spec of the graph,
+  each member of a cycle included.
+  tier:     T1
+  verify:   cargo nextest run -p graph epoch1_cycle_keys_ignore_order_and_root
+  property: for all graphs g, permutations p of g's specs and of each
+    spec's edge list, specs r and r' of g, specs s of g:
+    key_{g,r}(s) == key_{p(g),r}(s) == key_{g,r'}(s)
+
+- **EPOCH-030** THE SYSTEM SHALL begin the encoding of a member digest, a
+  cycle record, a member key and a first-build key each with a tag of its
+  own, distinct from each other and from the three leading tags of
+  EPOCH-022, so no value of one of these kinds is a value of another kind
+  under the one epoch-1 context.
+  tier:     T1
+  verify:   cargo nextest run -p graph epoch1_cycle_kinds_lead_with_distinct_tags
+  property: the leading tags of the encodings of a spec, a subset, a
+    container, a member digest, a cycle record, a member key and a
+    first-build key are pairwise distinct
+
+- **EPOCH-031** WHEN the system makes the first build of a member THE
+  SYSTEM SHALL give it, for each dependency on a member of the same cycle,
+  that member's `replace_on_cycle` spec, or that member's first build where
+  it has no `replace_on_cycle` spec. The rule holds at each depth of the
+  closure of the build box and for a member that depends on itself.
+  tier:     T0
+  verify:   cargo nextest run -p graph epoch1_first_build_takes_replace_on_cycle_specs
+  - WHERE a member has no build steps THE SYSTEM SHALL build it once and
+    use that build as both its first build and its final build.
+    tier:   T0
+    verify: cargo nextest run -p graph epoch1_member_without_build_steps_builds_once
+
+- **EPOCH-032** WHEN the system makes the final build of a member THE
+  SYSTEM SHALL give it the first build of each dependency on a member of
+  the same cycle, itself included, and never a final build of a member of
+  that cycle.
+  tier:     T0
+  verify:   cargo nextest run -p graph epoch1_final_build_takes_first_builds
+
+- **EPOCH-033** WHEN the system stores or finds the first build of a member
+  THE SYSTEM SHALL use the member's first-build key, derived under the
+  epoch-1 context from the member's key alone, 32 bytes wide, and distinct
+  from the member's key.
+  tier:     T1
+  verify:   cargo nextest run -p graph epoch1_first_build_key_derivation
+  property: for all members m: first_key(m) == blake3_derive_key(epoch-1
+    context, encode_first(key(m))), len(first_key(m)) == 32, and
+    encode_first(key(m)) leads with the first-build tag (EPOCH-030), so
+    first_key(m) != key(m) except through a Blake3 collision
+
+- **EPOCH-034** THE SYSTEM SHALL put a first build in no box but the build
+  box of a member of its own cycle.
+  tier:     T0
+  verify:   cargo nextest run -p graph epoch1_first_build_held_only_by_its_cycle
+  - THE SYSTEM SHALL seal no Registry Cache Index record for a first
+    build, so no catalog lists it and no lookup by a spec key finds it.
+    tier:   T0
+    verify: cargo nextest run -p rcache a_first_build_is_never_indexed
+
+- **EPOCH-035** WHEN the system loads an inline `replace_on_cycle` spec THE
+  SYSTEM SHALL take each of its dependencies on a package to mean that
+  package's `replace_on_cycle` spec, for the inline spec's key and for its
+  build.
+  tier:     T0
+  verify:   cargo nextest run -p graph epoch1_inline_spec_deps_are_replace_on_cycle_specs
+  - IF an inline `replace_on_cycle` spec names a package that has no
+    `replace_on_cycle` spec THEN THE SYSTEM SHALL refuse the graph at load
+    with an error that names that package.
+    tier:   T0
+    verify: cargo nextest run -p graph epoch1_inline_spec_naming_a_package_without_one_is_refused
+
+- **EPOCH-036** IF a package of a cycle names an output of a package of the
+  same cycle, and that package's `replace_on_cycle` spec does not have the
+  output, THEN THE SYSTEM SHALL refuse the graph at load with an error that
+  names the missing output, the package whose `replace_on_cycle` spec
+  lacks it and the package that names it.
+  tier:     T0
+  verify:   cargo nextest run -p graph epoch1_missing_replace_on_cycle_output_is_refused
+
 ## Non-goals
 
 - Changing the hash's size or algorithm: the interaction inventory in the
@@ -517,6 +671,15 @@ build-infra operator. Release manager.
   epoch 0 by a minimum accepted epoch in the trust root:
   gominimal/arch#157. This spec defines the encoding those attestations
   key on.
+- The provenance of a first build, its mark in the `resolvedDependencies`
+  of a final build, and the release gate's acceptance of a first build by
+  its provenance with no Package VSA: gominimal/build-servers, under
+  gominimal/arch#183 (decisions D-29). This spec fixes the key those
+  records name a first build by (EPOCH-033).
+- Counting which members of the package graph's cycle build with the
+  `replace_on_cycle` specs alone, and changing the packages that do not:
+  gominimal/pkgs, under gominimal/arch#183 (OQ-54). EPOCH-031 is the rule
+  that count measures against.
 
 ## Design reasoning
 
@@ -553,10 +716,11 @@ in the formal-verification path.
 D3.1 has four commitments, and each maps to requirements:
 
 - injective over the closure's meaning: EPOCH-001, EPOCH-002, EPOCH-004,
-  EPOCH-013, EPOCH-023 and, across kinds, EPOCH-022
+  EPOCH-013, EPOCH-023, on a cycle EPOCH-025, EPOCH-027 and EPOCH-029,
+  and, across kinds, EPOCH-022 and EPOCH-030
 - epochs by domain-separated context at a fixed 32 bytes, declared by the
   index and followed by consumers: EPOCH-005, EPOCH-009, EPOCH-012,
-  EPOCH-014, EPOCH-015 and EPOCH-019
+  EPOCH-014, EPOCH-015, EPOCH-019, EPOCH-026 and EPOCH-033
 - keyspace rotation as a migration class: the Rollout section and the
   migration non-goal
 - additive evolution, with an unknown tag as a hard error: EPOCH-007 and
@@ -649,6 +813,78 @@ epoch-1 keys, doubles every index. It also makes the epoch a per-record
 question for the whole overlap, which EPOCH-009's one-epoch-per-index rule
 exists to avoid.
 
+An edge enters a spec's encoding as its target's key, and on a cycle no
+member has a key before the others. Epoch 0 numbered specs in the order a
+walk found them, which put the root of the walk into the hash. The
+architecture keeps cycles in the hash ("The hash covers the closure of
+specs as today, cycles included", gominimal/arch#183, build §7) and asks
+this spec for "the encoding of a cycle as one unit" with no root in it
+(decisions D-29). EPOCH-026 splits what a member is from how the members
+connect. The member digest holds the member's own fields and the edges
+that leave the cycle, whose keys exist already because the system keys
+the graph from the bottom up. The cycle record holds every member's
+digest and its edges inside the cycle, which name their targets by
+digest. A member's key binds the cycle key to its own digest. Nothing in
+any of the three is a position, so reordering the graph or starting from
+another spec gives the same bytes (EPOCH-029). A change to one member
+changes the key of every member and of every spec above the cycle, as
+epoch 0 does. The cycle record is a set of entries, as a container is a
+set of members, so its injectivity and round-trip harnesses take the
+container's form (EPOCH-027, EPOCH-028). Each of the new encodings leads
+with a tag of its own (EPOCH-030), so no encoding of a member digest or a
+cycle record is the encoding of a spec, and the injectivity requirements compose
+across all seven kinds as they do across three under EPOCH-022.
+
+The merge comes first (EPOCH-025) because D3.1 asks for one preimage per
+meaning. Without it, a copy of a member that sits outside the cycle gets a
+second key, and a closure that holds both would trip the architecture's
+refusal of two builds of one package (D-29) falsely. After the merge, two
+members with one digest differ only in their edges inside the cycle, and
+those edges name targets by digest, so the encoding has nothing to order
+the two by. The name is a canonical field, so such a pair is two specs of
+one name on one cycle, which the architecture refuses in a closure
+anyway. The refusal names where each is declared because the two names
+are equal.
+
+A member is built twice so that the inputs of each build are a function of
+the specs (D-29). The owner ruled on what stands in during a first build:
+"each package of the cycle that has a `replace_on_cycle` spec is that spec,
+and a package with none comes as its first build" (comment on
+gominimal/arch#183, 2026-11-19). A final build takes the first builds and
+never a final build of its cycle (EPOCH-032). So the root of a walk, the
+order of the builds and the content of a store never change what a build
+takes, and a store can keep one built package per key. The rejected
+alternative, a dependency's own first build where it is ready earlier, is
+what today's planner does. Under it an edge that one package adds can
+change the inputs of other members' first builds. The chosen rule costs
+something instead: each member must build with its cycle's
+`replace_on_cycle` specs alone, and nobody has counted yet how many do
+(OQ-54 of gominimal/arch#183).
+
+A first build is a second build of the member's spec with other inputs, so
+it cannot be stored under the member's key. Its key is derived from the
+member's key under a leading tag of its own (EPOCH-033), so it changes
+exactly when the member's key does and equals no catalog key. The owner
+ruled that "a first build has a key that is derived from the hash, the
+catalog does not list it, and only a build box of its cycle holds it"
+(2026-11-19), and EPOCH-034 holds both halves on this side. No client box
+installs a first build, so it needs no index record.
+
+An inline `replace_on_cycle` spec is used only in a first build, and there
+every package of the cycle that has a `replace_on_cycle` spec is that spec.
+So in an inline spec a dependency on a package means that package's
+`replace_on_cycle` spec (EPOCH-035), and the loader refuses a name with no
+such spec. An inline spec's key then covers what it is built with, and the
+inline specs are keyed among themselves: they change only when an inline
+spec changes, never with a recipe of the cycle. A `replace_on_cycle` spec
+"has each output that a package of its cycle names" (owner ruling,
+2026-11-19). In a first build a name like `{ pkg = "gcc", outputs =
+["libgcc"] }` selects that output of the `replace_on_cycle` spec, so
+EPOCH-036 is the loader's ordinary refusal of an output that does not
+exist, applied where the name lands. The spec needs no other output of its
+package, and its output kinds need not agree with the package's, because
+it is a spec of its own.
+
 The release-attestation scheme of gominimal/arch#157 signs only at epoch 1
 or later. So no signature covers a key with epoch 0's known collisions.
 That gate belongs to the verification scheme, and this spec only supplies
@@ -667,7 +903,14 @@ reuses them.
   enforced by: prefix-free TLV encoding, with machine-checked bounded
   injectivity and witness refutations
   covered by: EPOCH-001, EPOCH-004, EPOCH-011, EPOCH-013, EPOCH-017,
-    EPOCH-022, EPOCH-023
+    EPOCH-022, EPOCH-023, EPOCH-027, EPOCH-030
+- **Invariant:** THE SYSTEM SHALL never let the root of a walk, the order
+  of the builds or the content of a store change what a build of a cycle
+  member takes.
+  enforced by: the two-build rule, under which a first build takes the
+    `replace_on_cycle` specs and a final build takes the first builds, and
+    first builds stored under keys of their own
+  covered by: EPOCH-029, EPOCH-031, EPOCH-032, EPOCH-033, EPOCH-034
 - **Invariant:** THE SYSTEM SHALL never silently absorb unknown structure
   into a hash preimage.
   enforced by: the encoder, which emits only the tags of its epoch for the
@@ -741,3 +984,39 @@ reuses them.
 - [NEEDS CLARIFICATION (LOW): the measured harness bounds. The unwind
   bounds in this spec are starting points. The codec PR records the bounds
   its harnesses ran at.]
+- [NEEDS CLARIFICATION (HIGH): which packages a reference as
+  `replace_on_cycle` can name. The architecture leaves it to this spec:
+  "No MPR spec has a reference as its `replace_on_cycle` (§9, row 11), and
+  the epoch-1 spec says which packages such a reference can name"
+  (gominimal/arch#183, build §7). The owner's list for this spec includes
+  "what a reference as `replace_on_cycle` can name" (comment of
+  2026-11-19, item 7). Neither source gives the rule, and EPOCH-035 covers
+  the inline form only. This closes before the loader accepts a reference
+  in that position.]
+- [NEEDS CLARIFICATION (MEDIUM): which runtime dependencies a
+  `replace_on_cycle` spec brings into a first-build box. Build §7 says
+  "The rule applies at each depth of the closure of the build box", and
+  EPOCH-031 carries that sentence. The question "in a first-build box, does
+  a spec'd dependency bring its spec's `runtime_deps` or the real
+  package's?" is asked on gominimal/arch#183 (the OQ-54 comment) and not
+  yet answered.]
+- [NEEDS CLARIFICATION (MEDIUM): whether this spec carries the loader's
+  refusal of a cycle that has no order of first builds. Build §7 has it:
+  "If a loop of dependencies has a package with build steps and no package
+  with a `replace_on_cycle` spec, no order of first builds exists. The
+  loader refuses it and names the packages of the loop." The owner's list
+  for this spec names "the two refusals of the loader", which EPOCH-035 and
+  EPOCH-036 carry, and does not name this one.]
+- [NEEDS CLARIFICATION (LOW): how a first build finds a member with no
+  build steps. Build §7 says "A package with no build steps has one build,
+  which serves as the two" (EPOCH-031). Whether that build is stored under
+  its first-build key as well as its spec key, or a first build looks it up
+  by its spec key, is not stated.]
+- [NEEDS CLARIFICATION (LOW): whether the member-digest encoding has a
+  bounded harness of its own. It holds the spec field list with only the
+  edges that leave the cycle, under its own leading tag (EPOCH-030).
+  EPOCH-001's harness runs over the spec encoding only.]
+- [NEEDS CLARIFICATION (LOW): which spec carries the architecture's second
+  defence: "the release gate and `min` refuse a closure that holds two
+  builds of one package" (decisions D-29). It is not on the owner's list
+  for this spec.]
