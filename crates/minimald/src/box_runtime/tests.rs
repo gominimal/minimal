@@ -1204,30 +1204,45 @@ fn eio_on_a_master_read_is_not_a_warning() {
 }
 
 /// The reap after a pty error nobody asked for is info only for the
-/// ordinary end: the master's `EIO` and an exit the process made itself,
-/// zero or not. A signal, another errno or a failed reap stays a warning.
+/// ordinary end: a master read's `EIO` and an exit the process made itself,
+/// zero or not. A signal, another errno, the same `EIO` from a write or a
+/// readiness wait, or a failed reap stays a warning.
 #[test]
 fn the_reap_after_eio_and_an_own_exit_is_info() {
     let eio = std::io::Error::from_raw_os_error(EIO_ON_EXIT);
     let eintr = std::io::Error::from_raw_os_error(libc::EINTR);
     let sigkill = signalled("container received signal SIGKILL");
     assert_eq!(
-        pty_reap_log_level(Some(&eio), Some(&exited(0))),
+        pty_reap_log_level(Some((PtyOp::Read, &eio)), Some(&exited(0))),
         tracing::Level::INFO
     );
     assert_eq!(
-        pty_reap_log_level(Some(&eio), Some(&exited(1))),
+        pty_reap_log_level(Some((PtyOp::Read, &eio)), Some(&exited(1))),
         tracing::Level::INFO
     );
     assert_eq!(
-        pty_reap_log_level(Some(&eio), Some(&sigkill)),
+        pty_reap_log_level(Some((PtyOp::Read, &eio)), Some(&sigkill)),
         tracing::Level::WARN
     );
-    assert_eq!(pty_reap_log_level(Some(&eio), None), tracing::Level::WARN);
     assert_eq!(
-        pty_reap_log_level(Some(&eintr), Some(&exited(0))),
+        pty_reap_log_level(Some((PtyOp::Read, &eio)), None),
         tracing::Level::WARN
     );
+    assert_eq!(
+        pty_reap_log_level(Some((PtyOp::Read, &eintr)), Some(&exited(0))),
+        tracing::Level::WARN
+    );
+    // A write into the pty can fail with `EIO` when the process exits with
+    // input still buffered. That error is a warning on its own line, so the
+    // reap after it is one too, even after an exit the process made itself.
+    for op in [PtyOp::Readable, PtyOp::Writable, PtyOp::Write] {
+        assert_eq!(
+            pty_reap_log_level(Some((op, &eio)), Some(&exited(0))),
+            tracing::Level::WARN,
+            "{}",
+            op.as_str()
+        );
+    }
     assert_eq!(
         pty_reap_log_level(None, Some(&exited(0))),
         tracing::Level::WARN

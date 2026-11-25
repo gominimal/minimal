@@ -107,8 +107,9 @@ pub(crate) struct Host<P: BoxProcess, G: BoxGuard> {
     /// the error says how the host noticed, the reap says what became of the
     /// shell — and the reap is the slower of the two. Set only by a pty
     /// failure, never by a deliberate kill, which is what keeps a destroy from
-    /// raising a shell-exit prompt.
-    pending_pty_err: Option<std::io::Error>,
+    /// raising a shell-exit prompt. Held with the operation that failed: only
+    /// a read's `EIO` makes the reap an ordinary end ([`pty_reap_log_level`]).
+    pending_pty_err: Option<(PtyOp, std::io::Error)>,
     /// Set when [`Host::step`] takes a `Message::Kill`. The step-error branch
     /// of [`Host::mainloop`] reads it to tell a requested end from a pty
     /// failure. A pty error stashed before the kill does not hide the kill.
@@ -1605,7 +1606,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                 // deliberate kill stays silent: `Message::Kill` also returns
                 // `Err` from `step`, but a destroy or a daemon shutdown either
                 // wants no farewell at all or has already sent its own teardown.
-                let mut pending = self.pending_pty_err.take();
+                let (pending_op, mut pending) = self.pending_pty_err.take().unzip();
                 // Read from the kill itself, not from `pending`: a kill can
                 // arrive after a pty error was stashed, and that end is still
                 // the daemon's, not the entrypoint's own return (BOX-038).
@@ -1637,10 +1638,11 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                 // with the same abnormal reason an OOM kill does, and a warn
                 // for every destroy would bury the deaths nobody asked for.
                 //
-                // So is the ordinary end of a session: the master's `EIO`
+                // So is the ordinary end of a session: a master read's `EIO`
                 // (still in `pending`, which only a non-`EIO` error left
                 // empty above) and an exit the process made on its own
-                // (`pty_reap_log_level`). Everything else stays a warning.
+                // (`pty_reap_log_level`). Everything else stays a warning,
+                // a write's `EIO` included.
                 if requested {
                     tracing::info!(
                         session_id = %self.session_id,
@@ -1650,7 +1652,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                         exit_reason = exit.as_ref().map_or("", |r| r.reason.as_str()),
                         "session process reaped after requested teardown",
                     );
-                } else if pty_reap_log_level(pending.as_ref(), exit.as_ref())
+                } else if pty_reap_log_level(pending_op.zip(pending.as_ref()), exit.as_ref())
                     == tracing::Level::INFO
                 {
                     tracing::info!(
@@ -1847,7 +1849,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                 "pty master error; tearing down host",
             );
         }
-        self.pending_pty_err = Some(e);
+        self.pending_pty_err = Some((op, e));
     }
 
     /// Notifies the attached binding that the session is going away, so it

@@ -361,15 +361,18 @@ pub(super) fn pty_err_log_level(op: PtyOp, e: &std::io::Error) -> tracing::Level
 /// The level of the reap that follows a pty/step error the daemon did not
 /// ask for (a kill it sent is logged as a requested teardown).
 ///
-/// Info when the master reported [`EIO_ON_EXIT`] and the reap found an exit
+/// Info when a `read(2)` on the master failed with [`EIO_ON_EXIT`] (the one
+/// failure [`pty_err_log_level`] logs at debug) and the reap found an exit
 /// the process made on its own: the ordinary end of a session. A warning
-/// when the error was anything else, when the process ended on a signal or
-/// a container failure, or when the reap failed and there is no account.
+/// when the error was anything else, a write or a readiness wait that failed
+/// with `EIO` included, when the process ended on a signal or a container
+/// failure, or when the reap failed and there is no account.
 pub(super) fn pty_reap_log_level(
-    pty_err: Option<&std::io::Error>,
+    pty_err: Option<(PtyOp, &std::io::Error)>,
     exit: Option<&ExitReason>,
 ) -> tracing::Level {
-    let terminal_closed = pty_err.is_some_and(shell_is_already_gone);
+    let terminal_closed =
+        pty_err.is_some_and(|(op, e)| pty_err_log_level(op, e) == tracing::Level::DEBUG);
     let ended_on_its_own = exit.is_some_and(|exit| !exit.is_abnormal());
     if terminal_closed && ended_on_its_own {
         tracing::Level::INFO
