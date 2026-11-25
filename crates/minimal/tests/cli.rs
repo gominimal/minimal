@@ -729,7 +729,6 @@ async fn start_session(
         SessionStartArgs {
             entry: None,
             name: Some(name.to_string()),
-            new: false,
             detach: true,
             overrides,
         },
@@ -941,7 +940,6 @@ async fn activate_uses_repo_dir_when_no_positional_path() {
         SessionStartArgs {
             entry: None,
             name: Some("repo-dir-test".to_string()),
-            new: false,
             detach: true,
             overrides: no_net(),
         },
@@ -4958,13 +4956,15 @@ async fn task_run_exits_with_held_open_stdin_pipe() {
         String::from_utf8_lossy(&stdout)
     );
     let stderr = String::from_utf8_lossy(&stderr);
-    // A task box with no requested name is `<project>-<task>-<n>`
-    // (BOX-211). The project is the tempdir's last path component.
+    // A task box with no requested name takes the derived name
+    // `<project>-<task>`, and a number only when that name is taken
+    // (BOX-211, BCLI-070, BCLI-080). The project is the tempdir's last path
+    // component.
     let root = project.path().to_string_lossy();
     let box_name = boxes::box_name::derived_box_name(
         boxes::box_name::project_name_of_root(&root),
         Some("e2e-echo"),
-        Some(1),
+        None,
     );
     assert!(
         stderr.contains(&format!("Running task e2e-echo in box {box_name}")),

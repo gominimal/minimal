@@ -143,11 +143,10 @@ pub(crate) fn put_task_spec(
     vpn_network_names: &[String],
 ) -> Result<(), anyhow::Error> {
     if let Some(spec) = spec {
-        if let Some(expanded) = expanded
-            && spec.name.is_none()
-        {
-            spec.name = crate::expanded_box_name(expanded);
-        }
+        // BOX-211, BCLI-069: the box name goes on the request, never into
+        // the stored spec. So `--name` changes neither the spec nor its
+        // projection digest.
+        spec.name = None;
         if let Some(expanded) = expanded {
             take_expanded_exports(spec, expanded);
             // The expansion holds the names `[defaults]` and the task's
@@ -157,17 +156,21 @@ pub(crate) fn put_task_spec(
         } else {
             crate::put_spec(request, spec)?;
         }
-        // BOX-211: the daemon names a box from the request alone, so the
-        // stored spec's `[box] name` goes on the request as the fresh base.
+        // BCLI-069, BCLI-079, BCLI-080: the requested name is `--name`,
+        // which the caller put on the request, else the entry's `[box]
+        // name`, else none, and the daemon derives the name (BOX-211).
         if request.config.name.is_none() {
-            request.config.name =
-                boxes::box_name::spec_box_name(request.spec.as_ref()).map(str::to_string);
+            request.config.name = expanded.and_then(crate::expanded_box_name);
         }
-    } else {
+    } else if request.config.name.is_none() {
         // An interactive task sends no spec: the task type denies a
-        // terminal. With no spec to name it, the request carries the
-        // entry's name, cleaned as the daemon cleans a spec's entry.
+        // terminal. With no spec for the daemon to derive a name from, the
+        // request carries the entry's name, cleaned as the daemon cleans a
+        // spec's entry. That name is not written by the person, so the
+        // create is a fresh instance and takes a number when the name is
+        // taken (BCLI-070).
         request.config.name = Some(interactive_task_box_name(entry));
+        request.fresh_instance = true;
     }
     // With no spec, a `--vpn-network-names` value has no place to go, so
     // the helper refuses it rather than drop it.
@@ -257,11 +260,12 @@ pub(crate) struct TaskBoxNetwork {
 /// [`crate::effective_egress`], as an activation applies them. With no flag
 /// and no declaration, the box is a `host_ip` box with the default policy.
 /// An `own_ip` box with no egress gets the deny-all default where the box
-/// is created (NET-074), as an activation's does.
+/// is created (NET-074), as an activation's does. `--network none` clears
+/// the egress and the ingress that the file declares for the task.
 ///
 /// # Errors
 ///
-/// An invalid egress flag or project file, egress on a `none` box
+/// An invalid egress flag or project file, an egress flag on a `none` box
 /// (NET-065), and `own_ip` on a host that runs boxes in a VM.
 fn task_box_network(
     project: &camino::Utf8Path,
@@ -272,7 +276,10 @@ fn task_box_network(
     kind: paths::HostKind,
 ) -> Result<TaskBoxNetwork, anyhow::Error> {
     let flag_egress = crate::flag_egress(flags)?;
-    let project_egress = crate::task_project_egress(project, task)?;
+    let mut project_egress = crate::task_project_egress(project, task)?;
+    // BCLI-024: `--network none` clears the egress and the ingress the
+    // task's layers set, as it does for a session box.
+    crate::clear_file_network_on_none_flag(&mut project_egress, network);
     let file_policy = project_egress.policy.is_some();
     let egress = crate::effective_egress(project_egress.policy, flag_egress, flags.deny_all_egress);
     tracing::debug!(
@@ -282,7 +289,7 @@ fn task_box_network(
     );
     let (mode, mode_layer) = match (network, project_egress.mode) {
         (Some(flag), _) => (flag.into(), None),
-        (None, Some(mode)) => (mode, project_egress.layer.clone()),
+        (None, Some(mode)) => (mode, project_egress.mode_layer.clone()),
         (None, None) => (
             crate::parse_network_mode(crate::NETWORK_DEFAULT)
                 .map_err(anyhow::Error::msg)?
@@ -670,7 +677,7 @@ fn task_run_cwd(upload_root: &camino::Utf8Path, invocation_dir: &camino::Utf8Pat
 
 /// The refusal of a run whose entry has a terminal (BCLI-010): `min task
 /// run` and `min box run` never give a box a terminal, so the entry starts
-/// with `min box start --new` instead. The run refuses it before it creates
+/// with `min box start <entry>` instead. The run refuses it before it creates
 /// anything, and `main.rs` ends the command with [`Self::EXIT_CODE`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunNeedsTerminal {
@@ -694,7 +701,7 @@ impl std::fmt::Display for RunNeedsTerminal {
         let entry = &self.entry;
         write!(
             f,
-            "{entry} runs with a terminal. Start it with min box start --new {entry}."
+            "{entry} runs with a terminal. Start it with min box start {entry}."
         )
     }
 }
@@ -729,6 +736,9 @@ pub(crate) struct RunEntry {
     pub egress: crate::EgressArgs,
     /// The rest of activate's override flags (BCLI-024, BCLI-075, BCLI-076).
     pub other: crate::BoxOverrideArgs,
+    /// `--name`: the requested name of the box (BCLI-069). `None` sends
+    /// the entry's `[box] name`, else no name.
+    pub box_name: Option<String>,
     pub args: Vec<String>,
 }
 
@@ -741,6 +751,7 @@ impl From<TaskRunArgs> for RunEntry {
             network: args.network,
             egress: args.egress,
             other: args.other,
+            box_name: args.name,
             args: args.args,
         }
     }
@@ -755,6 +766,7 @@ impl From<BoxRunArgs> for RunEntry {
             network: args.network,
             egress: args.egress,
             other: args.other,
+            box_name: args.name,
             args: args.args,
         }
     }
@@ -1624,16 +1636,17 @@ pub(crate) async fn run_entry(
     // an activation (BCLI-076): the stored spec and the expanded entry then
     // carry no hook.
     //
-    // BCLI-070, BOX-163: every run is a fresh instance. The daemon names the
-    // box `<task>-<n>` from the spec's entry, with the smallest `n` no
-    // retained box uses. The client invents no name.
+    // BCLI-069, BCLI-079, BCLI-080: the request carries `--name`, else
+    // `put_task_spec` puts the entry's `[box] name` on it, else it carries
+    // no name. The daemon numbers a derived name that is taken (BCLI-070),
+    // and refuses a written name that is taken (BOX-163).
     let mut request = minimald_rpc::CreateSessionRequest::new(
         String::new(),
         abs_path.clone(),
         box_network.mode,
         box_network.policy,
     );
-    crate::request_fresh_instance(&mut request);
+    request.config.name = args.box_name.clone();
     request.config.hooks_enabled = !args.other.no_hooks;
     // Refused by a daemon of another build before it allocates anything;
     // `None` under the skew override.
@@ -1735,7 +1748,7 @@ pub(crate) async fn run_entry(
         task = %args.entry,
         requested_name = ?request.config.name,
         fresh_instance = request.fresh_instance,
-        "creating the task box as a fresh instance"
+        "creating the task box"
     );
     let resp = client
         .oneshot_rpc::<CreateSession>(request.clone())
@@ -3168,6 +3181,7 @@ mod tests {
         };
         let args = TaskRunArgs {
             task: "deploy".into(),
+            name: None,
             network: None,
             egress: crate::EgressArgs::default(),
             other: crate::BoxOverrideArgs::default(),
@@ -3217,6 +3231,7 @@ mod tests {
         };
         let args = TaskRunArgs {
             task: "build".into(),
+            name: None,
             network: None,
             egress: crate::EgressArgs::default(),
             other: crate::BoxOverrideArgs::default(),
@@ -3274,6 +3289,7 @@ mod tests {
         };
         let args = TaskRunArgs {
             task: "build".into(),
+            name: None,
             network: None,
             egress: crate::EgressArgs::default(),
             other: crate::BoxOverrideArgs::default(),
@@ -3344,6 +3360,73 @@ mod tests {
         assert_eq!(
             (net.mode, net.policy),
             (boxes::NetworkMode::HostNet, boxes::BoxPolicy::default())
+        );
+    }
+
+    /// BCLI-024, gominimal/arch#200: `min task run --network none` clears
+    /// the egress and the ingress that the task inherits, as a session
+    /// start does, and is not refused. An egress flag on a `none` box is
+    /// still refused (NET-065).
+    #[test]
+    fn network_none_flag_drops_file_egress_and_ingress_on_task_run() {
+        let (_dir, project) = project_with(
+            "[defaults.network]\nmode = \"own_ip\"\n\
+             egress = { allow_dns_hosts = [\"a.example\"] }\n\
+             ingress = [{ port = 8080 }]\n\n\
+             [tasks.build]\nexec = 'true'\n",
+        );
+        let net = box_network(&project, "build", None, &crate::EgressArgs::default())
+            .expect("the inherited network applies");
+        assert_eq!(net.mode, boxes::NetworkMode::OwnIp);
+        assert!(net.policy.egress.is_some());
+
+        let net = box_network(
+            &project,
+            "build",
+            Some(crate::CliNetworkMode::NoNet),
+            &crate::EgressArgs::default(),
+        )
+        .expect("--network none is not refused");
+        assert_eq!(net.mode, boxes::NetworkMode::NoNet);
+        assert_eq!(net.policy.egress, None);
+        assert_eq!(net.policy.ingress, None);
+
+        let flags = crate::EgressArgs {
+            allow_dns_hosts: vec!["b.example".to_owned()],
+            ..crate::EgressArgs::default()
+        };
+        box_network(
+            &project,
+            "build",
+            Some(crate::CliNetworkMode::NoNet),
+            &flags,
+        )
+        .expect_err("an egress flag on a none box is refused");
+    }
+
+    /// gominimal/arch#188: `network.mode` and `network.egress` can come
+    /// from two tables. The own_ip refusal names the table that sets the
+    /// mode, not the table that sets the egress.
+    #[test]
+    fn task_box_network_own_ip_refusal_names_the_mode_table() {
+        let (_dir, project) = project_with(
+            "[defaults.network.egress]\nallow_dns_hosts = [\"a.example\"]\n\n\
+             [tasks.coder]\nexec = 'true'\nnetwork = { mode = \"own_ip\" }\n",
+        );
+        let error = task_box_network(
+            &project,
+            "coder",
+            RunVerb::Task,
+            None,
+            &crate::EgressArgs::default(),
+            paths::HostKind::Minvmd,
+        )
+        .expect_err("own_ip is refused on a VM host");
+        assert_eq!(
+            error.to_string(),
+            "Cannot run the task: [tasks.coder] in minimal.toml sets network.mode = \"own_ip\", \
+             which is not available to `min task run` on a host that runs boxes in a VM. Run it \
+             with --network host_ip."
         );
     }
 
@@ -3694,10 +3777,11 @@ mod tests {
         );
     }
 
-    /// NET-065: a `none` box refuses egress before the daemon, in the
-    /// daemon's own words, naming each place the egress came from: the
-    /// flags, `[defaults]`, `[defaults.task]` or the task's entry. With no
-    /// egress it runs.
+    /// NET-065: a `none` box refuses an egress flag before the daemon, in
+    /// the daemon's own words, naming the flags. BCLI-024: `--network none`
+    /// clears the egress that `[defaults]`, `[defaults.task]` or the task's
+    /// entry sets, so that egress alone does not refuse. With no egress it
+    /// runs.
     #[test]
     fn task_box_network_none_refuses_egress() {
         let daemon = "egress rules need network mode own_ip or host_ip (this box is none): a \
@@ -3740,17 +3824,18 @@ mod tests {
                 "[tasks.build]",
             ),
         ] {
+            // BCLI-024: `--network none` clears the egress that {layer}
+            // sets, so the box runs with no egress.
             let (_file_dir, declared) = project_with(body);
-            assert_eq!(
-                refusal(&declared, crate::EgressArgs::default()),
-                format!(
-                    "{daemon} The box's egress rules come from {layer} in minimal.toml. Run it \
-                     with --network host_ip or --network own_ip."
-                )
-            );
-            // A flag that replaces every field the file sets still leaves
-            // the file's egress, so the file is named and dropping the flag
-            // is not offered.
+            let net = box_network(
+                &declared,
+                "build",
+                Some(crate::CliNetworkMode::NoNet),
+                &crate::EgressArgs::default(),
+            )
+            .unwrap_or_else(|e| panic!("--network none clears the egress of {layer}: {e}"));
+            assert_eq!(net.policy.egress, None, "{layer}");
+            // An egress flag is still refused, and only the flag is named.
             assert_eq!(
                 refusal(
                     &declared,
@@ -3760,8 +3845,8 @@ mod tests {
                     }
                 ),
                 format!(
-                    "{daemon} The box's egress rules come from --deny-all-egress and {layer} in \
-                     minimal.toml. Run it with --network host_ip or --network own_ip."
+                    "{daemon} The box's egress rules come from --deny-all-egress. Run it with \
+                     --network host_ip or --network own_ip, or without --deny-all-egress."
                 )
             );
         }

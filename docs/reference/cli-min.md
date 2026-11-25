@@ -213,8 +213,7 @@ attaches this terminal to it. `ENTRY` names a `[sessions.<name>]` entry, or a
 | Argument or flag | Description |
 |------------------|-------------|
 | `ENTRY` | The session entry to start. Optional |
-| `--name <NAME>` | Name the box. With `--new`, the box is named `<NAME>-<n>` |
-| `--new` | Create another box from the entry, named `<name>-<n>`, even when a running box holds the entry's name |
+| `--name <NAME>` | Name the box. This replaces the `[box] name` in `minimal.toml` |
 | `--detach` | Create the box, print its id and return. This terminal is not attached to the box |
 | `--network <none\|host_ip\|own_ip>` | Override of the entry's `network.mode`: the box gets this network mode. Without the flag, the box takes the entry's `network.mode`, else `host_ip`. The old hyphenated spellings `no-net`, `host-net`, and `own-ip` still work for one release, with a one-line hint naming the current spelling |
 | `--ingress <EXT:INT[/PROTO]>` | Override of the entry's `network.ingress`: each use adds one port mapping, `EXT:INT[/PROTO]` (PROTO = tcp or udp, default tcp). Requires `--network own_ip` |
@@ -270,7 +269,7 @@ The command refuses these starts before it creates a box:
 | An entry in `minimal.toml` has a type that is not built in, or a `[boxes.<name>]` entry has no `type`. The command refuses only when `ENTRY` names that entry, or when the start must count the entries to pick one | 2 |
 | No terminal, and no `--detach` | 2 |
 | `--no-loadouts` and `--loadout` together | 2 |
-| A running box holds the box's name. Pass `--new` or `--name` to create the box | 2 |
+| A running box already has the name from `--name` or `[box] name`. Pass another `--name` to create the box | 2 |
 
 An invalid `minimal.toml` ends the command with exit code 3.
 
@@ -377,14 +376,17 @@ These are the [`box logs`](#box-logs), [`box stop`](#box-stop) and
 min task run [OPTIONS] <TASK> [ARGS]...
 ```
 
-Runs a task that the project's `minimal.toml` declares, in a box of its own
-named `<TASK>-<n>`. The command exits with the task's exit code. The task runs
-without a terminal. Its stdin, stdout and stderr are the command's. The box
-stays when the task ends: `min box show <TASK>-<n>` shows it and
-`min box rm <TASK>-<n>` removes it.
+Runs a task that the project's `minimal.toml` declares, in a box of its own.
+The command exits with the task's exit code. The task runs without a
+terminal. Its stdin, stdout and stderr are the command's. The box takes the
+name given with `--name`, else the task's `[box] name`. Without either, the
+box is named `<project>-<TASK>`, with `-<n>` added when a box already holds
+that name. The box stays when the task ends: `min box show <NAME>` shows it
+and `min box rm <NAME>` removes it.
 
 | Flag | Description |
 |------|-------------|
+| `--name <NAME>` | Name the box. This replaces the `[box] name` in minimal.toml |
 | `--detach` | Start the box, print its id and return. The task gets no input |
 | `--network <none\|host_ip\|own_ip>` | The box's network mode. Without the flag, the task's `network.mode`, else `host_ip` |
 
@@ -425,8 +427,7 @@ type, else the project's only entry.
 
 | Flag | Description |
 |------|-------------|
-| `--name <NAME>` | Name the box. With `--new`, the box is named `<NAME>-<n>` |
-| `--new` | Create another box from the entry, named `<name>-<n>`, even when a running box holds the entry's name |
+| `--name <NAME>` | Name the box. This replaces the `[box] name` in `minimal.toml` |
 | `--detach` | Create the box, print its id and return. This terminal is not attached to the box |
 
 The command takes every override flag of [`session start`](#session-start),
@@ -441,10 +442,13 @@ min box run [OPTIONS] <ENTRY> [ARGS]...
 
 Creates a box from an entry of the project, runs it without a terminal, and
 exits with its exit code. The command's stdin, stdout and stderr are the
-box's. Each run creates a new box, named `<ENTRY>-<n>`.
+box's. The box takes the name given with `--name`, else the entry's
+`[box] name`. Without either, the box is named `<project>-<ENTRY>`, with
+`-<n>` added when a box already holds that name.
 
 | Flag | Description |
 |------|-------------|
+| `--name <NAME>` | Name the box. This replaces the `[box] name` in minimal.toml |
 | `--detach` | Start the box, print its id and return. The box gets no input |
 | `--network <none\|host_ip\|own_ip>` | The box's network mode, as on [`task run`](#task-run) |
 
@@ -746,6 +750,13 @@ A task entry refuses `--ingress` and `--loadout` with exit code 2, as
 `min box spec <BOX>` shows the spec that the box was created with, as its
 host stores it. It takes `-o` and no override flag. An override flag with a
 box gives exit code 2.
+
+The TOML form starts with the box's name and its origin, as the box's record
+holds them. The origin says whether a person wrote the name or the host
+derived it from the project name and the entry. After `min box rename`, the
+form shows the new name. A `[box] name` in the stored spec is the name the
+entry asks for when a box is created from it. The form labels it so, because
+it is not the name of the box.
 
 The spec of a box lists its
 [lifecycle hooks](./loadouts.md#lifecycle_hooks---scripts-at-session-transition-points),

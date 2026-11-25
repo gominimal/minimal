@@ -207,7 +207,8 @@ diagnostics() {
 # same reason — and it is also what puts `min session start` in its non-interactive
 # mode, where it neither prompts for the non-VCS upload confirmation (#770) nor
 # expects a keypress for policy gating. Its --detach prints the box id and
-# returns, and --new mints a fresh box even when an earlier one holds the name.
+# returns. When an earlier box holds the entry's derived name, the new box
+# takes that name with a number at the end.
 run_deadline() {
   local secs="$1"
   shift
@@ -323,7 +324,7 @@ for i in $(seq 1 "$ITER"); do
   echo "::group::bulk upload $i/$ITER (${FIXTURE_MIB} MiB project)"
   # shellcheck disable=SC2086
   run_deadline "$DEADLINE_SECS" \
-    min ${E2E_MINIMAL_ARGS:-} session start --detach --new >"$WORK/activate.out" 2>"$WORK/activate.err"
+    min ${E2E_MINIMAL_ARGS:-} session start --detach >"$WORK/activate.out" 2>"$WORK/activate.err"
   rc=$?
 
   sid="$(tail -n1 "$WORK/activate.out" 2>/dev/null | tr -d '\r')"

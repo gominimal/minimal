@@ -106,18 +106,22 @@ impl std::error::Error for NetworkFlagRefusal {}
 
 /// Refuses a `network.ingress` from `minimal.toml` on a box that is not
 /// `own_ip`, as [`refuse_ingress_off_own_ip`] refuses `--ingress`. `layer`
-/// is the table that declares the entry's `network` (#3238).
+/// is the table that sets the entry's `network.ingress` (#3238), and
+/// `mode_layer` the table that sets its `network.mode`, when one does. The
+/// two can differ, because `network` merges by key (gominimal/arch#188).
 fn refuse_file_ingress_off_own_ip(
     network: crate::cli::CliNetworkMode,
     network_flagged: bool,
     has_ingress: bool,
     layer: Option<&str>,
+    mode_layer: Option<&str>,
 ) -> Result<(), anyhow::Error> {
     if network == crate::cli::CliNetworkMode::OwnIp || !has_ingress {
         return Ok(());
     }
     let mode = boxes::NetworkMode::from(network).word();
     let layer = layer.unwrap_or("[network]");
+    let mode_layer = mode_layer.unwrap_or(layer);
     let file = mfile::MFILE_NAME;
     if network_flagged {
         anyhow::bail!(
@@ -128,7 +132,7 @@ fn refuse_file_ingress_off_own_ip(
     }
     anyhow::bail!(
         "{layer} in {file} sets network.ingress, but the box is {mode}, so it cannot publish \
-         ports. Set network.mode = \"own_ip\" in {layer}, or run the command again with \
+         ports. Set network.mode = \"own_ip\" in {mode_layer}, or run the command again with \
          --network own_ip."
     )
 }
@@ -148,6 +152,7 @@ pub(crate) fn session_box_network(
     project: &mut ProjectEgress,
     flag_mappings: Vec<boxes::PortMapping>,
 ) -> anyhow::Result<(crate::cli::CliNetworkMode, Vec<boxes::PortMapping>)> {
+    clear_file_network_on_none_flag(project, args.network);
     let file_ingress = project.ingress.take();
     let network_flagged = args.network.is_some();
     let network = args
@@ -167,16 +172,41 @@ pub(crate) fn session_box_network(
         network,
         network_flagged,
         !file_mappings.is_empty(),
-        project.layer.as_deref(),
+        project.ingress_layer.as_deref(),
+        project.mode_layer.as_deref(),
     )?;
     tracing::debug!(
         network = boxes::NetworkMode::from(network).word(),
         file_mappings = file_mappings.len(),
         flag_mappings = flag_mappings.len(),
-        layer = ?project.layer,
+        layer = ?project.ingress_layer,
         "the session box takes the entry's network.ingress and the --ingress mappings"
     );
     Ok((network, union_ingress(file_mappings, flag_mappings)))
+}
+
+/// `--network none` clears the `network.egress` and `network.ingress` that
+/// the entry's layers set, as a layer's `mode = "none"` clears the ones it
+/// inherits (gominimal/arch#200). The other network flags change only the
+/// key they name. Returns whether the flag cleared them.
+pub(crate) fn clear_file_network_on_none_flag(
+    project: &mut ProjectEgress,
+    network: Option<crate::cli::CliNetworkMode>,
+) -> bool {
+    if network != Some(crate::cli::CliNetworkMode::NoNet) {
+        return false;
+    }
+    if project.policy.is_some() || project.ingress.is_some() {
+        tracing::debug!(
+            egress_layer = ?project.layer.as_ref().filter(|_| project.policy.is_some()),
+            ingress_layer = ?project.ingress_layer,
+            "--network none clears the entry's network.egress and network.ingress"
+        );
+    }
+    project.policy = None;
+    project.ingress = None;
+    project.ingress_layer = None;
+    true
 }
 
 /// The entry's `network.ingress` mappings followed by the `--ingress`
@@ -397,8 +427,6 @@ pub struct StartEntry {
     pub entry: Option<String>,
     /// `--name`: the box's `[box] name` (BCLI-069).
     pub name: Option<String>,
-    /// `--new`: a fresh instance (BCLI-070).
-    pub new: bool,
     /// `--detach`: print the id and return, never attach.
     pub detach: bool,
     /// The override flags: `--network`, `--ingress`, the egress flags and
@@ -412,7 +440,6 @@ impl From<BoxStartArgs> for StartEntry {
             verb: StartVerb::Box,
             entry: args.entry,
             name: args.name,
-            new: args.new,
             detach: args.detach,
             overrides: args.overrides,
         }
@@ -425,7 +452,6 @@ impl From<SessionStartArgs> for StartEntry {
             verb: StartVerb::Session,
             entry: args.entry,
             name: args.name,
-            new: args.new,
             detach: args.detach,
             overrides: args.overrides,
         }
@@ -577,16 +603,9 @@ pub enum StartEntryRefusal {
         entry: String,
         box_type: Option<String>,
     },
-    /// `--name` for a task entry: its box runs through the run path, which
-    /// generates the box's name and takes no `--name`. This refusal is an
-    /// interim. <https://github.com/gominimal/minimal/issues/3196> tracks a
-    /// box name for `RunEntry`. Remove this refusal when `RunEntry` takes a
-    /// name.
-    NameUnsupported { entry: String },
     /// `--ingress` or `--loadout` for a task entry: its box runs through the
     /// run path, which takes neither flag. `flag` is the flag as typed.
-    /// This refusal is an interim, like [`Self::NameUnsupported`]. Remove
-    /// it for a flag when `RunEntry` takes that flag
+    /// This refusal is an interim. Remove it for a flag when `RunEntry` takes that flag
     /// (<https://github.com/gominimal/minimal/issues/3163> for `--ingress`,
     /// <https://github.com/gominimal/minimal/issues/3237> for `--loadout`).
     FlagUnsupported { entry: String, flag: &'static str },
@@ -618,7 +637,6 @@ impl StartEntryRefusal {
             Self::Unknown { .. } | Self::NotSession { .. } => 4,
             Self::Several { .. }
             | Self::DefaultBlocked { .. }
-            | Self::NameUnsupported { .. }
             | Self::FlagUnsupported { .. }
             | Self::TaskNotInTasks { .. }
             | Self::UnsupportedType { .. } => 2,
@@ -706,12 +724,6 @@ impl std::fmt::Display for StartEntryRefusal {
                 }
                 Ok(())
             }
-            Self::NameUnsupported { entry } => write!(
-                f,
-                "Cannot start {entry} with --name. A box from a task entry gets a \
-                 generated name. Run min box start {entry} without --name.",
-                entry = printable(entry),
-            ),
             Self::FlagUnsupported { entry, flag } => write!(
                 f,
                 "Cannot start {entry} with {flag}. A box from a task entry does not \
@@ -771,8 +783,8 @@ impl std::fmt::Display for StartNeedsTerminal {
 impl std::error::Error for StartNeedsTerminal {}
 
 /// The refusal of a start whose box name a running box on the host holds
-/// (BCLI-069, BOX-163). It names the holder, and the two flags that create
-/// the box anyway. `main.rs` ends the command with [`Self::EXIT_CODE`].
+/// (BCLI-069, BOX-163). It names the holder and `--name`, which starts a box
+/// under another name. `main.rs` ends the command with [`Self::EXIT_CODE`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartNameHeld {
     pub verb: StartVerb,
@@ -817,8 +829,8 @@ impl std::fmt::Display for StartNameHeld {
         }
         write!(
             f,
-            " Run {command} --new {entry} to create another box from the entry, or \
-             pass --name <name> to give the box another name.",
+            " Run {command} {entry} --name <name> to start a box from the entry under \
+             another name.",
             command = self.verb.command(),
         )
     }
@@ -916,7 +928,6 @@ pub(crate) fn plan_start(
                     offer_scaffold: false,
                     entry: Some(entry.name.clone()),
                     box_name: start.name.clone(),
-                    fresh_instance: start.new,
                     quic443: other.quic443,
                     vpn_network_names: other.vpn_network_names.clone(),
                 },
@@ -925,22 +936,15 @@ pub(crate) fn plan_start(
             })
         }
         // A task box never has a terminal (BOX-054), so the start detaches.
-        // `run_entry` calls `request_fresh_instance`, and the daemon names
-        // the box `<entry>-<n>` (BOX-163). So a task-entry start is always a
-        // fresh instance, and `--new` changes nothing for it. A plain start
-        // does not refuse a held name until gominimal/minimal#3196 lands.
-        // The run path takes no `--name`, so the start refuses that flag
-        // rather than drop it. That refusal is the #3196 interim: remove it
-        // when `RunEntry` takes a name.
+        // `--name` reaches the run path as the requested name (BCLI-069).
+        // Without it the run sends the entry's `[box] name`, else no name
+        // (BCLI-079, BCLI-080).
         //
         // The run path finds its task in `[tasks]` only, so a `[boxes]`
         // task entry is refused first. That refusal is the #3213 interim:
         // remove it when `declared_task` reads the task entries of `[boxes]`.
         Some(boxes::TASK_BOX_TYPE) if entry.table != mfile::entry::EntryTable::Tasks => {
             Err(StartEntryRefusal::TaskNotInTasks { entry: entry.name }.into())
-        }
-        Some(boxes::TASK_BOX_TYPE) if start.name.is_some() => {
-            Err(StartEntryRefusal::NameUnsupported { entry: entry.name }.into())
         }
         // The run path takes `--network` and the egress flags, as `min box
         // run` does, but neither `--ingress` (#3163) nor `--loadout`
@@ -969,6 +973,7 @@ pub(crate) fn plan_start(
                 network: start.overrides.network,
                 egress: start.overrides.egress.clone(),
                 other: start.overrides.other.clone(),
+                box_name: start.name.clone(),
             },
             entry: entry.name,
         }),
@@ -1210,7 +1215,6 @@ pub async fn start_entry(global: &GlobalArgs, start: StartEntry) -> Result<(), a
         entry = %plan.entry(),
         typed_entry = ?start.entry,
         name = ?start.name,
-        fresh_instance = start.new,
         detach = start.detach,
         network = ?start.overrides.network,
         ingress = ?start.overrides.ingress,
@@ -1238,8 +1242,8 @@ pub async fn start_entry(global: &GlobalArgs, start: StartEntry) -> Result<(), a
 
 /// The error a start ends with, the same for `min box start` and `min
 /// session start`: a held name becomes [`StartNameHeld`], with its hint to
-/// `--new` and `--name`. A host port in use becomes the refusal's own text,
-/// with the port and its holder (NET-144). Any other error passes through.
+/// `--name`. A host port in use becomes the refusal's own text, with the port
+/// and its holder (NET-144). Any other error passes through.
 pub(crate) fn start_refusal(error: anyhow::Error, verb: StartVerb, entry: &str) -> anyhow::Error {
     match error.downcast::<minimald_rpc::HeldNameRefusal>() {
         Ok(refusal) => anyhow::Error::new(StartNameHeld {
@@ -1262,8 +1266,6 @@ pub struct ActivationOptions {
     pub entry: Option<String>,
     /// The `[box] name` of the box's spec (BCLI-069).
     pub box_name: Option<String>,
-    /// Ask for a fresh instance, `<name>-<n>` (BCLI-070).
-    pub fresh_instance: bool,
     /// The `--quic443` of a start (BCLI-024). `min session activate` does
     /// not take the flag.
     pub quic443: Option<boxes::core::bep::Quic443>,
@@ -1490,12 +1492,19 @@ pub(crate) struct ProjectEgress {
     /// layer sets the key. A session box takes them, and each `--ingress`
     /// adds one mapping after them (#3238).
     pub(crate) ingress: Option<Vec<boxes::PortMapping>>,
-    /// The table whose `network` the expanded entry holds, as the file
-    /// names it: `[defaults]`, `[defaults.<type>]` or the entry's own, such
-    /// as `[tasks.build]`. A later layer replaces the whole `network` table
-    /// of an earlier one, so one table holds all of it. `None` when no
+    /// The table that set the expanded entry's `network.egress`, as the
+    /// file names it: `[defaults]`, `[defaults.<type>]` or the entry's own,
+    /// such as `[tasks.build]`. The `network` table merges by key, so each
+    /// key can come from its own layer (gominimal/arch#188). With no
+    /// egress, the last table that declares `network`. `None` when no
     /// layer declares `network`.
     pub(crate) layer: Option<String>,
+    /// The table that set the expanded entry's `network.mode`, named as
+    /// [`ProjectEgress::layer`] names a table. `None` when no layer sets it.
+    pub(crate) mode_layer: Option<String>,
+    /// The table that set the expanded entry's `network.ingress`, named as
+    /// [`ProjectEgress::layer`] names a table. `None` when no layer sets it.
+    pub(crate) ingress_layer: Option<String>,
 }
 
 /// The loadout mode of the session box a start creates, from the project
@@ -1843,9 +1852,9 @@ pub(crate) fn entry_egress(
         body: network_of(&entry.body),
         ..entry
     };
-    // The merge replaces a table whole, so the last layer that declares
-    // `network` holds the expanded entry's `network` table.
-    let layer = if !entry.body.is_empty() {
+    // The last layer that declares `network`, for a key whose layer the
+    // report does not name.
+    let last_layer = if !entry.body.is_empty() {
         format!("[{}.{}]", entry.table.key(), entry.name)
     } else if !layers.defaults_type.is_empty() {
         format!(
@@ -1863,6 +1872,27 @@ pub(crate) fn entry_egress(
     // start with exit 3, as every invalid `minimal.toml` does.
     let hints = mfile::network::canonicalize(&mut expansion.spec)
         .map_err(|error| network_key_invalid(&expansion.spec, error))?;
+    // The merge keeps each key below `network` from the layer that set it
+    // (gominimal/arch#188), so each key names its own table.
+    let layer_of = |key: &str| {
+        expansion
+            .report
+            .network
+            .get(key)
+            .and_then(|origin| network_layer_words(origin, &entry))
+    };
+    // A flat `egress_*` key, which `canonicalize` folded into `egress`,
+    // sets egress too. The merge keeps only one layer of them.
+    let layer = std::iter::once("egress")
+        .chain(
+            mfile::network::FLAT_EGRESS_KEYS
+                .iter()
+                .map(|(flat, _)| *flat),
+        )
+        .find_map(layer_of)
+        .unwrap_or_else(|| last_layer.clone());
+    let mode_layer = layer_of("mode");
+    let ingress_layer = layer_of("ingress");
     let network = expansion.spec.get("network");
     // `canonicalize` has rewritten a legacy spelling and refused a value
     // that is not a mode, so the word is a current one.
@@ -1886,6 +1916,8 @@ pub(crate) fn entry_egress(
             mode,
             ingress,
             layer: Some(layer),
+            mode_layer,
+            ingress_layer,
         });
     };
     let mut egress: boxes::EgressPolicy =
@@ -1903,7 +1935,27 @@ pub(crate) fn entry_egress(
         mode,
         ingress,
         layer: Some(layer),
+        mode_layer,
+        ingress_layer,
     })
+}
+
+/// The minimal.toml table of `origin`, a layer that [`entry_egress`]
+/// reads. `None` for a layer that the read does not hold.
+fn network_layer_words(
+    origin: &mfile::expand::Origin,
+    entry: &mfile::entry::BoxEntry,
+) -> Option<String> {
+    use mfile::expand::Layer;
+    match origin.layer {
+        Layer::Entry => Some(format!("[{}.{}]", entry.table.key(), entry.name)),
+        Layer::DefaultsType => Some(format!(
+            "[defaults.{}]",
+            entry.box_type.as_deref().unwrap_or_default()
+        )),
+        Layer::Defaults => Some("[defaults]".to_owned()),
+        _ => None,
+    }
 }
 
 /// One `network.ingress` item of a `minimal.toml`, as `box.toml` writes it:
@@ -3849,16 +3901,6 @@ pub(crate) fn add_vpn_network_names(
     Ok(())
 }
 
-/// Marks `request` as a fresh instance (BCLI-070, BOX-163). The daemon
-/// names the box `<name>-<n>`, with the smallest `n` no retained box uses,
-/// and never refuses it for a held name. The client invents no name, so the
-/// request carries none. `min task run` and `min box run` create every box
-/// this way.
-pub(crate) fn request_fresh_instance(request: &mut minimald_rpc::CreateSessionRequest) {
-    request.config.name = None;
-    request.fresh_instance = true;
-}
-
 /// The name the daemon gives the box `request` creates, when the create
 /// is not a fresh instance (BOX-211): the request's name, which carries
 /// `--name` or the entry's `[box] name`, else the name the daemon derives
@@ -4761,12 +4803,6 @@ pub(crate) async fn activate_box(
     let mut request =
         minimald_rpc::CreateSessionRequest::new(String::new(), abs_path.clone(), network, policy);
     request.config.name = request_name(args.name.as_deref());
-    // BCLI-070: `--new` asks for a fresh instance, `<name>-<n>`. The
-    // spec stamp puts `--name` or the entry's `[box] name` back on the
-    // request, as the base of the name.
-    if options.fresh_instance {
-        request_fresh_instance(&mut request);
-    }
     request.config.hooks_enabled = !args.no_hooks;
     request.config.creating_verb = minimald_rpc::CreatingVerb::Session;
     // The version gate: a daemon of another build refuses the create
@@ -5082,8 +5118,8 @@ pub(crate) async fn activate_box(
     // BOX-163: a box the person did not name takes its entry's name. A
     // create under a name that a running box holds, the entry's name or a
     // `--name`, is refused: the command ends with exit 2, naming the
-    // holder. Only a run (`min task run`, `min box run`) asks for a fresh
-    // instance, `<name>-<n>` ([`request_fresh_instance`]).
+    // holder. Only an interactive task asks for a fresh instance,
+    // `<name>-<n>` (`crate::task`).
     let created = ActivationStep::CreateSession
         .run(async {
             let created = {
@@ -6048,7 +6084,6 @@ mod tests {
                 entry: bad.clone(),
                 box_type: Some(boxes::TASK_BOX_TYPE.to_owned()),
             },
-            StartEntryRefusal::NameUnsupported { entry: bad.clone() },
             StartEntryRefusal::TaskNotInTasks { entry: bad.clone() },
             StartEntryRefusal::UnsupportedType {
                 entry: bad.clone(),

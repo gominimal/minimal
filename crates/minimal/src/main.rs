@@ -863,6 +863,7 @@ mod tests {
         let cmd = Some(Command::Task(minimal::TaskArgs {
             command: minimal::TaskCommand::Run(minimal::TaskRunArgs {
                 task: "build".to_string(),
+                name: None,
                 network: None,
                 egress: minimal::EgressArgs::default(),
                 other: minimal::BoxOverrideArgs::default(),
@@ -1465,7 +1466,6 @@ mod tests {
                 2,
             ),
             (StartEntryRefusal::DefaultBlocked { box_type: None }, 2),
-            (StartEntryRefusal::NameUnsupported { entry: entry() }, 2),
             (StartEntryRefusal::TaskNotInTasks { entry: entry() }, 2),
             (
                 StartEntryRefusal::UnsupportedType {

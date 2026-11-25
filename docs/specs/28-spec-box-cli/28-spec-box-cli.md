@@ -262,12 +262,12 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     <!-- event-driven; the rows `min session hooks` lists today (11-spec-lifecycle-hooks, Disabling and listing). The ruling on gominimal/minimal#2877 keeps each hook's declarer in the stored spec, so `min box spec <box>` lists every column `min session hooks` lists today; the BOX amendment that names the field is in the Rollout. A box created with `--no-hooks` (BCLI-076) carries no hook -->
     tier:   T0
     verify: cargo nextest run -p minimal box_spec_box_lists_hooks_with_declarer
-  - WHEN `min box spec <box>` renders a stored spec THE SYSTEM SHALL show the box's name as its record holds it, and say whether a person wrote the name or the host derived it.
-    <!-- event-driven; gominimal/arch#195: a box's name is held in the box record with its origin (BOX-228) and never read from its Box Spec (BOX-227). So after a rename this shows the new name -->
+  - WHEN `min box spec <box>` renders a stored spec in the TOML form THE SYSTEM SHALL show the box's name as its record holds it, and say whether a person wrote the name or the host derived it.
+    <!-- event-driven; gominimal/arch#195: a box's name is held in the box record with its origin (BOX-228) and never read from its Box Spec (BOX-227). So after a rename this shows the new name. The TOML form shows it as comment lines. The `-o json` and `-o yaml` forms render the spec only: `min box show -o json` and `min box list -o json` (`min/v1/box`) carry the name and its origin, so one fact keeps one home -->
     tier:   T0
     verify: cargo nextest run -p minimal box_spec_box_shows_record_name_and_origin
-  - WHERE the stored spec sets `[box] name` THE SYSTEM SHALL label that value in `min box spec <box>` as the entry's default name request, and never as the box's name.
-    <!-- optional-feature; gominimal/arch#195: `[box] name` stays a key of the entry, read only at creation as the requested name (BCLI-079). After a rename it differs from the box's name -->
+  - WHERE the stored spec sets `[box] name` THE SYSTEM SHALL label that value in the TOML form of `min box spec <box>` as the entry's default name request, and never as the box's name.
+    <!-- optional-feature; gominimal/arch#195: `[box] name` stays a key of the entry, read only at creation as the requested name (BCLI-079). After a rename it differs from the box's name. The `-o json` and `-o yaml` forms carry the key as the spec stores it, with no label -->
     tier:   T0
     verify: cargo nextest run -p minimal box_spec_box_labels_box_name_as_default_request
 
@@ -305,6 +305,12 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     <!-- optional-feature; the owner's 2026-11-09 ruling (gominimal/minimal#3159): both flags only narrow, so they apply after deny-all. `--deny-subnets` adds its ranges to the `deny_subnets` the layers below give -->
     tier:   T0
     verify: cargo nextest run -p minimal deny_all_egress_then_allow_protocols_sets_protocol_list
+  - WHEN `--network none` is given THE SYSTEM SHALL clear the `egress` and `ingress` that earlier layers set, as a layer's `mode = "none"` does (BOX-048). Every other override flag SHALL still change only the key it names.
+    <!-- event-driven; gominimal/arch#200. A `none` box refuses egress (NET-065), so without the clear an inherited `egress` would refuse `--network none` on a file that a layer's `mode = "none"` accepts. An egress flag given with `--network none` is still refused -->
+    tier:   T0
+    verify: cargo nextest run -p minimal network_none_flag_drops_file_egress_and_ingress_in_box_spec
+    verify: cargo nextest run -p minimal network_none_flag_drops_file_egress_and_ingress_on_start
+    verify: cargo nextest run -p minimal network_none_flag_drops_file_egress_and_ingress_on_task_run
 
 - **BCLI-073** WHERE the `loadout_mode` that BOX-064's layers up to and including the entry set is `open`, WHEN `min box start` or `min session start` runs with `--loadout <l>` THE SYSTEM SHALL pass each loadout that `--loadout` names to BOX-064's selected-loadouts layer. The stored spec SHALL hold each of them.
   <!-- event-driven with a precondition; the architecture's `session start` and `box start` carry `--loadout <l>…` (gominimal/arch#124), a per-invocation Loadout Entry. The gate reads the effective mode, as the owner ruled on gominimal/minimal#3069 (BOX-166, BOX-167, BOX-170), so a session entry gets `open` from its type default (BOX-168) unless a project layer sets `sealed`. `upstream-only` is no mode: the owner dropped it on 2026-11-05, and BOX-174 refuses any value but `sealed` and `open` -->

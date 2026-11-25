@@ -198,6 +198,12 @@ pub struct ExpansionReport {
     /// The layer that set each variable of `env_vars`, by variable name
     /// (BOX-180).
     pub env_vars: BTreeMap<String, Origin>,
+    /// The layer that set each key of the `network` table, by the key's
+    /// name below `network`: `mode`, `egress`, `ingress`, `bep`. The
+    /// `network` table merges by these keys, so each one can come from its
+    /// own layer (gominimal/arch#188). `values["network"]` names the last
+    /// layer that set any of them.
+    pub network: BTreeMap<String, Origin>,
     /// One warning for each variable of the spec's `env_vars` whose name
     /// looks like a secret's, in name order (BOX-231). The expansion goes
     /// on, and the spec keeps the value as written (BOX-230).
@@ -1456,9 +1462,13 @@ fn secret_name_warnings(entry: &BoxEntry, loadouts: &[LoadoutLayer], expansion: 
 /// the command, so a layer replaces such a list whole and keeps every item.
 const ARGV_KEYS: &[&str] = &["cmdcmd", "exec"];
 
+/// The key of the spec's network settings, which merges by key.
+const NETWORK_KEY: &str = "network";
+
 /// Merges one key of a layer into the spec: a list onto a list unions,
 /// each item once, and any other value replaces the spec's. An argument
-/// vector (`ARGV_KEYS`) always replaces, item for item.
+/// vector (`ARGV_KEYS`) always replaces, item for item. A `network` table
+/// merges onto a `network` table by key, as [`merge_network`] says.
 fn merge_value(
     spec: &mut toml::Table,
     report: &mut ExpansionReport,
@@ -1466,6 +1476,10 @@ fn merge_value(
     value: &toml::Value,
     origin: &Origin,
 ) {
+    if key == NETWORK_KEY {
+        merge_network(spec, report, value, origin);
+        return;
+    }
     if ARGV_KEYS.contains(&key) {
         let value_origin = match value {
             toml::Value::Array(items) => ValueOrigin::List(vec![origin.clone(); items.len()]),
@@ -1503,6 +1517,70 @@ fn merge_value(
     };
     spec.insert(key.to_owned(), value);
     report.values.insert(key.to_owned(), value_origin);
+}
+
+/// Merges a layer's `network` value into the spec (BOX-048,
+/// gominimal/arch#188). A table onto a table merges by key: each key the
+/// layer sets below `network`, such as `mode`, `egress`, `ingress` or
+/// `bep`, replaces the spec's key whole, and the keys the layer does not
+/// set stay. Inside a sub-table nothing merges, so a later `egress`
+/// replaces an earlier one whole (NET-060). The flat `egress_*` keys and
+/// `egress` spell one setting, so a layer that sets any of them replaces
+/// all of them. A layer whose `mode` is `none` clears the egress and the
+/// ingress it inherits. Its own egress or ingress stays, for
+/// [`crate::network::canonicalize`] to refuse. Any other value replaces the
+/// whole `network` value. The report keeps the layer of each key below
+/// `network`.
+fn merge_network(
+    spec: &mut toml::Table,
+    report: &mut ExpansionReport,
+    value: &toml::Value,
+    origin: &Origin,
+) {
+    report
+        .values
+        .insert(NETWORK_KEY.to_owned(), ValueOrigin::Value(origin.clone()));
+    let (Some(toml::Value::Table(have)), toml::Value::Table(add)) =
+        (spec.get_mut(NETWORK_KEY), value)
+    else {
+        spec.insert(NETWORK_KEY.to_owned(), value.clone());
+        report.network.clear();
+        if let toml::Value::Table(add) = value {
+            for sub in add.keys() {
+                report.network.insert(sub.clone(), origin.clone());
+            }
+        }
+        return;
+    };
+    let egress_keys = || {
+        std::iter::once("egress").chain(crate::network::FLAT_EGRESS_KEYS.iter().map(|(f, _)| *f))
+    };
+    let mode_none = add
+        .get("mode")
+        .and_then(toml::Value::as_str)
+        .and_then(crate::network::canonical_mode)
+        == Some("none");
+    let mut cleared: Vec<&str> = Vec::new();
+    if mode_none || egress_keys().any(|key| add.contains_key(key)) {
+        cleared.extend(egress_keys());
+    }
+    if mode_none {
+        cleared.push("ingress");
+    }
+    for key in cleared {
+        if have.remove(key).is_some() && mode_none && !add.contains_key(key) {
+            tracing::debug!(
+                key = %format!("network.{key}"),
+                layer = ?origin.layer,
+                "mode = \"none\" clears the inherited key"
+            );
+        }
+        report.network.remove(key);
+    }
+    for (sub, item) in add {
+        have.insert(sub.clone(), item.clone());
+        report.network.insert(sub.clone(), origin.clone());
+    }
 }
 
 /// A copy of `table` with every table, at every depth, in key order.
@@ -1901,51 +1979,169 @@ mod tests {
     }
 
     proptest! {
-        // BOX-048 property: for every pair of layers, merging unions list
+        // BOX-048 property: for every run of layers, merging unions list
         // values in layer order and replaces scalars and tables with the
-        // more specific layer's.
+        // more specific layer's. The `network` table merges by key
+        // (gominimal/arch#188), as `expected_network` works it out.
         #[test]
         fn defaults_merge_lists_union_scalars_replace_property(
-            general in layer_strategy(),
-            specific in layer_strategy(),
+            layers in proptest::collection::vec(layer_with_network_strategy(), 2..=4),
         ) {
-            let merged = fold(&[
-                (Origin::of(Layer::Defaults), &general),
-                (Origin::of(Layer::DefaultsType), &specific),
-            ]);
-            let keys: BTreeSet<&String> = general.keys().chain(specific.keys()).collect();
+            let ordered: Vec<(Origin, &toml::Table)> = Layer::ORDER
+                .iter()
+                .zip(&layers)
+                .map(|(layer, t)| (Origin::of(*layer), t))
+                .collect();
+            let merged = fold(&ordered);
+            let keys: BTreeSet<&String> = layers.iter().flat_map(toml::Table::keys).collect();
             prop_assert_eq!(merged.spec.len(), keys.len());
             for key in keys {
-                let got = &merged.spec[key.as_str()];
-                match (general.get(key), specific.get(key)) {
-                    (Some(toml::Value::Array(a)), Some(toml::Value::Array(b))) => {
-                        let mut want: Vec<toml::Value> = Vec::new();
-                        for item in a.iter().chain(b) {
-                            if !want.contains(item) {
-                                want.push(item.clone());
-                            }
-                        }
-                        prop_assert_eq!(got, &toml::Value::Array(want));
-                    }
-                    (_, Some(toml::Value::Array(b))) => {
-                        let mut want: Vec<toml::Value> = Vec::new();
-                        for item in b {
-                            if !want.contains(item) {
-                                want.push(item.clone());
-                            }
-                        }
-                        prop_assert_eq!(got, &toml::Value::Array(want));
-                    }
-                    (_, Some(v)) => prop_assert_eq!(got, v),
-                    (Some(toml::Value::Array(a)), None) => {
-                        let unique: BTreeSet<String> = a.iter().map(ToString::to_string).collect();
-                        prop_assert_eq!(got.as_array().map(Vec::len), Some(unique.len()));
-                    }
-                    (Some(v), None) => prop_assert_eq!(got, v),
-                    (None, None) => unreachable!("the key is in one layer"),
+                if key == NETWORK_KEY {
+                    continue;
                 }
+                prop_assert_eq!(
+                    merged.spec.get(key.as_str()).cloned(),
+                    expected_value(&layers, key)
+                );
+            }
+
+            let last_network = layers.iter().rposition(|l| l.contains_key(NETWORK_KEY));
+            prop_assert_eq!(
+                merged.report.values.get(NETWORK_KEY).and_then(ValueOrigin::first),
+                last_network.map(|i| &ordered[i].0)
+            );
+            let want = expected_network(&layers);
+            let got = merged.spec.get(NETWORK_KEY).and_then(toml::Value::as_table);
+            prop_assert_eq!(got.is_some(), last_network.is_some());
+            let got_keys: BTreeSet<&String> = got.map(|t| t.keys().collect()).unwrap_or_default();
+            let want_keys: BTreeSet<&String> = want.keys().collect();
+            prop_assert_eq!(&got_keys, &want_keys);
+            let report_keys: BTreeSet<&String> = merged.report.network.keys().collect();
+            prop_assert_eq!(&report_keys, &want_keys);
+            for (key, (at, value)) in &want {
+                // Each key comes whole from the most specific layer that
+                // sets it, and the report names that layer.
+                prop_assert_eq!(got.and_then(|t| t.get(key.as_str())), Some(*value));
+                prop_assert_eq!(merged.report.network.get(key.as_str()), Some(&ordered[*at].0));
             }
         }
+    }
+
+    /// The egress keys below `network`: `egress` and its flat spellings.
+    /// A layer that sets one of them replaces all of them.
+    fn is_egress_key(key: &str) -> bool {
+        key == "egress"
+            || crate::network::FLAT_EGRESS_KEYS
+                .iter()
+                .any(|(f, _)| *f == key)
+    }
+
+    /// The expected `network` keys over `layers`, each with the index of
+    /// the layer it comes from, worked out per key and not by a fold. The
+    /// last layer that sets a key decides its value. A later layer drops
+    /// the key when it sets `mode = "none"` and the key is an egress key
+    /// or `ingress`, or when it sets any egress key and the key is one.
+    fn expected_network(layers: &[toml::Table]) -> BTreeMap<String, (usize, &toml::Value)> {
+        let network = |l: &toml::Table| l.get(NETWORK_KEY).and_then(toml::Value::as_table).cloned();
+        let tables: Vec<Option<toml::Table>> = layers.iter().map(network).collect();
+        let mut want = BTreeMap::new();
+        let keys: BTreeSet<&String> = tables
+            .iter()
+            .flatten()
+            .flat_map(toml::Table::keys)
+            .collect();
+        for key in keys {
+            let Some(at) = tables
+                .iter()
+                .rposition(|t| t.as_ref().is_some_and(|t| t.contains_key(key)))
+            else {
+                continue;
+            };
+            let dropped = tables[at + 1..].iter().flatten().any(|later| {
+                let mode_none = later
+                    .get("mode")
+                    .and_then(toml::Value::as_str)
+                    .and_then(crate::network::canonical_mode)
+                    == Some("none");
+                let clears_egress = mode_none || later.keys().any(|k| is_egress_key(k));
+                (is_egress_key(key) && clears_egress) || (key == "ingress" && mode_none)
+            });
+            if !dropped {
+                let value = layers[at][NETWORK_KEY]
+                    .as_table()
+                    .and_then(|t| t.get(key.as_str()));
+                want.insert(key.clone(), (at, value.expect("the layer sets the key")));
+            }
+        }
+        want
+    }
+
+    /// A `network` table with any of `mode`, `egress`, `ingress`, `bep`
+    /// and the flat `egress_*` keys.
+    fn network_strategy() -> impl Strategy<Value = toml::Value> {
+        let mode = prop_oneof![
+            Just("none"),
+            Just("no-net"),
+            Just("host_ip"),
+            Just("own_ip"),
+        ]
+        .prop_map(|m| toml::Value::String(m.to_owned()));
+        let hosts = proptest::collection::vec("[a-c]".prop_map(toml::Value::String), 0..3)
+            .prop_map(toml::Value::Array);
+        let egress = hosts.clone().prop_map(|h| {
+            let mut t = toml::Table::new();
+            t.insert("allow_dns_hosts".to_owned(), h);
+            toml::Value::Table(t)
+        });
+        let ingress = (1..4i64).prop_map(|port| {
+            let mut t = toml::Table::new();
+            t.insert("proto".to_owned(), toml::Value::String("tcp".to_owned()));
+            t.insert("port".to_owned(), toml::Value::Integer(port));
+            toml::Value::Array(vec![toml::Value::Table(t)])
+        });
+        let bep = any::<bool>().prop_map(|b| {
+            let mut t = toml::Table::new();
+            t.insert("enabled".to_owned(), toml::Value::Boolean(b));
+            toml::Value::Table(t)
+        });
+        let flat = (0..crate::network::FLAT_EGRESS_KEYS.len(), hosts)
+            .prop_map(|(i, h)| (crate::network::FLAT_EGRESS_KEYS[i].0.to_owned(), h));
+        (
+            proptest::option::of(mode),
+            proptest::option::of(egress),
+            proptest::option::of(ingress),
+            proptest::option::of(bep),
+            proptest::option::of(flat),
+        )
+            .prop_map(|(mode, egress, ingress, bep, flat)| {
+                let mut t = toml::Table::new();
+                let named = [
+                    ("mode", mode),
+                    ("egress", egress),
+                    ("ingress", ingress),
+                    ("bep", bep),
+                ];
+                for (key, value) in named {
+                    if let Some(value) = value {
+                        t.insert(key.to_owned(), value);
+                    }
+                }
+                if let Some((key, value)) = flat {
+                    t.insert(key, value);
+                }
+                toml::Value::Table(t)
+            })
+    }
+
+    /// A layer from [`layer_strategy`] that can also carry a `network`
+    /// table.
+    fn layer_with_network_strategy() -> impl Strategy<Value = toml::Table> {
+        (layer_strategy(), proptest::option::of(network_strategy())).prop_map(|(mut l, n)| {
+            if let Some(n) = n {
+                l.insert(NETWORK_KEY.to_owned(), n);
+            }
+            l
+        })
     }
 
     /// A layer of a few keys, each a scalar, a list of strings or a table.
@@ -2158,6 +2354,207 @@ mod tests {
             overrides: table("timeout = \"30m\""),
             ..Layers::default()
         }
+    }
+
+    // BOX-048, gominimal/arch#188, #3597: a later layer that sets one key
+    // of `network` keeps the other keys of an earlier layer. A key that two
+    // layers set comes whole from the later one. The report names the
+    // layer of each key below `network`.
+    #[test]
+    fn network_merges_by_sub_table() {
+        let file = r#"
+            [defaults.network.egress]
+            allow_dns_hosts = ["a.example"]
+            deny_subnets = ["10.0.0.0/8"]
+
+            [defaults.session.network.bep]
+            proxy_env = true
+
+            [sessions.dev]
+            network = { mode = "own_ip", egress = { deny_subnets = ["192.168.0.0/16"] } }
+        "#;
+        let e = expand_in(file, "dev", Layers::default()).expect("expands");
+        // The entry's `egress` replaces the defaults' `egress` whole: its
+        // `allow_dns_hosts` does not carry over (NET-060).
+        assert_eq!(
+            e.spec["network"],
+            toml::Value::Table(table(indoc::indoc! {r#"
+                mode = "own_ip"
+                bep = { proxy_env = true }
+                egress = { deny_subnets = ["192.168.0.0/16"] }
+            "#}))
+        );
+        let layer_of = |key: &str| e.report.network.get(key).map(|o| o.layer);
+        assert_eq!(layer_of("bep"), Some(Layer::DefaultsType));
+        assert_eq!(layer_of("egress"), Some(Layer::Entry));
+        assert_eq!(layer_of("mode"), Some(Layer::Entry));
+        assert_eq!(
+            e.report.values["network"],
+            ValueOrigin::Value(Origin::of(Layer::Entry))
+        );
+
+        // Without the entry's `network`, each sub-table keeps its own layer.
+        let file = file.split("[sessions.dev]").next().unwrap_or_default();
+        let file = format!("{file}[sessions.dev]\n");
+        let e = expand_in(&file, "dev", Layers::default()).expect("expands");
+        let network = e.spec["network"].as_table().expect("a table");
+        assert_eq!(
+            network["egress"],
+            toml::Value::Table(table(
+                "allow_dns_hosts = [\"a.example\"]\ndeny_subnets = [\"10.0.0.0/8\"]"
+            ))
+        );
+        assert_eq!(
+            network["bep"],
+            toml::Value::Table(table("proxy_env = true"))
+        );
+        assert_eq!(
+            e.report.network.get("egress").map(|o| o.layer),
+            Some(Layer::Defaults)
+        );
+        assert_eq!(
+            e.report.network.get("bep").map(|o| o.layer),
+            Some(Layer::DefaultsType)
+        );
+
+        // A value that is not a table replaces the whole `network` value.
+        let replaced = fold(&[
+            (
+                Origin::of(Layer::Defaults),
+                &table("network = { mode = \"host_ip\" }"),
+            ),
+            (Origin::of(Layer::Entry), &table("network = \"x\"")),
+        ]);
+        assert_eq!(replaced.spec["network"].as_str(), Some("x"));
+        assert!(replaced.report.network.is_empty());
+
+        // A flat egress key in a later layer replaces an earlier `egress`
+        // table, and the other way round.
+        let flat = fold(&[
+            (
+                Origin::of(Layer::Defaults),
+                &table("network = { egress = { allow_dns_hosts = [\"a\"] } }"),
+            ),
+            (
+                Origin::of(Layer::Entry),
+                &table("network = { egress_allow_dns = [\"b\"] }"),
+            ),
+        ]);
+        assert_eq!(
+            flat.spec["network"],
+            toml::Value::Table(table("egress_allow_dns = [\"b\"]"))
+        );
+        let nested = fold(&[
+            (
+                Origin::of(Layer::Defaults),
+                &table("network = { egress_allow_dns = [\"b\"] }"),
+            ),
+            (
+                Origin::of(Layer::Entry),
+                &table("network = { egress = { allow_dns_hosts = [\"a\"] } }"),
+            ),
+        ]);
+        assert_eq!(
+            nested.spec["network"],
+            toml::Value::Table(table("egress = { allow_dns_hosts = [\"a\"] }"))
+        );
+        assert!(!nested.report.network.contains_key("egress_allow_dns"));
+
+        // A command-line flag layer merges the same way: it sets `mode` and
+        // keeps the file's `egress`.
+        let flagged = fold(&[
+            (
+                Origin::of(Layer::Defaults),
+                &table("network = { egress = { allow_dns_hosts = [\"a\"] } }"),
+            ),
+            (
+                Origin::of(Layer::Overrides),
+                &table("network = { mode = \"own_ip\" }"),
+            ),
+        ]);
+        let network = flagged.spec["network"].as_table().expect("a table");
+        assert!(network.contains_key("egress"));
+        assert_eq!(
+            flagged.report.network.get("mode").map(|o| o.layer),
+            Some(Layer::Overrides)
+        );
+    }
+
+    // gominimal/arch#188: a later layer's `mode = "none"` clears the
+    // `egress` and the `ingress` it inherits, and keeps the other keys. The
+    // canonical read then takes the entry without a refusal.
+    #[test]
+    fn network_merges_by_sub_table_mode_none_clears_inherited_egress_and_ingress() {
+        let file = r#"
+            [defaults.network]
+            mode = "own_ip"
+            egress = { allow_dns_hosts = ["a.example"] }
+            egress_deny_subnets = ["10.0.0.0/8"]
+            ingress = [{ proto = "tcp", port = 8080 }]
+            bep = { proxy_env = true }
+
+            [tasks.offline]
+            network = { mode = "none" }
+        "#;
+        let mut e = expand_in(file, "offline", Layers::default()).expect("expands");
+        assert_eq!(
+            e.spec["network"],
+            toml::Value::Table(table("mode = \"none\"\nbep = { proxy_env = true }"))
+        );
+        for key in ["egress", "egress_deny_subnets", "ingress"] {
+            assert!(!e.report.network.contains_key(key), "{key}");
+        }
+        assert_eq!(
+            e.report.network.get("bep").map(|o| o.layer),
+            Some(Layer::Defaults)
+        );
+        assert_eq!(
+            e.report.network.get("mode").map(|o| o.layer),
+            Some(Layer::Entry)
+        );
+        crate::network::canonicalize(&mut e.spec).expect("mode none without egress is valid");
+
+        // The legacy spelling clears the same keys.
+        let legacy = fold(&[
+            (
+                Origin::of(Layer::Defaults),
+                &table("network = { egress = { allow_dns_hosts = [\"a\"] } }"),
+            ),
+            (
+                Origin::of(Layer::Entry),
+                &table("network = { mode = \"no-net\" }"),
+            ),
+        ]);
+        assert_eq!(
+            legacy.spec["network"],
+            toml::Value::Table(table("mode = \"no-net\""))
+        );
+    }
+
+    // gominimal/arch#188, BOX-080: `mode = "none"` with an `egress` that
+    // the same layer sets is still refused. `min` exits 3 on the refusal.
+    #[test]
+    fn network_merges_by_sub_table_mode_none_with_own_egress_is_refused() {
+        let file = r#"
+            [defaults.network.egress]
+            allow_dns_hosts = ["a.example"]
+
+            [tasks.offline.network]
+            mode = "none"
+            egress = { deny_subnets = ["10.0.0.0/8"] }
+        "#;
+        let mut e = expand_in(file, "offline", Layers::default()).expect("expands");
+        assert_eq!(
+            e.spec["network"]["egress"],
+            toml::Value::Table(table("deny_subnets = [\"10.0.0.0/8\"]"))
+        );
+        let err = crate::network::canonicalize(&mut e.spec).expect_err("refused");
+        assert_eq!(
+            err,
+            crate::network::NetworkError::ModeNoneWithEgress {
+                key: "network.egress.deny_subnets".to_owned()
+            }
+        );
     }
 
     // BOX-065: one file and one set of overrides expand to the same bytes

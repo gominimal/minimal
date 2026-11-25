@@ -1901,7 +1901,6 @@ mod tests {
                 verb: crate::StartVerb::Box,
                 entry: entry.map(str::to_owned),
                 name: None,
-                new: false,
                 detach: true,
                 overrides: crate::StartOverrideArgs::default(),
             };
@@ -2109,7 +2108,6 @@ mod tests {
             verb: crate::StartVerb::Box,
             entry: Some("dev".to_owned()),
             name: None,
-            new: false,
             detach: true,
             overrides: crate::StartOverrideArgs::default(),
         };

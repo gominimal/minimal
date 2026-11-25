@@ -43,8 +43,8 @@ mod tests {
         assert_eq!(request_name(Some("dev")).as_deref(), Some("dev"));
 
         // A create under a held name with no typed name is refused, and is
-        // never turned into a fresh instance. Only `min task run` asks for
-        // one.
+        // never turned into a fresh instance. Only an interactive task, which
+        // sends no spec, asks for one.
         let mut request = minimald_rpc::CreateSessionRequest::new(
             String::new(),
             paths::HostAbsPath::try_new("/home/u/code/foo").unwrap(),
