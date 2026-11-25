@@ -4031,8 +4031,8 @@ async fn held_name_holder(
 /// The error an own-address create ends with when the VM host refused its
 /// registration because a live row holds `held` (BOX-163). It is the
 /// held-name refusal a daemon create sends, so `min` exits 2. It names the
-/// holder's id when `holder` gives its id and name, and the held spelling
-/// alone when the holder could not be read.
+/// holder's id and state when `holder` gives its id and name, and the held
+/// spelling alone when the holder could not be read.
 pub(crate) fn registration_held_name_refusal(
     name: &str,
     held: &str,
@@ -4042,12 +4042,13 @@ pub(crate) fn registration_held_name_refusal(
         Some((id, name)) => (Some(id), name),
         None => (None, None),
     };
-    // A live row holds the name, so the holder runs.
+    // A live row holds the name, so a holder the daemon read runs. With
+    // no holder read, nothing says which box that is or its state.
     let refusal = minimald_rpc::HeldNameRefusal {
         name: name.to_string(),
         holder,
         holder_name: Some(holder_name.unwrap_or_else(|| held.to_string())),
-        state: Some("running".to_string()),
+        state: holder.map(|_| "running".to_string()),
     };
     tracing::info!(
         name = %refusal.name,

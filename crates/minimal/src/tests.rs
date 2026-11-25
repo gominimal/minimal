@@ -1892,8 +1892,8 @@ fn held_name_refusal_hides_the_holder_and_a_bad_name_exits_3() {
 
 /// BOX-163: an own-address create whose VM host registration is refused
 /// because a live row holds the name ends `min` with exit 2. The error names
-/// the holder's id, read from the daemon. When the holder cannot be read,
-/// it is still exit 2 and names the held spelling.
+/// the holder's id and state, read from the daemon. When the holder cannot
+/// be read, it is still exit 2 and names the held spelling, with no state.
 #[test]
 fn own_address_held_name_refusal_exits_2_and_names_the_holder() {
     let holder = boxes::SessionId::parse_str("0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b").unwrap();
@@ -1917,9 +1917,10 @@ fn own_address_held_name_refusal_exits_2_and_names_the_holder() {
         .downcast_ref::<minimald_rpc::HeldNameRefusal>()
         .expect("an unread holder is still exit 2");
     assert_eq!(refusal.holder, None);
+    assert_eq!(refusal.state, None);
     assert_eq!(
         format!("{unread:#}"),
-        "Cannot create a session named `dev`: the running session `Dev` holds that name. \
+        "Cannot create a session named `dev`: the session `Dev` holds that name. \
          Choose another name."
     );
     assert_eq!(
@@ -3887,7 +3888,7 @@ fn create_name_held_exit2_names_holder_hints_name_flag() {
     assert!(unread.downcast_ref::<StartNameHeld>().is_some());
     assert_eq!(
         format!("{unread:#}"),
-        "Cannot start dev. The running box dev holds the name dev. Run \
+        "Cannot start dev. The box dev holds the name dev. Run \
          min session start --new dev to create another box from the entry, or pass \
          --name <name> to give the box another name."
     );
