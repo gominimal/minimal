@@ -1298,14 +1298,15 @@ pub enum TaskCommand {
     Rm(BoxRmArgs),
 }
 
-// BCLI-069 gives `--name` to `min task run` too. It is not here yet: the
-// run path's `RunEntry` takes no box name, and the daemon names every run's
-// box `<entry>-<n>`. The start half is gominimal/minimal#3196. Add the flag
-// here and on `BoxRunArgs` when `RunEntry` takes a name.
+// BCLI-069: `--name` is the requested name of the run's box, in place of
+// the task's `[box] name`.
 #[derive(Debug, Args)]
 pub struct TaskRunArgs {
     /// Name of a task declared in the project's minimal.toml
     pub task: String,
+    /// Name the box. This replaces the `[box] name` in minimal.toml
+    #[arg(long)]
+    pub name: Option<String>,
     // BCLI-042: no `--path`. The global `-C <dir>` names the project.
     // The same values and parser as `min session activate --network`, with
     // help worded for a task box. With no flag, the box takes the task's
@@ -1330,12 +1331,15 @@ pub struct TaskRunArgs {
     pub args: Vec<String>,
 }
 
-// BCLI-010, BCLI-035, BCLI-070: `min box run <entry> [--detach] [-- <args>…]`.
-// BCLI-069's `--name` is not here yet. See the comment on `TaskRunArgs`.
+// BCLI-010, BCLI-035, BCLI-069, BCLI-070:
+// `min box run <entry> [--name <name>] [--detach] [-- <args>…]`.
 #[derive(Debug, Args)]
 pub struct BoxRunArgs {
     /// Name of an entry declared in the project's minimal.toml: a task
     pub entry: String,
+    /// Name the box. This replaces the `[box] name` in minimal.toml
+    #[arg(long)]
+    pub name: Option<String>,
     // BCLI-026: no `--path`. The global `-C <dir>` names the project.
     /// Start the box, print its id and return. The box gets no input
     #[arg(long)]

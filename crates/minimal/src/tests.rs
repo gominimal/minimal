@@ -2453,8 +2453,18 @@ fn task_run_parses_task_and_path() {
     assert_eq!(a.args, ["Alice"]);
 
     // A declared task arg is a `--<name>` flag; it passes through as-is.
-    let a = run_args(&["min", "task", "run", "greet", "--name", "Alice"]);
+    let a = run_args(&["min", "task", "run", "greet", "--who", "Alice"]);
     assert_eq!(a.task, "greet");
+    assert_eq!(a.args, ["--who", "Alice"]);
+    assert_eq!(a.name, None);
+
+    // BCLI-069: `--name` is `min`'s own flag and names the box, as
+    // `--detach` is. A task arg called `--name` goes after `--`.
+    let a = run_args(&["min", "task", "run", "greet", "--name", "Alice"]);
+    assert_eq!(a.name.as_deref(), Some("Alice"));
+    assert!(a.args.is_empty());
+    let a = run_args(&["min", "task", "run", "greet", "--", "--name", "Alice"]);
+    assert_eq!(a.name, None);
     assert_eq!(a.args, ["--name", "Alice"]);
 
     // `--` ends `min`'s own options: what follows is the task's.
@@ -2906,6 +2916,7 @@ async fn run_pty_entry_exit2_hints_start_new() {
             &global,
             BoxRunArgs {
                 entry: "default".into(),
+                name: None,
                 detach: false,
                 network: None,
                 egress: EgressArgs::default(),
@@ -2919,6 +2930,7 @@ async fn run_pty_entry_exit2_hints_start_new() {
             &global,
             TaskRunArgs {
                 task: "default".into(),
+                name: None,
                 network: None,
                 egress: EgressArgs::default(),
                 other: crate::BoxOverrideArgs::default(),
@@ -2996,6 +3008,7 @@ fn run_and_start_new_request_fresh_instance() {
     };
     let task_run = task::RunEntry::from(TaskRunArgs {
         task: "build".into(),
+        name: Some("ci-build".into()),
         network: Some(CliNetworkMode::OwnIp),
         egress: egress.clone(),
         other: crate::BoxOverrideArgs::default(),
@@ -3004,6 +3017,7 @@ fn run_and_start_new_request_fresh_instance() {
     });
     let box_run = task::RunEntry::from(BoxRunArgs {
         entry: "build".into(),
+        name: Some("ci-build".into()),
         detach: false,
         network: Some(CliNetworkMode::OwnIp),
         egress,
@@ -3012,6 +3026,9 @@ fn run_and_start_new_request_fresh_instance() {
     });
     assert_eq!(task_run.entry, box_run.entry);
     assert_eq!(task_run.args, box_run.args);
+    // BCLI-069: both carry `--name` as the requested name.
+    assert_eq!(task_run.box_name.as_deref(), Some("ci-build"));
+    assert_eq!(box_run.box_name.as_deref(), Some("ci-build"));
     // Both carry the network and egress flags to the one run path.
     assert_eq!(task_run.network, box_run.network);
     assert_eq!(task_run.egress, box_run.egress);
@@ -24879,6 +24896,7 @@ async fn task_run_broker_secret_unenrolled_exits_5() {
         &global,
         TaskRunArgs {
             task: "ci".into(),
+            name: None,
             network: None,
             egress: EgressArgs::default(),
             other: crate::BoxOverrideArgs::default(),
@@ -26811,12 +26829,7 @@ fn box_verbs_exist_with_arch_flags() {
     // The architecture's flags that are not in the model yet, each with the
     // issue that delivers it. When one of them lands, this test fails until
     // the flag moves from this table to `expected`.
-    const DEFERRED_ARCH_FLAGS: [(&str, &str, &str); 3] = [
-        (
-            "run",
-            "--name",
-            "https://github.com/gominimal/minimal/issues/3196",
-        ),
+    const DEFERRED_ARCH_FLAGS: [(&str, &str, &str); 2] = [
         (
             "run",
             "--ingress",
@@ -26847,7 +26860,13 @@ fn box_verbs_exist_with_arch_flags() {
         ),
         (
             "run",
-            &["--detach", "--network", "--no-loadouts", "--no-hooks"],
+            &[
+                "--name",
+                "--detach",
+                "--network",
+                "--no-loadouts",
+                "--no-hooks",
+            ],
         ),
         ("list", &["--all", "--type", "--parent", "--output"]),
         ("show", &["--network", "--output"]),

@@ -747,7 +747,7 @@ impl From<TaskRunArgs> for RunEntry {
             network: args.network,
             egress: args.egress,
             other: args.other,
-            box_name: None,
+            box_name: args.name,
             args: args.args,
         }
     }
@@ -762,7 +762,7 @@ impl From<BoxRunArgs> for RunEntry {
             network: args.network,
             egress: args.egress,
             other: args.other,
-            box_name: None,
+            box_name: args.name,
             args: args.args,
         }
     }
@@ -3177,6 +3177,7 @@ mod tests {
         };
         let args = TaskRunArgs {
             task: "deploy".into(),
+            name: None,
             network: None,
             egress: crate::EgressArgs::default(),
             other: crate::BoxOverrideArgs::default(),
@@ -3226,6 +3227,7 @@ mod tests {
         };
         let args = TaskRunArgs {
             task: "build".into(),
+            name: None,
             network: None,
             egress: crate::EgressArgs::default(),
             other: crate::BoxOverrideArgs::default(),
@@ -3283,6 +3285,7 @@ mod tests {
         };
         let args = TaskRunArgs {
             task: "build".into(),
+            name: None,
             network: None,
             egress: crate::EgressArgs::default(),
             other: crate::BoxOverrideArgs::default(),
