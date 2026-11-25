@@ -20193,6 +20193,30 @@ fn box_spec_keeps_earlier_network_egress_ingress_refusal_names_each_table() {
     );
 }
 
+// gominimal/arch#188: `network.egress` comes from `[defaults]`, and
+// `network.mode` and `network.ingress` from the entry. The refusal names
+// the entry's table for both keys, not the table of the egress.
+#[test]
+fn box_spec_keeps_earlier_network_egress_ingress_refusal_names_entry_table() {
+    let file = "[defaults.network.egress]\nallow_dns_hosts = [\"a\"]\n\n\
+                [sessions.dev]\n\
+                network = { mode = \"host_ip\", ingress = [{ proto = \"tcp\", port = 8080 }] }\n";
+    let (project, _global) = spec_project(file);
+    let root = camino::Utf8Path::from_path(project.path()).unwrap();
+    let options = ActivationOptions {
+        entry: Some("dev".to_owned()),
+        ..ActivationOptions::default()
+    };
+    let error = planned_session_request_checked(&ActivateArgs::unflagged(), &options, root)
+        .expect_err("a host_ip box cannot publish");
+    assert_eq!(
+        error.to_string(),
+        "[sessions.dev] in minimal.toml sets network.ingress, but the box is host_ip, so \
+         it cannot publish ports. Set network.mode = \"own_ip\" in [sessions.dev], or run \
+         the command again with --network own_ip."
+    );
+}
+
 /// A project whose session entry inherits `egress` and `ingress` from
 /// `[defaults.network]`, for the `--network none` cases.
 const NETWORK_NONE_FLAG_FILE: &str = "[defaults.network]\n\
