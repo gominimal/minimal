@@ -3823,8 +3823,7 @@ pub(crate) fn add_vpn_network_names(
 /// Marks `request` as a fresh instance (BCLI-070, BOX-163). The daemon
 /// names the box `<name>-<n>`, with the smallest `n` no retained box uses,
 /// and never refuses it for a held name. The client invents no name, so the
-/// request carries none. `min task run` and `min box run` create every box
-/// this way.
+/// request carries none.
 pub(crate) fn request_fresh_instance(request: &mut minimald_rpc::CreateSessionRequest) {
     request.config.name = None;
     request.fresh_instance = true;
