@@ -1073,6 +1073,9 @@ pub struct File {
     /// this project. Consumed by the `ProjectComposable` at
     /// `CreateSession` time.
     pub session: Option<Session>,
+    /// The `[project]` table: the name the project gives its boxes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<Project>,
 
     /// Any fields which are not understood by this version of minimal.
     #[serde(flatten)]
@@ -1096,6 +1099,20 @@ pub struct File {
     /// [`File::diagnostics`] and puts them on its own surface.
     #[serde(skip)]
     diagnostics: Vec<String>,
+}
+
+/// The `[project]` table of a `minimal.toml`.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct Project {
+    /// `[project] name`: the project name a box with no name of its own is
+    /// named from (BOX-214). It must be a DNS label (BOX-216).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Keys of `[project]` that this version does not know, such as a
+    /// misspelt `nmae`. The load warns about them, as it does for the
+    /// other tables' unknown fields.
+    #[serde(flatten)]
+    pub extra: HashMap<String, toml::Value>,
 }
 
 /// The entry keys that `[session]` and a task keep among their unknown
@@ -1629,6 +1646,7 @@ impl File {
         if self.extra.contains_key("harness") {
             return Err(Error::HarnessTable(self.mfile_path.clone()));
         }
+        self.declared_project_name()?;
         // serde takes one action key as `task.action` and leaves any other in
         // `task.extra`. Refuse the task here, before `unknown_field_warnings`
         // would misreport the extra action key as unknown and suggest an
@@ -2883,6 +2901,18 @@ impl File {
             ));
             was_unknown_fields = true;
         }
+        if let Some(project) = &self.project
+            && !project.extra.is_empty()
+        {
+            let mut keys: Vec<&str> = project.extra.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            warn(format!(
+                "unknown fields in [project] section of {}: {}",
+                shown,
+                keys.join(",")
+            ));
+            was_unknown_fields = true;
+        }
         if let Some(session) = &self.session
             && !session.extra.is_empty()
         {
@@ -2944,6 +2974,43 @@ impl File {
             tracing::debug!(file = %shown, "{line}");
         }
         lines
+    }
+
+    /// The project name (BOX-214): `[project] name` where the file declares
+    /// it, else the name of the project root directory converted as
+    /// BOX-215 states, else `box` for a file not loaded from disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidProjectName`] when `[project] name` is not a
+    /// DNS label (BOX-216). The declared name is never converted.
+    pub fn project_name(&self) -> Result<String, Error> {
+        if let Some(name) = self.declared_project_name()? {
+            return Ok(name.to_string());
+        }
+        // A root reached through `..` or `.` has no file name of its own, so
+        // it is resolved first: from `/work/web/sub`, `..` names `web`.
+        let root = self
+            .repo_path()
+            .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
+        Ok(root.as_deref().and_then(Path::file_name).map_or_else(
+            || boxes::box_name::NO_PROJECT_NAME.to_string(),
+            |dir| boxes::box_name::project_name_from_dir_bytes(dir.as_encoded_bytes()),
+        ))
+    }
+
+    /// `[project] name` when the file declares it, refused when it is not a
+    /// DNS label (BOX-216).
+    fn declared_project_name(&self) -> Result<Option<&str>, Error> {
+        let Some(name) = self.project.as_ref().and_then(|p| p.name.as_deref()) else {
+            return Ok(None);
+        };
+        if !boxes::box_name::is_dns_label(name) {
+            return Err(Error::InvalidProjectName {
+                value: name.to_string(),
+            });
+        }
+        Ok(Some(name))
     }
 
     /// Returns the path to the directory where the minimal file is located.
@@ -3649,6 +3716,7 @@ mod tests {
                 stdlib: Default::default(),
                 cache: Default::default(),
                 session: None,
+                project: None,
                 extra: HashMap::new(),
                 mfile_path: None,
                 content_hash: None,
@@ -4998,6 +5066,129 @@ mod tests {
         assert!(msg.contains("the `harness` key"), "{msg}");
         assert!(msg.contains("`name = \"x\"` under `[stack]`"), "{msg}");
         assert!(msg.starts_with(&path.display().to_string()), "{msg}");
+    }
+
+    /// BOX-214: the project name is `[project] name` where the file declares
+    /// it, else the root directory's name converted as BOX-215 states.
+    #[test]
+    fn project_name_declared_else_root_directory() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("My_Web App");
+        std::fs::create_dir(&root).unwrap();
+        let mfile = root.join(MFILE_NAME);
+
+        std::fs::write(&mfile, "[project]\nname = \"web\"\n").unwrap();
+        let file = File::from_dir(&root).unwrap();
+        assert_eq!(file.project_name().unwrap(), "web");
+        assert!(file.diagnostics().is_empty(), "{:?}", file.diagnostics());
+
+        std::fs::write(&mfile, "").unwrap();
+        let file = File::from_dir(&root).unwrap();
+        assert_eq!(file.project_name().unwrap(), "my-web-app");
+
+        // `.minimal/minimal.toml` takes the name of the folder above it.
+        let dot = root.join(".minimal");
+        std::fs::remove_file(&mfile).unwrap();
+        std::fs::create_dir(&dot).unwrap();
+        std::fs::write(dot.join(MFILE_NAME), "").unwrap();
+        let file = File::from_dir(&root).unwrap();
+        assert_eq!(file.project_name().unwrap(), "my-web-app");
+
+        // A file not loaded from disk has no root directory.
+        let file = File::from_toml_bytes(b"").unwrap();
+        assert_eq!(file.project_name().unwrap(), "box");
+    }
+
+    /// An unknown key in `[project]`, such as a misspelt `nmae`, is warned
+    /// about, and the project takes the directory's name.
+    #[test]
+    fn project_unknown_key_warns_and_name_comes_from_directory() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("web");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join(MFILE_NAME), "[project]\nnmae = \"other\"\n").unwrap();
+        let file = File::from_dir(&root).unwrap();
+        assert_eq!(file.project_name().unwrap(), "web");
+        assert!(
+            file.diagnostics()
+                .iter()
+                .any(|line| line.contains("unknown fields in [project] section")
+                    && line.contains("nmae")),
+            "{:?}",
+            file.diagnostics()
+        );
+    }
+
+    /// BOX-214: a project root reached through `..` takes the name of the
+    /// directory it resolves to, not `box`.
+    #[test]
+    fn project_name_resolves_a_relative_root() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("web");
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(root.join(MFILE_NAME), "").unwrap();
+        let file = File::from_dir(sub.join("..")).unwrap();
+        assert_eq!(file.project_name().unwrap(), "web");
+    }
+
+    /// BOX-215: a directory name's bytes convert to one DNS label, and a
+    /// name with nothing left gives `box`.
+    #[cfg(unix)]
+    #[test]
+    fn project_name_from_directory_bytes_is_dns_label() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempdir().unwrap();
+        let long = format!("{}..x", "A".repeat(62));
+        let cases: [(&[u8], String); 5] = [
+            (b"--Caf\xc3\xa9 Bar--", "caf-bar".to_string()),
+            (b"\xffweb\xfe\xfdapp", "web-app".to_string()),
+            ("日本".as_bytes(), "box".to_string()),
+            (b"___", "box".to_string()),
+            (long.as_bytes(), "a".repeat(62)),
+        ];
+        for (name, want) in cases {
+            let root = dir.path().join(std::ffi::OsStr::from_bytes(name));
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join(MFILE_NAME), "").unwrap();
+            let got = File::from_dir(&root).unwrap().project_name().unwrap();
+            assert_eq!(got, want, "{name:?}");
+            assert!(boxes::box_name::is_dns_label(&got), "{got}");
+        }
+    }
+
+    /// BOX-216: a `[project] name` that is not a DNS label refuses the load
+    /// with exit 3, names the key, quotes the value and states the rule. It
+    /// is never converted into a label.
+    #[test]
+    fn invalid_project_name_exit3_not_converted() {
+        let dir = tempdir().unwrap();
+        for bad in ["my_app", "-web", "web-", "", "caf\u{e9}"] {
+            let text = format!("[project]\nname = {bad:?}\n");
+            std::fs::write(dir.path().join(MFILE_NAME), &text).unwrap();
+            let err = File::from_dir(dir.path()).unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidProjectName { value } if value == bad),
+                "{err:?}"
+            );
+            assert_eq!(err.exit_code(), Some(3), "{err}");
+            let msg = err.to_string();
+            assert!(msg.contains("[project] name"), "{msg}");
+            assert!(msg.contains(&format!("{bad:?}")), "{msg}");
+            assert!(
+                msg.contains("1 to 63 ASCII letters, digits and `-`, with no `-` at either end"),
+                "{msg}"
+            );
+
+            // A file that skipped the load's checks is refused the same way.
+            let file = File::from_toml_bytes(text.as_bytes()).unwrap();
+            assert!(matches!(
+                file.project_name(),
+                Err(Error::InvalidProjectName { .. })
+            ));
+            assert!(file.validate().is_err());
+        }
     }
 
     /// The project's file is refused at load, with exit 3, when a task sets a

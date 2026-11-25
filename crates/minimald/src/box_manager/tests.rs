@@ -139,6 +139,7 @@ fn sample_config() -> minimald_rpc::BoxConfig {
         creating_verb: minimald_rpc::CreatingVerb::Session,
         project_root: None,
         host_ip_registration: None,
+        project_name: None,
     }
 }
 
@@ -4042,6 +4043,108 @@ fn derived_name_is_project_for_default_else_project_dash_entry() {
     assert_eq!(
         creation_name(&named, Some(&spec("lint"))),
         ("Exact".to_string(), NameSource::Request)
+    );
+}
+
+/// BOX-214, BOX-211: a sent project name names the project, whatever the
+/// root or the path. A request with none takes the root directory's name.
+#[test]
+fn derived_name_takes_sent_project_name_over_root() {
+    let spec = serde_json_lenient::json!({ "entry": "lint", "box": { "name": "api" } });
+    let mut config = unnamed_config();
+    config.project_root = Some(HostAbsPath::try_new("/home/me/checkout").unwrap());
+    config.project_name = Some("web".to_string());
+    assert_eq!(
+        creation_name(&config, Some(&spec)),
+        ("web-lint".to_string(), NameSource::Derived)
+    );
+    config.project_name = None;
+    assert_eq!(creation_name(&config, Some(&spec)).0, "checkout-lint");
+}
+
+/// BOX-216: a create whose project name is not a DNS label is refused with
+/// exit 3 before any name is derived. The message names `[project] name`
+/// and quotes the value, the name is never converted, and nothing is filed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_refuses_project_name_not_dns_label_exit3() {
+    let (_state, _cache, mngr) = manager().await;
+    for bad in ["my_app", "-web", "", "caf\u{e9}"] {
+        let mut config = as_task(unnamed_config());
+        config.project_name = Some(bad.to_string());
+        let error = mngr
+            .create_box_with_spec(config, Some(task_spec("lint", None)), None, None)
+            .await
+            .expect_err("a project name that is not a DNS label is refused");
+        assert_eq!(
+            crate::box_manager::admission_refusal(&error),
+            Some(3),
+            "{error}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("[project] name"), "{message}");
+        assert!(message.contains(&format!("{bad:?}")), "{message}");
+        assert!(
+            message.contains("1 to 63 ASCII letters, digits and `-`, with no `-` at either end"),
+            "{message}"
+        );
+    }
+    assert!(
+        mngr.list_boxes(None).await.unwrap().is_empty(),
+        "a refused create files no record"
+    );
+
+    // A requested name does not lift the check.
+    let mut config = named_task("given");
+    config.project_name = Some("my_app".to_string());
+    assert!(
+        mngr.create_box_with_spec(config, None, None, None)
+            .await
+            .is_err()
+    );
+
+    let mut config = as_task(unnamed_config());
+    config.project_name = Some("web".to_string());
+    let id = mngr
+        .create_box_with_spec(config, Some(task_spec("lint", None)), None, None)
+        .await
+        .unwrap();
+    assert_eq!(record_name(&mngr, id).await.as_deref(), Some("web-lint"));
+}
+
+/// BOX-211: the box name is the record's alone. A spec's `[box] name` is
+/// never read to name the box, and a rename changes the record and leaves
+/// the stored spec as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn box_name_never_read_from_stored_spec_rename_changes_record_only() {
+    let (_state, _cache, mngr) = manager().await;
+    let spec = task_spec("lint", Some("api"));
+    let mut config = as_task(unnamed_config());
+    config.project_name = Some("web".to_string());
+    let id = mngr
+        .create_box_with_spec(config, Some(spec.clone()), None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        record_name(&mngr, id).await.as_deref(),
+        Some("web-lint"),
+        "a `[box] name` in the stored spec does not name the box"
+    );
+
+    let stored = |bytes: Vec<u8>| -> serde_json_lenient::Value {
+        serde_json_lenient::from_slice(&bytes).expect("the stored spec is JSON")
+    };
+    let spec_path = mngr.box_events(id).await.unwrap().object.spec_path();
+    let before = std::fs::read(spec_path.as_utf8_path()).expect("the spec is stored");
+    assert_eq!(stored(before.clone()), spec);
+
+    rename_box(&mngr, id, "renamed").await;
+    assert_eq!(record_name(&mngr, id).await.as_deref(), Some("renamed"));
+    let after = std::fs::read(spec_path.as_utf8_path()).expect("the spec is still stored");
+    assert_eq!(after, before, "a rename leaves the stored spec as it was");
+    assert_eq!(
+        boxes::box_name::spec_box_name(Some(&stored(after))),
+        Some("api"),
+        "the stored spec keeps what it was sent"
     );
 }
 

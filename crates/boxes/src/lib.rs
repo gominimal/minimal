@@ -1878,6 +1878,62 @@ pub mod box_name {
         root.trim_end_matches('/').rsplit('/').next().unwrap_or("")
     }
 
+    /// The name a box takes from no project at all: a create that carries
+    /// neither a project name nor a project root.
+    pub const NO_PROJECT_NAME: &str = "box";
+
+    /// Whether `text` is one DNS label (BOX-216): 1 to [`BOX_NAME_MAX`]
+    /// ASCII letters, digits and `-`, with no `-` at either end.
+    #[must_use]
+    pub fn is_dns_label(text: &str) -> bool {
+        (1..=BOX_NAME_MAX).contains(&text.len())
+            && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && !text.starts_with('-')
+            && !text.ends_with('-')
+    }
+
+    /// The project name a directory name gives (BOX-215): its bytes with
+    /// each ASCII letter lowercased and each run of bytes that are not
+    /// ASCII letters or digits as one `-`, cut to [`BOX_NAME_MAX`]
+    /// characters, with no `-` at either end. A name with nothing left
+    /// gives [`NO_PROJECT_NAME`]. The answer is always a DNS label.
+    #[must_use]
+    pub fn project_name_from_dir_bytes(dir_name: &[u8]) -> String {
+        let mut converted = String::with_capacity(dir_name.len());
+        for &byte in dir_name {
+            if byte.is_ascii_alphanumeric() {
+                converted.push(char::from(byte.to_ascii_lowercase()));
+            } else if !converted.ends_with('-') {
+                converted.push('-');
+            }
+        }
+        converted.truncate(BOX_NAME_MAX);
+        match converted.trim_matches('-') {
+            "" => NO_PROJECT_NAME.to_string(),
+            name => name.to_string(),
+        }
+    }
+
+    /// The project name of a project root path (BOX-215): its last
+    /// component, converted as [`project_name_from_dir_bytes`] converts it.
+    #[must_use]
+    pub fn project_name_of_dir(root: &str) -> String {
+        project_name_from_dir_bytes(project_name_of_root(root).as_bytes())
+    }
+
+    /// The project name a create derives its box name from: the project
+    /// name the request carries, else the name of the project root
+    /// directory (BOX-215), else [`NO_PROJECT_NAME`]. A path never gives
+    /// the name when a project name is present.
+    #[must_use]
+    pub fn request_project_name(project_name: Option<&str>, project_root: Option<&str>) -> String {
+        match (project_name, project_root) {
+            (Some(name), _) => name.to_string(),
+            (None, Some(root)) => project_name_of_dir(root),
+            (None, None) => NO_PROJECT_NAME.to_string(),
+        }
+    }
+
     /// The project part of a derived name, as one DNS label: ASCII letters
     /// and digits lowercased, and each run of other characters as one `-`,
     /// with no `-` at either end. A project with nothing left is `box`, so
@@ -1936,15 +1992,15 @@ pub mod box_name {
     pub const DEFAULT_ENTRY: &str = "default";
 
     /// The name a create with no requested name gives its box (BOX-211):
-    /// [`derived_box_name`] of the last component of `project_root` and
-    /// the `entry` of the stored `spec`. A spec with no readable `entry`,
+    /// [`derived_box_name`] of the `project` name and the `entry` of the
+    /// stored `spec`. [`request_project_name`] gives the project name. A spec with no readable `entry`,
     /// a spec of [`DEFAULT_ENTRY`], or no spec takes the project name
     /// alone. Only the `entry` key is read, so a spec that does not parse
     /// as a v0 spec still gives a name. The Box Host, `min box start` and
     /// `min dash` all name an unnamed box through this one function.
     #[must_use]
     pub fn create_derived_name(
-        project_root: &str,
+        project: &str,
         spec: Option<&serde_json_lenient::Value>,
         instance: Option<usize>,
     ) -> String {
@@ -1952,7 +2008,7 @@ pub mod box_name {
             .and_then(|spec| spec.get("entry"))
             .and_then(serde_json_lenient::Value::as_str)
             .filter(|entry| *entry != DEFAULT_ENTRY);
-        derived_box_name(project_name_of_root(project_root), entry, instance)
+        derived_box_name(project, entry, instance)
     }
 
     /// The `[box] name` a stored `spec` carries at `box.name`, when it
@@ -3761,20 +3817,66 @@ mod tests {
             assert_eq!(project_name_of_root("/home/me/web"), "web");
             assert_eq!(project_name_of_root("/"), "");
 
-            // The create's name: the root's last component and the spec's
-            // entry, with the default entry naming the project alone.
+            // The create's name: the project name and the spec's entry,
+            // with the default entry naming the project alone.
             let spec = |entry: &str| serde_json_lenient::json!({ "entry": entry, "box": { "name": "api" } });
             assert_eq!(
-                create_derived_name("/home/me/web", Some(&spec("lint")), None),
+                create_derived_name("web", Some(&spec("lint")), None),
                 "web-lint"
             );
             assert_eq!(
-                create_derived_name("/home/me/web", Some(&spec(DEFAULT_ENTRY)), None),
+                create_derived_name("web", Some(&spec(DEFAULT_ENTRY)), None),
                 "web"
             );
-            assert_eq!(create_derived_name("/home/me/web", None, Some(2)), "web-2");
+            assert_eq!(create_derived_name("web", None, Some(2)), "web-2");
             assert_eq!(spec_box_name(Some(&spec("lint"))), Some("api"));
             assert_eq!(spec_box_name(None), None);
+        }
+
+        /// BOX-215, BOX-216: a request's project name wins over its root,
+        /// a root gives its converted directory name, and nothing gives
+        /// `box`. Only a DNS label passes the label check.
+        #[test]
+        fn request_project_name_prefers_sent_name_then_root() {
+            use super::super::box_name::{
+                is_dns_label, project_name_from_dir_bytes, request_project_name,
+            };
+
+            assert_eq!(
+                request_project_name(Some("web"), Some("/home/me/api")),
+                "web"
+            );
+            assert_eq!(
+                request_project_name(None, Some("/home/me/My App/")),
+                "my-app"
+            );
+            assert_eq!(request_project_name(None, None), "box");
+
+            assert_eq!(project_name_from_dir_bytes(b"__Web__App__"), "web-app");
+            assert_eq!(project_name_from_dir_bytes("café".as_bytes()), "caf");
+            assert_eq!(
+                project_name_from_dir_bytes(&[0xff, b'a', 0xfe, b'b']),
+                "a-b"
+            );
+            assert_eq!(project_name_from_dir_bytes("日本".as_bytes()), "box");
+            // Cut to 63 first, then trimmed.
+            let long = format!("{}_x", "p".repeat(62));
+            assert_eq!(project_name_from_dir_bytes(long.as_bytes()), "p".repeat(62));
+
+            assert!(is_dns_label("web"));
+            assert!(is_dns_label("Web-2"));
+            assert!(is_dns_label(&"a".repeat(63)));
+            for bad in [
+                "",
+                "-web",
+                "web-",
+                "my_app",
+                "my app",
+                "café",
+                &"a".repeat(64),
+            ] {
+                assert!(!is_dns_label(bad), "{bad:?}");
+            }
         }
 
         fn status() -> impl Strategy<Value = BoxState> {

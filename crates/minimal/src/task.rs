@@ -1684,6 +1684,9 @@ pub(crate) async fn run_entry(
         expanded.as_ref().map(|expanded| &expanded.spec),
         &args.other.vpn_network_names,
     )?;
+    // BOX-220: the request carries the project name, so the daemon derives
+    // a task box's name from `[project] name` as it does a session box's.
+    request.config.project_name = crate::project_name_at(&upload_root)?;
     // BOX-081, #3650: the run sends no proxy root certificate. So where no
     // proxy serves boxes, the daemon refuses each brokered secret of the
     // spec. The run refuses it here first, with exit 5, before a box exists.

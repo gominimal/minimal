@@ -3980,12 +3980,14 @@ mod create_naming_tests {
     use crate::box_manager::BoxKeyPredicate;
     use crate::test_harness::{TestClient, TestServer, create_session_req};
 
-    /// A create with no name on the request and a task spec whose entry is
-    /// `entry`, so the daemon derives the box's name from the project,
-    /// `tmp`, and the entry: `tmp-<entry>` (BOX-211).
+    /// A create with no name on the request, the project name `web` and a
+    /// task spec whose entry is `entry`, so the daemon derives the box's
+    /// name from the project and the entry: `web-<entry>` (BOX-211). The
+    /// project root, `/tmp`, does not name the box.
     fn entry_req(entry: &str, fresh_instance: bool) -> CreateSessionRequest {
         let mut request = create_session_req("unused", "/tmp");
         request.config.name = None;
+        request.config.project_name = Some("web".to_string());
         // A `task` spec is created under the task verb (BOX-160).
         request.config.creating_verb = minimald_rpc::CreatingVerb::Task;
         let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
@@ -4023,10 +4025,10 @@ mod create_naming_tests {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
         let holder = create(&mut client, &entry_req("dev", false)).await;
-        assert_eq!(name_of(&server, holder).await.as_deref(), Some("tmp-dev"));
+        assert_eq!(name_of(&server, holder).await.as_deref(), Some("web-dev"));
 
         let error = match client
-            .call::<CreateSession>(&create_session_req("tmp-dev", "/tmp"))
+            .call::<CreateSession>(&create_session_req("web-dev", "/tmp"))
             .await
         {
             CreateSessionReply::Err { error, .. } => error,
@@ -4037,9 +4039,9 @@ mod create_naming_tests {
         assert_eq!(
             refusal,
             HeldNameRefusal {
-                name: "tmp-dev".to_string(),
+                name: "web-dev".to_string(),
                 holder: Some(holder),
-                holder_name: "tmp-dev".to_string(),
+                holder_name: "web-dev".to_string(),
             }
         );
         assert_eq!(HeldNameRefusal::EXIT_CODE, 2);
@@ -4065,13 +4067,61 @@ mod create_naming_tests {
         let dev = create(&mut client, &entry_req("dev", false)).await;
         let first = create(&mut client, &entry_req("dev", true)).await;
         let second = create(&mut client, &entry_req("dev", true)).await;
-        assert_eq!(name_of(&server, dev).await.as_deref(), Some("tmp-dev"));
-        assert_eq!(name_of(&server, first).await.as_deref(), Some("tmp-dev-1"));
-        assert_eq!(name_of(&server, second).await.as_deref(), Some("tmp-dev-2"));
+        assert_eq!(name_of(&server, dev).await.as_deref(), Some("web-dev"));
+        assert_eq!(name_of(&server, first).await.as_deref(), Some("web-dev-1"));
+        assert_eq!(name_of(&server, second).await.as_deref(), Some("web-dev-2"));
 
         // A fresh instance with no running holder still takes a suffix.
         let web = create(&mut client, &entry_req("web", true)).await;
-        assert_eq!(name_of(&server, web).await.as_deref(), Some("tmp-web-1"));
+        assert_eq!(name_of(&server, web).await.as_deref(), Some("web-web-1"));
+    }
+
+    /// BOX-211, BOX-214: a create with no written name takes its name from
+    /// the project name the request sends and the entry, for the task verb
+    /// and for the session verb that `min box start` and `min dash` send.
+    /// A `[box] name` in the spec never names the box. A client that sends
+    /// no project name gets the project root directory's name.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_without_written_name_derives_from_project_and_entry_for_every_client() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        let mut task = entry_req("lint", false);
+        task.spec.as_mut().expect("a task spec")["box"]["name"] =
+            serde_json_lenient::Value::String("api".to_string());
+        assert_eq!(
+            boxes::box_name::spec_box_name(task.spec.as_ref()),
+            Some("api")
+        );
+        let id = create(&mut client, &task).await;
+        assert_eq!(name_of(&server, id).await.as_deref(), Some("web-lint"));
+
+        let mut session = create_session_req("unused", "/tmp");
+        session.config.name = None;
+        session.config.project_name = Some("app".to_string());
+        let id = create(&mut client, &session).await;
+        assert_eq!(name_of(&server, id).await.as_deref(), Some("app"));
+
+        let mut older = create_session_req("unused", "/tmp");
+        older.config.name = None;
+        older.config.project_name = None;
+        let id = create(&mut client, &older).await;
+        assert_eq!(name_of(&server, id).await.as_deref(), Some("tmp"));
+
+        let mut bad = create_session_req("unused", "/tmp");
+        bad.config.name = None;
+        bad.config.project_name = Some("my_app".to_string());
+        match client.call::<CreateSession>(&bad).await {
+            CreateSessionReply::Err {
+                error, exit_code, ..
+            } => {
+                assert_eq!(exit_code, Some(3), "{error}");
+                assert!(error.contains("[project] name"), "{error}");
+            }
+            CreateSessionReply::Ok(created) => {
+                panic!("a project name that is not a DNS label is not refused: {created:?}")
+            }
+        }
     }
 
     /// A task entry that is not a DNS label, such as `build_all`, names a
@@ -4083,12 +4133,12 @@ mod create_naming_tests {
         let build = create(&mut client, &entry_req("build_all", true)).await;
         assert_eq!(
             name_of(&server, build).await.as_deref(),
-            Some("tmp-build-all-1")
+            Some("web-build-all-1")
         );
         let lint = create(&mut client, &entry_req("CI.Lint", true)).await;
         assert_eq!(
             name_of(&server, lint).await.as_deref(),
-            Some("tmp-ci-lint-1")
+            Some("web-ci-lint-1")
         );
     }
 }
