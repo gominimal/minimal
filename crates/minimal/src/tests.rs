@@ -3313,7 +3313,8 @@ async fn start_with_a_box_for_the_path_prints_no_warning() {
             text
         };
         let (stdout, stderr) = (read(out), read(err));
-        result.unwrap_or_else(|e| panic!("{verb:?} round {round}: the start fails: {e:#}\n{stderr}"));
+        result
+            .unwrap_or_else(|e| panic!("{verb:?} round {round}: the start fails: {e:#}\n{stderr}"));
         assert_eq!(
             stderr, "",
             "{verb:?} round {round}: the start prints nothing on stderr"
@@ -3321,8 +3322,9 @@ async fn start_with_a_box_for_the_path_prints_no_warning() {
         let id = stdout
             .strip_suffix('\n')
             .unwrap_or_else(|| panic!("{verb:?} round {round}: stdout is one line: {stdout:?}"));
-        let id = boxes::SessionId::parse_str(id)
-            .unwrap_or_else(|_| panic!("{verb:?} round {round}: stdout holds only the id: {stdout:?}"));
+        let id = boxes::SessionId::parse_str(id).unwrap_or_else(|_| {
+            panic!("{verb:?} round {round}: stdout holds only the id: {stdout:?}")
+        });
         assert_ne!(
             id, existing,
             "{verb:?} round {round}: the start creates another box"
@@ -3479,7 +3481,10 @@ fn create_verbs_name_flag_overrides_box_name() {
         let spec: mfile::spec::BoxSpec =
             serde_json_lenient::from_value(request.spec.clone().unwrap()).unwrap();
         assert_eq!(spec.name, None);
-        assert!(!request.fresh_instance, "{verb:?}: a written name takes no number");
+        assert!(
+            !request.fresh_instance,
+            "{verb:?}: a written name takes no number"
+        );
     }
     // The activation never marks its create request as a fresh instance.
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));

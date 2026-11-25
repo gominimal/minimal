@@ -91,8 +91,6 @@ Useful start options:
 
 - `--name <NAME>` gives the session a stable, human-friendly name you can use
   in place of its id.
-- `--new` creates another session from the same entry, even when a running
-  session holds the entry's name.
 - `--detach` creates the session and returns without attaching. Off a terminal,
   the command requires `--detach`.
 - `--loadout <NAME>` applies a named loadout (repeatable); `--no-loadouts`
@@ -117,10 +115,13 @@ background, and `min session attach` rejoins it later. Changes you make inside s
 the session's workspace; bring them back to the host by pushing them out with
 `git push min://<session>`.
 
-Starting an entry whose name a running session already holds does not reuse
-that session: `min session start` refuses, and creates nothing. Attach to the
-existing session when you mean to rejoin it. Pass `--new` or `--name <NAME>`
-when you want a second session from the same entry. Once two sessions share a
+A start never reuses a session that already exists. When you do not choose a
+name, and a session already has the name that the start gives, the new session
+takes that name with a number at the end. When you choose the name, with
+`--name <NAME>` or the entry's `[box] name` in `minimal.toml`, and a session
+already has it, `min session start` refuses and creates nothing. Attach to the
+existing session when you mean to rejoin it, or pass another `--name <NAME>`
+for a second session from the same entry. Once two sessions share a
 project directory, a bare `min session attach` there cannot choose between
 them. When more than one session can match, the command lists them and exits
 with code 2.
