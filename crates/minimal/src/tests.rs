@@ -3575,13 +3575,13 @@ fn planned_task_start(argv: &[&str], toml: &str) -> task::RunEntry {
     run
 }
 
+/// The create request of a task run.
+type TaskCreate = minimald_rpc::CreateSessionRequest;
+
 /// The create request of `run` in the project at `project`, built as
 /// `task::run_entry` builds it: the run's box name on the request, then
 /// `task::put_task_spec` with the declared task's spec and the expansion.
-fn task_create_request(
-    project: &std::path::Path,
-    run: &task::RunEntry,
-) -> minimald_rpc::CreateSessionRequest {
+fn task_create_request(project: &std::path::Path, run: &task::RunEntry) -> TaskCreate {
     let root = camino::Utf8Path::from_path(project).unwrap();
     let mut request = minimald_rpc::CreateSessionRequest::new(
         String::new(),
@@ -3649,7 +3649,10 @@ fn task_entry_start_sends_name_flag_as_requested_name() {
     let sent = body
         .find("oneshot_rpc::<CreateSession>")
         .expect("the run sends its create");
-    assert!(named < spec && spec < sent, "the name goes on before the spec");
+    assert!(
+        named < spec && spec < sent,
+        "the name goes on before the spec"
+    );
     assert!(
         !body.contains("request_fresh_instance"),
         "the run does not mark its create as a fresh instance"
