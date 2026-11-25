@@ -327,6 +327,9 @@ fn build_record(
         box_type: Some(box_type.to_string()),
         parent,
         attrs: config.attrs,
+        project_name: None,
+        entry: None,
+        name_origin: boxes::NameOrigin::Written,
     };
     record
         .validate_new_policy()
@@ -477,6 +480,54 @@ impl NameSource {
     }
 }
 
+impl NameSource {
+    /// The origin a record keeps for a name from this source.
+    const fn origin(self) -> boxes::NameOrigin {
+        match self {
+            Self::Request => boxes::NameOrigin::Written,
+            Self::Derived => boxes::NameOrigin::Derived,
+        }
+    }
+}
+
+/// The name fields a create stamps on its record (BOX-158, BOX-159,
+/// BOX-164): the name's origin, the project name and the entry. The
+/// daemon reads them from the request and the stored spec at creation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordNaming {
+    project_name: String,
+    entry: Option<String>,
+    origin: boxes::NameOrigin,
+}
+
+impl RecordNaming {
+    /// The fields for a create of `config` with `spec`, named from
+    /// `source`. The project name is the one a derived name uses, also
+    /// when the request wrote the name.
+    fn of(
+        config: &minimald_rpc::BoxConfig,
+        spec: Option<&serde_json_lenient::Value>,
+        source: NameSource,
+    ) -> Self {
+        let entry = spec
+            .and_then(|spec| spec.get("entry"))
+            .and_then(serde_json_lenient::Value::as_str)
+            .map(str::to_string);
+        Self {
+            project_name: request_project(config),
+            entry,
+            origin: source.origin(),
+        }
+    }
+
+    /// Writes the fields onto `record`.
+    fn stamp(self, record: &mut boxes::Record) {
+        record.project_name = Some(self.project_name);
+        record.entry = self.entry;
+        record.name_origin = self.origin;
+    }
+}
+
 /// What a derived box name comes from (BOX-211, BOX-214): the project
 /// name the request carries, else the project root directory's name, and
 /// the stored spec, whose `entry` names the entry. A sent project name is
@@ -486,12 +537,16 @@ fn derived_name_of(
     config: &minimald_rpc::BoxConfig,
     spec: Option<&serde_json_lenient::Value>,
 ) -> boxes::box_name::DerivedName {
+    boxes::box_name::DerivedName::new(&request_project(config), spec)
+}
+
+/// The project name a create's derived name uses: the name the request
+/// carries, else the project root directory's name, else `box`.
+fn request_project(config: &minimald_rpc::BoxConfig) -> String {
     // A client that predates `project_root` sends none, and the record
     // takes `project_path` as the root, so the name does too.
     let root = config.project_root.as_ref().unwrap_or(&config.project_path);
-    let project =
-        boxes::box_name::request_project_name(config.project_name.as_deref(), Some(root.as_str()));
-    boxes::box_name::DerivedName::new(&project, spec)
+    boxes::box_name::request_project_name(config.project_name.as_deref(), Some(root.as_str()))
 }
 
 /// The refusal of a create whose project name is not a DNS label
@@ -1378,6 +1433,9 @@ fn box_listing_entry(
         box_type: record.box_type.clone(),
         parent: record.parent,
         project_root: record.project_root.clone(),
+        project_name: record.project_name.clone(),
+        entry: record.entry.clone(),
+        name_origin: record.name_origin,
         state: state.to_string(),
         reason,
         exit_code,
@@ -4744,6 +4802,10 @@ impl BoxManager {
                 .unwrap_or(crate::rpc::ANONYMOUS_SESSION),
         );
         let (base, source) = creation_name(&config, spec.as_ref());
+        // The record keeps where its name came from, the project name and
+        // the entry, stamped here from the request and the spec. Nothing the
+        // box itself runs writes them.
+        let naming = RecordNaming::of(&config, spec.as_ref(), source);
         // BEP-082: a fresh instance and a derived-name create registered
         // under a creation key, and only a key for their own base counts.
         // A derived name's base is its first candidate: the store can give
@@ -5018,7 +5080,9 @@ impl BoxManager {
             minimald_rpc::CreatingVerb::Session => boxes::SESSION_BOX_TYPE,
             minimald_rpc::CreatingVerb::Task => boxes::TASK_BOX_TYPE,
         };
-        let record = build_record(config, username, boxes::BoxState::Pending, box_type, parent)?;
+        let mut record =
+            build_record(config, username, boxes::BoxState::Pending, box_type, parent)?;
+        naming.stamp(&mut record);
         tracing::Span::current().record("box_type", box_type);
         let project_root = record.project_root.clone();
         let name = record.name.clone();

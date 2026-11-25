@@ -1114,6 +1114,9 @@ mod tests {
             parent: None,
             project_root: None,
             attrs: std::collections::BTreeMap::new(),
+            project_name: None,
+            entry: None,
+            name_origin: boxes::NameOrigin::Written,
         };
         let mut model = Model::new(Utc::now());
         model.details.insert(

@@ -591,6 +591,9 @@ mod tests {
             parent: None,
             project_root: None,
             attrs: Default::default(),
+            project_name: None,
+            entry: None,
+            name_origin: boxes::NameOrigin::Written,
         }
     }
 
