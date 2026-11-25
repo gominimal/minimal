@@ -3991,8 +3991,9 @@ mod trace_tests {
 
 /// The reply's account of a derived name a create did not get (BOX-163).
 /// It names the box that has the name only when the caller may read that
-/// box: the caller created it, or its record was read and records no
-/// creator. A record that was not read hides the holder. The name
+/// box: its record was read and names the caller as its creator. A
+/// record with no creator, or one that was not read, hides the holder
+/// (default deny). The name
 /// itself is always in the reply, because the caller's own create derived
 /// it.
 fn name_not_taken_reply(
@@ -4003,10 +4004,12 @@ fn name_not_taken_reply(
     use boxes::box_name::DerivedNameTaken;
     let reason = match &not_taken.reason {
         DerivedNameTaken::Held(holder) => {
+            // Default deny: only a read record whose creator is the caller
+            // names its box. A record with no creator, or one not read,
+            // hides it.
             let readable = match &not_taken.holder_creator {
                 HolderCreator::User(owner) => caller == Some(owner.as_str()),
-                HolderCreator::NoCreator => true,
-                HolderCreator::Unread => false,
+                HolderCreator::NoCreator | HolderCreator::Unread => false,
             };
             minimald_rpc::NameTakenReason::Held {
                 holder: readable.then(|| minimald_rpc::NameHolder {
@@ -4111,7 +4114,8 @@ mod create_naming_tests {
     }
 
     /// The reply names the box that has the name only for a caller who
-    /// may read it: its creator, or anyone when it records no creator.
+    /// may read it: the creator its read record names. A record with no
+    /// creator, or a record that was not read, hides the box.
     #[test]
     fn create_reply_names_the_taken_derived_name_holder_only_to_its_reader() {
         let holder = boxes::box_name::NamedBox {
@@ -4133,13 +4137,18 @@ mod create_naming_tests {
         let shown = named(super::name_not_taken_reply(&not_taken(ann()), Some("ann")))
             .expect("the creator reads the holder");
         assert_eq!((shown.id, shown.state.as_str()), (holder.id, "running"));
-        assert!(
+        assert_eq!(
             named(super::name_not_taken_reply(
                 &not_taken(HolderCreator::NoCreator),
                 Some("bob")
-            ))
-            .is_some(),
-            "a record with no creator is readable"
+            )),
+            None,
+            "a record with no creator is hidden"
+        );
+        assert_eq!(
+            named(super::name_not_taken_reply(&not_taken(ann()), None)),
+            None,
+            "a caller with no user does not read the holder"
         );
         let hidden = super::name_not_taken_reply(&not_taken(ann()), Some("bob"));
         assert_eq!(hidden.name, "web", "the name is still in the reply");
