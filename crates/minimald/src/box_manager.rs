@@ -389,17 +389,22 @@ struct CreateBoxMsg {
     >,
 }
 
-/// The refusal of a create whose name a running box holds (BOX-163). It
-/// names the holder, as a rename's refusal does (BOX-010), and the
-/// rename command that frees the name.
+/// The refusal of a create whose name another box has, in any state
+/// (BOX-007, BOX-163). It names the holder, as a rename's refusal does
+/// (BOX-010), and the rename command that frees the name. The reply
+/// names the holder only to a caller who may read it ([`Self::creator`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HeldNameRefusal {
     /// The name the create asked for.
     pub(crate) name: String,
-    /// The running box that holds it.
+    /// The box that has it.
     pub(crate) holder: SessionId,
     /// The holder's name, with the case it was given.
     pub(crate) holder_name: String,
+    /// The holder's state word (`running`, `stopped`, ...).
+    pub(crate) state: &'static str,
+    /// The holder's creator, as read from its record.
+    pub(crate) creator: HolderCreator,
 }
 
 impl HeldNameRefusal {
@@ -415,12 +420,14 @@ impl std::fmt::Display for HeldNameRefusal {
             name,
             holder,
             holder_name,
+            state,
+            ..
         } = self;
         write!(
             f,
-            "A running session named `{holder_name}` ({holder}) already exists, so a new \
+            "A {state} session named `{holder_name}` ({holder}) already exists, so a new \
              box cannot take the name `{name}`. Rename it with \
-             `min session rename {holder} <new-name>`, or choose another name."
+             `min box rename {holder} <new-name>`, or choose another name."
         )
     }
 }
@@ -2256,14 +2263,17 @@ fn proxy_root_certificate(certificate: Option<&str>, published: &PublishedRoot) 
 
 /// The exit code of a create that the admission check of BOX-160 refused:
 /// the error carries a [`RootConstraintRefusal`] or an
-/// [`UnknownRootRefusal`]. A [`ProjectNameRefusal`] (BOX-216) gives its
-/// exit code too. `None` for any other error.
+/// [`UnknownRootRefusal`]. A [`ProjectNameRefusal`] (BOX-216) and a
+/// requested name that breaks a naming rule (BOX-007) give their exit
+/// code too. `None` for any other error.
 pub(crate) fn admission_refusal(error: &std::io::Error) -> Option<u8> {
     let inner = error.get_ref()?;
     let code = if let Some(refusal) = inner.downcast_ref::<RootConstraintRefusal>() {
         refusal.exit_code()
     } else if inner.is::<ProjectNameRefusal>() {
         ProjectNameRefusal::EXIT_CODE
+    } else if let Some(refusal) = inner.downcast_ref::<boxes::box_name::NameRuleRefusal>() {
+        refusal.exit_code()
     } else {
         inner.downcast_ref::<UnknownRootRefusal>()?.exit_code()
     };
@@ -4802,6 +4812,20 @@ impl BoxManager {
                 .unwrap_or(crate::rpc::ANONYMOUS_SESSION),
         );
         let (base, source) = creation_name(&config, spec.as_ref());
+        // BOX-007: a requested name is a written name. One that breaks a
+        // naming rule refuses the create with exit 3, before any name is
+        // assigned and before any record is read.
+        if source == NameSource::Request
+            && let Err(refusal) = boxes::box_name::check_written_name(&base)
+        {
+            tracing::info!(
+                rule = refusal.rule.word(),
+                exit_code = refusal.exit_code(),
+                fresh,
+                "refused a create: the requested name breaks a naming rule"
+            );
+            return Err(refusal.into());
+        }
         // The record keeps where its name came from, the project name and
         // the entry, stamped here from the request and the spec. Nothing the
         // box itself runs writes them.
@@ -5328,49 +5352,53 @@ impl BoxManager {
         Ok(names)
     }
 
-    /// The refusal of a create whose name `name` a running box holds
-    /// (BOX-163), naming the holder, with exit code 2 in the log. `store`
-    /// is the store's own refusal, answered as it is when the holder is
-    /// gone by the time this reads the records.
+    /// The refusal of a create whose name `name` another box has, in any
+    /// state (BOX-007, BOX-163): the running box of the name, else the
+    /// latest, with its state and its creator. `store` is the store's own
+    /// refusal, answered as it is when the holder is gone by the time this
+    /// reads the records.
     async fn held_name_refusal(&self, name: &str, store: std::io::Error) -> BoxManagerError {
-        let holder = match self.store.handles().await {
-            Ok(handles) => {
-                let mut found = None;
-                for handle in handles {
-                    let Ok(record) = handle.record().await else {
-                        continue;
+        let mut named = Vec::new();
+        let mut creators = std::collections::BTreeMap::new();
+        if let Ok(handles) = self.store.handles().await {
+            for handle in handles {
+                let Ok(record) = handle.record().await else {
+                    continue;
+                };
+                if let Some(found) = boxes::box_name::NamedBox::from_record(&record)
+                    && found.name.eq_ignore_ascii_case(name)
+                {
+                    let creator = match record.username {
+                        Some(user) => HolderCreator::User(user),
+                        None => HolderCreator::NoCreator,
                     };
-                    if boxes::box_name::holds_name(record.status)
-                        && let Some(held) = record.name
-                        && held.eq_ignore_ascii_case(name)
-                    {
-                        found = Some((*handle.id(), held));
-                        break;
-                    }
+                    creators.insert(found.id, creator);
+                    named.push(found);
                 }
-                found
             }
-            Err(_) => None,
-        };
-        let Some((holder, holder_name)) = holder else {
+        }
+        let Some(holder) = boxes::box_name::name_holder(&named, name, None) else {
             tracing::info!(
                 name,
                 error = %store,
-                "refused a create whose name a running box holds; the holder is gone since"
+                "refused a create whose name another box has; the holder is gone since"
             );
             return store;
         };
         let refusal = HeldNameRefusal {
             name: name.to_string(),
-            holder,
-            holder_name,
+            holder: holder.id,
+            holder_name: holder.name.clone(),
+            state: holder.state_word(),
+            creator: creators.remove(&holder.id).unwrap_or(HolderCreator::Unread),
         };
         tracing::info!(
             name,
             holder = %refusal.holder,
             holder_name = %refusal.holder_name,
+            holder_state = refusal.state,
             exit_code = refusal.exit_code(),
-            "refused a create: a running box holds its name"
+            "refused a create: another box has its name"
         );
         std::io::Error::new(std::io::ErrorKind::AlreadyExists, refusal)
     }

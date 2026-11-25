@@ -730,15 +730,19 @@ impl BoxActor {
     /// stops (R3.6), and records a `renamed` event with both names
     /// (BOX-010).
     ///
-    /// A rename to `self`, or to a name a running box on this host holds,
-    /// is refused and changes nothing: the store makes the holder check,
-    /// and its refusal names the holder. The refusal's `exit_code()` is 2,
-    /// but this method returns an `io::Error`, so the code reaches only the
-    /// daemon log. The RPC reply and `min rename` do not carry it yet.
+    /// A rename to a name that breaks a naming rule (BOX-007), or to a
+    /// name another box on this host has in any state, is refused and
+    /// changes nothing. The naming rules come first, before the name is
+    /// tested against any other box. The store makes the holder check, and
+    /// its refusal names the holder. The error carries the
+    /// [`boxes::box_name::RenameRefusal`], whose `exit_code()` is 3 for a
+    /// naming rule and 2 for a taken name. The RPC reply's text carries
+    /// the same code to `min box rename`.
     pub(super) async fn rename(&mut self, new_name: String) -> Result<(), std::io::Error> {
         let record = self.record.record().await?;
 
-        // BOX-010: `self` is refused before the route is touched.
+        // BOX-007, BOX-010: the naming rules are checked with no other box
+        // in view, before the route is touched or any record is read.
         if let Err(refusal) = boxes::box_name::check_rename(&[], record.id, &new_name) {
             tracing::info!(
                 box_id = %record.id,

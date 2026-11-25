@@ -6154,6 +6154,29 @@ async fn restart(server: TestServer, client: TestClient) -> TestServer {
     TestServer::new_in(server.into_state_dir()).await
 }
 
+/// [`restart`], with the record of `id` renamed to `name` on disk while
+/// the daemon is down. A create or a rename never gives a box the name
+/// another box keeps (BOX-007), but a store written before that rule can
+/// hold two boxes of one name, and the restart reads the name from the
+/// record.
+async fn restart_renaming(
+    server: TestServer,
+    client: TestClient,
+    id: SessionId,
+    name: &str,
+) -> TestServer {
+    server
+        .state
+        .sessions_manager()
+        .await
+        .shutdown(true)
+        .await
+        .expect("a forced shutdown has nothing left to refuse it");
+    drop(client);
+    rewrite_record(&server, id, |record| record.name = Some(name.to_string())).await;
+    TestServer::new_in(server.into_state_dir()).await
+}
+
 /// A restarted daemon does not route the names of the boxes it found
 /// `running`: its start set each one `stopped` (BOX-154), and the resume at
 /// start brings none back. An attach resumes a box (BOX-025), and its name
@@ -6459,8 +6482,9 @@ async fn a_restored_session_that_fails_to_resume_does_not_stop_the_others() {
 }
 
 /// Two restored sessions whose box names fold to one hostname: the first
-/// takes the name derived from its project, `foldapp`, and the second asks
-/// for `FoldApp` once the first is stopped. The restart sets both
+/// takes the name derived from its project, `foldapp`, and the second is
+/// `FoldApp`, as a store written before BOX-007 can hold it. The restart
+/// sets both
 /// `stopped` (BOX-154). The first attach resumes its box
 /// and routes the name. The second attach is refused with exit status 2
 /// (BOX-025), so the name does not move.
@@ -6474,7 +6498,7 @@ async fn a_restored_hostname_collision_is_refused_on_resume() {
     let mut server = TestServer::new().await;
     let mut client = server.connect().await;
     let mut ids = Vec::new();
-    for (project, name) in [("/x/FoldApp", None), ("/y/foldapp", Some("FoldApp"))] {
+    for (project, name) in [("/x/FoldApp", None), ("/y/foldapp", Some("fold-b"))] {
         // The store refuses a name a running box holds, so the first box
         // stops in a restart before the second takes the same name.
         if !ids.is_empty() {
@@ -6508,7 +6532,7 @@ async fn a_restored_hostname_collision_is_refused_on_resume() {
         ids.push(id);
     }
 
-    let server = restart(server, client).await;
+    let server = restart_renaming(server, client, ids[1], "FoldApp").await;
     let mut client = server.connect().await;
     let manager = server.state.sessions_manager().await;
     assert_eq!(
@@ -6550,8 +6574,8 @@ async fn a_restored_hostname_collision_is_refused_on_resume() {
 }
 /// Two restored sessions that share one registry name outright: two unnamed
 /// sessions named `twins`: the first derives it from its project
-/// directory, and the second asks for it. The second is created while the
-/// first is stopped, which the store's name-uniqueness check allows. The restart
+/// directory, and the second has it as a store written before BOX-007 can
+/// hold it. A requested name never takes a kept box's name. The restart
 /// sets both `stopped` (BOX-154). The first attach resumes its box and routes the
 /// name. The second attach is refused with exit status 2 (BOX-025), so the
 /// name does not move.
@@ -6565,8 +6589,9 @@ async fn a_restored_session_sharing_another_sessions_registry_name_is_refused_on
     let mut server = TestServer::new().await;
     let mut client = server.connect().await;
     let mut ids = Vec::new();
-    // A derived name never reuses a kept box's name, so the second asks.
-    for (project, name) in [("/a/twins", None), ("/b/twins", Some("twins"))] {
+    // Neither a derived nor a requested name reuses a kept box's name, so
+    // the second takes `twins` on disk while the daemon is down.
+    for (project, name) in [("/a/twins", None), ("/b/twins", Some("twins-b"))] {
         // The store refuses a name a running box holds, so the first box
         // stops in a restart before the second takes the same name.
         if !ids.is_empty() {
@@ -6600,7 +6625,7 @@ async fn a_restored_session_sharing_another_sessions_registry_name_is_refused_on
         ids.push(id);
     }
 
-    let server = restart(server, client).await;
+    let server = restart_renaming(server, client, ids[1], "twins").await;
     let mut client = server.connect().await;
     let manager = server.state.sessions_manager().await;
     assert_eq!(
@@ -16560,8 +16585,30 @@ async fn resume_refuses_when_name_held_by_running_box() {
     let stopped =
         create_session_with_spec(&mut client, Some("proj"), "/a/x", Some(resume_spec(true))).await;
     let ending = stop_through_daemon(&server, stopped).await;
-    // A requested name takes the name of a stopped box.
-    let holder = create_session_with_spec(&mut client, Some("proj"), "/b/proj", None).await;
+    // A requested name never takes the name of a stopped box (BOX-007).
+    let refused = client
+        .call::<minimald_rpc::CreateSession>(&crate::test_harness::create_session_req(
+            "proj", "/b/proj",
+        ))
+        .await;
+    match refused {
+        minimald_rpc::CreateSessionReply::Err { error, .. } => {
+            let refusal = minimald_rpc::HeldNameRefusal::from_error(&error)
+                .unwrap_or_else(|| panic!("a held-name refusal: {error}"));
+            assert_eq!(refusal.name, "proj");
+            assert_eq!(minimald_rpc::HeldNameRefusal::EXIT_CODE, 2);
+        }
+        minimald_rpc::CreateSessionReply::Ok(created) => {
+            panic!("a stopped box's name is taken: {created:?}")
+        }
+    }
+    // A store written before that rule can hold a running `proj` beside
+    // the stopped one.
+    let holder = create_session_with_spec(&mut client, Some("proj-b"), "/b/proj", None).await;
+    rewrite_record(&server, holder, |record| {
+        record.name = Some("proj".to_string());
+    })
+    .await;
     assert_eq!(
         read_record(&server, holder).await.state().unwrap(),
         RecordState::Running
@@ -16596,15 +16643,17 @@ async fn resume_concurrent_same_name_runs_exactly_one() {
     let server = TestServer::new().await;
     let mut client = server.connect().await;
     let mut boxes_ = Vec::new();
-    // The first box derives `pair` from its project directory. The second
-    // asks for `pair` once the first is stopped: a derived name never
-    // reuses a kept box's name, and a requested one takes a stopped box's.
-    for (project, name) in [("/a/pair", None), ("/b/pair", Some("pair"))] {
+    // The first box derives `pair` from its project directory. Neither a
+    // derived nor a requested name reuses a kept box's name (BOX-007), so
+    // the second takes `pair` on disk while the daemon is down, as a store
+    // written before that rule can hold it.
+    for (project, name) in [("/a/pair", None), ("/b/pair", Some("pair-b"))] {
         let id =
             create_session_with_spec(&mut client, name, project, Some(resume_spec(true))).await;
         let ending = stop_through_daemon(&server, id).await;
         boxes_.push((id, ending));
     }
+    let server = restart_renaming(server, client, boxes_[1].0, "pair").await;
     let mut first = server.connect().await;
     let mut second = server.connect().await;
     let (a, b) = tokio::join!(

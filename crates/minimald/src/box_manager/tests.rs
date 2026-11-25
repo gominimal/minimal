@@ -1619,14 +1619,10 @@ async fn denying_verdict_faults_and_leaves_session_resumable() {
 async fn rename_of_unroutable_session_leaves_other_routes_alone() {
     let (state, _cache, mngr) = manager().await;
 
-    // Two sessions named "app": the NoNet one derives it from its
-    // project's basename, and the HostNet one asks for it. A derived name
-    // never reuses a kept box's name, but a requested name takes the name
-    // of a stopped box. Only the HostNet one registers a route when its
-    // actor spawns, so the NoNet one is made first and stopped.
-    let routable_project = TempDir::new().unwrap();
-    let routable_dir = routable_project.path().join("app");
-    std::fs::create_dir_all(&routable_dir).unwrap();
+    // The NoNet session derives "app" from its project's basename, and
+    // another box's "app" route stands in the registry. A requested name
+    // never takes a kept box's name (BOX-007), so the route is registered
+    // here as a store written before that rule could leave it.
     let unroutable_project = TempDir::new().unwrap();
     let unroutable_dir = unroutable_project.path().join("app");
     std::fs::create_dir_all(&unroutable_dir).unwrap();
@@ -1642,13 +1638,14 @@ async fn rename_of_unroutable_session_leaves_other_routes_alone() {
         boxes::core::record::RecordState::Stopped(boxes::core::record::StopEnding::AtDaemonStart),
     )
     .await;
-
-    let mut config = sample_config();
-    config.name = Some("app".to_string());
-    config.network = boxes::NetworkMode::HostNet;
-    config.project_path = HostAbsPath::try_new(routable_dir.to_str().unwrap()).unwrap();
-    // Finalizing the loadout registers the "app" route.
-    let _routable_id = create_active_session_with(&mngr, config).await;
+    assert_eq!(
+        record_name(&mngr, unroutable_id).await.as_deref(),
+        Some("app")
+    );
+    mngr.hostnames()
+        .write()
+        .expect("registry lock")
+        .register_host_net(SessionId::mint(), "app");
     let handle = session(&mngr, unroutable_id).await;
 
     handle
@@ -4153,9 +4150,10 @@ async fn box_name_never_read_from_stored_spec_rename_changes_record_only() {
     );
 }
 
-/// BOX-163: a create that asks for no fresh instance, under a name a
-/// running box holds, is refused with exit 2, naming the holder, and
-/// files nothing. A stopped holder blocks nothing (BOX-004).
+/// BOX-007, BOX-163: a create that asks for no fresh instance, under a
+/// name another box has, is refused with exit 2, naming the holder, and
+/// files nothing. A stopped holder keeps its name, so it refuses the
+/// create too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_with_name_held_by_running_box_refused_exit2_names_holder() {
     let log = crate::test_harness::captured_log();
@@ -4181,14 +4179,27 @@ async fn create_with_name_held_by_running_box_refused_exit2_names_holder() {
                 name: asked.to_string(),
                 holder,
                 holder_name: "dev".to_string(),
+                state: refusal.state,
+                creator: crate::box_manager::HolderCreator::NoCreator,
             }
         );
+        assert!(
+            boxes::box_name::holds_name(
+                mngr.get_record(BoxKeyPredicate::Id(holder))
+                    .await
+                    .unwrap()
+                    .expect("the holder is retained")
+                    .status
+            ),
+            "the holder is starting or running"
+        );
+        assert!(["pending", "materializing", "running"].contains(&refusal.state));
         assert_eq!(refusal.exit_code(), 2);
         let text = err.to_string();
         assert!(text.contains(&holder.to_string()), "{text}");
         assert!(text.contains("`dev`"), "{text}");
         assert!(
-            text.contains(&format!("min session rename {holder} <new-name>")),
+            text.contains(&format!("min box rename {holder} <new-name>")),
             "the refusal names the next step: {text}"
         );
     }
@@ -4201,26 +4212,243 @@ async fn create_with_name_held_by_running_box_refused_exit2_names_holder() {
     let logged = log.contents();
     assert!(
         logged.lines().any(
-            |line| line.contains("refused a create: a running box holds its name")
+            |line| line.contains("refused a create: another box has its name")
                 && line.contains(&holder.to_string())
                 && line.contains("exit_code=2")
         ),
         "the daemon log names the holder and the exit code:\n{logged}"
     );
 
-    // A stopped box keeps its name and leaves it free for a new box.
+    // A stopped box keeps its name, so the create is still refused.
     set_record_state(
         state.path(),
         holder,
         boxes::core::record::RecordState::Stopped(boxes::core::record::StopEnding::AtDaemonStart),
     )
     .await;
-    let reuse = mngr
+    let err = mngr
         .create_box_with_spec(named_task("dev"), Some(task_spec("dev", None)), None, None)
         .await
-        .expect("a stopped holder leaves the name free");
-    assert_ne!(reuse, holder);
-    assert_eq!(record_name(&mngr, reuse).await.as_deref(), Some("dev"));
+        .expect_err("a stopped holder keeps its name");
+    let refusal = err
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<HeldNameRefusal>())
+        .unwrap_or_else(|| panic!("the refusal names the holder: {err}"));
+    assert_eq!(refusal.holder, holder);
+    assert_eq!(refusal.state, "stopped");
+    assert_eq!(refusal.exit_code(), 2);
+    assert_eq!(mngr.list_boxes(None).await.unwrap().len(), 1);
+}
+
+/// BOX-007: a requested name that is not one DNS label, is reserved, or
+/// has the form of a box id refuses the create with exit 3, before any
+/// name is assigned, and files nothing. A fresh instance of such a name
+/// is refused the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_refuses_a_bad_requested_name_with_exit_3() {
+    let (_state, _cache, mngr) = manager().await;
+    for bad in [
+        "self",
+        "SELF",
+        "localhost",
+        "a b",
+        "-dev",
+        "0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b",
+    ] {
+        for fresh in [false, true] {
+            let created = if fresh {
+                mngr.create_fresh_box_with_spec(
+                    named_task(bad),
+                    Some(task_spec("lint", None)),
+                    None,
+                    None,
+                )
+                .await
+            } else {
+                mngr.create_box_with_spec(
+                    named_task(bad),
+                    Some(task_spec("lint", None)),
+                    None,
+                    None,
+                )
+                .await
+            };
+            let err = created.expect_err(bad);
+            assert_eq!(err.kind(), ErrorKind::InvalidInput, "{bad}: {err}");
+            assert!(
+                err.get_ref()
+                    .and_then(|e| e.downcast_ref::<boxes::box_name::NameRuleRefusal>())
+                    .is_some(),
+                "{bad}: {err}"
+            );
+            assert_eq!(
+                crate::box_manager::admission_refusal(&err),
+                Some(3),
+                "{bad}: the reply carries exit 3"
+            );
+        }
+    }
+    assert!(
+        mngr.list_boxes(None).await.unwrap().is_empty(),
+        "a refused name files nothing"
+    );
+}
+
+/// BOX-007, BOX-163: a create refusal names the box that has the name,
+/// with its state, only to a caller who may read that box: the caller
+/// created it. Any other caller reads only that the name is taken, and
+/// every caller exits 2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_refusal_names_the_holder_only_to_its_reader() {
+    let (state, _cache, mngr) = manager().await;
+    let holder = mngr
+        .create_box_with_spec(
+            named_task("dev"),
+            Some(task_spec("dev", None)),
+            Some("ann".to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+    set_record_state(
+        state.path(),
+        holder,
+        boxes::core::record::RecordState::Stopped(boxes::core::record::StopEnding::AtDaemonStart),
+    )
+    .await;
+    let err = mngr
+        .create_box_with_spec(
+            named_task("Dev"),
+            Some(task_spec("lint", None)),
+            Some("bob".to_string()),
+            None,
+        )
+        .await
+        .expect_err("a stopped box of another user keeps its name");
+    assert_eq!(err.kind(), ErrorKind::AlreadyExists, "{err}");
+
+    let shown = crate::rpc::held_name_refusal(&err, Some("ann")).expect("a held-name refusal");
+    assert_eq!(
+        shown,
+        minimald_rpc::HeldNameRefusal {
+            name: "Dev".to_string(),
+            holder: Some(holder),
+            holder_name: Some("dev".to_string()),
+            state: Some("stopped".to_string()),
+        }
+    );
+    let text = shown.to_string();
+    assert!(text.contains(&holder.to_string()), "{text}");
+    assert!(text.contains("stopped"), "{text}");
+    assert_eq!(
+        minimald_rpc::HeldNameRefusal::from_error(&text),
+        Some(shown)
+    );
+
+    for caller in [Some("bob"), None] {
+        let hidden = crate::rpc::held_name_refusal(&err, caller).expect("a held-name refusal");
+        assert_eq!(
+            hidden,
+            minimald_rpc::HeldNameRefusal {
+                name: "Dev".to_string(),
+                holder: None,
+                holder_name: None,
+                state: None,
+            }
+        );
+        let text = hidden.to_string();
+        assert_eq!(
+            text,
+            "Cannot create a session named `Dev`: the name is taken. Choose another name."
+        );
+        assert!(!text.contains(&holder.to_string()), "{text}");
+        assert!(!text.contains("stopped"), "{text}");
+        assert_eq!(
+            minimald_rpc::HeldNameRefusal::from_error(&text),
+            Some(hidden)
+        );
+    }
+    assert_eq!(minimald_rpc::HeldNameRefusal::EXIT_CODE, 2);
+    assert_eq!(mngr.list_boxes(None).await.unwrap().len(), 1);
+}
+
+/// BOX-007, BOX-010: a rename to the name of a stopped box of another
+/// user is refused with exit 2, and the reply says only that the name is
+/// taken. The creator of that box reads the holder and its state. A
+/// rename to a name that breaks a naming rule is refused with exit 3
+/// before any other box is read. The renamed box keeps its name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rename_to_a_name_a_stopped_box_has_is_refused() {
+    let (state, _cache, mngr) = manager().await;
+    let kept = mngr
+        .create_box_with_spec(
+            named_task("api"),
+            Some(task_spec("api", None)),
+            Some("ann".to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+    set_record_state(
+        state.path(),
+        kept,
+        boxes::core::record::RecordState::Stopped(boxes::core::record::StopEnding::AtDaemonStart),
+    )
+    .await;
+    let renamed = mngr
+        .create_box_with_spec(
+            named_task("web"),
+            Some(task_spec("web", None)),
+            Some("bob".to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let err = session(&mngr, renamed)
+        .await
+        .rename("API".to_string())
+        .await
+        .expect_err("a stopped box keeps its name");
+    assert_eq!(err.kind(), ErrorKind::AlreadyExists, "{err}");
+    let refusal = err
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<boxes::box_name::RenameRefusal>())
+        .unwrap_or_else(|| panic!("the refusal is typed: {err}"));
+    assert_eq!(
+        refusal,
+        &boxes::box_name::RenameRefusal::Held {
+            name: "API".to_string(),
+            holder: kept,
+            holder_name: "api".to_string(),
+            state: "stopped",
+        }
+    );
+
+    let hidden = crate::rpc::rename_error_text(&mngr, &err, Some("bob")).await;
+    assert_eq!(hidden, "The name `API` is taken. Choose another name.");
+    assert_eq!(minimald_rpc::rename_refusal_exit_code(&hidden), Some(2));
+    let shown = crate::rpc::rename_error_text(&mngr, &err, Some("ann")).await;
+    assert!(shown.contains(&kept.to_string()), "{shown}");
+    assert!(shown.contains("stopped"), "{shown}");
+    assert_eq!(minimald_rpc::rename_refusal_exit_code(&shown), Some(2));
+
+    for bad in ["self", "a b", "0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b"] {
+        let err = session(&mngr, renamed)
+            .await
+            .rename(bad.to_string())
+            .await
+            .expect_err(bad);
+        assert_eq!(err.kind(), ErrorKind::InvalidInput, "{bad}: {err}");
+        let text = crate::rpc::rename_error_text(&mngr, &err, Some("bob")).await;
+        assert_eq!(
+            minimald_rpc::rename_refusal_exit_code(&text),
+            Some(3),
+            "{bad}: {text}"
+        );
+    }
+    assert_eq!(record_name(&mngr, renamed).await.as_deref(), Some("web"));
+    assert_eq!(record_name(&mngr, kept).await.as_deref(), Some("api"));
 }
 
 /// BOX-211: only the derived name is cleaned into a label. A requested
@@ -4239,7 +4467,7 @@ async fn box_name_is_refused_unchanged_and_entry_is_cleaned() {
         .expect_err("an invalid requested name is refused");
     let text = format!("{refused:#}");
     assert!(
-        text.contains("invalid box name") && text.contains("DNS label"),
+        text.starts_with("Cannot name a box `My_Box`") && text.contains("ASCII letters"),
         "the refusal says the name is invalid: {text}"
     );
     assert!(
@@ -4361,9 +4589,10 @@ async fn rename_box(mngr: &BoxManagerHandle, id: SessionId, new_name: &str) {
         .unwrap_or_else(|e| panic!("rename of {id} to `{new_name}`: {e}"));
 }
 
-/// BOX-004, BOX-005, BOX-010: a stopped `dev` keeps its name and id, a new
-/// `dev` starts beside it with an id of its own, and a rename of either
-/// moves only that box's name. Through each step the name resolves to the
+/// BOX-004, BOX-005, BOX-007, BOX-010: a stopped `dev` keeps its name and
+/// id, so a new `dev` is refused. Once the stopped one is renamed, a new
+/// `dev` starts with an id of its own, and a rename of either moves only
+/// that box's name. Through each step the name resolves to the
 /// running box, and the daemon log names the id of each box it renames.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stopped_dev_and_new_dev_keep_ids_through_rename() {
@@ -4386,22 +4615,15 @@ async fn stopped_dev_and_new_dev_keep_ids_through_rename() {
         "a stopped `dev` still answers while no other `dev` exists"
     );
 
-    // Start a new `dev`: the stopped one leaves the name free.
-    let new = mngr
+    // A new `dev` is refused: the stopped one keeps the name (BOX-007).
+    let err = mngr
         .create_box_with_spec(named_task("dev"), Some(task_spec("dev", None)), None, None)
         .await
-        .expect("a stopped `dev` does not hold the name");
-    assert_ne!(new, old, "the new `dev` has an id of its own");
-    assert_eq!(record_name(&mngr, old).await.as_deref(), Some("dev"));
-    assert_eq!(record_name(&mngr, new).await.as_deref(), Some("dev"));
-    assert_eq!(
-        answers_to(&mngr, "dev").await,
-        Some(new),
-        "only the running `dev` answers to the name"
-    );
+        .expect_err("a stopped `dev` keeps the name");
+    assert_eq!(err.kind(), ErrorKind::AlreadyExists, "{err}");
 
-    // Rename the stopped one: it keeps its id and its state, and `dev`
-    // still answers with the running one.
+    // Rename the stopped one: it keeps its id and its state, and the name
+    // `dev` is free.
     rename_box(&mngr, old, "old").await;
     assert_eq!(record_name(&mngr, old).await.as_deref(), Some("old"));
     assert_eq!(
@@ -4410,8 +4632,16 @@ async fn stopped_dev_and_new_dev_keep_ids_through_rename() {
         "a rename starts nothing"
     );
     assert_eq!(answers_to(&mngr, "old").await, Some(old));
-    assert_eq!(answers_to(&mngr, "dev").await, Some(new));
+    assert_eq!(answers_to(&mngr, "dev").await, None);
+
+    // Start a new `dev`.
+    let new = mngr
+        .create_box_with_spec(named_task("dev"), Some(task_spec("dev", None)), None, None)
+        .await
+        .expect("a renamed box leaves the name free");
+    assert_ne!(new, old, "the new `dev` has an id of its own");
     assert_eq!(record_name(&mngr, new).await.as_deref(), Some("dev"));
+    assert_eq!(answers_to(&mngr, "dev").await, Some(new));
 
     // Rename the running one: it keeps its id, and its name moves with it.
     rename_box(&mngr, new, "web").await;
@@ -5408,165 +5638,106 @@ async fn stop(mngr: &BoxManagerHandle, id: SessionId) {
         .expect("the stop succeeds");
 }
 
-/// BOX-019, NET-012, NET-128: a reap of the box that holds a name's row
-/// hands the row to another retained box with that name, so the name
-/// answers as long as one box with it is retained. A forced reap of a
-/// running box beside a stopped one does the same. With two stopped
-/// holders, the row goes to the most recent creation, not to the box that
-/// ended last. Once the last holder is reaped, the name answers nothing.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reap_hands_name_to_retained_holder() {
-    use boxes::core::record::RecordState;
-
-    let log = crate::test_harness::captured_log();
-    let (state, _cache, mngr) = manager().await;
-
-    // `dev` stops, and holds its row as a stopped box.
-    let first = host_net_box(&mngr, "dev").await;
-    stop(&mngr, first).await;
-    assert_eq!(row_of(&mngr, "dev", &[first]), Some(first));
-
-    // A running `dev` beside it takes the row. A forced reap of it hands
-    // the row back to the stopped one.
-    let second = host_net_box(&mngr, "dev").await;
-    assert_eq!(row_of(&mngr, "dev", &[first, second]), Some(second));
-    mngr.reap_box(second, true).await.unwrap();
-    assert_eq!(row_of(&mngr, "dev", &[first, second]), Some(first));
-    assert!(matches!(
-        state_of(&mngr, first).await,
-        RecordState::Stopped(_)
-    ));
-
-    // A new `dev` takes the row and stops. Its reap hands the row back.
-    let third = host_net_box(&mngr, "dev").await;
-    stop(&mngr, third).await;
-    assert_eq!(row_of(&mngr, "dev", &[first, third]), Some(third));
-    mngr.reap_box(third, false).await.unwrap();
-    assert_eq!(row_of(&mngr, "dev", &[first, third]), Some(first));
-    assert_eq!(answers_to(&mngr, "dev").await, Some(first));
-
-    // Two stopped `dev` holders beside a running one. The earlier-created
-    // `first` ended last, and the later-created `fourth` still gets the
-    // row when the running one is reaped.
-    let fourth = host_net_box(&mngr, "dev").await;
-    stop(&mngr, fourth).await;
-    let fifth = host_net_box(&mngr, "dev").await;
-    write_exited_event(
-        state.path(),
-        first,
-        std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
-    )
-    .await;
-    assert_eq!(row_of(&mngr, "dev", &[first, fourth, fifth]), Some(fifth));
-    mngr.reap_box(fifth, true).await.unwrap();
-    assert_eq!(row_of(&mngr, "dev", &[first, fourth, fifth]), Some(fourth));
-    assert_eq!(answers_to(&mngr, "dev").await, Some(fourth));
-    mngr.reap_box(fourth, false).await.unwrap();
-    assert_eq!(row_of(&mngr, "dev", &[first, fourth]), Some(first));
-
-    // The last holder goes: the name answers nothing.
-    mngr.reap_box(first, false).await.unwrap();
-    assert_eq!(
-        row_of(&mngr, "dev", &[first, second, third, fourth, fifth]),
-        None
-    );
-    assert_eq!(answers_to(&mngr, "dev").await, None);
-
-    let logged = log.contents();
-    assert!(
-        logged
-            .lines()
-            .any(|line| line.contains("name-handed-over") && line.contains(&first.to_string())),
-        "the daemon log names the box the name went to:\n{logged}"
-    );
+/// The refusal of a `HostNet` create named `name` while `holder` keeps
+/// the name in `state`: exit 2, naming the holder (BOX-007).
+async fn assert_create_refused(
+    mngr: &BoxManagerHandle,
+    name: &str,
+    holder: SessionId,
+    state: &str,
+) {
+    let mut config = sample_config();
+    config.name = Some(name.to_string());
+    config.network = boxes::NetworkMode::HostNet;
+    let err = mngr
+        .create_session(config, None)
+        .await
+        .expect_err("a kept box's name is refused");
+    assert_eq!(err.kind(), ErrorKind::AlreadyExists, "{err}");
+    let refusal = err
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<HeldNameRefusal>())
+        .unwrap_or_else(|| panic!("the refusal names the holder: {err}"));
+    assert_eq!(refusal.holder, holder);
+    assert_eq!(refusal.state, state);
+    assert_eq!(refusal.exit_code(), 2);
 }
 
-/// BOX-019, NET-012, NET-128: a destroy of the box that holds a name's row
-/// hands the row to the next retained box with that name, as a reap does.
-/// The destroy returns after the handover. A destroy of a box that does not
-/// hold the row leaves the row where it is. Once the last holder is
-/// destroyed, the name answers nothing. The daemon log names the destroyed
-/// box and the successor.
+/// BOX-007, BOX-019, NET-012: a stopped box keeps its name and its row,
+/// so a second box of the name is refused with exit 2 and the row stays.
+/// Once the holder is reaped, the name answers nothing. Two boxes of one
+/// name, and so a handover between them, come only from a store written
+/// before BOX-007.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn destroy_hands_name_to_retained_holder() {
-    use boxes::core::record::RecordState;
+async fn reap_of_the_only_holder_frees_the_name() {
+    let (_state, _cache, mngr) = manager().await;
 
+    let first = host_net_box(&mngr, "dev").await;
+    assert_create_refused(&mngr, "dev", first, "running").await;
+    stop(&mngr, first).await;
+    assert_eq!(row_of(&mngr, "dev", &[first]), Some(first));
+    assert_create_refused(&mngr, "DEV", first, "stopped").await;
+    assert_eq!(row_of(&mngr, "dev", &[first]), Some(first));
+    assert_eq!(answers_to(&mngr, "dev").await, Some(first));
+
+    mngr.reap_box(first, false).await.unwrap();
+    assert_eq!(row_of(&mngr, "dev", &[first]), None);
+    assert_eq!(answers_to(&mngr, "dev").await, None);
+
+    // The name is free again.
+    let second = host_net_box(&mngr, "dev").await;
+    assert_eq!(row_of(&mngr, "dev", &[first, second]), Some(second));
+}
+
+/// BOX-007, BOX-019, NET-012: a destroy of the one box with a name frees
+/// its row, and the destroy returns after that. The daemon log says no
+/// box took the row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn destroy_of_the_only_holder_frees_the_name() {
     let log = crate::test_harness::captured_log();
     let (_state, _cache, mngr) = manager().await;
 
-    // `first` stops. A running `dev` beside it holds the row.
     let first = host_net_box(&mngr, "dev").await;
     stop(&mngr, first).await;
-    let second = host_net_box(&mngr, "dev").await;
-    assert_eq!(row_of(&mngr, "dev", &[first, second]), Some(second));
+    assert_create_refused(&mngr, "dev", first, "stopped").await;
+    assert_eq!(row_of(&mngr, "dev", &[first]), Some(first));
 
-    // The destroy of the running holder hands the row to the stopped box.
-    mngr.delete_session(second).await.unwrap();
+    mngr.delete_session(first).await.unwrap();
     assert!(
-        mngr.get_record(BoxKeyPredicate::Id(second))
+        mngr.get_record(BoxKeyPredicate::Id(first))
             .await
             .unwrap()
             .is_none(),
         "the destroyed record is gone when the destroy returns"
     );
-    assert_eq!(row_of(&mngr, "dev", &[first, second]), Some(first));
-    assert_eq!(answers_to(&mngr, "dev").await, Some(first));
-    assert!(matches!(
-        state_of(&mngr, first).await,
-        RecordState::Stopped(_)
-    ));
-
-    // A stopped `third` takes the row. The destroy of `first`, which does
-    // not hold it, leaves the row with `third`.
-    let third = host_net_box(&mngr, "dev").await;
-    stop(&mngr, third).await;
-    assert_eq!(row_of(&mngr, "dev", &[first, third]), Some(third));
-    mngr.delete_session(first).await.unwrap();
-    assert_eq!(row_of(&mngr, "dev", &[first, third]), Some(third));
-
-    // The last holder goes: the name answers nothing.
-    mngr.delete_session(third).await.unwrap();
-    assert_eq!(row_of(&mngr, "dev", &[first, second, third]), None);
+    assert_eq!(row_of(&mngr, "dev", &[first]), None);
     assert_eq!(answers_to(&mngr, "dev").await, None);
 
     let logged = log.contents();
     assert!(
         logged.lines().any(|line| line.contains("destroy:")
-            && line.contains(&second.to_string())
-            && line.contains(&format!("successor={first}"))),
-        "the daemon log names the destroyed box and its successor:\n{logged}"
-    );
-    assert!(
-        logged.lines().any(|line| line.contains("destroy:")
-            && line.contains(&third.to_string())
+            && line.contains(&first.to_string())
             && line.contains("successor=none")),
         "the daemon log says no box took the row:\n{logged}"
     );
 }
 
 /// BOX-019, BOX-021, NET-012: a reap returns only once the reaped box's
-/// teardown and the handover of its name are both done, under contention.
-/// The removal of another box with the name is held in its teardown while
-/// the row holder is reaped. When that reap returns, the reaped record is
-/// gone, the reaped box holds no row, and the row is with the one retained
-/// box that is not being removed. A prune that runs beside the held removal
-/// does the same. The daemon log orders the release before the handover.
+/// teardown is done, under contention. The removal of another box is held
+/// in its teardown while the row holder is reaped. When that reap
+/// returns, the reaped record is gone and the reaped box holds no row. A
+/// prune that runs beside a held removal does the same.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reap_returns_after_teardown_and_handover() {
+async fn reap_returns_after_teardown_under_contention() {
     let log = crate::test_harness::captured_log();
     let (state, _cache, mngr) = manager().await;
 
-    // `kept` and `leaving` stop. `holder` runs and holds the row.
-    let kept = host_net_box(&mngr, "dev").await;
-    stop(&mngr, kept).await;
-    let leaving = host_net_box(&mngr, "dev").await;
+    let leaving = host_net_box(&mngr, "leaving").await;
     stop(&mngr, leaving).await;
     let holder = host_net_box(&mngr, "dev").await;
-    let all = [kept, leaving, holder];
-    assert_eq!(row_of(&mngr, "dev", &all), Some(holder));
+    assert_eq!(row_of(&mngr, "dev", &[holder]), Some(holder));
 
-    // The removal of `leaving`, the most recent stopped creation, waits in
-    // its teardown.
+    // The removal of `leaving` waits in its teardown.
     let handle = session(&mngr, leaving).await;
     let release = handle.hold_for_test().await;
     let held_reap = crate::traced::spawn({
@@ -5591,20 +5762,18 @@ async fn reap_returns_after_teardown_and_handover() {
             .name_held_by(holder, "dev"),
         "the reaped box holds no row when the reap returns"
     );
-    assert_eq!(row_of(&mngr, "dev", &all), Some(kept));
-
+    assert_eq!(row_of(&mngr, "dev", &[holder]), None);
     release.send(()).expect("the actor is held");
     held_reap.await.unwrap().expect("the held removal goes on");
-    assert_eq!(row_of(&mngr, "dev", &all), Some(kept));
+    assert_eq!(row_of(&mngr, "leaving", &[leaving]), None);
 
-    // Prune beside a held removal: `pruned` holds the row and is pruned,
-    // `waiting` is being removed, and the row goes to `kept`.
-    let waiting = host_net_box(&mngr, "dev").await;
+    // Prune beside a held removal: `pruned` holds its row and is pruned
+    // while `waiting` is being removed.
+    let waiting = host_net_box(&mngr, "waiting").await;
     stop(&mngr, waiting).await;
     let pruned = host_net_box(&mngr, "dev").await;
     stop(&mngr, pruned).await;
-    let all = [kept, waiting, pruned];
-    assert_eq!(row_of(&mngr, "dev", &all), Some(pruned));
+    assert_eq!(row_of(&mngr, "dev", &[pruned]), Some(pruned));
     let handle = session(&mngr, waiting).await;
     let release = handle.hold_for_test().await;
     let held_reap = crate::traced::spawn({
@@ -5616,7 +5785,6 @@ async fn reap_returns_after_teardown_and_handover() {
     let now = std::time::SystemTime::now();
     let hour = std::time::Duration::from_secs(3600);
     write_exited_event(state.path(), pruned, now - 2 * hour).await;
-    write_exited_event(state.path(), kept, now + hour).await;
     let reply = mngr.prune_boxes(Some(hour), None).await.unwrap();
     let reaped: Vec<_> = reply.reaped.iter().map(|entry| entry.box_id).collect();
     assert_eq!(
@@ -5632,22 +5800,15 @@ async fn reap_returns_after_teardown_and_handover() {
             .name_held_by(pruned, "dev"),
         "the pruned box holds no row when the prune returns"
     );
-    assert_eq!(row_of(&mngr, "dev", &all), Some(kept));
     release.send(()).expect("the actor is held");
     held_reap.await.unwrap().expect("the held removal goes on");
-    assert_eq!(row_of(&mngr, "dev", &all), Some(kept));
 
     let logged = log.contents();
-    let position = |action: &str, id: SessionId| {
+    assert!(
         logged
             .lines()
-            .position(|line| line.contains(action) && line.contains(&id.to_string()))
-    };
-    let released = position("name-released", holder).expect("the release is logged");
-    let handed = position("name-handed-over", kept).expect("the handover is logged");
-    assert!(
-        released < handed,
-        "the daemon log orders the release before the handover:\n{logged}"
+            .any(|line| line.contains("name-released") && line.contains(&holder.to_string())),
+        "the release is logged:\n{logged}"
     );
 }
 
