@@ -520,22 +520,51 @@ fn find_sensitive_flag_value(input: &str) -> Option<CredentialMatch> {
 
 /// Scrubs an argv whose element boundaries are known (a process's
 /// `/proc/<pid>/cmdline`, the argv an exec request carried), one element at
-/// a time with [`scrub_argv_element`]. Each element stays one element, so
-/// the result has the length of `argv`.
+/// a time with an [`ArgvScrubber`]. Each element stays one element, so the
+/// result has the length of `argv`.
 ///
-/// Every bundle producer that holds a true argv scrubs it here, so they
-/// apply one rule.
+/// Every bundle producer that holds a true argv scrubs it here or with an
+/// [`ArgvScrubber`] of its own, so they apply one rule.
 #[must_use]
 pub fn scrub_argv<S: AsRef<str>>(argv: &[S]) -> Vec<Cow<'_, str>> {
-    let mut after_sensitive_flag = false;
+    let mut scrubber = ArgvScrubber::default();
     argv.iter()
         .map(|arg| {
             let arg: &str = arg.as_ref();
-            let clean = scrub_argv_element(after_sensitive_flag, arg);
-            after_sensitive_flag = is_sensitive_flag(arg);
-            clean
+            scrubber.scrub_next(arg)
         })
         .collect()
+}
+
+/// Scrubs the elements of one true argv in order, carrying the one fact the
+/// rule needs from the element before: whether it is a sensitive flag
+/// (`--token`, `-password`), whose value the next element is.
+///
+/// The element after a sensitive flag is masked whole. An assignment under a
+/// sensitive name (`-password=two words`) keeps its name and loses its whole
+/// value, and so does a header under a sensitive name (`X-Api-Key: v`). Any
+/// other element is scrubbed as free text with [`scrub_secrets`]. A value
+/// that is exactly a redaction placeholder is left as it is, so scrubbing
+/// twice equals scrubbing once.
+///
+/// [`scrub_argv`] drives one over a whole argv. A producer that holds the
+/// elements among other values (the string items of a JSON list) drives one
+/// itself, and starts a new one where its argv is broken.
+#[derive(Debug, Default, Clone)]
+pub struct ArgvScrubber {
+    /// The element before the next one is a sensitive flag.
+    after_sensitive_flag: bool,
+}
+
+impl ArgvScrubber {
+    /// Scrubs `arg`, the next element of the argv, and remembers whether it
+    /// is a sensitive flag for the element after it.
+    #[must_use]
+    pub fn scrub_next<'a>(&mut self, arg: &'a str) -> Cow<'a, str> {
+        let clean = scrub_argv_element(self.after_sensitive_flag, arg);
+        self.after_sensitive_flag = is_sensitive_flag(arg);
+        clean
+    }
 }
 
 /// Scrubs one true argv element. `after_sensitive_flag` says the element
@@ -552,17 +581,35 @@ pub fn scrub_argv<S: AsRef<str>>(argv: &[S]) -> Vec<Cow<'_, str>> {
 ///   `--env=API_TOKEN=x` are assignments, and a URL, a path, a header or a
 ///   shell line is not. The name it keeps goes to [`scrub_secrets`], so a
 ///   known token in it is masked too.
+/// - A header under a sensitive name keeps its name, its `:` and one space
+///   after it, and has everything after them masked as one value. The rule:
+///   an element is such a header when the text before its first `:` is not
+///   empty, holds no whitespace, `=`, `/` or `@`, and names a credential as
+///   an attribute key does ([`is_credential_attribute_key`]). So
+///   `X-Api-Key: v`, `X-Auth-Token: v`, `PRIVATE-TOKEN: v`, `Cookie: a=b`
+///   and `Authorization: Bearer v` (scheme and credential together) are
+///   such headers, and a URL (`https://...`), a drive path (`C:\x`) or a
+///   `name:value` under any other name is not. The name it keeps goes to
+///   [`scrub_secrets`].
+/// - A header given as the value of a flag in one element keeps the flag,
+///   its `=` and the header's name, and has the header's value masked as
+///   above. The rule: the element starts with `-`, the text before its first
+///   `=` holds no whitespace, `:`, `/` or `@`, and the text after that `=` is
+///   such a header. So `--header=X-Api-Key: v`, `-H=Cookie: a=b` and
+///   `--header=Authorization: Bearer v` are masked, and `--url=https://...`
+///   and `--time=12:30` are not. An assignment under a sensitive flag name
+///   (`--token=a:b`) is an assignment, as the rule before this one states.
 /// - Any other element goes to [`scrub_secrets`] whole, which masks the
-///   userinfo of a URL, a header value and the known token shapes in it.
+///   userinfo of a URL, an `Authorization` header value inside a longer
+///   line and the known token shapes in it.
 ///
 /// A value that is exactly a redaction placeholder is left as it is, so
 /// scrubbing twice equals scrubbing once.
-#[must_use]
-pub fn scrub_argv_element(after_sensitive_flag: bool, arg: &str) -> Cow<'_, str> {
+fn scrub_argv_element(after_sensitive_flag: bool, arg: &str) -> Cow<'_, str> {
     if after_sensitive_flag && !is_long_flag(arg) && !is_redaction_placeholder(arg) {
         return Cow::Owned(format!("<redacted:len={}>", arg.len()));
     }
-    match scrub_sensitive_assignment(arg) {
+    match scrub_sensitive_assignment(arg).or_else(|| scrub_sensitive_header(arg)) {
         Some(clean) => Cow::Owned(clean),
         None => scrub_secrets(arg),
     }
@@ -572,8 +619,7 @@ pub fn scrub_argv_element(after_sensitive_flag: bool, arg: &str) -> Cow<'_, str>
 /// name is a sensitive key: `--token`, `--api-key`, and the one-dash form Go
 /// tools use, `-token`. Not `--token=x`, which is an assignment. A name with
 /// whitespace, `:`, `/` or `@` is no flag.
-#[must_use]
-pub fn is_sensitive_flag(arg: &str) -> bool {
+fn is_sensitive_flag(arg: &str) -> bool {
     arg.strip_prefix("--")
         .or_else(|| arg.strip_prefix('-'))
         .is_some_and(|name| {
@@ -626,6 +672,43 @@ fn scrub_sensitive_assignment(arg: &str) -> Option<String> {
         return Some(format!("{name}=<redacted:len={}>", value.len()));
     }
     None
+}
+
+/// `Name: <redacted:len=N>` when `arg` is a header under a sensitive name,
+/// and `--flag=Name: <redacted:len=N>` when it is such a header given as the
+/// value of a flag, as [`scrub_argv_element`] states the rule; `None`
+/// otherwise. The flag and its `=` are kept as they are.
+fn scrub_sensitive_header(arg: &str) -> Option<String> {
+    if arg.starts_with('-')
+        && let Some((flag, header)) = arg.split_once('=')
+        && is_argv_name(flag)
+    {
+        return scrub_header(header).map(|clean| format!("{flag}={clean}"));
+    }
+    scrub_header(arg)
+}
+
+/// `Name: <redacted:len=N>` when `header` is a header under a sensitive
+/// name, with `Name` scrubbed by [`scrub_secrets`] and the one space after
+/// the `:` kept when there is one; `None` otherwise.
+fn scrub_header(header: &str) -> Option<String> {
+    let (name, rest) = header.split_once(':')?;
+    if name.is_empty()
+        || name.contains('=')
+        || !is_argv_name(name)
+        || !is_credential_attribute_key(name)
+    {
+        return None;
+    }
+    let (gap, value) = match rest.strip_prefix(' ') {
+        Some(value) => (" ", value),
+        None => ("", rest),
+    };
+    if value.is_empty() || is_redaction_placeholder(value) {
+        return None;
+    }
+    let name = scrub_secrets(name);
+    Some(format!("{name}:{gap}<redacted:len={}>", value.len()))
 }
 
 /// The OTLP exporter header variables, plain and `MINIMAL_`-prefixed, base
@@ -1702,5 +1785,107 @@ mod tests {
         let once: Vec<String> = scrub_argv(&argv).into_iter().map(Cow::into_owned).collect();
         let twice: Vec<String> = scrub_argv(&once).into_iter().map(Cow::into_owned).collect();
         assert_eq!(once, twice);
+    }
+
+    /// A header under a sensitive name keeps its name and loses everything
+    /// after its `:` and one space, whatever the header and whatever the
+    /// value holds. Scrubbing twice equals scrubbing once.
+    #[test]
+    fn scrub_argv_element_masks_a_header_under_a_sensitive_name() {
+        for (arg, masked) in [
+            ("X-Api-Key: abc123", "X-Api-Key: <redacted:len=6>"),
+            ("X-Auth-Token: v", "X-Auth-Token: <redacted:len=1>"),
+            ("PRIVATE-TOKEN: v", "PRIVATE-TOKEN: <redacted:len=1>"),
+            ("Cookie: session=v", "Cookie: <redacted:len=9>"),
+            (
+                "Proxy-Authorization: Basic dXNlcjpwYXNz",
+                "Proxy-Authorization: <redacted:len=18>",
+            ),
+            (
+                "Authorization: Bearer ghp_headerExample0123",
+                "Authorization: <redacted:len=28>",
+            ),
+            ("x-api-key:abc123", "x-api-key:<redacted:len=6>"),
+            ("X-Api-Key:  a b", "X-Api-Key: <redacted:len=4>"),
+        ] {
+            let once = scrub_argv_element(false, arg);
+            assert_eq!(once, masked, "{arg}");
+            assert_eq!(scrub_argv_element(false, &once), once, "{arg}");
+        }
+    }
+
+    /// A header is masked as the element after `-H` and as an element of
+    /// its own; `-H` itself is no sensitive flag, so the element after it
+    /// keeps the header's name.
+    #[test]
+    fn scrub_argv_masks_a_header_after_its_flag_and_on_its_own() {
+        let argv = ["curl", "-H", "X-Api-Key: abc123", "PRIVATE-TOKEN: v"];
+        let scrubbed = scrub_argv(&argv);
+        assert_eq!(scrubbed[2], "X-Api-Key: <redacted:len=6>");
+        assert_eq!(scrubbed[3], "PRIVATE-TOKEN: <redacted:len=1>");
+        assert_eq!(scrubbed[0], "curl");
+        assert_eq!(scrubbed[1], "-H");
+    }
+
+    /// A URL, a drive path and a `name:value` under a name that is no
+    /// credential are not headers: they are borrowed unchanged, and the
+    /// userinfo of a URL is masked by [`scrub_secrets`].
+    #[test]
+    fn scrub_argv_element_leaves_a_url_a_path_and_a_plain_pair() {
+        for clean in [
+            "https://example.test/r.git?ref=main",
+            "C:\\path\\to\\file",
+            "time:12:30",
+            "host:8080",
+        ] {
+            assert!(
+                matches!(scrub_argv_element(false, clean), Cow::Borrowed(_)),
+                "{clean}"
+            );
+        }
+        let url = scrub_argv_element(false, "https://user:urlHeaderPw0123@example.test/");
+        assert!(!url.contains("urlHeaderPw0123"), "{url}");
+        assert!(url.starts_with("https://"), "{url}");
+    }
+
+    /// A header given as the value of a flag in one element keeps the flag,
+    /// its `=` and the header's name, and loses the header's value. An
+    /// assignment under a sensitive flag name stays an assignment, and a
+    /// flag whose value is a URL or a time is unchanged. Scrubbing twice
+    /// equals scrubbing once.
+    #[test]
+    fn scrub_argv_element_masks_a_header_given_as_a_flag_value() {
+        for (arg, masked) in [
+            (
+                "--header=X-Api-Key: abc123",
+                "--header=X-Api-Key: <redacted:len=6>",
+            ),
+            ("-H=Cookie: a=b", "-H=Cookie: <redacted:len=3>"),
+            (
+                "--header=Authorization: Bearer x",
+                "--header=Authorization: <redacted:len=8>",
+            ),
+            ("--token=a:b", "--token=<redacted:len=3>"),
+        ] {
+            let once = scrub_argv_element(false, arg);
+            assert_eq!(once, masked, "{arg}");
+            assert_eq!(scrub_argv_element(false, &once), once, "{arg}");
+        }
+        for clean in ["--url=https://example.test/x", "--time=12:30"] {
+            assert!(
+                matches!(scrub_argv_element(false, clean), Cow::Borrowed(_)),
+                "{clean}"
+            );
+        }
+    }
+
+    /// An [`ArgvScrubber`] masks the element after a sensitive flag and
+    /// forgets the flag after one element, as [`scrub_argv`] does.
+    #[test]
+    fn an_argv_scrubber_carries_the_flag_one_element() {
+        let mut scrubber = ArgvScrubber::default();
+        assert_eq!(scrubber.scrub_next("-token"), "-token");
+        assert_eq!(scrubber.scrub_next("value"), "<redacted:len=5>");
+        assert_eq!(scrubber.scrub_next("value"), "value");
     }
 }

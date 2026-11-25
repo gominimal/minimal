@@ -26,9 +26,7 @@ use russh::{Channel as RuChannel, server::Msg};
 use serde::Serialize;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-use diagnostics::redact::{
-    is_sensitive_flag, masked_process_env, redact_json, scrub_argv_element, scrub_secrets,
-};
+use diagnostics::redact::{ArgvScrubber, masked_process_env, redact_json, scrub_secrets};
 use diagnostics::{BundleSink, BundleWriter, LOG_TAIL_CAP, Redaction};
 
 use crate::ChannelConfig;
@@ -907,14 +905,16 @@ fn redact_event_lines(bytes: &[u8]) -> (Vec<u8>, bool) {
 /// a credential inside a value: an exec event's `argv` is a list of strings
 /// the client sent, and an argument can be a header, a URL or a token.
 ///
-/// The strings of a list are scrubbed as the elements of an argv, with
-/// [`scrub_argv_element`], the rule the process table of a bundle uses too:
-/// the string after a sensitive flag (`--token`, then its value) is masked
-/// whole, and an assignment under a sensitive name (`-password=two words`)
-/// keeps its name and loses its whole value. That function states the rule.
+/// The strings of a list are scrubbed as the elements of an argv, with an
+/// [`ArgvScrubber`], the rule the process table of a bundle uses too: the
+/// string after a sensitive flag (`--token`, then its value) is masked
+/// whole, and an assignment or a header under a sensitive name
+/// (`-password=two words`, `X-Api-Key: v`) keeps its name and loses its
+/// whole value. A list item that is not a string breaks the argv: the
+/// string after it starts a new one.
 ///
-/// Both read a name as [`diagnostics::redact::is_sensitive_key`] does, by the
-/// parts it holds. A flag such as `--keyring` or `--author` is therefore
+/// The flag and assignment rules read a name as
+/// [`diagnostics::redact::is_sensitive_key`] does, by the parts it holds. A flag such as `--keyring` or `--author` is therefore
 /// masked too, with its value: the bundle loses that argument and keeps no
 /// secret, the same choice the key redaction makes for a record's members.
 fn scrub_event_strings(value: &mut serde_json_lenient::Value) -> bool {
@@ -930,19 +930,20 @@ fn scrub_event_strings(value: &mut serde_json_lenient::Value) -> bool {
         },
         Value::Array(items) => {
             let mut changed = false;
-            let mut after_sensitive_flag = false;
+            let mut scrubber = ArgvScrubber::default();
             for item in items.iter_mut() {
-                let flag = item.as_str().is_some_and(is_sensitive_flag);
                 match item {
                     Value::String(text) => {
-                        if let Cow::Owned(clean) = scrub_argv_element(after_sensitive_flag, text) {
+                        if let Cow::Owned(clean) = scrubber.scrub_next(text) {
                             *text = clean;
                             changed = true;
                         }
                     }
-                    other => changed |= scrub_event_strings(other),
+                    other => {
+                        changed |= scrub_event_strings(other);
+                        scrubber = ArgvScrubber::default();
+                    }
                 }
-                after_sensitive_flag = flag;
             }
             changed
         }

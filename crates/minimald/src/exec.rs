@@ -5,6 +5,7 @@
 //! so the bridge logic can be exercised with a mock in tests without
 //! going through `tokio::process` or russh.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 use std::io;
@@ -40,7 +41,7 @@ use tracing::Instrument as _;
 // clippy `disallowed-methods` for the crate names tokio's own spawn.
 use crate::traced::spawn;
 
-use diagnostics::redact::scrub_secrets;
+use diagnostics::redact::{scrub_argv, scrub_secrets};
 use minimald_rpc::exec::{ExecId, ExecMode};
 
 use crate::{
@@ -230,7 +231,7 @@ pub(crate) async fn handle_exec(
     if minimald_rpc::trace::opted_out(&config.env_vars) {
         tracing::info!(%session_id, telemetry = OPT_OUT, "exec request (command not recorded)");
     } else {
-        tracing::info!(%session_id, command = %scrub_secrets(&argv), "exec request");
+        tracing::info!(%session_id, command = %logged_command(&argv), "exec request");
     }
 
     // Parsed, never sniffed. The vocabulary in `minimald_rpc::exec` is the only
@@ -768,7 +769,7 @@ fn exec_span(
         tracing::info_span!(
             "exec",
             %session_id,
-            command = %scrub_secrets(argv),
+            command = %logged_command(argv),
             exec_id = tracing::field::Empty,
             exec_mode = tracing::field::Empty,
             telemetry = tracing::field::Empty,
@@ -780,6 +781,59 @@ fn exec_span(
     let adopted = adopt_client_trace(&span, config);
     let tp = box_traceparent(&adopted);
     (span, tp)
+}
+
+/// The command of an exec request as the daemon log records it, with its
+/// secrets masked.
+///
+/// The three forms that carry an argv are scrubbed element by element with
+/// [`scrub_argv`]: the words of `min://argv [...]`, the `argv` of
+/// `min://exec {...}`, and the task's args of `min://task/run`. A value is
+/// masked whole however many words it holds, and the value after a
+/// sensitive flag is masked as its own element. The request is logged in
+/// the encoding the client sends, so a log reader sees the same shape with
+/// the masked elements in place, and a request with nothing to mask is
+/// logged as it came. Any other command, and a request whose payload does
+/// not parse, is scrubbed as one line with [`scrub_secrets`].
+fn logged_command(command: &str) -> Cow<'_, str> {
+    use minimald_rpc::exec::{ExecRequest, ExecSpec};
+    match ExecRequest::parse(command) {
+        Ok(ExecRequest::Argv(words)) => match scrubbed_argv(&words) {
+            Some(words) => Cow::Owned(ExecRequest::Argv(words).encode()),
+            None => Cow::Borrowed(command),
+        },
+        Ok(ExecRequest::Exec(spec)) => match scrubbed_argv(&spec.argv) {
+            Some(argv) => Cow::Owned(ExecRequest::Exec(ExecSpec { argv, ..spec }).encode()),
+            None => Cow::Borrowed(command),
+        },
+        Ok(ExecRequest::TaskRun {
+            task,
+            owns_box,
+            args,
+            cwd,
+        }) => match scrubbed_argv(&args) {
+            Some(args) => Cow::Owned(
+                ExecRequest::TaskRun {
+                    task,
+                    owns_box,
+                    args,
+                    cwd,
+                }
+                .encode(),
+            ),
+            None => Cow::Borrowed(command),
+        },
+        _ => scrub_secrets(command),
+    }
+}
+
+/// `argv` scrubbed by [`scrub_argv`], or `None` when it masks nothing.
+fn scrubbed_argv(argv: &[String]) -> Option<Vec<String>> {
+    let scrubbed = scrub_argv(argv);
+    if scrubbed.iter().all(|word| matches!(word, Cow::Borrowed(_))) {
+        return None;
+    }
+    Some(scrubbed.into_iter().map(Cow::into_owned).collect())
 }
 
 /// The value of a request span's `telemetry` field when its client opted
@@ -929,6 +983,93 @@ mod box_traceparent_tests {
         assert!(!mlog::otel::exporting());
         let span = tracing::info_span!("exec");
         assert!(mlog::otel::align(&span, None).is_none());
+    }
+}
+
+#[cfg(test)]
+mod logged_command_tests {
+    use super::logged_command;
+    use minimald_rpc::exec::ExecRequest;
+
+    /// The `min://argv` encoding of `words`, as a client sends it.
+    fn argv(words: &[&str]) -> String {
+        ExecRequest::Argv(words.iter().map(|w| (*w).to_owned()).collect()).encode()
+    }
+
+    /// Every word of a passphrase given as one element is masked, and the
+    /// line keeps the `min://argv [...]` shape.
+    #[test]
+    fn an_assignment_loses_every_word_of_its_value() {
+        let command = argv(&["tool", "-password=correct horse battery staple"]);
+        let logged = logged_command(&command);
+        assert_eq!(
+            logged,
+            r#"min://argv ["tool","-password=<redacted:len=28>"]"#
+        );
+        for word in ["correct", "horse", "battery", "staple"] {
+            assert!(!logged.contains(word), "{logged}");
+        }
+    }
+
+    /// The element after a one-dash sensitive flag is masked.
+    #[test]
+    fn the_value_after_a_one_dash_flag_is_masked() {
+        assert_eq!(
+            logged_command(&argv(&["tool", "-token", "value"])),
+            r#"min://argv ["tool","-token","<redacted:len=5>"]"#
+        );
+    }
+
+    /// The argv of a `min://exec` request is scrubbed the same way, and the
+    /// request keeps its mode.
+    #[test]
+    fn the_argv_of_an_exec_request_is_masked() {
+        let logged =
+            logged_command(r#"min://exec {"argv":["tool","-token","value"],"mode":"detached"}"#);
+        assert_eq!(
+            logged,
+            r#"min://exec {"argv":["tool","-token","<redacted:len=5>"],"mode":"detached"}"#
+        );
+    }
+
+    /// The args of a task run are scrubbed element by element, and the
+    /// request keeps its task name and its `min://task/run` shape.
+    #[test]
+    fn the_args_of_a_task_run_are_masked() {
+        let command = ExecRequest::TaskRun {
+            task: "deploy".to_owned(),
+            owns_box: false,
+            args: ["-token", "value", "-password=two words"]
+                .map(str::to_owned)
+                .to_vec(),
+            cwd: String::new(),
+        }
+        .encode();
+        assert_eq!(
+            logged_command(&command),
+            r#"min://task/run ["deploy",["-token","<redacted:len=5>","-password=<redacted:len=9>"]]"#
+        );
+    }
+
+    /// A command with nothing to mask is logged as it came.
+    #[test]
+    fn an_ordinary_command_is_unchanged() {
+        let command = argv(&["cargo", "test", "--jobs=4", "https://example.test/"]);
+        assert_eq!(logged_command(&command), command);
+    }
+
+    /// A command outside the argv encoding, and an argv payload that does
+    /// not parse, go through the line rule.
+    #[test]
+    fn a_command_outside_the_argv_encoding_goes_through_the_line_rule() {
+        assert_eq!(
+            logged_command("curl -H 'Authorization: Bearer abc123' https://x/"),
+            "curl -H 'Authorization: Bearer <redacted:len=6>' https://x/"
+        );
+        assert_eq!(
+            logged_command("min://argv not-json --token abc123"),
+            "min://argv not-json --token <redacted:len=6>"
+        );
     }
 }
 
