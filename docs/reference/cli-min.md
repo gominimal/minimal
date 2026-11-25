@@ -213,8 +213,7 @@ attaches this terminal to it. `ENTRY` names a `[sessions.<name>]` entry, or a
 | Argument or flag | Description |
 |------------------|-------------|
 | `ENTRY` | The session entry to start. Optional |
-| `--name <NAME>` | Name the box. With `--new`, the box is named `<NAME>-<n>` |
-| `--new` | Create another box from the entry, named `<name>-<n>`, even when a running box holds the entry's name |
+| `--name <NAME>` | Name the box. This replaces the `[box] name` in `minimal.toml` |
 | `--detach` | Create the box, print its id and return. This terminal is not attached to the box |
 | `--network <none\|host_ip\|own_ip>` | Override of the entry's `network.mode`: the box gets this network mode. Without the flag, the box takes the entry's `network.mode`, else `host_ip`. The old hyphenated spellings `no-net`, `host-net`, and `own-ip` still work for one release, with a one-line hint naming the current spelling |
 | `--ingress <EXT:INT[/PROTO]>` | Override of the entry's `network.ingress`: each use adds one port mapping, `EXT:INT[/PROTO]` (PROTO = tcp or udp, default tcp). Requires `--network own_ip` |
@@ -270,7 +269,7 @@ The command refuses these starts before it creates a box:
 | An entry in `minimal.toml` has a type that is not built in, or a `[boxes.<name>]` entry has no `type`. The command refuses only when `ENTRY` names that entry, or when the start must count the entries to pick one | 2 |
 | No terminal, and no `--detach` | 2 |
 | `--no-loadouts` and `--loadout` together | 2 |
-| A running box holds the box's name. Pass `--new` or `--name` to create the box | 2 |
+| A running box already has the name from `--name` or `[box] name`. Pass another `--name` to create the box | 2 |
 
 An invalid `minimal.toml` ends the command with exit code 3.
 
@@ -428,8 +427,7 @@ type, else the project's only entry.
 
 | Flag | Description |
 |------|-------------|
-| `--name <NAME>` | Name the box. With `--new`, the box is named `<NAME>-<n>` |
-| `--new` | Create another box from the entry, named `<name>-<n>`, even when a running box holds the entry's name |
+| `--name <NAME>` | Name the box. This replaces the `[box] name` in `minimal.toml` |
 | `--detach` | Create the box, print its id and return. This terminal is not attached to the box |
 
 The command takes every override flag of [`session start`](#session-start),

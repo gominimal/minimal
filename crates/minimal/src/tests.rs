@@ -500,8 +500,6 @@ fn every_create_session_asserts_the_daemon_build() {
             // A test's request, sent only to the in-process test daemon,
             // which is this build: it checks the start's override flags.
             "tests.rs::planned_session_request_checked = asserts nothing",
-            // A unit test's request, never sent: it checks the fresh instance.
-            "tests.rs::run_and_start_new_request_fresh_instance = asserts nothing",
             // A unit test's request, never sent: it reads the spec a task
             // run stores, and only that spec reaches the daemon.
             "tests.rs::run_spec = asserts nothing",
@@ -860,8 +858,9 @@ const REMOVED_SESSION_VERBS: [&str; 7] = [
     "activate", "destroy", "exec", "rename", "policy", "hooks", "run",
 ];
 
-// BCLI-042: the removed `min session` verbs, bare `min stop` and `min task
-// run --path` fail as the parser fails for any unknown command or flag.
+// BCLI-042: the removed `min session` verbs, bare `min stop`, `min task
+// run --path` and `--new` on the start verbs fail as the parser fails for
+// any unknown command or flag.
 // The exit is 2, and nothing runs, because the parse gives no command.
 // A `--path` after the task's name parses as a task argument, so the run
 // refuses it with exit 2 before it creates a box.
@@ -931,6 +930,28 @@ async fn removed_session_verbs_fail_as_unknown_commands() {
         assert!(
             rendered.contains("unexpected argument '--sync'"),
             "{argv:?}: {rendered}"
+        );
+    }
+
+    // `--new` left `min box start` and `min session start`, hidden or not.
+    for noun in ["box", "session"] {
+        for argv in [
+            &["min", noun, "start", "--new"][..],
+            &["min", noun, "start", "web", "--new"],
+            &["min", noun, "start", "--new", "--detach"],
+            &["min", noun, "start", "web", "--name", "w", "--new"],
+        ] {
+            let rendered = refused(argv, ErrorKind::UnknownArgument);
+            assert!(
+                rendered.contains("unexpected argument '--new'"),
+                "{argv:?}: {rendered}"
+            );
+        }
+        assert!(
+            !model_verb(noun, "start")
+                .get_arguments()
+                .any(|arg| arg.get_long() == Some("new")),
+            "`min {noun} start` takes no --new"
         );
     }
 
@@ -2889,10 +2910,10 @@ async fn run_detach_prints_id_closes_stdin() {
 }
 
 // BCLI-010: `min box run` and `min task run` of an entry with a terminal
-// fail with exit 2 and a hint naming `min box start --new`, before they
+// fail with exit 2 and a hint naming `min box start <entry>`, before they
 // create anything.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn run_pty_entry_exit2_hints_start_new() {
+async fn run_pty_entry_exit2_hints_box_start() {
     let project = tempfile::tempdir().unwrap();
     std::fs::write(
         project.path().join(mfile::MFILE_NAME),
@@ -2948,7 +2969,7 @@ async fn run_pty_entry_exit2_hints_start_new() {
         );
         assert_eq!(
             err.to_string(),
-            "default runs with a terminal. Start it with min box start --new default."
+            "default runs with a terminal. Start it with min box start default."
         );
     }
     assert_eq!(task::RunNeedsTerminal::EXIT_CODE, 2);
@@ -2984,24 +3005,9 @@ async fn run_style_propagates_entrypoint_exit() {
     assert!(task::exit_outcome(None).is_err());
 }
 
-// BCLI-070: a fresh instance carries no name of the client's, so the
-// daemon names the box `<name>-<n>`. `min box start --new` and `min session
-// start --new` ask for one through `ActivationOptions::fresh_instance`.
-// `min task run` and `min box run` share one run path.
+// BCLI-010: `min task run` and `min box run` share one run path.
 #[test]
-fn run_and_start_new_request_fresh_instance() {
-    let mut request = minimald_rpc::CreateSessionRequest::new(
-        String::from("web"),
-        paths::HostAbsPath::try_new(camino::Utf8PathBuf::from("/tmp/project")).unwrap(),
-        boxes::NetworkMode::HostNet,
-        boxes::BoxPolicy::default(),
-    );
-    request.config.name = Some("web".into());
-    request_fresh_instance(&mut request);
-    assert!(request.fresh_instance);
-    assert_eq!(request.config.name, None, "the client invents no name");
-
-    // Both verbs reach the one run path.
+fn run_verbs_share_one_run_path() {
     let egress = EgressArgs {
         allow_dns_hosts: vec!["github.com".into()],
         ..EgressArgs::default()
@@ -3045,7 +3051,6 @@ fn typed_start(verb: StartVerb, entry: Option<&str>) -> StartEntry {
         verb,
         entry: entry.map(str::to_owned),
         name: None,
-        new: false,
         detach: false,
         overrides: StartOverrideArgs::default(),
     }
@@ -3181,7 +3186,6 @@ async fn start_off_tty_exit2_names_detach() {
             BoxStartArgs {
                 entry: None,
                 name: None,
-                new: false,
                 detach: false,
                 overrides: StartOverrideArgs::default(),
             },
@@ -3194,7 +3198,6 @@ async fn start_off_tty_exit2_names_detach() {
                 // A bare start picks the only session entry, `dev`.
                 entry: None,
                 name: None,
-                new: false,
                 detach: false,
                 overrides: StartOverrideArgs::default(),
             },
@@ -3225,7 +3228,7 @@ async fn start_off_tty_exit2_names_detach() {
 
 // BCLI-029, BCLI-070: a start for a path that already has a box creates
 // another box and prints only its id. It lists no boxes first and prints no
-// warning about the box that the path already has, with or without `--new`.
+// warning about the box that the path already has.
 // The attached start runs the same `activate_box` path, and this test cannot
 // attach off a terminal, so the source check below covers that half.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3269,13 +3272,12 @@ async fn start_with_a_box_for_the_path_prints_no_warning() {
         ..Default::default()
     };
 
-    // `min box start --detach`, `min session start --new --detach` and
-    // `min box start --new --detach`.
-    for (verb, new) in [
-        (StartVerb::Box, false),
-        (StartVerb::Session, true),
-        (StartVerb::Box, true),
-    ] {
+    // `min box start --detach`, `min session start --detach` and a second
+    // `min box start --detach`, whose derived name takes a number.
+    for (round, verb) in [StartVerb::Box, StartVerb::Session, StartVerb::Box]
+        .into_iter()
+        .enumerate()
+    {
         let out = tempfile::tempfile().unwrap();
         let err = tempfile::tempfile().unwrap();
         std::io::stdout().flush().unwrap();
@@ -3307,7 +3309,6 @@ async fn start_with_a_box_for_the_path_prints_no_warning() {
                     BoxStartArgs {
                         entry: None,
                         name: None,
-                        new,
                         detach: true,
                         overrides: StartOverrideArgs::default(),
                     },
@@ -3320,7 +3321,6 @@ async fn start_with_a_box_for_the_path_prints_no_warning() {
                     SessionStartArgs {
                         entry: None,
                         name: None,
-                        new,
                         detach: true,
                         overrides: StartOverrideArgs::default(),
                     },
@@ -3336,19 +3336,21 @@ async fn start_with_a_box_for_the_path_prints_no_warning() {
             text
         };
         let (stdout, stderr) = (read(out), read(err));
-        result.unwrap_or_else(|e| panic!("{verb:?} new={new}: the start fails: {e:#}\n{stderr}"));
+        result
+            .unwrap_or_else(|e| panic!("{verb:?} round {round}: the start fails: {e:#}\n{stderr}"));
         assert_eq!(
             stderr, "",
-            "{verb:?} new={new}: the start prints nothing on stderr"
+            "{verb:?} round {round}: the start prints nothing on stderr"
         );
         let id = stdout
             .strip_suffix('\n')
-            .unwrap_or_else(|| panic!("{verb:?} new={new}: stdout is one line: {stdout:?}"));
-        let id = boxes::SessionId::parse_str(id)
-            .unwrap_or_else(|_| panic!("{verb:?} new={new}: stdout holds only the id: {stdout:?}"));
+            .unwrap_or_else(|| panic!("{verb:?} round {round}: stdout is one line: {stdout:?}"));
+        let id = boxes::SessionId::parse_str(id).unwrap_or_else(|_| {
+            panic!("{verb:?} round {round}: stdout holds only the id: {stdout:?}")
+        });
         assert_ne!(
             id, existing,
-            "{verb:?} new={new}: the start creates another box"
+            "{verb:?} round {round}: the start creates another box"
         );
     }
 }
@@ -3448,8 +3450,8 @@ async fn unattached_start_closes_stdin_and_hints_run_logs_wait() {
 }
 
 // BCLI-069: `--name` on `min box start` and `min session start` becomes the
-// box's `[box] name`, which names the box. With `--new`, the name is the
-// base of the fresh instance's `<name>-<n>`.
+// box's `[box] name`, which names the box. BCLI-042: no start asks for a
+// fresh instance, so the name is never a base for `<name>-<n>`.
 #[test]
 fn create_verbs_name_flag_overrides_box_name() {
     for (verb, argv) in [
@@ -3502,41 +3504,22 @@ fn create_verbs_name_flag_overrides_box_name() {
         let spec: mfile::spec::BoxSpec =
             serde_json_lenient::from_value(request.spec.clone().unwrap()).unwrap();
         assert_eq!(spec.name, None);
-        request_fresh_instance(&mut request);
-        assert_eq!(request.config.name, None);
-
-        // A planned start with `--new` asks the activation for a fresh
-        // instance. A start without it does not.
-        assert!(!options.fresh_instance);
-        let fresh = StartEntry { new: true, ..start };
-        let StartPlan::Session { options, .. } =
-            plan_start(&fresh, &[], true).expect("the start is planned")
-        else {
-            panic!("the implicit default entry is a session");
-        };
         assert!(
-            options.fresh_instance,
-            "{verb:?}: --new asks for a fresh instance"
+            !request.fresh_instance,
+            "{verb:?}: a written name takes no number"
         );
     }
-    // The activation marks its create request as a fresh instance when its
-    // options ask for one, before it sends the request.
+    // The activation never marks its create request as a fresh instance.
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let text = std::fs::read_to_string(manifest.join("src/cmd/boxes/create.rs")).unwrap();
     let body = function_body(&text, "activate_box").expect("create.rs defines activate_box");
-    let asked = body
-        .find("if options.fresh_instance {")
-        .expect("the activation reads the fresh-instance option");
-    let marked = body[asked..]
-        .find("request_fresh_instance(&mut request)")
-        .map(|at| asked + at)
-        .expect("the activation marks its create as a fresh instance");
-    let sent = body
-        .find("oneshot_rpc::<CreateSession>")
-        .expect("the activation sends its create");
     assert!(
-        marked < sent,
-        "the activation marks its create before it sends it"
+        body.contains("oneshot_rpc::<CreateSession>"),
+        "the activation sends its create"
+    );
+    assert!(
+        !body.contains("fresh_instance = true"),
+        "the activation does not mark its create as a fresh instance"
     );
 
     // Without `--name` or a `[box] name`, the box takes the name the
@@ -3671,7 +3654,7 @@ fn task_entry_start_sends_name_flag_as_requested_name() {
         "the name goes on before the spec"
     );
     assert!(
-        !body.contains("request_fresh_instance"),
+        !body.contains("fresh_instance = true"),
         "the run does not mark its create as a fresh instance"
     );
 }
@@ -3978,8 +3961,8 @@ fn session_entry_until_stopped_stores_until_stopped() {
     }
 }
 
-// BCLI-069: a start without `--new` whose name a running box holds exits
-// 2, names the holder, and names `--new` and `--name`.
+// BCLI-069: a start whose name a running box holds exits 2, names the
+// holder, and names `--name`.
 #[test]
 fn create_name_held_exit2_names_holder_hints_name_flag() {
     let holder = boxes::SessionId::parse_str("0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b").unwrap();
@@ -4004,8 +3987,8 @@ fn create_name_held_exit2_names_holder_hints_name_flag() {
         format!("{error:#}"),
         "Cannot start default. The running box default \
          (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) holds the name default. Run \
-         min box start --new default to create another box from the entry, or pass \
-         --name <name> to give the box another name."
+         min box start default --name <name> to start a box from the entry under \
+         another name."
     );
 
     let unread = start_refusal(
@@ -4017,8 +4000,8 @@ fn create_name_held_exit2_names_holder_hints_name_flag() {
     assert_eq!(
         format!("{unread:#}"),
         "Cannot start dev. The running box dev holds the name dev. Run \
-         min session start --new dev to create another box from the entry, or pass \
-         --name <name> to give the box another name."
+         min session start dev --name <name> to start a box from the entry under \
+         another name."
     );
 
     let other = start_refusal(anyhow::anyhow!("boom"), StartVerb::Box, "dev");
@@ -17757,7 +17740,8 @@ fn planned_session_request_checked(
     stamp_session_spec_as(&mut request, root, options.entry.as_deref(), None, None).unwrap();
     add_vpn_network_names(&mut request, &options.vpn_network_names).unwrap();
     // Each create in a test is a fresh instance, so no name is held.
-    request_fresh_instance(&mut request);
+    request.config.name = None;
+    request.fresh_instance = true;
     Ok(request)
 }
 
@@ -24213,7 +24197,8 @@ async fn create_stores_client_digest_equal_to_daemon_digest() {
         boxes::BoxPolicy::default(),
     );
     task.config.creating_verb = minimald_rpc::CreatingVerb::Task;
-    request_fresh_instance(&mut task);
+    task.config.name = None;
+    task.fresh_instance = true;
     let file = mfile::File::from_dir_recursive(project.path()).expect("the project loads");
     let spec = mfile::spec::BoxSpec::for_task("lint", &file.tasks["lint"], spec_flags(&task))
         .expect("a task that is not interactive has a spec");
@@ -26978,7 +26963,6 @@ fn box_verbs_exist_with_arch_flags() {
             "start",
             &[
                 "--name",
-                "--new",
                 "--detach",
                 "--network",
                 "--ingress",
@@ -27040,7 +27024,7 @@ fn box_verbs_exist_with_arch_flags() {
 
     // Each verb parses a command line that uses its flags.
     for argv in [
-        &["box", "start", "web", "--name", "w", "--new", "--detach"][..],
+        &["box", "start", "web", "--name", "w", "--detach"][..],
         &[
             "box",
             "start",

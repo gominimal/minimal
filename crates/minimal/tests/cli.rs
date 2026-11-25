@@ -729,7 +729,6 @@ async fn start_session(
         SessionStartArgs {
             entry: None,
             name: Some(name.to_string()),
-            new: false,
             detach: true,
             overrides,
         },
@@ -941,7 +940,6 @@ async fn activate_uses_repo_dir_when_no_positional_path() {
         SessionStartArgs {
             entry: None,
             name: Some("repo-dir-test".to_string()),
-            new: false,
             detach: true,
             overrides: no_net(),
         },

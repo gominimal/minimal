@@ -1365,19 +1365,15 @@ pub struct BoxRunArgs {
 
 // BCLI-029, BCLI-069, BCLI-070, BCLI-072, and the override flags of
 // BCLI-024 and BCLI-073:
-// `min box start [<entry>] [--name <name>] [--new] [--detach]`.
+// `min box start [<entry>] [--name <name>] [--detach]`.
 #[derive(Debug, Args)]
 pub struct BoxStartArgs {
     /// Name of an entry declared in the project's minimal.toml. With none,
     /// the entry named `default`, else the project's only entry
     pub entry: Option<String>,
-    /// Name the box. With `--new`, the box is named `<name>-<n>`
+    /// Name the box. This replaces the `[box] name` in minimal.toml
     #[arg(long)]
     pub name: Option<String>,
-    /// Create another box from the entry, named `<name>-<n>`, even when a
-    /// running box holds the entry's name
-    #[arg(long)]
-    pub new: bool,
     /// Create the box, print its id and return. This terminal is not
     /// attached to the box
     #[arg(long)]
@@ -1388,20 +1384,16 @@ pub struct BoxStartArgs {
 
 // BCLI-029, BCLI-069, BCLI-070, BCLI-071, and the override flags of
 // BCLI-024 and BCLI-073:
-// `min session start [<entry>] [--name <name>] [--new] [--detach]`.
+// `min session start [<entry>] [--name <name>] [--detach]`.
 #[derive(Debug, Args)]
 pub struct SessionStartArgs {
     /// Name of a session entry declared in the project's minimal.toml. With
     /// none, the session entry named `default`, else the project's only
     /// session entry
     pub entry: Option<String>,
-    /// Name the box. With `--new`, the box is named `<name>-<n>`
+    /// Name the box. This replaces the `[box] name` in minimal.toml
     #[arg(long)]
     pub name: Option<String>,
-    /// Create another box from the entry, named `<name>-<n>`, even when a
-    /// running box holds the entry's name
-    #[arg(long)]
-    pub new: bool,
     /// Create the box, print its id and return. This terminal is not
     /// attached to the box
     #[arg(long)]
