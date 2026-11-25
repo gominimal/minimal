@@ -4744,9 +4744,11 @@ impl BoxManager {
                 .unwrap_or(crate::rpc::ANONYMOUS_SESSION),
         );
         let (base, source) = creation_name(&config, spec.as_ref());
-        // BEP-082: only a fresh instance registered under a creation key,
-        // and only a key for its own base. See `host_ip_mint_name`.
-        let fresh_base = fresh.then(|| base.clone());
+        // BEP-082: a fresh instance and a derived-name create registered
+        // under a creation key, and only a key for their own base counts.
+        // A derived name's base is its first candidate: the store can give
+        // the box `<base>-<n>` after the mint. See `host_ip_mint_name`.
+        let key_base = (fresh || source == NameSource::Derived).then(|| base.clone());
         // A derived name goes to the store, which walks its candidates
         // against every retained record and files the record in one step.
         // Until then the box carries the first candidate.
@@ -4950,7 +4952,7 @@ impl BoxManager {
         let switch_address = config.box_addresses.as_ref().map(|a| a.switch_address);
         // BEP-082: a `host_ip` grant box has no row, and its registration
         // minted its id under the box's name. See `host_ip_mint_name`.
-        let host_ip_name = host_ip_mint_name(&config, fresh_base.as_deref());
+        let host_ip_name = host_ip_mint_name(&config, key_base.as_deref());
         let control = crate::box_actor::switch_control_of(&self.net_switch).await;
         let minted = match crate::net::listeners::mint_box_id(
             &control,
@@ -5038,7 +5040,7 @@ impl BoxManager {
             tracing::Span::current().record("name", assigned.name.as_str());
             if fresh && let Some(n) = assigned.instance {
                 tracing::info!(
-                    base = ?fresh_base,
+                    base = ?key_base,
                     name = %assigned.name,
                     suffix = n,
                     "named a fresh box with the smallest suffix no retained record uses"
@@ -7074,15 +7076,16 @@ impl Drop for TearingDown {
 /// Only a `host_ip` box with no box addresses and a declared credentialed
 /// upstream registered, so only that box sends a name. It sends the name
 /// it registered under: the config's `host_ip_registration`, else the
-/// box's name. A fresh instance registered under a creation key, because
-/// this daemon names it `<base>-<n>` only after the registration.
-/// `fresh_base` is that base, and `None` when the create is not a fresh
-/// instance. The key counts only as `<fresh_base>~<hex>`. Any other value
+/// box's name. A fresh instance and a derived-name create registered
+/// under a creation key, because this daemon names them `<base>` or
+/// `<base>-<n>` only after the registration. `key_base` is that base: the
+/// first derived candidate for a derived name. It is `None` for a create
+/// with a written name. The key counts only as `<key_base>~<hex>`. Any other value
 /// is ignored, so a client cannot name another box's registration and
 /// take its id. A `host_ip` box with no grant registered nothing. If it
 /// sent its name, it could take the id of another live box that
 /// registered the same name.
-fn host_ip_mint_name(config: &minimald_rpc::BoxConfig, fresh_base: Option<&str>) -> Option<String> {
+fn host_ip_mint_name(config: &minimald_rpc::BoxConfig, key_base: Option<&str>) -> Option<String> {
     let grant_box = matches!(config.network, boxes::NetworkMode::HostNet)
         && config.box_addresses.is_none()
         && config.policy.credentialed_upstream.is_some();
@@ -7090,15 +7093,15 @@ fn host_ip_mint_name(config: &minimald_rpc::BoxConfig, fresh_base: Option<&str>)
         return None;
     }
     if let Some(key) = config.host_ip_registration.as_deref() {
-        if fresh_base.is_some_and(|base| is_creation_key_of(key, base)) {
+        if key_base.is_some_and(|base| is_creation_key_of(key, base)) {
             return Some(key.to_string());
         }
         tracing::warn!(
             host_ip_registration = %key,
-            fresh_base = ?fresh_base,
+            key_base = ?key_base,
             box_name = ?config.name,
             "ignored a host_ip registration key that is not a creation key \
-             for this fresh box's base; the mint asks by the box's name"
+             for this box's base; the mint asks by the box's name"
         );
     }
     config.name.clone()
@@ -7179,8 +7182,8 @@ mod host_ip_mint_name_tests {
         assert_eq!(host_ip_mint_name(&config, None), None);
     }
 
-    // BEP-082: the mint asks by a creation key only on a fresh instance,
-    // and only by a key for the box's own base.
+    // BEP-082: the mint asks by a creation key only on a fresh instance or
+    // a derived-name create, and only by a key for the box's own base.
     #[test]
     fn host_ip_box_record_takes_the_registration_key_only_for_its_own_fresh_base() {
         let key = "agent~00112233445566778899aabbccddeeff";
@@ -7193,7 +7196,7 @@ mod host_ip_mint_name_tests {
         assert_eq!(
             host_ip_mint_name(&config, None),
             Some("agent".to_string()),
-            "a create that is not a fresh instance asks by its name"
+            "a create with a written name asks by its name"
         );
         assert_eq!(
             host_ip_mint_name(&config, Some("other")),

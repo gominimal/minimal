@@ -4683,6 +4683,65 @@ async fn fresh_instance_mint_finds_its_registration_after_the_rename() {
     door_task.abort();
 }
 
+/// BEP-082, BOX-163: a derived-name `host_ip` grant box registered under
+/// a creation key, because the store can give it `<name>-<n>` after the
+/// mint. Two such creates of one project ask by their own keys, and both
+/// are created, as `web` and `web-1`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn taken_derived_name_gets_smallest_free_number_for_a_grant_box() {
+    let (state, _cache, mngr) = manager().await;
+    let control = manager_switch_control(state.path());
+    let door = state.path().join("vm-host-door.sock");
+    let first = SessionId::mint();
+    let second = SessionId::mint();
+    let (door_task, mut asks) = mint_door(
+        &door,
+        vec![
+            minimald_rpc::BoxControlReply::BoxIdMinted {
+                minted_box_id: first,
+            },
+            minimald_rpc::BoxControlReply::BoxIdMinted {
+                minted_box_id: second,
+            },
+        ],
+    );
+    crate::net::listeners::seed_vm_report_door_for_tests(&control, &door);
+
+    let mut created = Vec::new();
+    for key in [
+        "web~00112233445566778899aabbccddeeff",
+        "web~ffeeddccbbaa99887766554433221100",
+    ] {
+        let mut config = as_task(unnamed_config());
+        config.project_name = Some("web".to_string());
+        config.network = boxes::NetworkMode::HostNet;
+        config.policy.credentialed_upstream = Some(boxes::CredentialedUpstream::default());
+        config.host_ip_registration = Some(key.to_string());
+        let (id, _fact, name) = mngr
+            .create_box_reporting_fact(config, Some(task_spec("default", None)), false, None, None)
+            .await
+            .expect("a derived-name grant box is never refused");
+        let ask = mint_ask(asks.recv().await.unwrap());
+        assert_eq!(
+            ask.host_ip_name.as_deref(),
+            Some(key),
+            "the mint asks by the key"
+        );
+        created.push((id, name.name));
+    }
+    assert_eq!(
+        created,
+        vec![
+            (first, Some("web".to_string())),
+            (second, Some("web-1".to_string())),
+        ],
+        "each derived-name grant box takes its own id and name"
+    );
+
+    crate::net::listeners::clear_vm_report_door_for_tests(&control);
+    door_task.abort();
+}
+
 /// BOX-002: a create whose mint reply is lost asks again with the same
 /// token, so the VM host daemon can give the retry the id it already
 /// gave that create.
