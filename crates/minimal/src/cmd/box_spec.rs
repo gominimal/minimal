@@ -1360,11 +1360,34 @@ async fn box_spec(
     let mut text = Vec::new();
     match format {
         BoxSpecOutputFormat::Toml => {
+            // BCLI-022, BOX-227, BOX-228: the box's name comes from its
+            // record, never from its spec, so a renamed box shows its new
+            // name. `[box] name` is only the name the entry asked for.
+            let Some(record) = super::box_verbs::stored_box_record(&mut client, id).await? else {
+                tracing::info!(verb = "box spec", box_id = %id, outcome = "not found");
+                return Err(super::box_verbs::BoxAddressRefusal::NotFound {
+                    address: target.to_owned(),
+                }
+                .into());
+            };
             writeln!(text, "# The spec box {id} was created with.")?;
+            write_record_name(&record, &mut text)?;
             let spec = match json_to_toml(&stored) {
                 Some(toml::Value::Table(table)) => table,
                 _ => anyhow::bail!("The stored spec of box {id} is not a table."),
             };
+            if let Some(requested) = spec
+                .get("box")
+                .and_then(|b| b.get("name"))
+                .and_then(toml::Value::as_str)
+            {
+                writeln!(
+                    text,
+                    "# [box] name {}: the name the entry asks for when a box is created from it. \
+                     It is not the name of this box.",
+                    one_line_string(requested)
+                )?;
+            }
             // BCLI-022, BOX-179: each stored hook, with who declared it.
             if let Some(toml::Value::Array(hooks)) = spec.get("lifecycle_hooks") {
                 write_hook_list(hooks, &mut text)?;
@@ -1381,6 +1404,23 @@ async fn box_spec(
     }
     tracing::info!(verb = "box spec", box_id = %id, outcome = "ok", host = %host.host);
     out.extend_from_slice(&text);
+    Ok(())
+}
+
+/// Writes the name `record` holds as a comment line, with whether a person
+/// wrote it or the host derived it.
+fn write_record_name(record: &boxes::Record, out: &mut Vec<u8>) -> anyhow::Result<()> {
+    let Some(name) = record.name.as_deref() else {
+        writeln!(out, "# Box name: none.")?;
+        return Ok(());
+    };
+    let origin = match record.name_origin {
+        boxes::NameOrigin::Written => "a person wrote this name",
+        boxes::NameOrigin::Derived => {
+            "the host derived this name from the project name and the entry"
+        }
+    };
+    writeln!(out, "# Box name: {} ({origin}).", one_line_string(name))?;
     Ok(())
 }
 

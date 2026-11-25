@@ -20424,6 +20424,119 @@ async fn box_spec_box_renders_stored_copy() {
     );
 }
 
+/// Renames box `id` on `server` to `new_name`, as `min box rename` does.
+async fn rename_box(
+    server: &minimald::test_harness::TestServer,
+    id: boxes::SessionId,
+    new_name: &str,
+) {
+    let mut daemon = server.connect().await;
+    let request = minimald_rpc::RenameSessionRequest {
+        id,
+        new_name: new_name.to_owned(),
+    };
+    match daemon.call::<minimald_rpc::RenameSession>(&request).await {
+        minimald_rpc::Errorable::Ok(_) => {}
+        minimald_rpc::Errorable::Err { error } => panic!("the rename failed: {error}"),
+    }
+}
+
+// BCLI-022, BOX-227, BOX-228: `min box spec <box>` shows the name the
+// box's record holds and its origin, never a name from the spec. After a
+// rename it shows the new name, written by a person.
+#[tokio::test]
+async fn box_spec_box_shows_record_name_and_origin() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join(mfile::MFILE_NAME), "[session]\n").unwrap();
+    let root = camino::Utf8Path::from_path(project.path()).unwrap();
+    let (_state, mut global, server) = show_network_daemon().await;
+    let elsewhere = tempfile::tempdir().unwrap();
+    global.repo_dir = Some(elsewhere.path().to_path_buf());
+    let (_, id) = create_specced_box(&server, root, None).await;
+    let id_text = id.to_string();
+
+    let mut client = connect_daemon(&global).await.expect("the daemon answers");
+    let record = stored_box_record(&mut client, id)
+        .await
+        .expect("the record is read")
+        .expect("the host has the box");
+    let derived = record.name.clone().expect("the host names the box");
+    assert_eq!(record.name_origin, boxes::NameOrigin::Derived);
+    let toml = box_spec_text(&global, &["min", "box", "spec", &id_text])
+        .await
+        .expect("the stored spec renders");
+    assert!(
+        toml.contains(&format!(
+            "\n# Box name: \"{derived}\" (the host derived this name from the \
+             project name and the entry).\n"
+        )),
+        "{toml}"
+    );
+
+    rename_box(&server, id, "renamed-box").await;
+    let toml = box_spec_text(&global, &["min", "box", "spec", &id_text])
+        .await
+        .expect("the stored spec renders");
+    assert!(
+        toml.starts_with(&format!(
+            "# The spec box {id} was created with.\n\
+             # Box name: \"renamed-box\" (a person wrote this name).\n"
+        )),
+        "{toml}"
+    );
+    assert!(!toml.contains(&derived), "the old name is gone\n{toml}");
+    toml::from_str::<toml::Table>(&toml).expect("the render is TOML");
+}
+
+// BCLI-022: a stored `[box] name` is labelled as the name the entry asks
+// for at creation, never as the box's name. After a rename the two differ.
+#[tokio::test]
+async fn box_spec_box_labels_box_name_as_default_request() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join(mfile::MFILE_NAME), "[session]\n").unwrap();
+    let root = camino::Utf8Path::from_path(project.path()).unwrap();
+    let (_state, mut global, server) = show_network_daemon().await;
+    let elsewhere = tempfile::tempdir().unwrap();
+    global.repo_dir = Some(elsewhere.path().to_path_buf());
+    let (mut request, _) = create_specced_box(&server, root, Some("unused")).await;
+    request.config.name = Some("asked".to_owned());
+    if let Some(serde_json_lenient::Value::Object(spec)) = request.spec.as_mut() {
+        let section = spec
+            .entry("box".to_owned())
+            .or_insert_with(|| serde_json_lenient::json!({}));
+        section
+            .as_object_mut()
+            .expect("[box] is a table")
+            .insert("name".to_owned(), "asked".into());
+    }
+    let digest = mfile::projection::spec_digest(
+        request.spec.as_ref().expect("the request carries a spec"),
+        boxes::SESSION_BOX_TYPE,
+    )
+    .expect("the spec projects");
+    request.config.set_client_projection_digest(digest);
+    let id = create_box_from(&server, &request).await;
+    rename_box(&server, id, "renamed-box").await;
+
+    let toml = box_spec_text(&global, &["min", "box", "spec", &id.to_string()])
+        .await
+        .expect("the stored spec renders");
+    assert!(
+        toml.contains("\n# Box name: \"renamed-box\" (a person wrote this name).\n"),
+        "{toml}"
+    );
+    assert!(
+        toml.contains(
+            "\n# [box] name \"asked\": the name the entry asks for when a box is created \
+             from it. It is not the name of this box.\n"
+        ),
+        "{toml}"
+    );
+    assert!(!toml.contains("# Box name: \"asked\""), "{toml}");
+    let parsed: toml::Table = toml::from_str(&toml).expect("the render is TOML");
+    assert_eq!(parsed["box"]["name"].as_str(), Some("asked"));
+}
+
 // BCLI-022, BOX-179: `min box spec <box>` lists each stored lifecycle
 // hook with its event, its command, its description and its declarer.
 // A description, a script path or the first line of an inline command
