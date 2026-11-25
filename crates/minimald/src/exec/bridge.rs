@@ -402,14 +402,13 @@ pub(crate) enum ExecEnd {
 }
 
 impl ExecEnd {
-    /// The level the bridge logs this end at when it ends the command, for the tests
-    /// to hold the log lines to.
+    /// The level the bridge logs this end at ([`log_exec_end`], and the end
+    /// of an exec whose command is still starting, [`bridge_until_end`]).
     ///
     /// A client that closed its channel left on purpose, and its command
     /// ending with it is the contract (gominimal/inbox#813), so that is info.
     /// A connection that ended with no close, and an input bound that ran
-    /// out, stay warnings.
-    #[cfg(test)]
+    /// out, are warnings.
     pub(super) fn log_level(self) -> tracing::Level {
         match self {
             Self::ClientClosed => tracing::Level::INFO,
@@ -420,25 +419,36 @@ impl ExecEnd {
     }
 }
 
+/// One log line at `$level`, which is info or a warning: `tracing`'s macros
+/// take their level as a constant, so the two are spelled out here once.
+macro_rules! info_or_warn {
+    ($level:expr, $($line:tt)*) => {
+        if $level == tracing::Level::INFO {
+            tracing::info!($($line)*)
+        } else {
+            tracing::warn!($($line)*)
+        }
+    };
+}
+
 /// Logs why the bridge is ending the exec on `channel_id`, at the level
 /// [`ExecEnd::log_level`] gives.
 pub(super) fn log_exec_end(channel_id: &impl Display, end: ExecEnd) {
+    let level = end.log_level();
     match end {
-        ExecEnd::ClientClosed => tracing::info!(
+        ExecEnd::ClientClosed | ExecEnd::ClientLost => info_or_warn!(
+            level,
             %channel_id,
-            channel_closed = true,
+            channel_closed = matches!(end, ExecEnd::ClientClosed),
             "exec: ssh client disconnected; killing child",
         ),
-        ExecEnd::ClientLost => tracing::warn!(
-            %channel_id,
-            channel_closed = false,
-            "exec: ssh client disconnected; killing child",
-        ),
-        ExecEnd::InputHeldOver(bound) => tracing::warn!(
+        ExecEnd::InputHeldOver(bound) => info_or_warn!(
+            level,
             %channel_id, ?bound,
             "exec: the command's unread input crossed a bound; ending the exec",
         ),
-        ExecEnd::InputHeldUnstarted(bound) => tracing::warn!(
+        ExecEnd::InputHeldUnstarted(bound) => info_or_warn!(
+            level,
             %channel_id, ?bound,
             "exec: the command started after its wait at an input bound ran out; ending the exec",
         ),
@@ -1211,9 +1221,13 @@ where
             biased;
             next = stream.next() => next,
             () = until_ended(&mut client_lost) => {
-                tracing::warn!(
+                // The level is the end's own: a client that closed its
+                // channel while its command was starting left on purpose.
+                let end = *client_lost.borrow();
+                info_or_warn!(
+                    end.map_or(tracing::Level::WARN, ExecEnd::log_level),
                     %channel_id,
-                    end = ?*client_lost.borrow(),
+                    ?end,
                     "exec: ended while its command was starting; the start is ended when it returns",
                 );
                 return (1, Some(stream));

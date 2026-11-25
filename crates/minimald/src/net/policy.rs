@@ -1847,9 +1847,10 @@ async fn post_json_reply_within<T: Serialize>(
     // closing the connection. On the KVM libkrun `add_vsock_port2(listen=false)`
     // shuttle, a server-initiated close drops the still-buffered response bytes as
     // it propagates to the guest (the guest reads an immediate EOF → 0 bytes →
-    // `malformed gvproxy status line: ""`, even though the forward *was* applied —
-    // G-N8). Keeping the connection open lets the response drain to the guest,
-    // which then reads exactly `Content-Length` bytes and closes from its side.
+    // "the control connection closed before any answer came back", even though
+    // the forward *was* applied — G-N8). Keeping the connection open lets the
+    // response drain to the guest, which then reads exactly `Content-Length`
+    // bytes and closes from its side.
     request.extend_from_slice(format!("POST {path} HTTP/1.1\r\n").as_bytes());
     request.extend_from_slice(b"Host: localhost\r\n");
     request.extend_from_slice(b"Content-Type: application/json\r\n");
@@ -1969,15 +1970,14 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
         if n == 0 {
             // EOF before any byte of an answer: the far end closed without
             // answering. On a VM host that is also how the host's egress
-            // gate refuses a request it does not admit. Said as what
-            // happened, rather than as an empty status line.
+            // gate refuses a request it does not admit.
             if response.is_empty() {
                 return Err(io::Error::other(
                     "the control connection closed before any answer came back",
                 ));
             }
-            // EOF before headers completed — the empty-reply symptom the
-            // keep-alive framing is meant to avoid; surface it as-is.
+            // EOF after part of the head: the caller reads what came and
+            // names the malformed status line or headers.
             return Ok(response);
         }
         response.extend_from_slice(&buf[..n]);

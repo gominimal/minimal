@@ -696,8 +696,8 @@ async fn finish_own_ip_attach(
     // holds no name (NET-138's task rows), so the host's egress gate refuses
     // a zone record for it and closes the request without an answer. A task
     // launch owns no name of its own (`ungated_name` in
-    // `complete_own_ip_attach`). A native daemon's task still registers, as
-    // before: its gvproxy is its own and takes the record.
+    // `complete_own_ip_attach`). A native daemon's task registers: its
+    // gvproxy is its own and takes the record.
     let host_ids = if own_address.is_none() && handed_from_host {
         tracing::debug!(
             session = session_name,
