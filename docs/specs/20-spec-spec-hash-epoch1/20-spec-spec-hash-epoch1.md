@@ -307,8 +307,9 @@ build-infra operator. Release manager.
   property: no two structural tags share a byte, and for all byte strings s
     with an unassigned tag: decode(s) errors
   harness:  kani_epoch1_tags_unique_and_unknown_rejected, exhaustive over
-    all 256 tag bytes with a bounded 8-byte payload, in spec, subset and
-    container position, unwind 9 (the payload loop)
+    all 256 tag bytes with a bounded 8-byte payload, in spec, subset,
+    container and cycle record position (the decoder of EPOCH-028), unwind
+    9 (the payload loop)
   - THE SYSTEM SHALL assign no tag in 0xF0 to 0xFF at the epoch-1 seal;
     that range is the reserve an additive optional field (EPOCH-021) draws
     its tag from after the seal, and the test pins the seal's assignment,
