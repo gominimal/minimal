@@ -811,9 +811,10 @@ impl Drop for HeldInputReader {
 /// `Eof` closes the held input (the command sees EOF once it has read what
 /// is queued) but keeps watching the channel: `min task run` from a
 /// terminal half-closes stdin straight away, so a disconnect almost always
-/// arrives *after* EOF and must still be seen. `Close`, or the end of `msgs`
-/// (the channel's sender dropped with the connection), sends
-/// [`ExecEnd::ClientLost`] and returns.
+/// arrives *after* EOF and must still be seen. `Close` (the client closed
+/// its channel) sends [`ExecEnd::ClientClosed`]; the end of `msgs` with no
+/// `Close` (the channel's sender dropped with the connection) sends
+/// [`ExecEnd::ClientLost`]. Either returns.
 pub(super) async fn pump_channel_input<M>(
     mut msgs: M,
     held: Arc<HeldInput>,
