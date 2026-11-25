@@ -3991,19 +3991,22 @@ mod trace_tests {
 
 /// The reply's account of a derived name a create did not get (BOX-163).
 /// It names the box that has the name only when the caller may read that
-/// box: the caller created it, or the box records no creator. The name
+/// box: the caller created it, or its record was read and records no
+/// creator. A record that was not read hides the holder. The name
 /// itself is always in the reply, because the caller's own create derived
 /// it.
 fn name_not_taken_reply(
     not_taken: &crate::box_manager::NotTakenName,
     caller: Option<&str>,
 ) -> minimald_rpc::NameNotTaken {
+    use crate::box_manager::HolderCreator;
     use boxes::box_name::DerivedNameTaken;
     let reason = match &not_taken.reason {
         DerivedNameTaken::Held(holder) => {
-            let readable = match not_taken.holder_username.as_deref() {
-                None => true,
-                Some(owner) => caller == Some(owner),
+            let readable = match &not_taken.holder_creator {
+                HolderCreator::User(owner) => caller == Some(owner.as_str()),
+                HolderCreator::NoCreator => true,
+                HolderCreator::Unread => false,
             };
             minimald_rpc::NameTakenReason::Held {
                 holder: readable.then(|| minimald_rpc::NameHolder {
@@ -4116,25 +4119,34 @@ mod create_naming_tests {
             name: "web".to_string(),
             status: boxes::BoxState::Active,
         };
-        let not_taken = |owner: Option<&str>| crate::box_manager::NotTakenName {
+        use crate::box_manager::HolderCreator;
+        let not_taken = |creator: HolderCreator| crate::box_manager::NotTakenName {
             name: "web".to_string(),
             reason: boxes::box_name::DerivedNameTaken::Held(holder.clone()),
-            holder_username: owner.map(str::to_string),
+            holder_creator: creator,
         };
+        let ann = || HolderCreator::User("ann".to_string());
         let named = |reply: minimald_rpc::NameNotTaken| match reply.reason {
             minimald_rpc::NameTakenReason::Held { holder } => holder,
             other => panic!("a held name: {other:?}"),
         };
-        let shown = named(super::name_not_taken_reply(
-            &not_taken(Some("ann")),
-            Some("ann"),
-        ))
-        .expect("the creator reads the holder");
+        let shown = named(super::name_not_taken_reply(&not_taken(ann()), Some("ann")))
+            .expect("the creator reads the holder");
         assert_eq!((shown.id, shown.state.as_str()), (holder.id, "running"));
-        assert!(named(super::name_not_taken_reply(&not_taken(None), Some("bob"))).is_some());
-        let hidden = super::name_not_taken_reply(&not_taken(Some("ann")), Some("bob"));
+        assert!(
+            named(super::name_not_taken_reply(
+                &not_taken(HolderCreator::NoCreator),
+                Some("bob")
+            ))
+            .is_some(),
+            "a record with no creator is readable"
+        );
+        let hidden = super::name_not_taken_reply(&not_taken(ann()), Some("bob"));
         assert_eq!(hidden.name, "web", "the name is still in the reply");
         assert_eq!(named(hidden), None, "another user does not read the holder");
+        let unread = super::name_not_taken_reply(&not_taken(HolderCreator::Unread), Some("ann"));
+        assert_eq!(unread.name, "web", "the name is still in the reply");
+        assert_eq!(named(unread), None, "an unread holder record is hidden");
     }
 
     /// A create under a name a running box holds is refused, and the

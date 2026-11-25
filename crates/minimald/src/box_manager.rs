@@ -442,8 +442,21 @@ pub(crate) struct NotTakenName {
     pub(crate) name: String,
     /// Why the box did not get it.
     pub(crate) reason: boxes::box_name::DerivedNameTaken,
-    /// The SSH user that created the box that has the name, if known.
-    pub(crate) holder_username: Option<String>,
+    /// The creator of the box that has the name, as read from its record.
+    pub(crate) holder_creator: HolderCreator,
+}
+
+/// The creator of the box that holds a derived name, as the create read
+/// it back. A record that was not read is kept apart from one that records
+/// no creator, so the reply never names a holder it could not check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HolderCreator {
+    /// The record was read and names this SSH user as its creator.
+    User(String),
+    /// The record was read and records no creator.
+    NoCreator,
+    /// The record is gone or could not be read, or the name has no holder.
+    Unread,
 }
 
 /// Where a new box's name came from (BOX-211), for the create's log.
@@ -5192,28 +5205,31 @@ impl BoxManager {
 
     /// What a create's reply says about the name the store assigned: the
     /// name, and the name not taken with its holder's creator, read back
-    /// from the holder's record. A holder gone since reads as one with no
-    /// creator to compare.
+    /// from the holder's record. A holder gone since, or a record that
+    /// cannot be read, is `Unread`, and the reply then hides the holder.
     async fn created_name(&self, assigned: boxes::box_name::DerivedAssignment) -> CreatedName {
         let not_taken = match assigned.not_taken {
             None => None,
             Some((name, reason)) => {
-                let holder_username = match &reason {
+                let holder_creator = match &reason {
                     boxes::box_name::DerivedNameTaken::Held(holder) => {
                         match self.store.find(RecordPredicate::Id(holder.id)).await {
                             Ok(Some(handle)) => match handle.record().await {
-                                Ok(record) => record.username,
-                                Err(_) => None,
+                                Ok(record) => match record.username {
+                                    Some(user) => HolderCreator::User(user),
+                                    None => HolderCreator::NoCreator,
+                                },
+                                Err(_) => HolderCreator::Unread,
                             },
-                            _ => None,
+                            _ => HolderCreator::Unread,
                         }
                     }
-                    _ => None,
+                    _ => HolderCreator::Unread,
                 };
                 Some(NotTakenName {
                     name,
                     reason,
-                    holder_username,
+                    holder_creator,
                 })
             }
         };
