@@ -8660,7 +8660,7 @@ async fn box_verb_on_stopped_vm_box_refuses_with_start_hint() {
     // A type noun finds the running VM's session `api`: the stopped VM's
     // record carries no type, so it does not make the name ambiguous.
     let resolved = cmd::resolve_box_of_type(
-        crate::cmd::list::local_hosts(&global).expect("the local hosts"),
+        local_hosts(&global).expect("the local hosts"),
         "api",
         "session",
         "session stop",
