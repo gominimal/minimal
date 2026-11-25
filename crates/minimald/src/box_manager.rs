@@ -327,6 +327,9 @@ fn build_record(
         box_type: Some(box_type.to_string()),
         parent,
         attrs: config.attrs,
+        project_name: None,
+        entry: None,
+        name_origin: boxes::NameOrigin::Written,
     };
     record
         .validate_new_policy()
@@ -437,6 +440,54 @@ impl NameSource {
             Self::Request => "request name",
             Self::Derived => "project and entry",
         }
+    }
+}
+
+impl NameSource {
+    /// The origin a record keeps for a name from this source.
+    const fn origin(self) -> boxes::NameOrigin {
+        match self {
+            Self::Request => boxes::NameOrigin::Written,
+            Self::Derived => boxes::NameOrigin::Derived,
+        }
+    }
+}
+
+/// The name fields a create stamps on its record (BOX-158, BOX-159,
+/// BOX-164): the name's origin, the project name and the entry. The
+/// daemon reads them from the request and the stored spec at creation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordNaming {
+    project_name: String,
+    entry: Option<String>,
+    origin: boxes::NameOrigin,
+}
+
+impl RecordNaming {
+    /// The fields for a create of `config` with `spec`, named from
+    /// `source`. The project name is the one a derived name uses, also
+    /// when the request wrote the name.
+    fn of(
+        config: &minimald_rpc::BoxConfig,
+        spec: Option<&serde_json_lenient::Value>,
+        source: NameSource,
+    ) -> Self {
+        let entry = spec
+            .and_then(|spec| spec.get("entry"))
+            .and_then(serde_json_lenient::Value::as_str)
+            .map(str::to_string);
+        Self {
+            project_name: DerivedName::of(config, spec).project,
+            entry,
+            origin: source.origin(),
+        }
+    }
+
+    /// Writes the fields onto `record`.
+    fn stamp(self, record: &mut boxes::Record) {
+        record.project_name = Some(self.project_name);
+        record.entry = self.entry;
+        record.name_origin = self.origin;
     }
 }
 
@@ -1364,6 +1415,9 @@ fn box_listing_entry(
         box_type: record.box_type.clone(),
         parent: record.parent,
         project_root: record.project_root.clone(),
+        project_name: record.project_name.clone(),
+        entry: record.entry.clone(),
+        name_origin: record.name_origin,
         state: state.to_string(),
         reason,
         exit_code,
@@ -4723,6 +4777,10 @@ impl BoxManager {
                 .unwrap_or(crate::rpc::ANONYMOUS_SESSION),
         );
         let (base, source) = creation_name(&config, spec.as_ref());
+        // The record keeps where its name came from, the project name and
+        // the entry, stamped here from the request and the spec. Nothing the
+        // box itself runs writes them.
+        let naming = RecordNaming::of(&config, spec.as_ref(), source);
         // BEP-082: only a fresh instance registered under a creation key,
         // and only a key for its own base. See `host_ip_mint_name`.
         let fresh_base = fresh.then(|| base.clone());
@@ -4995,7 +5053,9 @@ impl BoxManager {
             minimald_rpc::CreatingVerb::Session => boxes::SESSION_BOX_TYPE,
             minimald_rpc::CreatingVerb::Task => boxes::TASK_BOX_TYPE,
         };
-        let record = build_record(config, username, boxes::BoxState::Pending, box_type, parent)?;
+        let mut record =
+            build_record(config, username, boxes::BoxState::Pending, box_type, parent)?;
+        naming.stamp(&mut record);
         tracing::Span::current().record("box_type", box_type);
         let project_root = record.project_root.clone();
         let name = record.name.clone();

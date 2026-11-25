@@ -2188,6 +2188,9 @@ fn reap_and_prune_requests_round_trip() {
         pty_enabled: false,
         lifetime: None,
         build_boxes: Vec::new(),
+        project_name: None,
+        entry: None,
+        name_origin: boxes::NameOrigin::Written,
     };
     let reap = ReapBoxResponse {
         reaped: entry.clone(),
@@ -2241,6 +2244,9 @@ fn preview_prune_and_show_disk_round_trip() {
         pty_enabled: true,
         lifetime: None,
         build_boxes: Vec::new(),
+        project_name: None,
+        entry: None,
+        name_origin: boxes::NameOrigin::Written,
     };
     let preview = PreviewPruneResponse {
         matched: vec![

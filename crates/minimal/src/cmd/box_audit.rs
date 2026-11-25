@@ -759,6 +759,9 @@ mod tests {
             parent: parent.map(id),
             project_root: None,
             attrs: Default::default(),
+            project_name: None,
+            entry: None,
+            name_origin: boxes::NameOrigin::Written,
         }
     }
 

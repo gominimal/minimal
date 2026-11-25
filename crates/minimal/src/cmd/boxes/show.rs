@@ -94,6 +94,9 @@ pub(crate) struct ShownBoxDoc {
     box_type: Option<String>,
     parent: Option<String>,
     project: Option<String>,
+    project_name: Option<String>,
+    entry: Option<String>,
+    name_origin: &'static str,
     state: String,
     reason: Option<String>,
     exit_code: Option<i32>,
@@ -150,6 +153,9 @@ pub(crate) fn shown_box_doc(
         box_type: record.box_type.clone(),
         parent: record.parent.map(|parent| parent.to_string()),
         project: record.project_root.as_ref().map(|root| root.to_string()),
+        project_name: record.project_name.clone(),
+        entry: record.entry.clone(),
+        name_origin: record.name_origin.as_str(),
         state: record.state.clone(),
         reason: record.reason.clone(),
         exit_code: record.exit_code,
@@ -557,11 +563,14 @@ pub(crate) fn render_box_show(
     let mut lines = vec![
         ("ID", record.box_id.to_string()),
         ("Name", or_none(record.name.clone())),
+        ("Name origin", record.name_origin.to_string()),
+        ("Entry", or_none(record.entry.clone())),
         ("Type", or_none(record.box_type.clone())),
         (
             "Parent",
             or_none(record.parent.map(|parent| parent.to_string())),
         ),
+        ("Project name", or_none(record.project_name.clone())),
         (
             "Project",
             or_none(record.project_root.as_ref().map(|root| root.to_string())),
@@ -584,7 +593,7 @@ pub(crate) fn render_box_show(
     lines.push(("Host", host.to_string()));
     for (label, value) in lines {
         let label = format!("{label}:");
-        writeln!(out, "{label:<11} {value}")?;
+        writeln!(out, "{label:<13} {value}")?;
     }
     // BCLI-067: one row for each live exec, with its id, whether it holds a
     // terminal, and its command.

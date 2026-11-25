@@ -2231,6 +2231,8 @@ impl Loader for DiskLoader {
         }
         let mut record = object.record.clone();
         record.name = Some(new_name.clone());
+        // A renamed box's name is one a person wrote.
+        record.name_origin = crate::NameOrigin::Written;
         self.save(key, &record)?;
         // BOX-010: the rename changed the alias and nothing else. The event
         // carries both names, and is keyed on the box's id like every other.
@@ -2474,6 +2476,9 @@ mod tests {
             attrs: [("color".to_string(), "blue".to_string())]
                 .into_iter()
                 .collect(),
+            project_name: None,
+            entry: None,
+            name_origin: crate::NameOrigin::Written,
         }
     }
 

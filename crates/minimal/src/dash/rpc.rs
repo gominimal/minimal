@@ -1601,6 +1601,9 @@ mod tests {
             parent: None,
             project_root: None,
             attrs: Default::default(),
+            project_name: None,
+            entry: None,
+            name_origin: boxes::NameOrigin::Written,
         }
     }
 
@@ -1666,6 +1669,9 @@ mod tests {
             parent: None,
             project_root: None,
             attrs: Default::default(),
+            project_name: None,
+            entry: None,
+            name_origin: boxes::NameOrigin::Written,
         };
         settle_destroyed_box(&ssh_sock, record.id, &record).await;
         let line = server.join().unwrap();

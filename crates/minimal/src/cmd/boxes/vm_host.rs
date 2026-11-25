@@ -1463,6 +1463,9 @@ mod tests {
             parent: None,
             project_root: None,
             attrs: Default::default(),
+            project_name: None,
+            entry: None,
+            name_origin: boxes::NameOrigin::Written,
         };
         let ssh_sock = dir.path().join("ssh.sock");
         resume_box_row(&ssh_sock, Some(&record))
@@ -1540,6 +1543,9 @@ mod tests {
             parent: None,
             project_root: None,
             attrs: Default::default(),
+            project_name: None,
+            entry: None,
+            name_origin: boxes::NameOrigin::Written,
         };
         let error = resume_box_row(&dir.path().join("ssh.sock"), Some(&record))
             .await
@@ -2412,6 +2418,9 @@ mod tests {
             parent: None,
             project_root: None,
             attrs: Default::default(),
+            project_name: None,
+            entry: None,
+            name_origin: boxes::NameOrigin::Written,
         };
         assert!(
             !holds_name(&record),
@@ -2551,6 +2560,9 @@ mod tests {
             parent: None,
             project_root: None,
             attrs: Default::default(),
+            project_name: None,
+            entry: None,
+            name_origin: boxes::NameOrigin::Written,
         };
         assert!(holds_name(&record), "a host_ip box holds its name");
 

@@ -3354,6 +3354,18 @@ pub struct BoxListingEntry {
     /// that predates the field.
     #[serde(default)]
     pub project_root: Option<paths::HostAbsPath>,
+    /// The project name the box's name derives from, `None` for a record
+    /// or a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
+    /// The entry the box's spec names, `None` for a box with no entry, and
+    /// for a record or a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<String>,
+    /// Whether the box's name was written or derived. A record or a daemon
+    /// that predates the field reads as written.
+    #[serde(default)]
+    pub name_origin: boxes::NameOrigin,
     /// The record's state as BOX-011 spells it: `pending`,
     /// `materializing`, `running`, `stopped` or `exited`.
     pub state: String,
@@ -4753,6 +4765,9 @@ mod box_listing_tests {
             box_type: Some("session".to_string()),
             parent: None,
             project_root: Some(paths::HostAbsPath::try_new("/home/dev/proj").unwrap()),
+            project_name: Some("proj".to_string()),
+            entry: Some("web".to_string()),
+            name_origin: boxes::NameOrigin::Derived,
             state: state.to_string(),
             reason: None,
             exit_code: None,
@@ -4826,6 +4841,21 @@ mod box_listing_tests {
         ))
         .unwrap();
         assert!(!older.pty_enabled);
+        // A reply from a daemon that predates the name fields reads with no
+        // project name and no entry, and its name as written.
+        assert_eq!(older.project_name, None);
+        assert_eq!(older.entry, None);
+        assert_eq!(older.name_origin, boxes::NameOrigin::Written);
+        // A newer reply keeps the three fields across the wire.
+        let named = entry("running");
+        let text = serde_json_lenient::to_string(&named).unwrap();
+        assert!(text.contains(r#""project_name":"proj""#), "{text}");
+        assert!(text.contains(r#""entry":"web""#), "{text}");
+        assert!(text.contains(r#""name_origin":"derived""#), "{text}");
+        assert_eq!(
+            serde_json_lenient::from_str::<BoxListingEntry>(&text).unwrap(),
+            named
+        );
         // The identity none serialises with the name BOX-140 reports.
         assert_eq!(
             serde_json_lenient::to_string(&BoxIdentity::None).unwrap(),

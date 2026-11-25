@@ -771,6 +771,8 @@ impl BoxActor {
         self.deregister_hostname(false).await;
         let mut new_record = record.clone();
         new_record.name = Some(new_name.clone());
+        // A renamed box's name is one a person wrote.
+        new_record.name_origin = boxes::NameOrigin::Written;
         let written = self.record.write(new_record.clone()).await;
 
         // Re-register whichever name stuck (the new one on success, the old
