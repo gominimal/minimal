@@ -871,6 +871,13 @@ pub(crate) async fn inject(
 pub(crate) mod tests {
     use super::*;
 
+    use tracing::Instrument as _;
+
+    const BOX: [u8; 4] = [100, 64, 0, 9];
+    const PEER: [u8; 4] = [100, 64, 0, 1];
+    const BOX_MAC: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
+    const PEER_MAC: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xdd];
+
     #[test]
     fn the_switchs_whole_answer_for_a_held_listener_reads_as_already_bound() {
         assert!(already_bound(
@@ -890,12 +897,6 @@ pub(crate) mod tests {
         assert!(!already_bound(404, "proxy already running\n"));
         assert!(!already_bound(500, ""));
     }
-    use tracing::Instrument as _;
-
-    const BOX: [u8; 4] = [100, 64, 0, 9];
-    const PEER: [u8; 4] = [100, 64, 0, 1];
-    const BOX_MAC: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
-    const PEER_MAC: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xdd];
 
     /// The answer the switch's stack gives `request`, an ARP request, from
     /// the address it asks for; `None` for any other frame.
