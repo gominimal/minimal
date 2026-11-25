@@ -563,7 +563,11 @@ pub(crate) fn render_box_show(
     let mut lines = vec![
         ("ID", record.box_id.to_string()),
         ("Name", or_none(record.name.clone())),
-        ("Name origin", record.name_origin.to_string()),
+        // A box with no name has no name origin to show.
+        (
+            "Name origin",
+            or_none(record.name.as_ref().map(|_| record.name_origin.to_string())),
+        ),
         ("Entry", or_none(record.entry.clone())),
         ("Type", or_none(record.box_type.clone())),
         (

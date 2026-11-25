@@ -1049,7 +1049,7 @@ Host:         local0
             "\
 ID:           0199e0a0-0000-7000-8000-000000000002
 Name:         -
-Name origin:  written
+Name origin:  -
 Entry:        -
 Type:         task
 Parent:       0199e0a0-0000-7000-8000-000000000001
