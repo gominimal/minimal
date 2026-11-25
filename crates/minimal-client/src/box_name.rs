@@ -13,8 +13,8 @@ pub fn request_name(typed: Option<&str>) -> Option<String> {
     typed.map(str::to_string)
 }
 
-/// The holder named by a create's refusal, when a running box holds the
-/// name the create asked for (BOX-163).
+/// The refusal of a create whose name another box has, in any state
+/// (BOX-007, BOX-163). It names the holder only when the daemon showed it.
 pub fn held_name_refusal(error: &str) -> Option<HeldNameRefusal> {
     HeldNameRefusal::from_error(error)
 }
@@ -29,7 +29,8 @@ mod tests {
             holder: Some(
                 boxes::SessionId::parse_str("0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b").unwrap(),
             ),
-            holder_name: "default".to_string(),
+            holder_name: Some("default".to_string()),
+            state: Some("stopped".to_string()),
         }
         .to_string()
     }
@@ -56,7 +57,8 @@ mod tests {
             "an untyped create does not ask for a fresh instance"
         );
         let held = held_name_refusal(&refusal()).expect("the refusal names the holder");
-        assert_eq!(held.holder_name, "default");
+        assert_eq!(held.holder_name.as_deref(), Some("default"));
+        assert_eq!(held.state.as_deref(), Some("stopped"));
         assert!(held_name_refusal("CreateSession failed: boom").is_none());
     }
 }

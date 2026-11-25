@@ -352,9 +352,10 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     if e.downcast_ref::<minimal::task::TaskFileInvalid>().is_some() {
         return minimal::task::TaskFileInvalid::EXIT_CODE;
     }
-    // BCLI-058: `min box rename` to a name BOX-010 refuses.
-    if e.downcast_ref::<minimal::BoxRenameRefusal>().is_some() {
-        return minimal::BoxRenameRefusal::EXIT_CODE;
+    // BCLI-058: `min box rename` to a name BOX-010 refuses: 3 for a name
+    // that breaks a naming rule (BOX-007), 2 for a name another box has.
+    if let Some(refusal) = e.downcast_ref::<minimal::BoxRenameRefusal>() {
+        return refusal.exit_code();
     }
     // BCLI-074: `min box restart` refused, such as for a box that runs to
     // completion (exit 2). The refusal carries its own code, never 0.

@@ -1810,7 +1810,8 @@ fn held_name_refusal_exits_2_and_names_the_holder() {
     let reply = minimald_rpc::HeldNameRefusal {
         name: "default".to_string(),
         holder: Some(holder),
-        holder_name: "Default".to_string(),
+        holder_name: Some("Default".to_string()),
+        state: Some("running".to_string()),
     }
     .to_string();
 
@@ -1820,7 +1821,7 @@ fn held_name_refusal_exits_2_and_names_the_holder() {
         .expect("main.rs maps this error to its exit code");
     assert_eq!(minimald_rpc::HeldNameRefusal::EXIT_CODE, 2);
     assert_eq!(refusal.holder, Some(holder));
-    assert_eq!(refusal.holder_name, "Default");
+    assert_eq!(refusal.holder_name.as_deref(), Some("Default"));
     let printed = format!("{error:#}");
     assert_eq!(
         printed,
@@ -1842,6 +1843,51 @@ fn held_name_refusal_exits_2_and_names_the_holder() {
             .is_none()
     );
     assert_eq!(format!("{other:#}"), "the project path is not a directory");
+}
+
+/// BOX-007, BOX-163: a create refused because a box the person may not
+/// read has the name says only that the name is taken, and exits 2. A
+/// `--name` that breaks a naming rule exits 3, from a daemon that sends
+/// the exit code and from one that predates it.
+#[test]
+fn held_name_refusal_hides_the_holder_and_a_bad_name_exits_3() {
+    let hidden = minimald_rpc::HeldNameRefusal {
+        name: "api".to_string(),
+        holder: None,
+        holder_name: None,
+        state: None,
+    }
+    .to_string();
+    let error = create_refusal(hidden.clone(), None, None, None);
+    assert!(
+        error
+            .downcast_ref::<minimald_rpc::HeldNameRefusal>()
+            .is_some(),
+        "main.rs maps this error to exit 2"
+    );
+    assert_eq!(
+        format!("{error:#}"),
+        "Cannot create a session named `api`: the name is taken. Choose another name."
+    );
+    let start = start_refusal(error, StartVerb::Box, "api");
+    assert_eq!(
+        format!("{start:#}"),
+        "Cannot start api. The name api is taken. Run min box start --new api to \
+         create another box from the entry, or pass --name <name> to give the box \
+         another name."
+    );
+
+    let rule = boxes::box_name::check_written_name("self")
+        .unwrap_err()
+        .to_string();
+    for exit_code in [Some(3), None] {
+        let error = create_refusal(rule.clone(), None, exit_code, None);
+        let refusal = error
+            .downcast_ref::<DaemonCreateRefusal>()
+            .unwrap_or_else(|| panic!("a typed refusal: {error:#}"));
+        assert_eq!(refusal.exit_code, 3);
+        assert_eq!(format!("{error:#}"), rule);
+    }
 }
 
 /// BOX-163: an own-address create whose VM host registration is refused
@@ -3810,7 +3856,8 @@ fn create_name_held_exit2_names_holder_hints_name_flag() {
     let reply = minimald_rpc::HeldNameRefusal {
         name: "default".to_string(),
         holder: Some(holder),
-        holder_name: "default".to_string(),
+        holder_name: Some("default".to_string()),
+        state: Some("running".to_string()),
     }
     .to_string();
 
@@ -9872,8 +9919,8 @@ fn box_address_accepts_id_name_and_qualified() {
     let by_name = resolve("DB");
     assert_eq!((by_name.box_id, by_name.host), (db.box_id, beta.clone()));
     // A name a running box holds on one host and a stopped box holds on
-    // another resolves to the running box.
-    assert_eq!(resolve("web").box_id, web.box_id);
+    // another is ambiguous (BOX-005, BOX-007).
+    assert_eq!(refused("web", &listings).1, 2);
     // `provider/host/name` picks the box on that host.
     let qualified = resolve("local-minvmd/beta.local-minvmd0/web");
     assert_eq!(
@@ -9905,6 +9952,46 @@ fn box_address_accepts_id_name_and_qualified() {
         parse_box_address("a/b"),
         BoxAddress::Unqualified("a/b"),
         "two parts are not provider/host/name"
+    );
+}
+
+/// BCLI-002, BOX-005, BOX-007: a name that boxes on more than one host
+/// have, in any state, is refused with exit 2 and lists every box, even
+/// when one host runs its box. On one host alone, the running box wins.
+#[test]
+fn name_on_two_hosts_in_any_state_is_ambiguous() {
+    let running = address_entry("0199f000-0000-7000-8000-000000000001", "web", "running");
+    let stopped = address_entry("0199f200-0000-7000-8000-000000000003", "Web", "stopped");
+    let older = address_entry("0199f100-0000-7000-8000-000000000002", "web", "exited");
+    let listings = [
+        answered(
+            address_host(LOCAL_MINVMD_PROVIDER, "alpha.local-minvmd0", true),
+            vec![running.clone()],
+        ),
+        answered(
+            address_host(LOCAL_MINVMD_PROVIDER, "beta.local-minvmd0", false),
+            vec![stopped],
+        ),
+    ];
+    let (message, code) = refused("web", &listings);
+    assert_eq!(code, 2);
+    assert_eq!(
+        message,
+        "web matches boxes on more than one host:\n\
+         \x20 local-minvmd/alpha.local-minvmd0/web  running  0199f000-0000-7000-8000-000000000001\n\
+         \x20 local-minvmd/beta.local-minvmd0/Web  stopped  0199f200-0000-7000-8000-000000000003\n\
+         Name one as provider/host/name."
+    );
+
+    let one_host = [answered(
+        address_host(LOCAL_MINVMD_PROVIDER, "alpha.local-minvmd0", true),
+        vec![older, running.clone()],
+    )];
+    assert_eq!(
+        resolve_box_address("web", &one_host)
+            .expect("one host keeps every box of the name")
+            .box_id,
+        running.box_id
     );
 }
 
@@ -22740,11 +22827,12 @@ fn refusals_exit_with_the_table_code() {
         "{err:#}"
     );
 
-    // `min box rename` to a name the store refuses: usage (2), says box.
+    // `min box rename` to a name an older daemon's store refuses: a
+    // naming rule (3), says box.
     let daemon = "invalid box name: must be a single DNS label";
     let err = anyhow::Error::from(BoxRenameRefusal::from_error(daemon).expect("a refusal"));
-    assert!(err.downcast_ref::<BoxRenameRefusal>().is_some(), "{err:#}");
-    assert_eq!(BoxRenameRefusal::EXIT_CODE, 2);
+    let refusal = err.downcast_ref::<BoxRenameRefusal>().expect("typed");
+    assert_eq!(refusal.exit_code(), 3);
     assert_eq!(format!("{err:#}"), daemon);
     assert!(BoxRenameRefusal::from_error("some other failure").is_none());
 

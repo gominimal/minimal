@@ -783,36 +783,39 @@ pub(crate) async fn rm_listed_box(
     })
 }
 
-/// The daemon's refusal of a rename (BOX-010): a running box on the host
-/// holds the name, the name is reserved, or the name is not a valid box
-/// name. The text is the daemon's, and
-/// names the holder. `min box rename` ends with exit 2 on it (BCLI-058).
+/// The daemon's refusal of a rename (BOX-007, BOX-010): the name breaks
+/// a naming rule, or another box on the host has it, in any state. The
+/// text is the daemon's. It names the holder only when the person may read
+/// that box. `min box rename` ends with [`Self::exit_code`]: 3 for a naming
+/// rule, 2 for a taken name (BCLI-058).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoxRenameRefusal {
     pub(crate) message: String,
+    pub(crate) exit_code: u8,
 }
 
 impl BoxRenameRefusal {
+    /// The exit code `min box rename` ends with when another box has the
+    /// name.
+    pub const EXIT_CODE: u8 = minimald_rpc::HeldNameRefusal::EXIT_CODE;
+
+    /// The exit code `min box rename` ends with when the name breaks a
+    /// naming rule (BOX-007).
+    pub const NAME_RULE_EXIT_CODE: u8 = minimald_rpc::NAME_RULE_EXIT_CODE;
+
     /// The exit code `min box rename` ends with on this refusal.
-    pub const EXIT_CODE: u8 = 2;
-
-    /// The lead of the daemon's text when a running box holds the name, as
-    /// `boxes::box_name::RenameRefusal::HeldByRunning` spells it.
-    const HELD_LEAD: &'static str = "The running session `";
-
-    /// The lead of the daemon's text when the name is not a valid box name,
-    /// as `boxes::store`'s name check spells it.
-    const INVALID_LEAD: &'static str = "invalid box name: ";
+    #[must_use]
+    pub fn exit_code(&self) -> u8 {
+        self.exit_code
+    }
 
     /// The refusal a `RenameSession` error carries, or `None` when the
-    /// error is any other failure.
+    /// error is any other failure. The reply's text carries its exit code
+    /// ([`minimald_rpc::rename_refusal_exit_code`]).
     pub(crate) fn from_error(error: &str) -> Option<Self> {
-        let reserved = boxes::box_name::RenameRefusal::Reserved.to_string();
-        let held = error.starts_with(Self::HELD_LEAD) && error.contains(" holds the name `");
-        // BCLI-058: a name the store refuses is a usage error too.
-        let invalid = error.starts_with(Self::INVALID_LEAD);
-        (held || invalid || error == reserved).then(|| Self {
+        minimald_rpc::rename_refusal_exit_code(error).map(|exit_code| Self {
             message: error.to_owned(),
+            exit_code,
         })
     }
 }
@@ -1713,7 +1716,7 @@ mod tests {
         let refusal = err
             .downcast_ref::<BoxRenameRefusal>()
             .unwrap_or_else(|| panic!("the refusal is typed: {err:#}"));
-        assert_eq!(BoxRenameRefusal::EXIT_CODE, 2);
+        assert_eq!(refusal.exit_code(), 2);
         let text = refusal.to_string();
         assert!(text.contains(&web.to_string()), "names the holder: {text}");
         assert!(text.contains("`front`"), "names the holder: {text}");
@@ -1731,13 +1734,47 @@ mod tests {
         )
         .await
         .expect_err("`self` is refused");
-        assert!(err.downcast_ref::<BoxRenameRefusal>().is_some(), "{err:#}");
+        let refusal = err
+            .downcast_ref::<BoxRenameRefusal>()
+            .unwrap_or_else(|| panic!("the refusal is typed: {err:#}"));
+        assert_eq!(refusal.exit_code(), 3, "{err:#}");
 
         // Any other daemon error is not the refusal.
         assert_eq!(
             BoxRenameRefusal::from_error("session is already named `api`"),
             None
         );
+    }
+
+    // BCLI-058, BOX-007: `min box rename` to a name that breaks a naming
+    // rule ends with exit 3, and the box keeps its name. The daemon refuses
+    // it before it reads any other box.
+    #[tokio::test]
+    async fn box_rename_bad_name_exits_3() {
+        let (_server, _dir, _project, mut client) = daemon_with_boxes(&["web"]).await;
+        let web = listed_id(&mut client, "web").await;
+        for bad in [
+            "self",
+            "LOCALHOST",
+            "a b",
+            "-web",
+            "0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b",
+        ] {
+            let mut out = Vec::new();
+            let err = rename_listed_box(&mut client, &mut out, web, "web", Some("web"), bad)
+                .await
+                .expect_err(bad);
+            let refusal = err
+                .downcast_ref::<BoxRenameRefusal>()
+                .unwrap_or_else(|| panic!("{bad}: the refusal is typed: {err:#}"));
+            assert_eq!(refusal.exit_code(), 3, "{bad}: {err:#}");
+            assert_eq!(refusal.exit_code(), BoxRenameRefusal::NAME_RULE_EXIT_CODE);
+            let text = refusal.to_string();
+            assert!(text.starts_with("Cannot name a box `"), "{text}");
+            assert!(text.ends_with(" Choose another name."), "{text}");
+            assert!(out.is_empty());
+        }
+        assert_eq!(listed_id(&mut client, "web").await, web);
     }
 
     // BCLI-061: `min box prune` asks for BOX-021's prune, with the
