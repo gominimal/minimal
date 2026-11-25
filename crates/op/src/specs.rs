@@ -56,6 +56,14 @@ pub struct SpecBuild<'a, SF: crate::SourceFetcher> {
     /// A patched build (`override_deps` that a person chose): it always gets
     /// the network, and it counts as workspace (NET-169).
     pub patched: bool,
+
+    /// Outside a box, whether the spec's own `needs` decide the network of a
+    /// build with `override_deps`, as they do in a box. Unset, such a build
+    /// has the network whatever its spec says. For a caller that passes the
+    /// dependencies of specs nobody patched and wants a build that declares
+    /// no network to get none: a build service. A patched build keeps the
+    /// network either way.
+    pub needs_decide: bool,
 }
 
 impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
@@ -136,9 +144,11 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
     ) -> Result<(HashSet<SandboxMapped>, bool, bool), Error> {
         if let Some(deps) = &self.override_deps {
             // Outside a box, a build with overridden dependencies has always
-            // had the network. In a box only a patched build does: any other
-            // build's own `needs` decide (NET-155).
-            let (needs_dns, needs_internet) = if self.build_box.is_none() || self.patched {
+            // had the network, unless its caller set `needs_decide`. In a box
+            // only a patched build does: any other build's own `needs` decide
+            // (NET-155).
+            let has_always = self.build_box.is_none() && !self.needs_decide;
+            let (needs_dns, needs_internet) = if has_always || self.patched {
                 (true, true)
             } else {
                 crate::build_box::declared_needs(opts.graph, self.spec)
@@ -673,6 +683,7 @@ mod tests {
             cpu_weight: None,
             build_box: None,
             patched: false,
+            needs_decide: false,
         }
     }
 
@@ -867,6 +878,7 @@ mod tests {
             cpu_weight: None,
             build_box: None,
             patched: false,
+            needs_decide: false,
         };
         let opts = Options {
             cache: cache.clone(),
@@ -1004,5 +1016,68 @@ mod tests {
         sb.patched = true;
         let (_, dns, internet) = sb.rootfs_mapped(build, &opts).await.unwrap();
         assert!(dns && internet, "a patched build keeps the network");
+    }
+
+    /// Outside a box, a caller that sets `needs_decide` gets a build whose
+    /// network is what its spec declares, even though its dependencies come
+    /// ready-made. A patched build still keeps the network.
+    #[tokio::test]
+    async fn override_deps_needs_follow_the_spec_when_the_caller_says_so() {
+        let fetcher = UnusedFetcher;
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("cache")).unwrap();
+        let cache = lcache::Cache::at_dir(tmp.path().join("cache")).unwrap();
+
+        let dg = network_build();
+        let opts = crate::Options {
+            cache: cache.clone(),
+            graph: &dg,
+            exec_base: tmp.path().to_path_buf(),
+            ot: None,
+            daemon_id: None,
+        };
+        let bsr = *dg.by_name("downloads-at-build").unwrap();
+        let build = dg.get(&bsr).unwrap();
+        let mut sb = spec_build(&bsr, &fetcher);
+        sb.override_deps = Some(Default::default());
+        sb.needs_decide = true;
+        let (rootfs, dns, internet) = sb.rootfs_mapped(build, &opts).await.unwrap();
+        assert!(!dns && !internet, "a spec that declares none gets none");
+        let config = sb
+            .sandbox_config(build, Vec::new(), rootfs, dns, internet, None)
+            .unwrap();
+        assert_eq!(config.plan, sandbox::NetPlan::isolated());
+
+        sb.patched = true;
+        let (_, dns, internet) = sb.rootfs_mapped(build, &opts).await.unwrap();
+        assert!(dns && internet, "a patched build keeps the network");
+
+        let dg = graph_from(indoc! {r#"
+            let {BuildSpec, Needs, ..} = import "minimal.ncl" in
+            {
+                name = "declares-dns",
+                build_deps = [],
+                needs = { dns = {} } | Needs,
+                cmd = "curl https://example.invalid/",
+            } | BuildSpec
+        "#});
+        let opts = crate::Options {
+            cache,
+            graph: &dg,
+            exec_base: tmp.path().to_path_buf(),
+            ot: None,
+            daemon_id: None,
+        };
+        let bsr = *dg.by_name("declares-dns").unwrap();
+        let build = dg.get(&bsr).unwrap();
+        let mut sb = spec_build(&bsr, &fetcher);
+        sb.override_deps = Some(Default::default());
+        sb.needs_decide = true;
+        let (rootfs, dns, internet) = sb.rootfs_mapped(build, &opts).await.unwrap();
+        assert!(dns && !internet, "a spec gets what it declares");
+        let config = sb
+            .sandbox_config(build, Vec::new(), rootfs, dns, internet, None)
+            .unwrap();
+        assert_eq!(config.plan, sandbox::NetPlan::host());
     }
 }

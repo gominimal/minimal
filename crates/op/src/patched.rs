@@ -155,6 +155,7 @@ impl<'a, SF: crate::SourceFetcher> Runnable for PatchedBuild<'a, SF> {
             cpu_weight: None,
             build_box: self.build_box.clone(),
             patched: true,
+            needs_decide: false,
         }
         .run(opts)
         .await?;
@@ -518,6 +519,7 @@ mod tests {
             cpu_weight: None,
             build_box: None,
             patched: false,
+            needs_decide: false,
         }
         .run(&opts)
         .await

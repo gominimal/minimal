@@ -140,6 +140,9 @@ pub struct LocalBackend<SF: SourceFetcher + 'static> {
     /// The build boxes of the box these builds run for, if any (NET-155).
     /// Every spec build this backend schedules runs in one of them.
     pub(crate) build_boxes: Option<std::sync::Arc<dyn op::BuildBoxes>>,
+    /// Whether a spec's own `needs` decide its build's network outside a box
+    /// ([`Self::needs_decide`]).
+    pub(crate) needs_decide: bool,
 }
 
 impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
@@ -233,6 +236,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
                     )
                 }),
                 patched: false,
+                needs_decide: shared.backend.needs_decide,
             };
 
             // The run ends the build box when the build ends, and also when
@@ -444,11 +448,21 @@ impl<SF: SourceFetcher> LocalBackend<SF> {
                 ot,
                 cancel,
                 build_boxes,
+                needs_decide: false,
             },
             graph,
             cache,
             daemon_id,
         })
+    }
+
+    /// Makes each spec's own `needs` decide its build's network when the
+    /// builds run outside any box. Without this, every such build has the
+    /// network, because this backend passes each build its dependencies. For
+    /// a build service, whose specs nobody patched: a build that declares no
+    /// network then runs in an empty network namespace.
+    pub fn needs_decide(&mut self) {
+        self.needs_decide = true;
     }
 
     /// The build boxes every spec build of this backend runs in, if the
