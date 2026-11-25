@@ -6549,9 +6549,9 @@ async fn a_restored_hostname_collision_is_refused_on_resume() {
     );
 }
 /// Two restored sessions that share one registry name outright: two unnamed
-/// sessions whose project directories share a basename, so both take the
-/// derived name `twins`. The second is created while the first is
-/// stopped, which the store's name-uniqueness check allows. The restart
+/// sessions named `twins`: the first derives it from its project
+/// directory, and the second asks for it. The second is created while the
+/// first is stopped, which the store's name-uniqueness check allows. The restart
 /// sets both `stopped` (BOX-154). The first attach resumes its box and routes the
 /// name. The second attach is refused with exit status 2 (BOX-025), so the
 /// name does not move.
@@ -6565,7 +6565,8 @@ async fn a_restored_session_sharing_another_sessions_registry_name_is_refused_on
     let mut server = TestServer::new().await;
     let mut client = server.connect().await;
     let mut ids = Vec::new();
-    for (project, name) in [("/a/twins", None), ("/b/twins", None)] {
+    // A derived name never reuses a kept box's name, so the second asks.
+    for (project, name) in [("/a/twins", None), ("/b/twins", Some("twins"))] {
         // The store refuses a name a running box holds, so the first box
         // stops in a restart before the second takes the same name.
         if !ids.is_empty() {
@@ -16559,8 +16560,8 @@ async fn resume_refuses_when_name_held_by_running_box() {
     let stopped =
         create_session_with_spec(&mut client, Some("proj"), "/a/x", Some(resume_spec(true))).await;
     let ending = stop_through_daemon(&server, stopped).await;
-    // An unnamed box answers to its project directory's name.
-    let holder = create_session_with_spec(&mut client, None, "/b/proj", None).await;
+    // A requested name takes the name of a stopped box.
+    let holder = create_session_with_spec(&mut client, Some("proj"), "/b/proj", None).await;
     assert_eq!(
         read_record(&server, holder).await.state().unwrap(),
         RecordState::Running
@@ -16595,11 +16596,12 @@ async fn resume_concurrent_same_name_runs_exactly_one() {
     let server = TestServer::new().await;
     let mut client = server.connect().await;
     let mut boxes_ = Vec::new();
-    // Unnamed boxes answer to their project directory's name, a pair the
-    // store's name-uniqueness check never sees.
-    for project in ["/a/pair", "/b/pair"] {
+    // The first box derives `pair` from its project directory. The second
+    // asks for `pair` once the first is stopped: a derived name never
+    // reuses a kept box's name, and a requested one takes a stopped box's.
+    for (project, name) in [("/a/pair", None), ("/b/pair", Some("pair"))] {
         let id =
-            create_session_with_spec(&mut client, None, project, Some(resume_spec(true))).await;
+            create_session_with_spec(&mut client, name, project, Some(resume_spec(true))).await;
         let ending = stop_through_daemon(&server, id).await;
         boxes_.push((id, ending));
     }

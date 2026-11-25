@@ -540,11 +540,28 @@ async fn serve_create_session(
             // refused for a held name. Any other create takes `<name>`, and
             // a running box that holds it refuses the create.
             let fresh_instance = req.fresh_instance;
+            let caller = ssh_username.clone();
             let created = mngr
                 .create_box_reporting_fact(req.config, spec, fresh_instance, ssh_username, creator)
                 .await;
             Ok(match created {
-                Ok((id, fact)) => {
+                Ok((id, fact, created_name)) => {
+                    // BOX-163: a derived name that was taken is named in the
+                    // reply, with its holder when the caller may read it.
+                    let name_not_taken = created_name
+                        .not_taken
+                        .as_ref()
+                        .map(|not_taken| name_not_taken_reply(not_taken, caller.as_deref()));
+                    if let Some(not_taken) = &name_not_taken {
+                        tracing::info!(
+                            session_id = %id,
+                            name = ?created_name.name,
+                            name_not_taken = %not_taken.name,
+                            reason = ?not_taken.reason,
+                            "create took another name: the derived name was taken; \
+                             the reply names it"
+                        );
+                    }
                     // Tag the session to this connection so it is reaped if
                     // the client drops before finalizing it (e.g. Ctrl-C at
                     // the gating prompt) — see [`ConnectionHandle`] and the
@@ -649,6 +666,8 @@ async fn serve_create_session(
                         classifier_advisory,
                         host_ip_enforcement: host_ip_enforcement
                             .map(|enforcement| enforcement.machine_str().to_string()),
+                        name: created_name.name,
+                        name_not_taken,
                     })
                 }
                 // BOX-163: a running box holds the name. The reply names the
@@ -3970,6 +3989,45 @@ mod trace_tests {
     }
 }
 
+/// The reply's account of a derived name a create did not get (BOX-163).
+/// It names the box that has the name only when the caller may read that
+/// box: its record was read and names the caller as its creator. A
+/// record with no creator, or one that was not read, hides the holder
+/// (default deny). The name
+/// itself is always in the reply, because the caller's own create derived
+/// it.
+fn name_not_taken_reply(
+    not_taken: &crate::box_manager::NotTakenName,
+    caller: Option<&str>,
+) -> minimald_rpc::NameNotTaken {
+    use crate::box_manager::HolderCreator;
+    use boxes::box_name::DerivedNameTaken;
+    let reason = match &not_taken.reason {
+        DerivedNameTaken::Held(holder) => {
+            // Default deny: only a read record whose creator is the caller
+            // names its box. A record with no creator, or one not read,
+            // hides it.
+            let readable = match &not_taken.holder_creator {
+                HolderCreator::User(owner) => caller == Some(owner.as_str()),
+                HolderCreator::NoCreator | HolderCreator::Unread => false,
+            };
+            minimald_rpc::NameTakenReason::Held {
+                holder: readable.then(|| minimald_rpc::NameHolder {
+                    id: holder.id,
+                    name: holder.name.clone(),
+                    state: holder.state_word().to_string(),
+                }),
+            }
+        }
+        DerivedNameTaken::Reserved => minimald_rpc::NameTakenReason::Reserved,
+        DerivedNameTaken::BoxIdForm => minimald_rpc::NameTakenReason::BoxIdForm,
+    };
+    minimald_rpc::NameNotTaken {
+        name: not_taken.name.clone(),
+        reason,
+    }
+}
+
 /// BOX-163 over the wire: what a `CreateSession` reply says when a running
 /// box holds the name, and how a fresh instance is named.
 #[cfg(test)]
@@ -4016,6 +4074,88 @@ mod create_naming_tests {
             .unwrap()
             .expect("the created record is filed")
             .name
+    }
+
+    /// BOX-163, BOX-211: two creates of one project and entry with no
+    /// name give `web-dev` and `web-dev-1`. The second is not refused,
+    /// and its reply names `web-dev` as the name it did not get, with the
+    /// box that has it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_reply_names_the_taken_derived_name() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let created = |reply: CreateSessionReply| match reply {
+            CreateSessionReply::Ok(created) => created,
+            CreateSessionReply::Err { error, .. } => panic!("the create is refused: {error}"),
+        };
+        let first = created(client.call::<CreateSession>(&entry_req("dev", false)).await);
+        assert_eq!(first.name.as_deref(), Some("web-dev"));
+        assert_eq!(first.name_not_taken, None);
+
+        let second = created(client.call::<CreateSession>(&entry_req("dev", false)).await);
+        assert_eq!(second.name.as_deref(), Some("web-dev-1"));
+        assert_eq!(
+            name_of(&server, second.id).await.as_deref(),
+            Some("web-dev-1")
+        );
+        assert_eq!(
+            second.name_not_taken,
+            Some(minimald_rpc::NameNotTaken {
+                name: "web-dev".to_string(),
+                reason: minimald_rpc::NameTakenReason::Held {
+                    holder: Some(minimald_rpc::NameHolder {
+                        id: first.id,
+                        name: "web-dev".to_string(),
+                        state: "pending".to_string(),
+                    }),
+                },
+            })
+        );
+    }
+
+    /// The reply names the box that has the name only for a caller who
+    /// may read it: the creator its read record names. A record with no
+    /// creator, or a record that was not read, hides the box.
+    #[test]
+    fn create_reply_names_the_taken_derived_name_holder_only_to_its_reader() {
+        let holder = boxes::box_name::NamedBox {
+            id: SessionId::mint(),
+            name: "web".to_string(),
+            status: boxes::BoxState::Active,
+        };
+        use crate::box_manager::HolderCreator;
+        let not_taken = |creator: HolderCreator| crate::box_manager::NotTakenName {
+            name: "web".to_string(),
+            reason: boxes::box_name::DerivedNameTaken::Held(holder.clone()),
+            holder_creator: creator,
+        };
+        let ann = || HolderCreator::User("ann".to_string());
+        let named = |reply: minimald_rpc::NameNotTaken| match reply.reason {
+            minimald_rpc::NameTakenReason::Held { holder } => holder,
+            other => panic!("a held name: {other:?}"),
+        };
+        let shown = named(super::name_not_taken_reply(&not_taken(ann()), Some("ann")))
+            .expect("the creator reads the holder");
+        assert_eq!((shown.id, shown.state.as_str()), (holder.id, "running"));
+        assert_eq!(
+            named(super::name_not_taken_reply(
+                &not_taken(HolderCreator::NoCreator),
+                Some("bob")
+            )),
+            None,
+            "a record with no creator is hidden"
+        );
+        assert_eq!(
+            named(super::name_not_taken_reply(&not_taken(ann()), None)),
+            None,
+            "a caller with no user does not read the holder"
+        );
+        let hidden = super::name_not_taken_reply(&not_taken(ann()), Some("bob"));
+        assert_eq!(hidden.name, "web", "the name is still in the reply");
+        assert_eq!(named(hidden), None, "another user does not read the holder");
+        let unread = super::name_not_taken_reply(&not_taken(HolderCreator::Unread), Some("ann"));
+        assert_eq!(unread.name, "web", "the name is still in the reply");
+        assert_eq!(named(unread), None, "an unread holder record is hidden");
     }
 
     /// A create under a name a running box holds is refused, and the

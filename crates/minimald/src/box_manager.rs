@@ -384,7 +384,9 @@ struct CreateBoxMsg {
     /// Where a created box's host-address fact goes: the one the create's
     /// own gate read ([`create_host_ip_fact`]), so the reply states what
     /// this create saw rather than whatever the global fact reads later.
-    fact: Option<tokio::sync::oneshot::Sender<crate::box_runtime::HostIpEnforcementFact>>,
+    fact: Option<
+        tokio::sync::oneshot::Sender<(crate::box_runtime::HostIpEnforcementFact, CreatedName)>,
+    >,
 }
 
 /// The refusal of a create whose name a running box holds (BOX-163). It
@@ -424,6 +426,41 @@ impl std::fmt::Display for HeldNameRefusal {
 }
 
 impl std::error::Error for HeldNameRefusal {}
+
+/// The name a create gave its box, for the create's reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CreatedName {
+    /// The name the box took.
+    pub(crate) name: Option<String>,
+    /// The derived name the box did not get, when it was taken.
+    pub(crate) not_taken: Option<NotTakenName>,
+}
+
+/// A derived name a create did not get (BOX-163), with the reason, and
+/// the creator of the box that has it. The reply names that box only to
+/// a caller who may read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NotTakenName {
+    /// The name the create derived first.
+    pub(crate) name: String,
+    /// Why the box did not get it.
+    pub(crate) reason: boxes::box_name::DerivedNameTaken,
+    /// The creator of the box that has the name, as read from its record.
+    pub(crate) holder_creator: HolderCreator,
+}
+
+/// The creator of the box that holds a derived name, as the create read
+/// it back. A record that was not read is kept apart from one that records
+/// no creator, so the reply never names a holder it could not check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HolderCreator {
+    /// The record was read and names this SSH user as its creator.
+    User(String),
+    /// The record was read and records no creator.
+    NoCreator,
+    /// The record is gone or could not be read, or the name has no holder.
+    Unread,
+}
 
 /// Where a new box's name came from (BOX-211), for the create's log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -477,7 +514,7 @@ impl RecordNaming {
             .and_then(serde_json_lenient::Value::as_str)
             .map(str::to_string);
         Self {
-            project_name: DerivedName::of(config, spec).project,
+            project_name: request_project(config),
             entry,
             origin: source.origin(),
         }
@@ -495,34 +532,21 @@ impl RecordNaming {
 /// name the request carries, else the project root directory's name, and
 /// the stored spec, whose `entry` names the entry. A sent project name is
 /// never overridden by a path, and the spec's `[box] name` is never read.
-#[derive(Debug, Clone)]
-struct DerivedName<'a> {
-    project: String,
-    spec: Option<&'a serde_json_lenient::Value>,
+/// The client derives the same name through the same functions.
+fn derived_name_of(
+    config: &minimald_rpc::BoxConfig,
+    spec: Option<&serde_json_lenient::Value>,
+) -> boxes::box_name::DerivedName {
+    boxes::box_name::DerivedName::new(&request_project(config), spec)
 }
 
-impl<'a> DerivedName<'a> {
-    /// The parts of a create's derived name: the project name (else the
-    /// project root's directory name, else `box`) and the spec.
-    fn of(
-        config: &'a minimald_rpc::BoxConfig,
-        spec: Option<&'a serde_json_lenient::Value>,
-    ) -> Self {
-        // A client that predates `project_root` sends none, and the record
-        // takes `project_path` as the root, so the name does too.
-        let root = config.project_root.as_ref().unwrap_or(&config.project_path);
-        let project = boxes::box_name::request_project_name(
-            config.project_name.as_deref(),
-            Some(root.as_str()),
-        );
-        Self { project, spec }
-    }
-
-    /// The name, with the `n`th fresh instance's number when `instance` is
-    /// set. The client derives the same name through the same function.
-    fn name(&self, instance: Option<usize>) -> String {
-        boxes::box_name::create_derived_name(&self.project, self.spec, instance)
-    }
+/// The project name a create's derived name uses: the name the request
+/// carries, else the project root directory's name, else `box`.
+fn request_project(config: &minimald_rpc::BoxConfig) -> String {
+    // A client that predates `project_root` sends none, and the record
+    // takes `project_path` as the root, so the name does too.
+    let root = config.project_root.as_ref().unwrap_or(&config.project_path);
+    boxes::box_name::request_project_name(config.project_name.as_deref(), Some(root.as_str()))
 }
 
 /// The refusal of a create whose project name is not a DNS label
@@ -572,25 +596,10 @@ fn creation_name(
     match config.name.as_deref() {
         Some(name) => (name.to_string(), NameSource::Request),
         None => (
-            DerivedName::of(config, spec).name(None),
+            derived_name_of(config, spec).name(None),
             NameSource::Derived,
         ),
     }
-}
-
-/// The name of a fresh instance of a derived name (BOX-163, BOX-213):
-/// the derived name with the smallest positive `n` such that no name in
-/// `retained` is the same under ASCII case. The number is never cut, so
-/// the name stays one label. Answers the name and its `n`.
-fn fresh_derived_name<'a>(
-    derived: &DerivedName<'_>,
-    retained: impl IntoIterator<Item = &'a str>,
-) -> (String, usize) {
-    let used: Vec<&str> = retained.into_iter().collect();
-    (1..)
-        .map(|n| (derived.name(Some(n)), n))
-        .find(|(name, _)| !used.iter().any(|used| used.eq_ignore_ascii_case(name)))
-        .expect("a finite set leaves a name unused")
 }
 
 /// The name of a fresh instance of `base` (BOX-163): `<base>-<n>`, with
@@ -666,15 +675,22 @@ impl BoxManagerHandle {
         fresh: bool,
         username: Option<String>,
         creator: Option<std::sync::Weak<()>>,
-    ) -> Result<(SessionId, crate::box_runtime::HostIpEnforcementFact), BoxManagerError> {
+    ) -> Result<
+        (
+            SessionId,
+            crate::box_runtime::HostIpEnforcementFact,
+            CreatedName,
+        ),
+        BoxManagerError,
+    > {
         let (send, recv) = tokio::sync::oneshot::channel();
         let id = self
             .send_create_box(config, spec, fresh, username, creator, Some(send))
             .await?;
-        let fact = recv
+        let (fact, created_name) = recv
             .await
             .expect("a created box's manager sends its fact before its id");
-        Ok((id, fact))
+        Ok((id, fact, created_name))
     }
 
     async fn send_create_box(
@@ -684,7 +700,9 @@ impl BoxManagerHandle {
         fresh: bool,
         username: Option<String>,
         creator: Option<std::sync::Weak<()>>,
-        fact: Option<tokio::sync::oneshot::Sender<crate::box_runtime::HostIpEnforcementFact>>,
+        fact: Option<
+            tokio::sync::oneshot::Sender<(crate::box_runtime::HostIpEnforcementFact, CreatedName)>,
+        >,
     ) -> Result<SessionId, BoxManagerError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
@@ -4704,7 +4722,14 @@ impl BoxManager {
         fresh: bool,
         username: Option<String>,
         creator: Option<std::sync::Weak<()>>,
-    ) -> Result<(SessionId, crate::box_runtime::HostIpEnforcementFact), BoxManagerError> {
+    ) -> Result<
+        (
+            SessionId,
+            crate::box_runtime::HostIpEnforcementFact,
+            CreatedName,
+        ),
+        BoxManagerError,
+    > {
         if self.in_shutdown.is_cancelled() {
             return Err(BoxManagerError::new(
                 std::io::ErrorKind::ConnectionRefused,
@@ -4781,19 +4806,21 @@ impl BoxManager {
         // the entry, stamped here from the request and the spec. Nothing the
         // box itself runs writes them.
         let naming = RecordNaming::of(&config, spec.as_ref(), source);
-        // BEP-082: only a fresh instance registered under a creation key,
-        // and only a key for its own base. See `host_ip_mint_name`.
-        let fresh_base = fresh.then(|| base.clone());
+        // BEP-082: a fresh instance and a derived-name create registered
+        // under a creation key, and only a key for their own base counts.
+        // A derived name's base is its first candidate: the store can give
+        // the box `<base>-<n>` after the mint. See `host_ip_mint_name`.
+        let key_base = (fresh || source == NameSource::Derived).then(|| base.clone());
+        // A derived name goes to the store, which walks its candidates
+        // against every retained record and files the record in one step.
+        // Until then the box carries the first candidate.
+        let derived =
+            (source == NameSource::Derived).then(|| derived_name_of(&config, spec.as_ref()));
         let name = match base {
-            base if fresh => {
+            base if fresh && derived.is_none() => {
                 let retained = self.retained_names().await?;
                 let retained_names = retained.iter().map(String::as_str);
-                let (name, n) = match source {
-                    NameSource::Request => fresh_instance_name(&base, retained_names),
-                    NameSource::Derived => {
-                        fresh_derived_name(&DerivedName::of(&config, spec.as_ref()), retained_names)
-                    }
-                };
+                let (name, n) = fresh_instance_name(&base, retained_names);
                 tracing::info!(
                     base = %base,
                     name = %name,
@@ -4987,7 +5014,7 @@ impl BoxManager {
         let switch_address = config.box_addresses.as_ref().map(|a| a.switch_address);
         // BEP-082: a `host_ip` grant box has no row, and its registration
         // minted its id under the box's name. See `host_ip_mint_name`.
-        let host_ip_name = host_ip_mint_name(&config, fresh_base.as_deref());
+        let host_ip_name = host_ip_mint_name(&config, key_base.as_deref());
         let control = crate::box_actor::switch_control_of(&self.net_switch).await;
         let minted = match crate::net::listeners::mint_box_id(
             &control,
@@ -5070,43 +5097,67 @@ impl BoxManager {
                 }
             }
         };
-        let handle = match create(record).await {
-            Ok(handle) => handle,
-            // The name may be held by a session whose destroy is still
-            // running (its record outlives its actor by the length of the
-            // teardown task, a stalled clone's connect timeout at worst):
-            // say so, rather than report a plain collision the user cannot
-            // see in `min ls`, where that session is no longer listed.
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // The teardown runs beside this mainloop, so it can end
-                // between the collision and the re-read: a record gone by
-                // then was a session destroyed meanwhile, and the name is
-                // free now, so take it. Once: a second collision is a
-                // session created meanwhile, which is a plain collision.
-                let Some(name) = name else { return Err(e) };
-                match self.name_is_being_destroyed(&name).await {
-                    Some(true) => {
-                        return Err(BoxManagerError::new(
-                            std::io::ErrorKind::AlreadyExists,
-                            format!(
-                                "a session named `{name}` is still being destroyed; run \
-                                 `min session activate --name {name}` again once it is gone"
-                            ),
-                        ));
-                    }
-                    None => match create(retry).await {
-                        Ok(handle) => handle,
-                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                            return Err(self.held_name_refusal(&name, e).await);
-                        }
-                        Err(e) => return Err(e),
-                    },
-                    // BOX-163: a running box holds the name, so the create
-                    // is refused, naming the holder, and files nothing.
-                    Some(false) => return Err(self.held_name_refusal(&name, e).await),
-                }
+        let (handle, created_name) = if let Some(derived) = derived {
+            // BOX-163, BOX-211: a derived name is never refused. A taken
+            // one gives the smallest free `<name>-<n>`.
+            let (handle, assigned) = store.create_derived(record, minted, derived, fresh).await?;
+            tracing::Span::current().record("name", assigned.name.as_str());
+            if fresh && let Some(n) = assigned.instance {
+                tracing::info!(
+                    base = ?key_base,
+                    name = %assigned.name,
+                    suffix = n,
+                    "named a fresh box with the smallest suffix no retained record uses"
+                );
             }
-            Err(e) => return Err(e),
+            let created_name = self.created_name(assigned).await;
+            (handle, created_name)
+        } else {
+            let handle = match create(record).await {
+                Ok(handle) => handle,
+                // The name may be held by a session whose destroy is still
+                // running (its record outlives its actor by the length of the
+                // teardown task, a stalled clone's connect timeout at worst):
+                // say so, rather than report a plain collision the user cannot
+                // see in `min ls`, where that session is no longer listed.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // The teardown runs beside this mainloop, so it can end
+                    // between the collision and the re-read: a record gone by
+                    // then was a session destroyed meanwhile, and the name is
+                    // free now, so take it. Once: a second collision is a
+                    // session created meanwhile, which is a plain collision.
+                    let Some(name) = name.clone() else {
+                        return Err(e);
+                    };
+                    match self.name_is_being_destroyed(&name).await {
+                        Some(true) => {
+                            return Err(BoxManagerError::new(
+                                std::io::ErrorKind::AlreadyExists,
+                                format!(
+                                    "a session named `{name}` is still being destroyed; run \
+                                 `min session activate --name {name}` again once it is gone"
+                                ),
+                            ));
+                        }
+                        None => match create(retry).await {
+                            Ok(handle) => handle,
+                            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                                return Err(self.held_name_refusal(&name, e).await);
+                            }
+                            Err(e) => return Err(e),
+                        },
+                        // BOX-163: a running box holds the name, so the create
+                        // is refused, naming the holder, and files nothing.
+                        Some(false) => return Err(self.held_name_refusal(&name, e).await),
+                    }
+                }
+                Err(e) => return Err(e),
+            };
+            let created_name = CreatedName {
+                name,
+                not_taken: None,
+            };
+            (handle, created_name)
         };
         let session_id = *handle.id();
         let box_id = session_id;
@@ -5196,7 +5247,7 @@ impl BoxManager {
         match BoxActor::run(seed).await {
             Ok(session) => {
                 self.running.insert(session_id, session);
-                Ok((session_id, host_ip_fact))
+                Ok((session_id, host_ip_fact, created_name))
             }
             // The actor never started, so no one else will delete the
             // record. Best-effort: the spawn error is what the client needs
@@ -5215,6 +5266,42 @@ impl BoxManager {
                 }
                 Err(e)
             }
+        }
+    }
+
+    /// What a create's reply says about the name the store assigned: the
+    /// name, and the name not taken with its holder's creator, read back
+    /// from the holder's record. A holder gone since, or a record that
+    /// cannot be read, is `Unread`, and the reply then hides the holder.
+    async fn created_name(&self, assigned: boxes::box_name::DerivedAssignment) -> CreatedName {
+        let not_taken = match assigned.not_taken {
+            None => None,
+            Some((name, reason)) => {
+                let holder_creator = match &reason {
+                    boxes::box_name::DerivedNameTaken::Held(holder) => {
+                        match self.store.find(RecordPredicate::Id(holder.id)).await {
+                            Ok(Some(handle)) => match handle.record().await {
+                                Ok(record) => match record.username {
+                                    Some(user) => HolderCreator::User(user),
+                                    None => HolderCreator::NoCreator,
+                                },
+                                Err(_) => HolderCreator::Unread,
+                            },
+                            _ => HolderCreator::Unread,
+                        }
+                    }
+                    _ => HolderCreator::Unread,
+                };
+                Some(NotTakenName {
+                    name,
+                    reason,
+                    holder_creator,
+                })
+            }
+        };
+        CreatedName {
+            name: Some(assigned.name),
+            not_taken,
         }
     }
 
@@ -5555,7 +5642,7 @@ impl BoxManager {
                 let created = self
                     .create_session(config, None, false, username, creator)
                     .await
-                    .map(|(id, _)| id);
+                    .map(|(id, _, _)| id);
                 responder.handle(async move { created }).await;
             }
             ManagerMessage::CreateBox(msg) => {
@@ -5574,9 +5661,9 @@ impl BoxManager {
                 let created = self
                     .create_session(config, spec, fresh, username, creator)
                     .await
-                    .map(|(id, host_ip_fact)| {
+                    .map(|(id, host_ip_fact, created_name)| {
                         if let Some(fact) = fact {
-                            let _ = fact.send(host_ip_fact);
+                            let _ = fact.send((host_ip_fact, created_name));
                         }
                         id
                     });
@@ -7053,15 +7140,16 @@ impl Drop for TearingDown {
 /// Only a `host_ip` box with no box addresses and a declared credentialed
 /// upstream registered, so only that box sends a name. It sends the name
 /// it registered under: the config's `host_ip_registration`, else the
-/// box's name. A fresh instance registered under a creation key, because
-/// this daemon names it `<base>-<n>` only after the registration.
-/// `fresh_base` is that base, and `None` when the create is not a fresh
-/// instance. The key counts only as `<fresh_base>~<hex>`. Any other value
+/// box's name. A fresh instance and a derived-name create registered
+/// under a creation key, because this daemon names them `<base>` or
+/// `<base>-<n>` only after the registration. `key_base` is that base: the
+/// first derived candidate for a derived name. It is `None` for a create
+/// with a written name. The key counts only as `<key_base>~<hex>`. Any other value
 /// is ignored, so a client cannot name another box's registration and
 /// take its id. A `host_ip` box with no grant registered nothing. If it
 /// sent its name, it could take the id of another live box that
 /// registered the same name.
-fn host_ip_mint_name(config: &minimald_rpc::BoxConfig, fresh_base: Option<&str>) -> Option<String> {
+fn host_ip_mint_name(config: &minimald_rpc::BoxConfig, key_base: Option<&str>) -> Option<String> {
     let grant_box = matches!(config.network, boxes::NetworkMode::HostNet)
         && config.box_addresses.is_none()
         && config.policy.credentialed_upstream.is_some();
@@ -7069,15 +7157,15 @@ fn host_ip_mint_name(config: &minimald_rpc::BoxConfig, fresh_base: Option<&str>)
         return None;
     }
     if let Some(key) = config.host_ip_registration.as_deref() {
-        if fresh_base.is_some_and(|base| is_creation_key_of(key, base)) {
+        if key_base.is_some_and(|base| is_creation_key_of(key, base)) {
             return Some(key.to_string());
         }
         tracing::warn!(
             host_ip_registration = %key,
-            fresh_base = ?fresh_base,
+            key_base = ?key_base,
             box_name = ?config.name,
             "ignored a host_ip registration key that is not a creation key \
-             for this fresh box's base; the mint asks by the box's name"
+             for this box's base; the mint asks by the box's name"
         );
     }
     config.name.clone()
@@ -7158,8 +7246,8 @@ mod host_ip_mint_name_tests {
         assert_eq!(host_ip_mint_name(&config, None), None);
     }
 
-    // BEP-082: the mint asks by a creation key only on a fresh instance,
-    // and only by a key for the box's own base.
+    // BEP-082: the mint asks by a creation key only on a fresh instance or
+    // a derived-name create, and only by a key for the box's own base.
     #[test]
     fn host_ip_box_record_takes_the_registration_key_only_for_its_own_fresh_base() {
         let key = "agent~00112233445566778899aabbccddeeff";
@@ -7172,7 +7260,7 @@ mod host_ip_mint_name_tests {
         assert_eq!(
             host_ip_mint_name(&config, None),
             Some("agent".to_string()),
-            "a create that is not a fresh instance asks by its name"
+            "a create with a written name asks by its name"
         );
         assert_eq!(
             host_ip_mint_name(&config, Some("other")),

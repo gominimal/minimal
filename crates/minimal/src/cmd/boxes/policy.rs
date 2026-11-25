@@ -1689,6 +1689,8 @@ mod tests {
             deny_all_opt_out: None,
             classifier_advisory: advisory.map(str::to_string),
             host_ip_enforcement: host_ip_enforcement.map(str::to_string),
+            name: None,
+            name_not_taken: None,
         }
     }
 

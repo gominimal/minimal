@@ -12,7 +12,6 @@ use paths::{DaemonAbsPath, DaemonRelPath, sub_path};
 use crate::{
     Record, SESSION_BOX_TYPE, SessionId,
     box_name::NamedBox,
-    core::zone_answer::{HOST_ROW_LABEL, NODE_ROW_LABEL},
     events::{BoxEvent, DecodedEvents, decode_lines},
 };
 
@@ -1961,13 +1960,7 @@ fn held_name_error(name: &str, holder: &NamedBox) -> std::io::Error {
 /// addresses the calling box (BOX-007): a rename to it is refused by
 /// [`crate::box_name::check_rename`] before this list is read, and a
 /// creation is refused here.
-const RESERVED_SESSION_NAMES: [&str; 5] = [
-    HOST_ROW_LABEL,
-    "local",
-    "localhost",
-    NODE_ROW_LABEL,
-    crate::box_name::RESERVED_NAME,
-];
+const RESERVED_SESSION_NAMES: [&str; 5] = crate::box_name::RESERVED_NAMES;
 
 /// Reject a session name that would break a downstream output contract.
 ///
@@ -2092,6 +2085,58 @@ impl DiskLoader {
             session_id: id,
             dir_key: DaemonRelPath::try_new(short).unwrap(),
         })
+    }
+
+    /// Names `record` from `derived` and files it, in one step: the
+    /// record takes the first candidate that no retained record has, in
+    /// any state and under ASCII case, and that is neither reserved nor
+    /// of box-id form. A create with no requested name is never refused
+    /// for a taken name. A rename and a reap go through this same loader,
+    /// so neither can take or free a name between the walk and the write.
+    /// The answer says which name the box took, and which name it did
+    /// not get, with the reason.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::boxes_named`] and [`Self::create_with_id`].
+    pub fn create_with_derived_name(
+        &mut self,
+        mut record: Record,
+        derived: &crate::box_name::DerivedName,
+        fresh: bool,
+    ) -> Result<(DiskBoxKey, crate::box_name::DerivedAssignment), std::io::Error> {
+        let mut walked = 0usize;
+        let assignment = crate::box_name::assign_derived_name(derived, fresh, |name| {
+            walked += 1;
+            let named = self.boxes_named(name)?;
+            Ok::<_, std::io::Error>(crate::box_name::derived_name_taken(&named, name))
+        })?;
+        record.name = Some(assignment.name.clone());
+        let key = self.create_with_id(record)?;
+        if let Some((wanted, reason)) = &assignment.not_taken {
+            tracing::info!(
+                box_id = %key.id(),
+                name = %assignment.name,
+                not_taken = %wanted,
+                reason = reason.word(),
+                holder = ?match reason {
+                    crate::box_name::DerivedNameTaken::Held(holder) => Some(holder.id),
+                    _ => None,
+                },
+                candidates_walked = walked,
+                fresh,
+                "named a box from its project and entry: the first name was taken"
+            );
+        } else {
+            tracing::info!(
+                box_id = %key.id(),
+                name = %assignment.name,
+                candidates_walked = walked,
+                fresh,
+                "named a box from its project and entry"
+            );
+        }
+        Ok((key, assignment))
     }
 }
 
@@ -2499,6 +2544,94 @@ mod tests {
         assert_eq!(loader.keys().count(), 1, "nothing new is filed");
         assert_eq!(loader.find_by_name("another-name").unwrap(), None);
         assert_eq!(loader.find_by_id(&held.session_id).unwrap(), Some(held));
+    }
+
+    /// A record for the derived-name step: a fresh id, and no name.
+    fn unnamed_record() -> Record {
+        let mut record = sample_record();
+        record.id = SessionId::mint();
+        record.name = None;
+        record
+    }
+
+    /// The derived-name step: a taken name walks on to the smallest free
+    /// `<name>-<n>`, a record in any state takes its name, the reply
+    /// names the name not taken with its holder, and a freed number is
+    /// taken again.
+    #[test]
+    fn derived_name_takes_smallest_free_number() {
+        use crate::box_name::{DerivedName, DerivedNameTaken};
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let web = DerivedName::new("web", None);
+
+        let (first, got) = loader
+            .create_with_derived_name(unnamed_record(), &web, false)
+            .unwrap();
+        assert_eq!(got.name, "web");
+        assert_eq!(got.not_taken, None);
+
+        let (second, got) = loader
+            .create_with_derived_name(unnamed_record(), &web, false)
+            .unwrap();
+        assert_eq!(got.name, "web-1");
+        assert_eq!(got.instance, Some(1));
+        let Some((wanted, DerivedNameTaken::Held(holder))) = got.not_taken else {
+            panic!("the reply names the holder of `web`: {got:?}");
+        };
+        assert_eq!(wanted, "web");
+        assert_eq!(holder.id, first.session_id);
+
+        // A stopped holder keeps its name: the next create still walks on.
+        let mut stopped = loader.get(&first).unwrap().record().clone();
+        stopped.status = BoxState::Stopped;
+        loader.save(&first, &stopped).unwrap();
+        let (_, got) = loader
+            .create_with_derived_name(unnamed_record(), &web, false)
+            .unwrap();
+        assert_eq!(got.name, "web-2");
+
+        // A freed number is the smallest free one again, under any case.
+        loader.delete(&second).unwrap();
+        let (_, got) = loader
+            .create_with_derived_name(unnamed_record(), &DerivedName::new("WEB", None), false)
+            .unwrap();
+        assert_eq!(got.name, "web-1");
+
+        // A fresh instance never asks for the bare name.
+        let (_, got) = loader
+            .create_with_derived_name(unnamed_record(), &web, true)
+            .unwrap();
+        assert_eq!(got.name, "web-3");
+        assert_eq!(got.not_taken, None);
+    }
+
+    /// A reserved or box-id-form derived name is not taken: the create
+    /// walks on to `<name>-1` and says why.
+    #[test]
+    fn derived_name_takes_smallest_free_number_past_reserved_and_id_form() {
+        use crate::box_name::{DerivedName, DerivedNameTaken};
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let (_, got) = loader
+            .create_with_derived_name(unnamed_record(), &DerivedName::new("self", None), false)
+            .unwrap();
+        assert_eq!(got.name, "self-1");
+        assert_eq!(
+            got.not_taken,
+            Some(("self".to_string(), DerivedNameTaken::Reserved))
+        );
+
+        let id_form = "0190a5b2-7c3d-7e4f-8a1b-2c3d4e5f6a7b";
+        let (_, got) = loader
+            .create_with_derived_name(unnamed_record(), &DerivedName::new(id_form, None), false)
+            .unwrap();
+        assert_eq!(got.name, format!("{id_form}-1"));
+        assert_eq!(
+            got.not_taken,
+            Some((id_form.to_string(), DerivedNameTaken::BoxIdForm))
+        );
     }
 
     /// BOX-068: a box's spec is stored beside its record, in the box's

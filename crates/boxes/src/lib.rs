@@ -2068,6 +2068,171 @@ pub mod box_name {
             .and_then(serde_json_lenient::Value::as_str)
     }
 
+    /// The names no box takes, compared under ASCII case: the host's and
+    /// the node's row labels, `local`, `localhost` and [`RESERVED_NAME`].
+    pub const RESERVED_NAMES: [&str; 5] = [
+        crate::core::zone_answer::HOST_ROW_LABEL,
+        "local",
+        "localhost",
+        crate::core::zone_answer::NODE_ROW_LABEL,
+        RESERVED_NAME,
+    ];
+
+    /// The reserved name `name` folds to, if any (see [`RESERVED_NAMES`]).
+    #[must_use]
+    pub fn reserved_name(name: &str) -> Option<&'static str> {
+        RESERVED_NAMES
+            .iter()
+            .copied()
+            .find(|reserved| name.eq_ignore_ascii_case(reserved))
+    }
+
+    /// Whether `name` parses as a box id. Lookups try an id before a
+    /// name, so a box never takes a name of this form.
+    #[must_use]
+    pub fn is_box_id_form(name: &str) -> bool {
+        BoxId::parse_str(name).is_ok()
+    }
+
+    /// What a name derived from a project and an entry is made of, so the
+    /// store can walk its candidates (BOX-211, BOX-213): the project name
+    /// and the entry, when the spec names one other than
+    /// [`DEFAULT_ENTRY`].
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct DerivedName {
+        project: String,
+        entry: Option<String>,
+    }
+
+    impl DerivedName {
+        /// The derived name of `project` and the `entry` of `spec`, read as
+        /// [`create_derived_name`] reads it.
+        #[must_use]
+        pub fn new(project: &str, spec: Option<&serde_json_lenient::Value>) -> Self {
+            let entry = spec
+                .and_then(|spec| spec.get("entry"))
+                .and_then(serde_json_lenient::Value::as_str)
+                .filter(|entry| *entry != DEFAULT_ENTRY)
+                .map(str::to_string);
+            Self {
+                project: project.to_string(),
+                entry,
+            }
+        }
+
+        /// The name, with `-<n>` for the `n`th instance. It fits
+        /// [`BOX_NAME_MAX`] octets, and the number is never cut.
+        #[must_use]
+        pub fn name(&self, instance: Option<usize>) -> String {
+            derived_box_name(&self.project, self.entry.as_deref(), instance)
+        }
+
+        /// The candidates in the order a create tries them: the name, then
+        /// `<name>-1`, `<name>-2` and so on. A fresh instance starts at
+        /// `<name>-1`.
+        pub fn candidates(
+            &self,
+            fresh: bool,
+        ) -> impl Iterator<Item = (String, Option<usize>)> + '_ {
+            let first = (!fresh).then(|| (self.name(None), None));
+            first
+                .into_iter()
+                .chain((1..).map(|n| (self.name(Some(n)), Some(n))))
+        }
+    }
+
+    /// Why a derived name is taken, so a create walks on to the next
+    /// candidate.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum DerivedNameTaken {
+        /// A retained record on this host has the name, in any state.
+        Held(NamedBox),
+        /// The name is reserved (see [`RESERVED_NAMES`]).
+        Reserved,
+        /// The name parses as a box id.
+        BoxIdForm,
+    }
+
+    impl DerivedNameTaken {
+        /// The word for the reason, for a log line.
+        #[must_use]
+        pub fn word(&self) -> &'static str {
+            match self {
+                Self::Held(_) => "held",
+                Self::Reserved => "reserved",
+                Self::BoxIdForm => "box_id_form",
+            }
+        }
+    }
+
+    /// Why `name` is taken for a derived name, or `None` when it is free.
+    /// `boxes` are the retained records whose name folds to `name`. Every
+    /// state counts, a stopped or exited record too, so a derived name
+    /// never reuses the name of a box that is kept. The running holder
+    /// is named first, else the latest record of the name.
+    #[must_use]
+    pub fn derived_name_taken(boxes: &[NamedBox], name: &str) -> Option<DerivedNameTaken> {
+        if reserved_name(name).is_some() {
+            return Some(DerivedNameTaken::Reserved);
+        }
+        if is_box_id_form(name) {
+            return Some(DerivedNameTaken::BoxIdForm);
+        }
+        let found = candidates(boxes, name);
+        found
+            .iter()
+            .copied()
+            .find(|b| b.is_running())
+            .or_else(|| latest(found.iter().copied()))
+            .cloned()
+            .map(DerivedNameTaken::Held)
+    }
+
+    /// The name a derived-name create takes, and the name it did not get.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct DerivedAssignment {
+        /// The name the box takes.
+        pub name: String,
+        /// The instance number in the name, if any.
+        pub instance: Option<usize>,
+        /// The first candidate, when it was taken, with the reason. A
+        /// fresh instance never asks for the bare name, so it has none.
+        pub not_taken: Option<(String, DerivedNameTaken)>,
+    }
+
+    /// Walks the candidates of `derived` and answers the first one that
+    /// `taken` says is free. `taken` answers [`derived_name_taken`] for
+    /// one candidate against the records it reads.
+    ///
+    /// # Errors
+    ///
+    /// The first error of `taken`.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: a finite set of records leaves a number free.
+    pub fn assign_derived_name<E>(
+        derived: &DerivedName,
+        fresh: bool,
+        mut taken: impl FnMut(&str) -> Result<Option<DerivedNameTaken>, E>,
+    ) -> Result<DerivedAssignment, E> {
+        let mut not_taken = None;
+        for (index, (name, instance)) in derived.candidates(fresh).enumerate() {
+            match taken(&name)? {
+                None => {
+                    return Ok(DerivedAssignment {
+                        name,
+                        instance,
+                        not_taken,
+                    });
+                }
+                Some(reason) if index == 0 && !fresh => not_taken = Some((name, reason)),
+                Some(_) => {}
+            }
+        }
+        unreachable!("the candidate walk is unbounded")
+    }
+
     /// What a name check reads of one retained record on one host.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct NamedBox {
@@ -3812,6 +3977,43 @@ mod tests {
             assert_eq!(entry_box_name(""), "box");
             assert_eq!(entry_box_name("\t日本\t"), "box");
             assert_eq!(entry_box_name("-_."), "box");
+        }
+
+        /// The candidate walk of a 63-octet derived name: each candidate is
+        /// one label of at most 63 octets, and keeps its number whole.
+        #[test]
+        fn derived_name_takes_smallest_free_number_fitted_to_63() {
+            use super::super::box_name::{
+                BOX_NAME_MAX, DerivedName, DerivedNameTaken, assign_derived_name, is_dns_label,
+            };
+
+            let derived = DerivedName::new(&"p".repeat(70), None);
+            let walked: Vec<String> = derived.candidates(false).take(12).map(|(n, _)| n).collect();
+            assert_eq!(walked[0], "p".repeat(63));
+            assert_eq!(walked[1], format!("{}-1", "p".repeat(61)));
+            assert_eq!(walked[11], format!("{}-11", "p".repeat(60)));
+            assert!(
+                walked
+                    .iter()
+                    .all(|name| is_dns_label(name) && name.len() == BOX_NAME_MAX)
+            );
+
+            let taken: Vec<String> = walked[..3].to_vec();
+            let got = assign_derived_name(&derived, false, |name| {
+                Ok::<_, ()>(
+                    taken
+                        .iter()
+                        .any(|t| t == name)
+                        .then_some(DerivedNameTaken::Reserved),
+                )
+            })
+            .unwrap();
+            assert_eq!(got.name, walked[3]);
+            assert_eq!(got.instance, Some(3));
+            assert_eq!(
+                got.not_taken,
+                Some((walked[0].clone(), DerivedNameTaken::Reserved))
+            );
         }
 
         /// BOX-211, BOX-213: a derived name is one label of at most 63

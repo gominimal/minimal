@@ -1619,10 +1619,11 @@ async fn denying_verdict_faults_and_leaves_session_resumable() {
 async fn rename_of_unroutable_session_leaves_other_routes_alone() {
     let (state, _cache, mngr) = manager().await;
 
-    // Two unnamed sessions whose projects share the basename "app":
-    // both derive the name "app". Only the HostNet one registers a
-    // route when its actor spawns. The store refuses a name a running
-    // box holds, so the NoNet one is made first and stopped.
+    // Two sessions named "app": the NoNet one derives it from its
+    // project's basename, and the HostNet one asks for it. A derived name
+    // never reuses a kept box's name, but a requested name takes the name
+    // of a stopped box. Only the HostNet one registers a route when its
+    // actor spawns, so the NoNet one is made first and stopped.
     let routable_project = TempDir::new().unwrap();
     let routable_dir = routable_project.path().join("app");
     std::fs::create_dir_all(&routable_dir).unwrap();
@@ -1643,7 +1644,7 @@ async fn rename_of_unroutable_session_leaves_other_routes_alone() {
     .await;
 
     let mut config = sample_config();
-    config.name = None;
+    config.name = Some("app".to_string());
     config.network = boxes::NetworkMode::HostNet;
     config.project_path = HostAbsPath::try_new(routable_dir.to_str().unwrap()).unwrap();
     // Finalizing the loadout registers the "app" route.
@@ -4680,6 +4681,65 @@ async fn fresh_instance_mint_finds_its_registration_after_the_rename() {
             (second, Some("proj-dev-2".to_string())),
         ],
         "each fresh instance takes its own id under its `<base>-<n>` name"
+    );
+
+    crate::net::listeners::clear_vm_report_door_for_tests(&control);
+    door_task.abort();
+}
+
+/// BEP-082, BOX-163: a derived-name `host_ip` grant box registered under
+/// a creation key, because the store can give it `<name>-<n>` after the
+/// mint. Two such creates of one project ask by their own keys, and both
+/// are created, as `web` and `web-1`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn taken_derived_name_gets_smallest_free_number_for_a_grant_box() {
+    let (state, _cache, mngr) = manager().await;
+    let control = manager_switch_control(state.path());
+    let door = state.path().join("vm-host-door.sock");
+    let first = SessionId::mint();
+    let second = SessionId::mint();
+    let (door_task, mut asks) = mint_door(
+        &door,
+        vec![
+            minimald_rpc::BoxControlReply::BoxIdMinted {
+                minted_box_id: first,
+            },
+            minimald_rpc::BoxControlReply::BoxIdMinted {
+                minted_box_id: second,
+            },
+        ],
+    );
+    crate::net::listeners::seed_vm_report_door_for_tests(&control, &door);
+
+    let mut created = Vec::new();
+    for key in [
+        "web~00112233445566778899aabbccddeeff",
+        "web~ffeeddccbbaa99887766554433221100",
+    ] {
+        let mut config = as_task(unnamed_config());
+        config.project_name = Some("web".to_string());
+        config.network = boxes::NetworkMode::HostNet;
+        config.policy.credentialed_upstream = Some(boxes::CredentialedUpstream::default());
+        config.host_ip_registration = Some(key.to_string());
+        let (id, _fact, name) = mngr
+            .create_box_reporting_fact(config, Some(task_spec("default", None)), false, None, None)
+            .await
+            .expect("a derived-name grant box is never refused");
+        let ask = mint_ask(asks.recv().await.unwrap());
+        assert_eq!(
+            ask.host_ip_name.as_deref(),
+            Some(key),
+            "the mint asks by the key"
+        );
+        created.push((id, name.name));
+    }
+    assert_eq!(
+        created,
+        vec![
+            (first, Some("web".to_string())),
+            (second, Some("web-1".to_string())),
+        ],
+        "each derived-name grant box takes its own id and name"
     );
 
     crate::net::listeners::clear_vm_report_door_for_tests(&control);
@@ -8571,6 +8631,145 @@ async fn export_claim_released_for_unreported_exports_on_disconnect() {
         .await
         .unwrap();
     assert_eq!(claim.granted, paths(&["c.txt"]));
+}
+
+/// An unnamed task create of the project `project` and the entry `entry`,
+/// through the path the create RPC takes. It answers the id and what the
+/// reply says about the name.
+async fn derived_create(
+    mngr: &BoxManagerHandle,
+    project: &str,
+    entry: &str,
+) -> (SessionId, CreatedName) {
+    let mut config = as_task(unnamed_config());
+    config.project_name = Some(project.to_string());
+    let (id, _fact, created) = mngr
+        .create_box_reporting_fact(config, Some(task_spec(entry, None)), false, None, None)
+        .await
+        .expect("a derived name is never refused");
+    (id, created)
+}
+
+/// The name not taken of `created`, with the id of its holder.
+fn held_by(created: &CreatedName) -> (String, SessionId) {
+    match &created.not_taken {
+        Some(NotTakenName {
+            name,
+            reason: boxes::box_name::DerivedNameTaken::Held(holder),
+            ..
+        }) => (name.clone(), holder.id),
+        other => panic!("the create names a held name: {other:?}"),
+    }
+}
+
+/// BOX-163, BOX-211: two creates of one project with no name give `web`
+/// and `web-1`. The second is not refused, and says it did not get `web`,
+/// and which box has it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn taken_derived_name_gets_smallest_free_number() {
+    let (_state, _cache, mngr) = manager().await;
+    let (web, created) = derived_create(&mngr, "web", "default").await;
+    assert_eq!(created.name.as_deref(), Some("web"));
+    assert_eq!(created.not_taken, None);
+
+    let (second, created) = derived_create(&mngr, "web", "default").await;
+    assert_eq!(created.name.as_deref(), Some("web-1"));
+    assert_eq!(record_name(&mngr, second).await.as_deref(), Some("web-1"));
+    assert_eq!(held_by(&created), ("web".to_string(), web));
+    // BOX-228: the store's derived-name step files the stamped record, so
+    // `web-1` keeps where its name came from.
+    let record = stored_record(&mngr, second).await;
+    assert_eq!(record.name_origin, boxes::NameOrigin::Derived);
+    assert_eq!(record.project_name.as_deref(), Some("web"));
+    assert_eq!(record.entry.as_deref(), Some("default"));
+
+    let (_, created) = derived_create(&mngr, "web", "default").await;
+    assert_eq!(created.name.as_deref(), Some("web-2"));
+    assert_eq!(held_by(&created), ("web".to_string(), web));
+}
+
+/// A stopped box keeps its name: a derived create walks past it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn taken_derived_name_gets_smallest_free_number_past_a_stopped_holder() {
+    let (state, _cache, mngr) = manager().await;
+    let (web, _) = derived_create(&mngr, "web", "lint").await;
+    set_record_state(
+        state.path(),
+        web,
+        boxes::core::record::RecordState::Stopped(boxes::core::record::StopEnding::AtDaemonStart),
+    )
+    .await;
+    let (_, created) = derived_create(&mngr, "web", "lint").await;
+    assert_eq!(created.name.as_deref(), Some("web-lint-1"));
+    let Some(NotTakenName {
+        reason: boxes::box_name::DerivedNameTaken::Held(holder),
+        ..
+    }) = &created.not_taken
+    else {
+        panic!("the create names the stopped holder: {created:?}");
+    };
+    assert_eq!(holder.id, web);
+    assert_eq!(holder.state_word(), "stopped");
+}
+
+/// A reserved or box-id-form derived name walks on to `<name>-1`, and the
+/// create says why it did not get the name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn taken_derived_name_gets_smallest_free_number_past_reserved_and_box_id_form() {
+    let (_state, _cache, mngr) = manager().await;
+    let (_, created) = derived_create(&mngr, "localhost", "default").await;
+    assert_eq!(created.name.as_deref(), Some("localhost-1"));
+    let not_taken = created.not_taken.expect("the create names `localhost`");
+    assert_eq!(not_taken.name, "localhost");
+    assert_eq!(
+        not_taken.reason,
+        boxes::box_name::DerivedNameTaken::Reserved
+    );
+
+    let id_form = "0190a5b2-7c3d-7e4f-8a1b-2c3d4e5f6a7b";
+    let (_, created) = derived_create(&mngr, id_form, "default").await;
+    assert_eq!(created.name, Some(format!("{id_form}-1")));
+    assert_eq!(
+        created.not_taken.map(|n| n.reason),
+        Some(boxes::box_name::DerivedNameTaken::BoxIdForm)
+    );
+}
+
+/// A 63-octet derived name that is taken is cut to keep its number whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn taken_derived_name_gets_smallest_free_number_fitted_to_63() {
+    let (_state, _cache, mngr) = manager().await;
+    let project = "p".repeat(63);
+    let (_, created) = derived_create(&mngr, &project, "default").await;
+    assert_eq!(created.name.as_deref(), Some(project.as_str()));
+    let (_, created) = derived_create(&mngr, &project, "default").await;
+    let name = created.name.expect("the box has a name");
+    assert_eq!(name, format!("{}-1", "p".repeat(61)));
+    assert_eq!(name.len(), boxes::box_name::BOX_NAME_MAX);
+}
+
+/// A create that fails before its first run deletes its record, so the
+/// derived name it took is free for the next create.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn taken_derived_name_gets_smallest_free_number_freed_after_a_failed_create() {
+    let (_state, _cache, mngr) = manager().await;
+    let (web, _) = derived_create(&mngr, "web", "default").await;
+    let (failed, created) = derived_create(&mngr, "web", "default").await;
+    assert_eq!(created.name.as_deref(), Some("web-1"));
+    assert!(
+        mngr.delete_session_if_unfinalized(failed)
+            .await
+            .unwrap()
+            .is_some(),
+        "the failed create's box is destroyed"
+    );
+    let (_, created) = derived_create(&mngr, "web", "default").await;
+    assert_eq!(
+        created.name.as_deref(),
+        Some("web-1"),
+        "`web-1` is free again"
+    );
+    assert_eq!(held_by(&created), ("web".to_string(), web));
 }
 
 /// The record of box `id`, as the store keeps it.
