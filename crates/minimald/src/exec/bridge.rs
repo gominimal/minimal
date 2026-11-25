@@ -86,15 +86,7 @@ impl<S: Exec> ExecTask<S> {
             Some(ExecEnd::ClientLost) | None => None,
         };
         if let Some(notice) = notice {
-            match e.write(notice.as_bytes()).await {
-                Relayed::Written => {}
-                Relayed::Cut => tracing::debug!(
-                    "exec: the held-input notice was not written; an earlier write was given up",
-                ),
-                Relayed::Failed(_) | Relayed::Lost => tracing::debug!(
-                    "exec: the held-input notice was not written; the client is gone",
-                ),
-            }
+            write_end_notice(&mut e, &notice).await;
         }
         let _ = w.flush().await;
         let _ = e.flush().await;
@@ -1655,9 +1647,39 @@ where
     }
 }
 
-/// How long [`bridge_one`] waits to write a process's exit notice to a
-/// client that is not reading, before it returns the status without it.
+/// How long a notice waits to be written to a client that is not reading,
+/// before the exec goes on without it: a process's exit notice
+/// ([`bridge_one`]), and the notice that names an input bound
+/// ([`write_end_notice`]).
 pub(super) const EXIT_NOTICE_BOUND: Duration = Duration::from_secs(5);
+
+/// Writes the notice that names the input bound an exec ended at, to the
+/// client's stderr, waiting no longer than [`EXIT_NOTICE_BOUND`].
+///
+/// The input pump is stopped by the time this runs, so nothing signals a
+/// lost client here, and a russh writer at zero window waits for a window
+/// grant that a dead session never sends. The bound is what ends that wait:
+/// the exit status, the channel's close and the end of a command still
+/// starting all follow this write. A notice given up leaves `e` cut
+/// ([`ChannelOut`]).
+pub(super) async fn write_end_notice<W>(e: &mut ChannelOut<W>, notice: &str)
+where
+    W: AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(EXIT_NOTICE_BOUND, e.write(notice.as_bytes())).await {
+        Ok(Relayed::Written) => {}
+        Ok(Relayed::Cut) => tracing::debug!(
+            "exec: the held-input notice was not written; an earlier write was given up",
+        ),
+        Ok(Relayed::Failed(_) | Relayed::Lost) => {
+            tracing::debug!("exec: the held-input notice was not written; the client is gone",)
+        }
+        Err(_) => tracing::debug!(
+            bound = ?EXIT_NOTICE_BOUND,
+            "exec: the held-input notice was not written; the client did not take it in time",
+        ),
+    }
+}
 
 /// How long [`drain_ready`] waits for a pipe to produce something after
 /// the child has been reaped, before concluding that whatever still

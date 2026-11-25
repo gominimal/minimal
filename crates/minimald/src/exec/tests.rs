@@ -2010,9 +2010,8 @@ impl tokio::io::AsyncWrite for WatchedChannel {
 /// session never sends; here the channel has one byte of room and a client
 /// that reads nothing, so the write can never finish. Without the race
 /// against the loss, the loop polls nothing while the write waits: the loss
-/// goes unseen, the command runs on, and this test fails on its timeout
-/// (read from the code; the unfixed bridge was not run). Run for stdout
-/// and for stderr.
+/// goes unseen, the command runs on, and this test fails on its timeout.
+/// Run for stdout and for stderr.
 #[tokio::test(start_paused = true)]
 async fn a_lost_client_ends_an_exec_whose_output_write_waits_on_it() {
     use std::sync::Arc;
@@ -2390,8 +2389,7 @@ async fn an_input_bound_during_a_parked_output_write_ends_the_exec_once_the_writ
 /// `ExecTask::run`: the command's output waits on a client that reads nothing,
 /// its input passes the exec's cap meanwhile, and then the channel closes. A
 /// pump that returned at the bound would leave the loss unseen and the write
-/// waiting for good, and this test would fail on its timeout (read from the
-/// code; the pump that returned was not run against this test).
+/// waiting for good, and this test would fail on its timeout.
 #[tokio::test(start_paused = true)]
 async fn a_client_lost_after_an_input_bound_ends_an_exec_whose_output_write_waits() {
     use std::sync::Arc;
@@ -6674,6 +6672,22 @@ async fn an_unread_exit_notice_does_not_hold_the_status() {
     )
     .await;
     assert_eq!(status, 125);
+}
+
+/// A client that stops reading does not hold an ended exec back: the write
+/// of the notice that names an input bound gives up after
+/// [`super::EXIT_NOTICE_BOUND`] and leaves the channel cut.
+#[tokio::test(start_paused = true)]
+async fn an_unread_input_bound_notice_does_not_hold_the_exec() {
+    // One byte of room and nobody reading: the notice write never completes.
+    let (bridge_stderr, _client_stderr) = duplex(1);
+    let mut bridge_stderr = super::bridge::ChannelOut::new(bridge_stderr);
+    let notice = super::bridge::held_input_notice(super::HeldBound::Exec);
+    let started = tokio::time::Instant::now();
+    super::bridge::write_end_notice(&mut bridge_stderr, &notice).await;
+    assert!(started.elapsed() >= super::EXIT_NOTICE_BOUND);
+    assert!(started.elapsed() < super::EXIT_NOTICE_BOUND * 2);
+    assert!(bridge_stderr.is_cut());
 }
 
 /// The lines an exec writes to the client's stderr read as the product's:

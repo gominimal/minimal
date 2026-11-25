@@ -3550,7 +3550,7 @@ mod duplex_transport_tests {
         assert_eq!(exit_status, Some(0), "and then the exit status");
     }
 
-    /// The client wrapped, the daemon bare (as a VM guest built before this change): the echo
+    /// The client wrapped, the daemon bare (as a VM guest built before the wrapper): the echo
     /// completes, through the real wiring in [`crate::Client::handshake`].
     #[tokio::test]
     async fn the_client_alone_breaks_the_wait() {
@@ -3567,7 +3567,7 @@ mod duplex_transport_tests {
         check(&payload, &echoed, exit_status);
     }
 
-    /// The daemon wrapped, the client bare (as a CLI built before this change): the echo
+    /// The daemon wrapped, the client bare (as a CLI built before the wrapper): the echo
     /// completes. The daemon's own wiring, in minimald's `Connection::from_stream`, has its own
     /// probe test there; this stand-in wraps its end the same way.
     #[tokio::test]
