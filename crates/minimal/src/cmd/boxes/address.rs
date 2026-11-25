@@ -488,7 +488,8 @@ pub(crate) async fn resolve_box_on_hosts(
 /// records of every other type are dropped first, so a type noun never
 /// reaches a box of another type. A host that is not running, and that a
 /// VM serves, lists the boxes its VM keeps on disk (NET-152). Those records
-/// carry no type, so every type noun sees them. A box resolved there is
+/// carry no type, so every type noun sees them, unless a running host
+/// answers the type noun with a box of that name. A box resolved there is
 /// refused as on a stopped VM (NET-058).
 pub(crate) async fn resolve_box_over(
     mut hosts: Vec<crate::cmd::list::LocalHost>,
@@ -523,6 +524,26 @@ pub(crate) async fn resolve_box_over(
             },
         };
         listings.push(HostListing { host, boxes });
+    }
+    // A stopped VM's records carry no type. When a running host answers a
+    // type noun with a box of that type and name, those untyped records do
+    // not make the name ambiguous: the typed box is the one meant.
+    if box_type.is_some() {
+        let on_stopped =
+            |listing: &HostListing| stopped.iter().any(|(h, _)| *h == listing.host.host);
+        let typed_match = listings.iter().any(|l| {
+            !on_stopped(l)
+                && l.boxes
+                    .as_ref()
+                    .is_ok_and(|boxes| boxes.iter().any(|e| holds_name(e, address)))
+        });
+        if typed_match {
+            for listing in listings.iter_mut().filter(|l| on_stopped(l)) {
+                if let Ok(boxes) = &mut listing.boxes {
+                    boxes.retain(|e| !holds_name(e, address));
+                }
+            }
+        }
     }
     let resolution = resolve_box_address(address, &listings).and_then(|resolved| {
         let Some((_, vm)) = stopped.iter().find(|(host, _)| *host == resolved.host.host) else {

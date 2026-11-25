@@ -8657,6 +8657,18 @@ async fn box_verb_on_stopped_vm_box_refuses_with_start_hint() {
     assert_eq!(resolved.box_id, api);
     assert!(resolved.host.selected, "{}", resolved.host.host);
 
+    // A type noun finds the running VM's session `api`: the stopped VM's
+    // record carries no type, so it does not make the name ambiguous.
+    let resolved = cmd::resolve_box_of_type(
+        crate::cmd::list::local_hosts(&global).expect("the local hosts"),
+        "api",
+        "session",
+        "session stop",
+    )
+    .await
+    .expect("the running session resolves under its type noun");
+    assert_eq!(resolved.box_id, api);
+
     // `min box spec` resolves through the same lookup, so it refuses the box
     // on the stopped VM the same way.
     let err = box_spec_text(&global, &["min", "box", "spec", "beta"])
