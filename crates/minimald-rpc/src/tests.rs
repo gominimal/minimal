@@ -805,6 +805,8 @@ fn create_session_response_round_trips() {
         // must not be able to silently drop off either.
         classifier_advisory: None,
         host_ip_enforcement: None,
+        name: None,
+        name_not_taken: None,
     };
     let json = serde_json_lenient::to_string(&resp).expect("serializes");
     assert!(
@@ -832,6 +834,8 @@ fn create_session_response_carries_the_deny_all_opt_out() {
         answerer_bound: false,
         classifier_advisory: None,
         host_ip_enforcement: None,
+        name: None,
+        name_not_taken: None,
     };
     let json = serde_json_lenient::to_string(&opted_out).expect("serializes");
     assert!(
@@ -884,6 +888,8 @@ fn create_response_carries_the_classifier_state() {
                 .to_string(),
         ),
         host_ip_enforcement: Some("none".into()),
+        name: None,
+        name_not_taken: None,
     };
     let json = serde_json_lenient::to_string(&step_missing).expect("serializes");
     assert!(

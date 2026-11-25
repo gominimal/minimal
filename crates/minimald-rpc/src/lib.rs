@@ -2504,9 +2504,13 @@ pub struct CreateSessionRequest {
     /// Whether the create asks for a fresh instance (BOX-163). The daemon
     /// names the box `<name>-<n>`, with the smallest `n` that no retained
     /// record on the host uses, and never refuses it for a held name.
-    /// `false`, the default, names the box `<name>` and refuses the create
-    /// when a running box holds that name ([`HeldNameRefusal`]). A daemon
-    /// that predates the field reads every create as `false`.
+    /// `false`, the default, names the box `<name>`. A requested name
+    /// that a running box holds refuses the create ([`HeldNameRefusal`]).
+    /// A derived name is never refused: when a retained record in any
+    /// state has it, or it is reserved or of box-id form, the box takes
+    /// the smallest free `<name>-<n>`, and the reply's
+    /// [`CreateSessionResponse::name_not_taken`] says so. A daemon that
+    /// predates the field reads every create as `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fresh_instance: bool,
 }
@@ -2757,6 +2761,55 @@ pub struct CreateSessionResponse {
     /// `per_box`: a client that reads nothing here claims nothing from it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_ip_enforcement: Option<String>,
+    /// The name the box took. `None` from a daemon that predates the
+    /// field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The name a create with no requested name did not get, and why.
+    /// `None` when the create took the first name it derived, when the
+    /// request named the box, for a fresh instance, and from a daemon
+    /// that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_not_taken: Option<NameNotTaken>,
+}
+
+/// The name a create with no requested name did not get (BOX-163,
+/// BOX-211): the daemon gave the box the smallest free `<name>-<n>` in its
+/// place, and never refused the create.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NameNotTaken {
+    /// The name the create derived first.
+    pub name: String,
+    /// Why the box did not get it.
+    pub reason: NameTakenReason,
+}
+
+/// Why a derived name was taken.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NameTakenReason {
+    /// A box on the host has the name, in any state. `holder` is `None`
+    /// when the caller may not read that box.
+    Held {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        holder: Option<NameHolder>,
+    },
+    /// The name is reserved.
+    Reserved,
+    /// The name has the form of a box id.
+    BoxIdForm,
+}
+
+/// The box that has a name a create did not get.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NameHolder {
+    /// The box's id.
+    pub id: SessionId,
+    /// The box's name, with the case it was given.
+    pub name: String,
+    /// The box's state word: `pending`, `materializing`, `running`,
+    /// `stopped` or `exited`.
+    pub state: String,
 }
 
 impl OneshotSshRpc for CreateSession {

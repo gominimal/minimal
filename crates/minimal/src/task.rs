@@ -3833,6 +3833,8 @@ mod tests {
             deny_all_opt_out: Some(opt_out),
             classifier_advisory: advisory.map(str::to_string),
             host_ip_enforcement: None,
+            name: None,
+            name_not_taken: None,
         }
     }
 
