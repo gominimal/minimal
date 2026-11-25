@@ -295,8 +295,8 @@ impl fmt::Display for RestartError {
 /// gives, with the next step.
 fn unsatisfiable_why(error: &std::io::Error, name: &str) -> String {
     format!(
-        "{error} Destroy it with `min session destroy {name}`, then start a new one with \
-         `min session activate`."
+        "{error} Remove it with `min box rm --force {name}`, then start a new one with \
+         `min session start`."
     )
 }
 
@@ -408,6 +408,11 @@ enum BoxMessage {
     ConfigureLoadout(
         WireContribution,
         oneshot::Sender<Result<Option<ContributionResponse>, std::io::Error>>,
+    ),
+    /// Take what `min` prepared for this box's builds (NET-165).
+    PrepareBuildBoxes(
+        minimald_rpc::PrepareBuildBoxesRequest,
+        oneshot::Sender<Result<minimald_rpc::PrepareBuildBoxesResponse, String>>,
     ),
     /// Resume a `Draft` session with the client's verdict, promoting it to
     /// `Active`. Boxed so the variant doesn't dominate the enum's size.
@@ -1207,6 +1212,16 @@ impl BoxActor {
     async fn destroy_now(&mut self) -> Result<Vec<String>, std::io::Error> {
         // A destroyed box never reaches its timeout.
         self.timeout_deadline = None;
+        // NET-165: a box's build table ends with the box, whatever else the
+        // destroy finds.
+        if let Ok(record) = self.record.record().await {
+            crate::build_boxes::drop_table(
+                self.minimal_state_dir.as_utf8_path().as_std_path(),
+                record.id,
+                &self.net_switch,
+            )
+            .await;
+        }
         // Before `stop_running`: a destroy hook runs *inside* the
         // session, so the sandbox it joins has to still exist — or
         // be minted, which is what this does when the session's
@@ -1733,7 +1748,7 @@ impl BoxActor {
             std::io::ErrorKind::AlreadyExists,
             format!(
                 "The running session `{holder}` holds the name `{name}`. Rename it \
-                 with `min session rename {holder_id} <new-name>`{then}."
+                 with `min box rename {holder_id} <new-name>`{then}."
             ),
         ))
     }
@@ -2153,9 +2168,9 @@ impl BoxActor {
                 "resume: hooks_on_resume is set, and the box has no composition to read its hooks from"
             );
             return Err(format!(
-                "The daemon cannot read its hook settings. Destroy it with \
-                 `min session destroy {name}`, then start a new one with \
-                 `min session activate`."
+                "The daemon cannot read its hook settings. Remove it with \
+                 `min box rm --force {name}`, then start a new one with \
+                 `min session start`."
             ));
         }
         if !self.has_hooks_for(event) {
@@ -2679,6 +2694,9 @@ impl BoxActor {
                     }
                 };
                 let _ = r.send(self.configure_loadout(contribution, hooks_enabled).await);
+            }
+            BoxMessage::PrepareBuildBoxes(request, r) => {
+                drop(r.send(self.prepare_build_boxes(request).await));
             }
             BoxMessage::SubmitVerdict(msg) => {
                 let (verdict, r) = *msg;

@@ -129,6 +129,11 @@ pub enum Error {
         path: String,
         layer: String,
     },
+    /// `[project] name` is not a DNS label (BOX-216). Carries the value as
+    /// written. The name is never converted. Exits 3.
+    InvalidProjectName {
+        value: String,
+    },
 }
 
 /// What is wrong with a key of an expanded box spec.
@@ -223,7 +228,8 @@ impl Error {
             | Error::LoadoutVarConflict { .. }
             | Error::RetiredVarKey { .. }
             | Error::InvalidVarName { .. }
-            | Error::ExportOutsideProject { .. } => Some(3),
+            | Error::ExportOutsideProject { .. }
+            | Error::InvalidProjectName { .. } => Some(3),
             _ => None,
         }
     }
@@ -503,6 +509,12 @@ impl fmt::Display for Error {
                  that holds minimal.toml or names that folder itself. Give \
                  the path of a file or folder inside that folder."
             ),
+            Error::InvalidProjectName { value } => write!(
+                f,
+                "[project] name = {value:?} in minimal.toml is not a DNS label. \
+                 A DNS label holds 1 to 63 ASCII letters, digits and `-`, with \
+                 no `-` at either end. Change [project] name to a DNS label."
+            ),
         }
     }
 }
@@ -537,6 +549,7 @@ impl std::error::Error for Error {
             Error::RetiredVarKey { .. } => None,
             Error::InvalidVarName { .. } => None,
             Error::ExportOutsideProject { .. } => None,
+            Error::InvalidProjectName { .. } => None,
         }
     }
 }

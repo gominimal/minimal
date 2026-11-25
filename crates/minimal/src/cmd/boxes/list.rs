@@ -1,7 +1,8 @@
 //! `min box list`: the box records the daemon of each local host keeps for
 //! the current project, or for every project with `--all`, in any state
 //! (BOX-158, rendered as BCLI-001 and BCLI-051 pull it forward into the
-//! first slice).
+//! first slice). `--type` and `--parent` keep only the matching boxes
+//! (BCLI-026).
 
 use super::*;
 
@@ -32,6 +33,9 @@ pub async fn cmd_box_list(global: &GlobalArgs, args: BoxListArgs) -> Result<(), 
     ensure_daemon(global)?;
     let scoped = scope.is_some();
     let hosts = crate::cmd::list::local_hosts(global)?;
+    // BCLI-026: `--parent` names a box as every box verb does, so it
+    // resolves over the same hosts before the listing reads them.
+    let parent = resolve_list_parent(hosts.clone(), args.parent.as_deref(), "box list").await?;
     let mut listed = Vec::new();
     for host in hosts {
         match list_host_boxes(&host, scope.clone()).await {
@@ -55,13 +59,159 @@ pub async fn cmd_box_list(global: &GlobalArgs, args: BoxListArgs) -> Result<(), 
             }
         }
     }
-    tracing::info!(verb = "box list", outcome = "ok", boxes = listed.len());
+    let filter = BoxListFilter {
+        box_type: args.box_type.as_deref(),
+        parent,
+    };
+    // The filter keeps rows, so a running build box matches as a row of
+    // its own (BCLI-026, NET-171).
+    let rows = filter.rows(&listed);
+    tracing::info!(verb = "box list", outcome = "ok", boxes = rows.len());
     let mut out = std::io::stdout().lock();
     match args.output {
-        Some(BoxListOutputFormat::Json) => render_box_list_json(&mut out, &listed)?,
-        None => render_box_list(&mut out, &listed, scoped)?,
+        Some(BoxListOutputFormat::Json) => render_box_rows_json(&mut out, &rows)?,
+        None if rows.is_empty() && filter.is_set() => {
+            writeln!(out, "{}", filtered_empty_line(&args, scoped))?;
+        }
+        None => render_box_rows(&mut out, &rows, scoped)?,
     }
     Ok(())
+}
+
+/// One row of a listing: a box record, or a running build box that the
+/// record of its requesting box carries (NET-171).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoxRow<'a> {
+    /// The box the record describes.
+    Record(&'a ListedBox),
+    /// A running build box of the record's box.
+    Build(&'a ListedBox, &'a minimald_rpc::RunningBuildBox),
+}
+
+impl BoxRow<'_> {
+    /// The Box Type the row prints.
+    pub(crate) fn box_type(&self) -> Option<&str> {
+        match self {
+            Self::Record(listed) => listed.record.box_type.as_deref(),
+            Self::Build(..) => Some(boxes::BUILD_BOX_TYPE),
+        }
+    }
+
+    /// The parent the row prints: a build box's parent is its requesting box.
+    pub(crate) fn parent(&self) -> Option<boxes::SessionId> {
+        match self {
+            Self::Record(listed) => listed.record.parent,
+            Self::Build(listed, _) => Some(listed.record.box_id),
+        }
+    }
+}
+
+/// Every row of `listed`, in order: each record, then its build boxes.
+pub(crate) fn box_rows(listed: &[ListedBox]) -> Vec<BoxRow<'_>> {
+    listed
+        .iter()
+        .flat_map(|listed| {
+            std::iter::once(BoxRow::Record(listed)).chain(
+                listed
+                    .record
+                    .build_boxes
+                    .iter()
+                    .map(move |build| BoxRow::Build(listed, build)),
+            )
+        })
+        .collect()
+}
+
+/// What `--type` and `--parent` keep of a listing (BCLI-026).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct BoxListFilter<'a> {
+    /// Keep only the boxes of this type.
+    pub box_type: Option<&'a str>,
+    /// Keep only the children of this box.
+    pub parent: Option<boxes::SessionId>,
+}
+
+impl BoxListFilter<'_> {
+    /// Whether either flag is set.
+    pub(crate) fn is_set(&self) -> bool {
+        self.box_type.is_some() || self.parent.is_some()
+    }
+
+    /// Whether `row` matches every set flag.
+    pub(crate) fn keeps(&self, row: &BoxRow<'_>) -> bool {
+        self.box_type
+            .is_none_or(|box_type| row.box_type() == Some(box_type))
+            && self
+                .parent
+                .is_none_or(|parent| row.parent() == Some(parent))
+    }
+
+    /// The rows of `listed` that match every set flag, in order. A build
+    /// box matches on its own type and its requesting box.
+    pub(crate) fn rows<'a>(&self, listed: &'a [ListedBox]) -> Vec<BoxRow<'a>> {
+        box_rows(listed)
+            .into_iter()
+            .filter(|row| self.keeps(row))
+            .collect()
+    }
+
+    /// The records of `listed` whose own row matches every set flag, in
+    /// order. A kept record keeps its build boxes, as `min task list`
+    /// prints them.
+    pub(crate) fn apply(&self, listed: Vec<ListedBox>) -> Vec<ListedBox> {
+        listed
+            .into_iter()
+            .filter(|listed| self.keeps(&BoxRow::Record(listed)))
+            .collect()
+    }
+}
+
+/// Resolves the `--parent` of a listing over `hosts` to the box id, as
+/// every box verb resolves a box. `min box list`, `min session list` and
+/// `min task list` share it (BCLI-026, BCLI-030).
+pub(crate) async fn resolve_list_parent(
+    hosts: Vec<crate::cmd::list::LocalHost>,
+    parent: Option<&str>,
+    verb: &'static str,
+) -> Result<Option<boxes::SessionId>, anyhow::Error> {
+    match parent {
+        Some(address) => Ok(Some(
+            resolve_box_on_hosts(hosts, address, verb).await?.box_id,
+        )),
+        None => Ok(None),
+    }
+}
+
+/// The line the table form prints when `--type` or `--parent` keeps no box.
+fn filtered_empty_line(args: &BoxListArgs, scoped: bool) -> String {
+    no_match_line(
+        "box",
+        args.box_type.as_deref(),
+        args.parent.as_deref(),
+        scoped,
+    )
+}
+
+/// The line a table listing prints when its `--type` or `--parent` keeps
+/// no `noun`: `box` for `min box list`, `session box` or `task box` for
+/// the type nouns.
+pub(crate) fn no_match_line(
+    noun: &str,
+    box_type: Option<&str>,
+    parent: Option<&str>,
+    scoped: bool,
+) -> String {
+    let flags: Vec<String> = box_type
+        .iter()
+        .map(|box_type| format!("--type {box_type}"))
+        .chain(parent.iter().map(|parent| format!("--parent {parent}")))
+        .collect();
+    let flags = flags.join(" ");
+    if scoped {
+        format!("No {noun} of this project matches {flags}.")
+    } else {
+        format!("No {noun} on this machine matches {flags}.")
+    }
 }
 
 /// The stderr line for a host whose boxes the listing could not read.
@@ -216,37 +366,59 @@ pub(crate) fn render_box_list(
     boxes: &[ListedBox],
     scoped: bool,
 ) -> std::io::Result<()> {
-    if boxes.is_empty() {
+    render_box_rows(out, &box_rows(boxes), scoped)
+}
+
+/// Writes `rows` as the table [`render_box_list`] describes.
+pub(crate) fn render_box_rows(
+    out: &mut impl std::io::Write,
+    rows: &[BoxRow<'_>],
+    scoped: bool,
+) -> std::io::Result<()> {
+    if rows.is_empty() {
         if scoped {
             return writeln!(out, "{EMPTY_PROJECT_LIST}");
         }
         return writeln!(out, "{EMPTY_HOST_LIST}");
     }
     let header = [
-        "ID", "NAME", "TYPE", "PARENT", "PROJECT", "STATE", "PROVIDER", "HOST",
+        "ID", "NAME", "ENTRY", "TYPE", "PARENT", "PROJECT", "STATE", "PROVIDER", "HOST",
     ];
-    let rows: Vec<[String; 8]> = boxes
+    let rows: Vec<[String; 9]> = rows
         .iter()
-        .map(|listed| {
-            let entry = &listed.record;
-            [
-                entry.box_id.to_string(),
-                entry.name.clone().unwrap_or_else(|| NO_VALUE.to_string()),
-                entry
-                    .box_type
-                    .clone()
-                    .unwrap_or_else(|| NO_VALUE.to_string()),
-                entry
-                    .parent
-                    .map_or_else(|| NO_VALUE.to_string(), |parent| parent.to_string()),
-                entry
-                    .project_root
-                    .as_ref()
-                    .map_or_else(|| NO_VALUE.to_string(), |root| root.to_string()),
-                box_state_label(entry),
+        .map(|row| match *row {
+            BoxRow::Record(listed) => {
+                let entry = &listed.record;
+                [
+                    entry.box_id.to_string(),
+                    entry.name.clone().unwrap_or_else(|| NO_VALUE.to_string()),
+                    entry.entry.clone().unwrap_or_else(|| NO_VALUE.to_string()),
+                    entry
+                        .box_type
+                        .clone()
+                        .unwrap_or_else(|| NO_VALUE.to_string()),
+                    entry
+                        .parent
+                        .map_or_else(|| NO_VALUE.to_string(), |parent| parent.to_string()),
+                    project_cell(entry),
+                    box_state_label(entry),
+                    listed.provider.clone(),
+                    listed.host.clone(),
+                ]
+            }
+            // NET-171: a build box has no record, so its row names its
+            // package and its requesting box.
+            BoxRow::Build(listed, build) => [
+                NO_VALUE.to_string(),
+                build.package.clone(),
+                NO_VALUE.to_string(),
+                boxes::BUILD_BOX_TYPE.to_string(),
+                listed.record.box_id.to_string(),
+                project_cell(&listed.record),
+                "running".to_string(),
                 listed.provider.clone(),
                 listed.host.clone(),
-            ]
+            ],
         })
         .collect();
     let mut widths = header.map(str::len);
@@ -255,7 +427,7 @@ pub(crate) fn render_box_list(
             *width = (*width).max(cell.chars().count());
         }
     }
-    let line = |cells: [&str; 8]| {
+    let line = |cells: [&str; 9]| {
         let mut text = String::new();
         for (index, (cell, width)) in cells.iter().zip(widths).enumerate() {
             if index + 1 == cells.len() {
@@ -273,6 +445,17 @@ pub(crate) fn render_box_list(
     Ok(())
 }
 
+/// The PROJECT cell of a record and of its build boxes: the project name,
+/// else the project root for a record that keeps no project name
+/// (BCLI-001).
+fn project_cell(entry: &minimald_rpc::BoxListingEntry) -> String {
+    entry
+        .project_name
+        .clone()
+        .or_else(|| entry.project_root.as_ref().map(ToString::to_string))
+        .unwrap_or_else(|| NO_VALUE.to_string())
+}
+
 /// One box as its `"schema": "min/v1/box"` object. A value the record
 /// does not carry is `null`.
 pub(crate) fn box_json(listed: &ListedBox) -> serde_json_lenient::Value {
@@ -287,6 +470,9 @@ pub(crate) fn box_json(listed: &ListedBox) -> serde_json_lenient::Value {
         "host": listed.host,
         "parent": entry.parent.map(|parent| parent.to_string()),
         "project": entry.project_root.as_ref().map(|root| root.to_string()),
+        "project_name": entry.project_name,
+        "entry": entry.entry,
+        "name_origin": entry.name_origin.as_str(),
         "reason": entry.reason,
         "exit_code": entry.exit_code,
         "signal": entry.signal,
@@ -299,7 +485,38 @@ pub(crate) fn render_box_list_json(
     out: &mut impl std::io::Write,
     boxes: &[ListedBox],
 ) -> std::io::Result<()> {
-    let objects: Vec<serde_json_lenient::Value> = boxes.iter().map(box_json).collect();
+    render_box_rows_json(out, &box_rows(boxes))
+}
+
+/// Writes `rows` as the JSON array [`render_box_list_json`] describes.
+pub(crate) fn render_box_rows_json(
+    out: &mut impl std::io::Write,
+    rows: &[BoxRow<'_>],
+) -> std::io::Result<()> {
+    let objects: Vec<serde_json_lenient::Value> = rows
+        .iter()
+        .map(|row| match *row {
+            BoxRow::Record(listed) => box_json(listed),
+            BoxRow::Build(listed, build) => serde_json_lenient::json!({
+                "schema": BOX_SCHEMA,
+                "id": null,
+                "name": build.package,
+                "type": boxes::BUILD_BOX_TYPE,
+                "state": "running",
+                "provider": listed.provider,
+                "host": listed.host,
+                "parent": listed.record.box_id.to_string(),
+                "project": listed.record.project_root.as_ref().map(|r| r.to_string()),
+                "project_name": listed.record.project_name,
+                // A build box is named by its package, and has no entry.
+                "entry": null,
+                "name_origin": null,
+                "reason": null,
+                "exit_code": null,
+                "signal": null,
+            }),
+        })
+        .collect();
     serde_json_lenient::to_writer_pretty(&mut *out, &objects)?;
     writeln!(out)
 }
@@ -318,6 +535,47 @@ mod tests {
         }
     }
 
+    /// `entry` with one running build box of `package`.
+    fn building(mut entry: BoxListingEntry, package: &str) -> BoxListingEntry {
+        entry.build_boxes = vec![minimald_rpc::RunningBuildBox {
+            package: package.to_string(),
+            egress: None,
+            granted: true,
+            no_network: false,
+        }];
+        entry
+    }
+
+    /// The table and the `-o json` array that `filter` gives for `listed`.
+    fn filtered(
+        filter: BoxListFilter<'_>,
+        listed: &[ListedBox],
+    ) -> (String, serde_json_lenient::Value) {
+        let rows = filter.rows(listed);
+        let mut table = Vec::new();
+        render_box_rows(&mut table, &rows, false).unwrap();
+        let mut json = Vec::new();
+        render_box_rows_json(&mut json, &rows).unwrap();
+        (
+            String::from_utf8(table).unwrap(),
+            serde_json_lenient::from_slice(&json).unwrap(),
+        )
+    }
+
+    /// The `type` and `name` of each object of a `-o json` array.
+    fn types_and_names(json: &serde_json_lenient::Value) -> Vec<(String, String)> {
+        json.as_array()
+            .unwrap()
+            .iter()
+            .map(|object| {
+                (
+                    object["type"].as_str().unwrap_or("").to_string(),
+                    object["name"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect()
+    }
+
     fn entry(id: &str, name: Option<&str>, box_type: &str, state: &str) -> BoxListingEntry {
         BoxListingEntry {
             box_id: boxes::SessionId::parse_str(id).unwrap(),
@@ -331,7 +589,299 @@ mod tests {
             signal: None,
             pty_enabled: true,
             lifetime: None,
+            build_boxes: Vec::new(),
+            project_name: None,
+            entry: None,
+            name_origin: boxes::NameOrigin::Written,
         }
+    }
+
+    // BCLI-026: `min box list --type task` keeps the task boxes and drops
+    // the boxes of every other type, and a record with no type.
+    #[test]
+    fn box_list_type_keeps_that_box_type() {
+        let task = entry(
+            "0199e0a0-0000-7000-8000-000000000001",
+            None,
+            "task",
+            "running",
+        );
+        let session = entry(
+            "0199e0a0-0000-7000-8000-000000000002",
+            Some("web"),
+            "session",
+            "running",
+        );
+        let mut untyped = entry(
+            "0199e0a0-0000-7000-8000-000000000003",
+            None,
+            "task",
+            "stopped",
+        );
+        untyped.box_type = None;
+        let listed = vec![local(task.clone()), local(session.clone()), local(untyped)];
+
+        let filter = BoxListFilter {
+            box_type: Some("task"),
+            parent: None,
+        };
+        assert!(filter.is_set());
+        assert_eq!(filter.apply(listed.clone()), vec![local(task.clone())]);
+
+        let filter = BoxListFilter {
+            box_type: Some("session"),
+            parent: None,
+        };
+        assert_eq!(filter.apply(listed.clone()), vec![local(session.clone())]);
+
+        // No flag keeps every record.
+        let filter = BoxListFilter::default();
+        assert!(!filter.is_set());
+        assert_eq!(filter.apply(listed.clone()), listed);
+
+        // A running build box is a row of its own: `--type task` drops it,
+        // and `--type build` keeps only it, in the table and in JSON.
+        let listed = vec![local(task), local(building(session.clone(), "claude-code"))];
+        let (table, json) = filtered(
+            BoxListFilter {
+                box_type: Some("task"),
+                parent: None,
+            },
+            &listed,
+        );
+        assert!(!table.contains("claude-code"), "{table}");
+        assert!(!table.contains(" build "), "{table}");
+        assert_eq!(
+            types_and_names(&json),
+            vec![("task".to_string(), String::new())]
+        );
+
+        let (table, json) = filtered(
+            BoxListFilter {
+                box_type: Some("build"),
+                parent: None,
+            },
+            &listed,
+        );
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(lines.len(), 2, "a header and the build row: {table}");
+        assert!(lines[1].contains("claude-code"), "{table}");
+        assert!(lines[1].contains(" build "), "{table}");
+        assert_eq!(
+            types_and_names(&json),
+            vec![("build".to_string(), "claude-code".to_string())]
+        );
+
+        // `--type session` keeps the session box and not its build box.
+        let (table, json) = filtered(
+            BoxListFilter {
+                box_type: Some("session"),
+                parent: None,
+            },
+            &listed,
+        );
+        assert!(!table.contains("claude-code"), "{table}");
+        assert_eq!(
+            types_and_names(&json),
+            vec![("session".to_string(), "web".to_string())]
+        );
+
+        // With no build box running, `--type build` keeps no row, so the
+        // table prints the no-match line.
+        let idle = vec![local(session)];
+        assert!(
+            BoxListFilter {
+                box_type: Some("build"),
+                parent: None,
+            }
+            .rows(&idle)
+            .is_empty()
+        );
+    }
+
+    // BCLI-026: `min box list --parent <box>` keeps the children of that box
+    // only: not the box itself, not a box with no parent, and not the
+    // children of another box. With `--type` too, both must match.
+    #[test]
+    fn box_list_parent_keeps_its_children() {
+        let parent_id = "0199e0a0-0000-7000-8000-000000000001";
+        let other_id = "0199e0a0-0000-7000-8000-000000000002";
+        let parent = entry(parent_id, Some("web"), "session", "running");
+        let other = entry(other_id, Some("api"), "session", "running");
+        let child = |id: &str, box_type: &str, of: &str| {
+            let mut child = entry(id, None, box_type, "running");
+            child.parent = Some(boxes::SessionId::parse_str(of).unwrap());
+            child
+        };
+        let task_child = child("0199e0a0-0000-7000-8000-000000000003", "task", parent_id);
+        let session_child = child("0199e0a0-0000-7000-8000-000000000004", "session", parent_id);
+        let other_child = child("0199e0a0-0000-7000-8000-000000000005", "task", other_id);
+        let listed: Vec<ListedBox> = [
+            parent,
+            other,
+            task_child.clone(),
+            session_child.clone(),
+            other_child,
+        ]
+        .into_iter()
+        .map(local)
+        .collect();
+
+        let filter = BoxListFilter {
+            box_type: None,
+            parent: Some(boxes::SessionId::parse_str(parent_id).unwrap()),
+        };
+        assert_eq!(
+            filter.apply(listed.clone()),
+            vec![local(task_child.clone()), local(session_child)]
+        );
+
+        let filter = BoxListFilter {
+            box_type: Some("task"),
+            parent: Some(boxes::SessionId::parse_str(parent_id).unwrap()),
+        };
+        assert_eq!(filter.apply(listed), vec![local(task_child.clone())]);
+
+        // `--parent <box>` keeps the build boxes of that box, and not those
+        // of its children or of another box, in the table and in JSON.
+        let listed: Vec<ListedBox> = [
+            building(
+                entry(parent_id, Some("web"), "session", "running"),
+                "claude-code",
+            ),
+            building(
+                entry(other_id, Some("api"), "session", "running"),
+                "ripgrep",
+            ),
+            building(task_child.clone(), "jq"),
+        ]
+        .into_iter()
+        .map(local)
+        .collect();
+        let (table, json) = filtered(
+            BoxListFilter {
+                box_type: None,
+                parent: Some(boxes::SessionId::parse_str(parent_id).unwrap()),
+            },
+            &listed,
+        );
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(
+            lines.len(),
+            3,
+            "a header, the build box, the child: {table}"
+        );
+        assert!(lines[1].contains("claude-code"), "{table}");
+        assert!(
+            lines[2].starts_with("0199e0a0-0000-7000-8000-000000000003"),
+            "{table}"
+        );
+        assert!(!table.contains("ripgrep"), "{table}");
+        assert!(!table.contains("jq"), "{table}");
+        assert_eq!(
+            types_and_names(&json),
+            vec![
+                ("build".to_string(), "claude-code".to_string()),
+                ("task".to_string(), String::new()),
+            ]
+        );
+        assert_eq!(json[0]["parent"], parent_id);
+
+        // `--parent` with `--type build` keeps only that box's build boxes.
+        let (_, json) = filtered(
+            BoxListFilter {
+                box_type: Some("build"),
+                parent: Some(boxes::SessionId::parse_str(parent_id).unwrap()),
+            },
+            &listed,
+        );
+        assert_eq!(
+            types_and_names(&json),
+            vec![("build".to_string(), "claude-code".to_string())]
+        );
+
+        // The table form names the flags when they keep no box.
+        let args = BoxListArgs {
+            all: false,
+            box_type: Some("task".to_string()),
+            parent: Some("web".to_string()),
+            output: None,
+        };
+        assert_eq!(
+            filtered_empty_line(&args, true),
+            "No box of this project matches --type task --parent web."
+        );
+        let args = BoxListArgs {
+            all: true,
+            box_type: None,
+            parent: Some("web".to_string()),
+            output: None,
+        };
+        assert_eq!(
+            filtered_empty_line(&args, false),
+            "No box on this machine matches --parent web."
+        );
+    }
+
+    /// NET-171, BOX-210: a running build box lists under its requesting box
+    /// with its type, its parent and its package, as a row and as JSON.
+    #[test]
+    fn build_box_listed_while_it_runs() {
+        let mut parent = entry(
+            "0199e0a0-0000-7000-8000-000000000001",
+            Some("sealed"),
+            "session",
+            "materializing",
+        );
+        parent.build_boxes = vec![minimald_rpc::RunningBuildBox {
+            package: "claude-code".to_string(),
+            egress: None,
+            granted: true,
+            no_network: false,
+        }];
+        let listed = [local(parent)];
+        let mut table = Vec::new();
+        render_box_list(&mut table, &listed, false).unwrap();
+        let table = String::from_utf8(table).unwrap();
+        let row = table
+            .lines()
+            .find(|line| line.contains("claude-code"))
+            .expect("the build box has a row");
+        assert!(row.starts_with("- "), "a build box has no id: {row}");
+        assert!(row.contains(" build "), "{row}");
+        assert!(
+            row.contains("0199e0a0-0000-7000-8000-000000000001"),
+            "{row}"
+        );
+
+        let mut json = Vec::new();
+        render_box_list_json(&mut json, &listed).unwrap();
+        let json: serde_json_lenient::Value = serde_json_lenient::from_slice(&json).unwrap();
+        assert_eq!(json[1]["type"], "build");
+        assert_eq!(json[1]["name"], "claude-code");
+        assert_eq!(json[1]["parent"], "0199e0a0-0000-7000-8000-000000000001");
+    }
+
+    /// BOX-209: a build box has no record, so no box verb can name it, by its
+    /// package or otherwise.
+    #[test]
+    fn build_box_is_no_target_of_a_box_verb() {
+        let mut parent = entry(
+            "0199e0a0-0000-7000-8000-000000000001",
+            Some("sealed"),
+            "session",
+            "materializing",
+        );
+        parent.build_boxes = vec![minimald_rpc::RunningBuildBox {
+            package: "claude-code".to_string(),
+            egress: None,
+            granted: true,
+            no_network: false,
+        }];
+        assert!(
+            find_listed_box(&[parent], "claude-code", "local0", "").is_err(),
+            "only a record resolves"
+        );
     }
 
     /// BOX-158, BOX-159 (BCLI-001, BCLI-003): the listing renders every
@@ -393,12 +943,12 @@ mod tests {
         render_box_list(&mut out, &rows, true).unwrap();
         let text = String::from_utf8(out).unwrap();
         let expected = "\
-ID                                    NAME          TYPE     PARENT                                PROJECT         STATE                   PROVIDER  HOST
-0199e0a0-0000-7000-8000-000000000001  kept-session  session  -                                     /home/dev/proj  stopped (signal 15)     local     local0
-0199e0a0-0000-7000-8000-000000000002  -             task     0199e0a0-0000-7000-8000-000000000001  /home/dev/proj  exited (exit 0)         local     local0
-0199e0a0-0000-7000-8000-000000000003  big-build     task     -                                     /home/dev/proj  exited (oom, exit 137)  local     local0
-0199e0b0-0000-7000-8000-000000000004  left-task     task     -                                     /home/dev/proj  stopped                 local     local0
-0199e0c0-0000-7000-8000-000000000005  live          session  -                                     -               running                 local     local0
+ID                                    NAME          ENTRY  TYPE     PARENT                                PROJECT         STATE                   PROVIDER  HOST
+0199e0a0-0000-7000-8000-000000000001  kept-session  -      session  -                                     /home/dev/proj  stopped (signal 15)     local     local0
+0199e0a0-0000-7000-8000-000000000002  -             -      task     0199e0a0-0000-7000-8000-000000000001  /home/dev/proj  exited (exit 0)         local     local0
+0199e0a0-0000-7000-8000-000000000003  big-build     -      task     -                                     /home/dev/proj  exited (oom, exit 137)  local     local0
+0199e0b0-0000-7000-8000-000000000004  left-task     -      task     -                                     /home/dev/proj  stopped                 local     local0
+0199e0c0-0000-7000-8000-000000000005  live          -      session  -                                     -               running                 local     local0
 ";
         assert_eq!(text, expected);
 
@@ -454,25 +1004,29 @@ ID                                    NAME          TYPE     PARENT             
             identity: BoxIdentity::None,
             live_execs: Vec::new(),
             disk_bytes: None,
+            missing_build_row: false,
         };
         let mut out = Vec::new();
         render_box_show(&mut out, &shown, "local", "local0").unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "\
-ID:         0199e0a0-0000-7000-8000-000000000001
-Name:       kept-session
-Type:       session
-Parent:     -
-Project:    /home/dev/proj
-State:      stopped
-Reason:     stopped
-Exit code:  -
-Signal:     15
-Disk:       -
-Identity:   none
-Provider:   local
-Host:       local0
+ID:           0199e0a0-0000-7000-8000-000000000001
+Name:         kept-session
+Name origin:  written
+Entry:        -
+Type:         session
+Parent:       -
+Project name: -
+Project:      /home/dev/proj
+State:        stopped
+Reason:       stopped
+Exit code:    -
+Signal:       15
+Disk:         -
+Identity:     none
+Provider:     local
+Host:         local0
 "
         );
 
@@ -486,25 +1040,29 @@ Host:       local0
                 mode: minimald_rpc::exec::ExecMode::Detached,
             }],
             disk_bytes: None,
+            missing_build_row: false,
         };
         let mut out = Vec::new();
         render_box_show(&mut out, &shown, "local", "local0").unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "\
-ID:         0199e0a0-0000-7000-8000-000000000002
-Name:       -
-Type:       task
-Parent:     0199e0a0-0000-7000-8000-000000000001
-Project:    /home/dev/proj
-State:      exited
-Reason:     exit
-Exit code:  0
-Signal:     -
-Disk:       -
-Identity:   unknown
-Provider:   local
-Host:       local0
+ID:           0199e0a0-0000-7000-8000-000000000002
+Name:         -
+Name origin:  written
+Entry:        -
+Type:         task
+Parent:       0199e0a0-0000-7000-8000-000000000001
+Project name: -
+Project:      /home/dev/proj
+State:        exited
+Reason:       exit
+Exit code:    0
+Signal:       -
+Disk:         -
+Identity:     unknown
+Provider:     local
+Host:         local0
 Live execs:
   exec-1  detached  sleep 60
 "
@@ -627,9 +1185,9 @@ Live execs:
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "\
-ID                                    NAME   TYPE     PARENT  PROJECT         STATE            PROVIDER      HOST
-0199e0a0-0000-7000-8000-000000000001  dev    session  -       /home/dev/proj  running          local-minvmd  local-minvmd0
-0199e0a0-0000-7000-8000-000000000002  build  task     -       /home/dev/proj  exited (exit 0)  local-minvmd  alpha.local-minvmd0
+ID                                    NAME   ENTRY  TYPE     PARENT  PROJECT         STATE            PROVIDER      HOST
+0199e0a0-0000-7000-8000-000000000001  dev    -      session  -       /home/dev/proj  running          local-minvmd  local-minvmd0
+0199e0a0-0000-7000-8000-000000000002  build  -      task     -       /home/dev/proj  exited (exit 0)  local-minvmd  alpha.local-minvmd0
 "
         );
 
@@ -654,6 +1212,9 @@ ID                                    NAME   TYPE     PARENT  PROJECT         ST
                 "host": "alpha.local-minvmd0",
                 "parent": null,
                 "project": "/home/dev/proj",
+                "project_name": null,
+                "entry": null,
+                "name_origin": "written",
                 "reason": "exit",
                 "exit_code": 0,
                 "signal": null,
@@ -689,21 +1250,25 @@ ID                                    NAME   TYPE     PARENT  PROJECT         ST
             identity: BoxIdentity::Unknown,
             live_execs: Vec::new(),
             disk_bytes: None,
+            missing_build_row: false,
         };
         let mut out = Vec::new();
         render_box_show(&mut out, &shown, "local-minvmd", "local-minvmd0").unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "\
-ID:         0199e0a0-0000-7000-8000-000000000001
-Name:       dev
-Type:       session
-Parent:     -
-Project:    /home/dev/proj
-State:      running
-Identity:   unknown
-Provider:   local-minvmd
-Host:       local-minvmd0
+ID:           0199e0a0-0000-7000-8000-000000000001
+Name:         dev
+Name origin:  written
+Entry:        -
+Type:         session
+Parent:       -
+Project name: -
+Project:      /home/dev/proj
+State:        running
+Identity:     unknown
+Provider:     local-minvmd
+Host:         local-minvmd0
 "
         );
 
@@ -720,16 +1285,164 @@ Host:       local-minvmd0
             identity: BoxIdentity::None,
             live_execs: Vec::new(),
             disk_bytes: None,
+            missing_build_row: false,
         };
         let mut out = Vec::new();
         render_box_show(&mut out, &shown, "local", "local0").unwrap();
         let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("State:      stopped\n"), "{text}");
-        assert!(text.contains("Signal:     9\n"), "{text}");
-        assert!(text.contains("Identity:   none\n"), "{text}");
+        assert!(text.contains("State:        stopped\n"), "{text}");
+        assert!(text.contains("Signal:       9\n"), "{text}");
+        assert!(text.contains("Identity:     none\n"), "{text}");
         assert!(
-            text.contains("Provider:   local\nHost:       local0\n"),
+            text.contains("Provider:     local\nHost:         local0\n"),
             "{text}"
         );
+    }
+
+    /// The listed boxes the name-field tests read: a derived name, a
+    /// renamed box, and a record that keeps no name fields.
+    fn named_boxes() -> Vec<ListedBox> {
+        let mut derived = entry(
+            "0199e0a0-0000-7000-8000-000000000001",
+            Some("proj-lint"),
+            "task",
+            "running",
+        );
+        derived.project_name = Some("proj".to_string());
+        derived.entry = Some("lint".to_string());
+        derived.name_origin = boxes::NameOrigin::Derived;
+        let mut renamed = entry(
+            "0199e0a0-0000-7000-8000-000000000002",
+            Some("mine"),
+            "session",
+            "running",
+        );
+        renamed.project_name = Some("web".to_string());
+        renamed.entry = Some("default".to_string());
+        let legacy = entry(
+            "0199e0a0-0000-7000-8000-000000000003",
+            Some("old"),
+            "session",
+            "stopped",
+        );
+        [derived, renamed, legacy].into_iter().map(local).collect()
+    }
+
+    /// BCLI-001: the table has an ENTRY column after NAME, and PROJECT
+    /// shows the project name, else the project root. Under `-o json` each
+    /// box object carries `entry`, `project_name` and `name_origin`, a
+    /// renamed box reads as written, and `project` stays the root.
+    #[test]
+    fn box_json_carries_project_name_entry_and_name_origin() {
+        let listed = named_boxes();
+        let mut out = Vec::new();
+        render_box_list(&mut out, &listed, true).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\
+ID                                    NAME       ENTRY    TYPE     PARENT  PROJECT         STATE    PROVIDER  HOST
+0199e0a0-0000-7000-8000-000000000001  proj-lint  lint     task     -       proj            running  local     local0
+0199e0a0-0000-7000-8000-000000000002  mine       default  session  -       web             running  local     local0
+0199e0a0-0000-7000-8000-000000000003  old        -        session  -       /home/dev/proj  stopped  local     local0
+"
+        );
+
+        let mut out = Vec::new();
+        render_box_list_json(&mut out, &listed).unwrap();
+        let parsed: serde_json_lenient::Value = serde_json_lenient::from_slice(&out).unwrap();
+        let objects = parsed.as_array().expect("an array of box objects");
+        let fields = |object: &serde_json_lenient::Value| {
+            (
+                object["project"].clone(),
+                object["project_name"].clone(),
+                object["entry"].clone(),
+                object["name_origin"].clone(),
+            )
+        };
+        use serde_json_lenient::json;
+        assert_eq!(
+            objects.iter().map(fields).collect::<Vec<_>>(),
+            vec![
+                (
+                    json!("/home/dev/proj"),
+                    json!("proj"),
+                    json!("lint"),
+                    json!("derived")
+                ),
+                (
+                    json!("/home/dev/proj"),
+                    json!("web"),
+                    json!("default"),
+                    json!("written")
+                ),
+                (
+                    json!("/home/dev/proj"),
+                    json!(null),
+                    json!(null),
+                    json!("written")
+                ),
+            ]
+        );
+    }
+
+    /// BCLI-003: `min box show` renders the project name, the entry and
+    /// the name origin, and its `-o json` object carries the three fields.
+    #[test]
+    fn box_show_renders_project_entry_and_name_origin() {
+        let listed = named_boxes();
+        let shown = ShowBoxResponse {
+            record: listed[0].record.clone(),
+            identity: BoxIdentity::None,
+            live_execs: Vec::new(),
+            disk_bytes: None,
+            missing_build_row: false,
+        };
+        let mut out = Vec::new();
+        render_box_show(&mut out, &shown, "local", "local0").unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\
+ID:           0199e0a0-0000-7000-8000-000000000001
+Name:         proj-lint
+Name origin:  derived
+Entry:        lint
+Type:         task
+Parent:       -
+Project name: proj
+Project:      /home/dev/proj
+State:        running
+Identity:     none
+Provider:     local
+Host:         local0
+"
+        );
+
+        let mut out = Vec::new();
+        render_box_show_as(
+            &mut out,
+            crate::cli::BoxShowOutputFormat::Json,
+            &shown,
+            "local",
+            "local0",
+        )
+        .unwrap();
+        let object: serde_json_lenient::Value = serde_json_lenient::from_slice(&out).unwrap();
+        assert_eq!(object["schema"], "min/v1/box");
+        assert_eq!(object["project"], "/home/dev/proj");
+        assert_eq!(object["project_name"], "proj");
+        assert_eq!(object["entry"], "lint");
+        assert_eq!(object["name_origin"], "derived");
+
+        // A record that keeps no name fields shows `-` and reads as written.
+        let legacy = ShowBoxResponse {
+            record: listed[2].record.clone(),
+            ..shown
+        };
+        let mut out = Vec::new();
+        render_box_show(&mut out, &legacy, "local", "local0").unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("Name origin:  written\n"), "{text}");
+        assert!(text.contains("Entry:        -\n"), "{text}");
+        assert!(text.contains("Project name: -\n"), "{text}");
     }
 }

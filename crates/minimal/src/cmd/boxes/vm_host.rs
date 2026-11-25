@@ -1300,6 +1300,7 @@ mod tests {
                 hold: false,
                 task_slots: 0,
                 host_ip: false,
+                stays_detached: false,
             },
         )
         .await
@@ -1462,6 +1463,9 @@ mod tests {
             parent: None,
             project_root: None,
             attrs: Default::default(),
+            project_name: None,
+            entry: None,
+            name_origin: boxes::NameOrigin::Written,
         };
         let ssh_sock = dir.path().join("ssh.sock");
         resume_box_row(&ssh_sock, Some(&record))
@@ -1539,6 +1543,9 @@ mod tests {
             parent: None,
             project_root: None,
             attrs: Default::default(),
+            project_name: None,
+            entry: None,
+            name_origin: boxes::NameOrigin::Written,
         };
         let error = resume_box_row(&dir.path().join("ssh.sock"), Some(&record))
             .await
@@ -2411,6 +2418,9 @@ mod tests {
             parent: None,
             project_root: None,
             attrs: Default::default(),
+            project_name: None,
+            entry: None,
+            name_origin: boxes::NameOrigin::Written,
         };
         assert!(
             !holds_name(&record),
@@ -2550,6 +2560,9 @@ mod tests {
             parent: None,
             project_root: None,
             attrs: Default::default(),
+            project_name: None,
+            entry: None,
+            name_origin: boxes::NameOrigin::Written,
         };
         assert!(holds_name(&record), "a host_ip box holds its name");
 
@@ -3400,7 +3413,7 @@ mod tests {
             name: Some("gate-web".to_string()),
             path: Some(project.path().to_str().unwrap().to_string()),
             network: Some(CliNetworkMode::OwnIp),
-            sync: Some(SyncMode::None),
+            skip_upload: true,
             no_loadouts: true,
             no_prompt: true,
             attach: false,

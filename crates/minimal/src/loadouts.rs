@@ -493,14 +493,25 @@ pub(crate) fn stage_loadout_hook_scripts(
 /// A project with no mfile, or one that does not parse, is not this
 /// function's problem — the activation has its own handling for both, and
 /// duplicating it here would report the same fault twice.
-pub(crate) fn check_project_hooks(project_root: &paths::HostAbsPath) -> Result<(), anyhow::Error> {
+///
+/// The load's legacy-table hints and unknown-field warnings go to
+/// `diagnostics`. It prints none of them.
+pub(crate) fn check_project_hooks(
+    project_root: &paths::HostAbsPath,
+    diagnostics: &mut crate::FileDiagnostics,
+) -> Result<(), anyhow::Error> {
     use boxes::client::hookscripts::{ScriptAnchors, stage_external_scripts};
     use boxes::core::lifecyclehook::{HookScript, HookScriptBody};
     use boxes::core::source::{ProvenancedHook, Source};
 
-    let Ok(mfile) = mfile::File::from_dir(project_root.as_utf8_path().as_std_path()) else {
-        return Ok(());
+    let mfile = match mfile::File::from_dir_quiet(project_root.as_utf8_path().as_std_path()) {
+        Ok(mfile) => mfile,
+        Err(refusal) => {
+            diagnostics.add_refusal(&refusal);
+            return Ok(());
+        }
     };
+    diagnostics.add(&mfile);
     let Some(session) = mfile.session.as_ref() else {
         return Ok(());
     };
@@ -564,11 +575,14 @@ pub(crate) fn check_project_hooks(project_root: &paths::HostAbsPath) -> Result<(
 ///
 /// Zero when hooks are disabled or nothing declares an `on_activate`. The
 /// project's `minimal.toml` is read the same way [`check_project_hooks`]
-/// reads it; an unreadable or session-less file contributes nothing.
+/// reads it; an unreadable or session-less file contributes nothing. The
+/// load's legacy-table hints and unknown-field warnings go to
+/// `diagnostics`, and it prints none of them.
 pub(crate) fn activate_hook_budget(
     active: &ActiveLoadouts,
     project_root: &camino::Utf8Path,
     hooks_enabled: bool,
+    diagnostics: &mut crate::FileDiagnostics,
 ) -> Duration {
     if !hooks_enabled {
         return Duration::ZERO;
@@ -580,9 +594,13 @@ pub(crate) fn activate_hook_budget(
         .filter_map(|h| h.on_activate())
         .map(|s| s.timeout())
         .sum();
-    let project: Duration = mfile::File::from_dir(project_root.as_std_path())
+    let project: Duration = mfile::File::from_dir_quiet(project_root.as_std_path())
+        .map_err(|refusal| diagnostics.add_refusal(&refusal))
         .ok()
-        .and_then(|f| f.session)
+        .and_then(|f| {
+            diagnostics.add(&f);
+            f.session
+        })
         .map(|s| {
             s.lifecycle_hooks
                 .iter()
@@ -680,6 +698,10 @@ pub struct ActivationInputs {
     pub compose_options: boxes::core::compose::ComposeOptions,
     /// The active loadouts' names, for the CLI's "Applying loadouts" line.
     pub loadout_names: Vec<String>,
+    /// The project `minimal.toml`'s legacy-table hints and unknown-field
+    /// warnings, each once. Nothing printed them: the CLI prints them on
+    /// stderr, and the dashboard puts them on its status line.
+    pub diagnostics: crate::FileDiagnostics,
 }
 
 impl ActivationInputs {
@@ -798,10 +820,16 @@ pub(crate) fn prepare_activation_inputs_with_config(
     // The project's hooks reach the daemon inside the uploaded mfile, so they
     // never pass through the staging above; the checks a staging pass would
     // have made are still worth making here, for the callers that ask.
+    let mut diagnostics = crate::FileDiagnostics::default();
     if hooks == HookPrep::Enforce {
-        check_project_hooks(project)?;
+        check_project_hooks(project, &mut diagnostics)?;
     }
-    let hook_budget = activate_hook_budget(&active, project.as_utf8_path(), hooks_enabled);
+    let hook_budget = activate_hook_budget(
+        &active,
+        project.as_utf8_path(),
+        hooks_enabled,
+        &mut diagnostics,
+    );
     let (contribution, user_policy) =
         compose_user_contribution(active, user_policy, compose_options, hooks_enabled)?;
     Ok(ActivationInputs {
@@ -812,6 +840,7 @@ pub(crate) fn prepare_activation_inputs_with_config(
         initial_policy,
         compose_options,
         loadout_names,
+        diagnostics,
     })
 }
 
@@ -979,7 +1008,7 @@ impl LoadoutRow {
             counts: format!(
                 "{} pkg / {} var / {} patch",
                 loadout.packages().len(),
-                loadout.vars().len() + loadout.vars_lenient().len(),
+                loadout.vars().len(),
                 loadout.patches().iter().count(),
             ),
         }
@@ -997,7 +1026,7 @@ impl LoadoutRow {
             counts: format!(
                 "{} pkg / {} var / {} patch",
                 l.packages().len(),
-                l.vars().len() + l.vars_lenient().len(),
+                l.vars().len(),
                 l.patches().iter().count(),
             ),
         }
@@ -1007,6 +1036,24 @@ impl LoadoutRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // T136: `min loadout list` counts each variable of a loadout's one
+    // `env_vars` table once, a lower-case name included.
+    #[test]
+    fn loadout_list_counts_each_env_var_once() {
+        let src = "description = \"proxy\"\n[env_vars]\nEDITOR = \"vi\"\nhttp_proxy = \"http://proxy:3128\"\n";
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("proxy.toml"), src).unwrap();
+        let entries = boxes::client::disk::list_loadouts(tmp.path()).expect("lists");
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        let loadout = entry.loadout.as_ref().expect("loads");
+        let row = LoadoutRow::from_entry(entry, loadout, &std::collections::HashSet::new());
+        assert_eq!(row.counts, "0 pkg / 2 var / 0 patch");
+
+        let builtin = LoadoutRow::builtin_default();
+        assert_eq!(builtin.counts, "0 pkg / 3 var / 0 patch");
+    }
 
     /// `HookPrep::StageOnly` leaves alone a project whose hooks the staging
     /// check would reject: `min task run` never refused one before the prep
@@ -1275,11 +1322,11 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
         let root = camino::Utf8Path::from_path(tmp.path()).unwrap();
 
         assert_eq!(
-            activate_hook_budget(&active, root, true),
+            activate_hook_budget(&active, root, true, &mut Default::default()),
             Duration::from_secs(90),
         );
         assert_eq!(
-            activate_hook_budget(&active, root, false),
+            activate_hook_budget(&active, root, false, &mut Default::default()),
             Duration::ZERO,
             "--no-hooks contributes no budget",
         );

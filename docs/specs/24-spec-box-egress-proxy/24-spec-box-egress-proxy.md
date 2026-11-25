@@ -549,6 +549,10 @@ Redemption
     tier:   T0
     verify: cargo nextest run -p minimal host_ip_grant_box_with_no_egress_section_registers_the_github_hosts
     <!-- the box lists no names, so an empty registration would refuse the hosts BEP-008 lets it reach -->
+  - WHEN a `host_ip` box that declares a store reference matched by a `[secret-store-rules]` rule and has no `egress` section registers with the proxy THE SYSTEM SHALL register each of the rule's upstream authorities, with its port, as part of its declared egress.
+    tier:   T0
+    verify: cargo nextest run -p minimal host_ip_store_box_with_no_egress_section_registers_the_rule_upstream
+    <!-- the box lists no names, so an empty registration would refuse the upstream BEP-036 lets it reach -->
 
 - **BEP-023** IF a request's `Host` header, or the authority of an absolute-form request target, differs from the connection authority it arrived on THEN THE SYSTEM SHALL refuse the request before substitution.
   tier:     T2
@@ -699,7 +703,11 @@ Store references
 - **BEP-036** IF a box spec declares a store reference whose registered upstream is not admitted by the box's egress THEN THE SYSTEM SHALL refuse expansion with exit 3 naming the missing host.
   tier:     T1
   verify:   cargo nextest run -p boxes prop_store_upstream_outside_egress_is_exit_3
-  property: for every box spec and every registered upstream set, expansion refuses with exit 3 iff some registered upstream is absent from the egress declaration, naming exactly the absent hosts
+  property: for every box spec and every registered upstream set, except a `host_ip` box with no `egress` section, expansion refuses with exit 3 iff some registered upstream is absent from the egress declaration, naming exactly the absent hosts
+  - WHERE a `host_ip` box has no `egress` section THE SYSTEM SHALL treat its egress as admitting every registered upstream host.
+    tier:   T0
+    verify: cargo nextest run -p boxes store_reference_with_rule_and_no_egress
+    <!-- as BEP-008 does for the GitHub hosts: such a box is allow-all, and an `own_ip` box with no `egress` section still admits no name -->
 
 - **BEP-037** IF a project `minimal.toml` contains a `[secret-store-rules]` section THEN THE SYSTEM SHALL ignore it and emit a warning.
   tier:     T0
@@ -770,7 +778,10 @@ Review, audit and revocation
   tier:     T0
   verify:   cargo nextest run -p minimal box_audit_filters_to_one_box
   <!-- the ruled grammar: `min box audit <box|self> | --parent <box|self> [-o jsonl] [--follow]`; the log is the proxy's, not part of the box record, so `rm` and `prune` never touch it; retention is BEP-068's -->
-  <!-- the design reads over the helper's local UDS (architecture line 501, Gatehouse §6.10 line 836, ruled on gominimal/arch#137); v1 reads the operator-owned log files under file mode in its place until gominimal/minimal#2463 serves the read; the interim is gominimal/minimal#2459 -->
+  - WHERE the host is not enrolled, WHEN `min box audit` reads a box's records THE SYSTEM SHALL read them from the proxy over its local control socket and open no audit log file in the client.
+    tier:   T0
+    verify: cargo nextest run -p minimal box_audit_reads_over_the_proxy_socket
+    <!-- the helper's local UDS (architecture line 501, Gatehouse §6.10 line 836, ruled on gominimal/arch#137): `bep serve` reads every retained segment and sends only the records whose subject the read names, and `--follow` tails over the same connection; `min doctor` keeps its read of the files, because the chain check (BEP-049) needs every segment's bytes -->
   - WHEN `min box audit <name>` is run with a friendly name THE SYSTEM SHALL read the live box of that name, else the most recent creation under it, and name the id it read.
     tier:   T0
     verify: cargo nextest run -p minimal box_audit_name_reads_live_else_latest_creation

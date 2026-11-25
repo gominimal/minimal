@@ -485,7 +485,7 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
             }
             DetachPoll::LeakedVmm(pid) => bail!(
                 "the supervisor exited but a leaked __krun-vmm (pid {pid}) still holds the \
-                 alive lock; run `min stop` (or `kill -9 {pid}`), then retry"
+                 alive lock; run `min host stop <host>` (or `kill -9 {pid}`), then retry"
             ),
             DetachPoll::Keep => {}
         }

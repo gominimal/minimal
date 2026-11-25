@@ -63,153 +63,6 @@ pub(crate) fn effective_egress_section(
     }
 }
 
-/// The classifier leaf a package build for the box `box_id` runs in
-/// (NET-155): the leaf the box's launch placed it in, under `root`. The
-/// launch places a box in exactly one subtree, so the leaf is the one of the
-/// two that exists.
-///
-/// `placed` is whether the box's launch recorded a leaf of its own
-/// ([`boxes::HostIpEnforcement::PerBox`]). A box that was never placed has no
-/// leaf by design (it is not host-address, or the host has no classifier
-/// tree), and its builds run in the daemon's own cgroup, as before. A placed
-/// box whose leaf is gone fails closed: the build is refused, never run
-/// outside the box's egress verdict. The `Err` is the refusal for the person
-/// who asked for the build.
-pub(crate) fn box_build_leaf(
-    root: &std::path::Path,
-    box_id: &str,
-    box_name: &str,
-    placed: bool,
-) -> Result<Option<sandbox::config::ClassifierLeaf>, String> {
-    let leaf = [
-        sandbox::config::Verdict::Deny,
-        sandbox::config::Verdict::Allow,
-    ]
-    .into_iter()
-    .map(|verdict| sandbox::config::ClassifierLeaf::under(root, box_id, verdict))
-    .find(|leaf| leaf.dir().is_dir());
-    match leaf {
-        Some(leaf) => Ok(Some(leaf)),
-        None if placed => Err(placed_box_build_refusal(box_name)),
-        None => Ok(None),
-    }
-}
-
-/// The network the package builds of the box `record` attach to, when the
-/// box has no classifier leaf (NET-155). A box with no network gets
-/// [`op::BuildNetwork::none`], so its builds never take the daemon's network
-/// or the daemon's fetch. A host-address box gets `None`, because a box with
-/// no leaf of that kind has no per-box enforcement.
-pub(crate) fn box_build_network(
-    record: &boxes::Record,
-    switch: &Arc<Mutex<crate::net::SwitchClient>>,
-    deny_all_opt_out: bool,
-) -> Option<op::BuildNetwork> {
-    match record.network {
-        boxes::NetworkMode::NoNet => Some(op::BuildNetwork::none()),
-        _ => own_address_build_network(record, switch, deny_all_opt_out),
-    }
-}
-
-/// The network the package builds of the box `record` attach to, when the
-/// box has a network namespace of its own and so no classifier leaf: an
-/// own-address box (NET-155). Each build gets the network a task of the box
-/// gets ([`crate::exec::task_network`]): a task address of the box's own,
-/// under the box's egress rules. So the box's egress verdict decides every
-/// connection the build makes, and the build is never the daemon's own
-/// traffic. `None` for every other box.
-pub(crate) fn own_address_build_network(
-    record: &boxes::Record,
-    switch: &Arc<Mutex<crate::net::SwitchClient>>,
-    deny_all_opt_out: bool,
-) -> Option<op::BuildNetwork> {
-    if record.network != boxes::NetworkMode::OwnIp {
-        return None;
-    }
-    let egress = effective_egress_section(
-        &record.policy,
-        record.network,
-        boxes::EGRESS_DEFAULT_PHASE,
-        deny_all_opt_out,
-    );
-    let denies_all =
-        crate::net::classifier::verdict_of(egress.as_ref()) == sandbox::config::Verdict::Deny;
-    let admits_name = move |host: &str| crate::net::dns_gate::admits_name(egress.as_ref(), host);
-    let record = record.clone();
-    let switch = Arc::clone(switch);
-    Some(
-        op::BuildNetwork::new(move || {
-            Arc::new(OwnAddressBuildNetwork {
-                inner: crate::exec::task_network(
-                    &record,
-                    &switch,
-                    boxes::EGRESS_DEFAULT_PHASE,
-                    deny_all_opt_out,
-                ),
-                record: record.clone(),
-                switch: Arc::clone(&switch),
-            }) as Arc<dyn sandbox::Network>
-        })
-        .with_denies_all(denies_all)
-        .with_admits_name(admits_name),
-    )
-}
-
-/// The network of one package build of an own-address box (NET-155). Before
-/// each plan it asks, as a task run does, whether the box's host-side row
-/// still stands, so the build never attaches under another box's row.
-struct OwnAddressBuildNetwork {
-    record: boxes::Record,
-    switch: Arc<Mutex<crate::net::SwitchClient>>,
-    inner: Arc<dyn sandbox::Network>,
-}
-
-impl std::fmt::Debug for OwnAddressBuildNetwork {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OwnAddressBuildNetwork")
-            .field("box_id", &self.record.id)
-            .finish_non_exhaustive()
-    }
-}
-
-impl sandbox::Network for OwnAddressBuildNetwork {
-    fn plan(&self) -> sandbox::PlanFuture<'_> {
-        Box::pin(async move {
-            crate::exec::ensure_task_rows_stand(&self.record, &self.switch)
-                .await
-                .map_err(sandbox::NetworkError::new)?;
-            self.inner.plan().await
-        })
-    }
-
-    fn attach(&self, spawned: sandbox::Spawned) -> sandbox::AttachFuture<'_> {
-        self.inner.attach(spawned)
-    }
-
-    fn abandon(&self) -> sandbox::AbandonFuture<'_> {
-        self.inner.abandon()
-    }
-}
-
-/// The refusal for a build of the box `box_name` when its launch placed it
-/// in a classifier leaf and that leaf is gone (NET-155). Every refusal of
-/// this kind uses this text: [`box_build_leaf`] and the task path
-/// (`exec::task_build_refusal`).
-///
-/// Only an Active box reaches this refusal: `context()` refuses a stopped or
-/// exited box first. An Active placed box loses its leaf when its shell ends
-/// (the host's teardown removes the leaf). An attach with no running shell
-/// mints a new one, and that launch places the box in a leaf again, so the
-/// attach is the next step.
-pub(crate) fn placed_box_build_refusal(box_name: &str) -> String {
-    format!(
-        "the build for box {box_name} did not start: box {box_name} runs under \
-         egress rules, and its shell is not running to apply them to the build. \
-         Run `min session attach {box_name}` to start its shell, then run the \
-         build again."
-    )
-}
-
 /// The context with its task state keyed on the record's host project, not
 /// on the workspace tree this daemon parsed the mfile from. Every box
 /// parses its mfile from the tree under `/tree`, native or VM, and that
@@ -813,14 +666,16 @@ impl BoxActor {
                 // the box stays at the fallback, and a watcher reports the
                 // held port in the daemon log ([`Self::watch_fallback_landing`]).
                 // At a node's shared address the port is yielded too
-                // (NET-129). Then the daemon checks the ports that something
-                // outside the registry holds. On a native host the forwarder
-                // binds in the daemon's own network namespace, so the daemon
-                // probes. On a VM-backed host the forwarder binds on the host
-                // OS, so a probe here proves nothing: the daemon binds the
-                // forwards at publish instead, toward the switch address the
-                // host handed the box, and a held port fails that bind with
-                // the same refusal. The check is skipped when activate hooks
+                // (NET-129). Then the daemon binds the forwards at publish, so
+                // a program on the host reaches the declared ports before any
+                // attach, and a port that something outside the registry
+                // holds fails that bind with the same refusal. On a VM-backed
+                // host the bind goes toward the switch address the host
+                // handed the box. On a native host the daemon draws the box's
+                // lease here and binds toward it. The box's first attach
+                // takes that lease and adopts the forwards. A native switch
+                // that cannot start falls back to a probe of the ports, and
+                // the first attach binds them. The check is skipped when activate hooks
                 // run: their launch binds the forwards, and a taken port
                 // fails that apply with the same refusal.
                 #[cfg(target_os = "linux")]
@@ -900,28 +755,105 @@ impl BoxActor {
                             // address has no forward to bind yet. Its
                             // first attach binds the forwards.
                             (true, None) => {}
+                            // A native host: draw the box's lease now and
+                            // bind at publish, toward that lease. The box's
+                            // first attach takes the lease and adopts the
+                            // forwards ([`crate::net::SwitchClient::attach_drawn`]).
                             (false, _) => {
-                                let yielded: Vec<u16> =
-                                    yielded_ports.iter().map(|c| c.port).collect();
-                                // The probe binds each port and pauses between
-                                // binds of a held one, so on the blocking pool.
-                                let in_use = {
-                                    let control = control.clone();
-                                    let ingress = ingress.clone();
-                                    crate::traced::spawn_blocking(move || {
-                                        crate::net::policy::host_ports_in_use(
-                                            &control, published, &ingress, &yielded,
+                                let drawn = {
+                                    let mut switch = self.net_switch.lock().await;
+                                    // A retried finalize finds its lease and
+                                    // its forwards standing.
+                                    if switch.activation_lease(record.id).is_some() {
+                                        None
+                                    } else {
+                                        Some(
+                                            switch
+                                                .draw_for_activation(record.id, switch_address)
+                                                .await,
                                         )
-                                    })
-                                    .await
-                                    .map_err(std::io::Error::other)?
+                                    }
                                 };
-                                if let Some(&port) = in_use.first() {
-                                    refusal = Some(minimald_rpc::PortInUseRefusal {
-                                        port,
-                                        box_port: box_port(port),
-                                        holder: holder_of(port),
-                                    });
+                                match drawn {
+                                    None => {}
+                                    Some(Ok(lease)) => {
+                                        match crate::net::policy::bind_declared_at_publish(
+                                            &control,
+                                            published,
+                                            lease.ip,
+                                            ingress,
+                                            &yielded_ports,
+                                            &holder_of,
+                                        )
+                                        .await
+                                        {
+                                            Ok(forwards) => {
+                                                for forwarder in &forwards {
+                                                    let (host, port) =
+                                                        forwarder.host_port().unwrap_or(("", 0));
+                                                    tracing::info!(
+                                                        host,
+                                                        port,
+                                                        session_id = %record.id,
+                                                        switch_address = %lease.ip,
+                                                        "bound declared ingress port at the box's activation"
+                                                    );
+                                                }
+                                                self.net_switch
+                                                    .lock()
+                                                    .await
+                                                    .record_activation_forwards(
+                                                        record.id, forwards,
+                                                    );
+                                            }
+                                            Err(e) => {
+                                                // The bind rolled its forwards
+                                                // back. The lease goes too.
+                                                self.release_activation_forwards().await;
+                                                match crate::net::policy::port_in_use_refusal(&e) {
+                                                    Some(held) => refusal = Some(held),
+                                                    None => return Err(e),
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // A switch that cannot start binds
+                                    // nothing here. The probe still refuses a
+                                    // held port, and the first attach binds
+                                    // the forwards or says why it cannot.
+                                    // gominimal/minimal#3716 tracks failing
+                                    // the finalize here instead (NET-121).
+                                    Some(Err(e)) => {
+                                        tracing::warn!(
+                                            session_id = %record.id,
+                                            error = %e,
+                                            "the switch did not start at the box's activation; \
+                                             the box's first attach binds its declared ports"
+                                        );
+                                        let yielded: Vec<u16> =
+                                            yielded_ports.iter().map(|c| c.port).collect();
+                                        // The probe binds each port and pauses
+                                        // between binds of a held one, so on
+                                        // the blocking pool.
+                                        let in_use = {
+                                            let control = control.clone();
+                                            let ingress = ingress.clone();
+                                            crate::traced::spawn_blocking(move || {
+                                                crate::net::policy::host_ports_in_use(
+                                                    &control, published, &ingress, &yielded,
+                                                )
+                                            })
+                                            .await
+                                            .map_err(std::io::Error::other)?
+                                        };
+                                        if let Some(&port) = in_use.first() {
+                                            refusal = Some(minimald_rpc::PortInUseRefusal {
+                                                port,
+                                                box_port: box_port(port),
+                                                holder: holder_of(port),
+                                            });
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1012,37 +944,11 @@ impl BoxActor {
         }
     }
 
-    /// Where this box's package builds run (NET-155): the box's own
-    /// classifier leaf, so its egress verdict decides what the builds can
-    /// reach. A box whose launch placed it in a leaf never builds outside it,
-    /// so a missing leaf refuses the build.
-    async fn build_placement(&self) -> Result<crate::box_ops::BuildPlacement, std::io::Error> {
+    /// The box's name, as `min ls` shows it: its name, or its id when it has
+    /// none.
+    async fn box_name(&self) -> Result<String, std::io::Error> {
         let record = self.record.record().await?;
-        let box_id = record.id.to_string();
-        let box_name = record.name.clone().unwrap_or_else(|| box_id.clone());
-        let placed = record.host_ip_enforcement == Some(boxes::HostIpEnforcement::PerBox);
-        let leaf = box_build_leaf(
-            std::path::Path::new(sandbox::classifier::TREE_ROOT),
-            &box_id,
-            &box_name,
-            placed,
-        )
-        .map_err(|refusal| {
-            tracing::warn!(
-                box_name = %box_name,
-                "refusing a package build for a placed box whose classifier leaf is missing",
-            );
-            std::io::Error::new(std::io::ErrorKind::PermissionDenied, refusal)
-        })?;
-        let network = match leaf {
-            Some(_) => None,
-            None => box_build_network(&record, &self.net_switch, self.deny_all_opt_out),
-        };
-        Ok(crate::box_ops::BuildPlacement {
-            box_name,
-            leaf,
-            network,
-        })
+        Ok(record.name.clone().unwrap_or_else(|| record.id.to_string()))
     }
 
     /// Kicks off a background package build as a side-op and registers it on
@@ -1057,9 +963,9 @@ impl BoxActor {
         pkgs: Vec<String>,
     ) -> Result<mpsc::Receiver<BuildUpdate>, std::io::Error> {
         let ctx = self.context(false).await.map_err(std::io::Error::other)?;
-        let placement = self.build_placement().await?;
+        let box_name = self.box_name().await?;
         let (sop, rx) =
-            SideOp::spawn_build(self.weak_self.clone(), rebuild, pkgs, ctx, placement, 64).await?;
+            SideOp::spawn_build(self.weak_self.clone(), box_name, rebuild, pkgs, ctx, 64).await?;
         match &mut self.inner {
             BoxInner::Active { sops, .. } => sops.push(sop),
             BoxInner::Draft { .. } => {
@@ -1082,17 +988,6 @@ impl BoxActor {
         opts: CheckOpts,
     ) -> Result<mpsc::Receiver<CheckUpdate>, std::io::Error> {
         let ctx = self.context(false).await.map_err(std::io::Error::other)?;
-        // NET-155: a check's package builds follow the box's egress verdict.
-        // A placed box whose leaf is gone is refused, the same as a task, so
-        // its builds never run in the daemon's own cgroup. No relaunch asks
-        // for a check, so the refusal cannot block a launch.
-        let record = self.record.record().await?;
-        let box_name = record.name.clone().unwrap_or_else(|| record.id.to_string());
-        crate::exec::task_build_refusal(
-            record.host_ip_enforcement,
-            &box_name,
-            ctx.classifier_leaf().is_some(),
-        )?;
         let (sop, rx) = SideOp::spawn_check(self.weak_self.clone(), opts, ctx, 64).await?;
         match &mut self.inner {
             BoxInner::Active { sops, .. } => sops.push(sop),
@@ -1114,39 +1009,9 @@ impl BoxActor {
         opts: MaterializeOpts,
     ) -> Result<mpsc::Receiver<MaterializeUpdate>, std::io::Error> {
         let ctx = self.context(false).await.map_err(std::io::Error::other)?;
-        // NET-155: the package builds a materialize starts run in the box's
-        // leaf, the same as a build side-op's.
-        let placement = self.build_placement().await?;
-        let ctx = match (placement.leaf.clone(), placement.network.clone()) {
-            (Some(leaf), _) => {
-                tracing::info!(
-                    box_name = %placement.box_name,
-                    leaf = %leaf.dir().display(),
-                    "starting a materialize for a box in the box's classifier leaf",
-                );
-                ctx.with_classifier_leaf(leaf)
-            }
-            (None, Some(network)) => {
-                tracing::info!(
-                    box_name = %placement.box_name,
-                    leaf = "none",
-                    "starting a materialize for a box on the box's own network, \
-                     under the box's egress rules",
-                );
-                ctx.with_box_network(network)
-            }
-            (None, None) => {
-                tracing::info!(
-                    box_name = %placement.box_name,
-                    leaf = "none",
-                    "starting a materialize for a box in the daemon's own cgroup, with no \
-                     per-box egress enforcement, because the box has none",
-                );
-                ctx
-            }
-        };
+        let box_name = self.box_name().await?;
         let (sop, rx) =
-            SideOp::spawn_materialize(self.weak_self.clone(), opts, ctx, placement, 64).await?;
+            SideOp::spawn_materialize(self.weak_self.clone(), box_name, opts, ctx, 64).await?;
         match &mut self.inner {
             BoxInner::Active { sops, .. } => sops.push(sop),
             BoxInner::Draft { .. } => {
@@ -1266,28 +1131,22 @@ impl BoxActor {
         }
 
         let ctx = self.build_context(scaffold_if_missing).await?;
-        // NET-155: every context the box hands out places the package builds
-        // it starts in the box's leaf while the box has one, so a task run,
-        // a check or a launch's builds follow the box's egress verdict. The
-        // lookup does not refuse here: a relaunch asks for this context
-        // before its launch creates the leaf again, and the launch then
-        // places the env's builds in that leaf itself (`Env::build`). The
-        // build and materialize side operations refuse a placed box whose
-        // leaf is gone (`build_placement`).
-        let box_id = record.id.to_string();
-        let box_name = record.name.clone().unwrap_or_else(|| box_id.clone());
-        let leaf = box_build_leaf(
-            std::path::Path::new(sandbox::classifier::TREE_ROOT),
-            &box_id,
-            &box_name,
-            false,
-        )?;
-        // An own-address box has no leaf: `build_context` gave its context
-        // the box's own network instead.
-        Ok(match leaf {
-            Some(leaf) => ctx.with_classifier_leaf(leaf),
-            None => ctx,
-        })
+        // NET-079: a task env this context makes runs in the box's leaf
+        // while the box has one, so a daemon-side task run follows the box's
+        // egress verdict, as an in-box one does. The leaf places task envs
+        // only: package builds take their build box from `build_boxes`. The
+        // lookup does not refuse: a relaunch asks for this context before
+        // its launch creates the leaf again. The task path refuses a placed
+        // box whose leaf is gone (`exec::task_leaf_refusal`).
+        Ok(
+            match box_task_leaf(
+                std::path::Path::new(sandbox::classifier::TREE_ROOT),
+                &record.id.to_string(),
+            ) {
+                Some(leaf) => ctx.with_classifier_leaf(leaf),
+                None => ctx,
+            },
+        )
     }
 
     /// The mctx [`Config`] rooted at this session's workspace, shared by the
@@ -1408,10 +1267,8 @@ impl BoxActor {
         )
         .map_err(|e| e.to_string())?;
         ctx.confine_mfile_edits_to(root);
-        // NET-155: an own-address box has no classifier leaf. Every package
-        // build its context starts, the activation launch's among them,
-        // attaches to a network of the box's own, under the box's egress
-        // rules. A box with no network has none to give them.
+        // NET-155: every package build a context of this box starts runs in
+        // a build box, which asks the host side by spec hash (NET-165).
         let record = self
             .record
             .record()
@@ -1419,11 +1276,45 @@ impl BoxActor {
             .map_err(|e| format!("reading session record: {e}"))?;
         let ctx = keyed_on_project(ctx, &record);
         Ok(
-            match box_build_network(&record, &self.net_switch, self.deny_all_opt_out) {
-                Some(network) => ctx.with_box_network(network),
-                None => ctx,
-            },
+            ctx.with_build_boxes(Arc::new(crate::build_boxes::BoxBuildBoxes::new(
+                record,
+                Arc::clone(&self.net_switch),
+                self.deny_all_opt_out,
+                self.minimal_state_dir
+                    .as_utf8_path()
+                    .as_std_path()
+                    .to_path_buf(),
+            ))),
         )
+    }
+
+    /// Takes what `min` prepared for this box's builds (NET-165). A table
+    /// comes here only on a host with no VM: on a VM-backed host the table
+    /// goes to the VM host daemon, and a guest's copy would decide nothing.
+    pub(super) async fn prepare_build_boxes(
+        &self,
+        request: minimald_rpc::PrepareBuildBoxesRequest,
+    ) -> Result<minimald_rpc::PrepareBuildBoxesResponse, String> {
+        let mut record = self.record.record().await.map_err(|e| e.to_string())?;
+        if !request.task_addresses.is_empty() {
+            record.task_addresses = request.task_addresses;
+            self.record
+                .write(record.clone())
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        if let Some(table) = &request.table {
+            let control = switch_control_of(&self.net_switch).await;
+            if matches!(control, crate::net::policy::ControlChannel::Unix(_)) {
+                crate::build_boxes::file_table(
+                    self.minimal_state_dir.as_utf8_path().as_std_path(),
+                    record.id,
+                    table,
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(minimald_rpc::PrepareBuildBoxesResponse {})
     }
 
     /// Refuse a composition that names a package the session's graph does
@@ -1577,4 +1468,38 @@ impl BoxActor {
             }
         }
     }
+}
+
+/// The classifier leaf a task of the box `box_id` runs in (NET-079): the
+/// leaf the box's launch placed it in, under `root`, or `None` when it has
+/// none. The launch places a box in exactly one subtree, so the leaf is the
+/// one of the two that exists.
+pub(crate) fn box_task_leaf(
+    root: &std::path::Path,
+    box_id: &str,
+) -> Option<sandbox::config::ClassifierLeaf> {
+    [
+        sandbox::config::Verdict::Deny,
+        sandbox::config::Verdict::Allow,
+    ]
+    .into_iter()
+    .map(|verdict| sandbox::config::ClassifierLeaf::under(root, box_id, verdict))
+    .find(|leaf| leaf.dir().is_dir())
+}
+
+/// The refusal for a task of the box `box_name` when its launch placed it in
+/// a classifier leaf and that leaf is gone (NET-079).
+///
+/// Only an Active box reaches this refusal: `context()` refuses a stopped or
+/// exited box first. An Active placed box loses its leaf when its shell ends
+/// (the host's teardown removes the leaf). An attach with no running shell
+/// starts a new one, and that launch places the box in a leaf again, so the
+/// attach is the next step.
+pub(crate) fn placed_box_task_refusal(box_name: &str) -> String {
+    format!(
+        "the task for box {box_name} did not start: box {box_name} runs under \
+         egress rules, and its shell is not running to apply them to the task. \
+         Run `min session attach {box_name}` to start its shell, then run the \
+         task again."
+    )
 }

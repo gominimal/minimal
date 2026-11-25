@@ -208,7 +208,7 @@ fn the_unanswered_inherit_refusal_names_both_causes_and_the_commands() {
     assert!(msg.contains("a stack provides the task"), "{msg}");
     assert!(
         msg.ends_with(
-            "run `min session destroy dev`, then `min session activate --name dev /home/me/proj`."
+            "run `min box rm --force dev`, then `min -C /home/me/proj session start --name dev`."
         ),
         "names the commands: {msg}"
     );
@@ -220,11 +220,11 @@ fn the_unanswered_inherit_refusal_names_both_causes_and_the_commands() {
     // is quoted so both commands paste as they are.
     let msg = refused.refusal(None, "0b5e", "/home/me/it's mine");
     assert!(
-        msg.contains("run `min session destroy 0b5e`, then "),
+        msg.contains("run `min box rm --force 0b5e`, then "),
         "{msg}"
     );
     assert!(
-        msg.ends_with(r#"`min session activate '/home/me/it'\''s mine'`."#),
+        msg.ends_with(r#"`min -C '/home/me/it'\''s mine' session start`."#),
         "{msg}"
     );
 }
@@ -273,6 +273,9 @@ fn record_with(mode: boxes::NetworkMode) -> boxes::Record {
         parent: None,
         project_root: None,
         attrs: Default::default(),
+        project_name: None,
+        entry: None,
+        name_origin: boxes::NameOrigin::Written,
     }
 }
 
@@ -310,11 +313,9 @@ async fn a_task_run_of_a_registered_box_with_no_box_id_is_refused() {
         refused.to_string().contains("could not confirm session"),
         "{refused}"
     );
-    // The bare command fails: a destroy needs a session or `--all`.
+    // The command names the box it removes, so it pastes as it is.
     assert!(
-        refused
-            .to_string()
-            .contains("`min session destroy <session>`"),
+        refused.to_string().contains("`min box rm --force <box>`"),
         "{refused}"
     );
 }
@@ -644,6 +645,114 @@ async fn a_refused_task_attach_stops_the_task() {
     assert!(
         err.to_string().contains("switch refused the client"),
         "the provider's reason must reach the caller, got: {err}",
+    );
+}
+
+/// NET-079. A task in a box's leaf whose supervisor the leaf refuses stops
+/// with the cause: the process is killed and reaped, and the task fails
+/// rather than run with its supervisor outside the leaf. The stand-in leaf
+/// has no `cgroup.procs`, so it is not a cgroup at all.
+#[test]
+fn a_task_supervisor_the_leaf_refuses_stops_the_task() {
+    struct Child {
+        reaped: bool,
+    }
+    impl super::Reapable for Child {
+        fn kill_and_reap(&mut self) {
+            self.reaped = true;
+        }
+    }
+
+    let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+    let leaf = sandbox::config::ClassifierLeaf::new(tree.path().join("box-leaf"));
+    std::fs::create_dir(leaf.dir()).expect("creating the stand-in leaf");
+
+    let mut child = Child { reaped: false };
+    let err =
+        super::place_supervisor_or_reap(Some(&leaf), std::process::id(), &mut child, None::<()>)
+            .expect_err("a leaf with no cgroup.procs must refuse the supervisor");
+    assert!(child.reaped, "the task must not run on");
+    assert_eq!(
+        err.to_string(),
+        "the task did not start: Minimal could not move the task's supervisor process \
+         into the cgroup that decides the box's network access. The cgroup no longer \
+         exists. If it keeps failing, run `min bug` to collect a diagnostic bundle.",
+    );
+    assert!(!leaf.procs().exists(), "the move creates no cgroup.procs");
+
+    // A box with no leaf places nothing and leaves the process alone.
+    let mut unplaced = Child { reaped: false };
+    super::place_supervisor_or_reap(None, std::process::id(), &mut unplaced, None::<()>)
+        .expect("a box with no leaf has nothing to place");
+    assert!(!unplaced.reaped);
+}
+
+/// NET-079. A task in a box's leaf holds its program at a start gate until
+/// its supervisor is in the leaf, as a box launch and a sandbox run do.
+/// The gate goes only after the placement: on success it releases the
+/// program, and on a refusal it goes after the process is reaped, so a
+/// refused task never runs its program.
+#[test]
+fn a_task_program_waits_at_its_gate_until_the_supervisor_is_placed() {
+    use std::sync::{Arc, Mutex};
+
+    type Log = Arc<Mutex<Vec<&'static str>>>;
+    struct Child(Log);
+    impl super::Reapable for Child {
+        fn kill_and_reap(&mut self) {
+            self.0.lock().unwrap().push("reaped");
+        }
+    }
+    struct Gate(Log);
+    impl Drop for Gate {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().push("released");
+        }
+    }
+
+    let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+    let supervisor = std::process::id();
+
+    // A leaf that takes the supervisor: the gate is held through the
+    // placement and released once the leaf lists the supervisor.
+    let placed = sandbox::config::ClassifierLeaf::new(tree.path().join("placed"));
+    std::fs::create_dir(placed.dir()).expect("creating the stand-in leaf");
+    std::fs::write(placed.procs(), "").expect("a cgroup.procs that keeps what is written");
+    let log = Log::default();
+    super::place_supervisor_or_reap(
+        Some(&placed),
+        supervisor,
+        &mut Child(log.clone()),
+        Some(Gate(log.clone())),
+    )
+    .expect("a leaf that takes the supervisor");
+    assert_eq!(
+        std::fs::read_to_string(placed.procs()).expect("reading the leaf's procs"),
+        format!("{supervisor}\n"),
+        "the supervisor is in the leaf before the program starts",
+    );
+    assert_eq!(
+        *log.lock().unwrap(),
+        ["released"],
+        "the program starts once"
+    );
+
+    // A leaf that refuses the supervisor: the process is reaped while the
+    // program still waits at its gate.
+    let refused = sandbox::config::ClassifierLeaf::new(tree.path().join("refused"));
+    std::fs::create_dir(refused.dir()).expect("creating a leaf with no cgroup.procs");
+    let log = Log::default();
+    super::place_supervisor_or_reap(
+        Some(&refused),
+        supervisor,
+        &mut Child(log.clone()),
+        Some(Gate(log.clone())),
+    )
+    .expect_err("a leaf with no cgroup.procs must refuse the supervisor");
+    assert_eq!(
+        *log.lock().unwrap(),
+        ["reaped", "released"],
+        "a refused task is reaped before its gate goes, so its program never runs",
     );
 }
 
@@ -1132,7 +1241,7 @@ async fn an_exec_ended_by_shutdown_writes_the_notice_to_stderr() {
         let mut err = Vec::new();
         client_stderr.read_to_end(&mut err).await.unwrap();
         let expected: &[u8] = if shutting_down {
-            b"err!minimald is shutting down; the command was stopped\n"
+            b"err!the daemon is shutting down, so the command was stopped\n"
         } else {
             b"err!"
         };
@@ -1358,7 +1467,7 @@ async fn an_exec_that_exits_on_its_own_gets_no_notice() {
         let mut err = Vec::new();
         client_stderr.read_to_end(&mut err).await.unwrap();
         let expected: &[u8] = if noticed {
-            b"err!minimald is shutting down; the command was stopped\n"
+            b"err!the daemon is shutting down, so the command was stopped\n"
         } else {
             b"err!"
         };
@@ -5712,6 +5821,46 @@ async fn an_unread_exit_notice_does_not_hold_the_status() {
     )
     .await;
     assert_eq!(status, 125);
+}
+
+/// The lines an exec writes to the client's stderr read as the product's:
+/// none opens with, or names, the daemon's process name, and a refusal's
+/// reason reaches the client unchanged, as the sandbox-failure line does.
+#[test]
+fn client_stderr_lines_do_not_name_the_daemon() {
+    use super::HeldBound;
+
+    let reason = "unknown exec form `min://nope`";
+    assert_eq!(
+        super::unsupported_command_message(reason),
+        format!("{reason}\n")
+    );
+
+    let lines = [
+        super::unsupported_command_message(reason),
+        super::bridge::held_input_notice(HeldBound::Exec),
+        super::bridge::held_input_notice(HeldBound::Daemon),
+        super::bridge::unstarted_input_notice(HeldBound::Exec),
+        super::bridge::unstarted_input_notice(HeldBound::Daemon),
+        super::sandbox_failure_notice("mount /home/h810: ENOENT"),
+        super::bridge::spawn_failed_notice(&"No such file or directory (os error 2)"),
+        super::git::NO_REPOSITORY_NOTICE.to_owned(),
+        super::run::start_failed_notice("build", &"the session is gone"),
+        super::run::start_failed_notice("check", &"the session is gone"),
+        super::run::check_args_notice(&"unknown flag `--nope`"),
+        String::from_utf8(SHUTDOWN_NOTICE.to_vec()).unwrap(),
+        String::from_utf8(super::bridge::DESTROYED_NOTICE.to_vec()).unwrap(),
+    ];
+    for line in &lines {
+        assert!(
+            !line.contains("minimald"),
+            "a client line names the daemon: {line:?}"
+        );
+        assert!(
+            line.ends_with('\n') && line.matches('\n').count() == 1,
+            "a client line is one whole line: {line:?}"
+        );
+    }
 }
 
 /// NET-138. An exec or a run refused because the VM host released the

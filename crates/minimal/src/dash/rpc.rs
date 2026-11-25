@@ -205,7 +205,7 @@ pub async fn connect_missing(hosts: &mut Vec<Host>, minimal_dir: Option<&Path>) 
         // Version-gated like `discover`, but a skewed host that appears
         // mid-run must not kill the dashboard the other hosts are still
         // serving, so the refusal skips it — the warning it logged is the
-        // operator's cue to `min stop --force` and reopen.
+        // operator's cue to `min host stop <host>` and reopen.
         if let Err(e) = minimal_client::ensure_version_match(&mut client).await {
             tracing::warn!(provider = label, error = %e, "provider build is skewed");
             continue;
@@ -499,6 +499,7 @@ pub async fn rename(host: &mut Host, id: SessionId, new_name: &str) -> Result<()
 /// composition, staged hook scripts, and hook budget
 /// arrive as [`crate::loadouts::ActivationInputs`], resolved against the same
 /// project path, so an external loadout hook works from the dashboard.
+#[allow(clippy::too_many_arguments)]
 pub async fn activate(
     sock: &Path,
     name: Option<String>,
@@ -506,9 +507,9 @@ pub async fn activate(
     upload_root: camino::Utf8PathBuf,
     network: NetworkMode,
     decision: crate::UploadDecision,
-    inputs: crate::loadouts::ActivationInputs,
+    mut inputs: crate::loadouts::ActivationInputs,
+    picked: PickedEntry,
 ) -> Result<Activated, anyhow::Error> {
-    let mut client = Client::connect(sock).await?;
     // The dashboard's own copy of the create/upload/configure/finalize
     // sequence, so it needs the same gate `min session activate` gets: on a
     // skewed pair `FinalizeSession` fails after the record exists, and the
@@ -533,19 +534,30 @@ pub async fn activate(
     // The caller resolved the upload root and its decision, before the create
     // and off the async worker, so the TUI could confirm. The root is both the
     // box's project root on the create and the upload root after it.
-    // The directory that holds the project's `minimal.toml`, as `min session
-    // activate` sends it. The daemon records it as the box's project root
-    // (BOX-001), and falls back to the form's path only for older clients.
-    set_project_root(&mut request, &upload_root)?;
     // A daemon of another build refuses this before it allocates anything;
     // `None` under the skew override, which is how an operator still gets
     // through.
     request.must_match_version = minimal_client::version_assertion();
+    // The picked entry's network and policy, its expansion, the project
+    // root and the box's spec, through the helpers `min box start` uses.
+    // A refusal here comes before the daemon sees anything. The grants are
+    // minted once the box registers, in [`create_registering`].
+    let (request, contribution, grants) = put_picked_entry_off_worker(
+        request,
+        std::mem::take(&mut inputs.contribution),
+        upload_root.clone(),
+        picked,
+    )
+    .await?;
+    inputs.contribution = contribution;
+    let mut client = Client::connect(sock).await?;
     let undeclared_own_ip =
         request.config.network == NetworkMode::OwnIp && request.config.policy.egress.is_none();
     let (created, mut row) = create_registering(
         sock,
         request.config.clone(),
+        request.spec.as_ref(),
+        &grants,
         &mut client,
         |client, config| {
             let mut request = request.clone();
@@ -627,7 +639,7 @@ pub async fn activate(
             Errorable::Ok(minimald_rpc::ConfigureLoadoutResponse::Pending { .. }) => {
                 anyhow::bail!(
                     "this project needs approvals the dashboard cannot ask for; \
-                     create it with `min session activate` instead"
+                     create it with `min session start` instead"
                 );
             }
             Errorable::Err { error } => anyhow::bail!("{error}"),
@@ -667,6 +679,11 @@ pub async fn activate(
             if let Some(residency) = host_ip_residency.as_mut() {
                 residency.keep();
             }
+            // The proxy keeps the box's egress once the session is active,
+            // as `min box start` keeps it.
+            if let Some(proxy) = row.proxy.take() {
+                proxy.keep();
+            }
             // The session is active: a `host_ip` box holds its name in the
             // zone (NODATA) the way `min session activate` holds it, read
             // off the record so the name the daemon gave is the one held.
@@ -704,6 +721,9 @@ struct BoxRow {
     control_sock: Option<PathBuf>,
     name: Option<String>,
     registration: Option<minimal_client::box_registration::RegisteredWithVmHost>,
+    /// The proxy's hold on the box's grants. Dropped by a failure, it
+    /// makes the proxy forget the box's declared egress.
+    proxy: Option<crate::mint::ProxyRegistration>,
 }
 
 impl BoxRow {
@@ -748,9 +768,12 @@ type CreateFuture<'c> = std::pin::Pin<
 /// box registers first, through the client library the CLI registers
 /// through, and the create carries the addresses the registration handed
 /// back, since the in-VM daemon refuses an own-address box with none. A
-/// box the form left unnamed that registers takes the default session
-/// entry's name, because the row is registered under the name and the
-/// daemon must give the box the same one (BOX-163). Nothing mints a name:
+/// box the form left unnamed takes the entry's `[box] name`. Else, a box
+/// that registers takes the name the daemon
+/// derives from the project and the entry in `spec` ([`derived_name`]),
+/// because the row is registered under the name and the daemon must give
+/// the box the same one (BOX-211). A box that does not register goes
+/// unnamed, and the daemon derives the same name. Nothing mints a name:
 /// a name that a live row or a running box holds refuses the create,
 /// naming the holder. Every failure after the row exists withdraws it,
 /// with its id.
@@ -760,6 +783,8 @@ type CreateFuture<'c> = std::pin::Pin<
 async fn create_registering<C: Send>(
     sock: &Path,
     mut config: BoxConfig,
+    spec: Option<&serde_json_lenient::Value>,
+    grants: &BoxGrants,
     client: &mut C,
     mut create: impl for<'c> FnMut(&'c mut C, BoxConfig) -> CreateFuture<'c>,
 ) -> anyhow::Result<(minimald_rpc::CreateSessionResponse, BoxRow)> {
@@ -768,18 +793,23 @@ async fn create_registering<C: Send>(
     };
     let control_sock = control_sock_beside(sock);
     let registers = config.network == NetworkMode::OwnIp && vm_host_control_sock(sock).is_some();
+    // BOX-211: a blank form name already took the entry's `[box] name` on
+    // the request, and the stored spec carries no name. With neither, a box
+    // that registers takes the name derived from the project name.
     if registers && config.name.is_none() {
-        config.name = Some(mfile::spec::DEFAULT_SESSION_ENTRY.to_string());
+        config.name = Some(derived_name(&config, spec));
     }
     tracing::info!(
         requested_name = ?config.name,
         registers,
-        "dashboard create: the request carries only the form's name or the entry's"
+        "dashboard create: the request carries the form's name, else the \
+         derived name when the box registers, else none"
     );
     let mut row = BoxRow {
         control_sock,
         name: None,
         registration: None,
+        proxy: None,
     };
     if let Some(name) = config.name.as_deref() {
         row.registration =
@@ -814,6 +844,10 @@ async fn create_registering<C: Send>(
     // withdrawal. The create relays none: the in-VM daemon takes the id
     // from the VM host daemon alone (BOX-002).
     config.box_id = None;
+    // BEP-005/007/032: each grant is minted for the id the registration
+    // handed back, before the create, as `min box start` mints it. The
+    // create carries each sealed value. A failed mint withdraws the row.
+    let config = mint_box_grants(config, &mut row, grants).await?;
     let created = create(client, config).await;
     if let Ok(minimald_rpc::CreateSessionReply::Ok(created)) = created {
         return Ok((created, row));
@@ -827,6 +861,53 @@ async fn create_registering<C: Send>(
         Err(error) => Err(error),
         Ok(minimald_rpc::CreateSessionReply::Ok(_)) => unreachable!("a created box returned above"),
     }
+}
+
+/// Mints `grants` for the box id the registration on `row` handed back,
+/// through the mint `min box start` calls, and gives `config` with each
+/// sealed value and the proxy's root certificate on it. The proxy's hold
+/// on the box goes on `row`. A failed mint withdraws the row. The request
+/// built here only carries `config` to the mint, and is never sent.
+async fn mint_box_grants(
+    config: BoxConfig,
+    row: &mut BoxRow,
+    grants: &BoxGrants,
+) -> anyhow::Result<BoxConfig> {
+    let registered_id = row
+        .registration
+        .as_ref()
+        .and_then(|registration| registration.box_id);
+    let mut minting = CreateSessionRequest::new(
+        String::new(),
+        config.project_path.clone(),
+        config.network,
+        BoxPolicy::default(),
+    );
+    minting.config = config;
+    row.proxy = crate::mint_into_request(
+        &mut minting,
+        row.name.as_deref(),
+        registered_id,
+        &grants.github,
+        &grants.store,
+        grants.config_dir.clone(),
+        row.control_sock.clone(),
+        grants.proxy_log.clone(),
+    )
+    .await?;
+    Ok(minting.config)
+}
+
+/// The name the daemon gives a create that asks for none (BOX-211),
+/// through the one derivation the daemon and `min box start` call
+/// ([`boxes::box_name::create_derived_name`]): the request's project name,
+/// else the project root directory's name, and the entry. A box registered
+/// under it is the box the daemon names.
+fn derived_name(config: &BoxConfig, spec: Option<&serde_json_lenient::Value>) -> String {
+    let root = config.project_root.as_ref().unwrap_or(&config.project_path);
+    let project =
+        boxes::box_name::request_project_name(config.project_name.as_deref(), Some(root.as_str()));
+    boxes::box_name::create_derived_name(&project, spec, None)
 }
 
 /// A session the dashboard created and activated.
@@ -866,7 +947,9 @@ pub(super) async fn resolve_project_off_worker(
 ) -> Result<(camino::Utf8PathBuf, bool), anyhow::Error> {
     let dir = dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let root = crate::resolve_upload_root(&dir)?;
+        // The TUI owns the screen: the create puts the file's hints on the
+        // status line.
+        let root = crate::resolve_upload_root_quiet(&dir)?;
         let repo = minimal_client::file_upload::is_vcs_root(root.as_std_path());
         Ok::<_, anyhow::Error>((root, repo))
     })
@@ -874,14 +957,162 @@ pub(super) async fn resolve_project_off_worker(
     .context("resolving the upload root")?
 }
 
-/// Puts `root` on the create request as the box's project root (BOX-001).
-fn set_project_root(
+/// The session entry a dashboard create starts its box from, and what its
+/// expansion reads beside the project.
+#[derive(Debug, Clone, Default)]
+pub struct PickedEntry {
+    /// The entry the create form picked. `None` applies the session entry
+    /// pick that `min session start` makes with no entry.
+    pub name: Option<String>,
+    /// The gated loadouts of the selected-loadouts layer (BOX-064).
+    pub(crate) selected: crate::SelectedLoadouts,
+    /// Reads the client's store rules for the spec's `[secrets]` (BOX-071).
+    pub(crate) global: Option<crate::GlobalArgs>,
+}
+
+impl PickedEntry {
+    /// The entry `name`, with no selected loadouts and no store rules.
+    #[must_use]
+    pub fn new(name: Option<String>) -> Self {
+        Self {
+            name,
+            ..Self::default()
+        }
+    }
+}
+
+/// Puts the picked entry on the create request and its contribution: the
+/// network and policy `min box start` gives the entry, the
+/// entry's expansion, the project root `upload_root` (BOX-001), and the
+/// box's spec with its hooks (BOX-068). The request's `name` is the spec's
+/// `[box] name`, as `min box start --name` gives it.
+///
+/// # Errors
+///
+/// Fails on a `minimal.toml` that does not load or expand, and when the
+/// picked entry is not a session entry of the project. With no picked
+/// entry, fails when no single session entry can be picked. Fails on the
+/// entry's network or secret settings where `min box start` refuses them.
+fn put_picked_entry(
     request: &mut CreateSessionRequest,
-    root: &camino::Utf8Path,
-) -> Result<(), anyhow::Error> {
-    request.config.project_root =
-        Some(paths::HostAbsPath::try_new(root.to_path_buf()).context("Invalid project root")?);
-    Ok(())
+    contribution: &mut boxes::wire::request::WireContribution,
+    upload_root: &camino::Utf8Path,
+    picked: &PickedEntry,
+) -> Result<BoxGrants, anyhow::Error> {
+    let dir = request.config.project_path.as_utf8_path().to_path_buf();
+    let box_name = request.config.name.clone();
+    // The pick `min session start` makes: a typed entry the project does
+    // not declare as a session is refused, and no entry picks one.
+    let entries = crate::project_entries(&dir)?;
+    let entry = crate::pick_session_start_entry(&entries, picked.name.as_deref())?.name;
+    // The form's mode acts as `--network`, so it would replace the entry's
+    // `network.mode`. An entry whose declared mode differs is refused, and
+    // the request gets no spec and no expansion. This refusal is interim. It
+    // is narrower than layer 7 of docs/architecture.md, and it stays only
+    // until the create form preselects the entry's declared `network.mode`
+    // (gominimal/minimal#3774).
+    let egress = crate::project_egress(&dir, Some(&entry))?;
+    if let Some(declared) = egress.mode
+        && declared != request.config.network
+    {
+        anyhow::bail!(
+            "the entry {entry} declares network mode {declared}, but the create form has \
+             {form}. Run min box start {entry} to start it with its own network mode.",
+            declared = declared.word(),
+            form = request.config.network.word(),
+        );
+    }
+    // `check_project` reads the form's mode as a `--network` flag, so its
+    // ingress refusal names a flag the dashboard does not have. Refuse
+    // here with the form's own next step.
+    if egress.ingress.is_some() && request.config.network != boxes::NetworkMode::OwnIp {
+        anyhow::bail!(
+            "the entry {entry} declares network.ingress, which needs network mode own_ip. \
+             Pick own_ip in the create form."
+        );
+    }
+    // The entry's `[network]`, `[secrets]` and Box Egress Proxy settings,
+    // through the checks `min box start` runs. The form's network mode is
+    // the create's `--network`, and the form sets no other flag.
+    let global = picked.global.clone().unwrap_or_default();
+    let mut args = crate::cli::ActivateArgs::unflagged();
+    args.network = Some(
+        crate::cli::parse_network_mode(request.config.network.word())
+            .map_err(|error| anyhow::anyhow!(error))?,
+    );
+    let checks = crate::check_project(
+        &global,
+        &mut args,
+        &dir,
+        Some(&entry),
+        None,
+        (Vec::new(), None),
+        crate::ProjectPrompts::Dashboard,
+    )?;
+    request.config.network = args.network_mode().into();
+    request.config.policy = checks.policy;
+    tracing::debug!(
+        entry = %entry,
+        network = request.config.network.word(),
+        egress = request.config.policy.egress.is_some(),
+        github_grants = checks.github_grants.len(),
+        store_grants = checks.store_grants.len(),
+        "dashboard create: the request takes the entry's network and secret settings"
+    );
+    crate::put_session_entry(
+        request,
+        contribution,
+        &crate::SessionEntryCreate {
+            dir: &dir,
+            project_root: upload_root,
+            entry: Some(&entry),
+            box_name: box_name.as_deref(),
+            selected: &picked.selected,
+            global: picked.global.as_ref(),
+        },
+    )?;
+    Ok(BoxGrants {
+        github: checks.github_grants,
+        store: checks.store_grants,
+        config_dir: global.config_dir,
+        proxy_log: crate::proxy_log_path(global.minimal_dir.as_deref()),
+    })
+}
+
+/// The grants a dashboard create mints for its box once the box registers,
+/// as `min box start` mints them, and where the mint reads its settings.
+#[derive(Debug, Default)]
+pub(crate) struct BoxGrants {
+    github: Vec<String>,
+    store: Vec<crate::mint::StoreGrant>,
+    /// The `min --config-dir` override.
+    config_dir: Option<PathBuf>,
+    /// The proxy's log, which a refusal names when the proxy does not answer.
+    proxy_log: Option<PathBuf>,
+}
+
+/// [`put_picked_entry`], off the async worker: it reads the project's
+/// `minimal.toml` and the client configuration, and a stalled mount must
+/// not stall the dashboard.
+async fn put_picked_entry_off_worker(
+    mut request: CreateSessionRequest,
+    mut contribution: boxes::wire::request::WireContribution,
+    upload_root: camino::Utf8PathBuf,
+    picked: PickedEntry,
+) -> Result<
+    (
+        CreateSessionRequest,
+        boxes::wire::request::WireContribution,
+        BoxGrants,
+    ),
+    anyhow::Error,
+> {
+    tokio::task::spawn_blocking(move || {
+        let grants = put_picked_entry(&mut request, &mut contribution, &upload_root, &picked)?;
+        Ok::<_, anyhow::Error>((request, contribution, grants))
+    })
+    .await
+    .context("reading the session entry")?
 }
 
 #[cfg(test)]
@@ -965,9 +1196,9 @@ mod tests {
 
     /// T66 from the dashboard: an own-address create on a VM-backed host
     /// registers the box first, through the client library the CLI
-    /// registers through — under the default session entry's name, since
+    /// registers through — under the name derived from the project, since
     /// the form left it unnamed and the row is registered under the name,
-    /// never a minted `<dir>-<hex>` name (BOX-163) — and the
+    /// never a minted `<dir>-<hex>` name (BOX-211) — and the
     /// create carries the addresses the registration handed back, never
     /// none (the in-VM daemon refuses an own-address box with none).
     #[tokio::test]
@@ -990,6 +1221,8 @@ mod tests {
         let (_, row) = create_registering(
             &ssh_sock,
             own_ip_config(dir.path(), None),
+            None,
+            &BoxGrants::default(),
             &mut sent,
             |sent, config| {
                 sent.push(config);
@@ -1008,9 +1241,8 @@ mod tests {
         };
         assert!(request.hold, "the create holds its registration as a lease");
         assert_eq!(
-            request.name,
-            mfile::spec::DEFAULT_SESSION_ENTRY,
-            "an unnamed box is registered under the entry's name, not a minted one"
+            request.name, "web-app",
+            "an unnamed box is registered under the derived name, not a minted one"
         );
 
         let [config] = sent.as_slice() else {
@@ -1066,6 +1298,8 @@ mod tests {
         create_registering(
             &ssh_sock,
             own_ip_config(dir.path(), Some("web")),
+            None,
+            &BoxGrants::default(),
             &mut sent,
             |sent, config| {
                 sent.push(config);
@@ -1123,6 +1357,8 @@ mod tests {
         let failed = create_registering(
             &ssh_sock,
             own_ip_config(dir.path(), Some("web")),
+            None,
+            &BoxGrants::default(),
             &mut (),
             |(), _config| {
                 Box::pin(async {
@@ -1172,6 +1408,8 @@ mod tests {
         let failed = create_registering(
             &ssh_sock,
             own_ip_config(dir.path(), Some("web")),
+            None,
+            &BoxGrants::default(),
             &mut (),
             |(), _config| -> CreateFuture<'_> {
                 panic!("no create is sent for a box that did not register")
@@ -1188,6 +1426,67 @@ mod tests {
             "the refusal surfaces with its reason: {error}"
         );
         assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    /// BEP-005 from the dashboard: a create whose entry declares a GitHub
+    /// grant runs the mint for the registered row before any create is
+    /// sent. A host that hands back no box id gives the mint no id to mint
+    /// for, so the mint refuses, names the grant, and withdraws the row by
+    /// the name and the pair the registration handed back. The refusal is
+    /// reached before the mint reads the home directory, so the test does
+    /// not depend on a proxy on this host.
+    #[tokio::test]
+    async fn dashboard_create_with_grants_withdraws_the_row_when_the_mint_fails() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let host_dir = vm_host_dir(&dir);
+        let ssh_sock = host_dir.join("ssh.sock");
+        let addresses = boxes::BoxAddresses {
+            switch_address: std::net::Ipv4Addr::new(100, 64, 0, 5),
+            loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 2),
+        };
+        let server = fake_vm_host(
+            &host_dir.join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
+            vec![
+                // A host that predates ids registers the box with no id.
+                minimald_rpc::BoxControlReply::Addresses(addresses),
+                minimald_rpc::BoxControlReply::Addresses(addresses),
+            ],
+        );
+        let grants = BoxGrants {
+            github: vec!["GH_TOKEN".to_string()],
+            ..BoxGrants::default()
+        };
+        let failed = create_registering(
+            &ssh_sock,
+            own_ip_config(dir.path(), Some("web")),
+            None,
+            &grants,
+            &mut (),
+            |(), _config| -> CreateFuture<'_> {
+                panic!("no create is sent for a box whose grants were not minted")
+            },
+        )
+        .await;
+        let error = match failed {
+            Ok(_) => panic!("the failed mint is the dashboard's error"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            error.contains("GH_TOKEN"),
+            "the refusal names the grant it could not mint: {error}"
+        );
+        let lines = server.join().unwrap();
+
+        assert_eq!(lines.len(), 2, "a registration, then its withdrawal");
+        let request: minimald_rpc::BoxControlRequest =
+            serde_json_lenient::from_str(lines[1].trim()).expect("the request is the wire type");
+        let minimald_rpc::BoxControlRequest::Withdraw(request) = request else {
+            panic!("the row the failed mint abandons goes by the withdraw verb");
+        };
+        assert_eq!(request.name, "web", "the mint withdraws the row's name");
+        assert_eq!(request.switch_address, addresses.switch_address);
+        assert_eq!(request.loopback_address, addresses.loopback_address);
+        assert_eq!(request.box_id, None, "the host handed back no id");
     }
 
     /// On a native host an own-address create is the plain create it always
@@ -1208,6 +1507,8 @@ mod tests {
         let (_, row) = create_registering(
             &host_dir.join("ssh.sock"),
             own_ip_config(dir.path(), None),
+            None,
+            &BoxGrants::default(),
             &mut sent,
             |sent, config| {
                 sent.push(config);
@@ -1300,6 +1601,9 @@ mod tests {
             parent: None,
             project_root: None,
             attrs: Default::default(),
+            project_name: None,
+            entry: None,
+            name_origin: boxes::NameOrigin::Written,
         }
     }
 
@@ -1365,6 +1669,9 @@ mod tests {
             parent: None,
             project_root: None,
             attrs: Default::default(),
+            project_name: None,
+            entry: None,
+            name_origin: boxes::NameOrigin::Written,
         };
         settle_destroyed_box(&ssh_sock, record.id, &record).await;
         let line = server.join().unwrap();
@@ -1542,6 +1849,174 @@ mod tests {
         );
     }
 
+    /// BOX-211: a box created from `min dash` with the name left blank takes
+    /// the name a `min box start` with no `--name` takes in the same
+    /// project: the project name for the session entry, and
+    /// `<project>-<entry>` for a picked entry. Each create goes to a daemon
+    /// of its own, so the two names do not collide. An own-address box on
+    /// a VM-backed host registers under that name too.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dash_create_blank_name_takes_box_start_name() {
+        use minimald_rpc::{CreateSession, CreateSessionReply, ListSessions};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().join("Web_App")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join(mfile::MFILE_NAME),
+            "[sessions.default]\npackages = []\n\n[sessions.dev]\npackages = []\n\n\
+             [sessions.api]\npackages = []\n[sessions.api.box]\nname = \"web\"\n",
+        )
+        .unwrap();
+        let project_path = paths::HostAbsPath::try_new(root.clone()).unwrap();
+        let blank = || {
+            // The harness's request, which asserts no daemon build: each
+            // create goes to a harness daemon of this build.
+            let mut request =
+                minimald::test_harness::create_session_req("unused", project_path.as_str());
+            request.config.name = None;
+            request.config.network = NetworkMode::HostNet;
+            request
+        };
+        async fn name_on(server: &minimald::test_harness::TestServer) -> Option<String> {
+            let listed = server.connect().await.call::<ListSessions>(&()).await;
+            let [only] = listed.sessions.as_slice() else {
+                panic!("one box on the daemon: {:?}", listed.sessions);
+            };
+            only.name.clone()
+        }
+
+        // An entry's `[box] name` names the box before the derived name.
+        for (entry, expected) in [
+            (None, "web-app"),
+            (Some("dev"), "web-app-dev"),
+            (Some("api"), "web"),
+        ] {
+            // `min box start [dev]`: the plan the CLI makes, then the
+            // shared helper with the plan's options, as `activate_box`
+            // calls it.
+            let entries = crate::project_entries(&root).unwrap();
+            let start = crate::StartEntry {
+                verb: crate::StartVerb::Box,
+                entry: entry.map(str::to_owned),
+                name: None,
+                new: false,
+                detach: true,
+                overrides: crate::StartOverrideArgs::default(),
+            };
+            let crate::StartPlan::Session { options, .. } =
+                crate::plan_start(&start, &entries, false).unwrap()
+            else {
+                panic!("{entry:?} is a session entry");
+            };
+            let mut started = blank();
+            crate::put_session_entry(
+                &mut started,
+                &mut boxes::wire::request::WireContribution::default(),
+                &crate::SessionEntryCreate {
+                    dir: &root,
+                    project_root: &root,
+                    entry: options.entry.as_deref(),
+                    box_name: options.box_name.as_deref(),
+                    selected: &crate::SelectedLoadouts::default(),
+                    global: None,
+                },
+            )
+            .unwrap();
+            let start_daemon = minimald::test_harness::TestServer::new().await;
+            match start_daemon
+                .connect()
+                .await
+                .call::<CreateSession>(&started)
+                .await
+            {
+                CreateSessionReply::Ok(_) => {}
+                CreateSessionReply::Err { error, .. } => panic!("min box start: {error}"),
+            }
+
+            // The dashboard's create, with the name left blank.
+            let mut dashed = blank();
+            put_picked_entry(
+                &mut dashed,
+                &mut boxes::wire::request::WireContribution::default(),
+                &root,
+                &PickedEntry::new(entry.map(str::to_owned)),
+            )
+            .unwrap();
+            let dash_daemon = minimald::test_harness::TestServer::new().await;
+            let sock = dir.path().join("ssh.sock");
+            let _ = std::fs::remove_file(&sock);
+            dash_daemon.listen_on_uds(&sock).await;
+            let mut client = dash_daemon.connect().await;
+            let request = dashed.clone();
+            create_registering(
+                &sock,
+                dashed.config.clone(),
+                dashed.spec.as_ref(),
+                &BoxGrants::default(),
+                &mut client,
+                |client, config| {
+                    let mut request = request.clone();
+                    request.config = config;
+                    Box::pin(async move { Ok(client.call::<CreateSession>(&request).await) })
+                },
+            )
+            .await
+            .expect("the dashboard's create");
+
+            let start_name = name_on(&start_daemon).await;
+            assert_eq!(start_name.as_deref(), Some(expected), "{entry:?}");
+            assert_eq!(
+                name_on(&dash_daemon).await,
+                start_name,
+                "{entry:?}: the dashboard's blank-name box takes the box start name"
+            );
+
+            // An own-address box on a VM-backed host registers under it.
+            let vm_dir = tempfile::TempDir::new().unwrap();
+            let host_dir = vm_host_dir(&vm_dir);
+            let server = fake_vm_host(
+                &host_dir.join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
+                vec![minimald_rpc::BoxControlReply::Registered(
+                    minimald_rpc::RegisteredBox {
+                        switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
+                        loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
+                        box_id: minimald_rpc::BoxId::from_bytes([7; 16]),
+                        task_addresses: Vec::new(),
+                    },
+                )],
+            );
+            let mut config = dashed.config.clone();
+            config.network = NetworkMode::OwnIp;
+            let mut sent = Vec::new();
+            create_registering(
+                &host_dir.join("ssh.sock"),
+                config,
+                dashed.spec.as_ref(),
+                &BoxGrants::default(),
+                &mut sent,
+                |sent, config| {
+                    sent.push(config);
+                    Box::pin(async { Ok(minimald_rpc::CreateSessionReply::Ok(created())) })
+                },
+            )
+            .await
+            .expect("the registered box is created");
+            let lines = server.join().unwrap();
+            let request: minimald_rpc::BoxControlRequest =
+                serde_json_lenient::from_str(lines[0].trim()).unwrap();
+            let minimald_rpc::BoxControlRequest::Register(request) = request else {
+                panic!("a registration is carried by the register verb");
+            };
+            assert_eq!(Some(request.name.as_str()), start_name.as_deref());
+            assert_eq!(
+                sent[0].name, start_name,
+                "the create asks for the same name"
+            );
+        }
+    }
+
     /// BOX-001: the dashboard's create from a form path `<root>/sub` sends
     /// `<root>`, the directory that holds `minimal.toml`, as the project
     /// root, the same stamp `activate` puts on its request.
@@ -1564,16 +2039,287 @@ mod tests {
             BoxPolicy::default(),
         );
 
+        request.config.name = None;
+
         let (upload_root, _) = resolve_project_off_worker(project_path.as_utf8_path())
             .await
             .unwrap();
-        set_project_root(&mut request, &upload_root).unwrap();
+        let mut contribution = boxes::wire::request::WireContribution::default();
+        put_picked_entry(
+            &mut request,
+            &mut contribution,
+            &upload_root,
+            &PickedEntry::default(),
+        )
+        .unwrap();
 
         assert_eq!(
             request.config.project_root,
             Some(paths::HostAbsPath::try_new(root).unwrap())
         );
         assert_eq!(request.config.project_path.as_str(), sub.as_str());
+    }
+
+    /// A box created from `min dash` with the entry `dev` stores the spec,
+    /// and the projection digest, that `min box start dev` stores for the
+    /// same project, and the contribution carries the same expansion. The
+    /// entry declares `[network.egress]` and `[secrets]`, and the create
+    /// takes the network, the policy and the grants `min box start dev`
+    /// takes (#3739).
+    #[test]
+    fn dashboard_create_with_a_named_entry_stores_the_box_start_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(mfile::MFILE_NAME),
+            "[session]\npackages = [\"git\"]\n\n\
+             [sessions.dev]\npackages = [\"rust\"]\n\n\
+             [sessions.dev.network]\nmode = \"own_ip\"\n\n\
+             [sessions.dev.network.egress]\nallow_dns_hosts = [\"registry.npmjs.org\"]\n\n\
+             [sessions.dev.network.bep]\nsteering = \"proxy_env\"\n\n\
+             [sessions.dev.secrets.NPM_TOKEN]\nsource = \"store\"\n\
+             store = \"keychain\"\nid = \"npm-token\"\n",
+        )
+        .unwrap();
+        let config = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(config.path().join("minimal")).unwrap();
+        std::fs::write(
+            config.path().join("minimal/config.toml"),
+            "[secret-store-rules.npm-token]\nupstream = [\"registry.npmjs.org\"]\n\
+             header = \"Authorization\"\nprefix = \"Bearer \"\n",
+        )
+        .unwrap();
+        let global = crate::GlobalArgs {
+            config_dir: Some(config.path().to_path_buf()),
+            no_input: true,
+            ..Default::default()
+        };
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let project_path = paths::HostAbsPath::try_new(root.clone()).unwrap();
+        let fresh = |network: NetworkMode, policy: BoxPolicy| {
+            let mut request =
+                CreateSessionRequest::new(String::new(), project_path.clone(), network, policy);
+            request.config.name = None;
+            request
+        };
+
+        // `min box start dev`: the plan the CLI makes, then the shared
+        // helpers with the plan's options, as `activate_box` calls them.
+        let entries = crate::project_entries(&root).unwrap();
+        let start = crate::StartEntry {
+            verb: crate::StartVerb::Box,
+            entry: Some("dev".to_owned()),
+            name: None,
+            new: false,
+            detach: true,
+            overrides: crate::StartOverrideArgs::default(),
+        };
+        let crate::StartPlan::Session { options, .. } =
+            crate::plan_start(&start, &entries, false).unwrap()
+        else {
+            panic!("dev is a session entry");
+        };
+        let mut args = crate::cli::ActivateArgs::unflagged();
+        let flags = crate::flag_network_overrides(&args).unwrap();
+        let checks = crate::check_project(
+            &global,
+            &mut args,
+            &root,
+            options.entry.as_deref(),
+            options.quic443,
+            flags,
+            crate::ProjectPrompts::Terminal,
+        )
+        .expect("min box start dev passes its project checks");
+        let mut started = fresh(args.network_mode().into(), checks.policy);
+        let mut started_contribution = boxes::wire::request::WireContribution::default();
+        crate::put_session_entry(
+            &mut started,
+            &mut started_contribution,
+            &crate::SessionEntryCreate {
+                dir: &root,
+                project_root: &root,
+                entry: options.entry.as_deref(),
+                box_name: options.box_name.as_deref(),
+                selected: &crate::SelectedLoadouts::default(),
+                global: Some(&global),
+            },
+        )
+        .unwrap();
+
+        // The dashboard's create, with `dev` and `own_ip` picked in the form.
+        let mut created = fresh(NetworkMode::OwnIp, BoxPolicy::default());
+        let mut created_contribution = boxes::wire::request::WireContribution::default();
+        let grants = put_picked_entry(
+            &mut created,
+            &mut created_contribution,
+            &root,
+            &PickedEntry {
+                name: Some("dev".to_owned()),
+                global: Some(global.clone()),
+                ..PickedEntry::default()
+            },
+        )
+        .expect("the dashboard creates a box from an entry with network and secret settings");
+
+        let spec = created.spec.clone().expect("the dashboard sends a spec");
+        assert_eq!(spec["entry"], "dev", "{spec}");
+        assert_eq!(
+            spec["install"]["packages"],
+            serde_json_lenient::json!(["git", "rust"])
+        );
+        assert_eq!(spec["secrets"]["NPM_TOKEN"]["id"], "npm-token", "{spec}");
+        assert_eq!(created.spec, started.spec);
+        assert!(created.config.client_projection_digest().is_some());
+        assert_eq!(
+            created.config.client_projection_digest(),
+            started.config.client_projection_digest()
+        );
+        assert_eq!(created.config.network, NetworkMode::OwnIp);
+        assert_eq!(created.config.network, started.config.network);
+        assert!(created.config.policy.egress.is_some(), "the entry's egress");
+        assert_eq!(created.config.policy, started.config.policy);
+        assert_eq!(created.config.project_root, started.config.project_root);
+        assert_eq!(created_contribution, started_contribution);
+        assert_eq!(
+            created_contribution
+                .entry
+                .as_ref()
+                .map(|entry| entry.name.as_str()),
+            Some("dev")
+        );
+        // The grants the create mints once the box registers.
+        assert_eq!(grants.github, checks.github_grants);
+        assert_eq!(grants.store, checks.store_grants);
+        assert_eq!(grants.store.len(), 1, "{:?}", grants.store);
+
+        // An entry the project does not declare is refused before a create.
+        let mut unknown = fresh(NetworkMode::OwnIp, BoxPolicy::default());
+        let error = put_picked_entry(
+            &mut unknown,
+            &mut boxes::wire::request::WireContribution::default(),
+            &root,
+            &PickedEntry::new(Some("nope".to_owned())),
+        )
+        .expect_err("an undeclared entry is refused");
+        assert!(format!("{error:#}").contains("nope"), "{error:#}");
+    }
+
+    /// Picks `dev` with `network` in the form, in a project whose `dev`
+    /// entry declares `table`, and gives the create request the dashboard
+    /// builds, or its refusal, and the request as the refusal leaves it.
+    fn dashboard_request_for_entry_with(
+        table: &str,
+        network: NetworkMode,
+    ) -> (
+        Result<BoxGrants, anyhow::Error>,
+        CreateSessionRequest,
+        boxes::wire::request::WireContribution,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(mfile::MFILE_NAME),
+            format!("[sessions.dev]\n\n{table}"),
+        )
+        .unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let mut request = CreateSessionRequest::new(
+            String::new(),
+            paths::HostAbsPath::try_new(root.clone()).unwrap(),
+            network,
+            BoxPolicy::default(),
+        );
+        let mut contribution = boxes::wire::request::WireContribution::default();
+        let config = tempfile::tempdir().unwrap();
+        let picked = PickedEntry {
+            name: Some("dev".to_owned()),
+            global: Some(crate::GlobalArgs {
+                config_dir: Some(config.path().to_path_buf()),
+                no_input: true,
+                ..Default::default()
+            }),
+            ..PickedEntry::default()
+        };
+        let result = put_picked_entry(&mut request, &mut contribution, &root, &picked);
+        (result, request, contribution)
+    }
+
+    #[test]
+    fn dashboard_create_applies_the_entry_network_egress() {
+        let (result, request, contribution) = dashboard_request_for_entry_with(
+            "[sessions.dev.network]\nmode = \"own_ip\"\n\n\
+             [sessions.dev.network.egress]\nallow_dns_hosts = [\"github.com\"]\n",
+            NetworkMode::OwnIp,
+        );
+        result.expect("an entry with network.egress is created");
+        let egress = request
+            .config
+            .policy
+            .egress
+            .as_ref()
+            .expect("the entry's egress is on the request");
+        assert_eq!(
+            egress.allow_dns_hosts.as_deref(),
+            Some(["github.com".to_owned()].as_slice())
+        );
+        assert!(request.spec.is_some());
+        assert!(contribution.entry.is_some());
+    }
+
+    /// An entry whose `network.mode` differs from the form's mode is
+    /// refused, and the request gets no spec and no expansion.
+    #[test]
+    fn dashboard_create_refuses_an_entry_whose_network_mode_differs_from_the_form() {
+        let (result, request, contribution) = dashboard_request_for_entry_with(
+            "[sessions.dev.network]\nmode = \"none\"\n",
+            NetworkMode::HostNet,
+        );
+        let error = result.expect_err("an entry whose network.mode differs is refused");
+        assert_eq!(
+            format!("{error:#}"),
+            "the entry dev declares network mode none, but the create form has host_ip. \
+             Run min box start dev to start it with its own network mode."
+        );
+        assert!(request.spec.is_none());
+        assert!(contribution.entry.is_none());
+    }
+
+    /// An entry with `network.ingress` and no `network.mode` is refused
+    /// when the form's mode is not `own_ip`, with a next step in the form,
+    /// not a `--network` flag the dashboard does not have.
+    #[test]
+    fn dashboard_create_refuses_an_entry_with_ingress_off_own_ip() {
+        let (result, request, contribution) = dashboard_request_for_entry_with(
+            "[[sessions.dev.network.ingress]]\nproto = \"tcp\"\nport = 8080\n",
+            NetworkMode::HostNet,
+        );
+        let error = result.expect_err("an entry with ingress off own_ip is refused");
+        assert_eq!(
+            format!("{error:#}"),
+            "the entry dev declares network.ingress, which needs network mode own_ip. Pick \
+             own_ip in the create form."
+        );
+        assert!(request.spec.is_none());
+        assert!(contribution.entry.is_none());
+    }
+
+    /// A store reference with no rule is refused before a create, as
+    /// `min box start` refuses it.
+    #[test]
+    fn dashboard_create_refuses_a_store_secret_with_no_rule() {
+        let (result, request, contribution) = dashboard_request_for_entry_with(
+            "[sessions.dev.network]\nmode = \"own_ip\"\n\n\
+             [sessions.dev.network.bep]\nsteering = \"proxy_env\"\n\n\
+             [sessions.dev.secrets.NPM_TOKEN]\nsource = \"store\"\n\
+             store = \"keychain\"\nid = \"npm-token\"\n",
+            NetworkMode::OwnIp,
+        );
+        let error = result.expect_err("a store reference with no rule is refused");
+        assert!(format!("{error:#}").contains("npm-token"), "{error:#}");
+        assert!(request.spec.is_none(), "no spec on a refused create");
+        assert!(
+            contribution.entry.is_none(),
+            "no expansion on a refused create"
+        );
     }
 
     /// NET-057's TUI half: the probe list covers every VM — the default one

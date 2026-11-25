@@ -35,6 +35,16 @@ impl SpecHash {
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         SpecHash(blake3::Hash::from_bytes(bytes))
     }
+
+    /// The cache slot a patched build of this spec writes its output to. It
+    /// is never the spec hash itself, so a lookup by spec hash never returns
+    /// a patched build's output.
+    #[must_use]
+    pub fn patched_slot(&self) -> SpecHash {
+        let mut hasher = blake3::Hasher::new_derive_key("minimal patched build output v1");
+        hasher.update(self.as_bytes());
+        SpecHash(hasher.finalize())
+    }
 }
 
 impl PartialEq<blake3::Hash> for SpecHash {

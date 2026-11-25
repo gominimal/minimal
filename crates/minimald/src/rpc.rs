@@ -206,6 +206,7 @@ async fn serve_list_sessions(
             );
             Ok(ListSessionsResponse {
                 daemon_version: Some(OWN_VERSION.to_string()),
+                daemon_epoch: Some(daemon_epoch().to_string()),
                 hostname_routing_unavailable: s.proxy_unavailable().await,
                 hostname_proxy_port,
                 zone_answerer_port,
@@ -539,11 +540,28 @@ async fn serve_create_session(
             // refused for a held name. Any other create takes `<name>`, and
             // a running box that holds it refuses the create.
             let fresh_instance = req.fresh_instance;
+            let caller = ssh_username.clone();
             let created = mngr
                 .create_box_reporting_fact(req.config, spec, fresh_instance, ssh_username, creator)
                 .await;
             Ok(match created {
-                Ok((id, fact)) => {
+                Ok((id, fact, created_name)) => {
+                    // BOX-163: a derived name that was taken is named in the
+                    // reply, with its holder when the caller may read it.
+                    let name_not_taken = created_name
+                        .not_taken
+                        .as_ref()
+                        .map(|not_taken| name_not_taken_reply(not_taken, caller.as_deref()));
+                    if let Some(not_taken) = &name_not_taken {
+                        tracing::info!(
+                            session_id = %id,
+                            name = ?created_name.name,
+                            name_not_taken = %not_taken.name,
+                            reason = ?not_taken.reason,
+                            "create took another name: the derived name was taken; \
+                             the reply names it"
+                        );
+                    }
                     // Tag the session to this connection so it is reaped if
                     // the client drops before finalizing it (e.g. Ctrl-C at
                     // the gating prompt) — see [`ConnectionHandle`] and the
@@ -648,6 +666,8 @@ async fn serve_create_session(
                         classifier_advisory,
                         host_ip_enforcement: host_ip_enforcement
                             .map(|enforcement| enforcement.machine_str().to_string()),
+                        name: created_name.name,
+                        name_not_taken,
                     })
                 }
                 // BOX-163: a running box holds the name. The reply names the
@@ -1186,7 +1206,12 @@ async fn serve_answerer_control(
                 | BoxControlRequest::MintBoxId(_)
                 | BoxControlRequest::ReportExposeDecision(_)
                 | BoxControlRequest::ReportRefusedEgress(_)
-                | BoxControlRequest::ListenNotice(_) => BoxControlReply::Error {
+                | BoxControlRequest::ListenNotice(_)
+                | BoxControlRequest::FileBuildTable(_)
+                | BoxControlRequest::OpenBuildGrant(_)
+                | BoxControlRequest::CloseBuildGrant(_)
+                | BoxControlRequest::DropBuildTable(_)
+                | BoxControlRequest::RegisterBuildRow(_) => BoxControlReply::Error {
                     error: "the native daemon's control socket answers only the answerer \
                             verbs; boxes register over the daemon's RPC channels"
                         .to_string(),
@@ -1321,6 +1346,36 @@ async fn serve_configure_loadout(
                 Err(e) => Errorable::Err {
                     error: e.to_string(),
                 },
+            })
+        })
+        .await
+}
+
+/// `PrepareBuildBoxes`: takes what `min` prepared for a box's builds
+/// (NET-165).
+async fn serve_prepare_build_boxes(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    minimald_rpc::PrepareBuildBoxes
+        .handle_channel(c, async |req: minimald_rpc::PrepareBuildBoxesRequest| {
+            let mngr = s.sessions_manager().await;
+            let handle = mngr
+                .get_session(BoxKeyPredicate::Id(req.session_id))
+                .await
+                .map_err(|e| ConnectionError::Internal(e.to_string()))?;
+            let Some(h) = handle else {
+                return Ok(Errorable::Err {
+                    error: format!(
+                        "{} `{}`",
+                        minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                        req.session_id.as_ref()
+                    ),
+                });
+            };
+            Ok(match h.prepare_build_boxes(req).await {
+                Ok(prepared) => Errorable::Ok(prepared),
+                Err(error) => Errorable::Err { error },
             })
         })
         .await
@@ -3669,6 +3724,7 @@ pub async fn handle_ssh_rpc(
         | GetSessionRecord::NAME
         | CreateSession::NAME
         | minimald_rpc::ConfigureLoadout::NAME
+        | minimald_rpc::PrepareBuildBoxes::NAME
         | SubmitVerdict::NAME
         | FinalizeSession::NAME
         | RenameSession::NAME
@@ -3760,6 +3816,7 @@ pub async fn handle_ssh_rpc(
         GetSessionRecord::NAME => serve!(serve_get_session_record(s, channel)),
         CreateSession::NAME => serve!(serve_create_session(s, c.clone(), channel, ssh_username)),
         minimald_rpc::ConfigureLoadout::NAME => serve!(serve_configure_loadout(s, channel)),
+        minimald_rpc::PrepareBuildBoxes::NAME => serve!(serve_prepare_build_boxes(s, channel)),
         SubmitVerdict::NAME => serve!(serve_submit_verdict(s, channel)),
         FinalizeSession::NAME => serve!(serve_finalize_session(s, channel)),
         RenameSession::NAME => serve!(serve_rename_session(s, channel)),
@@ -3932,6 +3989,45 @@ mod trace_tests {
     }
 }
 
+/// The reply's account of a derived name a create did not get (BOX-163).
+/// It names the box that has the name only when the caller may read that
+/// box: its record was read and names the caller as its creator. A
+/// record with no creator, or one that was not read, hides the holder
+/// (default deny). The name
+/// itself is always in the reply, because the caller's own create derived
+/// it.
+fn name_not_taken_reply(
+    not_taken: &crate::box_manager::NotTakenName,
+    caller: Option<&str>,
+) -> minimald_rpc::NameNotTaken {
+    use crate::box_manager::HolderCreator;
+    use boxes::box_name::DerivedNameTaken;
+    let reason = match &not_taken.reason {
+        DerivedNameTaken::Held(holder) => {
+            // Default deny: only a read record whose creator is the caller
+            // names its box. A record with no creator, or one not read,
+            // hides it.
+            let readable = match &not_taken.holder_creator {
+                HolderCreator::User(owner) => caller == Some(owner.as_str()),
+                HolderCreator::NoCreator | HolderCreator::Unread => false,
+            };
+            minimald_rpc::NameTakenReason::Held {
+                holder: readable.then(|| minimald_rpc::NameHolder {
+                    id: holder.id,
+                    name: holder.name.clone(),
+                    state: holder.state_word().to_string(),
+                }),
+            }
+        }
+        DerivedNameTaken::Reserved => minimald_rpc::NameTakenReason::Reserved,
+        DerivedNameTaken::BoxIdForm => minimald_rpc::NameTakenReason::BoxIdForm,
+    };
+    minimald_rpc::NameNotTaken {
+        name: not_taken.name.clone(),
+        reason,
+    }
+}
+
 /// BOX-163 over the wire: what a `CreateSession` reply says when a running
 /// box holds the name, and how a fresh instance is named.
 #[cfg(test)]
@@ -3942,11 +4038,14 @@ mod create_naming_tests {
     use crate::box_manager::BoxKeyPredicate;
     use crate::test_harness::{TestClient, TestServer, create_session_req};
 
-    /// A create with no name on the request and a task spec whose entry is
-    /// `entry`, so the daemon names the box from the entry.
+    /// A create with no name on the request, the project name `web` and a
+    /// task spec whose entry is `entry`, so the daemon derives the box's
+    /// name from the project and the entry: `web-<entry>` (BOX-211). The
+    /// project root, `/tmp`, does not name the box.
     fn entry_req(entry: &str, fresh_instance: bool) -> CreateSessionRequest {
         let mut request = create_session_req("unused", "/tmp");
         request.config.name = None;
+        request.config.project_name = Some("web".to_string());
         // A `task` spec is created under the task verb (BOX-160).
         request.config.creating_verb = minimald_rpc::CreatingVerb::Task;
         let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
@@ -3977,6 +4076,88 @@ mod create_naming_tests {
             .name
     }
 
+    /// BOX-163, BOX-211: two creates of one project and entry with no
+    /// name give `web-dev` and `web-dev-1`. The second is not refused,
+    /// and its reply names `web-dev` as the name it did not get, with the
+    /// box that has it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_reply_names_the_taken_derived_name() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let created = |reply: CreateSessionReply| match reply {
+            CreateSessionReply::Ok(created) => created,
+            CreateSessionReply::Err { error, .. } => panic!("the create is refused: {error}"),
+        };
+        let first = created(client.call::<CreateSession>(&entry_req("dev", false)).await);
+        assert_eq!(first.name.as_deref(), Some("web-dev"));
+        assert_eq!(first.name_not_taken, None);
+
+        let second = created(client.call::<CreateSession>(&entry_req("dev", false)).await);
+        assert_eq!(second.name.as_deref(), Some("web-dev-1"));
+        assert_eq!(
+            name_of(&server, second.id).await.as_deref(),
+            Some("web-dev-1")
+        );
+        assert_eq!(
+            second.name_not_taken,
+            Some(minimald_rpc::NameNotTaken {
+                name: "web-dev".to_string(),
+                reason: minimald_rpc::NameTakenReason::Held {
+                    holder: Some(minimald_rpc::NameHolder {
+                        id: first.id,
+                        name: "web-dev".to_string(),
+                        state: "pending".to_string(),
+                    }),
+                },
+            })
+        );
+    }
+
+    /// The reply names the box that has the name only for a caller who
+    /// may read it: the creator its read record names. A record with no
+    /// creator, or a record that was not read, hides the box.
+    #[test]
+    fn create_reply_names_the_taken_derived_name_holder_only_to_its_reader() {
+        let holder = boxes::box_name::NamedBox {
+            id: SessionId::mint(),
+            name: "web".to_string(),
+            status: boxes::BoxState::Active,
+        };
+        use crate::box_manager::HolderCreator;
+        let not_taken = |creator: HolderCreator| crate::box_manager::NotTakenName {
+            name: "web".to_string(),
+            reason: boxes::box_name::DerivedNameTaken::Held(holder.clone()),
+            holder_creator: creator,
+        };
+        let ann = || HolderCreator::User("ann".to_string());
+        let named = |reply: minimald_rpc::NameNotTaken| match reply.reason {
+            minimald_rpc::NameTakenReason::Held { holder } => holder,
+            other => panic!("a held name: {other:?}"),
+        };
+        let shown = named(super::name_not_taken_reply(&not_taken(ann()), Some("ann")))
+            .expect("the creator reads the holder");
+        assert_eq!((shown.id, shown.state.as_str()), (holder.id, "running"));
+        assert_eq!(
+            named(super::name_not_taken_reply(
+                &not_taken(HolderCreator::NoCreator),
+                Some("bob")
+            )),
+            None,
+            "a record with no creator is hidden"
+        );
+        assert_eq!(
+            named(super::name_not_taken_reply(&not_taken(ann()), None)),
+            None,
+            "a caller with no user does not read the holder"
+        );
+        let hidden = super::name_not_taken_reply(&not_taken(ann()), Some("bob"));
+        assert_eq!(hidden.name, "web", "the name is still in the reply");
+        assert_eq!(named(hidden), None, "another user does not read the holder");
+        let unread = super::name_not_taken_reply(&not_taken(HolderCreator::Unread), Some("ann"));
+        assert_eq!(unread.name, "web", "the name is still in the reply");
+        assert_eq!(named(unread), None, "an unread holder record is hidden");
+    }
+
     /// A create under a name a running box holds is refused, and the
     /// reply names the holder for the client to print and exit 2 on.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3984,10 +4165,10 @@ mod create_naming_tests {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
         let holder = create(&mut client, &entry_req("dev", false)).await;
-        assert_eq!(name_of(&server, holder).await.as_deref(), Some("dev"));
+        assert_eq!(name_of(&server, holder).await.as_deref(), Some("web-dev"));
 
         let error = match client
-            .call::<CreateSession>(&create_session_req("dev", "/tmp"))
+            .call::<CreateSession>(&create_session_req("web-dev", "/tmp"))
             .await
         {
             CreateSessionReply::Err { error, .. } => error,
@@ -3998,15 +4179,15 @@ mod create_naming_tests {
         assert_eq!(
             refusal,
             HeldNameRefusal {
-                name: "dev".to_string(),
+                name: "web-dev".to_string(),
                 holder: Some(holder),
-                holder_name: "dev".to_string(),
+                holder_name: "web-dev".to_string(),
             }
         );
         assert_eq!(HeldNameRefusal::EXIT_CODE, 2);
         assert!(error.contains(&holder.to_string()), "{error}");
         assert!(
-            error.contains(&format!("min session rename {holder} <new-name>")),
+            error.contains(&format!("min box rename {holder} <new-name>")),
             "the refusal names the next step: {error}"
         );
         assert_eq!(
@@ -4016,8 +4197,9 @@ mod create_naming_tests {
         );
     }
 
-    /// A fresh instance takes `<name>-<n>`, with the smallest `n` that no
-    /// retained record uses, while a running box holds `<name>`.
+    /// A fresh instance takes the derived `<project>-<entry>-<n>`, with the
+    /// smallest `n` that no retained record uses, while a running box
+    /// holds `<project>-<entry>`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_session_fresh_instance_takes_the_smallest_unused_suffix() {
         let server = TestServer::new().await;
@@ -4025,13 +4207,61 @@ mod create_naming_tests {
         let dev = create(&mut client, &entry_req("dev", false)).await;
         let first = create(&mut client, &entry_req("dev", true)).await;
         let second = create(&mut client, &entry_req("dev", true)).await;
-        assert_eq!(name_of(&server, dev).await.as_deref(), Some("dev"));
-        assert_eq!(name_of(&server, first).await.as_deref(), Some("dev-1"));
-        assert_eq!(name_of(&server, second).await.as_deref(), Some("dev-2"));
+        assert_eq!(name_of(&server, dev).await.as_deref(), Some("web-dev"));
+        assert_eq!(name_of(&server, first).await.as_deref(), Some("web-dev-1"));
+        assert_eq!(name_of(&server, second).await.as_deref(), Some("web-dev-2"));
 
         // A fresh instance with no running holder still takes a suffix.
         let web = create(&mut client, &entry_req("web", true)).await;
-        assert_eq!(name_of(&server, web).await.as_deref(), Some("web-1"));
+        assert_eq!(name_of(&server, web).await.as_deref(), Some("web-web-1"));
+    }
+
+    /// BOX-211, BOX-214: a create with no written name takes its name from
+    /// the project name the request sends and the entry, for the task verb
+    /// and for the session verb that `min box start` and `min dash` send.
+    /// A `[box] name` in the spec never names the box. A client that sends
+    /// no project name gets the project root directory's name.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_without_written_name_derives_from_project_and_entry_for_every_client() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        let mut task = entry_req("lint", false);
+        task.spec.as_mut().expect("a task spec")["box"]["name"] =
+            serde_json_lenient::Value::String("api".to_string());
+        assert_eq!(
+            boxes::box_name::spec_box_name(task.spec.as_ref()),
+            Some("api")
+        );
+        let id = create(&mut client, &task).await;
+        assert_eq!(name_of(&server, id).await.as_deref(), Some("web-lint"));
+
+        let mut session = create_session_req("unused", "/tmp");
+        session.config.name = None;
+        session.config.project_name = Some("app".to_string());
+        let id = create(&mut client, &session).await;
+        assert_eq!(name_of(&server, id).await.as_deref(), Some("app"));
+
+        let mut older = create_session_req("unused", "/tmp");
+        older.config.name = None;
+        older.config.project_name = None;
+        let id = create(&mut client, &older).await;
+        assert_eq!(name_of(&server, id).await.as_deref(), Some("tmp"));
+
+        let mut bad = create_session_req("unused", "/tmp");
+        bad.config.name = None;
+        bad.config.project_name = Some("my_app".to_string());
+        match client.call::<CreateSession>(&bad).await {
+            CreateSessionReply::Err {
+                error, exit_code, ..
+            } => {
+                assert_eq!(exit_code, Some(3), "{error}");
+                assert!(error.contains("[project] name"), "{error}");
+            }
+            CreateSessionReply::Ok(created) => {
+                panic!("a project name that is not a DNS label is not refused: {created:?}")
+            }
+        }
     }
 
     /// A task entry that is not a DNS label, such as `build_all`, names a
@@ -4043,10 +4273,13 @@ mod create_naming_tests {
         let build = create(&mut client, &entry_req("build_all", true)).await;
         assert_eq!(
             name_of(&server, build).await.as_deref(),
-            Some("build-all-1")
+            Some("web-build-all-1")
         );
         let lint = create(&mut client, &entry_req("CI.Lint", true)).await;
-        assert_eq!(name_of(&server, lint).await.as_deref(), Some("ci-lint-1"));
+        assert_eq!(
+            name_of(&server, lint).await.as_deref(),
+            Some("web-ci-lint-1")
+        );
     }
 }
 
@@ -4351,4 +4584,11 @@ mod admission_refusal_tests {
         let mngr = server.state.sessions_manager().await;
         assert!(mngr.list_boxes(None).await.unwrap().is_empty());
     }
+}
+
+/// The id this daemon process took when it started, which the session list
+/// reports ([`minimald_rpc::ListSessionsResponse::daemon_epoch`]).
+fn daemon_epoch() -> &'static str {
+    static EPOCH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(|| boxes::SessionId::mint().to_string())
 }

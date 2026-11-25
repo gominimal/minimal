@@ -223,6 +223,7 @@ fn ls_shows_shared_resource_pool() {
     let resp = ListSessionsResponse {
         box_networks: Default::default(),
         daemon_version: None,
+        daemon_epoch: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
         zone_answerer_port: None,
@@ -267,6 +268,7 @@ fn ls_table_exposes_project_path_and_status() {
     let resp = ListSessionsResponse {
         box_networks: Default::default(),
         daemon_version: None,
+        daemon_epoch: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
         zone_answerer_port: None,
@@ -358,6 +360,7 @@ fn ls_table_shows_host_address_enforcement() {
         .into_iter()
         .collect(),
         daemon_version: None,
+        daemon_epoch: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
         zone_answerer_port: None,
@@ -419,6 +422,7 @@ fn ls_reports_yielded_shared_address_ports() {
     let resp = ListSessionsResponse {
         box_networks: Default::default(),
         daemon_version: None,
+        daemon_epoch: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
         zone_answerer_port: None,
@@ -505,6 +509,7 @@ fn ls_across_vms_table_shows_host_address_enforcement() {
         resp: ListSessionsResponse {
             box_networks,
             daemon_version: None,
+            daemon_epoch: None,
             hostname_routing_unavailable: None,
             hostname_proxy_port: None,
             zone_answerer_port: None,
@@ -865,6 +870,7 @@ async fn dashboard_activate_uploads_loadout_patches() {
         initial_policy: Default::default(),
         compose_options: Default::default(),
         loadout_names: Vec::new(),
+        diagnostics: Default::default(),
     };
     let activated = minimal::dash::rpc::activate(
         &sock,
@@ -874,6 +880,7 @@ async fn dashboard_activate_uploads_loadout_patches() {
         boxes::NetworkMode::NoNet,
         minimal::UploadDecision::Upload,
         inputs,
+        minimal::dash::rpc::PickedEntry::default(),
     )
     .await
     .expect("a patch-carrying dashboard create finalizes");
@@ -1650,6 +1657,95 @@ async fn loadout_list_warning_goes_to_stderr_not_stdout() {
         !stdout.contains("warning:"),
         "a plain-mode warning must not pollute stdout, got: {stdout}"
     );
+}
+
+/// #3529: `min dash` puts a `minimal.toml`'s legacy-table hints on its
+/// status line, and every other command still prints them on stderr. Driven
+/// through the compiled binary, because the contract is which stream the
+/// process writes to. `min box spec <entry>` loads the file more than once,
+/// and the hint prints once.
+#[tokio::test]
+async fn box_spec_entry_prints_legacy_session_hint_on_stderr() {
+    let (_daemon, args) = setup().await;
+    let minimal_dir = args.minimal_dir.clone().expect("setup points at a tempdir");
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "[session]\npackages = [\"git\"]\n",
+    )
+    .unwrap();
+    let config_dir = tempfile::TempDir::new().unwrap();
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .current_dir(project.path())
+        .env("MIN_PROVIDER", "local")
+        .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
+        .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+        .arg("--no-input")
+        .args(["box", "spec", "default"])
+        .env_remove("RUST_LOG")
+        .output()
+        .await
+        .expect("the min binary should be invocable");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let hint = "hint: Rename `[session]` to `[defaults.session]` in minimal.toml.";
+    assert_eq!(
+        stderr.matches(hint).count(),
+        1,
+        "the legacy hint must print once on stderr: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        !stdout.contains("hint:"),
+        "the hint must not reach stdout: {stdout}"
+    );
+}
+
+/// BCLI-084, BOX-230, BOX-231: `min box spec <entry>` prints one stderr
+/// line for each `env_vars` name that looks like a secret's, and stdout
+/// stays the spec, with the value as written, under `-o json`.
+#[tokio::test]
+async fn box_spec_entry_prints_secret_name_warnings_on_stderr() {
+    let (_daemon, args) = setup().await;
+    let minimal_dir = args.minimal_dir.clone().expect("setup points at a tempdir");
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "[sessions.dev]\nenv_vars = { GITHUB_TOKEN = \"x\", EDITOR = \"hx\" }\n",
+    )
+    .unwrap();
+    let config_dir = tempfile::TempDir::new().unwrap();
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .current_dir(project.path())
+        .env("MIN_PROVIDER", "local")
+        .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
+        .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+        .arg("--no-input")
+        .args(["box", "spec", "dev", "-o", "json"])
+        .env_remove("RUST_LOG")
+        .output()
+        .await
+        .expect("the min binary should be invocable");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "min box spec dev: stdout={stdout} stderr={stderr}"
+    );
+    let line = "warning: the variable GITHUB_TOKEN in `env_vars` has a name that looks \
+                like a secret's. `[sessions.dev]` in minimal.toml sets it. A box from this \
+                entry stores its value as written in the box's spec. Put a secret value in \
+                a `[secrets]` entry to keep it out of the spec.\n";
+    assert_eq!(
+        stderr.matches(line).count(),
+        1,
+        "one warning line on stderr: {stderr}"
+    );
+    assert_eq!(stderr.matches("warning:").count(), 1, "{stderr}");
+    let doc: serde_json_lenient::Value =
+        serde_json_lenient::from_str(stdout.trim()).expect("stdout parses as JSON");
+    assert_eq!(doc["spec"]["env_vars"]["GITHUB_TOKEN"], "x", "{stdout}");
 }
 
 // --- box rm (BCLI-042 removed `min session destroy`) ---
@@ -3748,6 +3844,7 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
     let resp = ListSessionsResponse {
         box_networks: Default::default(),
         daemon_version: None,
+        daemon_epoch: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
         zone_answerer_port: None,
@@ -3890,6 +3987,7 @@ fn ls_keeps_the_answerer_row_beside_a_down_proxy() {
     let resp = ListSessionsResponse {
         box_networks: Default::default(),
         daemon_version: None,
+        daemon_epoch: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
         zone_answerer_port: None,
@@ -4070,6 +4168,7 @@ fn ls_across_vms_names_one_proxy_verdict_per_vm() {
         resp: ListSessionsResponse {
             box_networks: Default::default(),
             daemon_version: None,
+            daemon_epoch: None,
             hostname_routing_unavailable: None,
             hostname_proxy_port: Some(proxy_port),
             zone_answerer_port: None,
@@ -4329,6 +4428,7 @@ fn session_list_decodes_without_mtls_field() {
     let resp = ListSessionsResponse {
         box_networks: Default::default(),
         daemon_version: Some("test".to_string()),
+        daemon_epoch: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
         zone_answerer_port: None,
@@ -4858,9 +4958,19 @@ async fn task_run_exits_with_held_open_stdin_pipe() {
         String::from_utf8_lossy(&stdout)
     );
     let stderr = String::from_utf8_lossy(&stderr);
+    // A task box with no requested name takes the derived name
+    // `<project>-<task>`, and a number only when that name is taken
+    // (BOX-211, BCLI-070, BCLI-080). The project is the tempdir's last path
+    // component.
+    let root = project.path().to_string_lossy();
+    let box_name = boxes::box_name::derived_box_name(
+        boxes::box_name::project_name_of_root(&root),
+        Some("e2e-echo"),
+        None,
+    );
     assert!(
-        stderr.contains("Running task e2e-echo in box e2e-echo-1"),
-        "task run must reach its box's entrypoint: stderr={stderr}"
+        stderr.contains(&format!("Running task e2e-echo in box {box_name}")),
+        "task run must reach its box's entrypoint as {box_name}: stderr={stderr}"
     );
     // The entrypoint never started, so the client removes the box and
     // keeps nothing.

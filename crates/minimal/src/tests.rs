@@ -232,7 +232,10 @@ fn version_skew_is_reported_with_both_builds_and_a_recovery() {
         msg.contains("0.5.0-dev.12.g86ce5c3a"),
         "missing the daemon version: {msg}"
     );
-    assert!(msg.contains("min stop"), "missing the recovery: {msg}");
+    assert!(
+        msg.contains("min host stop <host>"),
+        "missing the recovery: {msg}"
+    );
     assert!(
         msg.contains(client::SKEW_OVERRIDE_VAR),
         "missing the override: {msg}"
@@ -259,6 +262,10 @@ fn every_daemon_connection_is_classified() {
             // the same ride-along shape `resolve_session_version_gated` uses.
             "attach.rs::box_record_on = gated",
             "cmd/admin.rs::cmd_version = ungated",
+            // Not a daemon connection: `min box audit` reads the audit
+            // records from the Box Egress Proxy over its control socket. The
+            // proxy is not the daemon, and the read builds nothing.
+            "cmd/box_audit.rs::open = ungated",
             // A box address reaches every local host, split as `min box
             // list` splits it: the selected host is the one this process
             // ensured, so it keeps the gate. The others are probed ungated,
@@ -372,6 +379,9 @@ fn every_daemon_connection_is_classified() {
             "tests.rs::an_identity_with_no_root_validity_mints_nothing = ungated",
             "tests.rs::attach_fall_through_hands_off_the_owning_vm = gated",
             "tests.rs::attach_refuses_a_box_name_two_vms_know = gated",
+            // Test-only: the audit read test serves its own proxy control
+            // socket, so no daemon is involved.
+            "tests.rs::box_audit_reads_over_the_proxy_socket = ungated",
             "tests.rs::exec_fall_through_hands_off_the_owning_vm = gated",
             "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy = ungated",
             "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy = ungated",
@@ -440,6 +450,15 @@ fn every_create_session_asserts_the_daemon_build() {
             "dash/rpc.rs::activate = asserts",
             // A unit test's request, never sent: it checks the project root.
             "dash/rpc.rs::dashboard_create_from_a_subdirectory_sends_the_project_root = asserts nothing",
+            // A unit test's request, never sent: it checks that a dashboard
+            // create stores the spec `min box start` stores.
+            "dash/rpc.rs::dashboard_create_with_a_named_entry_stores_the_box_start_spec = asserts nothing",
+            // A unit test's request, never sent: it checks the network and
+            // policy a dashboard create takes from an entry.
+            "dash/rpc.rs::dashboard_request_for_entry_with = asserts nothing",
+            // Not a create: the request only carries a config to the grant
+            // mint. The create `activate` sends asserts the build.
+            "dash/rpc.rs::mint_box_grants = asserts nothing",
             // Not a create the dashboard sends: the unit tests' own-address
             // config, which only a fake create closure receives.
             "dash/rpc.rs::own_ip_config = asserts nothing",
@@ -458,6 +477,10 @@ fn every_create_session_asserts_the_daemon_build() {
             "tests.rs::create_box_on = asserts",
             // Not a client path: the mint unit tests' create-request fixture.
             "tests.rs::create_request = asserts",
+            // Unit test requests, never sent: they check what a start puts
+            // on its create request.
+            "tests.rs::create_request_carries_project_name_and_entry = asserts nothing",
+            "tests.rs::create_request_carries_project_name_and_entry = asserts nothing",
             // A test's request, sent only to the in-process test daemon,
             // which is this build: it checks the stored projection digests.
             "tests.rs::create_stores_client_digest_equal_to_daemon_digest = asserts nothing",
@@ -466,11 +489,14 @@ fn every_create_session_asserts_the_daemon_build() {
             "tests.rs::create_verbs_name_flag_overrides_box_name = asserts nothing",
             "tests.rs::create_verbs_name_flag_overrides_box_name = asserts nothing",
             // A unit test's request, never sent: it checks the box's name.
-            "tests.rs::created_box_name_is_the_entry_without_a_typed_name = asserts nothing",
+            "tests.rs::created_box_name_is_the_request_name_else_derived = asserts nothing",
             // A unit test's request, never sent: it checks the cleaned entry name.
             "tests.rs::entry_name_registers_and_creates_under_one_cleaned_name = asserts nothing",
             // A unit test's request, never sent: it checks the session spec's packages.
             "tests.rs::init_scaffolds_entry_shape_loads_and_starts_with_its_packages = asserts nothing",
+            // A unit test's request, never sent: it checks the name an
+            // interactive task's run requests (BCLI-069).
+            "tests.rs::interactive_task_name_flag_is_written = asserts nothing",
             // A test's request, sent only to the in-process test daemon,
             // which is this build: it checks the start's override flags.
             "tests.rs::planned_session_request_checked = asserts nothing",
@@ -486,6 +512,9 @@ fn every_create_session_asserts_the_daemon_build() {
             // A unit test's request, never sent: it checks the run path's
             // `--no-hooks` on the stored spec.
             "tests.rs::start_no_hooks_stores_no_hooks = asserts nothing",
+            // A unit test's request, never sent: it checks the name a
+            // task-entry start requests (BCLI-069, BCLI-079, BCLI-080).
+            "tests.rs::task_create_request = asserts nothing",
             // A unit test's request, never sent: it checks the task's
             // secrets on the spec a run sends.
             "tests.rs::task_spec_carries_expanded_secrets = asserts nothing",
@@ -893,6 +922,18 @@ async fn removed_session_verbs_fail_as_unknown_commands() {
         );
     }
 
+    // `--sync` left with `min session activate`: no start takes it.
+    for argv in [
+        &["min", "session", "start", "--sync", "none"][..],
+        &["min", "box", "start", "--sync", "none"],
+    ] {
+        let rendered = refused(argv, ErrorKind::UnknownArgument);
+        assert!(
+            rendered.contains("unexpected argument '--sync'"),
+            "{argv:?}: {rendered}"
+        );
+    }
+
     // The command model has none of them, hidden or not, so neither help
     // nor completions offer them.
     let cli = Cli::command();
@@ -935,23 +976,41 @@ async fn removed_session_verbs_fail_as_unknown_commands() {
         no_input: true,
         ..Default::default()
     };
-    for (argv, flag) in [
+    // BCLI-026: the box verb refuses a `--path` after the entry's name the
+    // same way, and its refusal names the box verb.
+    for (argv, flag, verb) in [
         (
             &["min", "task", "run", "build", "--path", "sub/dir"][..],
             "--path",
+            "task",
         ),
-        (&["min", "task", "run", "build", "--path=sub/dir"], "--path"),
+        (
+            &["min", "task", "run", "build", "--path=sub/dir"],
+            "--path",
+            "task",
+        ),
+        (
+            &["min", "box", "run", "build", "--path", "sub/dir"],
+            "--path",
+            "box",
+        ),
+        (
+            &["min", "box", "run", "build", "--path=sub/dir"],
+            "--path",
+            "box",
+        ),
     ] {
         let cli = Cli::try_parse_from(argv).unwrap_or_else(|err| panic!("{argv:?}: {err}"));
-        let Some(Command::Task(TaskArgs {
-            command: TaskCommand::Run(run),
-        })) = cli.command
-        else {
-            panic!("{argv:?} parses as a task run");
-        };
-        let err = task::cmd_task_run(&global, run)
-            .await
-            .expect_err("a task run with --path is refused");
+        let err = match cli.command {
+            Some(Command::Task(TaskArgs {
+                command: TaskCommand::Run(run),
+            })) => task::cmd_task_run(&global, run).await,
+            Some(Command::Box(BoxArgs {
+                command: BoxCommand::Run(run),
+            })) => task::cmd_box_run(&global, run).await,
+            _ => panic!("{argv:?} parses as a task run or a box run"),
+        }
+        .expect_err("a run with --path is refused");
         let refusal = err
             .downcast_ref::<task::RunFlagMisplaced>()
             .unwrap_or_else(|| panic!("{argv:?}: {err:#}"));
@@ -959,9 +1018,9 @@ async fn removed_session_verbs_fail_as_unknown_commands() {
         assert_eq!(
             refusal.to_string(),
             format!(
-                "Cannot run build: min task run has no {flag} flag. Run min -C <dir> task run \
-                 build to run the task in the project at <dir>, or put -- between build and \
-                 its arguments to pass {flag} to the task."
+                "Cannot run build: min {verb} run has no {flag} flag. Run min -C <dir> {verb} \
+                 run build to run the task in the project at <dir>, or put -- between build \
+                 and its arguments to pass {flag} to the task."
             ),
             "{argv:?}"
         );
@@ -1045,6 +1104,255 @@ async fn kept_session_list_and_attach_still_work() {
         .await
         .unwrap_or_else(|err| panic!("the session attach: {err:#}"));
     assert_eq!(attached.box_id, dev);
+}
+
+/// One `min` command line the box grammar end-to-end test ran, with
+/// its stdout, its stderr and its exit code.
+struct GrammarRun {
+    argv: Vec<String>,
+    stdout: String,
+    stderr: String,
+    exit: u8,
+}
+
+impl std::fmt::Display for GrammarRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "$ {}", self.argv.join(" "))?;
+        writeln!(f, "  exit: {}", self.exit)?;
+        writeln!(f, "  stdout: {:?}", self.stdout)?;
+        writeln!(f, "  stderr: {:?}", self.stderr)
+    }
+}
+
+/// Runs `argv` as `main` does: a parse failure ends with clap's exit code
+/// and runs nothing. A parsed command goes through [`run`], with fd 1 and
+/// fd 2 captured. The exit code of a failed run is the one
+/// [`box_command_ending`] gives. Under nextest every test owns its
+/// process, so the redirect reaches no other test.
+async fn run_min_captured(argv: &[&str]) -> GrammarRun {
+    use clap::Parser as _;
+    use std::io::{Read as _, Seek as _, Write as _};
+
+    let argv_owned: Vec<String> = argv.iter().map(|arg| (*arg).to_owned()).collect();
+    let cli = match Cli::try_parse_from(argv) {
+        Ok(cli) => cli,
+        Err(err) => {
+            let err = with_retired_command_hint(err);
+            return GrammarRun {
+                argv: argv_owned,
+                stdout: String::new(),
+                stderr: err.to_string(),
+                exit: u8::try_from(err.exit_code()).unwrap_or(u8::MAX),
+            };
+        }
+    };
+    struct RestoreStdio {
+        out: std::os::fd::OwnedFd,
+        err: std::os::fd::OwnedFd,
+    }
+    impl Drop for RestoreStdio {
+        fn drop(&mut self) {
+            let _ = std::io::stdout().flush();
+            nix::unistd::dup2_stdout(&self.out).expect("restore stdout after capture");
+            nix::unistd::dup2_stderr(&self.err).expect("restore stderr after capture");
+        }
+    }
+    let mut out = tempfile::tempfile().expect("a stdout capture file");
+    let mut err = tempfile::tempfile().expect("a stderr capture file");
+    std::io::stdout().flush().expect("flush stdout");
+    let restore = RestoreStdio {
+        out: nix::unistd::dup(std::io::stdout()).expect("dup stdout"),
+        err: nix::unistd::dup(std::io::stderr()).expect("dup stderr"),
+    };
+    nix::unistd::dup2_stdout(&out).expect("redirect stdout");
+    nix::unistd::dup2_stderr(&err).expect("redirect stderr");
+    let result = run(cli).await;
+    drop(restore);
+    let read = |file: &mut std::fs::File| {
+        let mut text = String::new();
+        file.rewind().expect("rewind the capture");
+        file.read_to_string(&mut text).expect("read the capture");
+        text
+    };
+    let (stdout, mut stderr) = (read(&mut out), read(&mut err));
+    let (error, exit) = box_command_ending(&result);
+    if !error.is_empty() {
+        stderr.push_str(&format!("error: {error}\n"));
+    }
+    GrammarRun {
+        argv: argv_owned,
+        stdout,
+        stderr,
+        exit,
+    }
+}
+
+// T34 (S8; BCLI-026, BCLI-030, BCLI-032, BCLI-042): the box grammar and
+// its migration, end to end. Every `min box` verb and its session and task
+// forms parse to their own verb. The verbs a harness daemon can answer run
+// through the CLI's dispatch against it. The harness cannot start a box, so
+// start, run, attach, resume, restart, exec, cp and wait are proved at the
+// parser here, and through stand-ins in their own end-to-end tests. Each
+// spelling BCLI-042 removed fails with exit 2 and leaves the daemon's boxes
+// as they were. A failure prints every command run so far.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn box_grammar_and_migration_end_to_end() {
+    use clap::CommandFactory as _;
+
+    // Each form parses to the verb it names (an alias to its verb).
+    for (argv, path) in [
+        (&["min", "box", "start", "--detach"][..], "box start"),
+        (&["min", "box", "run", "check"], "box run"),
+        (&["min", "box", "list", "--all"], "box list"),
+        (&["min", "boxes", "list"], "box list"),
+        (&["min", "box", "show", "web"], "box show"),
+        (&["min", "box", "spec", "web"], "box spec"),
+        (&["min", "box", "audit", "web"], "box audit"),
+        (&["min", "box", "stop", "web"], "box stop"),
+        (&["min", "box", "rm", "--force", "web"], "box rm"),
+        (&["min", "box", "prune", "--dry-run"], "box prune"),
+        (&["min", "box", "resume", "web"], "box resume"),
+        (&["min", "box", "rename", "web", "api"], "box rename"),
+        (&["min", "box", "restart", "web"], "box restart"),
+        (&["min", "box", "logs", "web"], "box logs"),
+        (&["min", "box", "wait", "web"], "box wait"),
+        (&["min", "box", "events", "web"], "box events"),
+        (&["min", "box", "cp", "web:/etc/hostname", "out"], "box cp"),
+        (&["min", "box", "exec", "web", "--", "true"], "box exec"),
+        (&["min", "box", "attach", "web"], "box attach"),
+        (&["min", "session", "start", "--detach"], "session start"),
+        (&["min", "session", "list"], "session list"),
+        (&["min", "sessions", "ls"], "session list"),
+        (&["min", "session", "attach", "web"], "session attach"),
+        (&["min", "session", "logs", "web"], "session logs"),
+        (&["min", "session", "stop", "web"], "session stop"),
+        (&["min", "session", "rm", "web"], "session rm"),
+        (&["min", "task", "run", "check"], "task run"),
+        (&["min", "task", "list"], "task list"),
+        (&["min", "tasks", "list"], "task list"),
+        (&["min", "task", "logs", "check"], "task logs"),
+        (&["min", "task", "stop", "check"], "task stop"),
+        (&["min", "task", "rm", "check"], "task rm"),
+    ] {
+        let matches = Cli::command()
+            .try_get_matches_from(argv)
+            .unwrap_or_else(|err| panic!("`{}` does not parse: {err}", argv.join(" ")));
+        let (noun, sub) = matches.subcommand().expect("a noun");
+        let verb = sub.subcommand_name().expect("a verb");
+        assert_eq!(format!("{noun} {verb}"), path, "`{}`", argv.join(" "));
+    }
+
+    // A session box and a task box in one project, on a harness daemon
+    // that the native host's socket serves.
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let config_dir = tempfile::tempdir().expect("a temp config dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let (server, _global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let project = project.path().to_str().expect("a UTF-8 project path");
+    let mut daemon = server.connect().await;
+    let web = minimald::test_harness::create_configured_session(&mut daemon, "web", project).await;
+    let check = create_configured_task(&mut daemon, "check", project).await;
+    let boxes_now = async || {
+        let mut ids: Vec<String> = server
+            .connect()
+            .await
+            .call::<minimald_rpc::ListSessions>(&())
+            .await
+            .sessions
+            .iter()
+            .map(|listed| format!("{listed:?}"))
+            .collect();
+        ids.sort();
+        ids
+    };
+
+    let dirs = [
+        "--minimal-dir",
+        minimal_dir.path().to_str().expect("a UTF-8 state dir"),
+        "--config-dir",
+        config_dir.path().to_str().expect("a UTF-8 config dir"),
+        "--provider",
+        "local",
+        "--no-input",
+        "-C",
+        project,
+    ];
+    let mut runs: Vec<GrammarRun> = Vec::new();
+    let transcript = |runs: &[GrammarRun]| -> String {
+        runs.iter().map(ToString::to_string).collect::<String>()
+    };
+    // (argv after `min`, exit, text stdout must hold)
+    let (web, check) = (web.to_string(), check.to_string());
+    let steps: &[(&[&str], u8, &str)] = &[
+        (&["box", "list", "--all"], 0, &web),
+        (&["box", "list", "--all"], 0, &check),
+        (&["session", "list", "--all"], 0, &web),
+        (&["task", "list"], 0, "check"),
+        (&["box", "show", "web"], 0, &web),
+        (&["box", "events", "web"], 0, ""),
+        (&["box", "rename", "web", "api"], 0, ""),
+        (&["box", "show", "api"], 0, "api"),
+        (&["box", "show", "web"], 4, ""),
+        (&["box", "rm", "api"], 2, ""),
+        (&["session", "stop", "api"], 0, ""),
+        (&["box", "prune", "--dry-run"], 0, "api"),
+        (&["session", "rm", "api"], 2, ""),
+        (&["session", "rm", "--force", "api"], 0, ""),
+        (&["task", "stop", "check"], 0, ""),
+        (&["box", "stop", "check"], 0, ""),
+        (&["box", "rm", "check"], 2, ""),
+        (&["task", "rm", "check"], 2, ""),
+        (&["task", "rm", "--force", "check"], 0, ""),
+        (&["box", "list", "--all"], 0, ""),
+    ];
+    for (args, exit, shows) in steps {
+        let argv: Vec<&str> = ["min"].iter().chain(&dirs).chain(*args).copied().collect();
+        runs.push(run_min_captured(&argv).await);
+        let ran = runs.last().expect("the run just pushed");
+        assert_eq!(ran.exit, *exit, "{}", transcript(&runs));
+        assert!(ran.stdout.contains(shows), "{}", transcript(&runs));
+        // Each rm form refuses a box it cannot remove unasked as
+        // `min box rm` does, and the refusal names `--force`.
+        if args.contains(&"rm") && *exit == 2 {
+            assert!(ran.stderr.contains("--force"), "{}", transcript(&runs));
+        }
+    }
+    assert!(boxes_now().await.is_empty(), "{}", transcript(&runs));
+
+    // Each spelling BCLI-042 removed fails as an unknown command or flag,
+    // with exit 2, and the daemon's boxes are as they were.
+    let kept = minimald::test_harness::create_configured_session(&mut daemon, "web", project).await;
+    let before = boxes_now().await;
+    let mut removed: Vec<Vec<&str>> = REMOVED_SESSION_VERBS
+        .iter()
+        .flat_map(|verb| [vec!["session", *verb, "web"], vec!["sessions", *verb]])
+        .collect();
+    removed.push(vec!["stop"]);
+    removed.push(vec!["stop", "--force"]);
+    removed.push(vec!["task", "run", "--path", "sub", "check"]);
+    removed.push(vec!["task", "run", "--path=sub", "check"]);
+    for args in removed {
+        let argv: Vec<&str> = ["min"].iter().chain(&dirs).chain(&args).copied().collect();
+        runs.push(run_min_captured(&argv).await);
+        let ran = runs.last().expect("the run just pushed");
+        assert_eq!(ran.exit, 2, "{}", transcript(&runs));
+        assert_eq!(ran.stdout, "", "{}", transcript(&runs));
+        assert!(
+            ran.stderr.contains("unrecognized subcommand")
+                || ran.stderr.contains("unexpected argument '--path"),
+            "{}",
+            transcript(&runs)
+        );
+        assert_eq!(boxes_now().await, before, "{}", transcript(&runs));
+    }
+    assert!(
+        before
+            .iter()
+            .any(|listed| listed.contains(&kept.to_string())),
+        "{}",
+        transcript(&runs)
+    );
 }
 
 /// The clap command of [`ActivateArgs`], built, so its flags and help are
@@ -1524,7 +1832,7 @@ fn held_name_refusal_exits_2_and_names_the_holder() {
         printed,
         "Cannot create a session named `default`: the running session `Default` \
          (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) holds that name. Rename that session \
-         with `min session rename 0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b <new-name>`, \
+         with `min box rename 0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b <new-name>`, \
          or choose another name."
     );
 
@@ -1560,7 +1868,7 @@ fn own_address_held_name_refusal_exits_2_and_names_the_holder() {
         format!("{error:#}"),
         "Cannot create a session named `dev`: the running session `Dev` \
          (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) holds that name. Rename that session \
-         with `min session rename 0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b <new-name>`, \
+         with `min box rename 0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b <new-name>`, \
          or choose another name."
     );
 
@@ -1581,11 +1889,12 @@ fn own_address_held_name_refusal_exits_2_and_names_the_holder() {
     );
 }
 
-/// BOX-163: with no `--name`, the create carries no name and the box takes
-/// its entry's name. Nothing mints `<dir>-<hex>`. A `[box] name` in the
-/// spec comes first, then `--name`.
+/// BOX-211: the name the client registers a box under is the request's
+/// name, which carries `--name` or the spec's `[box] name`, else the name
+/// the daemon derives from the project and the spec's entry. Nothing mints
+/// `<dir>-<hex>`.
 #[test]
-fn created_box_name_is_the_entry_without_a_typed_name() {
+fn created_box_name_is_the_request_name_else_derived() {
     let mut request = minimald_rpc::CreateSessionRequest::new(
         String::new(),
         paths::HostAbsPath::try_new("/home/u/code/foo").unwrap(),
@@ -1593,26 +1902,27 @@ fn created_box_name_is_the_entry_without_a_typed_name() {
         boxes::BoxPolicy::default(),
     );
     request.config.name = minimal_client::box_name::request_name(None);
-    assert_eq!(created_box_name(&request), None, "no spec, no name");
+    assert_eq!(
+        created_box_name(&request).as_deref(),
+        Some("foo"),
+        "no spec: the project name"
+    );
 
     let mut spec = mfile::spec::BoxSpec::for_session(None, spec_flags(&request));
     put_spec(&mut request, &spec).unwrap();
-    assert_eq!(
-        created_box_name(&request).as_deref(),
-        Some(mfile::spec::DEFAULT_SESSION_ENTRY)
-    );
+    assert_eq!(created_box_name(&request).as_deref(), Some("foo"));
+
+    spec.entry = "lint".to_string();
+    put_spec(&mut request, &spec).unwrap();
+    assert_eq!(created_box_name(&request).as_deref(), Some("foo-lint"));
 
     request.config.name = minimal_client::box_name::request_name(Some("api"));
     assert_eq!(created_box_name(&request).as_deref(), Some("api"));
-
-    spec.name = Some("web".to_string());
-    put_spec(&mut request, &spec).unwrap();
-    assert_eq!(created_box_name(&request).as_deref(), Some("web"));
 }
 
-/// BOX-163: the VM host row and the box carry one name. For an entry such
+/// BOX-211: the VM host row and the box carry one name. For an entry such
 /// as `My App`, the client registers the row under the name the daemon
-/// gives the box, because both sides clean the entry with one function.
+/// gives the box, because both sides derive it with one function.
 #[test]
 fn entry_name_registers_and_creates_under_one_cleaned_name() {
     let mut request = minimald_rpc::CreateSessionRequest::new(
@@ -1625,12 +1935,100 @@ fn entry_name_registers_and_creates_under_one_cleaned_name() {
     let mut spec = mfile::spec::BoxSpec::for_session(None, spec_flags(&request));
     spec.entry = "My App".to_string();
     put_spec(&mut request, &spec).unwrap();
-    assert_eq!(created_box_name(&request).as_deref(), Some("myapp"));
+    assert_eq!(created_box_name(&request).as_deref(), Some("foo-myapp"));
     assert_eq!(
-        created_box_name(&request).as_deref(),
-        Some(boxes::box_name::entry_box_name(&spec.entry).as_str()),
+        created_box_name(&request),
+        Some(boxes::box_name::create_derived_name(
+            "foo",
+            request.spec.as_ref(),
+            None
+        )),
         "the row's name is the daemon's name for the entry"
     );
+}
+
+/// BOX-211, BOX-214: a start's create request carries the project name and
+/// the entry, and the box name only when one is written: `--name`, else
+/// the entry's `[box] name`. The stored spec never carries a name, so a
+/// box with no written name in a project with `[project] name = "web"` is
+/// named `web`, or `web-<entry>` for an entry other than the default.
+#[test]
+fn create_request_carries_project_name_and_entry() {
+    let project = tempfile::tempdir().unwrap();
+    let root = camino::Utf8Path::from_path(project.path())
+        .unwrap()
+        .join("My Checkout");
+    std::fs::create_dir(&root).unwrap();
+    let request = |text: &str, entry: Option<&str>, name: Option<&str>| {
+        std::fs::write(root.join(mfile::MFILE_NAME), text).unwrap();
+        let mut request = minimald_rpc::CreateSessionRequest::new(
+            String::new(),
+            paths::HostAbsPath::try_new(root.clone()).unwrap(),
+            boxes::NetworkMode::HostNet,
+            boxes::BoxPolicy::default(),
+        );
+        request.config.name = minimal_client::box_name::request_name(name);
+        stamp_session_spec_as(&mut request, &root, entry, name, None).unwrap();
+        let spec = request.spec.clone().expect("the start stores a spec");
+        assert_eq!(
+            boxes::box_name::spec_box_name(Some(&spec)),
+            None,
+            "the stored spec carries no name: {spec}"
+        );
+        request
+    };
+
+    let default = request("[project]\nname = \"web\"\n", None, None);
+    assert_eq!(default.config.project_name.as_deref(), Some("web"));
+    assert_eq!(default.config.name, None);
+    assert_eq!(created_box_name(&default).as_deref(), Some("web"));
+
+    let named = "[project]\nname = \"web\"\n[sessions.dev]\n";
+    let dev = request(named, Some("dev"), None);
+    assert_eq!(dev.config.project_name.as_deref(), Some("web"));
+    assert_eq!(dev.config.name, None);
+    let spec: mfile::spec::BoxSpec =
+        serde_json_lenient::from_value(dev.spec.clone().unwrap()).unwrap();
+    assert_eq!(spec.entry, "dev");
+    assert_eq!(created_box_name(&dev).as_deref(), Some("web-dev"));
+
+    // `--name` goes on the request as written.
+    let flagged = request(named, Some("dev"), Some("X"));
+    assert_eq!(flagged.config.name.as_deref(), Some("X"));
+    assert_eq!(flagged.config.project_name.as_deref(), Some("web"));
+
+    // The entry's `[box] name` goes on the request, not into the spec.
+    let boxed = "[project]\nname = \"web\"\n[sessions.dev.box]\nname = \"api\"\n";
+    let entry_named = request(boxed, Some("dev"), None);
+    assert_eq!(entry_named.config.name.as_deref(), Some("api"));
+    assert_eq!(
+        request(boxed, Some("dev"), Some("X"))
+            .config
+            .name
+            .as_deref(),
+        Some("X")
+    );
+
+    // With no `[project] name`, the root directory's name is converted.
+    let plain = request("[sessions.dev]\n", Some("dev"), None);
+    assert_eq!(plain.config.project_name.as_deref(), Some("my-checkout"));
+    assert_eq!(created_box_name(&plain).as_deref(), Some("my-checkout-dev"));
+
+    // A `[project] name` that is not a DNS label refuses the start.
+    std::fs::write(
+        root.join(mfile::MFILE_NAME),
+        "[project]\nname = \"my_app\"\n",
+    )
+    .unwrap();
+    let mut refused = minimald_rpc::CreateSessionRequest::new(
+        String::new(),
+        paths::HostAbsPath::try_new(root.clone()).unwrap(),
+        boxes::NetworkMode::HostNet,
+        boxes::BoxPolicy::default(),
+    );
+    let error = stamp_session_spec_as(&mut refused, &root, None, None, None)
+        .expect_err("an invalid [project] name refuses the start");
+    assert!(format!("{error:#}").contains("[project] name"), "{error:#}");
 }
 
 #[test]
@@ -1775,7 +2173,7 @@ fn no_provider_defaults_to_the_host_backend() {
 #[test]
 fn session_list_spellings_reach_box_list() {
     use clap::Parser as _;
-    let list_args = |args: &[&str]| -> BoxListArgs {
+    let list_args = |args: &[&str]| -> TypedBoxListArgs {
         match Cli::try_parse_from(args).unwrap().command {
             Some(Command::Session(SessionArgs {
                 command: SessionCommand::List(a),
@@ -2055,8 +2453,18 @@ fn task_run_parses_task_and_path() {
     assert_eq!(a.args, ["Alice"]);
 
     // A declared task arg is a `--<name>` flag; it passes through as-is.
-    let a = run_args(&["min", "task", "run", "greet", "--name", "Alice"]);
+    let a = run_args(&["min", "task", "run", "greet", "--who", "Alice"]);
     assert_eq!(a.task, "greet");
+    assert_eq!(a.args, ["--who", "Alice"]);
+    assert_eq!(a.name, None);
+
+    // BCLI-069: `--name` is `min`'s own flag and names the box, as
+    // `--detach` is. A task arg called `--name` goes after `--`.
+    let a = run_args(&["min", "task", "run", "greet", "--name", "Alice"]);
+    assert_eq!(a.name.as_deref(), Some("Alice"));
+    assert!(a.args.is_empty());
+    let a = run_args(&["min", "task", "run", "greet", "--", "--name", "Alice"]);
+    assert_eq!(a.name, None);
     assert_eq!(a.args, ["--name", "Alice"]);
 
     // `--` ends `min`'s own options: what follows is the task's.
@@ -2508,7 +2916,7 @@ async fn run_pty_entry_exit2_hints_start_new() {
             &global,
             BoxRunArgs {
                 entry: "default".into(),
-                path: None,
+                name: None,
                 detach: false,
                 network: None,
                 egress: EgressArgs::default(),
@@ -2522,6 +2930,7 @@ async fn run_pty_entry_exit2_hints_start_new() {
             &global,
             TaskRunArgs {
                 task: "default".into(),
+                name: None,
                 network: None,
                 egress: EgressArgs::default(),
                 other: crate::BoxOverrideArgs::default(),
@@ -2575,10 +2984,10 @@ async fn run_style_propagates_entrypoint_exit() {
     assert!(task::exit_outcome(None).is_err());
 }
 
-// BCLI-070: `min task run` and `min box run` share one run path, and its
-// create asks for a fresh instance under no name of the client's, so the
+// BCLI-070: a fresh instance carries no name of the client's, so the
 // daemon names the box `<name>-<n>`. `min box start --new` and `min session
 // start --new` ask for one through `ActivationOptions::fresh_instance`.
+// `min task run` and `min box run` share one run path.
 #[test]
 fn run_and_start_new_request_fresh_instance() {
     let mut request = minimald_rpc::CreateSessionRequest::new(
@@ -2599,6 +3008,7 @@ fn run_and_start_new_request_fresh_instance() {
     };
     let task_run = task::RunEntry::from(TaskRunArgs {
         task: "build".into(),
+        name: Some("ci-build".into()),
         network: Some(CliNetworkMode::OwnIp),
         egress: egress.clone(),
         other: crate::BoxOverrideArgs::default(),
@@ -2607,7 +3017,7 @@ fn run_and_start_new_request_fresh_instance() {
     });
     let box_run = task::RunEntry::from(BoxRunArgs {
         entry: "build".into(),
-        path: None,
+        name: Some("ci-build".into()),
         detach: false,
         network: Some(CliNetworkMode::OwnIp),
         egress,
@@ -2616,20 +3026,12 @@ fn run_and_start_new_request_fresh_instance() {
     });
     assert_eq!(task_run.entry, box_run.entry);
     assert_eq!(task_run.args, box_run.args);
+    // BCLI-069: both carry `--name` as the requested name.
+    assert_eq!(task_run.box_name.as_deref(), Some("ci-build"));
+    assert_eq!(box_run.box_name.as_deref(), Some("ci-build"));
     // Both carry the network and egress flags to the one run path.
     assert_eq!(task_run.network, box_run.network);
     assert_eq!(task_run.egress, box_run.egress);
-    // That path marks its create as a fresh instance, before it sends it.
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let text = std::fs::read_to_string(manifest.join("src/task.rs")).unwrap();
-    let body = function_body(&text, "run_entry").expect("task.rs defines run_entry");
-    let marked = body
-        .find("request_fresh_instance(&mut request)")
-        .expect("the run marks its create as a fresh instance");
-    let sent = body
-        .find("oneshot_rpc::<CreateSession>")
-        .expect("the run sends its create");
-    assert!(marked < sent, "the run marks its create before it sends it");
 }
 
 /// The entries of a `minimal.toml` that holds `toml`.
@@ -2969,12 +3371,12 @@ async fn unattached_start_closes_stdin_and_hints_run_logs_wait() {
         task::RunEntry {
             verb: task::RunVerb::Box,
             entry: "build".into(),
-            path: None,
             detach: true,
             args: vec![],
             network: None,
             egress: crate::EgressArgs::default(),
             other: crate::BoxOverrideArgs::default(),
+            box_name: None,
         },
         "the start takes the detached run, which closes the box's stdin"
     );
@@ -3096,13 +3498,12 @@ fn create_verbs_name_flag_overrides_box_name() {
         .unwrap();
         assert_eq!(created_box_name(&request).as_deref(), Some("api"));
 
-        // `--new`: no name of the client's on the request, and the spec's
-        // `[box] name` is the base the daemon numbers.
-        request_fresh_instance(&mut request);
-        assert_eq!(request.config.name, None);
+        // The stored spec carries no name (BOX-211).
         let spec: mfile::spec::BoxSpec =
             serde_json_lenient::from_value(request.spec.clone().unwrap()).unwrap();
-        assert_eq!(spec.name.as_deref(), Some("api"));
+        assert_eq!(spec.name, None);
+        request_fresh_instance(&mut request);
+        assert_eq!(request.config.name, None);
 
         // A planned start with `--new` asks the activation for a fresh
         // instance. A start without it does not.
@@ -3138,7 +3539,8 @@ fn create_verbs_name_flag_overrides_box_name() {
         "the activation marks its create before it sends it"
     );
 
-    // Without `--name`, a named session entry names the box.
+    // Without `--name` or a `[box] name`, the box takes the name the
+    // daemon derives from the project and the entry (BOX-211).
     let entries = start_entries("[sessions.dev]\n");
     let StartPlan::Session { options, .. } =
         plan_start(&typed_start(StartVerb::Session, None), &entries, true).unwrap()
@@ -3155,28 +3557,197 @@ fn create_verbs_name_flag_overrides_box_name() {
     );
     request.config.name = minimal_client::box_name::request_name(None);
     stamp_session_spec_as(&mut request, root, options.entry.as_deref(), None, None).unwrap();
-    assert_eq!(created_box_name(&request).as_deref(), Some("dev"));
+    let derived = boxes::box_name::derived_box_name(
+        boxes::box_name::project_name_of_root(root.as_str()),
+        Some("dev"),
+        None,
+    );
+    assert!(derived.ends_with("-dev"), "{derived}");
+    assert_eq!(created_box_name(&request), Some(derived));
+}
 
-    // A task entry's box takes a generated name, so `--name` is refused
-    // before anything is created, not dropped.
-    let entries = start_entries("[tasks.build]\necho = 'x'\n");
-    let mut start = typed_start(StartVerb::Box, Some("build"));
-    start.name = Some("x".to_owned());
-    let error = plan_start(&start, &entries, true).expect_err("--name is refused");
-    let refusal = error
-        .downcast_ref::<StartEntryRefusal>()
-        .expect("a start refusal, which exits 2");
-    assert_eq!(
-        refusal,
-        &StartEntryRefusal::NameUnsupported {
-            entry: "build".to_owned()
-        }
+/// A project whose task `build` sets `[box] name` to `builder`.
+const NAMED_TASK_FILE: &str =
+    "[tasks.build]\nexec = [\"make\"]\n\n[tasks.build.box]\nname = \"builder\"\n";
+
+/// A project whose task `build` sets no `[box] name`.
+const UNNAMED_TASK_FILE: &str = "[tasks.build]\nexec = [\"make\"]\n";
+
+/// The run that `argv`, a `min box start` of a task entry in a project with
+/// `toml` as its `minimal.toml`, plans.
+fn planned_task_start(argv: &[&str], toml: &str) -> task::RunEntry {
+    let cli = Cli::try_parse_from(argv).unwrap();
+    let Some(Command::Box(BoxArgs {
+        command: BoxCommand::Start(args),
+    })) = cli.command
+    else {
+        panic!("not a box start: {argv:?}");
+    };
+    let StartPlan::Detached { run, .. } =
+        plan_start(&StartEntry::from(args), &start_entries(toml), true)
+            .expect("the start is planned")
+    else {
+        panic!("a task entry starts detached");
+    };
+    run
+}
+
+/// The create request of a task run.
+type TaskCreate = minimald_rpc::CreateSessionRequest;
+
+/// The create request of `run` in the project at `project`, built as
+/// `task::run_entry` builds it: the run's box name on the request, then
+/// `task::put_task_spec` with the declared task's spec and the expansion.
+fn task_create_request(project: &std::path::Path, run: &task::RunEntry) -> TaskCreate {
+    let root = camino::Utf8Path::from_path(project).unwrap();
+    let mut request = minimald_rpc::CreateSessionRequest::new(
+        String::new(),
+        paths::HostAbsPath::try_new(root.to_owned()).unwrap(),
+        boxes::NetworkMode::HostNet,
+        boxes::BoxPolicy::default(),
     );
-    assert_eq!(
-        refusal.to_string(),
-        "Cannot start build with --name. A box from a task entry gets a generated \
-         name. Run min box start build without --name."
+    request.config.name = run.box_name.clone();
+    let declared = task::declared_task(root, &run.entry).expect("the task is declared");
+    let mut spec = task::task_box_spec(
+        &run.entry,
+        &declared,
+        crate::spec_flags(&request),
+        &run.args,
+    )
+    .expect("a non-interactive task has a spec");
+    let expanded = crate::task_box_entry(root, &run.entry, true, None)
+        .expect("the task entry expands")
+        .expect("the project declares the task");
+    task::put_task_spec(
+        &mut request,
+        &run.entry,
+        Some(&mut spec),
+        Some(&expanded.spec),
+        &[],
+    )
+    .expect("the spec encodes");
+    request
+}
+
+/// A temp project with `toml` as its `minimal.toml`.
+fn task_project(toml: &str) -> tempfile::TempDir {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    std::fs::write(project.path().join(mfile::MFILE_NAME), toml).unwrap();
+    project
+}
+
+// BCLI-069, BCLI-029: `min box start build --name api` of a task entry
+// sends `api` as the requested name, in place of the entry's `[box] name`.
+// The create is not a fresh instance, so the daemon names the box exactly
+// `api`, or refuses it when the name is taken.
+#[test]
+fn task_entry_start_sends_name_flag_as_requested_name() {
+    let project = task_project(NAMED_TASK_FILE);
+    let run = planned_task_start(
+        &["min", "box", "start", "build", "--name", "api"],
+        NAMED_TASK_FILE,
     );
+    assert_eq!(run.box_name.as_deref(), Some("api"));
+    let request = task_create_request(project.path(), &run);
+    assert_eq!(request.config.name.as_deref(), Some("api"));
+    assert!(!request.fresh_instance, "a written name takes no number");
+
+    // The run path puts the run's name on the request before the spec, and
+    // sends it with no fresh-instance mark.
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(manifest.join("src/task.rs")).unwrap();
+    let body = function_body(&text, "run_entry").expect("task.rs defines run_entry");
+    let named = body
+        .find("request.config.name = args.box_name.clone();")
+        .expect("the run puts its box name on the request");
+    let spec = body
+        .find("put_task_spec(")
+        .expect("the run puts the task spec on the request");
+    let sent = body
+        .find("oneshot_rpc::<CreateSession>")
+        .expect("the run sends its create");
+    assert!(
+        named < spec && spec < sent,
+        "the name goes on before the spec"
+    );
+    assert!(
+        !body.contains("request_fresh_instance"),
+        "the run does not mark its create as a fresh instance"
+    );
+}
+
+// BCLI-079: a start of a task entry without `--name` sends the entry's
+// `[box] name` as the requested name.
+#[test]
+fn task_entry_start_sends_box_name_from_entry() {
+    let project = task_project(NAMED_TASK_FILE);
+    let run = planned_task_start(&["min", "box", "start", "build"], NAMED_TASK_FILE);
+    assert_eq!(run.box_name, None);
+    let request = task_create_request(project.path(), &run);
+    assert_eq!(request.config.name.as_deref(), Some("builder"));
+    assert!(!request.fresh_instance, "a written name takes no number");
+}
+
+// BCLI-080: a start of a task entry without `--name`, whose entry sets no
+// `[box] name`, sends no requested name, so the daemon derives the name.
+#[test]
+fn task_entry_start_without_name_sends_no_requested_name() {
+    let project = task_project(UNNAMED_TASK_FILE);
+    let run = planned_task_start(&["min", "box", "start", "build"], UNNAMED_TASK_FILE);
+    assert_eq!(run.box_name, None);
+    let request = task_create_request(project.path(), &run);
+    assert_eq!(request.config.name, None);
+    assert!(!request.fresh_instance);
+}
+
+// BCLI-069, BOX-211: the stored spec of a task box carries no box name, so
+// `--name` changes neither the spec nor its projection digest.
+#[test]
+fn task_spec_stores_no_box_name() {
+    let project = task_project(NAMED_TASK_FILE);
+    let plain = task_create_request(
+        project.path(),
+        &planned_task_start(&["min", "box", "start", "build"], NAMED_TASK_FILE),
+    );
+    let named = task_create_request(
+        project.path(),
+        &planned_task_start(
+            &["min", "box", "start", "build", "--name", "api"],
+            NAMED_TASK_FILE,
+        ),
+    );
+    let wire = plain.spec.as_ref().expect("the run stores a spec");
+    let spec: mfile::spec::BoxSpec = serde_json_lenient::from_value(wire.clone()).unwrap();
+    assert_eq!(spec.name, None, "{wire}");
+    assert_eq!(boxes::box_name::spec_box_name(Some(wire)), None, "{wire}");
+    assert_eq!(plain.spec, named.spec, "--name leaves the spec as it is");
+    assert_eq!(
+        plain.config.client_projection_digest(),
+        named.config.client_projection_digest()
+    );
+}
+
+// BCLI-069: an interactive task sends no spec. `--name` is still the
+// requested name, a written one. Without it the request carries the
+// entry's cleaned name as a fresh instance, which takes a number when
+// the name is taken (BCLI-070).
+#[test]
+fn interactive_task_name_flag_is_written() {
+    let mut request = minimald_rpc::CreateSessionRequest::new(
+        String::new(),
+        paths::HostAbsPath::try_new(camino::Utf8PathBuf::from("/tmp/project")).unwrap(),
+        boxes::NetworkMode::HostNet,
+        boxes::BoxPolicy::default(),
+    );
+    request.config.name = Some("api".to_owned());
+    task::put_task_spec(&mut request, "build_all", None, None, &[]).unwrap();
+    assert_eq!(request.config.name.as_deref(), Some("api"));
+    assert!(!request.fresh_instance, "a written name takes no number");
+
+    request.config.name = None;
+    task::put_task_spec(&mut request, "build_all", None, None, &[]).unwrap();
+    assert_eq!(request.config.name.as_deref(), Some("build-all"));
+    assert!(request.fresh_instance, "the entry's name takes a number");
 }
 
 /// The egress that `argv`, a `min session start` in a project with
@@ -3801,44 +4372,6 @@ fn project_has_mfile_false_when_absent() {
     assert!(!project_has_mfile(path));
 }
 
-/// `--sync none` drops a config only when one exists up the tree: a
-/// `minimal.toml` at the project root is detected from a nested subdir,
-/// so the notice fires for the case that would otherwise silently lose
-/// the project's packages, vars, patches and hooks.
-#[test]
-fn sync_none_drops_project_config_true_when_mfile_up_tree() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join(mfile::MFILE_NAME),
-        "[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\n",
-    )
-    .unwrap();
-    let root = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
-    let subdir = root.join("nested/deep");
-    std::fs::create_dir_all(&subdir).unwrap();
-
-    assert!(sync_none_drops_project_config(&subdir));
-    let notice = sync_none_notice(&subdir).expect("a config to drop gets a notice");
-    assert!(notice.contains("minimal.toml is not sent"), "{notice}");
-}
-
-/// With no mfile anywhere up the tree, `--sync none` has nothing to
-/// drop, so the notice stays silent. Anchored in `$HOME` for the same
-/// reason as [`resolve_upload_root_returns_input_when_no_mfile`]: the
-/// upward walk stops there, so "no mfile up the tree" is guaranteed.
-#[test]
-fn sync_none_drops_project_config_false_when_no_mfile() {
-    let Some(home) = std::env::home_dir() else {
-        return; // no HOME: no walk boundary to anchor the test to
-    };
-    let Ok(dir) = tempfile::tempdir_in(&home) else {
-        return; // can't create temp dir in HOME, such as on a read only file system
-    };
-    let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
-    assert!(!sync_none_drops_project_config(path));
-    assert_eq!(sync_none_notice(path), None);
-}
-
 /// With no mfile anywhere up the tree, `resolve_upload_root` returns the
 /// input directory unchanged — the original activate behaviour.
 ///
@@ -3907,21 +4440,20 @@ fn resolve_upload_root_errors_on_malformed_mfile() {
 }
 
 /// The pure upload decision over its whole domain: the empty/`$HOME`
-/// carve-out, the explicit-sync escape hatch, and the VCS / blueprint /
+/// carve-out and the VCS / blueprint /
 /// headless gate, with no TTY and no daemon in sight.
 #[test]
 fn decide_workspace_upload_covers_empty_vcs_blueprint_and_headless() {
-    // An empty directory skips silently — unless the caller passed an
-    // explicit `--sync tarball`, which uploads it anyway.
+    // An empty directory skips silently.
     let empty = tempfile::tempdir().unwrap();
     let empty = camino::Utf8Path::from_path(empty.path()).expect("temp path is UTF-8");
     assert_eq!(
-        decide_workspace_upload(empty, false, false, None),
+        decide_workspace_upload(empty, false, None),
         UploadDecision::SkipEmptyOrHome
     );
     assert_eq!(
-        decide_workspace_upload(empty, true, false, None),
-        UploadDecision::Upload
+        decide_workspace_upload(empty, true, None),
+        UploadDecision::SkipEmptyOrHome
     );
 
     // A non-empty, undeclared, non-VCS root: a headless caller skips with
@@ -3930,11 +4462,11 @@ fn decide_workspace_upload_covers_empty_vcs_blueprint_and_headless() {
     std::fs::write(plain.path().join("notes.txt"), "x").unwrap();
     let plain = camino::Utf8Path::from_path(plain.path()).expect("temp path is UTF-8");
     assert_eq!(
-        decide_workspace_upload(plain, false, true, None),
+        decide_workspace_upload(plain, true, None),
         UploadDecision::SkipUndeclared
     );
     assert_eq!(
-        decide_workspace_upload(plain, false, false, None),
+        decide_workspace_upload(plain, false, None),
         UploadDecision::Confirm
     );
 
@@ -3944,7 +4476,7 @@ fn decide_workspace_upload_covers_empty_vcs_blueprint_and_headless() {
     std::fs::create_dir(repo.path().join(".git")).unwrap();
     let repo = camino::Utf8Path::from_path(repo.path()).expect("temp path is UTF-8");
     assert_eq!(
-        decide_workspace_upload(repo, false, true, None),
+        decide_workspace_upload(repo, true, None),
         UploadDecision::Upload
     );
 
@@ -3953,7 +4485,7 @@ fn decide_workspace_upload_covers_empty_vcs_blueprint_and_headless() {
     std::fs::write(declared.path().join(mfile::MFILE_NAME), "[upstream]\n").unwrap();
     let declared = camino::Utf8Path::from_path(declared.path()).expect("temp path is UTF-8");
     assert_eq!(
-        decide_workspace_upload(declared, false, true, None),
+        decide_workspace_upload(declared, true, None),
         UploadDecision::Upload
     );
 
@@ -3970,7 +4502,7 @@ fn decide_workspace_upload_covers_empty_vcs_blueprint_and_headless() {
     .unwrap();
     let home = camino::Utf8Path::from_path(home.path()).expect("temp path is UTF-8");
     assert_eq!(
-        decide_workspace_upload(home, false, false, Some(home.as_std_path())),
+        decide_workspace_upload(home, false, Some(home.as_std_path())),
         UploadDecision::SkipEmptyOrHome
     );
     assert_eq!(project_lifecycle_hook_count(home), 1);
@@ -3987,12 +4519,12 @@ fn decide_workspace_upload_covers_empty_vcs_blueprint_and_headless() {
     );
 }
 
-/// The refusal a hook-dropping skip raises names the root, the count, and the
-/// `--sync` escape hatch. It is shared by both CLI callers and by the
+/// The refusal a hook-dropping skip raises names the root, the count, and
+/// `--no-hooks`, the flag that starts the box without them. It is shared by both CLI callers and by the
 /// dashboard's own gate, so the wording cannot drift between them; the remedy
 /// clause is the caller's, and each caller's names what it can do.
 #[test]
-fn dropped_hooks_error_names_root_count_and_escape_hatch() {
+fn dropped_hooks_error_names_root_count_and_no_hooks() {
     let err = dropped_hooks_error(
         camino::Utf8Path::new("/srv/data/run42"),
         3,
@@ -4002,11 +4534,14 @@ fn dropped_hooks_error_names_root_count_and_escape_hatch() {
     assert!(text.contains("/srv/data/run42"), "{text}");
     assert!(text.contains("is your home directory"), "{text}");
     assert!(text.contains("3 lifecycle hook(s)"), "{text}");
-    assert!(text.contains("--sync tarball"), "{text}");
-    assert!(text.contains("--sync none"), "{text}");
+    assert!(
+        text.contains("Pass `--no-hooks` to start without them deliberately."),
+        "{text}"
+    );
+    assert!(!text.contains("--sync"), "{text}");
 
-    // The dashboard owns neither flag, so its refusal names the command that
-    // does rather than advice no key on the screen can follow.
+    // The dashboard has no `--no-hooks`, so its refusal names the command
+    // that does rather than advice no key on the screen can follow.
     let dashboard = dropped_hooks_error(
         camino::Utf8Path::new("/home/dev"),
         2,
@@ -4014,13 +4549,12 @@ fn dropped_hooks_error_names_root_count_and_escape_hatch() {
     )
     .to_string();
     assert!(
-        dashboard.contains("min session activate --sync tarball"),
+        dashboard.contains(
+            "Create the box from a terminal with `min session start --no-hooks` instead."
+        ),
         "{dashboard}"
     );
-    assert!(
-        !dashboard.contains("`--sync none`"),
-        "the dashboard cannot pass --sync none, so it must not be told to: {dashboard}"
-    );
+    assert!(!dashboard.contains("--sync"), "{dashboard}");
 }
 
 /// The resolved-root notice appears only when the upload walked above the
@@ -7124,6 +7658,100 @@ mod mint_tests {
             None
         );
     }
+    // BEP-042: un-enrolled, `min box audit <box-id>` reads the records that
+    // `bep serve` wrote for the box over the proxy's control socket. The
+    // box is in no listing, as after a reap. The command is given the
+    // socket only, never the log's directory, so it opens no log file.
+    #[test]
+    fn box_audit_reads_over_the_proxy_socket() {
+        use bep::audit::{AuditLog, Rotation};
+
+        use crate::cmd::box_audit;
+        use crate::{BoxAuditArgs, BoxAuditOutputFormat};
+
+        const OTHER_HEX: &str = "0193f0c17a2b7c3d8e4fa0b1c2d3e4f6";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/control.sock");
+        let audit = dir.path().join("audit");
+        let log = AuditLog::open_dir(&audit, Rotation::default()).unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let control = runtime
+            .block_on(async {
+                Control::bind(&path, Registry::default(), BoxRegistry::default()).map(|control| {
+                    control
+                        .with_audit(Arc::new(std::sync::Mutex::new(log)))
+                        .with_audit_dir(&audit)
+                })
+            })
+            .unwrap();
+        runtime.spawn(control.run());
+
+        // The proxy writes the records, as at the box's mints.
+        let mut client = ControlClient::connect(&path).unwrap();
+        client.record_mint(BOX_HEX, "github:one").unwrap();
+        client.record_mint(OTHER_HEX, "github:other").unwrap();
+        client.record_mint(BOX_HEX, "github:two").unwrap();
+        drop(client);
+
+        let read = |output: Option<BoxAuditOutputFormat>| {
+            let args = BoxAuditArgs {
+                target: Some(BOX_ID.to_owned()),
+                parent: None,
+                output,
+                follow: false,
+            };
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            box_audit::run(&args, &[], false, &path, &mut out, &mut err, || false).unwrap();
+            (
+                String::from_utf8(out).unwrap(),
+                String::from_utf8(err).unwrap(),
+            )
+        };
+        let (out, err) = read(None);
+        assert!(err.is_empty(), "{err}");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "{out}");
+        assert!(lines[0].starts_with("mint  admit"), "{out}");
+        assert!(lines[0].contains("github:one"), "{out}");
+        assert!(lines[1].contains("github:two"), "{out}");
+        assert!(!out.contains("github:other"), "{out}");
+
+        // -o jsonl gives the proxy's lines as its log holds them.
+        let (out, _) = read(Some(BoxAuditOutputFormat::Jsonl));
+        let segments = bep::audit::segments(&audit).unwrap();
+        let on_disk: String = segments
+            .iter()
+            .map(|segment| std::fs::read_to_string(segment).unwrap())
+            .collect();
+        let expected: Vec<&str> = on_disk
+            .lines()
+            .filter(|line| line.contains(&format!("\"subject\":\"{BOX_HEX}\"")))
+            .collect();
+        assert_eq!(out.lines().collect::<Vec<_>>(), expected);
+
+        // With the proxy gone, the command says so and reads no file.
+        drop(runtime);
+        let args = BoxAuditArgs {
+            target: Some(BOX_ID.to_owned()),
+            parent: None,
+            output: None,
+            follow: false,
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let error =
+            box_audit::run(&args, &[], false, &path, &mut out, &mut err, || false).unwrap_err();
+        assert!(out.is_empty());
+        assert!(
+            error
+                .to_string()
+                .starts_with("Cannot read the audit log: the Box Egress Proxy does not answer on "),
+            "{error}"
+        );
+    }
 }
 
 /// BEP-070: on a host that is not enrolled, each box creation gets a box id
@@ -7438,6 +8066,7 @@ fn listing_of(
             })
             .collect(),
         daemon_version: None,
+        daemon_epoch: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
         zone_answerer_port: None,
@@ -8161,7 +8790,8 @@ async fn every_box_verb_refuses_box_on_stopped_vm() {
         target: "beta".to_owned(),
         force: false,
     };
-    let session_rm = cmd::typed_box_rm_on_hosts(hosts(), &rm_args, session, "rm").await;
+    let session_rm =
+        cmd::typed_box_rm_on_hosts(hosts(), &rm_args, session, "rm", &mut headless_rm()).await;
     results.push((
         "session rm",
         session_rm.map(|_| ()).expect_err("session rm"),
@@ -9366,6 +9996,10 @@ fn address_entry(id: &str, name: &str, state: &str) -> minimald_rpc::BoxListingE
         signal: None,
         pty_enabled: true,
         lifetime: None,
+        build_boxes: Vec::new(),
+        project_name: None,
+        entry: None,
+        name_origin: boxes::NameOrigin::Written,
     }
 }
 
@@ -13942,6 +14576,10 @@ fn fake_listed(id: boxes::BoxId, parent: Option<boxes::BoxId>) -> minimald_rpc::
         signal: None,
         pty_enabled: false,
         lifetime: None,
+        build_boxes: Vec::new(),
+        project_name: None,
+        entry: None,
+        name_origin: boxes::NameOrigin::Written,
     }
 }
 
@@ -14289,6 +14927,9 @@ fn hold_record(
         parent: None,
         project_root: None,
         attrs: Default::default(),
+        project_name: None,
+        entry: None,
+        name_origin: boxes::NameOrigin::Written,
     }
 }
 
@@ -14589,7 +15230,7 @@ async fn show_and_prune_dry_run_report_disk() {
     // no disk line.
     let (shown, text) = show(web).await;
     let bytes = shown.disk_bytes.expect("the daemon measures a stopped box");
-    let disk = format!("Disk:       {}", format_disk(bytes));
+    let disk = format!("Disk:         {}", format_disk(bytes));
     assert!(text.lines().any(|line| line == disk), "{text}");
     let (_, text) = show(live).await;
     assert!(!text.contains("Disk:"), "{text}");
@@ -15660,6 +16301,7 @@ async fn typed_list_on_hosts(
         box_type,
         verb: "test list",
         project_root,
+        parent: None,
         output: None,
     };
     cmd::typed_box_list_on_hosts(hosts, request, out, err).await
@@ -15711,14 +16353,30 @@ async fn type_noun_verbs_alias_box_forms() {
                 "`min {noun} {verb}` exists"
             );
         }
-        // The list, stop and rm forms take the flags of the `min box` form.
-        for verb in ["list", "stop", "rm"] {
+        // The list form takes the flags of `min box list` except `--type`,
+        // which the noun fixes.
+        let mut box_list = arg_ids(&["box", "list"]);
+        box_list.retain(|id| id != "box_type");
+        assert_eq!(
+            arg_ids(&[noun, "list"]),
+            box_list,
+            "`min {noun} list` takes the arguments of `min box list` but `--type`"
+        );
+        // The stop and rm forms take the flags of the `min box` form.
+        for verb in ["stop", "rm"] {
             assert_eq!(
                 arg_ids(&[noun, verb]),
                 arg_ids(&["box", verb]),
                 "`min {noun} {verb}` takes the arguments of `min box {verb}`"
             );
         }
+    }
+    {
+        use clap::Parser as _;
+        assert!(
+            Cli::try_parse_from(["min", "session", "list", "--type", "task"]).is_err(),
+            "`min session list --type task` does not parse"
+        );
     }
 
     let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
@@ -15792,9 +16450,10 @@ async fn type_noun_verbs_alias_box_forms() {
             "{err:#}"
         );
         assert!(out.is_empty());
-        let err = cmd::typed_box_rm_on_hosts(hosts(), &rm(other), box_type, "rm")
-            .await
-            .expect_err("a box of another type is not removed");
+        let err =
+            cmd::typed_box_rm_on_hosts(hosts(), &rm(other), box_type, "rm", &mut headless_rm())
+                .await
+                .expect_err("a box of another type is not removed");
         assert!(
             matches!(
                 err.downcast_ref::<BoxAddressRefusal>(),
@@ -15828,9 +16487,15 @@ async fn type_noun_verbs_alias_box_forms() {
         other => panic!("an unknown exec in the session box, not {other:?}: {err:#}"),
     }
     assert!(out.is_empty());
-    cmd::typed_box_rm_on_hosts(hosts(), &rm(&decoy.to_string()), task, "rm")
-        .await
-        .expect("the decoy task box goes");
+    cmd::typed_box_rm_on_hosts(
+        hosts(),
+        &rm(&decoy.to_string()),
+        task,
+        "rm",
+        &mut confirmed_rm(),
+    )
+    .await
+    .expect("the decoy task box goes");
 
     // With `--exec`, each noun prints the line of `min box stop --exec`,
     // and the line names the box as the person typed it.
@@ -15906,9 +16571,15 @@ async fn type_noun_verbs_alias_box_forms() {
         "the task box's exec runs on\n{text}"
     );
     for (box_type, id) in [(task, twin_task), (session, twin_session)] {
-        cmd::typed_box_rm_on_hosts(hosts(), &rm(&id.to_string()), box_type, "rm")
-            .await
-            .expect("the twin box goes");
+        cmd::typed_box_rm_on_hosts(
+            hosts(),
+            &rm(&id.to_string()),
+            box_type,
+            "rm",
+            &mut confirmed_rm(),
+        )
+        .await
+        .expect("the twin box goes");
     }
 
     // Under its own noun, each box stops with the line of `min box stop`,
@@ -15925,9 +16596,10 @@ async fn type_noun_verbs_alias_box_forms() {
             String::from_utf8(out).unwrap(),
             format!("Stopped {name}.\n")
         );
-        let (_, removed) = cmd::typed_box_rm_on_hosts(hosts(), &rm(name), box_type, "rm")
-            .await
-            .expect("the box goes");
+        let (_, removed) =
+            cmd::typed_box_rm_on_hosts(hosts(), &rm(name), box_type, "rm", &mut confirmed_rm())
+                .await
+                .expect("the box goes");
         assert_eq!(removed.id, id);
     }
     let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -16918,7 +17590,7 @@ echo = "ok"
         ("check", "task")
     );
     // A task's own vars have the task shape, so a task entry sends none.
-    assert_eq!(task.vars, None);
+    assert_eq!(task.env_vars, None);
     // `--no-hooks` sends no hook list, so the daemon's own stays cleared.
     let no_hooks = crate::session_box_entry(root, None, false)
         .unwrap()
@@ -17356,7 +18028,7 @@ fn parsed_run(argv: &[&str]) -> task::RunEntry {
 async fn start_and_run_take_every_network_key_flag() {
     let activate = activate_long_flags();
     // The flags of activate that do not override a key of the box.
-    let not_overrides = ["--name", "--sync", "--no-prompt", "--attach", "--help"];
+    let not_overrides = ["--name", "--no-prompt", "--attach", "--help"];
     // The run path takes no `--ingress` (#3163) and no `--loadout` (#3237).
     let not_on_run = ["--ingress", "--loadout"];
     for verb in [
@@ -17830,6 +18502,7 @@ async fn box_show_network_renders_effective_policy() {
         record.network,
         None,
         &live,
+        &[],
         paths::HostKind::Minimald,
     )
     .expect("the render");
@@ -18170,6 +18843,9 @@ async fn box_show_output_yaml_matches_json() {
         "type",
         "parent",
         "project",
+        "project_name",
+        "entry",
+        "name_origin",
         "state",
         "reason",
         "exit_code",
@@ -18286,7 +18962,7 @@ async fn box_stop_exec_stops_that_exec() {
     // The box runs on, with its other exec.
     let text = box_show_text(&alpha.host, "web").await;
     assert!(
-        text.lines().any(|line| line == "State:      running"),
+        text.lines().any(|line| line == "State:        running"),
         "{text}"
     );
     assert_eq!(
@@ -19046,7 +19722,7 @@ async fn box_exec_show_logs_wait_stop_end_to_end() {
         let text = box_show_text(&alpha.host, "web").await;
         ran.push("min box show web", text.as_bytes(), b"", 0);
         assert!(
-            text.lines().any(|line| line == "State:      running"),
+            text.lines().any(|line| line == "State:        running"),
             "the box runs on\n{ran}"
         );
         assert_eq!(
@@ -20195,6 +20871,119 @@ async fn box_spec_box_renders_stored_copy() {
     );
 }
 
+/// Renames box `id` on `server` to `new_name`, as `min box rename` does.
+async fn rename_box(
+    server: &minimald::test_harness::TestServer,
+    id: boxes::SessionId,
+    new_name: &str,
+) {
+    let mut daemon = server.connect().await;
+    let request = minimald_rpc::RenameSessionRequest {
+        id,
+        new_name: new_name.to_owned(),
+    };
+    match daemon.call::<minimald_rpc::RenameSession>(&request).await {
+        minimald_rpc::Errorable::Ok(_) => {}
+        minimald_rpc::Errorable::Err { error } => panic!("the rename failed: {error}"),
+    }
+}
+
+// BCLI-022, BOX-227, BOX-228: `min box spec <box>` shows the name the
+// box's record holds and its origin, never a name from the spec. After a
+// rename it shows the new name, written by a person.
+#[tokio::test]
+async fn box_spec_box_shows_record_name_and_origin() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join(mfile::MFILE_NAME), "[session]\n").unwrap();
+    let root = camino::Utf8Path::from_path(project.path()).unwrap();
+    let (_state, mut global, server) = show_network_daemon().await;
+    let elsewhere = tempfile::tempdir().unwrap();
+    global.repo_dir = Some(elsewhere.path().to_path_buf());
+    let (_, id) = create_specced_box(&server, root, None).await;
+    let id_text = id.to_string();
+
+    let mut client = connect_daemon(&global).await.expect("the daemon answers");
+    let record = stored_box_record(&mut client, id)
+        .await
+        .expect("the record is read")
+        .expect("the host has the box");
+    let derived = record.name.clone().expect("the host names the box");
+    assert_eq!(record.name_origin, boxes::NameOrigin::Derived);
+    let toml = box_spec_text(&global, &["min", "box", "spec", &id_text])
+        .await
+        .expect("the stored spec renders");
+    assert!(
+        toml.contains(&format!(
+            "\n# Box name: \"{derived}\" (the host derived this name from the \
+             project name and the entry).\n"
+        )),
+        "{toml}"
+    );
+
+    rename_box(&server, id, "renamed-box").await;
+    let toml = box_spec_text(&global, &["min", "box", "spec", &id_text])
+        .await
+        .expect("the stored spec renders");
+    assert!(
+        toml.starts_with(&format!(
+            "# The spec box {id} was created with.\n\
+             # Box name: \"renamed-box\" (a person wrote this name).\n"
+        )),
+        "{toml}"
+    );
+    assert!(!toml.contains(&derived), "the old name is gone\n{toml}");
+    toml::from_str::<toml::Table>(&toml).expect("the render is TOML");
+}
+
+// BCLI-022: a stored `[box] name` is labelled as the name the entry asks
+// for at creation, never as the box's name. After a rename the two differ.
+#[tokio::test]
+async fn box_spec_box_labels_box_name_as_default_request() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join(mfile::MFILE_NAME), "[session]\n").unwrap();
+    let root = camino::Utf8Path::from_path(project.path()).unwrap();
+    let (_state, mut global, server) = show_network_daemon().await;
+    let elsewhere = tempfile::tempdir().unwrap();
+    global.repo_dir = Some(elsewhere.path().to_path_buf());
+    let (mut request, _) = create_specced_box(&server, root, Some("unused")).await;
+    request.config.name = Some("asked".to_owned());
+    if let Some(serde_json_lenient::Value::Object(spec)) = request.spec.as_mut() {
+        let section = spec
+            .entry("box".to_owned())
+            .or_insert_with(|| serde_json_lenient::json!({}));
+        section
+            .as_object_mut()
+            .expect("[box] is a table")
+            .insert("name".to_owned(), "asked".into());
+    }
+    let digest = mfile::projection::spec_digest(
+        request.spec.as_ref().expect("the request carries a spec"),
+        boxes::SESSION_BOX_TYPE,
+    )
+    .expect("the spec projects");
+    request.config.set_client_projection_digest(digest);
+    let id = create_box_from(&server, &request).await;
+    rename_box(&server, id, "renamed-box").await;
+
+    let toml = box_spec_text(&global, &["min", "box", "spec", &id.to_string()])
+        .await
+        .expect("the stored spec renders");
+    assert!(
+        toml.contains("\n# Box name: \"renamed-box\" (a person wrote this name).\n"),
+        "{toml}"
+    );
+    assert!(
+        toml.contains(
+            "\n# [box] name \"asked\": the name the entry asks for when a box is created \
+             from it. It is not the name of this box.\n"
+        ),
+        "{toml}"
+    );
+    assert!(!toml.contains("# Box name: \"asked\""), "{toml}");
+    let parsed: toml::Table = toml::from_str(&toml).expect("the render is TOML");
+    assert_eq!(parsed["box"]["name"].as_str(), Some("asked"));
+}
+
 // BCLI-022, BOX-179: `min box spec <box>` lists each stored lifecycle
 // hook with its event, its command, its description and its declarer.
 // A description, a script path or the first line of an inline command
@@ -20237,13 +21026,22 @@ on_detach = { type = "external", value = "./cleanup.sh" }
     let (_state, mut global, server) = show_network_daemon().await;
     let elsewhere = tempfile::tempdir().unwrap();
     global.repo_dir = Some(elsewhere.path().to_path_buf());
-    let id = create_box_from(&server, &request).await.to_string();
+    let box_id = create_box_from(&server, &request).await;
+    let id = box_id.to_string();
+    let mut client = connect_daemon(&global).await.expect("the daemon answers");
+    let derived = stored_box_record(&mut client, box_id)
+        .await
+        .expect("the record is read")
+        .expect("the host has the box")
+        .name
+        .expect("the host names the box");
 
     let text = box_spec_text(&global, &["min", "box", "spec", &id])
         .await
         .expect("the stored spec renders");
     let header = format!(
         "# The spec box {id} was created with.\n\
+         # Box name: \"{derived}\" (the host derived this name from the project name and the entry).\n\
          # Lifecycle hooks:\n\
          #   on_activate \"Warm the cache\": inline \"echo project\" (from minimal.toml)\n\
          #   on_destroy \"Warm the cache\": inline \"echo bye\" ... (from minimal.toml)\n\
@@ -20278,13 +21076,22 @@ on_detach = { type = "external", value = "./cleanup.sh" }
     let mut unhooked = request.clone();
     unhooked.config.name = Some("unhooked".to_owned());
     crate::put_spec_hooks(&mut unhooked, Vec::new()).expect("the hooks go on the spec");
-    let unhooked_id = create_box_from(&server, &unhooked).await.to_string();
+    let unhooked_box = create_box_from(&server, &unhooked).await;
+    let unhooked_id = unhooked_box.to_string();
+    let unhooked_name = stored_box_record(&mut client, unhooked_box)
+        .await
+        .expect("the record is read")
+        .expect("the host has the box")
+        .name
+        .expect("the box has a name");
     let text = box_spec_text(&global, &["min", "box", "spec", &unhooked_id])
         .await
         .expect("the stored spec renders");
     assert!(
         text.starts_with(&format!(
-            "# The spec box {unhooked_id} was created with.\n# Lifecycle hooks: none.\n"
+            "# The spec box {unhooked_id} was created with.\n\
+             # Box name: \"{unhooked_name}\" (a person wrote this name).\n\
+             # Lifecycle hooks: none.\n"
         )),
         "{text}"
     );
@@ -20442,7 +21249,26 @@ fn concept_and_reference_docs_use_no_removed_session_verb() {
     for page in PAGES {
         let text = std::fs::read_to_string(root.join(page))
             .unwrap_or_else(|e| panic!("{page} must be readable: {e}"));
-        for (n, line) in text.lines().enumerate() {
+        // BCLI-044: the one migration note in docs/concepts/sessions.md (the
+        // `## ` section that names `local-minimald`) names the old spellings
+        // on purpose. Every other line of every page must not.
+        let lines: Vec<&str> = text.lines().collect();
+        let mut in_note = vec![false; lines.len()];
+        let mut start = 0;
+        while start < lines.len() {
+            let end = (start + 1..lines.len())
+                .find(|&i| lines[i].starts_with("## "))
+                .unwrap_or(lines.len());
+            let is_note = *page == "docs/concepts/sessions.md"
+                && lines[start].starts_with("## ")
+                && names_local_minimald_alias(&lines[start..end].join("\n"));
+            in_note[start..end].fill(is_note);
+            start = end;
+        }
+        for (n, line) in lines.iter().enumerate() {
+            if in_note[n] {
+                continue;
+            }
             let mut hits: Vec<String> = REMOVED_SESSION_VERBS
                 .iter()
                 .map(|verb| format!("min session {verb}"))
@@ -24472,6 +25298,7 @@ async fn task_run_broker_secret_unenrolled_exits_5() {
         &global,
         TaskRunArgs {
             task: "ci".into(),
+            name: None,
             network: None,
             egress: EgressArgs::default(),
             other: crate::BoxOverrideArgs::default(),
@@ -26268,4 +27095,747 @@ fn row_not_back_names_the_box_that_holds_the_name() {
          now. Give that box another name with `min box rename Web <new-name>`, then run \
          `min box attach web` again."
     );
+}
+
+// D3699 (NET-156, NET-160): the references say how a box reaches a host port.
+#[test]
+fn cli_reference_says_how_a_box_reaches_the_host() {
+    let docs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/reference");
+    let minvmd = std::fs::read_to_string(docs.join("cli-minvmd.md"))
+        .expect("the minvmd reference must be readable at docs/reference/cli-minvmd.md");
+    let min = std::fs::read_to_string(docs.join("cli-min.md"))
+        .expect("the min CLI reference must be readable at docs/reference/cli-min.md");
+
+    let minvmd_flat = minvmd.split_whitespace().collect::<Vec<_>>().join(" ");
+    for stale in [
+        "refusal at every port",
+        "refused at every port",
+        "issues/2990",
+    ] {
+        assert!(
+            !minvmd_flat.contains(stale),
+            "docs/reference/cli-minvmd.md still says an own-address box is refused \
+             at every port ({stale:?})"
+        );
+    }
+    assert!(
+        minvmd_flat.contains("own-address box reaches an exposure"),
+        "docs/reference/cli-minvmd.md must say an own-address box reaches an exposure"
+    );
+
+    let paragraphs: Vec<&str> = min
+        .split("\n\n")
+        .filter(|p| p.contains("`host.min.internal` included"))
+        .collect();
+    assert!(
+        !paragraphs.is_empty(),
+        "docs/reference/cli-min.md must name host.min.internal in the egress flags section"
+    );
+    for paragraph in paragraphs {
+        assert!(
+            paragraph.contains("[host-exposures]"),
+            "the cli-min.md paragraph that names host.min.internal must name \
+             [host-exposures]: {paragraph}"
+        );
+        assert!(
+            paragraph.contains("./cli-minvmd.md"),
+            "the cli-min.md paragraph that names host.min.internal must link the minvmd page"
+        );
+        // A native host-address box shares the host's namespace, so the
+        // exposure table does not bind it (design §7.1 Lanes).
+        let flat = paragraph.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("A box on a VM host, and an own-address box on any host,"),
+            "the cli-min.md sentence on [host-exposures] must scope itself to VM hosts \
+             and own-address boxes: {flat}"
+        );
+        assert!(
+            flat.contains("host-address box on a native Linux host shares the host's network"),
+            "the cli-min.md paragraph must say what a native host-address box reaches: {flat}"
+        );
+    }
+}
+
+/// The `min box` verbs BCLI-026 names, in the architecture's order.
+const BOX_VERBS: [&str; 17] = [
+    "start", "run", "list", "show", "spec", "stop", "rm", "prune", "resume", "rename", "restart",
+    "logs", "wait", "events", "cp", "exec", "attach",
+];
+
+/// The type-noun verbs BCLI-030 names: the `min box` forms, filtered to
+/// boxes of that type.
+const TYPE_NOUN_VERBS: [(&str, &[&str]); 2] = [
+    (
+        "session",
+        &["list", "start", "attach", "logs", "stop", "rm"],
+    ),
+    ("task", &["run", "list", "logs", "stop", "rm"]),
+];
+
+/// One `min <noun> <verb>` of the command model, unbuilt, so its arguments
+/// are its own and not the propagated globals.
+fn model_verb(noun: &str, verb: &str) -> clap::Command {
+    use clap::CommandFactory as _;
+    Cli::command()
+        .find_subcommand(noun)
+        .unwrap_or_else(|| panic!("`min {noun}` is in the command model"))
+        .find_subcommand(verb)
+        .unwrap_or_else(|| panic!("`min {noun} {verb}` is in the command model"))
+        .clone()
+}
+
+/// The visible long flags of one verb, as `--<long>`.
+fn visible_long_flags(cmd: &clap::Command) -> Vec<String> {
+    cmd.get_arguments()
+        .filter(|arg| !arg.is_hide_set())
+        .filter_map(|arg| arg.get_long().map(|long| format!("--{long}")))
+        .collect()
+}
+
+/// The help that `min <argv> --help` prints, rendered from the command model.
+fn rendered_help(argv: &[&str]) -> String {
+    use clap::Parser as _;
+    let mut full = vec!["min"];
+    full.extend_from_slice(argv);
+    full.push("--help");
+    let err = Cli::try_parse_from(&full)
+        .map(|_| ())
+        .expect_err("--help ends the parse");
+    assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp, "{full:?}");
+    err.to_string()
+}
+
+/// The values the shell completion offers for the last word of `words`,
+/// from the same command model as the help (BCLI-028).
+fn completion_values(words: &[&str]) -> Vec<String> {
+    use clap::CommandFactory as _;
+    let mut args: Vec<std::ffi::OsString> = vec!["min".into()];
+    args.extend(words.iter().map(std::ffi::OsString::from));
+    let index = args.len() - 1;
+    clap_complete::engine::complete(&mut Cli::command(), args, index, None)
+        .expect("completion runs over the command model")
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+        .collect()
+}
+
+// BCLI-026: every `min box` verb parses with the flags the spec delivers.
+// This test pins those delivered flags plus `DEFERRED_ARCH_FLAGS`, the
+// architecture flags that the model does not have yet. It does not pin every
+// flag of architecture lines 488 and 493. The flags of the Non-goals stay
+// out of the model.
+#[test]
+fn box_verbs_exist_with_arch_flags() {
+    use clap::Parser as _;
+
+    // The architecture's flags that are not in the model yet, each with the
+    // issue that delivers it. When one of them lands, this test fails until
+    // the flag moves from this table to `expected`.
+    const DEFERRED_ARCH_FLAGS: [(&str, &str, &str); 2] = [
+        (
+            "run",
+            "--ingress",
+            "https://github.com/gominimal/minimal/issues/3163",
+        ),
+        (
+            "run",
+            "--loadout",
+            "https://github.com/gominimal/minimal/issues/3237",
+        ),
+    ];
+
+    let expected: [(&str, &[&str]); 17] = [
+        (
+            "start",
+            &[
+                "--name",
+                "--new",
+                "--detach",
+                "--network",
+                "--ingress",
+                "--loadout",
+                "--no-loadouts",
+                "--no-hooks",
+                "--allow-subnets",
+                "--deny-all-egress",
+            ],
+        ),
+        (
+            "run",
+            &[
+                "--name",
+                "--detach",
+                "--network",
+                "--no-loadouts",
+                "--no-hooks",
+            ],
+        ),
+        ("list", &["--all", "--type", "--parent", "--output"]),
+        ("show", &["--network", "--output"]),
+        ("spec", &["--output", "--network", "--loadout"]),
+        ("stop", &["--force", "--exec"]),
+        ("rm", &["--force"]),
+        ("prune", &["--older-than", "--parent", "--yes", "--dry-run"]),
+        ("resume", &[]),
+        ("rename", &[]),
+        ("restart", &[]),
+        ("logs", &["--follow", "--raw", "--exec"]),
+        ("wait", &["--timeout", "--exec", "--output"]),
+        ("events", &["--parent", "--output", "--follow"]),
+        ("cp", &[]),
+        ("exec", &["--tty", "--detach", "--timeout"]),
+        ("attach", &["--exec"]),
+    ];
+    assert_eq!(
+        expected.map(|(verb, _)| verb),
+        BOX_VERBS,
+        "the table covers every verb BCLI-026 names"
+    );
+    for (verb, flags) in expected {
+        let have = visible_long_flags(&model_verb("box", verb));
+        for flag in flags {
+            assert!(
+                have.iter().any(|h| h == flag),
+                "`min box {verb}` takes {flag}, got {have:?}"
+            );
+        }
+    }
+    // `min box run` takes no `--path`, hidden or visible. `-C` names the
+    // project.
+    assert!(
+        !model_verb("box", "run")
+            .get_arguments()
+            .any(|arg| arg.get_long() == Some("path")),
+        "`min box run` takes no --path"
+    );
+
+    // Each verb parses a command line that uses its flags.
+    for argv in [
+        &["box", "start", "web", "--name", "w", "--new", "--detach"][..],
+        &[
+            "box",
+            "start",
+            "--network",
+            "own_ip",
+            "--ingress",
+            "8080:80",
+            "--loadout",
+            "x",
+            "--no-hooks",
+        ],
+        &["box", "start"],
+        &[
+            "box",
+            "run",
+            "build",
+            "--detach",
+            "--network",
+            "none",
+            "--no-loadouts",
+            "--",
+            "a",
+        ],
+        &["box", "list", "--all", "-o", "json"],
+        &["box", "list", "--type", "task", "--parent", "web"],
+        &["box", "show", "web", "--network", "-o", "json"],
+        &["box", "spec", "web", "-o", "yaml"],
+        &["box", "spec"],
+        &["box", "stop", "web", "--force"],
+        &["box", "stop", "web", "--exec", "e1"],
+        &["box", "rm", "web", "--force"],
+        &[
+            "box",
+            "prune",
+            "--older-than",
+            "7d",
+            "--parent",
+            "p",
+            "--yes",
+            "--dry-run",
+        ],
+        &["box", "resume", "web"],
+        &["box", "rename", "web", "api"],
+        &["box", "restart", "web"],
+        &["box", "logs", "web", "-f", "--raw"],
+        &["box", "logs", "web", "--exec", "e1"],
+        &["box", "wait", "web", "--timeout", "30s", "-o", "json"],
+        &["box", "wait", "web", "--exec", "e1"],
+        &["box", "events", "web", "-o", "jsonl", "-f"],
+        &["box", "events", "--parent", "p"],
+        &["box", "cp", "web:/etc/hosts", "."],
+        &[
+            "box",
+            "exec",
+            "web",
+            "-t",
+            "--timeout",
+            "5m",
+            "--",
+            "ls",
+            "-l",
+        ],
+        &["box", "exec", "web", "--detach", "--", "ls"],
+        &["box", "attach"],
+        &["box", "attach", "web", "--exec", "e1"],
+        &["boxes", "list"],
+    ] {
+        let mut full = vec!["min"];
+        full.extend_from_slice(argv);
+        if let Err(err) = Cli::try_parse_from(&full) {
+            panic!("`min {}` parses: {err}", argv.join(" "));
+        }
+    }
+
+    // The type nouns keep their filtered forms.
+    for (noun, verbs) in TYPE_NOUN_VERBS {
+        for verb in verbs {
+            let _ = model_verb(noun, verb);
+        }
+    }
+
+    // The Non-goals' flags are not in the model.
+    for (verb, absent) in [
+        ("list", "--using"),
+        ("list", "--all-providers"),
+        ("wait", "--parent"),
+        ("wait", "--any"),
+    ] {
+        let have = visible_long_flags(&model_verb("box", verb));
+        assert!(
+            !have.iter().any(|h| h == absent),
+            "`min box {verb}` has no {absent}"
+        );
+    }
+    // The deferred architecture flags are not in the model yet.
+    for (verb, flag, issue) in DEFERRED_ARCH_FLAGS {
+        let have = visible_long_flags(&model_verb("box", verb));
+        assert!(
+            !have.iter().any(|h| h == flag),
+            "`min box {verb}` now has {flag}: move it from DEFERRED_ARCH_FLAGS \
+             to the expected flags ({issue})"
+        );
+    }
+    // `min box attach --exec` needs a box.
+    assert!(Cli::try_parse_from(["min", "box", "attach", "--exec", "e1"]).is_err());
+}
+
+// BCLI-028: `--help` at every level and the shell completions come from
+// one command model, so both list the same verbs and the same flags.
+#[test]
+fn help_and_completions_from_one_model() {
+    use clap::CommandFactory as _;
+
+    let cli = Cli::command();
+    for noun in ["box", "session", "task"] {
+        let help = rendered_help(&[noun]);
+        let offered = completion_values(&[noun, ""]);
+        let model = cli.find_subcommand(noun).expect("noun in the model");
+        let visible: Vec<_> = model
+            .get_subcommands()
+            .filter(|verb| !verb.is_hide_set())
+            .collect();
+        assert!(!visible.is_empty(), "`min {noun}` has verbs");
+        for verb in &visible {
+            let name = verb.get_name();
+            let about = verb
+                .get_about()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            assert!(
+                !about.trim().is_empty(),
+                "`min {noun} {name}` has a line on what it does"
+            );
+            assert!(
+                help.lines()
+                    .any(|line| line.trim_start().starts_with(&format!("{name} "))),
+                "`min {noun} --help` lists {name}:\n{help}"
+            );
+            assert!(
+                offered.iter().any(|value| value == name),
+                "the completion of `min {noun} ` offers {name}, got {offered:?}"
+            );
+
+            let verb_help = rendered_help(&[noun, name]);
+            let flag_offers = completion_values(&[noun, name, "--"]);
+            for flag in visible_long_flags(verb) {
+                assert!(
+                    verb_help.contains(&flag),
+                    "`min {noun} {name} --help` lists {flag}:\n{verb_help}"
+                );
+                assert!(
+                    flag_offers.contains(&flag),
+                    "the completion of `min {noun} {name} --` offers {flag}, got {flag_offers:?}"
+                );
+            }
+        }
+        // A hidden verb is in neither.
+        for verb in model.get_subcommands().filter(|verb| verb.is_hide_set()) {
+            let name = verb.get_name();
+            assert!(
+                !offered.iter().any(|value| value == name),
+                "the completion hides {name}"
+            );
+            assert!(
+                !help
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(&format!("{name} "))),
+                "`min {noun} --help` hides {name}"
+            );
+        }
+    }
+    // Every box verb BCLI-026 names is one of the verbs both list.
+    let offered = completion_values(&["box", ""]);
+    for verb in BOX_VERBS {
+        assert!(offered.iter().any(|value| value == verb), "box {verb}");
+    }
+}
+
+/// One section of the CLI reference: the text from a `### ` heading that
+/// names `` `<noun> <verb>` `` to the next `### ` heading.
+fn reference_section<'a>(reference: &'a str, noun: &str, verb: &str) -> Option<&'a str> {
+    let wanted = format!("`{noun} {verb}`");
+    let mut start = None;
+    let mut offset = 0;
+    for line in reference.split_inclusive('\n') {
+        if line.starts_with("### ") || line.starts_with("## ") {
+            if let Some(begin) = start {
+                return Some(&reference[begin..offset]);
+            }
+            if line.starts_with("### ") && line.contains(&wanted) {
+                start = Some(offset);
+            }
+        }
+        offset += line.len();
+    }
+    start.map(|begin| &reference[begin..])
+}
+
+/// Whether `text` names `flag` as a whole word: `--all` does not match
+/// inside `--all-providers`.
+fn names_flag(text: &str, flag: &str) -> bool {
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    text.match_indices(flag).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + flag.len()..].chars().next();
+        !before.is_some_and(is_word) && !after.is_some_and(is_word)
+    })
+}
+
+#[test]
+fn names_flag_matches_whole_words_only() {
+    assert!(names_flag("use `--all` here", "--all"));
+    assert!(names_flag("--all <name>", "--all"));
+    assert!(!names_flag("use `--all-providers`", "--all"));
+    assert!(!names_flag("x--all", "--all"));
+}
+
+// BCLI-044: the CLI reference documents every verb that BCLI-026 and
+// BCLI-030 name, and each flag the command model gives it. A flag that the
+// verb shares with `min session start` can be documented there, when the
+// verb's section points to it.
+#[test]
+fn cli_reference_documents_box_grammar() {
+    let reference = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/reference/cli-min.md"),
+    )
+    .expect("the min CLI reference must be readable at docs/reference/cli-min.md");
+    let session_start = reference_section(&reference, "session", "start")
+        .expect("the reference documents `session start`");
+
+    let mut verbs: Vec<(&str, &str)> = BOX_VERBS.iter().map(|verb| ("box", *verb)).collect();
+    for (noun, list) in TYPE_NOUN_VERBS {
+        verbs.extend(list.iter().map(|verb| (noun, *verb)));
+    }
+    let mut missing = Vec::new();
+    for (noun, verb) in verbs {
+        let Some(section) = reference_section(&reference, noun, verb) else {
+            missing.push(format!("min {noun} {verb}: no section"));
+            continue;
+        };
+        let points_to_start = section.contains("session start");
+        for flag in visible_long_flags(&model_verb(noun, verb)) {
+            let documented =
+                names_flag(section, &flag) || (points_to_start && names_flag(session_start, &flag));
+            if !documented {
+                missing.push(format!("min {noun} {verb}: {flag}"));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "the CLI reference does not document:\n{}",
+        missing.join("\n")
+    );
+}
+
+/// Whether `text` names the `local-minimald` provider alias, and not the
+/// `local-minimald<N>` state directory of a host.
+fn names_local_minimald_alias(text: &str) -> bool {
+    text.match_indices("local-minimald").any(|(at, word)| {
+        !matches!(
+            text[at + word.len()..].chars().next(),
+            Some(c) if c.is_ascii_digit() || c == '<' || c == '/'
+        )
+    })
+}
+
+// BCLI-044: the `local-minimald` alias, its replacement `local` and its
+// removal in 0.9 appear in one migration note only, in `docs/reference`
+// and `docs/concepts` together.
+#[test]
+fn docs_name_aliases_only_in_one_migration_note() {
+    let docs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs");
+    let mut notes = Vec::new();
+    for dir in ["reference", "concepts"] {
+        let mut stack = vec![docs.join(dir)];
+        while let Some(path) = stack.pop() {
+            if path.is_dir() {
+                for entry in std::fs::read_dir(&path).expect("docs dir readable") {
+                    stack.push(entry.expect("docs entry").path());
+                }
+                continue;
+            }
+            if path.extension().is_none_or(|ext| ext != "md") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("doc readable");
+            // One note is one `## ` section.
+            for section in text.split("\n## ") {
+                if names_local_minimald_alias(section) {
+                    notes.push((path.clone(), section.to_owned()));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        notes.len(),
+        1,
+        "one migration note names local-minimald, found {:?}",
+        notes.iter().map(|(path, _)| path).collect::<Vec<_>>()
+    );
+    let (path, note) = &notes[0];
+    assert!(
+        path.ends_with("concepts/sessions.md"),
+        "the note is in docs/concepts/sessions.md, not {}",
+        path.display()
+    );
+    assert!(
+        note.contains("--provider local") && note.contains("0.9"),
+        "the note names the replacement `local` and the removal in 0.9:\n{note}"
+    );
+    for old in [
+        "min session activate",
+        "min session destroy",
+        "min session exec",
+        "min session rename",
+        "min session policy",
+        "min session hooks",
+        "min session run",
+        "--path",
+        "min stop",
+    ] {
+        assert!(note.contains(old), "the note names {old}");
+    }
+}
+
+// BCLI-026: `min box run` takes no `--path`. The parser refuses it before
+// the entry's name with the usage exit code, and `-C <dir>` names the
+// project in its place.
+#[test]
+fn box_run_path_flag_is_refused() {
+    use clap::Parser as _;
+    use clap::error::ErrorKind;
+
+    for argv in [
+        &["min", "box", "run", "--path", ".", "check"][..],
+        &["min", "box", "run", "--path=.", "check"],
+    ] {
+        let Err(err) = Cli::try_parse_from(argv) else {
+            panic!("{argv:?}: --path is refused");
+        };
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument, "{argv:?}: {err}");
+        assert_eq!(err.exit_code(), 2, "{argv:?}: {err}");
+        assert!(
+            err.to_string().contains("unexpected argument '--path"),
+            "{argv:?}: {err}"
+        );
+    }
+
+    let cli = Cli::try_parse_from(["min", "-C", "/tmp", "box", "run", "check"])
+        .expect("`-C` names the project of a box run");
+    assert_eq!(
+        cli.global_args.repo_dir,
+        Some(std::path::PathBuf::from("/tmp"))
+    );
+}
+
+// BCLI-043: `min session setup-zed` stays hidden, with the arguments it
+// had: the session, `--settings <FILE>` and `--print`.
+#[test]
+fn setup_zed_unchanged() {
+    use clap::Parser as _;
+
+    let setup_zed = model_verb("session", "setup-zed");
+    assert!(setup_zed.is_hide_set(), "setup-zed stays hidden");
+    let mut args: Vec<String> = setup_zed
+        .get_arguments()
+        .map(|arg| arg.get_id().to_string())
+        .collect();
+    args.sort();
+    assert_eq!(args, ["print", "session", "settings"]);
+
+    let parsed = Cli::try_parse_from([
+        "min",
+        "session",
+        "setup-zed",
+        "my-box",
+        "--settings",
+        "/tmp/s.json",
+        "--print",
+    ])
+    .expect("setup-zed parses");
+    let Some(Command::Session(SessionArgs {
+        command: SessionCommand::SetupZed(zed),
+    })) = parsed.command
+    else {
+        panic!("setup-zed parses into its own command");
+    };
+    assert_eq!(zed.session, "my-box");
+    assert_eq!(
+        zed.settings.as_deref(),
+        Some(std::path::Path::new("/tmp/s.json"))
+    );
+    assert!(zed.print);
+
+    let help = rendered_help(&["session", "setup-zed"]);
+    assert!(
+        help.contains("Register a session as an SSH remote in Zed's settings"),
+        "{help}"
+    );
+    assert!(!rendered_help(&["session"]).contains("setup-zed"));
+    assert!(
+        !completion_values(&["session", ""])
+            .iter()
+            .any(|v| v == "setup-zed")
+    );
+}
+
+/// BCLI-034: every refusal that carries its own exit code carries the one
+/// the exit-code table gives its outcome: 2 for a usage or state error, 3
+/// for a project file or a spec that does not load, 4 for a thing not
+/// found, and 124 for a timeout. `main.rs`'s `exit_code_table` pins how
+/// each one reaches the process exit status.
+#[test]
+fn exit_code_table_refusal_codes() {
+    const USAGE: u8 = 2;
+    const CONFIG: u8 = 3;
+    const NOT_FOUND: u8 = 4;
+    const TIMEOUT: u8 = 124;
+    for (outcome, code, row) in [
+        ("rm of a running box", BoxRunningRefusal::EXIT_CODE, USAGE),
+        (
+            "rename to a refused name",
+            BoxRenameRefusal::EXIT_CODE,
+            USAGE,
+        ),
+        ("prune off a terminal", PruneNeedsYes::EXIT_CODE, USAGE),
+        ("network flag refused", NetworkFlagRefusal::EXIT_CODE, USAGE),
+        (
+            "session entry undecided",
+            SessionEntryUndecided::EXIT_CODE,
+            USAGE,
+        ),
+        (
+            "start needs a terminal",
+            StartNeedsTerminal::EXIT_CODE,
+            USAGE,
+        ),
+        ("start name held", StartNameHeld::EXIT_CODE, USAGE),
+        (
+            "create name held",
+            minimald_rpc::HeldNameRefusal::EXIT_CODE,
+            USAGE,
+        ),
+        (
+            "run flag misplaced",
+            task::RunFlagMisplaced::EXIT_CODE,
+            USAGE,
+        ),
+        (
+            "run needs a terminal",
+            task::RunNeedsTerminal::EXIT_CODE,
+            USAGE,
+        ),
+        (
+            "task network unapplied",
+            TaskNetworkUnapplied::EXIT_CODE,
+            CONFIG,
+        ),
+        ("spec file invalid", SpecFileInvalid::EXIT_CODE, CONFIG),
+        ("box types invalid", BoxTypesInvalid::EXIT_CODE, CONFIG),
+        (
+            "task file invalid",
+            task::TaskFileInvalid::EXIT_CODE,
+            CONFIG,
+        ),
+        ("box type not found", BoxTypeNotFound::EXIT_CODE, NOT_FOUND),
+        (
+            "project file not found",
+            task::ProjectFileNotFound::EXIT_CODE,
+            NOT_FOUND,
+        ),
+        ("task not found", task::TaskNotFound::EXIT_CODE, NOT_FOUND),
+        (
+            "loadout not found",
+            loadouts::LoadoutNotFound::EXIT_CODE,
+            NOT_FOUND,
+        ),
+        (
+            "local host not found",
+            hosts::LocalHostNotFound::EXIT_CODE,
+            NOT_FOUND,
+        ),
+        ("box timed out", BoxTimedOut::EXIT_CODE, TIMEOUT),
+        ("exec timed out", BoxExecTimedOut::EXIT_CODE, TIMEOUT),
+    ] {
+        assert_eq!(code, row, "{outcome}");
+    }
+}
+
+/// BCLI-034: `box_host_client` on a host this process did not select types
+/// a stopped host and an unreachable host as `HostUnreachable`, which
+/// `main.rs`'s `failure_exit_code` ends with 7. Each keeps its text.
+#[tokio::test]
+async fn exit_code_table_box_host_client_host_unreachable() {
+    let stopped = address_host(LOCAL_MINVMD_PROVIDER, "local-minvmd0", false);
+    let err = box_host_client(&stopped)
+        .await
+        .err()
+        .expect("a stopped host gives no client");
+    assert!(
+        err.downcast_ref::<client::box_registration::HostUnreachable>()
+            .is_some(),
+        "{err:#}"
+    );
+    assert_eq!(err.to_string(), "Host local-minvmd0 is not running.");
+
+    // A socket path longer than the kernel accepts fails the connect with
+    // an error that is neither refused nor missing: the probe's
+    // unreachable arm.
+    let unreachable = LocalHost {
+        provider: LOCAL_MINVMD_PROVIDER,
+        host: "beta.local-minvmd0".to_owned(),
+        sock: std::path::PathBuf::from(format!("/{}/ssh.sock", "x".repeat(200))),
+        selected: false,
+    };
+    let err = box_host_client(&unreachable)
+        .await
+        .err()
+        .expect("an unreachable host gives no client");
+    assert!(
+        err.downcast_ref::<client::box_registration::HostUnreachable>()
+            .is_some(),
+        "{err:#}"
+    );
+    assert_eq!(err.to_string(), "Could not reach host beta.local-minvmd0.");
 }

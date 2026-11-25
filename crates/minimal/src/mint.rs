@@ -63,7 +63,7 @@ use p256::ecdsa::SigningKey;
 use zeroize::{Zeroize as _, Zeroizing};
 
 /// How long a control socket request waits for the proxy.
-const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the forget of a failed creation waits for the proxy. It is
 /// short, so a stuck proxy does not hold up the end of the creation.
@@ -1093,6 +1093,85 @@ fn root_expiry(identity: &Identity, identity_path: &Path, now: u64) -> Result<u6
     Ok(not_after)
 }
 
+/// What one read of the proxy's audit log gave back.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AuditBatch {
+    /// The record lines, in log order, as the log holds them.
+    pub lines: Vec<String>,
+    /// The lines the proxy skipped because they are not records.
+    pub skipped: usize,
+    /// The proxy's log has no directory yet.
+    pub no_log: bool,
+}
+
+/// The records of a followed audit read, batch by batch.
+pub struct AuditStream {
+    client: ControlClient,
+    /// The bytes of a line that the proxy has not finished.
+    pending: Vec<u8>,
+    /// The records read since the last `caught_up` line.
+    batch: AuditBatch,
+}
+
+impl AuditStream {
+    fn new(client: ControlClient) -> Self {
+        Self {
+            client,
+            pending: Vec::new(),
+            batch: AuditBatch::default(),
+        }
+    }
+
+    /// The next batch: the records up to the proxy's next `caught_up` line.
+    /// `None` when the read timed out first. The records read so far are
+    /// kept for the next call.
+    ///
+    /// # Errors
+    ///
+    /// [`MintError::Control`] when the connection fails or closes, and
+    /// [`MintError::Refused`] when the proxy refuses the read.
+    pub fn next_batch(&mut self) -> Result<Option<AuditBatch>, MintError> {
+        loop {
+            match self.client.stream.read_until(b'\n', &mut self.pending) {
+                Ok(0) => return Err(MintError::Control(io::ErrorKind::UnexpectedEof.into())),
+                Ok(_) if !self.pending.ends_with(b"\n") => {
+                    return Err(MintError::Control(io::ErrorKind::UnexpectedEof.into()));
+                }
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Ok(None);
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(MintError::Control(error)),
+            }
+            let line = std::mem::take(&mut self.pending);
+            let reply: bep::control::AuditReply =
+                serde_json_lenient::from_slice(&line).map_err(|error| {
+                    MintError::Control(io::Error::new(io::ErrorKind::InvalidData, error))
+                })?;
+            if !reply.ok {
+                return Err(MintError::Refused {
+                    what: "the read of its audit log",
+                    error: reply.error.unwrap_or_default(),
+                });
+            }
+            if let Some(record) = reply.record {
+                self.batch.lines.push(record);
+            }
+            if reply.caught_up {
+                self.batch.skipped = reply.skipped;
+                self.batch.no_log = reply.no_log;
+                return Ok(Some(std::mem::take(&mut self.batch)));
+            }
+        }
+    }
+}
+
 /// One connection to the proxy's control socket.
 pub struct ControlClient {
     path: PathBuf,
@@ -1163,6 +1242,61 @@ impl ControlClient {
                 error: reply.error.unwrap_or_default(),
             })
         }
+    }
+
+    /// Reads the audit records whose subject is one of `subjects`, each
+    /// box id in the proxy's text form, from the proxy's log (BEP-042). The
+    /// proxy reads its log files, and this client opens none of them.
+    ///
+    /// # Errors
+    ///
+    /// [`MintError::Control`] when the connection fails, and
+    /// [`MintError::Refused`] when the proxy refuses the read. A proxy that
+    /// sends nothing for the connection's read timeout gives
+    /// [`MintError::Control`] with [`io::ErrorKind::TimedOut`], so the read
+    /// never waits without end.
+    pub fn read_audit(mut self, subjects: &[String]) -> Result<AuditBatch, MintError> {
+        self.send_audit(subjects, false)?;
+        let mut stream = AuditStream::new(self);
+        stream
+            .next_batch()?
+            .ok_or_else(|| MintError::Control(io::ErrorKind::TimedOut.into()))
+    }
+
+    /// Reads the audit records whose subject is one of `subjects`, and then
+    /// each new one as the proxy writes it, until the stream is dropped and
+    /// the connection closes.
+    /// Each [`AuditStream::next_batch`] waits at most `poll` for the proxy.
+    ///
+    /// # Errors
+    ///
+    /// [`MintError::Control`] when the request is not sent.
+    pub fn follow_audit(
+        mut self,
+        subjects: &[String],
+        poll: Duration,
+    ) -> Result<AuditStream, MintError> {
+        self.stream
+            .get_ref()
+            .set_read_timeout(Some(poll))
+            .map_err(MintError::Control)?;
+        self.send_audit(subjects, true)?;
+        Ok(AuditStream::new(self))
+    }
+
+    fn send_audit(&mut self, subjects: &[String], follow: bool) -> Result<(), MintError> {
+        let mut line = serde_json_lenient::to_string(&bep::control::AuditRequest::ReadAudit {
+            subjects: subjects.to_vec(),
+            follow,
+        })
+        .map_err(|error| MintError::Control(io::Error::new(io::ErrorKind::InvalidData, error)))?;
+        line.push('\n');
+        self.stream
+            .get_mut()
+            .write_all(line.as_bytes())
+            .map_err(MintError::Control)?;
+        tracing::debug!(?subjects, follow, path = %self.path.display(), "asked the proxy for the audit records");
+        Ok(())
     }
 
     /// Registers `key` with the proxy, so it verifies handles signed under
@@ -1983,7 +2117,7 @@ impl Drop for ProxyRegistration {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::cell::RefCell;
     use std::sync::Arc;
 
@@ -2083,6 +2217,37 @@ mod tests {
                 }
             }
         });
+    }
+
+    /// A control socket that accepts each connection and never answers.
+    /// Its thread holds each connection open until the test ends.
+    pub(crate) fn serve_silent(path: &Path) {
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                held.push(stream);
+            }
+        });
+    }
+
+    // Architecture principle 3: a proxy that accepts the audit read and
+    // never answers ends the read with a timeout, not a wait without end.
+    #[test]
+    fn an_audit_read_the_proxy_never_answers_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        serve_silent(&path);
+        let client =
+            ControlClient::connect_with_timeout(&path, Duration::from_millis(100)).unwrap();
+        let started = std::time::Instant::now();
+        let error = client.read_audit(&["00".repeat(16)]).unwrap_err();
+        assert!(
+            matches!(&error, MintError::Control(error) if error.kind() == io::ErrorKind::TimedOut),
+            "{error:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     // BEP-063: a store handle is a `gatehouse-store-handle+jws` signed under

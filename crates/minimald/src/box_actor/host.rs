@@ -933,6 +933,33 @@ impl BoxActor {
         )
     }
 
+    /// Unbinds the declared forwards a native finalize bound for this box
+    /// before any attach, and gives their lease back to the switch. An
+    /// attach that adopted them owns them, and this does nothing then.
+    #[cfg(target_os = "linux")]
+    pub(super) async fn release_activation_forwards(&self) {
+        let released = self
+            .net_switch
+            .lock()
+            .await
+            .release_activation_bind(*self.record.id());
+        let Some((lease, forwards)) = released else {
+            return;
+        };
+        if !forwards.is_empty() {
+            let control = self.switch_control().await;
+            crate::net::policy::release_declared_ingress(&control, &forwards).await;
+        }
+        if let Err(e) = self.net_switch.lock().await.detach(lease).await {
+            tracing::warn!(
+                session_id = %self.record.id(),
+                ip = %lease.ip,
+                error = %e,
+                "giving back the switch lease drawn at the box's activation"
+            );
+        }
+    }
+
     /// Tears down any runtime objects, such as the host or side ops. Shutdown
     /// of these objects is complete once awaited.
     ///
@@ -962,6 +989,10 @@ impl BoxActor {
         // publish asked in the window between this stop and the next launch
         // answers what stopped the box, not an entry whose publication came
         // down with it.
+        // The declared forwards a native finalize bound before any attach
+        // go with the box too, when no attach adopted them.
+        #[cfg(target_os = "linux")]
+        self.release_activation_forwards().await;
         let forwarders = self.live_ingress.take_all();
         self.publications.revoke_all();
         // A declared port bound for this box at a shared-address port's
@@ -1230,8 +1261,8 @@ impl BoxActor {
             AttachError::SpawnFailed(std::io::Error::new(
                 error.kind(),
                 format!(
-                    "{error} Destroy it with `min session destroy {name}`, then start a new \
-                     one with `min session activate`.",
+                    "{error} Remove it with `min box rm --force {name}`, then start a new \
+                     one with `min session start`.",
                     name = registry_name(&record),
                 ),
             ))
@@ -2224,7 +2255,57 @@ fn stop_signal_name(signal: i32) -> &'static str {
     match signal {
         libc::SIGTERM => "SIGTERM",
         libc::SIGKILL => "SIGKILL",
+        libc::SIGHUP => "SIGHUP",
         _ => "signal",
+    }
+}
+
+/// How long a graceful stop of a box whose entrypoint is its shell waits
+/// after SIGTERM before it sends SIGHUP. An interactive shell ignores
+/// SIGTERM and ends on SIGHUP, as on a closed terminal. A shell that ends on
+/// SIGTERM inside this wait records SIGTERM.
+///
+/// Interim: the SIGHUP step is the short-term option (a) of
+/// gominimal/arch#201. It is not part of the design's stop, which is
+/// SIGTERM, the grace period, then SIGKILL. A timeout (`time_out_box`,
+/// BOX-037) uses the step too. gominimal/minimal#3741 removes it, when an
+/// init runs in front of the session shell.
+const SHELL_HUP_AFTER: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// What a box runs as its entrypoint, as a stop reads it: the stop's
+/// signals depend on it.
+///
+/// Interim: only the SIGHUP step of a stop and a timeout reads it. That
+/// step is the short-term option (a) of gominimal/arch#201, not part of the
+/// design's SIGTERM, grace period, SIGKILL stop. `time_out_box` (BOX-037)
+/// uses it too. gominimal/minimal#3741 removes the step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EntrypointKind {
+    /// The box's login shell, a session's entrypoint.
+    Shell,
+    /// A program the spec names, such as a task box's relay.
+    Program,
+}
+
+impl EntrypointKind {
+    /// The kind of entrypoint a launch of `spec` starts. A box with no
+    /// stored spec starts its shell, as the launch does.
+    pub(crate) fn of_spec(spec: Option<&mfile::spec::BoxSpec>) -> Self {
+        match spec.map(|spec| &spec.entrypoint) {
+            None | Some(mfile::spec::Entrypoint::Shell) => Self::Shell,
+            Some(mfile::spec::Entrypoint::Exec(_)) => Self::Program,
+        }
+    }
+
+    /// The kind of entrypoint of a box whose held spec is `held`. `None` is
+    /// a spec never read: that box is a `Program`, so its stop sends no
+    /// interim SIGHUP (gominimal/arch#201). `Some(None)` is a box filed with
+    /// no spec, which starts its shell.
+    pub(crate) fn of_held(held: Option<Option<&mfile::spec::BoxSpec>>) -> Self {
+        match held {
+            None => Self::Program,
+            Some(spec) => Self::of_spec(spec),
+        }
     }
 }
 
@@ -2256,6 +2337,114 @@ pub(crate) struct StopOutcome {
     pub(crate) unfinished: Option<JoinHandle<Result<box_runtime::HostExit, std::io::Error>>>,
 }
 
+/// How long a stop that ended the box's task containers waits for the
+/// entrypoint to end with them (BOX-013). A task box's relay forwards the
+/// task's exit and ends within it. A session box's shell does not end, and
+/// the box's own stop takes over once it passes.
+pub(crate) const TASK_EXIT_RELAY_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long a graceful stop waits for a task run of the box to deliver its
+/// exit to the in-box helper (BOX-013), once its containers have ended. The
+/// run tears the container's network down before it sends the exit, and a
+/// stop that signalled the helper first would record the signal, not the
+/// task's exit. A run that has not delivered by then is left behind.
+pub(crate) const TASK_EXIT_DELIVERY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Ends the task containers the box's invocations run in (BOX-013): the
+/// containers a task run records beside the box, which the box's own PID
+/// namespace does not hold. A task box's entrypoint is the in-box relay, not
+/// the task: signalling only the box ends the relay and leaves the task
+/// running, its TERM trap unrun. This sends the task containers the stop's
+/// signals first — SIGTERM, the grace period, SIGKILL to what is left, a
+/// forced stop's SIGKILL at once — while the relay stays up, so the task's
+/// last output and its `exit:N` line still reach the box, and the
+/// entrypoint that ends with the task is the exit status the box records.
+///
+/// The returned [`box_runtime::TaskStop`] marks the stop as under way from
+/// before the take: until the caller drops it, the box records no new task
+/// container, and a run that spawns one kills it and starts no later
+/// invocation. So the one take holds every task container that can run.
+/// The caller holds it until the box's own processes are stopped.
+///
+/// The grace period ends as soon as no task container is left. A graceful
+/// stop then waits, for at most [`TASK_EXIT_DELIVERY_WAIT`], until every
+/// task run of the box has delivered its exit: a run whose container was
+/// already reaped when the stop started is waited for too. It then waits
+/// for the entrypoint for at most [`TASK_EXIT_RELAY_WAIT`], never for the
+/// whole grace period, because a session box's entrypoint does not end
+/// with a task. A forced stop waits for neither. `entrypoint` is only read,
+/// never taken: the caller's [`stop_box_processes`] still consumes it. A
+/// box with no task container and no task run delivering its exit is
+/// skipped at once.
+pub(crate) async fn stop_task_containers(
+    box_id: boxes::SessionId,
+    entrypoint: &JoinHandle<Result<box_runtime::HostExit, std::io::Error>>,
+    force: bool,
+    grace: std::time::Duration,
+    forced: &std::sync::atomic::AtomicBool,
+) -> box_runtime::TaskStop {
+    let stop = box_runtime::begin_task_stop(box_id);
+    let containers = box_runtime::take_task_containers(box_id);
+    let exit_pending = || box_runtime::task_exit_pending(box_id);
+    if containers.is_empty() && !exit_pending() {
+        return stop;
+    }
+    let signal = |signal: i32| {
+        let reached: usize = containers.iter().map(|c| c.signal(signal)).sum();
+        tracing::info!(
+            box_id = %box_id,
+            signal = stop_signal_name(signal),
+            signal_number = signal,
+            processes = reached,
+            "stop: signalled the box's task containers"
+        );
+    };
+    let left = || containers.iter().map(|c| c.pids().len()).sum::<usize>();
+    let forced_now = || forced.load(std::sync::atomic::Ordering::SeqCst);
+    if force || forced_now() {
+        if !containers.is_empty() {
+            signal(libc::SIGKILL);
+        }
+        return stop;
+    }
+    if !containers.is_empty() {
+        signal(libc::SIGTERM);
+        let deadline = tokio::time::Instant::now() + grace;
+        loop {
+            if left() == 0 || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            if forced_now() {
+                tracing::info!(
+                    box_id = %box_id,
+                    "stop: a forced stop arrived; the task containers' grace period ends now"
+                );
+                break;
+            }
+            tokio::time::sleep(STOP_POLL).await;
+        }
+        if left() > 0 {
+            signal(libc::SIGKILL);
+        }
+    }
+    let delivery_deadline = tokio::time::Instant::now() + TASK_EXIT_DELIVERY_WAIT;
+    while exit_pending() && !forced_now() && tokio::time::Instant::now() < delivery_deadline {
+        tokio::time::sleep(STOP_POLL).await;
+    }
+    if exit_pending() && !forced_now() {
+        tracing::info!(
+            box_id = %box_id,
+            "stop: a task run did not deliver its exit in time; the box's stop goes on"
+        );
+    }
+    let relay_deadline = tokio::time::Instant::now() + TASK_EXIT_RELAY_WAIT;
+    while !entrypoint.is_finished() && !forced_now() && tokio::time::Instant::now() < relay_deadline
+    {
+        tokio::time::sleep(STOP_POLL).await;
+    }
+    stop
+}
+
 /// Sends a stop's signals to every process in the box (BOX-013), and reads
 /// how the entrypoint ended from the host loop `entrypoint`, which ends when
 /// the entrypoint does.
@@ -2271,15 +2460,27 @@ pub(crate) struct StopOutcome {
 /// kill ends the box.
 ///
 /// In a real box the entrypoint is the init of the box's PID namespace. The
-/// kernel delivers SIGTERM from the daemon's namespace to that init only
-/// when the init has a handler for it. An entrypoint without a SIGTERM
-/// handler, such as a plain shell, keeps running through the grace period.
-/// The SIGKILL then ends it, and the ending stores SIGKILL. BOX-013 asks for
-/// that order: SIGTERM, the grace period, then SIGKILL to what still runs.
+/// kernel delivers a signal from the daemon's namespace to that init only
+/// when the init has a handler for it. An interactive shell has no SIGTERM
+/// handler: it ignores SIGTERM, but it handles SIGHUP. So when `kind` is
+/// [`EntrypointKind::Shell`], a graceful stop that still finds the
+/// entrypoint running [`SHELL_HUP_AFTER`] after its SIGTERM sends SIGHUP to
+/// every process in the box. The shell then ends inside the grace period,
+/// and the ending stores SIGHUP. An entrypoint that handles neither keeps
+/// running through the grace period. The SIGKILL then ends it, and the
+/// ending stores SIGKILL. BOX-013 asks for that order: SIGTERM, the grace
+/// period, then SIGKILL to what still runs.
+///
+/// Interim: the SIGHUP step is the short-term option (a) of
+/// gominimal/arch#201. It is not part of the design's SIGTERM, grace period,
+/// SIGKILL stop. The timeout path (`time_out_box`, BOX-037) uses it too.
+/// gominimal/minimal#3741 removes it, when an init runs in front of the
+/// session shell. Then `kind` goes too.
 pub(crate) async fn stop_box_processes(
     box_id: boxes::SessionId,
     processes: Option<box_runtime::BoxProcesses>,
     mut entrypoint: JoinHandle<Result<box_runtime::HostExit, std::io::Error>>,
+    kind: EntrypointKind,
     force: bool,
     grace: std::time::Duration,
     forced: &std::sync::atomic::AtomicBool,
@@ -2310,10 +2511,23 @@ pub(crate) async fn stop_box_processes(
     } else {
         signal(libc::SIGTERM);
         sent.push(libc::SIGTERM);
-        let deadline = tokio::time::Instant::now() + grace;
+        let start = tokio::time::Instant::now();
+        let deadline = start + grace;
+        let mut hup_at = (kind == EntrypointKind::Shell).then(|| start + SHELL_HUP_AFTER);
         loop {
             if ended_after.is_none() && entrypoint.is_finished() {
-                ended_after = Some(Some(libc::SIGTERM));
+                ended_after = Some(sent.last().copied());
+            }
+            if ended_after.is_none()
+                && hup_at.is_some_and(|at| tokio::time::Instant::now() >= at && at < deadline)
+            {
+                hup_at = None;
+                tracing::info!(
+                    box_id = %box_id,
+                    "stop: the box's shell is still running after SIGTERM; sending SIGHUP"
+                );
+                signal(libc::SIGHUP);
+                sent.push(libc::SIGHUP);
             }
             if ended_after.is_some() && left() == 0 {
                 break;
@@ -2340,7 +2554,7 @@ pub(crate) async fn stop_box_processes(
         );
         if ended_after.is_none() || still_running > 0 {
             if ended_after.is_none() && entrypoint.is_finished() {
-                ended_after = Some(Some(libc::SIGTERM));
+                ended_after = Some(sent.last().copied());
             }
             signal(libc::SIGKILL);
             sent.push(libc::SIGKILL);
@@ -2436,6 +2650,16 @@ fn ending_event_data(
 }
 
 impl BoxActor {
+    /// The kind of entrypoint the box's host runs, from the spec its launch
+    /// read. A launch reads the spec before it starts a host, so a box with
+    /// a host holds it. A box whose spec was never read is a `Program`: a
+    /// stop that cannot decide sends the design's SIGTERM, grace period,
+    /// SIGKILL and no interim SIGHUP (gominimal/arch#201). A box filed with
+    /// no spec starts its shell, so it is a `Shell`.
+    fn entrypoint_kind(&self) -> EntrypointKind {
+        EntrypointKind::of_held(self.held_spec.as_ref().map(|spec| spec.as_deref()))
+    }
+
     /// Stops the box and keeps its record (BOX-013): signals every process
     /// in it, tears its host down, sets the record to `stopped` with how the
     /// entrypoint ended, and records an `exited` event. One `box.stop` span
@@ -2515,6 +2739,9 @@ impl BoxActor {
         {
             return self.write_kept_exit(ending).await;
         }
+        // Held until what ran beside the host is down: a task run of this
+        // box starts no container meanwhile.
+        let mut task_stop = None;
         let ending = match (self.unrecorded_stop, launched) {
             // An earlier stop ended the processes and could not write the
             // record. This one writes how they ended then. `launch_host`
@@ -2535,6 +2762,12 @@ impl BoxActor {
                 // any signal, so an attached client is told the box was
                 // stopped or restarted, and sees no shell-exit prompt.
                 host.announce_end(end).await;
+                // The task containers first (BOX-013), relay still up: the
+                // task's exit reaches the box, and what the entrypoint then
+                // records is the task's own ending.
+                task_stop = Some(
+                    stop_task_containers(box_id, &task, force, grace, &self.weak_self.3).await,
+                );
                 let container_pid = probe_host(host.get_attrs())
                     .await
                     .and_then(|attrs| attrs.container_pid);
@@ -2548,6 +2781,7 @@ impl BoxActor {
                     box_id,
                     container_pid.map(box_runtime::BoxProcesses::of_container),
                     task,
+                    self.entrypoint_kind(),
                     force,
                     grace,
                     &self.weak_self.3,
@@ -2581,6 +2815,7 @@ impl BoxActor {
         // The host is gone: this takes down what ran beside it, as every
         // other stop does.
         self.stop_running(false).await;
+        drop(task_stop);
 
         // The `stopped` record is the step a stop cannot skip. A failed
         // read or write keeps the ending on the actor and returns the error,
@@ -2682,6 +2917,7 @@ impl BoxActor {
                     box_id,
                     container_pid.map(box_runtime::BoxProcesses::of_container),
                     task,
+                    self.entrypoint_kind(),
                     false,
                     timeout_grace(&box_id),
                     &self.weak_self.3,
@@ -2801,6 +3037,9 @@ mod quic443_cohort_tests {
             parent: None,
             project_root: None,
             attrs: Default::default(),
+            project_name: None,
+            entry: None,
+            name_origin: boxes::NameOrigin::Written,
         }
     }
 

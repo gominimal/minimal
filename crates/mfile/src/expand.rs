@@ -204,9 +204,120 @@ pub struct ExpansionReport {
     /// own layer (gominimal/arch#188). `values["network"]` names the last
     /// layer that set any of them.
     pub network: BTreeMap<String, Origin>,
+    /// One warning for each variable of the spec's `env_vars` whose name
+    /// looks like a secret's, in name order (BOX-231). The expansion goes
+    /// on, and the spec keeps the value as written (BOX-230).
+    pub secret_name_warnings: Vec<SecretNameWarning>,
     /// Whether the expanded entry is the implicit default session entry,
     /// which the file does not declare (BOX-165).
     pub implicit: bool,
+}
+
+/// The parts of a variable name that make it look like a secret's, upper
+/// case. A name that contains one, in any case, gets a warning (BOX-231).
+pub const SECRET_NAME_PARTS: [&str; 8] = [
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "API_KEY",
+    "APIKEY",
+    "PRIVATE_KEY",
+    "CREDENTIAL",
+];
+
+/// Whether a variable name contains one of [`SECRET_NAME_PARTS`], without
+/// regard to ASCII case.
+#[must_use]
+pub fn looks_like_secret_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    SECRET_NAME_PARTS.iter().any(|part| upper.contains(part))
+}
+
+/// A variable of the expanded `env_vars` whose name looks like a secret's
+/// (BOX-231). Its value is in the spec as written (BOX-230), so the
+/// caller tells the person that only `[secrets]` keeps a value out of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretNameWarning {
+    /// The variable name.
+    pub name: String,
+    /// The layer whose value survives the merge (BOX-180).
+    pub origin: Origin,
+    /// The layer as a message names it, such as "`[sessions.dev]` in
+    /// minimal.toml" or "the loadout `gh`".
+    pub layer: String,
+    /// The file that holds the layer: minimal.toml for a project layer,
+    /// the loadout's file for a loadout. `None` for a layer that no file
+    /// holds, such as a built-in type or a command-line flag.
+    pub file: Option<std::path::PathBuf>,
+    /// What the spec stores for the variable.
+    pub stored: StoredVar,
+}
+
+/// What the expanded spec stores for a variable of `env_vars`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoredVar {
+    /// A value, as written.
+    Literal,
+    /// `{ inherit = true }` with no `default`: no value.
+    Inherit,
+    /// `{ inherit = true, default = ... }`: the default, as written.
+    InheritWithDefault,
+}
+
+impl StoredVar {
+    /// The shape of `value`, a variable of `env_vars` as a layer writes it.
+    #[must_use]
+    pub fn of(value: &toml::Value) -> Self {
+        match value {
+            toml::Value::Table(t)
+                if t.get("inherit").and_then(toml::Value::as_bool) == Some(true) =>
+            {
+                if t.contains_key("default") {
+                    Self::InheritWithDefault
+                } else {
+                    Self::Inherit
+                }
+            }
+            _ => Self::Literal,
+        }
+    }
+}
+
+impl std::fmt::Display for SecretNameWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the variable {} in `env_vars` has a name that looks like a secret's. ",
+            self.name
+        )?;
+        match (&self.origin.layer, &self.file) {
+            (Layer::Loadouts, Some(file)) => {
+                write!(f, "{} sets it, in {}. ", self.layer, file.display())?;
+            }
+            _ => write!(f, "{} sets it. ", self.layer)?,
+        }
+        // BOX-230 stores the value as written. An inherit with no default
+        // has no value in the spec, so the text says what the spec holds.
+        match self.stored {
+            StoredVar::Literal => write!(
+                f,
+                "A box from this entry stores its value as written in the box's spec. "
+            )?,
+            StoredVar::Inherit => write!(
+                f,
+                "The box's spec stores `{{ inherit = true }}` for it, not a value. "
+            )?,
+            StoredVar::InheritWithDefault => write!(
+                f,
+                "A box from this entry stores its `default` as written in the box's spec. "
+            )?,
+        }
+        write!(
+            f,
+            "Put a secret value in a `[secrets]` entry to keep it out of the spec."
+        )
+    }
 }
 
 /// The layers of one entry that are not in the entry's own table. Each
@@ -451,6 +562,7 @@ pub fn expand(entry: &BoxEntry, layers: &Layers) -> Result<Expansion, Error> {
     check_var_tables(entry, &ordered, loadouts)?;
     let mut expansion = fold(&ordered);
     merge_vars(entry, &ordered, &layers.host_vars, &mut expansion)?;
+    secret_name_warnings(entry, loadouts, &mut expansion);
     // BOX-071: the store references carry the client's authorities, so
     // the daemon projects the same `secret_grants` from the spec it
     // receives. The omitted values the digest binds are filled by the
@@ -1297,6 +1409,53 @@ fn merge_vars(
     expansion.spec.insert(ENV_VARS_KEY.to_owned(), value);
     report.values.insert(ENV_VARS_KEY.to_owned(), value_origin);
     Ok(())
+}
+
+/// Fills the report's [`SecretNameWarning`]s: one for each variable of the
+/// spec's `env_vars` whose name looks like a secret's, with the layer whose
+/// value the merge kept (BOX-231). The value stays as written (BOX-230).
+fn secret_name_warnings(entry: &BoxEntry, loadouts: &[LoadoutLayer], expansion: &mut Expansion) {
+    let Some(vars) = expansion
+        .spec
+        .get(ENV_VARS_KEY)
+        .and_then(toml::Value::as_table)
+    else {
+        return;
+    };
+    let report = &mut expansion.report;
+    for name in vars.keys().filter(|name| looks_like_secret_name(name)) {
+        let Some(origin) = report.env_vars.get(name) else {
+            continue;
+        };
+        let file = match origin.layer {
+            Layer::Loadouts => loadouts
+                .iter()
+                .find(|l| origin.loadout.as_deref() == Some(l.name.as_str()))
+                .and_then(|l| l.path.clone()),
+            Layer::Overrides => None,
+            Layer::TypeDefaults
+                if BUILTIN_BOX_TYPES.contains(&origin.box_type.as_deref().unwrap_or_default()) =>
+            {
+                None
+            }
+            _ => Some(std::path::PathBuf::from(crate::MFILE_NAME)),
+        };
+        let layer = layer_words(entry, Some(origin));
+        let stored = StoredVar::of(&vars[name]);
+        tracing::debug!(
+            rule = "BOX-231",
+            variable = %name,
+            set_by = %layer,
+            "an env_vars name looks like a secret's; its value is stored as written"
+        );
+        report.secret_name_warnings.push(SecretNameWarning {
+            name: name.clone(),
+            origin: origin.clone(),
+            layer,
+            file,
+            stored,
+        });
+    }
 }
 
 /// The keys whose list is an argument vector. Order and repeats are part of
@@ -2951,9 +3110,23 @@ mod tests {
                 msg.starts_with(&format!("`{header}` has the type `{box_type}`")),
                 "{msg}"
             );
-            assert!(msg.contains("gominimal/inbox#678"), "{msg}");
             assert!(msg.contains(&format!("a box of type `{root}`")), "{msg}");
+            // A build box is min's to make, so no epic is named for it.
+            assert_eq!(
+                msg.contains("gominimal/inbox#678"),
+                root != "build",
+                "{msg}"
+            );
         }
+        assert_eq!(
+            expand_typed(TYPED_FILE, "builder")
+                .expect_err("refused")
+                .to_string(),
+            "`[boxes.builder]` has the type `build`. \
+             min makes a box of type `build` for each package build, \
+             and never from an entry in minimal.toml. \
+             The other entries of minimal.toml are not affected."
+        );
         assert_eq!(
             expand_typed(TYPED_FILE, "assistant")
                 .expect_err("refused")
@@ -3773,6 +3946,141 @@ mod tests {
         }
     }
 
+    // BOX-231: a kept variable whose name contains a secret-like part, in
+    // any case, gets one warning that names it, the layer whose value the
+    // merge kept and that layer's file. The expansion goes on.
+    #[test]
+    fn credential_like_env_var_name_warns() {
+        for part in SECRET_NAME_PARTS {
+            assert!(looks_like_secret_name(part), "{part}");
+            assert!(looks_like_secret_name(&format!(
+                "my_{}_x",
+                part.to_ascii_lowercase()
+            )));
+        }
+        assert!(!looks_like_secret_name("EDITOR"));
+        assert!(!looks_like_secret_name("API_KE"));
+        let file = r#"
+            [defaults]
+            env_vars = { db_password = "defaults", EDITOR = "hx", Api_Key = "defaults" }
+            [sessions.dev]
+            loadout_mode = "open"
+            env_vars = { Api_Key = "entry" }
+        "#;
+        let path = std::path::PathBuf::from("/home/u/.config/minimal/loadouts/gh.toml");
+        let layers = Layers {
+            loadouts: vec![LoadoutLayer {
+                name: "gh".to_owned(),
+                path: Some(path.clone()),
+                table: table("env_vars = { GITHUB_TOKEN = \"x\", PAGER = \"less\" }"),
+            }],
+            ..Layers::default()
+        };
+        let e = expand_in(file, "dev", layers).expect("a warning does not stop the expansion");
+        let warned: Vec<(&str, Layer, Option<&std::path::Path>)> = e
+            .report
+            .secret_name_warnings
+            .iter()
+            .map(|w| (w.name.as_str(), w.origin.layer, w.file.as_deref()))
+            .collect();
+        let mfile = std::path::Path::new(crate::MFILE_NAME);
+        assert_eq!(
+            warned,
+            [
+                ("Api_Key", Layer::Entry, Some(mfile)),
+                ("GITHUB_TOKEN", Layer::Loadouts, Some(path.as_path())),
+                ("db_password", Layer::Defaults, Some(mfile)),
+            ]
+        );
+        let text: Vec<String> = e
+            .report
+            .secret_name_warnings
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            text[0],
+            "the variable Api_Key in `env_vars` has a name that looks like a secret's. \
+             `[sessions.dev]` in minimal.toml sets it. A box from this entry stores its \
+             value as written in the box's spec. Put a secret value in a `[secrets]` \
+             entry to keep it out of the spec."
+        );
+        assert!(
+            text[1].contains(&format!(
+                "the loadout `gh` sets it, in {}. ",
+                path.display()
+            )),
+            "{}",
+            text[1]
+        );
+        // A loadout with no file names no file.
+        let builtin = Layers {
+            loadouts: one(table("env_vars = { MY_SECRET = \"x\" }")),
+            ..Layers::default()
+        };
+        let e = expand_in(file, "dev", builtin).unwrap();
+        let w = &e.report.secret_name_warnings[1];
+        assert_eq!((w.name.as_str(), w.file.as_ref()), ("MY_SECRET", None));
+        assert!(w.to_string().contains("the loadout `l` sets it. "), "{w}");
+        // An inherit stores no value, so the text does not say "as written".
+        let inherit = expand_in(
+            "[sessions.dev]\nenv_vars = { GH_TOKEN = { inherit = true }, \
+             NPM_TOKEN = { inherit = true, default = \"d\" } }\n",
+            "dev",
+            Layers::default(),
+        )
+        .unwrap();
+        let text: Vec<(StoredVar, String)> = inherit
+            .report
+            .secret_name_warnings
+            .iter()
+            .map(|w| (w.stored, w.to_string()))
+            .collect();
+        assert_eq!(
+            text,
+            [
+                (
+                    StoredVar::Inherit,
+                    "the variable GH_TOKEN in `env_vars` has a name that looks like a \
+                     secret's. `[sessions.dev]` in minimal.toml sets it. The box's spec \
+                     stores `{ inherit = true }` for it, not a value. Put a secret \
+                     value in a `[secrets]` entry to keep it out of the spec."
+                        .to_owned()
+                ),
+                (
+                    StoredVar::InheritWithDefault,
+                    "the variable NPM_TOKEN in `env_vars` has a name that looks like a \
+                     secret's. `[sessions.dev]` in minimal.toml sets it. A box from this \
+                     entry stores its `default` as written in the box's spec. Put a secret \
+                     value in a `[secrets]` entry to keep it out of the spec."
+                        .to_owned()
+                ),
+            ]
+        );
+        // No secret-like name, no warning.
+        let plain = expand_in(
+            "[sessions.dev]\nenv_vars = { EDITOR = \"hx\" }\n",
+            "dev",
+            Layers::default(),
+        )
+        .unwrap();
+        assert!(plain.report.secret_name_warnings.is_empty());
+    }
+
+    // BOX-230: a loadout's literal value survives the merge and is stored
+    // in the expanded spec as written, a secret-like name included.
+    #[test]
+    fn loadout_env_var_literal_stored_as_written() {
+        let file = "[sessions.dev]\nloadout_mode = \"open\"\n";
+        let loadouts = r#"env_vars = { GITHUB_TOKEN = "ghp_x y", PLAIN = "1" }"#;
+        let e = expand_in(file, "dev", vars_layers(loadouts, &[])).expect("the entry expands");
+        assert_eq!(e.spec["env_vars"]["GITHUB_TOKEN"].as_str(), Some("ghp_x y"));
+        assert_eq!(e.spec["env_vars"]["PLAIN"].as_str(), Some("1"));
+        assert_eq!(e.report.env_vars["GITHUB_TOKEN"], Origin::loadout("l"));
+        let bytes = e.spec_bytes().unwrap();
+        assert!(bytes.contains("GITHUB_TOKEN = \"ghp_x y\""), "{bytes}");
+    }
+
     // BOX-180: `env_vars` merges by name across the layers. A name keeps
     // the value of the most specific layer up to the entry, and a loadout
     // adds the names it sets.
@@ -3910,14 +4218,10 @@ mod tests {
         )
         .expect("the file reads");
         let session = read.session.expect("the session defaults read");
+        // A lower-case POSIX name is a strict name, so both land in `vars`.
         let strict: Vec<&str> = session.vars.keys().map(AsRef::as_ref).collect();
-        assert_eq!(strict, ["A"]);
-        let lenient: Vec<&str> = session
-            .vars_lenient
-            .iter()
-            .map(|v| v.name().as_ref())
-            .collect();
-        assert_eq!(lenient, ["my_var"]);
+        assert_eq!(strict, ["A", "my_var"]);
+        assert!(session.vars_lenient.is_empty());
         assert!(read.tasks["lint"].vars.contains_key("T"));
         // A session writes its variables back as one `env_vars` table.
         let written = toml::Table::try_from(&session).expect("the session writes");

@@ -636,7 +636,7 @@ fn render_preview_body(model: &Model, key: &SessionKey, frame: &mut Frame, area:
             // A subsystem refusal means the running daemon predates
             // GetSessionScreen; everything else is transient.
             let text = if e.contains("request subsystem") {
-                "preview unavailable: this minimald is too old — restart it (min stop --force)"
+                "preview unavailable: this minimald is too old — restart it (min host stop <host>)"
                     .to_string()
             } else {
                 format!("preview unavailable: {e}")
@@ -820,6 +820,18 @@ fn render_footer(model: &Model, frame: &mut Frame, area: Rect) {
                 Paragraph::new(Line::from(vec![
                     field("name", &form.name, form.field == CreateField::Name),
                     field("path", &form.path, form.field == CreateField::Path),
+                    // The picked session entry. While the entries of the
+                    // path are not read it shows `reading…`. A project with
+                    // none to offer shows `none`, and the create says why
+                    // on submit.
+                    field(
+                        "entry",
+                        match form.entries_current() {
+                            true => form.entry().unwrap_or("none"),
+                            false => "reading…",
+                        },
+                        form.field == CreateField::Entry,
+                    ),
                     field(
                         "net",
                         network_mode_label(crate::dash::app::NETWORK_MODES[form.net_idx]),
@@ -1102,6 +1114,9 @@ mod tests {
             parent: None,
             project_root: None,
             attrs: std::collections::BTreeMap::new(),
+            project_name: None,
+            entry: None,
+            name_origin: boxes::NameOrigin::Written,
         };
         let mut model = Model::new(Utc::now());
         model.details.insert(

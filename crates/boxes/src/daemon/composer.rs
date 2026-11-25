@@ -237,8 +237,8 @@ impl SessionComposer {
 ///
 /// - `patches` and `lifecycle_hooks` replace the project's own items of
 ///   that kind, so a present empty list leaves the project none.
-/// - `vars` and `vars_lenient` set each variable they name, in place of
-///   the project's value for it. The daemon folds the project's stack
+/// - `env_vars`, the entry's one variable table, sets each variable it
+///   names, in place of the project's value for it. The daemon folds the project's stack
 ///   variables into its project list, so the project's other variables
 ///   stay.
 /// - `packages` adds each package that the daemon does not have yet. The
@@ -256,8 +256,7 @@ fn compose_entry(
         box_type,
         project,
         packages,
-        vars,
-        vars_lenient,
+        env_vars,
         patches,
         lifecycle_hooks,
     } = entry;
@@ -265,8 +264,7 @@ fn compose_entry(
         entry = %name,
         box_type = %box_type,
         packages = ?packages.as_ref().map(Vec::len),
-        vars = ?vars.as_ref().map(std::collections::BTreeMap::len),
-        vars_lenient = ?vars_lenient.as_ref().map(Vec::len),
+        env_vars = ?env_vars.as_ref().map(std::collections::BTreeMap::len),
         patches = ?patches.as_ref().map(crate::core::primitives::Patches::len),
         lifecycle_hooks = ?lifecycle_hooks.as_ref().map(Vec::len),
         "compose: composing the project from the received entry (absent lists keep the project's own)",
@@ -276,8 +274,8 @@ fn compose_entry(
     let incoming = crate::core::compose::contribute_primitives(
         &source,
         packages.clone().unwrap_or_default(),
-        vars.clone().unwrap_or_default(),
-        vars_lenient.clone().unwrap_or_default(),
+        env_vars.clone().unwrap_or_default(),
+        Vec::new(),
         patches.clone().unwrap_or_default(),
         lifecycle_hooks.clone().unwrap_or_default(),
         env,
@@ -303,7 +301,7 @@ fn compose_entry(
             .retain(|h| !is_project(h.source()));
         contribution.lifecycle_hooks.extend(incoming_hooks);
     }
-    if vars.is_some() || vars_lenient.is_some() {
+    if env_vars.is_some() {
         let names: std::collections::BTreeSet<String> = incoming_vars
             .iter()
             .map(|v| v.var().name().to_owned())
@@ -1296,11 +1294,11 @@ mod tests {
             }
         };
 
-        // The entry carries packages, vars and an empty hook list, and no
-        // patches or lenient vars.
+        // The entry carries packages, env_vars and an empty hook list, and
+        // no patches.
         let mut entry = WireBoxEntry::new("default", "session", project());
         entry.packages = Some(vec!["ripgrep".into(), "jq".into()]);
-        entry.vars = Some(
+        entry.env_vars = Some(
             [(
                 StrictVarName::try_new("EDITOR").unwrap(),
                 VarValue::specified("hx"),
@@ -1340,5 +1338,106 @@ mod tests {
         assert!(response.vars.iter().any(|v| v.name == "EDITOR"
             && matches!(&v.spec, WireVarSpec::Specified { value } if value == "vi")));
         assert_eq!(response.lifecycle_hooks.len(), 1);
+    }
+
+    /// T136: `compose_entry` sets each variable of the entry's one
+    /// `env_vars` table over the project's, a lower-case name included,
+    /// and a contribution's loadout variables travel under `env_vars`.
+    #[test]
+    fn compose_entry_sets_each_env_var() {
+        use crate::core::compose::{Composable, Contribution, Error};
+        use crate::core::primitives::{ResolvedVar, StrictVarName, VarValue};
+        use crate::core::source::ProvenancedVar;
+        use crate::wire::primitives::WireVarSpec;
+        use crate::wire::request::WireBoxEntry;
+
+        /// The project's own variables: EDITOR and KEEP.
+        struct ProjectVars;
+        impl Composable for ProjectVars {
+            fn contribute(
+                self,
+                _env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
+            ) -> Result<Contribution, Error> {
+                let src = Source::Project {
+                    path: paths::HostPath::try_new("/proj").unwrap(),
+                };
+                let mut c = Contribution::new();
+                for (name, value) in [("EDITOR", "vi"), ("KEEP", "kept")] {
+                    let var = ResolvedVar::resolve_with(
+                        name.to_owned(),
+                        VarValue::specified(value),
+                        |_| Err(std::env::VarError::NotPresent),
+                    )?;
+                    c.push_var(ProvenancedVar::new(var, src.clone()));
+                }
+                Ok(c)
+            }
+        }
+
+        let mut entry = WireBoxEntry::new(
+            "default",
+            "session",
+            paths::HostPath::try_new("/proj").unwrap(),
+        );
+        entry.env_vars = Some(
+            [
+                (
+                    StrictVarName::try_new("EDITOR").unwrap(),
+                    VarValue::specified("hx"),
+                ),
+                (
+                    StrictVarName::try_new("http_proxy").unwrap(),
+                    VarValue::specified("http://proxy:3128"),
+                ),
+            ]
+            .into(),
+        );
+        let loadout_var = WireSessionVar {
+            var: WireResolvedVar {
+                name: "no_proxy".into(),
+                value: "localhost".into(),
+                carries_user_data: false,
+            },
+            source: WireSource::UserLoadout { name: "dev".into() },
+        };
+        let sent = WireContribution {
+            vars: vec![loadout_var.clone()],
+            entry: Some(Box::new(entry)),
+            ..WireContribution::default()
+        };
+        // The contribution reaches the daemon as JSON, with its loadout
+        // variables under `env_vars`.
+        let json = serde_json_lenient::to_string(&sent).unwrap();
+        assert!(json.contains(r#""env_vars":[{"#), "got: {json}");
+        let received: WireContribution = serde_json_lenient::from_str(&json).unwrap();
+        assert_eq!(received, sent);
+
+        let mut composer = SessionComposer::new(received);
+        composer.add(ProjectVars).unwrap();
+        let ComposeOutcome::Pending { response, state } = composer
+            .compose(nil_id(), ComposeOptions::default())
+            .unwrap()
+        else {
+            panic!("project vars must reach the gate");
+        };
+        let mut vars: Vec<(&str, &str)> = response
+            .vars
+            .iter()
+            .map(|v| match &v.spec {
+                WireVarSpec::Specified { value } => (v.name.as_str(), value.as_str()),
+                other => panic!("unexpected spec {other:?}"),
+            })
+            .collect();
+        vars.sort_unstable();
+        assert_eq!(
+            vars,
+            [
+                ("EDITOR", "hx"),
+                ("KEEP", "kept"),
+                ("http_proxy", "http://proxy:3128"),
+            ],
+            "each env_vars variable once, over the project's"
+        );
+        assert_eq!(state.client_contribution.vars, [loadout_var]);
     }
 }

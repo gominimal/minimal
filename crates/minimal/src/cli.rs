@@ -73,18 +73,18 @@ pub enum Command {
     // not remove it.
     Ls(LsArgs),
     // BCLI-042: no bare `min stop`. `min host stop` takes its place.
-    /// Session management subcommands
+    /// Session subcommands: the box commands for session boxes
     #[command(visible_alias = "sessions")]
     Session(SessionArgs),
     /// Loadout management subcommands
     #[command(visible_alias = "loadouts")]
     Loadout(LoadoutArgs),
-    /// Task subcommands: run declared project tasks in ephemeral sessions
+    /// Task subcommands: run the project's tasks, each in a box of its own
     #[command(visible_alias = "tasks")]
     Task(TaskArgs),
     /// Network subcommands: bring a box's services to the laptop
     Net(NetArgs),
-    /// Box subcommands: show what a box will get
+    /// Box subcommands: create, run, inspect, stop and remove boxes
     #[command(visible_alias = "boxes")]
     Box(BoxArgs),
     /// Host subcommands: the daemons on this machine that run boxes
@@ -229,7 +229,7 @@ pub enum SessionCommand {
     /// `min box list` lists boxes. `--all` lists the session boxes of every
     /// project
     #[command(visible_alias = "ls")]
-    List(BoxListArgs),
+    List(TypedBoxListArgs),
     // BCLI-042: no `activate`, `destroy`, `exec`, `rename`, `policy`,
     // `hooks` or `run` here. They fail as unknown commands.
     /// Create a box from a session entry of the project and attach this
@@ -661,13 +661,40 @@ pub enum TypeOutputFormat {
     Toml,
 }
 
-// BOX-158 (BCLI-001, BCLI-051): `min box list [--all] [-o json]`.
+// BOX-158 (BCLI-001, BCLI-051): `min box list [--all] [-o json]`, and
+// BCLI-026's `--type <name>` and `--parent <box>`.
 #[derive(Debug, Args)]
 pub struct BoxListArgs {
     /// List the boxes of every project, not only the boxes of the current
     /// project
     #[arg(long)]
     pub all: bool,
+    /// List only the boxes of this type, such as `session` or `task`
+    #[arg(long = "type", value_name = "TYPE", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub box_type: Option<String>,
+    /// List only the child boxes of this box: its id, the start of its id,
+    /// or its name
+    #[arg(long, value_name = "BOX", add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub parent: Option<String>,
+    /// Write the boxes as a JSON array, one object for each box, and
+    /// nothing else
+    #[arg(short = 'o', long = "output", value_enum)]
+    pub output: Option<BoxListOutputFormat>,
+}
+
+// BCLI-030: `min session list` and `min task list` are `min box list` for
+// one Box Type, so they take the flags of `min box list` except `--type`,
+// which the noun fixes.
+#[derive(Debug, Args)]
+pub struct TypedBoxListArgs {
+    /// List the boxes of every project, not only the boxes of the current
+    /// project
+    #[arg(long)]
+    pub all: bool,
+    /// List only the child boxes of this box: its id, the start of its id,
+    /// or its name
+    #[arg(long, value_name = "BOX", add = completion::box_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub parent: Option<String>,
     /// Write the boxes as a JSON array, one object for each box, and
     /// nothing else
     #[arg(short = 'o', long = "output", value_enum)]
@@ -1256,7 +1283,7 @@ pub enum TaskCommand {
     /// `min box list` lists boxes. A task that ended shows its exit code,
     /// as `exited (exit 3)`, until `min box prune` removes it. `--all`
     /// lists the tasks of every project
-    List(BoxListArgs),
+    List(TypedBoxListArgs),
     /// Show what a task printed, from its start. `-f` keeps showing new
     /// output until the task's box is removed or the command is interrupted
     Logs(BoxLogsArgs),
@@ -1271,14 +1298,15 @@ pub enum TaskCommand {
     Rm(BoxRmArgs),
 }
 
-// BCLI-069 gives `--name` to `min task run` too. It is not here yet: the
-// run path's `RunEntry` takes no box name, and the daemon names every run's
-// box `<entry>-<n>`. The start half is gominimal/minimal#3196. Add the flag
-// here and on `BoxRunArgs` when `RunEntry` takes a name.
+// BCLI-069: `--name` is the requested name of the run's box, in place of
+// the task's `[box] name`.
 #[derive(Debug, Args)]
 pub struct TaskRunArgs {
     /// Name of a task declared in the project's minimal.toml
     pub task: String,
+    /// Name the box. This replaces the `[box] name` in minimal.toml
+    #[arg(long)]
+    pub name: Option<String>,
     // BCLI-042: no `--path`. The global `-C <dir>` names the project.
     // The same values and parser as `min session activate --network`, with
     // help worded for a task box. With no flag, the box takes the task's
@@ -1303,16 +1331,16 @@ pub struct TaskRunArgs {
     pub args: Vec<String>,
 }
 
-// BCLI-010, BCLI-035, BCLI-070: `min box run <entry> [--detach] [-- <args>…]`.
-// BCLI-069's `--name` is not here yet. See the comment on `TaskRunArgs`.
+// BCLI-010, BCLI-035, BCLI-069, BCLI-070:
+// `min box run <entry> [--name <name>] [--detach] [-- <args>…]`.
 #[derive(Debug, Args)]
 pub struct BoxRunArgs {
     /// Name of an entry declared in the project's minimal.toml: a task
     pub entry: String,
-    /// Project path. Defaults to the directory set by `-C`/`--repo-dir`,
-    /// or the current working directory when neither is given
+    /// Name the box. This replaces the `[box] name` in minimal.toml
     #[arg(long)]
-    pub path: Option<String>,
+    pub name: Option<String>,
+    // BCLI-026: no `--path`. The global `-C <dir>` names the project.
     /// Start the box, print its id and return. The box gets no input
     #[arg(long)]
     pub detach: bool,
@@ -1640,13 +1668,11 @@ pub struct ActivateArgs {
     /// `-C`/`--repo-dir`, or the current working directory when neither
     /// is given.
     pub path: Option<String>,
-    /// How to load project files into the session.
-    ///
-    /// Defaults to `tarball`. Passing `--sync tarball` explicitly is also
-    /// the escape hatch that uploads an empty directory or `$HOME`, which
-    /// are otherwise skipped without a prompt.
-    #[arg(long, value_enum)]
-    pub sync: Option<SyncMode>,
+    // Not a flag: an internal start (the VM-host routing test) that must
+    // not upload the project sets it. BCLI-042 removed `--sync`, so every
+    // start from the command line uploads the project.
+    #[arg(skip)]
+    pub skip_upload: bool,
     // The `--network` flag is shared with `min box spec`, so the two
     // cannot drift: see [`NETWORK_HELP`].
     #[arg(
@@ -1827,15 +1853,6 @@ pub enum Provider {
     // after the command ends.
     #[value(hide = true)]
     LocalMinimald,
-}
-
-/// Configuration for file sync during activation.
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
-pub enum SyncMode {
-    /// Stream a tarball of your project and unpack it into the session.
-    Tarball,
-    /// Do not populate the worktree of the session.
-    None,
 }
 
 /// CLI surface for [`boxes::NetworkMode`]. Parsed by hand in

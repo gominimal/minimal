@@ -97,6 +97,7 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
     let module_hosts = crate::config::store_module_hosts();
     check_store_references(
         inputs.secrets,
+        inputs.network,
         inputs.egress,
         inputs.store_rules,
         crate::config::store_deny_set(&module_hosts),
@@ -419,6 +420,7 @@ fn project_file_bytes(project: &Path) -> anyhow::Result<Option<(PathBuf, Vec<u8>
         Err(mfile::Error::NotFound) => return Ok(None),
         Err(error) => return Err(crate::ProjectFileInvalid { error }.into()),
     };
+    file.print_diagnostics();
     let Some(root) = file.repo_path() else {
         return Ok(None);
     };
@@ -446,7 +448,7 @@ fn project_rows(global: &GlobalArgs, args: &BoxSpecArgs, out: &mut Vec<u8>) -> a
     // This parse only maps a missing or invalid project file to its
     // message. The expansion below loads the file again.
     match mfile::File::from_dir_recursive(&project) {
-        Ok(_) => {}
+        Ok(file) => file.print_diagnostics(),
         Err(mfile::Error::NotFound) => anyhow::bail!(
             "No {} found in {} or its parent directories.",
             mfile::MFILE_NAME,
@@ -937,6 +939,9 @@ struct EntrySpec {
     /// the order it applies them, for a task entry too. Empty for a sealed
     /// box, which selects no loadout.
     loadouts: Option<Vec<String>>,
+    /// The expander's warnings about `env_vars` names that look like a
+    /// secret's (BOX-231). Only `min box spec` prints them (BCLI-084).
+    secret_name_warnings: Vec<mfile::expand::SecretNameWarning>,
 }
 
 /// `min box spec <entry>` (BCLI-021): the entry's expanded spec in the
@@ -1003,7 +1008,17 @@ fn entry_spec(
             write_document(&serde_json_lenient::Value::Object(doc), format, &mut text)?;
         }
     }
-    tracing::info!(verb = "box spec", entry = %rendered.entry, outcome = "ok");
+    // BCLI-084, BOX-231: each warning goes to stderr, so stdout stays the
+    // spec in every `-o` format. No other command prints them.
+    for warning in &rendered.secret_name_warnings {
+        eprintln!("warning: {warning}");
+    }
+    tracing::info!(
+        verb = "box spec",
+        entry = %rendered.entry,
+        secret_name_warnings = rendered.secret_name_warnings.len(),
+        outcome = "ok"
+    );
     out.extend_from_slice(&text);
     Ok(())
 }
@@ -1051,6 +1066,7 @@ fn expand_entry(
     // same read.
     let (expansion, read_rules) = expand_with_store_rules(Some(global), entry, &mut layers)?;
     let store_ids = store_reference_ids(&expansion.spec);
+    let secret_name_warnings = expansion.report.secret_name_warnings.clone();
     let mut spec = expansion.spec;
     let mut sources = std::collections::BTreeMap::new();
     for (key, origin) in &expansion.report.values {
@@ -1304,6 +1320,7 @@ fn expand_entry(
             sources,
             proxy_rows: Vec::new(),
             loadouts,
+            secret_name_warnings,
         });
     }
     let bep: BepSettings = network
@@ -1350,6 +1367,7 @@ fn expand_entry(
         sources,
         proxy_rows: rows_text,
         loadouts,
+        secret_name_warnings,
     })
 }
 
@@ -1402,11 +1420,34 @@ async fn box_spec(
     let mut text = Vec::new();
     match format {
         BoxSpecOutputFormat::Toml => {
+            // BCLI-022, BOX-227, BOX-228: the box's name comes from its
+            // record, never from its spec, so a renamed box shows its new
+            // name. `[box] name` is only the name the entry asked for.
+            let Some(record) = super::box_verbs::stored_box_record(&mut client, id).await? else {
+                tracing::info!(verb = "box spec", box_id = %id, outcome = "not found");
+                return Err(super::box_verbs::BoxAddressRefusal::NotFound {
+                    address: target.to_owned(),
+                }
+                .into());
+            };
             writeln!(text, "# The spec box {id} was created with.")?;
+            write_record_name(&record, &mut text)?;
             let spec = match json_to_toml(&stored) {
                 Some(toml::Value::Table(table)) => table,
                 _ => anyhow::bail!("The stored spec of box {id} is not a table."),
             };
+            if let Some(requested) = spec
+                .get("box")
+                .and_then(|b| b.get("name"))
+                .and_then(toml::Value::as_str)
+            {
+                writeln!(
+                    text,
+                    "# [box] name {}: the name the entry asks for when a box is created from it. \
+                     It is not the name of this box.",
+                    one_line_string(requested)
+                )?;
+            }
             // BCLI-022, BOX-179: each stored hook, with who declared it.
             if let Some(toml::Value::Array(hooks)) = spec.get("lifecycle_hooks") {
                 write_hook_list(hooks, &mut text)?;
@@ -1423,6 +1464,23 @@ async fn box_spec(
     }
     tracing::info!(verb = "box spec", box_id = %id, outcome = "ok", host = %host.host);
     out.extend_from_slice(&text);
+    Ok(())
+}
+
+/// Writes the name `record` holds as a comment line, with whether a person
+/// wrote it or the host derived it.
+fn write_record_name(record: &boxes::Record, out: &mut Vec<u8>) -> anyhow::Result<()> {
+    let Some(name) = record.name.as_deref() else {
+        writeln!(out, "# Box name: none.")?;
+        return Ok(());
+    };
+    let origin = match record.name_origin {
+        boxes::NameOrigin::Written => "a person wrote this name",
+        boxes::NameOrigin::Derived => {
+            "the host derived this name from the project name and the entry"
+        }
+    };
+    writeln!(out, "# Box name: {} ({origin}).", one_line_string(name))?;
     Ok(())
 }
 

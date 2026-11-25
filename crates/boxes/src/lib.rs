@@ -1563,8 +1563,56 @@ pub struct Record {
     #[serde(default)]
     pub project_root: Option<HostAbsPath>,
 
+    /// The project name the create derived the box's name from, or would
+    /// have: the request's project name, else the project root's directory
+    /// name. Daemon-stamped at creation. `None` for a record that predates
+    /// the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
+
+    /// The entry the box's stored spec names, as the create read it.
+    /// Daemon-stamped at creation. `None` for a box filed with no spec, a
+    /// spec that names no entry, and a record that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<String>,
+
+    /// Whether the box's name was written by a person or derived from the
+    /// project and the entry. A rename sets it to [`NameOrigin::Written`].
+    /// A record that predates the field reads as written.
+    #[serde(default)]
+    pub name_origin: NameOrigin,
+
     /// Free-form attributes.
     pub attrs: BTreeMap<String, String>,
+}
+
+/// Where a box's current name came from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NameOrigin {
+    /// A person wrote the name: on the create request, or with a rename.
+    /// Also the reading of a record that predates the field.
+    #[default]
+    Written,
+    /// The daemon derived the name from the project name and the entry.
+    Derived,
+}
+
+impl NameOrigin {
+    /// The origin as the record and the wire spell it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Written => "written",
+            Self::Derived => "derived",
+        }
+    }
+}
+
+impl std::fmt::Display for NameOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// The Box Type of a box `min session activate` creates (BOX-001).
@@ -1572,6 +1620,57 @@ pub const SESSION_BOX_TYPE: &str = "session";
 
 /// The Box Type of a box `min task run` creates (BOX-001).
 pub const TASK_BOX_TYPE: &str = "task";
+
+/// The Box Type of a box `min` expands from a Package Build Spec (BOX-209).
+pub const BUILD_BOX_TYPE: &str = "build";
+
+/// The Box Spec of a box of the `build` type (BOX-209): the part a Package
+/// Build Spec does not choose. Everything but the package, its dependencies,
+/// its parent and its egress is the type's own.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BuildBoxSpec {
+    /// Always [`BUILD_BOX_TYPE`].
+    pub box_type: &'static str,
+    /// The requesting box.
+    pub parent: SessionId,
+    /// The package the box builds.
+    pub package: String,
+    /// The build's declared dependencies.
+    pub packages: Vec<String>,
+    /// A build box has no terminal.
+    pub pty_enabled: bool,
+    /// It ends with its build.
+    pub lifetime: &'static str,
+    /// Nothing runs in it but the build.
+    pub exec_enabled: bool,
+    /// It takes no loadout.
+    pub loadout_mode: &'static str,
+    /// What it may reach, `None` for everything.
+    pub egress: Option<EgressPolicy>,
+}
+
+impl BuildBoxSpec {
+    /// The spec of the build box of `package`, for the box `parent`.
+    #[must_use]
+    pub fn derive(
+        parent: SessionId,
+        package: String,
+        packages: Vec<String>,
+        egress: Option<EgressPolicy>,
+    ) -> Self {
+        Self {
+            box_type: BUILD_BOX_TYPE,
+            parent,
+            package,
+            packages,
+            pty_enabled: false,
+            lifetime: "until_complete",
+            exec_enabled: false,
+            loadout_mode: "sealed",
+            egress,
+        }
+    }
+}
 
 impl Record {
     /// The one state the record is in (BOX-011), read from its `status`
@@ -1790,6 +1889,348 @@ pub mod box_name {
         } else {
             trimmed.to_string()
         }
+    }
+
+    /// The longest box name: one DNS label (BOX-213).
+    pub const BOX_NAME_MAX: usize = 63;
+
+    /// `text` as DNS label characters, uncapped: ASCII letters and digits
+    /// lowercased, `-`, `_` and `.` as `-`, other characters dropped, and
+    /// no `-` at either end.
+    fn label_chars(text: &str) -> String {
+        let filtered: String = text
+            .chars()
+            .filter_map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    Some(c.to_ascii_lowercase())
+                } else if matches!(c, '-' | '_' | '.') {
+                    Some('-')
+                } else {
+                    None
+                }
+            })
+            .collect();
+        filtered.trim_matches('-').to_string()
+    }
+
+    /// The first `max` octets of the ASCII label `label`, with no `-` left
+    /// at the end.
+    fn cut_label(label: &str, max: usize) -> &str {
+        label[..label.len().min(max)].trim_end_matches('-')
+    }
+
+    /// The project name of a project root path: its last path component.
+    /// An empty string when the path has none, as for `/`.
+    #[must_use]
+    pub fn project_name_of_root(root: &str) -> &str {
+        root.trim_end_matches('/').rsplit('/').next().unwrap_or("")
+    }
+
+    /// The name a box takes from no project at all: a create that carries
+    /// neither a project name nor a project root.
+    pub const NO_PROJECT_NAME: &str = "box";
+
+    /// Whether `text` is one DNS label (BOX-216): 1 to [`BOX_NAME_MAX`]
+    /// ASCII letters, digits and `-`, with no `-` at either end.
+    #[must_use]
+    pub fn is_dns_label(text: &str) -> bool {
+        (1..=BOX_NAME_MAX).contains(&text.len())
+            && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && !text.starts_with('-')
+            && !text.ends_with('-')
+    }
+
+    /// The project name a directory name gives (BOX-215): its bytes with
+    /// each ASCII letter lowercased and each run of bytes that are not
+    /// ASCII letters or digits as one `-`, cut to [`BOX_NAME_MAX`]
+    /// characters, with no `-` at either end. A name with nothing left
+    /// gives [`NO_PROJECT_NAME`]. The answer is always a DNS label.
+    #[must_use]
+    pub fn project_name_from_dir_bytes(dir_name: &[u8]) -> String {
+        let mut converted = String::with_capacity(dir_name.len());
+        for &byte in dir_name {
+            if byte.is_ascii_alphanumeric() {
+                converted.push(char::from(byte.to_ascii_lowercase()));
+            } else if !converted.ends_with('-') {
+                converted.push('-');
+            }
+        }
+        converted.truncate(BOX_NAME_MAX);
+        match converted.trim_matches('-') {
+            "" => NO_PROJECT_NAME.to_string(),
+            name => name.to_string(),
+        }
+    }
+
+    /// The project name of a project root path (BOX-215): its last
+    /// component, converted as [`project_name_from_dir_bytes`] converts it.
+    #[must_use]
+    pub fn project_name_of_dir(root: &str) -> String {
+        project_name_from_dir_bytes(project_name_of_root(root).as_bytes())
+    }
+
+    /// The project name a create derives its box name from: the project
+    /// name the request carries, else the name of the project root
+    /// directory (BOX-215), else [`NO_PROJECT_NAME`]. A path never gives
+    /// the name when a project name is present.
+    #[must_use]
+    pub fn request_project_name(project_name: Option<&str>, project_root: Option<&str>) -> String {
+        match (project_name, project_root) {
+            (Some(name), _) => name.to_string(),
+            (None, Some(root)) => project_name_of_dir(root),
+            (None, None) => NO_PROJECT_NAME.to_string(),
+        }
+    }
+
+    /// The project part of a derived name, as one DNS label: ASCII letters
+    /// and digits lowercased, and each run of other characters as one `-`,
+    /// with no `-` at either end. A project with nothing left is `box`, so
+    /// `cafébar` gives `caf-bar` and `日本` gives `box`.
+    fn project_label(project: &str) -> String {
+        let mut label = String::with_capacity(project.len());
+        for c in project.chars() {
+            if c.is_ascii_alphanumeric() {
+                label.push(c.to_ascii_lowercase());
+            } else if !label.is_empty() && !label.ends_with('-') {
+                label.push('-');
+            }
+        }
+        let label = label.trim_end_matches('-');
+        if label.is_empty() {
+            "box".to_string()
+        } else {
+            label.to_string()
+        }
+    }
+
+    /// The name the Box Host derives for a box created with no requested
+    /// name (BOX-211, BOX-213): the project name for the default entry
+    /// (`entry` is `None`), else `<project>-<entry>`, and then `-<n>` for
+    /// the `n`th fresh instance. The project is cleaned as
+    /// [`project_label`] cleans it, and the entry to DNS label characters.
+    /// The name fits [`BOX_NAME_MAX`] octets: the project is cut first,
+    /// then the entry, and the instance number never.
+    #[must_use]
+    pub fn derived_box_name(project: &str, entry: Option<&str>, instance: Option<usize>) -> String {
+        let suffix = instance.map(|n| format!("-{n}")).unwrap_or_default();
+        let budget = BOX_NAME_MAX.saturating_sub(suffix.len());
+        let project = project_label(project);
+        let entry = entry.map(label_chars).filter(|entry| !entry.is_empty());
+        let base = match entry {
+            None => cut_label(&project, budget).to_string(),
+            Some(entry) => {
+                let entry = cut_label(&entry, budget);
+                let room = budget.saturating_sub(entry.len() + 1);
+                match cut_label(&project, room) {
+                    "" => entry.to_string(),
+                    project => format!("{project}-{entry}"),
+                }
+            }
+        };
+        let base = if base.is_empty() {
+            "box"
+        } else {
+            base.as_str()
+        };
+        format!("{base}{suffix}")
+    }
+
+    /// The entry a session spec names when it names none of its own. A
+    /// box of this entry takes the project name alone.
+    pub const DEFAULT_ENTRY: &str = "default";
+
+    /// The name a create with no requested name gives its box (BOX-211):
+    /// [`derived_box_name`] of the `project` name and the `entry` of the
+    /// stored `spec`. [`request_project_name`] gives the project name. A spec with no readable `entry`,
+    /// a spec of [`DEFAULT_ENTRY`], or no spec takes the project name
+    /// alone. Only the `entry` key is read, so a spec that does not parse
+    /// as a v0 spec still gives a name. The Box Host, `min box start` and
+    /// `min dash` all name an unnamed box through this one function.
+    #[must_use]
+    pub fn create_derived_name(
+        project: &str,
+        spec: Option<&serde_json_lenient::Value>,
+        instance: Option<usize>,
+    ) -> String {
+        let entry = spec
+            .and_then(|spec| spec.get("entry"))
+            .and_then(serde_json_lenient::Value::as_str)
+            .filter(|entry| *entry != DEFAULT_ENTRY);
+        derived_box_name(project, entry, instance)
+    }
+
+    /// The `[box] name` a stored `spec` carries at `box.name`, when it
+    /// carries one.
+    #[must_use]
+    pub fn spec_box_name(spec: Option<&serde_json_lenient::Value>) -> Option<&str> {
+        spec.and_then(|spec| spec.get("box"))
+            .and_then(|table| table.get("name"))
+            .and_then(serde_json_lenient::Value::as_str)
+    }
+
+    /// The names no box takes, compared under ASCII case: the host's and
+    /// the node's row labels, `local`, `localhost` and [`RESERVED_NAME`].
+    pub const RESERVED_NAMES: [&str; 5] = [
+        crate::core::zone_answer::HOST_ROW_LABEL,
+        "local",
+        "localhost",
+        crate::core::zone_answer::NODE_ROW_LABEL,
+        RESERVED_NAME,
+    ];
+
+    /// The reserved name `name` folds to, if any (see [`RESERVED_NAMES`]).
+    #[must_use]
+    pub fn reserved_name(name: &str) -> Option<&'static str> {
+        RESERVED_NAMES
+            .iter()
+            .copied()
+            .find(|reserved| name.eq_ignore_ascii_case(reserved))
+    }
+
+    /// Whether `name` parses as a box id. Lookups try an id before a
+    /// name, so a box never takes a name of this form.
+    #[must_use]
+    pub fn is_box_id_form(name: &str) -> bool {
+        BoxId::parse_str(name).is_ok()
+    }
+
+    /// What a name derived from a project and an entry is made of, so the
+    /// store can walk its candidates (BOX-211, BOX-213): the project name
+    /// and the entry, when the spec names one other than
+    /// [`DEFAULT_ENTRY`].
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct DerivedName {
+        project: String,
+        entry: Option<String>,
+    }
+
+    impl DerivedName {
+        /// The derived name of `project` and the `entry` of `spec`, read as
+        /// [`create_derived_name`] reads it.
+        #[must_use]
+        pub fn new(project: &str, spec: Option<&serde_json_lenient::Value>) -> Self {
+            let entry = spec
+                .and_then(|spec| spec.get("entry"))
+                .and_then(serde_json_lenient::Value::as_str)
+                .filter(|entry| *entry != DEFAULT_ENTRY)
+                .map(str::to_string);
+            Self {
+                project: project.to_string(),
+                entry,
+            }
+        }
+
+        /// The name, with `-<n>` for the `n`th instance. It fits
+        /// [`BOX_NAME_MAX`] octets, and the number is never cut.
+        #[must_use]
+        pub fn name(&self, instance: Option<usize>) -> String {
+            derived_box_name(&self.project, self.entry.as_deref(), instance)
+        }
+
+        /// The candidates in the order a create tries them: the name, then
+        /// `<name>-1`, `<name>-2` and so on. A fresh instance starts at
+        /// `<name>-1`.
+        pub fn candidates(
+            &self,
+            fresh: bool,
+        ) -> impl Iterator<Item = (String, Option<usize>)> + '_ {
+            let first = (!fresh).then(|| (self.name(None), None));
+            first
+                .into_iter()
+                .chain((1..).map(|n| (self.name(Some(n)), Some(n))))
+        }
+    }
+
+    /// Why a derived name is taken, so a create walks on to the next
+    /// candidate.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum DerivedNameTaken {
+        /// A retained record on this host has the name, in any state.
+        Held(NamedBox),
+        /// The name is reserved (see [`RESERVED_NAMES`]).
+        Reserved,
+        /// The name parses as a box id.
+        BoxIdForm,
+    }
+
+    impl DerivedNameTaken {
+        /// The word for the reason, for a log line.
+        #[must_use]
+        pub fn word(&self) -> &'static str {
+            match self {
+                Self::Held(_) => "held",
+                Self::Reserved => "reserved",
+                Self::BoxIdForm => "box_id_form",
+            }
+        }
+    }
+
+    /// Why `name` is taken for a derived name, or `None` when it is free.
+    /// `boxes` are the retained records whose name folds to `name`. Every
+    /// state counts, a stopped or exited record too, so a derived name
+    /// never reuses the name of a box that is kept. The running holder
+    /// is named first, else the latest record of the name.
+    #[must_use]
+    pub fn derived_name_taken(boxes: &[NamedBox], name: &str) -> Option<DerivedNameTaken> {
+        if reserved_name(name).is_some() {
+            return Some(DerivedNameTaken::Reserved);
+        }
+        if is_box_id_form(name) {
+            return Some(DerivedNameTaken::BoxIdForm);
+        }
+        let found = candidates(boxes, name);
+        found
+            .iter()
+            .copied()
+            .find(|b| b.is_running())
+            .or_else(|| latest(found.iter().copied()))
+            .cloned()
+            .map(DerivedNameTaken::Held)
+    }
+
+    /// The name a derived-name create takes, and the name it did not get.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct DerivedAssignment {
+        /// The name the box takes.
+        pub name: String,
+        /// The instance number in the name, if any.
+        pub instance: Option<usize>,
+        /// The first candidate, when it was taken, with the reason. A
+        /// fresh instance never asks for the bare name, so it has none.
+        pub not_taken: Option<(String, DerivedNameTaken)>,
+    }
+
+    /// Walks the candidates of `derived` and answers the first one that
+    /// `taken` says is free. `taken` answers [`derived_name_taken`] for
+    /// one candidate against the records it reads.
+    ///
+    /// # Errors
+    ///
+    /// The first error of `taken`.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: a finite set of records leaves a number free.
+    pub fn assign_derived_name<E>(
+        derived: &DerivedName,
+        fresh: bool,
+        mut taken: impl FnMut(&str) -> Result<Option<DerivedNameTaken>, E>,
+    ) -> Result<DerivedAssignment, E> {
+        let mut not_taken = None;
+        for (index, (name, instance)) in derived.candidates(fresh).enumerate() {
+            match taken(&name)? {
+                None => {
+                    return Ok(DerivedAssignment {
+                        name,
+                        instance,
+                        not_taken,
+                    });
+                }
+                Some(reason) if index == 0 && !fresh => not_taken = Some((name, reason)),
+                Some(_) => {}
+            }
+        }
+        unreachable!("the candidate walk is unbounded")
     }
 
     /// What a name check reads of one retained record on one host.
@@ -2085,7 +2526,7 @@ pub mod box_name {
                 } => write!(
                     f,
                     "The running session `{holder_name}` ({holder}) holds the name `{name}`. \
-                     Rename it with `min session rename {holder} <new-name>`, \
+                     Rename it with `min box rename {holder} <new-name>`, \
                      or choose another name."
                 ),
                 Self::Reserved => write!(
@@ -2152,6 +2593,34 @@ pub mod box_name {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BOX-209: everything but the package, its dependencies, its parent and
+    /// its egress is the `build` type's own.
+    #[test]
+    fn build_box_spec_derives_from_the_build_spec() {
+        let parent = SessionId::nil();
+        let egress = EgressPolicy::deny_all();
+        let spec = BuildBoxSpec::derive(
+            parent,
+            "claude-code".to_string(),
+            vec!["nodejs".to_string()],
+            Some(egress.clone()),
+        );
+        assert_eq!(
+            spec,
+            BuildBoxSpec {
+                box_type: "build",
+                parent,
+                package: "claude-code".to_string(),
+                packages: vec!["nodejs".to_string()],
+                pty_enabled: false,
+                lifetime: "until_complete",
+                exec_enabled: false,
+                loadout_mode: "sealed",
+                egress: Some(egress),
+            }
+        );
+    }
 
     /// A clock reading at or behind the last mint millisecond never moves
     /// the mint back: a stale reading, a same-millisecond reading and a
@@ -2300,6 +2769,9 @@ mod tests {
             parent: None,
             project_root: None,
             attrs: BTreeMap::new(),
+            project_name: None,
+            entry: None,
+            name_origin: crate::NameOrigin::Written,
         }
     }
 
@@ -3505,6 +3977,159 @@ mod tests {
             assert_eq!(entry_box_name(""), "box");
             assert_eq!(entry_box_name("\t日本\t"), "box");
             assert_eq!(entry_box_name("-_."), "box");
+        }
+
+        /// The candidate walk of a 63-octet derived name: each candidate is
+        /// one label of at most 63 octets, and keeps its number whole.
+        #[test]
+        fn derived_name_takes_smallest_free_number_fitted_to_63() {
+            use super::super::box_name::{
+                BOX_NAME_MAX, DerivedName, DerivedNameTaken, assign_derived_name, is_dns_label,
+            };
+
+            let derived = DerivedName::new(&"p".repeat(70), None);
+            let walked: Vec<String> = derived.candidates(false).take(12).map(|(n, _)| n).collect();
+            assert_eq!(walked[0], "p".repeat(63));
+            assert_eq!(walked[1], format!("{}-1", "p".repeat(61)));
+            assert_eq!(walked[11], format!("{}-11", "p".repeat(60)));
+            assert!(
+                walked
+                    .iter()
+                    .all(|name| is_dns_label(name) && name.len() == BOX_NAME_MAX)
+            );
+
+            let taken: Vec<String> = walked[..3].to_vec();
+            let got = assign_derived_name(&derived, false, |name| {
+                Ok::<_, ()>(
+                    taken
+                        .iter()
+                        .any(|t| t == name)
+                        .then_some(DerivedNameTaken::Reserved),
+                )
+            })
+            .unwrap();
+            assert_eq!(got.name, walked[3]);
+            assert_eq!(got.instance, Some(3));
+            assert_eq!(
+                got.not_taken,
+                Some((walked[0].clone(), DerivedNameTaken::Reserved))
+            );
+        }
+
+        /// BOX-211, BOX-213: a derived name is one label of at most 63
+        /// octets. The project is cut first, then the entry, and the
+        /// fresh instance's number is never cut.
+        #[test]
+        fn derived_name_fits_63_cutting_project_then_entry_never_number() {
+            use super::super::box_name::{
+                BOX_NAME_MAX, DEFAULT_ENTRY, create_derived_name, derived_box_name,
+                project_name_of_root, spec_box_name,
+            };
+
+            assert_eq!(derived_box_name("Web_App", None, None), "web-app");
+            assert_eq!(derived_box_name("web", Some("lint"), None), "web-lint");
+            assert_eq!(derived_box_name("web", Some("lint"), Some(3)), "web-lint-3");
+
+            // The project is cut first.
+            let project = "p".repeat(70);
+            let name = derived_box_name(&project, Some("lint"), None);
+            assert_eq!(name, format!("{}-lint", "p".repeat(58)));
+            assert_eq!(name.len(), BOX_NAME_MAX);
+
+            // The number keeps its digits, and the project gives the room.
+            let name = derived_box_name(&project, Some("lint"), Some(12));
+            assert_eq!(name, format!("{}-lint-12", "p".repeat(55)));
+            assert_eq!(name.len(), BOX_NAME_MAX);
+
+            // A project alone is cut to the label.
+            let name = derived_box_name(&project, None, Some(7));
+            assert_eq!(name, format!("{}-7", "p".repeat(61)));
+
+            // With no room for the project, the entry is cut next.
+            let entry = "e".repeat(80);
+            let name = derived_box_name("web", Some(&entry), Some(100));
+            assert_eq!(name, format!("{}-100", "e".repeat(59)));
+            assert_eq!(name.len(), BOX_NAME_MAX);
+
+            // A cut never leaves a `-` before the next part.
+            let project = format!("{}_x", "p".repeat(57));
+            assert_eq!(
+                derived_box_name(&project, Some("lint"), None),
+                format!("{}-lint", "p".repeat(57))
+            );
+
+            // Parts that clean to nothing.
+            assert_eq!(derived_box_name("日本", Some("lint"), None), "box-lint");
+            assert_eq!(derived_box_name("My_App.v2", None, None), "my-app-v2");
+            assert_eq!(derived_box_name("cafébar", None, None), "caf-bar");
+            assert_eq!(derived_box_name("a--b", Some("x"), None), "a-b-x");
+            assert_eq!(derived_box_name("日本", None, None), "box");
+            assert_eq!(derived_box_name("", None, Some(2)), "box-2");
+
+            assert_eq!(project_name_of_root("/home/me/web/"), "web");
+            assert_eq!(project_name_of_root("/home/me/web"), "web");
+            assert_eq!(project_name_of_root("/"), "");
+
+            // The create's name: the project name and the spec's entry,
+            // with the default entry naming the project alone.
+            let spec = |entry: &str| serde_json_lenient::json!({ "entry": entry, "box": { "name": "api" } });
+            assert_eq!(
+                create_derived_name("web", Some(&spec("lint")), None),
+                "web-lint"
+            );
+            assert_eq!(
+                create_derived_name("web", Some(&spec(DEFAULT_ENTRY)), None),
+                "web"
+            );
+            assert_eq!(create_derived_name("web", None, Some(2)), "web-2");
+            assert_eq!(spec_box_name(Some(&spec("lint"))), Some("api"));
+            assert_eq!(spec_box_name(None), None);
+        }
+
+        /// BOX-215, BOX-216: a request's project name wins over its root,
+        /// a root gives its converted directory name, and nothing gives
+        /// `box`. Only a DNS label passes the label check.
+        #[test]
+        fn request_project_name_prefers_sent_name_then_root() {
+            use super::super::box_name::{
+                is_dns_label, project_name_from_dir_bytes, request_project_name,
+            };
+
+            assert_eq!(
+                request_project_name(Some("web"), Some("/home/me/api")),
+                "web"
+            );
+            assert_eq!(
+                request_project_name(None, Some("/home/me/My App/")),
+                "my-app"
+            );
+            assert_eq!(request_project_name(None, None), "box");
+
+            assert_eq!(project_name_from_dir_bytes(b"__Web__App__"), "web-app");
+            assert_eq!(project_name_from_dir_bytes("café".as_bytes()), "caf");
+            assert_eq!(
+                project_name_from_dir_bytes(&[0xff, b'a', 0xfe, b'b']),
+                "a-b"
+            );
+            assert_eq!(project_name_from_dir_bytes("日本".as_bytes()), "box");
+            // Cut to 63 first, then trimmed.
+            let long = format!("{}_x", "p".repeat(62));
+            assert_eq!(project_name_from_dir_bytes(long.as_bytes()), "p".repeat(62));
+
+            assert!(is_dns_label("web"));
+            assert!(is_dns_label("Web-2"));
+            assert!(is_dns_label(&"a".repeat(63)));
+            for bad in [
+                "",
+                "-web",
+                "web-",
+                "my_app",
+                "my app",
+                "café",
+                &"a".repeat(64),
+            ] {
+                assert!(!is_dns_label(bad), "{bad:?}");
+            }
         }
 
         fn status() -> impl Strategy<Value = BoxState> {

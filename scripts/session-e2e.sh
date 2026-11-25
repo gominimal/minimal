@@ -80,7 +80,12 @@
 #                                    terminal and reads the output again
 #   box_exec                         `min box exec`: plain with its exit code,
 #                                    -t on a pty and off one, --detach,
-#                                    --timeout 124, a stopped box refused
+#                                    --timeout 124, an idle session box
+#                                    stops in less than 10 s and
+#                                    `min box wait` exits 129, a detached
+#                                    box with no shell stops in less than
+#                                    10 s with no signal, a stopped box
+#                                    refused
 #   attach_ends_on_stop              `min box stop` ends an attach with exit
 #                                    254 and a line that names the stop, never
 #                                    the shell-exit prompt (#3526). `min box
@@ -385,6 +390,14 @@
 #                                    at the host-side gate (NET-155, NET-085),
 #                                    and each refusal's record is read back
 #                                    from the host's logs
+#   a_build_box_fetches_its_source
+#                                    NET-155, NET-165: a deny-all box's cold
+#                                    build of a package at the pinned commit
+#                                    fetches its source cold and succeeds,
+#                                    the build box lists while it runs and
+#                                    leaves when it ends, and the box stays
+#                                    deny-all; NOT RUN without a switch or,
+#                                    natively, a tap
 #   host_ip_rules_follow_the_running_box
 #                                    NET-085, VM host: root in the VM
 #                                    wearing the node's address and the box
@@ -604,6 +617,7 @@ ESU_B_SEED_DIR="" # its box B seed; removed on teardown
 ESU_LISTENER_PID="" # its host listener; killed on teardown
 ESU_LISTEN_PORT="" # the port the listener binds; this proof's own band
 EBR_SEED_DIR="" # the escapes-and-builds proof's seed; removed on teardown
+BBF_SEED_DIR="" # the build-box fetch proof's seed; removed on teardown
 EBR_LISTENER_PID="" # its host listener; killed on teardown
 EBR_LISTEN_PORT="" # the port the listener binds, beside the escape-union band
 HRF_SEED_DIR="" # the host_ip rules proof's seed; removed on teardown
@@ -1427,6 +1441,7 @@ teardown() {
   fi
   # The escapes-and-builds proof's seed and listener, for the same reasons.
   [ -n "$EBR_SEED_DIR" ] && rm -rf "$EBR_SEED_DIR"
+  [ -n "$BBF_SEED_DIR" ] && rm -rf "$BBF_SEED_DIR"
   [ -n "$HRF_SEED_DIR" ] && rm -rf "$HRF_SEED_DIR"
   if [ -n "$EBR_LISTENER_PID" ]; then
     kill "$EBR_LISTENER_PID" 2>/dev/null || true
@@ -2207,11 +2222,32 @@ out="$(cd "$PROJECT_DIR" && mnl session start --detach --name e2e-box-exec-stopp
   fail
 }
 stop_sid="$(printf '%s\n' "$out" | tail -n1 | tr -d '\r')"
+# A detached start files the box but does not run its shell. A stop of
+# that box signals nothing and keeps neither a signal nor an exit code, so
+# `min box wait` gives 137. `min box exec` starts the shell, and the box
+# is then an idle session box with its shell running.
+mnl box exec "$stop_sid" -- true </dev/null >"$WORK/box-exec-stop-start.out" 2>&1 || {
+  echo "::error::'min box exec $stop_sid -- true' failed, so the box's shell did not start before the stop"
+  cat "$WORK/box-exec-stop-start.out" 2>/dev/null || true
+  fail
+}
+# A graceful stop of an idle session box reaches its shell: the stop
+# returns well inside the 10 s grace, and the shell ends on SIGHUP, so
+# `min box wait` exits 129. The SIGHUP step is the interim of
+# gominimal/arch#201 option (a), and gominimal/minimal#3741 removes it.
+t0=$(now_ms)
 mnl box stop "$stop_sid" </dev/null >"$WORK/box-exec-stop.out" 2>&1 || {
   echo "::error::'min box stop $stop_sid' failed"
   cat "$WORK/box-exec-stop.out" 2>/dev/null || true
   fail
 }
+t1=$(now_ms)
+if [ $((t1 - t0)) -ge 10000 ]; then
+  echo "::error::'min box stop $stop_sid' on an idle session box returned after $((t1 - t0))ms (expected less than 10 s: the shell ends before the SIGKILL)"
+  cat "$WORK/box-exec-stop.out" 2>/dev/null || true
+  fail
+fi
+echo "min box stop: an idle session box stopped after $((t1 - t0))ms"
 for i in $(seq 1 20); do
   shown="$(mnl box show "$stop_sid" </dev/null 2>&1)" || shown=""
   state="$(printf '%s\n' "$shown" | sed -n 's/^State: *//p' | tr -d '\r')"
@@ -2223,6 +2259,14 @@ if [ "$state" != stopped ]; then
   echo "--- min box show $stop_sid ---"; printf '%s\n' "$shown"
   fail
 fi
+mnl box wait "$stop_sid" </dev/null >"$WORK/box-exec-stop-wait.out" 2>&1
+rc=$?
+if [ "$rc" -ne 129 ]; then
+  echo "::error::'min box wait $stop_sid' exited $rc after the stop (expected 129: the shell ended on SIGHUP)"
+  cat "$WORK/box-exec-stop-wait.out" 2>/dev/null || true
+  fail
+fi
+echo "min box wait: the stopped session box exits 129 (SIGHUP)"
 mnl box exec "$stop_sid" -- true </dev/null >"$WORK/box-exec-stopped.out" 2>"$WORK/box-exec-stopped.err"
 rc=$?
 if [ "$rc" -ne 2 ] || ! grep -Fq "$stop_sid is stopped. Only a running box can run a command." "$WORK/box-exec-stopped.err"; then
@@ -2244,6 +2288,52 @@ if printf '%s\n' "$listed" | grep -Fqx "$stop_sid"; then
   fail
 fi
 echo "stopped box: exit 2, and the refusal names the state"
+
+# 6. A detached session box that nothing attached to or exec'd in. The
+# detached start files the box but does not run its shell, so the stop
+# has no process to signal. The stop returns well inside the 10 s grace,
+# and `min box show` records no signal.
+# This leg does not assert the `min box wait` code. That code is 137
+# today. gominimal/arch#202 decides the right code, and
+# gominimal/minimal#3743 tracks it.
+# shellcheck disable=SC2086
+out="$(cd "$PROJECT_DIR" && mnl session start --detach --name e2e-box-stop-unstarted ${E2E_ACTIVATE_ARGS:-} 2>"$WORK/box-stop-unstarted-activate.err")" || {
+  echo "::error::activation of the box for the stop of a box with no shell failed"
+  echo "--- stderr ---"; cat "$WORK/box-stop-unstarted-activate.err" 2>/dev/null || true
+  fail
+}
+idle_sid="$(printf '%s\n' "$out" | tail -n1 | tr -d '\r')"
+t0=$(now_ms)
+mnl box stop "$idle_sid" </dev/null >"$WORK/box-stop-unstarted.out" 2>&1 || {
+  echo "::error::'min box stop $idle_sid' failed on a detached box with no shell"
+  cat "$WORK/box-stop-unstarted.out" 2>/dev/null || true
+  fail
+}
+t1=$(now_ms)
+if [ $((t1 - t0)) -ge 10000 ]; then
+  echo "::error::'min box stop $idle_sid' on a detached box with no shell returned after $((t1 - t0))ms (expected less than 10 s: no process to wait for)"
+  cat "$WORK/box-stop-unstarted.out" 2>/dev/null || true
+  fail
+fi
+echo "min box stop: a detached box with no shell stopped after $((t1 - t0))ms"
+for i in $(seq 1 20); do
+  shown="$(mnl box show "$idle_sid" </dev/null 2>&1)" || shown=""
+  state="$(printf '%s\n' "$shown" | sed -n 's/^State: *//p' | tr -d '\r')"
+  [ "$state" = stopped ] && break
+  sleep 0.5
+done
+signal="$(printf '%s\n' "$shown" | sed -n 's/^Signal: *//p' | tr -d '\r')"
+if [ "$state" != stopped ] || [ "$signal" != "-" ]; then
+  echo "::error::box $idle_sid is '${state:-<none>}' with signal '${signal:-<none>}' after 'min box stop' (expected stopped with no signal: the box had no shell to signal)"
+  echo "--- min box show $idle_sid ---"; printf '%s\n' "$shown"
+  fail
+fi
+mnl box rm --force "$idle_sid" </dev/null >"$WORK/box-stop-unstarted-rm.out" 2>&1 || {
+  echo "::error::'min box rm --force $idle_sid' failed"
+  cat "$WORK/box-stop-unstarted-rm.out" 2>/dev/null || true
+  fail
+}
+echo "detached box with no shell: the stop returned in less than 10 s and recorded no signal"
 echo "box exec proof OK"
 echo "::endgroup::"
 }
@@ -7044,6 +7134,11 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     # shellcheck disable=SC2016 # $l is the task's, expanded in the box
     printf '\n[tasks.e2e-stdin]\nbash = "read -r l; echo STDIN_GOT:$l"\n'
     printf '\n[tasks.e2e-sleep]\nbash = "sleep 300"\n'
+    # A task that runs long enough to outlive its box's stop, and traps
+    # TERM so a stop that reaches it is observable: the trap's echo lands in
+    # the redirected output, and the wait below proves the run itself ended
+    # 0 — the task's own exit, not the relay's signal death.
+    printf '\n[tasks.e2e-stoptask]\nbash = "trap '"'"'echo TASK-TERM; echo TASK-TERM >&2; exit 0'"'"' TERM; echo TASK-UP; sleep 31337 & wait; echo TASK-NOT-STOPPED"\n'
     printf '\n[tasks.e2e-envprint]\nexec = "printenv E2E_INHERIT_MARKER"\nenv_vars.E2E_INHERIT_MARKER = { inherit = true }\n'
     # shellcheck disable=SC2016 # $PWD is the task's, expanded in the box
     printf '\n[tasks.e2e-ic]\ninherit_cwd = true\nbash = "echo PWD=$PWD"\n'
@@ -7055,16 +7150,22 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   mkdir -p "$TASK_SEED_DIR/sub/inner"
   : > "$TASK_SEED_DIR/sub/inner/marker"
 
+  # The project part of a task box's derived name (BOX-211): the seed
+  # directory's last component as a DNS label, so `mnlt.AbC123` is
+  # `mnlt-abc123`. mktemp fills the template with letters and digits only.
+  TASK_PROJECT_LABEL="$(basename "$TASK_SEED_DIR" | tr 'A-Z._' 'a-z--')"
+
   # task_kept_check <task> <stderr file>: the run's stderr names the kept
-  # box `<task>-<n>`, `min ls` lists it, and `min box rm` removes it. The
+  # box `<project>-<task>`, with a `-<n>` only when that derived name is
+  # taken (BCLI-070), `min ls` lists it, and `min box rm` removes it. The
   # box can still read running for a moment after the run returns, so the
   # rm is retried briefly before it counts as a failure.
   task_kept_check() {
     local tk_task="$1" tk_err="$2" tk_name tk_ls tk_i
-    tk_name="$(grep -o "Kept box $tk_task-[0-9][0-9]*" "$tk_err" | head -n1)"
+    tk_name="$(grep -oE "Kept box $TASK_PROJECT_LABEL-$tk_task(-[0-9]+)?" "$tk_err" | head -n1)"
     tk_name="${tk_name#Kept box }"
     if [ -z "$tk_name" ]; then
-      echo "::error::'min task run $tk_task' did not name its kept box"
+      echo "::error::'min task run $tk_task' did not name its kept box $TASK_PROJECT_LABEL-${tk_task}[-<n>]"
       echo "--- task stderr ---"; cat "$tk_err" 2>/dev/null || true
       fail
     fi
@@ -7203,6 +7304,101 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     fail
   fi
   echo "task run interrupt: box stopped, record kept, exit 130 OK"
+
+  # `min box stop` on a task box must stop the task itself, not just the
+  # box's own relay: the daemon records the container each invocation runs
+  # in and signals it first, so the task's TERM trap runs, the run exits 0,
+  # and the box record keeps that exit (BOX-013). Before the fix only the
+  # relay died: the client saw 143 and the task was left running.
+  ts_env=()
+  # shellcheck disable=SC2031
+  if [ -n "$E2E_NATIVE_SWITCH_DIR" ] && [ "${MINIMAL_BIN:-}" = "$E2E_LANE_MINIMAL_BIN" ]; then
+    ts_env=(env "MINIMAL_BIN=$E2E_NATIVE_SWITCH_DIR")
+  fi
+  # shellcheck disable=SC2086
+  (cd "$TASK_SEED_DIR" \
+    && exec ${ts_env[@]+"${ts_env[@]}"} min ${E2E_MINIMAL_ARGS:-} task run e2e-stoptask \
+      >"$WORK/task-stop.out" 2>"$WORK/task-stop.err") &
+  ts_pid=$!
+  ts_name=""
+  for _ in $(seq 1 120); do
+    ts_name="$(grep -o 'Running task e2e-stoptask in box [^ .]*' "$WORK/task-stop.err" 2>/dev/null \
+      | head -n1)"
+    ts_name="${ts_name#Running task e2e-stoptask in box }"
+    [ -n "$ts_name" ] && break
+    sleep 0.5
+  done
+  if [ -z "$ts_name" ]; then
+    echo "::error::'min task run e2e-stoptask' did not name its box"
+    cat "$WORK/task-stop.err" 2>/dev/null || true
+    kill "$ts_pid" 2>/dev/null || true
+    fail
+  fi
+  for _ in $(seq 1 120); do
+    grep -q 'TASK-UP' "$WORK/task-stop.out" 2>/dev/null && break
+    sleep 0.5
+  done
+  if ! grep -q 'TASK-UP' "$WORK/task-stop.out" 2>/dev/null; then
+    echo "::error::task e2e-stoptask never reported TASK-UP in the box $ts_name"
+    cat "$WORK/task-stop.out" 2>/dev/null || true
+    mnl box stop "$ts_name" >/dev/null 2>&1 || true
+    kill "$ts_pid" 2>/dev/null || true
+    fail
+  fi
+  # Long enough for the trap to be armed at the wait.
+  sleep 3
+  if ! mnl box stop "$ts_name" </dev/null >"$WORK/task-stop-stop.out" 2>"$WORK/task-stop-stop.err"; then
+    echo "::error::'min box stop $ts_name' failed while the task was running"
+    cat "$WORK/task-stop-stop.err" 2>/dev/null || true
+    kill "$ts_pid" 2>/dev/null || true
+    fail
+  fi
+  # The client ends with the task's relayed exit. A client still connected
+  # after the stop is the regression this proof catches, so the wait is
+  # bounded and a miss fails with the client's output.
+  ts_deadline=$((SECONDS + 60))
+  while kill -0 "$ts_pid" 2>/dev/null && [ "$SECONDS" -lt "$ts_deadline" ]; do
+    sleep 0.5
+  done
+  if kill -0 "$ts_pid" 2>/dev/null; then
+    echo "::error::'min task run e2e-stoptask' was still running 60s after 'min box stop $ts_name'"
+    echo "--- task stdout ---"; cat "$WORK/task-stop.out" 2>/dev/null || true
+    echo "--- task stderr ---"; cat "$WORK/task-stop.err" 2>/dev/null || true
+    kill "$ts_pid" 2>/dev/null || true
+    wait "$ts_pid" 2>/dev/null || true
+    fail
+  fi
+  wait "$ts_pid"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "::error::'min task run e2e-stoptask' exited $rc after 'min box stop' (expected 0)"
+    echo "--- task stdout ---"; cat "$WORK/task-stop.out" 2>/dev/null || true
+    echo "--- task stderr ---"; cat "$WORK/task-stop.err" 2>/dev/null || true
+    fail
+  fi
+  if ! grep -q 'TASK-TERM' "$WORK/task-stop.out" 2>/dev/null; then
+    echo "::error::the task never saw the stop's TERM (no TASK-TERM in its output)"
+    echo "--- task stdout ---"; cat "$WORK/task-stop.out" 2>/dev/null || true
+    echo "--- task stderr ---"; cat "$WORK/task-stop.err" 2>/dev/null || true
+    fail
+  fi
+  if grep -q 'TASK-NOT-STOPPED' "$WORK/task-stop.out" 2>/dev/null; then
+    echo "::error::the task outlived the stop (TASK-NOT-STOPPED printed after the wait)"
+    echo "--- task stdout ---"; cat "$WORK/task-stop.out" 2>/dev/null || true
+    fail
+  fi
+  # `min ls` prints only the state; `min box show` prints the exit code the
+  # record keeps.
+  ts_shown="$(mnl box show "$ts_name" </dev/null 2>&1)" || ts_shown=""
+  ts_state="$(printf '%s\n' "$ts_shown" | sed -n 's/^State: *//p' | tr -d '\r')"
+  ts_code="$(printf '%s\n' "$ts_shown" | sed -n 's/^Exit code: *//p' | tr -d '\r')"
+  if [ "$ts_state" != stopped ] || [ "$ts_code" != 0 ]; then
+    echo "::error::stopped task box $ts_name is recorded as state '${ts_state:-<none>}', exit code '${ts_code:-<none>}' (expected stopped, 0)"
+    echo "--- min box show $ts_name ---"; printf '%s\n' "$ts_shown"
+    fail
+  fi
+  task_kept_check e2e-stoptask "$WORK/task-stop.err"
+  echo "task run box-stop: task container signalled, run exits 0, record kept OK"
 
   # The step that ran a declared task inside a running session is gone: the
   # CLI no longer has that verb, and no box verb replaces it yet.
@@ -23555,6 +23751,196 @@ source=203.0.113.7 destination=$esu_host:$ESU_LISTEN_PORT verdict=refused at the
   echo "::endgroup::"
 }
 
+# NET-155, NET-165: every other proof of a build box stops at a refusal or at a
+# cache hit, so this one forces a cold build and a cold source fetch. The
+# package comes from the pinned upstream, its source is `gs://`, and the box
+# allows nothing: only the table `min` made at the box's creation can give the
+# fetch its reach. The package is `tree`: a plain Makefile with no configure,
+# so its cold build regenerates nothing, and no other proof builds it. On a VM
+# lane the guest daemon's download cache starts empty with the lane's fresh
+# state. On a native lane this proof removes the source from the daemon's
+# download cache first. Either way the proof asks the daemon's log for the
+# grant the fetch opened, so a source that was cached anyway fails the proof.
+proof_a_build_box_fetches_its_source() {
+  local bbf_pkg="tree" bbf_sid="" bbf_out="" bbf_rc="" bbf_policy="" bbf_native=""
+  local bbf_sha="513a53cbc42ca1f4ea06af2bab1f5283524a3848266b1d162416f8033afc4985"
+  local bbf_grant="" bbf_log_mark=0 bbf_listed="" bbf_build_pid=""
+  echo "::group::a build box fetches its source for a deny-all box (NET-155, NET-165)"
+  # An own-address box needs the switch, as the other own-IP proofs do, and
+  # on a native lane the tap device too.
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ] && [ -z "$E2E_NATIVE_SWITCH" ]; then
+    not_run a_build_box_fetches_its_source "no switch staged: neither MINVMD_GVPROXY_BIN (VM) nor E2E_NATIVE_SWITCH (native) is set, and a deny-all box is an own-address box"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ "$min_daemon" != minvmd ] && [ -z "$E2E_VM" ]; then
+    bbf_native=1
+    if [ ! -c /dev/net/tun ]; then
+      not_run a_build_box_fetches_its_source "no /dev/net/tun on this host: a native own-address box opens its tap on this host and needs the device"
+      echo "::endgroup::"
+      return 0
+    fi
+    # The daemon's download cache, by the source's sha256 (paths::minimal_cache_dir).
+    # shellcheck disable=SC2031
+    rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/minimal/downloads/$bbf_sha"
+  fi
+  # Stop whatever daemon is up, so the activation below autospawns a fresh
+  # one under this proof's record filter. The grant lines it reads are INFO,
+  # which the lane's default filter drops (the daemon inherits RUST_LOG at
+  # autospawn; see the header). On a native lane the fresh daemon also
+  # carries the staged switch (native_switch_daemon).
+  mnl host stop "$E2E_HOST" --force >/dev/null 2>&1 || true
+  if [ -n "$E2E_VM" ]; then
+    minvmd stop >/dev/null 2>&1 || true
+  fi
+  local bbf_filter="warn,minimald::exec=info,minimald::build_boxes=info,minvmd=info"
+  # The daemon log this proof reads its grant from: the native daemon's own,
+  # or on a VM lane the VM host daemon's. Each day's file in date order, so a
+  # line count taken before the build marks where the build's lines begin.
+  bbf_grant_log() {
+    local daemon=minvmd
+    [ -z "$bbf_native" ] || daemon=minimald
+    find "$XDG_STATE_HOME/minimal/logs" -name "$daemon.log.*" -type f 2>/dev/null \
+      | sort | while IFS= read -r day; do cat "$day"; done
+  }
+  # The logs that say why a failed build failed: the daemon's, where this
+  # lane can read it, and on a VM lane the guest daemon's console too.
+  bbf_logs() {
+    if [ -n "$bbf_native" ]; then
+      echo "--- the daemon's log, last lines ---"
+      find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f \
+        -exec cat {} + 2>/dev/null | tail -n 40 || true
+    else
+      echo "--- the VM host daemon's build grant lines ---"
+      minvmd_log_lines 'build grant' | tail -n 20 || true
+      echo "--- the guest daemon's console, last lines ---"
+      tail -n 40 "${MINVMD_BOOT_LOG:-$XDG_STATE_HOME/minimal/providers/local-minvmd0/boot.log}" \
+        2>/dev/null || true
+    fi
+  }
+  BBF_SEED_DIR="$(hook_mktemp /tmp/mnlbbf.XXXXXX)"
+  hook_seed_preamble > "$BBF_SEED_DIR/minimal.toml"
+  mkdir "$BBF_SEED_DIR/.git"
+  bbf_sid="$(cd "$BBF_SEED_DIR" && RUST_LOG="$bbf_filter" mnl session start --detach --no-input \
+    --name e2e-bbf --network own_ip --deny-all-egress 2>"$WORK/bbf-activate.err")" || {
+    echo "::error::the deny-all box's 'min session start' failed"
+    cat "$WORK/bbf-activate.err" 2>/dev/null || true
+    switch_spawn_fault "$WORK/bbf-activate.err" || true
+    fail
+  }
+  bbf_sid="$(printf '%s\n' "$bbf_sid" | tail -n1)"
+  # Where this build's log lines begin: a grant the activation or an earlier
+  # build opened is before it, and does not count.
+  bbf_log_mark="$(bbf_grant_log | wc -l | tr -d ' ')"
+  # The build box's row in `min box list`, as JSON: a `build` entry for the
+  # package under this box. Empty when the list shows none.
+  bbf_listing() {
+    (cd "$BBF_SEED_DIR" && mnl box list -o json 2>/dev/null) \
+      | jq -c --arg pkg "$bbf_pkg" --arg sid "$bbf_sid" \
+        '.[] | select(.type == "build" and .name == $pkg and .parent == $sid)' 2>/dev/null \
+      | head -n1
+  }
+  # The build runs in the background, so the list can be read while it runs.
+  # shellcheck disable=SC2016 # `$?` must reach the box's shell unexpanded.
+  mnl box exec "$bbf_sid" -- bash -c \
+    "timeout 600 min package build --rebuild $bbf_pkg 2>&1; echo build-exit=\$?" \
+    >"$WORK/bbf-build.out" 2>"$WORK/bbf-build.err" </dev/null &
+  bbf_build_pid=$!
+  while kill -0 "$bbf_build_pid" 2>/dev/null; do
+    [ -n "$bbf_listed" ] || bbf_listed="$(bbf_listing)"
+    sleep 0.2
+  done
+  wait "$bbf_build_pid" || {
+    echo "::error::the in-box 'min package build --rebuild $bbf_pkg' could not run"
+    cat "$WORK/bbf-build.err" 2>/dev/null || true
+    bbf_logs
+    fail
+  }
+  bbf_out="$(tr -d '\r' <"$WORK/bbf-build.out")"
+  bbf_rc="$(printf '%s\n' "$bbf_out" | sed -n 's/^build-exit=//p' | tail -n1)"
+  if [ "$bbf_rc" != 0 ]; then
+    echo "::error::the cold build of $bbf_pkg failed (exit '$bbf_rc'): the table should give its fetch the source's host"
+    echo "--- the build's output, last lines ---"
+    printf '%s\n' "$bbf_out" | tail -n 60 | sed 's/^/  /'
+    bbf_logs
+    fail
+  fi
+  printf '%s\n' "$bbf_out" | tail -n 20 | sed 's/^/  /'
+  # The fetch was cold: the build box opened its grant, which a cached source
+  # never asks for. Only a line written after the build began counts. On a
+  # VM lane the line names the box's session, not the package: it names the
+  # spec hash, which the box computes from the resolved graph, and nothing
+  # this script runs prints that hash.
+  bbf_grant_line() {
+    if [ -n "$bbf_native" ]; then
+      bbf_grant_log | tail -n "+$((bbf_log_mark + 1))" \
+        | grep -F -- 'opened the network of a build box' \
+        | grep -F -- '"box_name":"e2e-bbf"' | grep -F -- '"granted":true' \
+        | grep -F -- "package: \\\"$bbf_pkg\\\"" | tail -n1
+    else
+      # The host sees the spec hash alone, never the package's name, so the
+      # line is matched on this package's grant: its `gs://` source's host
+      # and no internet.
+      bbf_grant_log | tail -n "+$((bbf_log_mark + 1))" \
+        | grep -F -- 'opened a build grant' \
+        | grep -F -- "\"session\":\"$bbf_sid\"" \
+        | grep -F -- '"internet":false' \
+        | grep -F -- 'storage.googleapis.com' | tail -n1
+    fi
+  }
+  # BOX-210, NET-171: the build box listed under this box while it ran, and
+  # leaves the list with its build.
+  if [ -z "$bbf_listed" ]; then
+    echo "::error::the build of $bbf_pkg passed, but 'min box list' never showed its build box under box e2e-bbf"
+    fail
+  fi
+  echo "listed: $bbf_listed"
+  # Gone only on a list read that worked: a failed read proves nothing.
+  if ! (cd "$BBF_SEED_DIR" && mnl box list -o json) \
+      >"$WORK/bbf-after.json" 2>"$WORK/bbf-after.err" </dev/null; then
+    echo "::error::'min box list' failed after the build of $bbf_pkg, so it cannot show that the build box left"
+    cat "$WORK/bbf-after.err" 2>/dev/null || true
+    fail
+  fi
+  if ! bbf_left="$(jq -n -c --arg pkg "$bbf_pkg" --arg sid "$bbf_sid" \
+      'input | if type == "array" then
+         [.[] | select(.type == "build" and .name == $pkg and .parent == $sid)] | first // empty
+       else error("not a list") end' "$WORK/bbf-after.json")"; then
+    echo "::error::'min box list -o json' printed no JSON list after the build of $bbf_pkg"
+    head -c 2000 "$WORK/bbf-after.json" 2>/dev/null || true
+    fail
+  fi
+  if [ -n "$bbf_left" ]; then
+    echo "::error::the build of $bbf_pkg ended, but 'min box list' still shows its build box"
+    echo "still listed: $bbf_left"
+    fail
+  fi
+  # The daemon's file writer is asynchronous, so the line can land after the
+  # build returns: wait for it, as esu_wait_gate_line does.
+  for _ in $(seq 1 40); do
+    bbf_grant="$(bbf_grant_line)"
+    [ -z "$bbf_grant" ] || break
+    sleep 0.25
+  done
+  if [ -z "$bbf_grant" ]; then
+    echo "::error::the build of $bbf_pkg passed, but no build grant line for box e2e-bbf appeared in the daemon's log after the build began"
+    bbf_logs
+    fail
+  fi
+  echo "grant: $bbf_grant"
+  bbf_policy="$(mnl box show "$bbf_sid" --network 2>&1)"
+  if ! grep -qF 'deny-all' <<<"$bbf_policy"; then
+    echo "::error::the box's own rules changed: the reach is the build box's, not the box's"
+    printf '%s\n' "$bbf_policy"
+    fail
+  fi
+  mnl box rm --force "$bbf_sid" >/dev/null 2>&1 </dev/null || true
+  rm -rf "$BBF_SEED_DIR"
+  BBF_SEED_DIR=""
+  echo "a build box fetches its source OK"
+  echo "::endgroup::"
+}
+
 # T108 on the VM host, end to end: escapes and builds stay inside the box's
 # rules. Each refusal that reaches the host leaves a record there. The
 # vsock refusal inside the box is the one exception (see the RPC leg). One deny-all
@@ -26671,9 +27057,14 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     fi
     echo "run: the task is inside its box and printed $PO_RUN_MARKER"
     po_task_ls="$(mnl ls 2>/dev/null)"
-    po_task_box="$(printf '%s\n' "$po_task_ls" | grep -o 'e2e-port-run-[0-9][0-9]*' | head -n1)"
+    # A task box with no requested name is `<project>-<task>` (BOX-211),
+    # with a `-<n>` only when that name is taken (BCLI-070). Match the whole
+    # name: the bare `e2e-port-run` tail names no box, so `min box show` on
+    # it never reads the run's own state.
+    po_task_label="$(basename "$PO_TASK_SEED_DIR" | tr 'A-Z._' 'a-z--')"
+    po_task_box="$(printf '%s\n' "$po_task_ls" | grep -oE "$po_task_label-e2e-port-run(-[0-9]+)?" | head -n1)"
     if [ -z "$po_task_box" ]; then
-      echo "::error::the run's box was not listed while its task ran"
+      echo "::error::the run's box $po_task_label-e2e-port-run[-<n>] was not listed while its task ran"
       echo "--- min ls ---"; printf '%s\n' "$po_task_ls"
       fail
     fi
@@ -27635,12 +28026,33 @@ proof_listen_published_port_reaches_peer_and_host() {
   # ---- the audit: the allow decision has its decisions.log line (NET-046) --
   # The watcher appends one record per listen it publishes, to the audit log
   # of the daemon that runs the box. On a VM lane that daemon is the guest's,
-  # whose state directory this host does not read — the same split the
-  # expose case's guest-audit legs carry — so the leg is counted NOT RUN
-  # there and asserted everywhere else.
+  # whose state directory this host does not read. The publish crossed to the
+  # VM host daemon's admission, though, and that admission writes its own
+  # copy to the owner-only host audit (audit/box-admissions.log, T84): the
+  # box, the port, and the source the report carried — a listen's is
+  # 'listen'. So on a VM lane the leg asserts that host-held line instead.
   if [ -n "${E2E_VM:-}" ]; then
-    not_run listen_published_port_reaches_peer_and_host \
-      "VM lane: the listen's decision record is in the guest daemon's audit file, which this host does not read (NET-046)"
+    local lp_vm_audit="$XDG_STATE_HOME/minimal/providers/local-minvmd0/audit/box-admissions.log"
+    local lp_vm_line=""
+    for _ in $(seq 1 20); do
+      lp_vm_line="$(grep -F "\"box\":\"$lp_target_name\"" "$lp_vm_audit" 2>/dev/null \
+        | grep -E "\"port\":${lp_listen_port}[,}]" \
+        | grep -F '"source":"listen"' | tail -n1)"
+      [ -n "$lp_vm_line" ] && break
+      sleep 0.25
+    done
+    if [ -z "$lp_vm_line" ]; then
+      echo "::error::the VM host daemon's host audit carries no admission line for box $lp_target_name port $lp_listen_port with source listen — the listen's publish was never audited on the host (T84, NET-046)"
+      local lp_vm_box_lines
+      lp_vm_box_lines="$(grep -F "\"box\":\"$lp_target_name\"" "$lp_vm_audit" 2>/dev/null || true)"
+      if [ -n "$lp_vm_box_lines" ]; then
+        printf '%s\n' "$lp_vm_box_lines" | sed 's/^/  /'
+      else
+        echo "(no host audit line for $lp_target_name in $lp_vm_audit)"
+      fi
+      fail
+    fi
+    echo "host audit: $lp_vm_line (the listen's admission in the owner-only host audit, T84, NET-046)"
   elif python3 - "$lp_target_name" "$lp_listen_port" \
       "$XDG_STATE_HOME/minimal/audit/decisions.log" <<'PY'
 import json
@@ -33343,6 +33755,7 @@ case "${1:-}" in
     # Beside the escape-union proof, for the same reason: it stops the daemon
     # pair and autospawns a fresh one under its own record filter.
     proof_escapes_and_builds_stay_inside_box_rules
+    proof_a_build_box_fetches_its_source
     # Beside them, for the same reason.
     proof_host_ip_rules_follow_the_running_box
     # Stops the VM host: its boxes, then the daemon and its VM. The next
@@ -33403,6 +33816,7 @@ case "${1:-}" in
     | published_proxy_routes_from_host \
     | escape_reaches_only_declared_union \
     | escapes_and_builds_stay_inside_box_rules \
+    | a_build_box_fetches_its_source \
     | host_ip_rules_follow_the_running_box \
     | host_ip_deny_all \
     | daemon_fetch_under_deny_all_host_address_box \
@@ -33484,6 +33898,7 @@ case "${1:-}" in
     echo "         published_proxy_routes_from_host"
     echo "         escape_reaches_only_declared_union"
     echo "         escapes_and_builds_stay_inside_box_rules"
+    echo "         a_build_box_fetches_its_source"
     echo "         host_ip_rules_follow_the_running_box"
     echo "         host_ip_deny_all"
     echo "         daemon_fetch_under_deny_all_host_address_box"

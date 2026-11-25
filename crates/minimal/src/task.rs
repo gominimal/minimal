@@ -22,7 +22,7 @@ use anyhow::{Context as _, bail};
 use tokio::io::AsyncWriteExt as _;
 use tracing::Instrument as _;
 
-use crate::{BoxListArgs, BoxRmArgs, BoxRunArgs, BoxStopArgs, GlobalArgs, TaskRunArgs};
+use crate::{BoxRmArgs, BoxRunArgs, BoxStopArgs, GlobalArgs, TaskRunArgs, TypedBoxListArgs};
 
 /// A task's non-zero exit status, carried as a typed error so `main.rs` can
 /// downcast it and terminate with the task's own code instead of printing an
@@ -143,6 +143,10 @@ pub(crate) fn put_task_spec(
     vpn_network_names: &[String],
 ) -> Result<(), anyhow::Error> {
     if let Some(spec) = spec {
+        // BOX-211, BCLI-069: the box name goes on the request, never into
+        // the stored spec. So `--name` changes neither the spec nor its
+        // projection digest.
+        spec.name = None;
         if let Some(expanded) = expanded {
             take_expanded_exports(spec, expanded);
             // The expansion holds the names `[defaults]` and the task's
@@ -152,11 +156,21 @@ pub(crate) fn put_task_spec(
         } else {
             crate::put_spec(request, spec)?;
         }
-    } else {
+        // BCLI-069, BCLI-079, BCLI-080: the requested name is `--name`,
+        // which the caller put on the request, else the entry's `[box]
+        // name`, else none, and the daemon derives the name (BOX-211).
+        if request.config.name.is_none() {
+            request.config.name = expanded.and_then(crate::expanded_box_name);
+        }
+    } else if request.config.name.is_none() {
         // An interactive task sends no spec: the task type denies a
-        // terminal. With no spec to name it, the request carries the
-        // entry's name, cleaned as the daemon cleans a spec's entry.
+        // terminal. With no spec for the daemon to derive a name from, the
+        // request carries the entry's name, cleaned as the daemon cleans a
+        // spec's entry. That name is not written by the person, so the
+        // create is a fresh instance and takes a number when the name is
+        // taken (BCLI-070).
         request.config.name = Some(interactive_task_box_name(entry));
+        request.fresh_instance = true;
     }
     // With no spec, a `--vpn-network-names` value has no place to go, so
     // the helper refuses it rather than drop it.
@@ -481,10 +495,10 @@ pub(crate) fn misplaced_run_flag<'a>(typed: &[String], args: &'a [String]) -> Op
 
 /// The first task argument that is `--path`, alone or as `--path=<value>`,
 /// before any `--` ([`misplaced_run_flag`] reads `typed` and `args` the
-/// same way). `min task run` takes no `--path` (BCLI-042), but clap reads
-/// every token after the task's name as a task argument, so
-/// `min task run build --path sub/dir` parses. The run refuses it, as the
-/// parser refuses `--path` before the task's name.
+/// same way). Neither `min task run` (BCLI-042) nor `min box run`
+/// (BCLI-026) takes `--path`, but clap reads every token after the entry's
+/// name as an argument, so a `--path` after `min box run build` parses. The
+/// run refuses it, as the parser refuses `--path` before the entry's name.
 pub(crate) fn removed_task_path_flag<'a>(typed: &[String], args: &'a [String]) -> Option<&'a str> {
     let before_args = typed
         .len()
@@ -505,14 +519,14 @@ pub(crate) fn removed_task_path_flag<'a>(typed: &[String], args: &'a [String]) -
 enum MisplacedFlag {
     /// One of the run's own network flags ([`misplaced_run_flag`]).
     Network,
-    /// `--path`, which `min task run` does not take
-    /// ([`removed_task_path_flag`]).
-    RemovedPath,
+    /// `--path`, which neither run verb takes
+    /// ([`removed_task_path_flag`]). The verb names the command.
+    RemovedPath(RunVerb),
 }
 
 /// The refusal of a run with one of its own network flags among the
-/// task's arguments ([`misplaced_run_flag`]), or of `min task run` with
-/// `--path` among them ([`removed_task_path_flag`]): a usage error, which
+/// task's arguments ([`misplaced_run_flag`]), or of a run with `--path`
+/// among them ([`removed_task_path_flag`]): a usage error, which
 /// `main.rs` ends with [`Self::EXIT_CODE`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunFlagMisplaced {
@@ -539,12 +553,13 @@ impl RunFlagMisplaced {
         }
     }
 
-    /// The refusal of `min task run <entry>` with `arg`, `--path` alone or
-    /// as `--path=<value>`, among its arguments (BCLI-042).
+    /// The refusal of `min task run <entry>` or `min box run <entry>`, as
+    /// `verb` says, with `arg`, `--path` alone or as `--path=<value>`, among
+    /// its arguments (BCLI-042, BCLI-026).
     #[must_use]
-    pub fn removed_path(entry: &str, arg: &str) -> Self {
+    pub(crate) fn removed_path(verb: RunVerb, entry: &str, arg: &str) -> Self {
         Self {
-            kind: MisplacedFlag::RemovedPath,
+            kind: MisplacedFlag::RemovedPath(verb),
             ..Self::new(entry, arg)
         }
     }
@@ -561,12 +576,16 @@ impl std::fmt::Display for RunFlagMisplaced {
                  {entry} to set the box's network, or put -- between {entry} and its arguments \
                  to pass it to the task."
             ),
-            MisplacedFlag::RemovedPath => write!(
-                f,
-                "Cannot run {entry}: min task run has no {flag} flag. Run \
-                 min -C <dir> task run {entry} to run the task in the project at <dir>, or put \
-                 -- between {entry} and its arguments to pass {flag} to the task."
-            ),
+            MisplacedFlag::RemovedPath(verb) => {
+                let command = verb.command();
+                let with_dir = command.replacen("min ", "min -C <dir> ", 1);
+                write!(
+                    f,
+                    "Cannot run {entry}: {command} has no {flag} flag. Run \
+                     {with_dir} {entry} to run the task in the project at <dir>, or put \
+                     -- between {entry} and its arguments to pass {flag} to the task."
+                )
+            }
         }
     }
 }
@@ -708,12 +727,14 @@ impl RunVerb {
 pub(crate) struct RunEntry {
     pub verb: RunVerb,
     pub entry: String,
-    pub path: Option<String>,
     pub detach: bool,
     pub network: Option<crate::CliNetworkMode>,
     pub egress: crate::EgressArgs,
     /// The rest of activate's override flags (BCLI-024, BCLI-075, BCLI-076).
     pub other: crate::BoxOverrideArgs,
+    /// `--name`: the requested name of the box (BCLI-069). `None` sends
+    /// the entry's `[box] name`, else no name.
+    pub box_name: Option<String>,
     pub args: Vec<String>,
 }
 
@@ -722,13 +743,11 @@ impl From<TaskRunArgs> for RunEntry {
         Self {
             verb: RunVerb::Task,
             entry: args.task,
-            // BCLI-042: `min task run` takes no `--path`. `-C` names the
-            // project.
-            path: None,
             detach: args.detach,
             network: args.network,
             egress: args.egress,
             other: args.other,
+            box_name: args.name,
             args: args.args,
         }
     }
@@ -739,11 +758,11 @@ impl From<BoxRunArgs> for RunEntry {
         Self {
             verb: RunVerb::Box,
             entry: args.entry,
-            path: args.path,
             detach: args.detach,
             network: args.network,
             egress: args.egress,
             other: args.other,
+            box_name: args.name,
             args: args.args,
         }
     }
@@ -1483,7 +1502,10 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
 /// only the task boxes of the current project, or of every project. The
 /// daemon keeps a task's record after the task ends, so an exited task
 /// stays in the list until `min box prune` or `min box rm` removes it.
-pub async fn cmd_task_list(global: &GlobalArgs, args: BoxListArgs) -> Result<(), anyhow::Error> {
+pub async fn cmd_task_list(
+    global: &GlobalArgs,
+    args: TypedBoxListArgs,
+) -> Result<(), anyhow::Error> {
     crate::cmd::cmd_typed_box_list(global, args, boxes::TASK_BOX_TYPE, "task list").await
 }
 
@@ -1521,21 +1543,18 @@ pub(crate) async fn run_entry(
     if let Some(arg) = misplaced_run_flag(&typed, &args.args) {
         return Err(RunFlagMisplaced::new(&args.entry, arg).into());
     }
-    // BCLI-042: `min task run` takes no `--path`. One typed after the task's
-    // name parses as a task argument, so the run refuses it here, before any
-    // box exists.
-    if args.verb == RunVerb::Task
-        && let Some(arg) = removed_task_path_flag(&typed, &args.args)
-    {
-        return Err(RunFlagMisplaced::removed_path(&args.entry, arg).into());
+    // BCLI-042, BCLI-026: neither `min task run` nor `min box run` takes
+    // `--path`. One typed after the entry's name parses as an argument, so
+    // the run refuses it here, before any box exists.
+    if let Some(arg) = removed_task_path_flag(&typed, &args.args) {
+        return Err(RunFlagMisplaced::removed_path(args.verb, &args.entry, arg).into());
     }
-    // Same project-path resolution as `activate_box`: explicit path, then
-    // `-C`/`--repo-dir`, then the cwd.
-    let effective_path = match (&args.path, &global.repo_dir) {
-        (Some(p), _) => std::path::PathBuf::from(p),
-        (None, Some(dir)) => dir.clone(),
-        (None, None) => std::path::PathBuf::from("."),
-    };
+    // BCLI-026, BCLI-042: neither verb takes `--path`. The project is
+    // `-C`/`--repo-dir`, else the cwd.
+    let effective_path = global
+        .repo_dir
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
     let project_path = std::fs::canonicalize(&effective_path)
         .with_context(|| format!("Cannot resolve project path '{}'", effective_path.display()))?;
     let utf8_path = camino::Utf8PathBuf::from_path_buf(project_path)
@@ -1551,7 +1570,12 @@ pub(crate) async fn run_entry(
     // before the run creates anything. A broken file is left to
     // `declared_task`, which names it.
     match mfile::File::from_dir_recursive(utf8_path.as_std_path()) {
-        Ok(file) => refuse_terminal_entry(Some(&file), &args.entry)?,
+        Ok(file) => {
+            // The load prints nothing: its legacy-table hints and
+            // unknown-field warnings print here, on stderr, each once.
+            file.print_diagnostics();
+            refuse_terminal_entry(Some(&file), &args.entry)?;
+        }
         Err(mfile::Error::NotFound) => refuse_terminal_entry(None, &args.entry)?,
         Err(_) => {}
     }
@@ -1608,16 +1632,17 @@ pub(crate) async fn run_entry(
     // an activation (BCLI-076): the stored spec and the expanded entry then
     // carry no hook.
     //
-    // BCLI-070, BOX-163: every run is a fresh instance. The daemon names the
-    // box `<task>-<n>` from the spec's entry, with the smallest `n` no
-    // retained box uses. The client invents no name.
+    // BCLI-069, BCLI-079, BCLI-080: the request carries `--name`, else
+    // `put_task_spec` puts the entry's `[box] name` on it, else it carries
+    // no name. The daemon numbers a derived name that is taken (BCLI-070),
+    // and refuses a written name that is taken (BOX-163).
     let mut request = minimald_rpc::CreateSessionRequest::new(
         String::new(),
         abs_path.clone(),
         box_network.mode,
         box_network.policy,
     );
-    crate::request_fresh_instance(&mut request);
+    request.config.name = args.box_name.clone();
     request.config.hooks_enabled = !args.other.no_hooks;
     // Refused by a daemon of another build before it allocates anything;
     // `None` under the skew override.
@@ -1668,6 +1693,9 @@ pub(crate) async fn run_entry(
         expanded.as_ref().map(|expanded| &expanded.spec),
         &args.other.vpn_network_names,
     )?;
+    // BOX-220: the request carries the project name, so the daemon derives
+    // a task box's name from `[project] name` as it does a session box's.
+    request.config.project_name = crate::project_name_at(&upload_root)?;
     // BOX-081, #3650: the run sends no proxy root certificate. So where no
     // proxy serves boxes, the daemon refuses each brokered secret of the
     // spec. The run refuses it here first, with exit 5, before a box exists.
@@ -1716,7 +1744,7 @@ pub(crate) async fn run_entry(
         task = %args.entry,
         requested_name = ?request.config.name,
         fresh_instance = request.fresh_instance,
-        "creating the task box as a fresh instance"
+        "creating the task box"
     );
     let resp = client
         .oneshot_rpc::<CreateSession>(request.clone())
@@ -1776,12 +1804,8 @@ pub(crate) async fn run_entry(
     let interrupt_guard = crate::arm_activation_interrupt(global, id);
 
     let headless = global.no_input || !crate::can_prompt_interactively();
-    let decision = crate::decide_workspace_upload(
-        &upload_root,
-        false,
-        headless,
-        std::env::home_dir().as_deref(),
-    );
+    let decision =
+        crate::decide_workspace_upload(&upload_root, headless, std::env::home_dir().as_deref());
     // `min task run` has no `--sync` flags, so it warns rather than refuses:
     // an undeclared root starts empty, and a `$HOME` skip names the lifecycle
     // hooks it drops. The box still starts, as it did before the shared gate.
@@ -1883,6 +1907,33 @@ pub(crate) async fn run_entry(
         }
     }
     let _ = initial_policy;
+
+    // NET-165: the task box's table goes to the host side before it runs, as
+    // an activation's does.
+    let control_sock = crate::vm_host_control_sock(
+        crate::daemon_host_kind(global),
+        global.minimal_dir.as_deref(),
+    );
+    let task_addresses = crate::hold_requester_build_row(
+        control_sock.as_deref(),
+        id,
+        request.config.network,
+        request.config.policy.egress.as_ref(),
+        created.deny_all_opt_out == Some(true),
+    )
+    .await;
+    crate::prepare_build_boxes(
+        &mut client,
+        crate::BuildBoxActivation {
+            global,
+            session_id: id,
+            project_dir: abs_path.as_utf8_path().as_std_path().to_path_buf(),
+            control_sock,
+            task_addresses,
+            network: request.config.network,
+        },
+    )
+    .await;
 
     minimal_client::dedup_patch_uploads(&mut collected_patches);
     if let Err(e) = crate::upload_and_finalize(
@@ -2333,7 +2384,17 @@ pub(crate) fn task_activation_inputs(
     } else {
         crate::loadouts::HookPrep::StageOnly
     };
-    crate::loadouts::prepare_activation_inputs(global, project, selection, hook_prep, Some(policy))
+    let inputs = crate::loadouts::prepare_activation_inputs(
+        global,
+        project,
+        selection,
+        hook_prep,
+        Some(policy),
+    )?;
+    // The loads of the project's minimal.toml print nothing. Its legacy-table
+    // hints and unknown-field warnings print here, on stderr, each once.
+    inputs.diagnostics.print();
+    Ok(inputs)
 }
 
 #[cfg(test)]
@@ -2369,7 +2430,7 @@ mod tests {
             spec.entrypoint,
             mfile::spec::Entrypoint::Exec(argv.map(String::from).to_vec())
         );
-        // The in-box run reads `--path` as the task's, not as its own flag.
+        // The run inside the box reads `--path` as the task's, not as its own flag.
         let cli = <crate::cli::Cli as clap::Parser>::try_parse_from(argv).expect("the argv parses");
         let Some(crate::cli::Command::Task(crate::cli::TaskArgs {
             command: crate::cli::TaskCommand::Run(run),
@@ -3116,6 +3177,7 @@ mod tests {
         };
         let args = TaskRunArgs {
             task: "deploy".into(),
+            name: None,
             network: None,
             egress: crate::EgressArgs::default(),
             other: crate::BoxOverrideArgs::default(),
@@ -3165,6 +3227,7 @@ mod tests {
         };
         let args = TaskRunArgs {
             task: "build".into(),
+            name: None,
             network: None,
             egress: crate::EgressArgs::default(),
             other: crate::BoxOverrideArgs::default(),
@@ -3222,6 +3285,7 @@ mod tests {
         };
         let args = TaskRunArgs {
             task: "build".into(),
+            name: None,
             network: None,
             egress: crate::EgressArgs::default(),
             other: crate::BoxOverrideArgs::default(),
@@ -3781,6 +3845,8 @@ mod tests {
             deny_all_opt_out: Some(opt_out),
             classifier_advisory: advisory.map(str::to_string),
             host_ip_enforcement: None,
+            name: None,
+            name_not_taken: None,
         }
     }
 

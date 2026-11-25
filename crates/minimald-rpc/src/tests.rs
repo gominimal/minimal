@@ -528,6 +528,7 @@ fn create_session_request_round_trips() {
             creating_verb: CreatingVerb::Task,
             project_root: Some(paths::HostAbsPath::try_new("/home/u").unwrap()),
             host_ip_registration: Some("dev~0123456789abcdef".into()),
+            project_name: Some("proj".into()),
         },
         must_match_version: Some("0.6.0".into()),
         spec: Some(serde_json_lenient::json!({"v": 0, "box": {"type": "task"}})),
@@ -605,6 +606,7 @@ fn create_request_constructor_round_trips() {
                 creating_verb: CreatingVerb::Session,
                 project_root: None,
                 host_ip_registration: None,
+                project_name: None,
             },
             must_match_version: None,
             spec: None,
@@ -757,7 +759,10 @@ fn version_skew_message_names_both_builds_the_recovery_and_the_override() {
         msg.contains("0.5.0-dev.12.g86ce5c3a"),
         "missing the daemon version: {msg}"
     );
-    assert!(msg.contains("min stop"), "missing the recovery: {msg}");
+    assert!(
+        msg.contains("min host stop <host>"),
+        "missing the recovery: {msg}"
+    );
     assert!(
         msg.contains(SKEW_OVERRIDE_VAR),
         "missing the override: {msg}"
@@ -800,6 +805,8 @@ fn create_session_response_round_trips() {
         // must not be able to silently drop off either.
         classifier_advisory: None,
         host_ip_enforcement: None,
+        name: None,
+        name_not_taken: None,
     };
     let json = serde_json_lenient::to_string(&resp).expect("serializes");
     assert!(
@@ -827,6 +834,8 @@ fn create_session_response_carries_the_deny_all_opt_out() {
         answerer_bound: false,
         classifier_advisory: None,
         host_ip_enforcement: None,
+        name: None,
+        name_not_taken: None,
     };
     let json = serde_json_lenient::to_string(&opted_out).expect("serializes");
     assert!(
@@ -879,6 +888,8 @@ fn create_response_carries_the_classifier_state() {
                 .to_string(),
         ),
         host_ip_enforcement: Some("none".into()),
+        name: None,
+        name_not_taken: None,
     };
     let json = serde_json_lenient::to_string(&step_missing).expect("serializes");
     assert!(
@@ -1137,6 +1148,7 @@ fn responses_predating_hostname_routing_field_decode_as_absent() {
 fn hostname_routing_field_is_omitted_when_healthy() {
     let resp = ListSessionsResponse {
         daemon_version: Some("0.6.0".into()),
+        daemon_epoch: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
         zone_answerer_port: None,
@@ -1342,6 +1354,7 @@ fn list_sessions_reply_carries_box_address_and_posture() {
         resource_pool: None,
         sessions: Vec::new(),
         daemon_version: None,
+        daemon_epoch: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
         zone_answerer_port: None,
@@ -1459,6 +1472,7 @@ fn list_sessions_shared_port_collisions_survive_version_skew_both_ways() {
         resource_pool: None,
         sessions,
         daemon_version: None,
+        daemon_epoch: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
         zone_answerer_port: None,
@@ -2179,6 +2193,10 @@ fn reap_and_prune_requests_round_trip() {
         signal: Some(15),
         pty_enabled: false,
         lifetime: None,
+        build_boxes: Vec::new(),
+        project_name: None,
+        entry: None,
+        name_origin: boxes::NameOrigin::Written,
     };
     let reap = ReapBoxResponse {
         reaped: entry.clone(),
@@ -2231,6 +2249,10 @@ fn preview_prune_and_show_disk_round_trip() {
         signal: None,
         pty_enabled: true,
         lifetime: None,
+        build_boxes: Vec::new(),
+        project_name: None,
+        entry: None,
+        name_origin: boxes::NameOrigin::Written,
     };
     let preview = PreviewPruneResponse {
         matched: vec![
@@ -2261,6 +2283,7 @@ fn preview_prune_and_show_disk_round_trip() {
         identity: BoxIdentity::None,
         live_execs: Vec::new(),
         disk_bytes: Some(8192),
+        missing_build_row: true,
     };
     assert_eq!(round_trip(&show), show);
     let older: ShowBoxResponse = serde_json_lenient::from_str(&format!(
@@ -2269,6 +2292,7 @@ fn preview_prune_and_show_disk_round_trip() {
     ))
     .unwrap();
     assert_eq!(older.disk_bytes, None);
+    assert!(!older.missing_build_row);
 
     let error = r#"{"error":"no session with ID `x`"}"#;
     assert!(matches!(
@@ -2400,6 +2424,111 @@ fn retire_without_an_end_is_refused_at_decode() {
         }
         other => panic!("decoded as {other:?}"),
     }
+}
+
+/// NET-167: a build box's egress is its hosts and nothing else. NET-168: a
+/// build with the internet has it, and no host list.
+#[test]
+fn build_box_egress_is_its_hosts_or_the_internet() {
+    let declared = build_box_egress(&["example.org".to_string()].into(), false);
+    assert_eq!(
+        declared.allow_dns_hosts,
+        Some(vec!["example.org".to_string()])
+    );
+    assert_eq!(declared.allow_subnets, Some(Vec::new()));
+    let internet = build_box_egress(&std::collections::BTreeSet::new(), true);
+    assert_eq!(internet.allow_subnets, Some(vec!["0.0.0.0/0".to_string()]));
+    assert_eq!(internet.allow_dns_hosts, Some(Vec::new()));
+    let deny: Vec<String> = BUILD_BOX_INTERNET_DENY.map(String::from).to_vec();
+    assert_eq!(
+        internet.deny_subnets,
+        Some(deny.clone()),
+        "an internet grant reaches no private, shared or link-local space"
+    );
+    assert_eq!(declared.deny_subnets, Some(deny));
+}
+
+/// NET-168: the deny list covers the private, shared, link-local and
+/// loopback ranges in both families, the IPv4-mapped form of each IPv4
+/// range and the NAT64 prefixes, and every entry is a valid CIDR prefix.
+#[test]
+fn the_internet_deny_list_covers_both_families() {
+    for cidr in [
+        "fc00::/7",
+        "fe80::/10",
+        "::1/128",
+        "::ffff:10.0.0.0/104",
+        "::ffff:172.16.0.0/108",
+        "::ffff:192.168.0.0/112",
+        "::ffff:100.64.0.0/106",
+        "::ffff:169.254.0.0/112",
+        "64:ff9b::/96",
+        "64:ff9b:1::/48",
+    ] {
+        assert!(BUILD_BOX_INTERNET_DENY.contains(&cidr), "{cidr}");
+    }
+    for cidr in BUILD_BOX_INTERNET_DENY {
+        let (address, prefix) = cidr.split_once('/').expect("a prefix");
+        let prefix: u8 = prefix.parse().expect("a prefix length");
+        match address.parse::<std::net::IpAddr>().expect("an address") {
+            std::net::IpAddr::V4(_) => assert!(prefix <= 32, "{cidr}"),
+            std::net::IpAddr::V6(_) => assert!(prefix <= 128, "{cidr}"),
+        }
+    }
+}
+
+/// NET-167: a source host that is a literal address is that one address in
+/// the build box's subnets, under the deny list, and never a name to resolve.
+#[test]
+fn a_literal_address_host_is_one_address_not_a_name() {
+    let egress = build_box_egress(
+        &[
+            "example.org".to_string(),
+            "203.0.113.7".to_string(),
+            "[2001:db8::7]".to_string(),
+        ]
+        .into(),
+        false,
+    );
+    assert_eq!(
+        egress.allow_dns_hosts,
+        Some(vec!["example.org".to_string()])
+    );
+    assert_eq!(
+        egress.allow_subnets,
+        Some(vec![
+            "203.0.113.7/32".to_string(),
+            "2001:db8::7/128".to_string()
+        ])
+    );
+    assert_eq!(
+        egress.deny_subnets,
+        Some(BUILD_BOX_INTERNET_DENY.map(String::from).to_vec())
+    );
+}
+
+/// NET-169: a requester row's name gives back its box, and no other row's
+/// name does.
+#[test]
+fn a_requester_row_name_names_its_box() {
+    let id = SessionId::mint();
+    let row = requester_build_row_name(id);
+    assert_eq!(requester_build_row_session(&row), Some(id));
+    assert_eq!(requester_build_row_session(&format!("{row}-1")), None);
+    assert_eq!(requester_build_row_session("build-web"), None);
+    assert_eq!(requester_build_row_session(&id.to_string()), None);
+}
+
+/// A daemon's refusal of a box's table decodes as a refusal. The response
+/// has no fields, so `deny_unknown_fields` is what tells the two apart.
+#[test]
+fn a_prepare_error_does_not_decode_as_success() {
+    let refused: Errorable<PrepareBuildBoxesResponse> =
+        serde_json_lenient::from_str(r#"{"error":"no such box"}"#).expect("an error decodes");
+    assert!(matches!(refused, Errorable::Err { .. }));
+    let prepared: Errorable<PrepareBuildBoxesResponse> =
+        serde_json_lenient::from_str("{}").expect("a success decodes");
+    assert_eq!(prepared, Errorable::Ok(PrepareBuildBoxesResponse {}));
 }
 
 /// BOX-074: the `GetVersion` reply carries the daemon's expander version,

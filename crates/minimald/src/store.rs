@@ -1,5 +1,6 @@
 use boxes::{
     Record, SessionId,
+    box_name::{DerivedAssignment, DerivedName},
     store::{BoxKey, BoxObject, DiskBox, DiskBoxKey, DiskLoader, Loader as _},
 };
 use paths::DaemonAbsPath;
@@ -29,6 +30,10 @@ enum StoreMessage {
         Box<Record>,
         Option<SessionId>,
         oneshot::Sender<Result<BoxRecordHandle, std::io::Error>>,
+    ),
+    CreateDerived(
+        Box<CreateDerived>,
+        oneshot::Sender<Result<(BoxRecordHandle, DerivedAssignment), std::io::Error>>,
     ),
     Find(
         RecordPredicate,
@@ -60,6 +65,15 @@ enum StoreMessage {
         Vec<u8>,
         oneshot::Sender<Result<(), std::io::Error>>,
     ),
+}
+
+/// A create with no requested name: the record, the id the VM host
+/// daemon handed, if any, and the derived name the store walks.
+struct CreateDerived {
+    record: Record,
+    handed: Option<SessionId>,
+    derived: DerivedName,
+    fresh: bool,
 }
 
 /// The session store actor. Mediates reading, writing, and enumerating
@@ -133,6 +147,30 @@ impl Store {
         mut record: Record,
         handed: Option<SessionId>,
     ) -> Result<DiskBoxKey, std::io::Error> {
+        record.id = self.new_id(handed)?;
+        self.store.create_with_id(record)
+    }
+
+    /// [`Self::create`] for a create with no requested name: the loader
+    /// names the record from `derived` and files it in one step, so no
+    /// other create, rename or reap runs between the two.
+    fn create_derived(
+        &mut self,
+        create: CreateDerived,
+    ) -> Result<(DiskBoxKey, DerivedAssignment), std::io::Error> {
+        let CreateDerived {
+            mut record,
+            handed,
+            derived,
+            fresh,
+        } = create;
+        record.id = self.new_id(handed)?;
+        self.store.create_with_derived_name(record, &derived, fresh)
+    }
+
+    /// The id a new record is filed under: `handed`, else a fresh mint.
+    /// An id that a retained record already names is refused.
+    fn new_id(&mut self, handed: Option<SessionId>) -> Result<SessionId, std::io::Error> {
         let id = handed.unwrap_or_else(self.mint);
         if self.store.find_by_id(&id)?.is_some() {
             tracing::warn!(
@@ -149,8 +187,7 @@ impl Store {
                  No session was created. Run the command again."
             )));
         }
-        record.id = id;
-        self.store.create_with_id(record)
+        Ok(id)
     }
 
     /// Wraps a key in a record handle. The caller awaiting this message holds a
@@ -174,6 +211,10 @@ impl Store {
             StoreMessage::Create(record, handed, r) => {
                 let created = self.create(*record, handed);
                 let _ = r.send(created.map(|k| self.handle_for(k)));
+            }
+            StoreMessage::CreateDerived(create, r) => {
+                let created = self.create_derived(*create);
+                let _ = r.send(created.map(|(k, assigned)| (self.handle_for(k), assigned)));
             }
             StoreMessage::Find(pred, r) => {
                 let _ = r.send(
@@ -266,6 +307,37 @@ impl StoreHandle {
         let _ = self
             .sender
             .send(StoreMessage::Create(Box::new(record), Some(id), send))
+            .await;
+        recv.await.expect("corresponding store is dead")
+    }
+
+    /// Creates a record with no requested name (BOX-211): the store gives
+    /// it the derived name, else the smallest free `<name>-<n>`, against
+    /// every retained record in any state, and files it in the same step.
+    /// A taken name never refuses the create. `handed` is the id the VM
+    /// host daemon minted, as for [`Self::create_under`]. With `fresh`,
+    /// the walk starts at `<name>-1`. The answer carries the assigned name
+    /// and the name not taken, with its holder or reason.
+    pub async fn create_derived(
+        &self,
+        record: Record,
+        handed: Option<SessionId>,
+        derived: DerivedName,
+        fresh: bool,
+    ) -> Result<(BoxRecordHandle, DerivedAssignment), std::io::Error> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .sender
+            .send(StoreMessage::CreateDerived(
+                Box::new(CreateDerived {
+                    record,
+                    handed,
+                    derived,
+                    fresh,
+                }),
+                send,
+            ))
             .await;
         recv.await.expect("corresponding store is dead")
     }
@@ -519,6 +591,9 @@ mod tests {
             parent: None,
             project_root: None,
             attrs: Default::default(),
+            project_name: None,
+            entry: None,
+            name_origin: boxes::NameOrigin::Written,
         }
     }
 
