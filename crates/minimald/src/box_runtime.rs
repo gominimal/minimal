@@ -2675,6 +2675,9 @@ mod proxy_env_tests {
             parent: None,
             project_root: None,
             attrs: BTreeMap::new(),
+            project_name: None,
+            entry: None,
+            name_origin: boxes::NameOrigin::Written,
         }
     }
 

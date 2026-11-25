@@ -8464,6 +8464,9 @@ fn stored_record(parent: boxes::SessionId) -> boxes::Record {
         parent: Some(parent),
         project_root: None,
         attrs: BTreeMap::new(),
+        project_name: None,
+        entry: None,
+        name_origin: boxes::NameOrigin::Written,
     }
 }
 

@@ -3430,6 +3430,10 @@ async fn show_returns_record_state_identity_and_live_execs() {
             pty_enabled: true,
             lifetime: None,
             build_boxes: Vec::new(),
+            // The project name the root gives, and no entry: no spec.
+            project_name: Some("proj".to_string()),
+            entry: None,
+            name_origin: boxes::NameOrigin::Written,
         }
     );
     assert_eq!(shown.identity, minimald_rpc::BoxIdentity::None);
@@ -8567,4 +8571,254 @@ async fn export_claim_released_for_unreported_exports_on_disconnect() {
         .await
         .unwrap();
     assert_eq!(claim.granted, paths(&["c.txt"]));
+}
+
+/// The record of box `id`, as the store keeps it.
+async fn stored_record(mngr: &BoxManagerHandle, id: SessionId) -> boxes::Record {
+    mngr.get_record(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the created record is filed")
+}
+
+/// The path of box `id`'s `record.json` under the state directory `state`.
+fn record_file(state: &std::path::Path, id: SessionId) -> std::path::PathBuf {
+    let dir = boxes::store::BoxDir::find(&daemon_abs(state), &id)
+        .unwrap()
+        .expect("the box has a directory");
+    dir.log_path()
+        .as_utf8_path()
+        .parent()
+        .expect("the log sits in the box directory")
+        .join("record.json")
+        .into_std_path_buf()
+}
+
+/// The record keeps where its name came from. A request's name is written
+/// and a derived name is derived. A rename makes it written, and a record
+/// that predates the field reads as written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn record_keeps_name_origin_written_or_derived() {
+    let (_state, _cache, mngr) = manager().await;
+
+    let derived = mngr
+        .create_box_with_spec(
+            as_task(unnamed_config()),
+            Some(task_spec("lint", None)),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let record = stored_record(&mngr, derived).await;
+    assert_eq!(record.name.as_deref(), Some("proj-lint"));
+    assert_eq!(record.name_origin, boxes::NameOrigin::Derived);
+    assert_eq!(record.project_name.as_deref(), Some("proj"));
+    assert_eq!(record.entry.as_deref(), Some("lint"));
+
+    let written = mngr
+        .create_box_with_spec(
+            named_task("given"),
+            Some(task_spec("lint", None)),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let record = stored_record(&mngr, written).await;
+    assert_eq!(record.name.as_deref(), Some("given"));
+    assert_eq!(record.name_origin, boxes::NameOrigin::Written);
+    assert_eq!(record.project_name.as_deref(), Some("proj"));
+    assert_eq!(record.entry.as_deref(), Some("lint"));
+
+    // A rename through the actor makes the name one a person wrote.
+    rename_box(&mngr, derived, "renamed").await;
+    let record = stored_record(&mngr, derived).await;
+    assert_eq!(record.name.as_deref(), Some("renamed"));
+    assert_eq!(record.name_origin, boxes::NameOrigin::Written);
+    assert_eq!(
+        record.entry.as_deref(),
+        Some("lint"),
+        "a rename keeps the entry"
+    );
+
+    // The record writes the origin, and one without it reads as written.
+    let text = serde_json_lenient::to_string(&record).unwrap();
+    assert!(text.contains(r#""name_origin":"written""#), "{text}");
+    let mut value: serde_json_lenient::Value = serde_json_lenient::from_str(&text).unwrap();
+    let object = value.as_object_mut().unwrap();
+    object.insert("name_origin".into(), "derived".into());
+    let back: boxes::Record = serde_json_lenient::from_value(value.clone()).unwrap();
+    assert_eq!(back.name_origin, boxes::NameOrigin::Derived);
+    let object = value.as_object_mut().unwrap();
+    object.remove("name_origin");
+    object.remove("project_name");
+    object.remove("entry");
+    let legacy: boxes::Record = serde_json_lenient::from_value(value).unwrap();
+    assert_eq!(legacy.name_origin, boxes::NameOrigin::Written);
+    assert_eq!(legacy.project_name, None);
+    assert_eq!(legacy.entry, None);
+}
+
+/// BOX-158: the listing returns each retained record with its project
+/// name, its entry and its name origin, beside its state and project root.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_returns_every_retained_record_with_state_project_and_entry() {
+    let (_state, _cache, mngr) = manager().await;
+    let derived = mngr
+        .create_box_with_spec(
+            as_task(unnamed_config()),
+            Some(task_spec("lint", None)),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut config = as_task(unnamed_config());
+    config.project_name = Some("web".to_string());
+    let declared = mngr
+        .create_box_with_spec(config, Some(task_spec("check", None)), None, None)
+        .await
+        .unwrap();
+    let written = mngr
+        .create_box_with_spec(named_task("given"), None, None, None)
+        .await
+        .unwrap();
+    let renamed = mngr
+        .create_box_with_spec(
+            as_task(unnamed_config()),
+            Some(task_spec("fmt", None)),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    rename_box(&mngr, renamed, "mine").await;
+
+    let listing = mngr.list_boxes(None).await.unwrap();
+    assert_eq!(listing.len(), 4, "{listing:?}");
+    let entry = |id| listing.iter().find(|entry| entry.box_id == id).unwrap();
+    for (id, name, project, box_entry, origin) in [
+        (
+            derived,
+            "proj-lint",
+            "proj",
+            Some("lint"),
+            boxes::NameOrigin::Derived,
+        ),
+        (
+            declared,
+            "web-check",
+            "web",
+            Some("check"),
+            boxes::NameOrigin::Derived,
+        ),
+        (written, "given", "proj", None, boxes::NameOrigin::Written),
+        (
+            renamed,
+            "mine",
+            "proj",
+            Some("fmt"),
+            boxes::NameOrigin::Written,
+        ),
+    ] {
+        let entry = entry(id);
+        assert_eq!(entry.name.as_deref(), Some(name), "{entry:?}");
+        assert_eq!(entry.project_name.as_deref(), Some(project), "{entry:?}");
+        assert_eq!(entry.entry.as_deref(), box_entry, "{entry:?}");
+        assert_eq!(entry.name_origin, origin, "{entry:?}");
+        assert_eq!(entry.state, "pending", "{entry:?}");
+        assert!(entry.project_root.is_some(), "{entry:?}");
+    }
+
+    // BOX-159: a read returns the same three fields.
+    let shown = mngr.show_box(declared).await.unwrap().expect("retained");
+    assert_eq!(shown.record.project_name.as_deref(), Some("web"));
+    assert_eq!(shown.record.entry.as_deref(), Some("check"));
+    assert_eq!(shown.record.name_origin, boxes::NameOrigin::Derived);
+}
+
+/// BOX-158, BOX-159: a record that predates the name fields lists and
+/// reads with no project name and no entry, and its name as written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_record_lists_and_reads_missing_name_fields_as_absent() {
+    let (state, cache, mngr) = manager().await;
+    // A pending record does not outlive a restart, so the box is active.
+    let mut config = rooted_config("old", "/home/dev/proj");
+    config.name = None;
+    let id = create_active_session_with(&mngr, config).await;
+    drop(mngr);
+
+    let path = record_file(state.path(), id);
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut value: serde_json_lenient::Value = serde_json_lenient::from_str(&text).unwrap();
+    let object = value.as_object_mut().unwrap();
+    // A box filed with no spec has no entry to write.
+    assert!(object.remove("entry").is_none());
+    for key in ["name_origin", "project_name"] {
+        assert!(object.remove(key).is_some(), "the record wrote `{key}`");
+    }
+    std::fs::write(&path, serde_json_lenient::to_vec(&value).unwrap()).unwrap();
+
+    let mngr = manager_over(state.path(), cache.path()).await;
+    let listing = mngr.list_boxes(None).await.unwrap();
+    assert_eq!(listing.len(), 1, "the legacy record lists: {listing:?}");
+    let listed = &listing[0];
+    assert_eq!(listed.box_id, id);
+    assert_eq!(listed.name.as_deref(), Some("proj"));
+    assert_eq!(listed.state, "stopped", "the restart stopped the box");
+    assert_eq!(listed.project_name, None);
+    assert_eq!(listed.entry, None);
+    assert_eq!(listed.name_origin, boxes::NameOrigin::Written);
+
+    let shown = mngr.show_box(id).await.unwrap().expect("retained");
+    assert_eq!(shown.record, *listed);
+}
+
+/// BOX-164: the name fields are the daemon's. A create request that asserts
+/// them in its attributes does not set them, and a record file written into
+/// the box's project directory, as a process in the box can, changes
+/// nothing the listing returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn box_process_cannot_write_name_origin_project_name_or_entry() {
+    let (_state, _cache, mngr) = manager().await;
+    let project = TempDir::new().unwrap();
+    let mut config = named_task("given");
+    config.project_path = HostAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
+    config.project_root = Some(config.project_path.clone());
+    for (key, value) in [
+        ("name_origin", "derived"),
+        ("project_name", "forged"),
+        ("entry", "forged"),
+    ] {
+        config.attrs.insert(key.to_string(), value.to_string());
+    }
+    let id = mngr
+        .create_box_with_spec(config, Some(task_spec("lint", None)), None, None)
+        .await
+        .unwrap();
+    let project_name = boxes::box_name::project_name_of_dir(project.path().to_str().unwrap());
+
+    let forged = serde_json_lenient::json!({
+        "id": id.to_string(),
+        "name": "given",
+        "name_origin": "derived",
+        "project_name": "forged",
+        "entry": "forged",
+    });
+    std::fs::write(
+        project.path().join("record.json"),
+        serde_json_lenient::to_vec(&forged).unwrap(),
+    )
+    .unwrap();
+
+    let listing = mngr.list_boxes(None).await.unwrap();
+    let listed = listing.iter().find(|entry| entry.box_id == id).unwrap();
+    assert_eq!(listed.name_origin, boxes::NameOrigin::Written);
+    assert_eq!(listed.project_name.as_deref(), Some(project_name.as_str()));
+    assert_eq!(listed.entry.as_deref(), Some("lint"));
+    let record = stored_record(&mngr, id).await;
+    assert_eq!(record.name_origin, boxes::NameOrigin::Written);
+    assert_eq!(record.project_name.as_deref(), Some(project_name.as_str()));
+    assert_eq!(record.entry.as_deref(), Some("lint"));
 }

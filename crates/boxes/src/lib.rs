@@ -1563,8 +1563,56 @@ pub struct Record {
     #[serde(default)]
     pub project_root: Option<HostAbsPath>,
 
+    /// The project name the create derived the box's name from, or would
+    /// have: the request's project name, else the project root's directory
+    /// name. Daemon-stamped at creation. `None` for a record that predates
+    /// the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
+
+    /// The entry the box's stored spec names, as the create read it.
+    /// Daemon-stamped at creation. `None` for a box filed with no spec, a
+    /// spec that names no entry, and a record that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<String>,
+
+    /// Whether the box's name was written by a person or derived from the
+    /// project and the entry. A rename sets it to [`NameOrigin::Written`].
+    /// A record that predates the field reads as written.
+    #[serde(default)]
+    pub name_origin: NameOrigin,
+
     /// Free-form attributes.
     pub attrs: BTreeMap<String, String>,
+}
+
+/// Where a box's current name came from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NameOrigin {
+    /// A person wrote the name: on the create request, or with a rename.
+    /// Also the reading of a record that predates the field.
+    #[default]
+    Written,
+    /// The daemon derived the name from the project name and the entry.
+    Derived,
+}
+
+impl NameOrigin {
+    /// The origin as the record and the wire spell it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Written => "written",
+            Self::Derived => "derived",
+        }
+    }
+}
+
+impl std::fmt::Display for NameOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// The Box Type of a box `min session activate` creates (BOX-001).
@@ -2556,6 +2604,9 @@ mod tests {
             parent: None,
             project_root: None,
             attrs: BTreeMap::new(),
+            project_name: None,
+            entry: None,
+            name_origin: crate::NameOrigin::Written,
         }
     }
 
