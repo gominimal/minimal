@@ -269,7 +269,7 @@ The command refuses these starts before it creates a box:
 | An entry in `minimal.toml` has a type that is not built in, or a `[boxes.<name>]` entry has no `type`. The command refuses only when `ENTRY` names that entry, or when the start must count the entries to pick one | 2 |
 | No terminal, and no `--detach` | 2 |
 | `--no-loadouts` and `--loadout` together | 2 |
-| A box already has the name from `--name` or `[box] name`. Pass another `--name` to create the box | 2 |
+| A running box already has the name from `--name` or `[box] name`. Pass another `--name` to create the box | 2 |
 
 An invalid `minimal.toml` ends the command with exit code 3.
 
