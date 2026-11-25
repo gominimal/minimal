@@ -747,6 +747,13 @@ A task entry refuses `--ingress` and `--loadout` with exit code 2, as
 host stores it. It takes `-o` and no override flag. An override flag with a
 box gives exit code 2.
 
+The TOML form starts with the box's name and its origin, as the box's record
+holds them. The origin says whether a person wrote the name or the host
+derived it from the project name and the entry. After `min box rename`, the
+form shows the new name. A `[box] name` in the stored spec is the name the
+entry asks for when a box is created from it. The form labels it so, because
+it is not the name of the box.
+
 The spec of a box lists its
 [lifecycle hooks](./loadouts.md#lifecycle_hooks---scripts-at-session-transition-points),
 each with the loadout or project that declared it. A box started with
