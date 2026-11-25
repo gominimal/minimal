@@ -382,9 +382,9 @@ pub(crate) fn render_box_rows(
         return writeln!(out, "{EMPTY_HOST_LIST}");
     }
     let header = [
-        "ID", "NAME", "TYPE", "PARENT", "PROJECT", "STATE", "PROVIDER", "HOST",
+        "ID", "NAME", "ENTRY", "TYPE", "PARENT", "PROJECT", "STATE", "PROVIDER", "HOST",
     ];
-    let rows: Vec<[String; 8]> = rows
+    let rows: Vec<[String; 9]> = rows
         .iter()
         .map(|row| match *row {
             BoxRow::Record(listed) => {
@@ -392,6 +392,7 @@ pub(crate) fn render_box_rows(
                 [
                     entry.box_id.to_string(),
                     entry.name.clone().unwrap_or_else(|| NO_VALUE.to_string()),
+                    entry.entry.clone().unwrap_or_else(|| NO_VALUE.to_string()),
                     entry
                         .box_type
                         .clone()
@@ -410,6 +411,7 @@ pub(crate) fn render_box_rows(
             BoxRow::Build(listed, build) => [
                 NO_VALUE.to_string(),
                 build.package.clone(),
+                NO_VALUE.to_string(),
                 boxes::BUILD_BOX_TYPE.to_string(),
                 listed.record.box_id.to_string(),
                 project_cell(&listed.record),
@@ -425,7 +427,7 @@ pub(crate) fn render_box_rows(
             *width = (*width).max(cell.chars().count());
         }
     }
-    let line = |cells: [&str; 8]| {
+    let line = |cells: [&str; 9]| {
         let mut text = String::new();
         for (index, (cell, width)) in cells.iter().zip(widths).enumerate() {
             if index + 1 == cells.len() {
@@ -443,12 +445,15 @@ pub(crate) fn render_box_rows(
     Ok(())
 }
 
-/// The PROJECT cell of a record and of its build boxes.
+/// The PROJECT cell of a record and of its build boxes: the project name,
+/// else the project root for a record that keeps no project name
+/// (BCLI-001).
 fn project_cell(entry: &minimald_rpc::BoxListingEntry) -> String {
     entry
-        .project_root
-        .as_ref()
-        .map_or_else(|| NO_VALUE.to_string(), |root| root.to_string())
+        .project_name
+        .clone()
+        .or_else(|| entry.project_root.as_ref().map(ToString::to_string))
+        .unwrap_or_else(|| NO_VALUE.to_string())
 }
 
 /// One box as its `"schema": "min/v1/box"` object. A value the record
@@ -465,6 +470,9 @@ pub(crate) fn box_json(listed: &ListedBox) -> serde_json_lenient::Value {
         "host": listed.host,
         "parent": entry.parent.map(|parent| parent.to_string()),
         "project": entry.project_root.as_ref().map(|root| root.to_string()),
+        "project_name": entry.project_name,
+        "entry": entry.entry,
+        "name_origin": entry.name_origin.as_str(),
         "reason": entry.reason,
         "exit_code": entry.exit_code,
         "signal": entry.signal,
@@ -499,6 +507,10 @@ pub(crate) fn render_box_rows_json(
                 "host": listed.host,
                 "parent": listed.record.box_id.to_string(),
                 "project": listed.record.project_root.as_ref().map(|r| r.to_string()),
+                "project_name": listed.record.project_name,
+                // A build box is named by its package, and has no entry.
+                "entry": null,
+                "name_origin": null,
                 "reason": null,
                 "exit_code": null,
                 "signal": null,
@@ -578,6 +590,9 @@ mod tests {
             pty_enabled: true,
             lifetime: None,
             build_boxes: Vec::new(),
+            project_name: None,
+            entry: None,
+            name_origin: boxes::NameOrigin::Written,
         }
     }
 
@@ -928,12 +943,12 @@ mod tests {
         render_box_list(&mut out, &rows, true).unwrap();
         let text = String::from_utf8(out).unwrap();
         let expected = "\
-ID                                    NAME          TYPE     PARENT                                PROJECT         STATE                   PROVIDER  HOST
-0199e0a0-0000-7000-8000-000000000001  kept-session  session  -                                     /home/dev/proj  stopped (signal 15)     local     local0
-0199e0a0-0000-7000-8000-000000000002  -             task     0199e0a0-0000-7000-8000-000000000001  /home/dev/proj  exited (exit 0)         local     local0
-0199e0a0-0000-7000-8000-000000000003  big-build     task     -                                     /home/dev/proj  exited (oom, exit 137)  local     local0
-0199e0b0-0000-7000-8000-000000000004  left-task     task     -                                     /home/dev/proj  stopped                 local     local0
-0199e0c0-0000-7000-8000-000000000005  live          session  -                                     -               running                 local     local0
+ID                                    NAME          ENTRY  TYPE     PARENT                                PROJECT         STATE                   PROVIDER  HOST
+0199e0a0-0000-7000-8000-000000000001  kept-session  -      session  -                                     /home/dev/proj  stopped (signal 15)     local     local0
+0199e0a0-0000-7000-8000-000000000002  -             -      task     0199e0a0-0000-7000-8000-000000000001  /home/dev/proj  exited (exit 0)         local     local0
+0199e0a0-0000-7000-8000-000000000003  big-build     -      task     -                                     /home/dev/proj  exited (oom, exit 137)  local     local0
+0199e0b0-0000-7000-8000-000000000004  left-task     -      task     -                                     /home/dev/proj  stopped                 local     local0
+0199e0c0-0000-7000-8000-000000000005  live          -      session  -                                     -               running                 local     local0
 ";
         assert_eq!(text, expected);
 
@@ -996,19 +1011,22 @@ ID                                    NAME          TYPE     PARENT             
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "\
-ID:         0199e0a0-0000-7000-8000-000000000001
-Name:       kept-session
-Type:       session
-Parent:     -
-Project:    /home/dev/proj
-State:      stopped
-Reason:     stopped
-Exit code:  -
-Signal:     15
-Disk:       -
-Identity:   none
-Provider:   local
-Host:       local0
+ID:           0199e0a0-0000-7000-8000-000000000001
+Name:         kept-session
+Name origin:  written
+Entry:        -
+Type:         session
+Parent:       -
+Project name: -
+Project:      /home/dev/proj
+State:        stopped
+Reason:       stopped
+Exit code:    -
+Signal:       15
+Disk:         -
+Identity:     none
+Provider:     local
+Host:         local0
 "
         );
 
@@ -1029,19 +1047,22 @@ Host:       local0
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "\
-ID:         0199e0a0-0000-7000-8000-000000000002
-Name:       -
-Type:       task
-Parent:     0199e0a0-0000-7000-8000-000000000001
-Project:    /home/dev/proj
-State:      exited
-Reason:     exit
-Exit code:  0
-Signal:     -
-Disk:       -
-Identity:   unknown
-Provider:   local
-Host:       local0
+ID:           0199e0a0-0000-7000-8000-000000000002
+Name:         -
+Name origin:  written
+Entry:        -
+Type:         task
+Parent:       0199e0a0-0000-7000-8000-000000000001
+Project name: -
+Project:      /home/dev/proj
+State:        exited
+Reason:       exit
+Exit code:    0
+Signal:       -
+Disk:         -
+Identity:     unknown
+Provider:     local
+Host:         local0
 Live execs:
   exec-1  detached  sleep 60
 "
@@ -1164,9 +1185,9 @@ Live execs:
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "\
-ID                                    NAME   TYPE     PARENT  PROJECT         STATE            PROVIDER      HOST
-0199e0a0-0000-7000-8000-000000000001  dev    session  -       /home/dev/proj  running          local-minvmd  local-minvmd0
-0199e0a0-0000-7000-8000-000000000002  build  task     -       /home/dev/proj  exited (exit 0)  local-minvmd  alpha.local-minvmd0
+ID                                    NAME   ENTRY  TYPE     PARENT  PROJECT         STATE            PROVIDER      HOST
+0199e0a0-0000-7000-8000-000000000001  dev    -      session  -       /home/dev/proj  running          local-minvmd  local-minvmd0
+0199e0a0-0000-7000-8000-000000000002  build  -      task     -       /home/dev/proj  exited (exit 0)  local-minvmd  alpha.local-minvmd0
 "
         );
 
@@ -1191,6 +1212,9 @@ ID                                    NAME   TYPE     PARENT  PROJECT         ST
                 "host": "alpha.local-minvmd0",
                 "parent": null,
                 "project": "/home/dev/proj",
+                "project_name": null,
+                "entry": null,
+                "name_origin": "written",
                 "reason": "exit",
                 "exit_code": 0,
                 "signal": null,
@@ -1233,15 +1257,18 @@ ID                                    NAME   TYPE     PARENT  PROJECT         ST
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "\
-ID:         0199e0a0-0000-7000-8000-000000000001
-Name:       dev
-Type:       session
-Parent:     -
-Project:    /home/dev/proj
-State:      running
-Identity:   unknown
-Provider:   local-minvmd
-Host:       local-minvmd0
+ID:           0199e0a0-0000-7000-8000-000000000001
+Name:         dev
+Name origin:  written
+Entry:        -
+Type:         session
+Parent:       -
+Project name: -
+Project:      /home/dev/proj
+State:        running
+Identity:     unknown
+Provider:     local-minvmd
+Host:         local-minvmd0
 "
         );
 
@@ -1263,12 +1290,159 @@ Host:       local-minvmd0
         let mut out = Vec::new();
         render_box_show(&mut out, &shown, "local", "local0").unwrap();
         let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("State:      stopped\n"), "{text}");
-        assert!(text.contains("Signal:     9\n"), "{text}");
-        assert!(text.contains("Identity:   none\n"), "{text}");
+        assert!(text.contains("State:        stopped\n"), "{text}");
+        assert!(text.contains("Signal:       9\n"), "{text}");
+        assert!(text.contains("Identity:     none\n"), "{text}");
         assert!(
-            text.contains("Provider:   local\nHost:       local0\n"),
+            text.contains("Provider:     local\nHost:         local0\n"),
             "{text}"
         );
+    }
+
+    /// The listed boxes the name-field tests read: a derived name, a
+    /// renamed box, and a record that keeps no name fields.
+    fn named_boxes() -> Vec<ListedBox> {
+        let mut derived = entry(
+            "0199e0a0-0000-7000-8000-000000000001",
+            Some("proj-lint"),
+            "task",
+            "running",
+        );
+        derived.project_name = Some("proj".to_string());
+        derived.entry = Some("lint".to_string());
+        derived.name_origin = boxes::NameOrigin::Derived;
+        let mut renamed = entry(
+            "0199e0a0-0000-7000-8000-000000000002",
+            Some("mine"),
+            "session",
+            "running",
+        );
+        renamed.project_name = Some("web".to_string());
+        renamed.entry = Some("default".to_string());
+        let legacy = entry(
+            "0199e0a0-0000-7000-8000-000000000003",
+            Some("old"),
+            "session",
+            "stopped",
+        );
+        [derived, renamed, legacy].into_iter().map(local).collect()
+    }
+
+    /// BCLI-001: the table has an ENTRY column after NAME, and PROJECT
+    /// shows the project name, else the project root. Under `-o json` each
+    /// box object carries `entry`, `project_name` and `name_origin`, a
+    /// renamed box reads as written, and `project` stays the root.
+    #[test]
+    fn box_json_carries_project_name_entry_and_name_origin() {
+        let listed = named_boxes();
+        let mut out = Vec::new();
+        render_box_list(&mut out, &listed, true).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\
+ID                                    NAME       ENTRY    TYPE     PARENT  PROJECT         STATE    PROVIDER  HOST
+0199e0a0-0000-7000-8000-000000000001  proj-lint  lint     task     -       proj            running  local     local0
+0199e0a0-0000-7000-8000-000000000002  mine       default  session  -       web             running  local     local0
+0199e0a0-0000-7000-8000-000000000003  old        -        session  -       /home/dev/proj  stopped  local     local0
+"
+        );
+
+        let mut out = Vec::new();
+        render_box_list_json(&mut out, &listed).unwrap();
+        let parsed: serde_json_lenient::Value = serde_json_lenient::from_slice(&out).unwrap();
+        let objects = parsed.as_array().expect("an array of box objects");
+        let fields = |object: &serde_json_lenient::Value| {
+            (
+                object["project"].clone(),
+                object["project_name"].clone(),
+                object["entry"].clone(),
+                object["name_origin"].clone(),
+            )
+        };
+        use serde_json_lenient::json;
+        assert_eq!(
+            objects.iter().map(fields).collect::<Vec<_>>(),
+            vec![
+                (
+                    json!("/home/dev/proj"),
+                    json!("proj"),
+                    json!("lint"),
+                    json!("derived")
+                ),
+                (
+                    json!("/home/dev/proj"),
+                    json!("web"),
+                    json!("default"),
+                    json!("written")
+                ),
+                (
+                    json!("/home/dev/proj"),
+                    json!(null),
+                    json!(null),
+                    json!("written")
+                ),
+            ]
+        );
+    }
+
+    /// BCLI-003: `min box show` renders the project name, the entry and
+    /// the name origin, and its `-o json` object carries the three fields.
+    #[test]
+    fn box_show_renders_project_entry_and_name_origin() {
+        let listed = named_boxes();
+        let shown = ShowBoxResponse {
+            record: listed[0].record.clone(),
+            identity: BoxIdentity::None,
+            live_execs: Vec::new(),
+            disk_bytes: None,
+            missing_build_row: false,
+        };
+        let mut out = Vec::new();
+        render_box_show(&mut out, &shown, "local", "local0").unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\
+ID:           0199e0a0-0000-7000-8000-000000000001
+Name:         proj-lint
+Name origin:  derived
+Entry:        lint
+Type:         task
+Parent:       -
+Project name: proj
+Project:      /home/dev/proj
+State:        running
+Identity:     none
+Provider:     local
+Host:         local0
+"
+        );
+
+        let mut out = Vec::new();
+        render_box_show_as(
+            &mut out,
+            crate::cli::BoxShowOutputFormat::Json,
+            &shown,
+            "local",
+            "local0",
+        )
+        .unwrap();
+        let object: serde_json_lenient::Value = serde_json_lenient::from_slice(&out).unwrap();
+        assert_eq!(object["schema"], "min/v1/box");
+        assert_eq!(object["project"], "/home/dev/proj");
+        assert_eq!(object["project_name"], "proj");
+        assert_eq!(object["entry"], "lint");
+        assert_eq!(object["name_origin"], "derived");
+
+        // A record that keeps no name fields shows `-` and reads as written.
+        let legacy = ShowBoxResponse {
+            record: listed[2].record.clone(),
+            ..shown
+        };
+        let mut out = Vec::new();
+        render_box_show(&mut out, &legacy, "local", "local0").unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("Name origin:  written\n"), "{text}");
+        assert!(text.contains("Entry:        -\n"), "{text}");
+        assert!(text.contains("Project name: -\n"), "{text}");
     }
 }

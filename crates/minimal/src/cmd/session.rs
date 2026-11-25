@@ -592,6 +592,9 @@ mod tests {
             signal: None,
             pty_enabled: true,
             lifetime: None,
+            project_name: None,
+            entry: None,
+            name_origin: boxes::NameOrigin::Written,
         };
         let typed = super::typed_records(vec![entry("session"), entry("task")], "session", None);
         assert_eq!(typed.len(), 1);

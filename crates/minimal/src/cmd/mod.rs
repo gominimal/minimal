@@ -1848,6 +1848,9 @@ mod tests {
             parent: None,
             project_root: None,
             attrs: Default::default(),
+            project_name: None,
+            entry: None,
+            name_origin: boxes::NameOrigin::Written,
         };
         super::withdraw_interrupted_box(Some(control_sock), &record, &guard.host_ip_box_id).await;
         let requests = server.join().unwrap();

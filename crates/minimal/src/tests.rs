@@ -9821,6 +9821,9 @@ fn address_entry(id: &str, name: &str, state: &str) -> minimald_rpc::BoxListingE
         pty_enabled: true,
         lifetime: None,
         build_boxes: Vec::new(),
+        project_name: None,
+        entry: None,
+        name_origin: boxes::NameOrigin::Written,
     }
 }
 
@@ -14398,6 +14401,9 @@ fn fake_listed(id: boxes::BoxId, parent: Option<boxes::BoxId>) -> minimald_rpc::
         pty_enabled: false,
         lifetime: None,
         build_boxes: Vec::new(),
+        project_name: None,
+        entry: None,
+        name_origin: boxes::NameOrigin::Written,
     }
 }
 
@@ -14745,6 +14751,9 @@ fn hold_record(
         parent: None,
         project_root: None,
         attrs: Default::default(),
+        project_name: None,
+        entry: None,
+        name_origin: boxes::NameOrigin::Written,
     }
 }
 
@@ -15045,7 +15054,7 @@ async fn show_and_prune_dry_run_report_disk() {
     // no disk line.
     let (shown, text) = show(web).await;
     let bytes = shown.disk_bytes.expect("the daemon measures a stopped box");
-    let disk = format!("Disk:       {}", format_disk(bytes));
+    let disk = format!("Disk:         {}", format_disk(bytes));
     assert!(text.lines().any(|line| line == disk), "{text}");
     let (_, text) = show(live).await;
     assert!(!text.contains("Disk:"), "{text}");
@@ -18658,6 +18667,9 @@ async fn box_show_output_yaml_matches_json() {
         "type",
         "parent",
         "project",
+        "project_name",
+        "entry",
+        "name_origin",
         "state",
         "reason",
         "exit_code",
@@ -18774,7 +18786,7 @@ async fn box_stop_exec_stops_that_exec() {
     // The box runs on, with its other exec.
     let text = box_show_text(&alpha.host, "web").await;
     assert!(
-        text.lines().any(|line| line == "State:      running"),
+        text.lines().any(|line| line == "State:        running"),
         "{text}"
     );
     assert_eq!(
@@ -19534,7 +19546,7 @@ async fn box_exec_show_logs_wait_stop_end_to_end() {
         let text = box_show_text(&alpha.host, "web").await;
         ran.push("min box show web", text.as_bytes(), b"", 0);
         assert!(
-            text.lines().any(|line| line == "State:      running"),
+            text.lines().any(|line| line == "State:        running"),
             "the box runs on\n{ran}"
         );
         assert_eq!(
