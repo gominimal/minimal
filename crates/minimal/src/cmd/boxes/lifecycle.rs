@@ -1683,8 +1683,9 @@ mod tests {
     }
 
     // BCLI-058: `min box rename` renames the box as BOX-010 defines. A name
-    // a running box holds is refused with exit 2, and the refusal names the
-    // holder. The reserved name `self` is refused too.
+    // another box holds is refused with exit 2. These boxes record no
+    // creator, so the caller may not read the holder, and the refusal names
+    // only the name (BOX-163). The reserved name `self` is refused too.
     #[tokio::test]
     async fn box_rename_renames_as_box_010() {
         let log = minimald::test_harness::captured_log();
@@ -1708,6 +1709,7 @@ mod tests {
         );
 
         // The running box `front` holds the name, so `api` cannot take it.
+        // Its record names no creator, so the refusal hides it.
         let api = listed_id(&mut client, "api").await;
         let mut out = Vec::new();
         let err = rename_listed_box(&mut client, &mut out, api, "api", Some("api"), "front")
@@ -1717,9 +1719,10 @@ mod tests {
             .downcast_ref::<BoxRenameRefusal>()
             .unwrap_or_else(|| panic!("the refusal is typed: {err:#}"));
         assert_eq!(refusal.exit_code(), 2);
-        let text = refusal.to_string();
-        assert!(text.contains(&web.to_string()), "names the holder: {text}");
-        assert!(text.contains("`front`"), "names the holder: {text}");
+        assert_eq!(
+            refusal.to_string(),
+            "The name `front` is taken. Choose another name."
+        );
         assert!(out.is_empty());
         assert_eq!(listed_id(&mut client, "api").await, api);
 

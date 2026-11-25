@@ -8435,9 +8435,9 @@ async fn box_name_resolves_vm_without_flag_refuses_a_name_two_vms_hold() {
 /// BCLI-002, NET-058: a box verb that names a box on a stopped VM is refused
 /// with the VM's name and the command that starts it, and exits 4. The box
 /// is found by its name, its id and its `provider/host/name`. A name that a
-/// running VM's box and a stopped VM's records both hold resolves to the
-/// running box. A name that a running VM holds only as a box that does not
-/// run, and that a stopped VM's records hold too, is ambiguous and exits 2.
+/// running VM's box and a stopped VM's records both hold is ambiguous, in
+/// any state, and exits 2 (BOX-005); its `provider/host/name` finds the
+/// running box.
 /// `min box spec` refuses the box on the stopped VM as `min box show` does,
 /// and a name that no VM holds is not found.
 #[tokio::test]
@@ -8478,10 +8478,23 @@ async fn box_verb_on_stopped_vm_box_refuses_with_start_hint() {
         assert_eq!(refusal.code(), "not_found", "{address}");
     }
 
-    // A running VM's box wins over a stopped VM's record of the same name.
-    let resolved = cmd::resolve_box_on_local_hosts(&global, "api", "box show")
+    // A running VM's box and a stopped VM's record of the same name are
+    // ambiguous, and the qualified address finds the running box.
+    let err = cmd::resolve_box_on_local_hosts(&global, "api", "box show")
         .await
-        .expect("the running box resolves");
+        .expect_err("two hosts hold 'api'");
+    let refusal = err
+        .downcast_ref::<BoxAddressRefusal>()
+        .expect("the refusal is a box address refusal");
+    assert!(
+        matches!(refusal, BoxAddressRefusal::Ambiguous { .. }),
+        "{refusal:?}"
+    );
+    assert_eq!(refusal.exit_code(), 2);
+    let resolved =
+        cmd::resolve_box_on_local_hosts(&global, "local-minvmd/local-minvmd0/api", "box show")
+            .await
+            .expect("the running box resolves");
     assert_eq!(resolved.box_id, api);
     assert!(resolved.host.selected, "{}", resolved.host.host);
 
@@ -11337,6 +11350,19 @@ fn box_state_dir(state: &std::path::Path, id: boxes::SessionId) -> std::path::Pa
                 .is_ok_and(|record| record.contains(&id.to_string()))
         })
         .expect("the box's state dir")
+}
+
+/// Renames the record of box `id` to `name` on disk, under the daemon state
+/// dir `state`. A create or a rename never gives a box a name another box
+/// on the host has (BOX-007, BOX-163), but a store written before that
+/// rule can hold two boxes of one name, and the daemon reads the name from
+/// the record.
+fn rename_stored_record(state: &std::path::Path, id: boxes::SessionId, name: &str) {
+    let path = box_state_dir(state, id).join("record.json");
+    let mut record: boxes::Record =
+        serde_json_lenient::from_slice(&std::fs::read(&path).unwrap()).expect("the box's record");
+    record.name = Some(name.to_owned());
+    std::fs::write(&path, serde_json_lenient::to_vec(&record).unwrap()).unwrap();
 }
 
 /// Appends the exec event `kind` for `exec_id` to the events of box `id`
@@ -16292,6 +16318,7 @@ async fn type_noun_verbs_alias_box_forms() {
 
     let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
     let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let state_path = state.path().to_path_buf();
     let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
     let project = tempfile::tempdir().expect("a temp project dir");
     let project = project.path().to_str().expect("a UTF-8 project path");
@@ -16444,7 +16471,9 @@ async fn type_noun_verbs_alias_box_forms() {
 
     // A stopped session box and a running task box hold the same name, and
     // the task box runs an exec. A session stop with `--exec` does not stop
-    // the task box's exec.
+    // the task box's exec. A create never takes a stopped box's name
+    // (BOX-007), so the two boxes of one name come from a store written
+    // before that rule.
     let twin_session =
         minimald::test_harness::create_configured_session(&mut daemon, "twin", project).await;
     let mut out = Vec::new();
@@ -16452,7 +16481,8 @@ async fn type_noun_verbs_alias_box_forms() {
         .await
         .expect("the session box stops")
         .expect("a box stop");
-    let twin_task = create_configured_task(&mut daemon, "twin", project).await;
+    let twin_task = create_configured_task(&mut daemon, "twin-b", project).await;
+    rename_stored_record(&state_path, twin_task, "twin");
     let _task_exec = server.list_running_exec(twin_task, FIRST_EXEC_ID, &["sleep", "600"], false);
     let exec_stop = BoxStopArgs {
         target: "twin".to_owned(),
@@ -16769,15 +16799,19 @@ async fn named_attach_finds_box_only_another_vm_knows() {
 
 /// BCLI-007: a resume of a box with a terminal whose name a running box on
 /// its host holds fails with exit 2. The refusal names the running box and
-/// the renames that free the name, and notes the volume refusal.
+/// the renames that free the name, and notes the volume refusal. A create
+/// never takes a stopped box's name (BOX-007), so the two boxes of one name
+/// come from a store written before that rule.
 #[tokio::test]
 async fn resume_name_conflict_exit2_names_holder() {
-    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    let (alpha, state) = exec_attach_host("alpha.local-minvmd0").await;
     let web = alpha.create("web", Some(true)).await;
     alpha.stop("web").await;
-    // A running box with no terminal takes the name. It is no candidate of
-    // the bare form, so the bare form still finds the stopped box.
-    let holder = alpha.create("web", Some(false)).await;
+    // A running box with no terminal has the name, as an older store can
+    // hold it. It is no candidate of the bare form, so the bare form still
+    // finds the stopped box.
+    let holder = alpha.create("web-b", Some(false)).await;
+    rename_stored_record(&state, holder, "web");
     let hosts = [alpha.host.clone()];
     let scope = alpha.scope();
     let id = web.to_string();
@@ -16815,7 +16849,7 @@ async fn resume_name_conflict_exit2_names_holder() {
 #[tokio::test]
 async fn resume_non_pty_box_exit2_hint_by_lifetime() {
     use minimald_rpc::CreatingVerb;
-    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    let (alpha, state) = exec_attach_host("alpha.local-minvmd0").await;
     alpha
         .create_with(
             "agent",
@@ -16845,8 +16879,11 @@ async fn resume_non_pty_box_exit2_hint_by_lifetime() {
         );
     }
 
-    // A running box that holds the name does not change the refusal.
-    alpha.create("job", Some(true)).await;
+    // A running box that holds the name does not change the refusal. A
+    // create never takes a stopped box's name (BOX-007), so the running
+    // `job` comes from a store written before that rule.
+    let running = alpha.create("job-b", Some(true)).await;
+    rename_stored_record(&state, running, "job");
     let id = job.to_string();
     let (message, code) = refused_by(AttachVerb::BoxResume, &hosts, Some(&id), None).await;
     assert_eq!(code, 2, "{message}");
