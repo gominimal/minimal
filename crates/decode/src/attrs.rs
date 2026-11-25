@@ -574,18 +574,6 @@ mod tests {
         assert!(res.is_ok());
     }
 
-    /// Evaluates `attrs | Attrs` and reports whether it was accepted.
-    fn attrs_accepted(attrs: &str) -> bool {
-        let src = format!("let {{Attrs, ..}} = import \"minimal.ncl\" in {attrs} | Attrs");
-        Loader::new(&src, None, &LoadOptions::for_test())
-            .unwrap_or_else(|e| {
-                e.report_to_stderr();
-                panic!("load failed");
-            })
-            .finish()
-            .is_ok()
-    }
-
     const SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     /// An attrs record with an upstream_version, plus `rest`.
