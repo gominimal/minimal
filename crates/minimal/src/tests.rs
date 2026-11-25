@@ -858,8 +858,9 @@ const REMOVED_SESSION_VERBS: [&str; 7] = [
     "activate", "destroy", "exec", "rename", "policy", "hooks", "run",
 ];
 
-// BCLI-042: the removed `min session` verbs, bare `min stop` and `min task
-// run --path` fail as the parser fails for any unknown command or flag.
+// BCLI-042: the removed `min session` verbs, bare `min stop`, `min task
+// run --path` and `--new` on the start verbs fail as the parser fails for
+// any unknown command or flag.
 // The exit is 2, and nothing runs, because the parse gives no command.
 // A `--path` after the task's name parses as a task argument, so the run
 // refuses it with exit 2 before it creates a box.
@@ -929,6 +930,28 @@ async fn removed_session_verbs_fail_as_unknown_commands() {
         assert!(
             rendered.contains("unexpected argument '--sync'"),
             "{argv:?}: {rendered}"
+        );
+    }
+
+    // `--new` left `min box start` and `min session start`, hidden or not.
+    for noun in ["box", "session"] {
+        for argv in [
+            &["min", noun, "start", "--new"][..],
+            &["min", noun, "start", "web", "--new"],
+            &["min", noun, "start", "--new", "--detach"],
+            &["min", noun, "start", "web", "--name", "w", "--new"],
+        ] {
+            let rendered = refused(argv, ErrorKind::UnknownArgument);
+            assert!(
+                rendered.contains("unexpected argument '--new'"),
+                "{argv:?}: {rendered}"
+            );
+        }
+        assert!(
+            !model_verb(noun, "start")
+                .get_arguments()
+                .any(|arg| arg.get_long() == Some("new")),
+            "`min {noun} start` takes no --new"
         );
     }
 
@@ -3939,7 +3962,7 @@ fn session_entry_until_stopped_stores_until_stopped() {
 }
 
 // BCLI-069: a start whose name a running box holds exits 2, names the
-// holder, and names `--name` and `[box] name`.
+// holder, and names `--name`.
 #[test]
 fn create_name_held_exit2_names_holder_hints_name_flag() {
     let holder = boxes::SessionId::parse_str("0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b").unwrap();
@@ -3965,8 +3988,7 @@ fn create_name_held_exit2_names_holder_hints_name_flag() {
         "Cannot start default. The running box default \
          (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) holds the name default. Run \
          min box start default --name <name> to start a box from the entry under \
-         another name. Without --name, the box takes its name from [box] name in \
-         minimal.toml."
+         another name."
     );
 
     let unread = start_refusal(
@@ -3979,8 +4001,7 @@ fn create_name_held_exit2_names_holder_hints_name_flag() {
         format!("{unread:#}"),
         "Cannot start dev. The running box dev holds the name dev. Run \
          min session start dev --name <name> to start a box from the entry under \
-         another name. Without --name, the box takes its name from [box] name in \
-         minimal.toml."
+         another name."
     );
 
     let other = start_refusal(anyhow::anyhow!("boom"), StartVerb::Box, "dev");
@@ -26910,40 +26931,6 @@ fn completion_values(words: &[&str]) -> Vec<String> {
         .into_iter()
         .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
         .collect()
-}
-
-// BCLI-042: `min box start` and `min session start` take no `--new`, hidden
-// or visible. The flag fails as the parser fails for any unknown flag, with
-// exit 2, so nothing runs.
-#[test]
-fn box_and_session_start_refuse_new_flag() {
-    use clap::Parser as _;
-    use clap::error::ErrorKind;
-
-    for noun in ["box", "session"] {
-        assert!(
-            !model_verb(noun, "start")
-                .get_arguments()
-                .any(|arg| arg.get_long() == Some("new")),
-            "`min {noun} start` takes no --new"
-        );
-        for argv in [
-            &["min", noun, "start", "--new"][..],
-            &["min", noun, "start", "web", "--new"],
-            &["min", noun, "start", "--new", "--detach"],
-            &["min", noun, "start", "web", "--name", "w", "--new"],
-        ] {
-            let err = Cli::try_parse_from(argv)
-                .map(|_| ())
-                .expect_err("--new does not parse");
-            assert_eq!(err.kind(), ErrorKind::UnknownArgument, "{argv:?}: {err}");
-            assert_eq!(err.exit_code(), 2, "{argv:?}: {err}");
-            assert!(
-                err.to_string().contains("unexpected argument '--new'"),
-                "{argv:?}: {err}"
-            );
-        }
-    }
 }
 
 // BCLI-026: every `min box` verb parses with the flags the spec delivers.

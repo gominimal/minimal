@@ -753,8 +753,8 @@ impl std::fmt::Display for StartNeedsTerminal {
 impl std::error::Error for StartNeedsTerminal {}
 
 /// The refusal of a start whose box name a running box on the host holds
-/// (BCLI-069, BOX-163). It names the holder, `--name`, which starts a box
-/// under another name, and the `[box] name` that names the box without it. `main.rs` ends the command with [`Self::EXIT_CODE`].
+/// (BCLI-069, BOX-163). It names the holder and `--name`, which starts a box
+/// under another name. `main.rs` ends the command with [`Self::EXIT_CODE`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartNameHeld {
     pub verb: StartVerb,
@@ -791,8 +791,7 @@ impl std::fmt::Display for StartNameHeld {
         write!(
             f,
             " Run {command} {entry} --name <name> to start a box from the entry under \
-             another name. Without --name, the box takes its name from [box] name in \
-             minimal.toml.",
+             another name.",
             command = self.verb.command(),
         )
     }
@@ -1204,8 +1203,8 @@ pub async fn start_entry(global: &GlobalArgs, start: StartEntry) -> Result<(), a
 
 /// The error a start ends with, the same for `min box start` and `min
 /// session start`: a held name becomes [`StartNameHeld`], with its hint to
-/// `--name` and `[box] name`. A host port in use becomes the refusal's own text,
-/// with the port and its holder (NET-144). Any other error passes through.
+/// `--name`. A host port in use becomes the refusal's own text, with the port
+/// and its holder (NET-144). Any other error passes through.
 pub(crate) fn start_refusal(error: anyhow::Error, verb: StartVerb, entry: &str) -> anyhow::Error {
     match error.downcast::<minimald_rpc::HeldNameRefusal>() {
         Ok(refusal) => anyhow::Error::new(StartNameHeld {
