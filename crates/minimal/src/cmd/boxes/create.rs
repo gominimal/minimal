@@ -397,8 +397,6 @@ pub struct StartEntry {
     pub entry: Option<String>,
     /// `--name`: the box's `[box] name` (BCLI-069).
     pub name: Option<String>,
-    /// `--new`: a fresh instance (BCLI-070).
-    pub new: bool,
     /// `--detach`: print the id and return, never attach.
     pub detach: bool,
     /// The override flags: `--network`, `--ingress`, the egress flags and
@@ -412,7 +410,6 @@ impl From<BoxStartArgs> for StartEntry {
             verb: StartVerb::Box,
             entry: args.entry,
             name: args.name,
-            new: args.new,
             detach: args.detach,
             overrides: args.overrides,
         }
@@ -425,7 +422,6 @@ impl From<SessionStartArgs> for StartEntry {
             verb: StartVerb::Session,
             entry: args.entry,
             name: args.name,
-            new: args.new,
             detach: args.detach,
             overrides: args.overrides,
         }
@@ -757,8 +753,8 @@ impl std::fmt::Display for StartNeedsTerminal {
 impl std::error::Error for StartNeedsTerminal {}
 
 /// The refusal of a start whose box name a running box on the host holds
-/// (BCLI-069, BOX-163). It names the holder, and the two flags that create
-/// the box anyway. `main.rs` ends the command with [`Self::EXIT_CODE`].
+/// (BCLI-069, BOX-163). It names the holder, `--name`, which starts a box
+/// under another name, and the `[box] name` that names the box without it. `main.rs` ends the command with [`Self::EXIT_CODE`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartNameHeld {
     pub verb: StartVerb,
@@ -794,8 +790,9 @@ impl std::fmt::Display for StartNameHeld {
         }
         write!(
             f,
-            " Run {command} --new {entry} to create another box from the entry, or \
-             pass --name <name> to give the box another name.",
+            " Run {command} {entry} --name <name> to start a box from the entry under \
+             another name. Without --name, the box takes its name from [box] name in \
+             minimal.toml.",
             command = self.verb.command(),
         )
     }
@@ -893,7 +890,6 @@ pub(crate) fn plan_start(
                     offer_scaffold: false,
                     entry: Some(entry.name.clone()),
                     box_name: start.name.clone(),
-                    fresh_instance: start.new,
                     quic443: other.quic443,
                     vpn_network_names: other.vpn_network_names.clone(),
                 },
@@ -904,7 +900,7 @@ pub(crate) fn plan_start(
         // A task box never has a terminal (BOX-054), so the start detaches.
         // `--name` reaches the run path as the requested name (BCLI-069).
         // Without it the run sends the entry's `[box] name`, else no name
-        // (BCLI-079, BCLI-080). `--new` changes nothing for a task entry.
+        // (BCLI-079, BCLI-080).
         //
         // The run path finds its task in `[tasks]` only, so a `[boxes]`
         // task entry is refused first. That refusal is the #3213 interim:
@@ -1181,7 +1177,6 @@ pub async fn start_entry(global: &GlobalArgs, start: StartEntry) -> Result<(), a
         entry = %plan.entry(),
         typed_entry = ?start.entry,
         name = ?start.name,
-        fresh_instance = start.new,
         detach = start.detach,
         network = ?start.overrides.network,
         ingress = ?start.overrides.ingress,
@@ -1209,7 +1204,7 @@ pub async fn start_entry(global: &GlobalArgs, start: StartEntry) -> Result<(), a
 
 /// The error a start ends with, the same for `min box start` and `min
 /// session start`: a held name becomes [`StartNameHeld`], with its hint to
-/// `--new` and `--name`. A host port in use becomes the refusal's own text,
+/// `--name` and `[box] name`. A host port in use becomes the refusal's own text,
 /// with the port and its holder (NET-144). Any other error passes through.
 pub(crate) fn start_refusal(error: anyhow::Error, verb: StartVerb, entry: &str) -> anyhow::Error {
     match error.downcast::<minimald_rpc::HeldNameRefusal>() {
@@ -1233,8 +1228,6 @@ pub struct ActivationOptions {
     pub entry: Option<String>,
     /// The `[box] name` of the box's spec (BCLI-069).
     pub box_name: Option<String>,
-    /// Ask for a fresh instance, `<name>-<n>` (BCLI-070).
-    pub fresh_instance: bool,
     /// The `--quic443` of a start (BCLI-024). `min session activate` does
     /// not take the flag.
     pub quic443: Option<boxes::core::bep::Quic443>,
@@ -3820,15 +3813,6 @@ pub(crate) fn add_vpn_network_names(
     Ok(())
 }
 
-/// Marks `request` as a fresh instance (BCLI-070, BOX-163). The daemon
-/// names the box `<name>-<n>`, with the smallest `n` no retained box uses,
-/// and never refuses it for a held name. The client invents no name, so the
-/// request carries none.
-pub(crate) fn request_fresh_instance(request: &mut minimald_rpc::CreateSessionRequest) {
-    request.config.name = None;
-    request.fresh_instance = true;
-}
-
 /// The name the daemon gives the box `request` creates, when the create
 /// is not a fresh instance (BOX-211): the request's name, which carries
 /// `--name` or the entry's `[box] name`, else the name the daemon derives
@@ -4719,12 +4703,6 @@ pub(crate) async fn activate_box(
     let mut request =
         minimald_rpc::CreateSessionRequest::new(String::new(), abs_path.clone(), network, policy);
     request.config.name = request_name(args.name.as_deref());
-    // BCLI-070: `--new` asks for a fresh instance, `<name>-<n>`. The
-    // spec stamp puts `--name` or the entry's `[box] name` back on the
-    // request, as the base of the name.
-    if options.fresh_instance {
-        request_fresh_instance(&mut request);
-    }
     request.config.hooks_enabled = !args.no_hooks;
     request.config.creating_verb = minimald_rpc::CreatingVerb::Session;
     // The version gate: a daemon of another build refuses the create
@@ -5040,8 +5018,8 @@ pub(crate) async fn activate_box(
     // BOX-163: a box the person did not name takes its entry's name. A
     // create under a name that a running box holds, the entry's name or a
     // `--name`, is refused: the command ends with exit 2, naming the
-    // holder. Only a run (`min task run`, `min box run`) asks for a fresh
-    // instance, `<name>-<n>` ([`request_fresh_instance`]).
+    // holder. Only an interactive task asks for a fresh instance,
+    // `<name>-<n>` (`crate::task`).
     let created = ActivationStep::CreateSession
         .run(async {
             let created = {

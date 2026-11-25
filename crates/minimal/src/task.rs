@@ -673,7 +673,7 @@ fn task_run_cwd(upload_root: &camino::Utf8Path, invocation_dir: &camino::Utf8Pat
 
 /// The refusal of a run whose entry has a terminal (BCLI-010): `min task
 /// run` and `min box run` never give a box a terminal, so the entry starts
-/// with `min box start --new` instead. The run refuses it before it creates
+/// with `min box start <entry>` instead. The run refuses it before it creates
 /// anything, and `main.rs` ends the command with [`Self::EXIT_CODE`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunNeedsTerminal {
@@ -697,7 +697,7 @@ impl std::fmt::Display for RunNeedsTerminal {
         let entry = &self.entry;
         write!(
             f,
-            "{entry} runs with a terminal. Start it with min box start --new {entry}."
+            "{entry} runs with a terminal. Start it with min box start {entry}."
         )
     }
 }
