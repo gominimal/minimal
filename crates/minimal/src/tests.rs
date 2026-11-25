@@ -20579,13 +20579,22 @@ on_detach = { type = "external", value = "./cleanup.sh" }
     let (_state, mut global, server) = show_network_daemon().await;
     let elsewhere = tempfile::tempdir().unwrap();
     global.repo_dir = Some(elsewhere.path().to_path_buf());
-    let id = create_box_from(&server, &request).await.to_string();
+    let box_id = create_box_from(&server, &request).await;
+    let id = box_id.to_string();
+    let mut client = connect_daemon(&global).await.expect("the daemon answers");
+    let derived = stored_box_record(&mut client, box_id)
+        .await
+        .expect("the record is read")
+        .expect("the host has the box")
+        .name
+        .expect("the host names the box");
 
     let text = box_spec_text(&global, &["min", "box", "spec", &id])
         .await
         .expect("the stored spec renders");
     let header = format!(
         "# The spec box {id} was created with.\n\
+         # Box name: \"{derived}\" (the host derived this name from the project name and the entry).\n\
          # Lifecycle hooks:\n\
          #   on_activate \"Warm the cache\": inline \"echo project\" (from minimal.toml)\n\
          #   on_destroy \"Warm the cache\": inline \"echo bye\" ... (from minimal.toml)\n\
@@ -20620,13 +20629,22 @@ on_detach = { type = "external", value = "./cleanup.sh" }
     let mut unhooked = request.clone();
     unhooked.config.name = Some("unhooked".to_owned());
     crate::put_spec_hooks(&mut unhooked, Vec::new()).expect("the hooks go on the spec");
-    let unhooked_id = create_box_from(&server, &unhooked).await.to_string();
+    let unhooked_box = create_box_from(&server, &unhooked).await;
+    let unhooked_id = unhooked_box.to_string();
+    let unhooked_name = stored_box_record(&mut client, unhooked_box)
+        .await
+        .expect("the record is read")
+        .expect("the host has the box")
+        .name
+        .expect("the box has a name");
     let text = box_spec_text(&global, &["min", "box", "spec", &unhooked_id])
         .await
         .expect("the stored spec renders");
     assert!(
         text.starts_with(&format!(
-            "# The spec box {unhooked_id} was created with.\n# Lifecycle hooks: none.\n"
+            "# The spec box {unhooked_id} was created with.\n\
+             # Box name: \"{unhooked_name}\" (a person wrote this name).\n\
+             # Lifecycle hooks: none.\n"
         )),
         "{text}"
     );
