@@ -16511,7 +16511,8 @@ async fn type_noun_verbs_alias_box_forms() {
         ],
         "the task box's exec runs on\n{text}"
     );
-    for (box_type, id) in [(task, twin_task), (session, twin_session)] {
+    // The session box holds the name's row in the store, so it goes first.
+    for (box_type, id) in [(session, twin_session), (task, twin_task)] {
         cmd::typed_box_rm_on_hosts(
             hosts(),
             &rm(&id.to_string()),
