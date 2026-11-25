@@ -262,12 +262,12 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     <!-- event-driven; the rows `min session hooks` lists today (11-spec-lifecycle-hooks, Disabling and listing). The ruling on gominimal/minimal#2877 keeps each hook's declarer in the stored spec, so `min box spec <box>` lists every column `min session hooks` lists today; the BOX amendment that names the field is in the Rollout. A box created with `--no-hooks` (BCLI-076) carries no hook -->
     tier:   T0
     verify: cargo nextest run -p minimal box_spec_box_lists_hooks_with_declarer
-  - WHEN `min box spec <box>` renders a stored spec THE SYSTEM SHALL show the box's name as its record holds it, and say whether a person wrote the name or the host derived it.
-    <!-- event-driven; gominimal/arch#195: a box's name is held in the box record with its origin (BOX-228) and never read from its Box Spec (BOX-227). So after a rename this shows the new name -->
+  - WHEN `min box spec <box>` renders a stored spec in the TOML form THE SYSTEM SHALL show the box's name as its record holds it, and say whether a person wrote the name or the host derived it.
+    <!-- event-driven; gominimal/arch#195: a box's name is held in the box record with its origin (BOX-228) and never read from its Box Spec (BOX-227). So after a rename this shows the new name. The TOML form shows it as comment lines. The `-o json` and `-o yaml` forms render the spec only: `min box show -o json` and `min box list -o json` (`min/v1/box`) carry the name and its origin, so one fact keeps one home -->
     tier:   T0
     verify: cargo nextest run -p minimal box_spec_box_shows_record_name_and_origin
-  - WHERE the stored spec sets `[box] name` THE SYSTEM SHALL label that value in `min box spec <box>` as the entry's default name request, and never as the box's name.
-    <!-- optional-feature; gominimal/arch#195: `[box] name` stays a key of the entry, read only at creation as the requested name (BCLI-079). After a rename it differs from the box's name -->
+  - WHERE the stored spec sets `[box] name` THE SYSTEM SHALL label that value in the TOML form of `min box spec <box>` as the entry's default name request, and never as the box's name.
+    <!-- optional-feature; gominimal/arch#195: `[box] name` stays a key of the entry, read only at creation as the requested name (BCLI-079). After a rename it differs from the box's name. The `-o json` and `-o yaml` forms carry the key as the spec stores it, with no label -->
     tier:   T0
     verify: cargo nextest run -p minimal box_spec_box_labels_box_name_as_default_request
 
