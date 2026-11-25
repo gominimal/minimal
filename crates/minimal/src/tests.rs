@@ -494,6 +494,9 @@ fn every_create_session_asserts_the_daemon_build() {
             "tests.rs::entry_name_registers_and_creates_under_one_cleaned_name = asserts nothing",
             // A unit test's request, never sent: it checks the session spec's packages.
             "tests.rs::init_scaffolds_entry_shape_loads_and_starts_with_its_packages = asserts nothing",
+            // A unit test's request, never sent: it checks the name an
+            // interactive task's run requests (BCLI-069).
+            "tests.rs::interactive_task_name_flag_is_written = asserts nothing",
             // A test's request, sent only to the in-process test daemon,
             // which is this build: it checks the start's override flags.
             "tests.rs::planned_session_request_checked = asserts nothing",
@@ -509,6 +512,9 @@ fn every_create_session_asserts_the_daemon_build() {
             // A unit test's request, never sent: it checks the run path's
             // `--no-hooks` on the stored spec.
             "tests.rs::start_no_hooks_stores_no_hooks = asserts nothing",
+            // A unit test's request, never sent: it checks the name a
+            // task-entry start requests (BCLI-069, BCLI-079, BCLI-080).
+            "tests.rs::task_create_request = asserts nothing",
             // A unit test's request, never sent: it checks the task's
             // secrets on the spec a run sends.
             "tests.rs::task_spec_carries_expanded_secrets = asserts nothing",
@@ -2966,10 +2972,10 @@ async fn run_style_propagates_entrypoint_exit() {
     assert!(task::exit_outcome(None).is_err());
 }
 
-// BCLI-070: `min task run` and `min box run` share one run path, and its
-// create asks for a fresh instance under no name of the client's, so the
+// BCLI-070: a fresh instance carries no name of the client's, so the
 // daemon names the box `<name>-<n>`. `min box start --new` and `min session
 // start --new` ask for one through `ActivationOptions::fresh_instance`.
+// `min task run` and `min box run` share one run path.
 #[test]
 fn run_and_start_new_request_fresh_instance() {
     let mut request = minimald_rpc::CreateSessionRequest::new(
@@ -3009,17 +3015,6 @@ fn run_and_start_new_request_fresh_instance() {
     // Both carry the network and egress flags to the one run path.
     assert_eq!(task_run.network, box_run.network);
     assert_eq!(task_run.egress, box_run.egress);
-    // That path marks its create as a fresh instance, before it sends it.
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let text = std::fs::read_to_string(manifest.join("src/task.rs")).unwrap();
-    let body = function_body(&text, "run_entry").expect("task.rs defines run_entry");
-    let marked = body
-        .find("request_fresh_instance(&mut request)")
-        .expect("the run marks its create as a fresh instance");
-    let sent = body
-        .find("oneshot_rpc::<CreateSession>")
-        .expect("the run sends its create");
-    assert!(marked < sent, "the run marks its create before it sends it");
 }
 
 /// The entries of a `minimal.toml` that holds `toml`.
@@ -3364,6 +3359,7 @@ async fn unattached_start_closes_stdin_and_hints_run_logs_wait() {
             network: None,
             egress: crate::EgressArgs::default(),
             other: crate::BoxOverrideArgs::default(),
+            box_name: None,
         },
         "the start takes the detached run, which closes the box's stdin"
     );
@@ -3551,27 +3547,187 @@ fn create_verbs_name_flag_overrides_box_name() {
     );
     assert!(derived.ends_with("-dev"), "{derived}");
     assert_eq!(created_box_name(&request), Some(derived));
+}
 
-    // A task entry's box takes a generated name, so `--name` is refused
-    // before anything is created, not dropped.
-    let entries = start_entries("[tasks.build]\necho = 'x'\n");
-    let mut start = typed_start(StartVerb::Box, Some("build"));
-    start.name = Some("x".to_owned());
-    let error = plan_start(&start, &entries, true).expect_err("--name is refused");
-    let refusal = error
-        .downcast_ref::<StartEntryRefusal>()
-        .expect("a start refusal, which exits 2");
-    assert_eq!(
-        refusal,
-        &StartEntryRefusal::NameUnsupported {
-            entry: "build".to_owned()
-        }
+/// A project whose task `build` sets `[box] name` to `builder`.
+const NAMED_TASK_FILE: &str =
+    "[tasks.build]\nexec = [\"make\"]\n\n[tasks.build.box]\nname = \"builder\"\n";
+
+/// A project whose task `build` sets no `[box] name`.
+const UNNAMED_TASK_FILE: &str = "[tasks.build]\nexec = [\"make\"]\n";
+
+/// The run that `argv`, a `min box start` of a task entry in a project with
+/// `toml` as its `minimal.toml`, plans.
+fn planned_task_start(argv: &[&str], toml: &str) -> task::RunEntry {
+    let cli = Cli::try_parse_from(argv).unwrap();
+    let Some(Command::Box(BoxArgs {
+        command: BoxCommand::Start(args),
+    })) = cli.command
+    else {
+        panic!("not a box start: {argv:?}");
+    };
+    let StartPlan::Detached { run, .. } =
+        plan_start(&StartEntry::from(args), &start_entries(toml), true)
+            .expect("the start is planned")
+    else {
+        panic!("a task entry starts detached");
+    };
+    run
+}
+
+/// The create request of `run` in the project at `project`, built as
+/// `task::run_entry` builds it: the run's box name on the request, then
+/// `task::put_task_spec` with the declared task's spec and the expansion.
+fn task_create_request(
+    project: &std::path::Path,
+    run: &task::RunEntry,
+) -> minimald_rpc::CreateSessionRequest {
+    let root = camino::Utf8Path::from_path(project).unwrap();
+    let mut request = minimald_rpc::CreateSessionRequest::new(
+        String::new(),
+        paths::HostAbsPath::try_new(root.to_owned()).unwrap(),
+        boxes::NetworkMode::HostNet,
+        boxes::BoxPolicy::default(),
     );
-    assert_eq!(
-        refusal.to_string(),
-        "Cannot start build with --name. A box from a task entry gets a generated \
-         name. Run min box start build without --name."
+    request.config.name = run.box_name.clone();
+    let declared = task::declared_task(root, &run.entry).expect("the task is declared");
+    let mut spec = task::task_box_spec(
+        &run.entry,
+        &declared,
+        crate::spec_flags(&request),
+        &run.args,
+    )
+    .expect("a non-interactive task has a spec");
+    let expanded = crate::task_box_entry(root, &run.entry, true, None)
+        .expect("the task entry expands")
+        .expect("the project declares the task");
+    task::put_task_spec(
+        &mut request,
+        &run.entry,
+        Some(&mut spec),
+        Some(&expanded.spec),
+        &[],
+    )
+    .expect("the spec encodes");
+    request
+}
+
+/// A temp project with `toml` as its `minimal.toml`.
+fn task_project(toml: &str) -> tempfile::TempDir {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    std::fs::write(project.path().join(mfile::MFILE_NAME), toml).unwrap();
+    project
+}
+
+// BCLI-069, BCLI-029: `min box start build --name api` of a task entry
+// sends `api` as the requested name, in place of the entry's `[box] name`.
+// The create is not a fresh instance, so the daemon names the box exactly
+// `api`, or refuses it when the name is taken.
+#[test]
+fn task_entry_start_sends_name_flag_as_requested_name() {
+    let project = task_project(NAMED_TASK_FILE);
+    let run = planned_task_start(
+        &["min", "box", "start", "build", "--name", "api"],
+        NAMED_TASK_FILE,
     );
+    assert_eq!(run.box_name.as_deref(), Some("api"));
+    let request = task_create_request(project.path(), &run);
+    assert_eq!(request.config.name.as_deref(), Some("api"));
+    assert!(!request.fresh_instance, "a written name takes no number");
+
+    // The run path puts the run's name on the request before the spec, and
+    // sends it with no fresh-instance mark.
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(manifest.join("src/task.rs")).unwrap();
+    let body = function_body(&text, "run_entry").expect("task.rs defines run_entry");
+    let named = body
+        .find("request.config.name = args.box_name.clone();")
+        .expect("the run puts its box name on the request");
+    let spec = body
+        .find("put_task_spec(")
+        .expect("the run puts the task spec on the request");
+    let sent = body
+        .find("oneshot_rpc::<CreateSession>")
+        .expect("the run sends its create");
+    assert!(named < spec && spec < sent, "the name goes on before the spec");
+    assert!(
+        !body.contains("request_fresh_instance"),
+        "the run does not mark its create as a fresh instance"
+    );
+}
+
+// BCLI-079: a start of a task entry without `--name` sends the entry's
+// `[box] name` as the requested name.
+#[test]
+fn task_entry_start_sends_box_name_from_entry() {
+    let project = task_project(NAMED_TASK_FILE);
+    let run = planned_task_start(&["min", "box", "start", "build"], NAMED_TASK_FILE);
+    assert_eq!(run.box_name, None);
+    let request = task_create_request(project.path(), &run);
+    assert_eq!(request.config.name.as_deref(), Some("builder"));
+    assert!(!request.fresh_instance, "a written name takes no number");
+}
+
+// BCLI-080: a start of a task entry without `--name`, whose entry sets no
+// `[box] name`, sends no requested name, so the daemon derives the name.
+#[test]
+fn task_entry_start_without_name_sends_no_requested_name() {
+    let project = task_project(UNNAMED_TASK_FILE);
+    let run = planned_task_start(&["min", "box", "start", "build"], UNNAMED_TASK_FILE);
+    assert_eq!(run.box_name, None);
+    let request = task_create_request(project.path(), &run);
+    assert_eq!(request.config.name, None);
+    assert!(!request.fresh_instance);
+}
+
+// BCLI-069, BOX-211: the stored spec of a task box carries no box name, so
+// `--name` changes neither the spec nor its projection digest.
+#[test]
+fn task_spec_stores_no_box_name() {
+    let project = task_project(NAMED_TASK_FILE);
+    let plain = task_create_request(
+        project.path(),
+        &planned_task_start(&["min", "box", "start", "build"], NAMED_TASK_FILE),
+    );
+    let named = task_create_request(
+        project.path(),
+        &planned_task_start(
+            &["min", "box", "start", "build", "--name", "api"],
+            NAMED_TASK_FILE,
+        ),
+    );
+    let wire = plain.spec.as_ref().expect("the run stores a spec");
+    let spec: mfile::spec::BoxSpec = serde_json_lenient::from_value(wire.clone()).unwrap();
+    assert_eq!(spec.name, None, "{wire}");
+    assert_eq!(boxes::box_name::spec_box_name(Some(wire)), None, "{wire}");
+    assert_eq!(plain.spec, named.spec, "--name leaves the spec as it is");
+    assert_eq!(
+        plain.config.client_projection_digest(),
+        named.config.client_projection_digest()
+    );
+}
+
+// BCLI-069: an interactive task sends no spec. `--name` is still the
+// requested name, a written one. Without it the request carries the
+// entry's cleaned name as a fresh instance, which takes a number when
+// the name is taken (BCLI-070).
+#[test]
+fn interactive_task_name_flag_is_written() {
+    let mut request = minimald_rpc::CreateSessionRequest::new(
+        String::new(),
+        paths::HostAbsPath::try_new(camino::Utf8PathBuf::from("/tmp/project")).unwrap(),
+        boxes::NetworkMode::HostNet,
+        boxes::BoxPolicy::default(),
+    );
+    request.config.name = Some("api".to_owned());
+    task::put_task_spec(&mut request, "build_all", None, None, &[]).unwrap();
+    assert_eq!(request.config.name.as_deref(), Some("api"));
+    assert!(!request.fresh_instance, "a written name takes no number");
+
+    request.config.name = None;
+    task::put_task_spec(&mut request, "build_all", None, None, &[]).unwrap();
+    assert_eq!(request.config.name.as_deref(), Some("build-all"));
+    assert!(request.fresh_instance, "the entry's name takes a number");
 }
 
 /// The egress that `argv`, a `min session start` in a project with

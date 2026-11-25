@@ -1464,7 +1464,6 @@ mod tests {
                 2,
             ),
             (StartEntryRefusal::DefaultBlocked { box_type: None }, 2),
-            (StartEntryRefusal::NameUnsupported { entry: entry() }, 2),
             (StartEntryRefusal::TaskNotInTasks { entry: entry() }, 2),
             (
                 StartEntryRefusal::UnsupportedType {
