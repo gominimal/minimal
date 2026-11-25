@@ -4814,9 +4814,14 @@ impl BoxManager {
         let (base, source) = creation_name(&config, spec.as_ref());
         // BOX-007: a requested name is a written name. One that breaks a
         // naming rule refuses the create with exit 3, before any name is
-        // assigned and before any record is read.
+        // assigned and before any record is read. A fresh instance's name
+        // is `<base>-<n>`, which nobody wrote: `min task run` sends an
+        // interactive task's entry name this way. Only a base that is not
+        // one DNS label refuses it. A reserved or box-id-form base takes a
+        // number, as any name the form rule excludes does.
         if source == NameSource::Request
             && let Err(refusal) = boxes::box_name::check_written_name(&base)
+            && (!fresh || refusal.rule == boxes::box_name::NameRule::NotDnsLabel)
         {
             tracing::info!(
                 rule = refusal.rule.word(),

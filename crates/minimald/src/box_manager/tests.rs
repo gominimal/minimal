@@ -4242,8 +4242,8 @@ async fn create_with_name_held_by_running_box_refused_exit2_names_holder() {
 
 /// BOX-007: a requested name that is not one DNS label, is reserved, or
 /// has the form of a box id refuses the create with exit 3, before any
-/// name is assigned, and files nothing. A fresh instance of such a name
-/// is refused the same way.
+/// name is assigned, and files nothing. A fresh instance of a name that
+/// is not one DNS label is refused the same way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_refuses_a_bad_requested_name_with_exit_3() {
     let (_state, _cache, mngr) = manager().await;
@@ -4255,7 +4255,11 @@ async fn create_refuses_a_bad_requested_name_with_exit_3() {
         "-dev",
         "0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b",
     ] {
-        for fresh in [false, true] {
+        let not_dns_label = !boxes::box_name::is_dns_label(bad);
+        for fresh in [false, true]
+            .into_iter()
+            .filter(|fresh| !fresh || not_dns_label)
+        {
             let created = if fresh {
                 mngr.create_fresh_box_with_spec(
                     named_task(bad),
@@ -4292,6 +4296,42 @@ async fn create_refuses_a_bad_requested_name_with_exit_3() {
         mngr.list_boxes(None).await.unwrap().is_empty(),
         "a refused name files nothing"
     );
+}
+
+/// BOX-007, BOX-163: a fresh instance's name is `<base>-<n>`, which
+/// nobody wrote, so a reserved or box-id-form base takes a number, as
+/// `min task run` of an interactive task named `local` needs. A base that
+/// is not one DNS label is still refused with exit 3.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fresh_instance_numbers_a_reserved_base_and_refuses_a_bad_label() {
+    let (_state, _cache, mngr) = manager().await;
+    for (base, numbered) in [
+        ("local", "local-1"),
+        ("SELF", "SELF-1"),
+        (
+            "0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b",
+            "0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b-1",
+        ),
+    ] {
+        let id = mngr
+            .create_fresh_box_with_spec(named_task(base), Some(task_spec("lint", None)), None, None)
+            .await
+            .unwrap_or_else(|err| panic!("{base}: {err}"));
+        assert_eq!(record_name(&mngr, id).await.unwrap(), numbered);
+    }
+
+    let err = mngr
+        .create_fresh_box_with_spec(named_task("a b"), Some(task_spec("lint", None)), None, None)
+        .await
+        .expect_err("a fresh instance of a name that is not one DNS label");
+    assert!(
+        err.get_ref()
+            .and_then(|e| e.downcast_ref::<boxes::box_name::NameRuleRefusal>())
+            .is_some_and(|refusal| refusal.rule == boxes::box_name::NameRule::NotDnsLabel),
+        "{err}"
+    );
+    assert_eq!(crate::box_manager::admission_refusal(&err), Some(3));
+    assert_eq!(mngr.list_boxes(None).await.unwrap().len(), 3);
 }
 
 /// BOX-007, BOX-163: a create refusal names the box that has the name,

@@ -2504,6 +2504,9 @@ pub struct CreateSessionRequest {
     /// Whether the create asks for a fresh instance (BOX-163). The daemon
     /// names the box `<name>-<n>`, with the smallest `n` that no retained
     /// record on the host uses, and never refuses it for a held name.
+    /// Nobody wrote `<name>-<n>`, so a reserved or box-id-form `<name>`
+    /// takes a number too (`local` becomes `local-1`). Only a `<name>`
+    /// that is not one DNS label refuses it, with [`NAME_RULE_EXIT_CODE`].
     /// `false`, the default, names the box `<name>`. A requested name
     /// that any retained box has, in any state, refuses the create
     /// ([`HeldNameRefusal`]), and one that breaks a naming rule refuses
