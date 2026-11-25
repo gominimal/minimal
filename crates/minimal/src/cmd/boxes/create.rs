@@ -3876,14 +3876,15 @@ pub(crate) fn created_box_name(request: &minimald_rpc::CreateSessionRequest) -> 
     ))
 }
 
-/// The creation key a fresh-instance `host_ip` grant box registers under
-/// with the VM host daemon (BEP-082): `<base>~<random hex>`. The daemon
-/// names a fresh instance `<base>-<n>` only after the registration, so the
-/// box cannot register under that name. No box name can spell `~`, so the
-/// key never meets a box's name, and two fresh instances of one entry
-/// register at once under keys of their own. `None` for a create that is
-/// not a fresh instance, or for a box that is not a `host_ip` grant box:
-/// those register under [`created_box_name`].
+/// The creation key a `host_ip` grant box registers under with the VM
+/// host daemon (BEP-082): `<base>~<random hex>`. A fresh instance, and a
+/// create that sends no written name, get a key. The daemon names those
+/// boxes `<base>` or `<base>-<n>` only after the registration, so the box
+/// cannot register under that name. No box name can spell `~`, so the key
+/// never meets a box's name, and two creates of one entry register at once
+/// under keys of their own. `None` for a create with a written name, or for
+/// a box that is not a `host_ip` grant box: those register under
+/// [`created_box_name`].
 ///
 /// # Errors
 ///
@@ -3895,7 +3896,10 @@ pub(crate) fn host_ip_registration_key(
     let grant_box = matches!(request.config.network, boxes::NetworkMode::HostNet)
         && request.config.box_addresses.is_none()
         && request.config.policy.credentialed_upstream.is_some();
-    let Some(base) = base.filter(|_| request.fresh_instance && grant_box) else {
+    // A create with no written name gets a derived name, and the daemon
+    // gives a taken derived name `<base>-<n>` in place of a refusal.
+    let named_by_daemon = request.fresh_instance || request.config.name.is_none();
+    let Some(base) = base.filter(|_| named_by_daemon && grant_box) else {
         return Ok(None);
     };
     let mut bytes = [0u8; 16];
@@ -4946,17 +4950,17 @@ pub(crate) async fn activate_box(
         },
         "creating the box under the name the daemon gives it"
     );
-    // BEP-082: a fresh-instance `host_ip` grant box registers under a
-    // creation key of its own, and the create carries the key so the
-    // in-VM daemon's id mint finds the registration after it names the
-    // box `<base>-<n>`. Every withdrawal before and after the create names
+    // BEP-082: a fresh-instance or derived-name `host_ip` grant box
+    // registers under a creation key of its own, and the create carries the
+    // key so the in-VM daemon's id mint finds the registration after it
+    // names the box `<base>` or `<base>-<n>`. Every withdrawal before and after the create names
     // the row by the name it registered under.
     let host_ip_registration = host_ip_registration_key(&request, box_name.as_deref())?;
     if let Some(key) = &host_ip_registration {
         tracing::info!(
             box_name = ?box_name,
             host_ip_registration = %key,
-            "registering the fresh host_ip box under a creation key of its own"
+            "registering the host_ip box under a creation key of its own"
         );
     }
     let mut registered = ActivationStep::RegisterBox
@@ -6627,12 +6631,12 @@ mod tests {
         );
     }
 
-    /// BEP-082: a fresh-instance `host_ip` grant box registers under a
-    /// creation key, `<base>~<random hex>`, and each create gets a key of
-    /// its own. Two such keys for one base register at once, each for its
-    /// own id, and a failed create withdraws by its key. A create that is
-    /// not a fresh instance, or a box that is not a `host_ip` grant box,
-    /// has no key and registers under its created name: a second
+    /// BEP-082: a fresh-instance or derived-name `host_ip` grant box
+    /// registers under a creation key, `<base>~<random hex>`, and each
+    /// create gets a key of its own. Two such keys for one base register at
+    /// once, each for its own id, and a failed create withdraws by its key.
+    /// A create with a written name, or a box that is not a `host_ip` grant
+    /// box, has no key and registers under its created name: a second
     /// registration of that fixed name is still refused.
     #[tokio::test]
     async fn fresh_instance_grant_box_registers_under_a_creation_key() {
@@ -6671,10 +6675,18 @@ mod tests {
             assert!(hex.chars().all(|c| c.is_ascii_hexdigit()), "{key}");
         }
         assert_ne!(first_key, second_key, "each create gets its own key");
+        // A create with no written name gets a derived name, and the daemon
+        // can give it `<base>-<n>`, so it registers under a key too.
+        let mut derived_grant = request(boxes::NetworkMode::HostNet, &grant_policy, false);
+        derived_grant.config.name = None;
+        let derived_key = host_ip_registration_key(&derived_grant, Some("dev"))
+            .expect("random bytes")
+            .expect("a derived-name grant box has a key");
+        assert!(derived_key.starts_with("dev~"), "{derived_key}");
         for (no_key, why) in [
             (
                 request(boxes::NetworkMode::HostNet, &grant_policy, false),
-                "not a fresh instance",
+                "a create with a written name",
             ),
             (
                 request(boxes::NetworkMode::OwnIp, &grant_policy, true),
