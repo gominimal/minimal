@@ -1619,10 +1619,11 @@ async fn denying_verdict_faults_and_leaves_session_resumable() {
 async fn rename_of_unroutable_session_leaves_other_routes_alone() {
     let (state, _cache, mngr) = manager().await;
 
-    // Two unnamed sessions whose projects share the basename "app":
-    // both derive the name "app". Only the HostNet one registers a
-    // route when its actor spawns. The store refuses a name a running
-    // box holds, so the NoNet one is made first and stopped.
+    // Two sessions named "app": the NoNet one derives it from its
+    // project's basename, and the HostNet one asks for it. A derived name
+    // never reuses a kept box's name, but a requested name takes the name
+    // of a stopped box. Only the HostNet one registers a route when its
+    // actor spawns, so the NoNet one is made first and stopped.
     let routable_project = TempDir::new().unwrap();
     let routable_dir = routable_project.path().join("app");
     std::fs::create_dir_all(&routable_dir).unwrap();
@@ -1643,7 +1644,7 @@ async fn rename_of_unroutable_session_leaves_other_routes_alone() {
     .await;
 
     let mut config = sample_config();
-    config.name = None;
+    config.name = Some("app".to_string());
     config.network = boxes::NetworkMode::HostNet;
     config.project_path = HostAbsPath::try_new(routable_dir.to_str().unwrap()).unwrap();
     // Finalizing the loadout registers the "app" route.
