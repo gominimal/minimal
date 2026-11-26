@@ -561,7 +561,7 @@ impl InitOutcome {
 /// missing-mfile prompt.
 ///
 /// The file is always written in the entry shape (BCLI-017):
-/// [`to_entry_shape`] adds the `[boxes.dev]` session entry to the
+/// [`to_entry_shape`] adds the `[boxes.default]` session entry to the
 /// initializer's `[defaults.task]` and `[defaults.session]`.
 pub(crate) fn run_init_flow(
     config: mctx::Config,
@@ -766,7 +766,8 @@ fn check_entry_name(entry: &str) -> Result<(), InitRefusal> {
 
 /// Rewrite the scaffold that the project initializer generates into the
 /// entry shape (BCLI-017): the file declares one session entry,
-/// `[boxes.dev]`. The initializer writes `[defaults.task]` and
+/// `[boxes.default]`, so the first `min session start` names its box
+/// after the project. The initializer writes `[defaults.task]` and
 /// `[defaults.session]`, and those are kept as they are. A legacy
 /// `[session]` table still becomes `[defaults.session]`, and a legacy
 /// `[defaults] state_key` becomes `[defaults.task] state_key` (BOX-050,
@@ -802,7 +803,7 @@ pub(crate) fn to_entry_shape(legacy: &str) -> Result<String, anyhow::Error> {
     entry.insert("type", value("session"));
     let mut boxes = Table::new();
     boxes.set_implicit(true);
-    boxes.insert("dev", Item::Table(entry));
+    boxes.insert(mfile::entry::DEFAULT_ENTRY_NAME, Item::Table(entry));
     doc.insert("boxes", Item::Table(boxes));
     Ok(doc.to_string())
 }
@@ -1080,7 +1081,7 @@ pub async fn cmd_init(global: &GlobalArgs, args: InitArgs) -> Result<(), mctx::E
             tracing::info!(
                 verb = "init",
                 shape = "entry",
-                entry = "dev",
+                entry = mfile::entry::DEFAULT_ENTRY_NAME,
                 outcome = if outcome.result_line().is_some() {
                     "written"
                 } else {
@@ -1410,7 +1411,7 @@ mod init_tests {
             "no legacy state_key:\n{shaped}"
         );
         assert_eq!(
-            doc["boxes"]["dev"]["type"].as_str(),
+            doc["boxes"]["default"]["type"].as_str(),
             Some("session"),
             "{shaped}"
         );
@@ -1442,7 +1443,7 @@ mod init_tests {
         let boxes = after["boxes"].as_table().unwrap();
         assert_eq!(boxes.len(), 2, "{after_text}");
         assert_eq!(boxes["build"]["type"].as_str(), Some("task"));
-        assert_eq!(boxes["dev"], before["boxes"]["dev"]);
+        assert_eq!(boxes["default"], before["boxes"]["default"]);
         assert_eq!(
             after["upstream"], before["upstream"],
             "the rest of the file is kept"
@@ -1466,7 +1467,7 @@ mod init_tests {
     // BCLI-018: a [box_types] entry with no extends is invalid minimal.toml.
     #[test]
     fn init_box_type_without_extends_exit3_appends_nothing() {
-        let original = "[box_types.web]\nimage = \"x\"\n\n[boxes.dev]\ntype = \"session\"\n";
+        let original = "[box_types.web]\nimage = \"x\"\n\n[boxes.default]\ntype = \"session\"\n";
         let dir = project(original);
         let refusal = run(&dir, &["init", "x", "--type", "web"]).unwrap_err();
         assert_eq!(refusal.code, 3, "{}", refusal.message);
@@ -1495,7 +1496,7 @@ mod init_tests {
     #[test]
     fn init_refused_type_exit3_appends_nothing() {
         let original =
-            "[box_types.reviewer]\nextends = \"agent\"\n\n[boxes.dev]\ntype = \"session\"\n";
+            "[box_types.reviewer]\nextends = \"agent\"\n\n[boxes.default]\ntype = \"session\"\n";
         let dir = project(original);
         for ty in ["agent", "service", "build", "container-build", "reviewer"] {
             let refusal = run(&dir, &["init", "bot", "--type", ty]).unwrap_err();
@@ -1647,7 +1648,7 @@ mod init_tests {
     // exit 3, and the refusal names the file.
     #[test]
     fn init_invalid_mfile_exit3_appends_nothing() {
-        const BROKEN: &str = "[boxes.dev\ntype = \"session\"\n";
+        const BROKEN: &str = "[boxes.default\ntype = \"session\"\n";
         let root = project(BROKEN);
         let sub = root.path().join("src");
         std::fs::create_dir(&sub).expect("create the subdirectory");
