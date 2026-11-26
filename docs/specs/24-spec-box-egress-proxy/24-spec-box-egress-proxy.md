@@ -910,10 +910,19 @@ Setting secrets
   tier:     T0
   verify:   cargo nextest run -p bep linux_native_store_is_secret_service
   <!-- the store that the GitHub sign-in uses on Linux; a store reference names it `keychain`, as on macOS, so one project file names the native store on both hosts; a listing reads identifiers only, never a value -->
-  - IF `secret-tool` is not installed, no Secret Service answers in the session, or the keyring is locked THEN THE SYSTEM SHALL refuse `min secret set`, `min secret list` and `min secret rm`, before reading a value, and report which of the three it is and, for the first two, what to install or set up.
+  - IF `secret-tool` is not installed or no Secret Service answers in the session THEN THE SYSTEM SHALL refuse `min secret set`, `min secret list` and `min secret rm`, before reading a value, and report which of the two it is and what to install or set up.
     tier:   T0
     verify: cargo nextest run -p bep linux_native_store_refusals_name_what_to_install
-    <!-- unwanted; no command unlocks a keyring on every desktop, so the locked case states the situation -->
+    <!-- unwanted; a Linux-only test, which a fake `secret-tool` drives -->
+  - IF the keyring is locked THEN THE SYSTEM SHALL refuse `min secret set` and report that the keyring is locked.
+    tier:   T0
+    verify: cargo nextest run -p bep linux_native_store_refusals_name_what_to_install
+    <!-- unwanted; no command unlocks a keyring on every desktop, so the message states the situation; a listing of a locked keyring still names its items, because it reads no value -->
+  - WHILE the keyring is locked THE SYSTEM SHALL wait at most 10 seconds on the proxy's read of a value, and refuse that request.
+    tier:   T0
+    verify: cargo nextest run -p bep linux_native_store_refusals_name_what_to_install
+    <!-- a lookup on a locked keyring can show an unlock prompt; on macOS the read shows no prompt at all -->
+
 
 - **BEP-092** IF a box spec declares a store reference to the host's native store and this host cannot use that store THEN THE SYSTEM SHALL refuse the creation with exit 3 before it seals a value, and report the store's reason and next step.
   tier:     T0

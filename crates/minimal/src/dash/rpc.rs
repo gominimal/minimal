@@ -2257,7 +2257,13 @@ mod tests {
             }),
             ..PickedEntry::default()
         };
-        let result = put_picked_entry(&mut request, &mut contribution, &root, &picked);
+        let result = put_picked_entry_with(
+            &mut request,
+            &mut contribution,
+            &root,
+            &picked,
+            &bep::store::MemorySecretStore::default(),
+        );
         (result, request, contribution)
     }
 

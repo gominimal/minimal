@@ -1296,7 +1296,8 @@ mod tests {
         assert!(store.value("claude").is_none());
     }
 
-    /// A store that this host cannot use, as [`HostStore`] is off macOS.
+    /// A store that this host cannot use, as [`HostStore`] is on a host
+    /// that is neither macOS nor Linux.
     struct NoStore;
     impl SecretStore for NoStore {
         fn name(&self) -> &'static str {

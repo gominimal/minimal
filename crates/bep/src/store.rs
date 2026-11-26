@@ -1406,6 +1406,11 @@ mod host {
     /// no match by a Secret Service that runs.
     const PROBE: &str = "dev.minimal.secret.probe";
 
+    /// The longest that the proxy's read of a value waits for `secret-tool`.
+    /// A lookup on a locked keyring can show an unlock prompt, and the
+    /// request waits on it no longer than this.
+    pub(super) const READ_TIMEOUT: Duration = Duration::from_secs(10);
+
     /// The line that `secret-tool search` prints on standard error for an
     /// item's identifier.
     const ID_LINE: &str = "attribute.id = ";
@@ -1451,7 +1456,7 @@ mod host {
 
         /// Whether a Secret Service answers in this session.
         pub(super) fn check_available(&self) -> Result<(), StoreError> {
-            let action = "reach Secret Service";
+            let action = "answer a lookup";
             let out = self.run(
                 action,
                 &["lookup", "service", SERVICE, PROBE, "absent"],
@@ -1510,11 +1515,17 @@ mod host {
             Err(failure(action, &out))
         }
 
-        /// The value under `id`, read now.
+        /// The value under `id`, read now. The read waits at most
+        /// [`READ_TIMEOUT`], so a locked keyring's unlock prompt holds a
+        /// request only that long.
         pub(super) fn read(&self, id: &str) -> Result<Zeroizing<Vec<u8>>, ReadError> {
             check_id(id).map_err(ReadError::Store)?;
             let action = "read the secret";
-            let mut out = self
+            let reader = Self {
+                timeout: self.timeout.min(READ_TIMEOUT),
+                ..self.clone()
+            };
+            let mut out = reader
                 .run(action, &["lookup", "service", SERVICE, ID, id], None, true)
                 .map_err(ReadError::Store)?;
             let value = Zeroizing::new(std::mem::take(&mut out.stdout));
@@ -1569,7 +1580,10 @@ mod host {
         ) -> Result<Output, StoreError> {
             let piped_if = |yes: bool| if yes { Stdio::piped() } else { Stdio::null() };
             let mut cmd = Command::new(&self.program);
-            cmd.args(&self.leading)
+            // libsecret and GDBus translate their messages. The causes are
+            // sorted by their English text.
+            cmd.env("LC_ALL", "C")
+                .args(&self.leading)
                 .args(args)
                 .stdin(piped_if(stdin.is_some()))
                 .stdout(piped_if(capture))
@@ -1646,14 +1660,15 @@ mod host {
                     tracing::warn!(
                         action,
                         timeout_secs = self.timeout.as_secs_f64(),
-                        "secret-tool did not finish in time; read as a locked keyring"
+                        "secret-tool did not finish in time"
                     );
-                    return Err(StoreError::KeyringLocked {
-                        detail: format!(
-                            "`{SECRET_TOOL}` did not finish in {} s, so an unlock prompt can still be waiting",
+                    return Err(refused(
+                        action,
+                        format!(
+                            "`{SECRET_TOOL}` did not answer in {} s. A keyring unlock prompt can be waiting, or Secret Service can be stuck",
                             self.timeout.as_secs()
                         ),
-                    });
+                    ));
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -2737,14 +2752,22 @@ esac
         std::fs::remove_file(dir.path().join("silent-locked")).unwrap();
 
         // A call that waits on an unlock prompt nobody answers ends at the
-        // timeout as a locked keyring.
+        // timeout, and says what can be waiting.
         let script = dir.path().join("slow");
-        std::fs::write(&script, "sleep 5\n").unwrap();
+        std::fs::write(&script, "exec sleep 5\n").unwrap();
         let slow = host::SecretItems::with_program("/bin/sh", [script])
             .with_timeout(std::time::Duration::from_millis(200));
+        let err = slow.check_available().expect_err("timed out");
+        assert_eq!(
+            err.to_string(),
+            "the Secret Service store refused to answer a lookup: `secret-tool` did not answer in 0 s. A keyring unlock prompt can be waiting, or Secret Service can be stuck"
+        );
+        // The proxy's read refuses its request on the timeout, and never
+        // waits longer than READ_TIMEOUT, whatever the store's own timeout.
         assert!(matches!(
-            slow.check_available(),
-            Err(StoreError::KeyringLocked { .. })
+            slow.read("claude"),
+            Err(ReadError::Store(StoreError::Refused { .. }))
         ));
+        assert_eq!(host::READ_TIMEOUT, std::time::Duration::from_secs(10));
     }
 }
