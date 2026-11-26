@@ -115,12 +115,12 @@ background, and `min session attach` rejoins it later. Changes you make inside s
 the session's workspace; bring them back to the host by pushing them out with
 `git push min://<session>`.
 
-A start never reuses a session that already exists. When you do not choose a
-name, and a session already has the name that the start gives, the new session
-takes that name with a number at the end. When you choose the name, with
-`--name <NAME>` or the entry's `[box] name` in `minimal.toml`, and a box on
-the host already has it, in any state, `min session start` refuses and creates
-nothing. Attach
+A start never reuses a session that already exists. Without a name you
+choose, the start gives the session a name. If a session already has that name,
+the new session takes it with a number at the end. You choose the name with
+`--name <NAME>` or with the entry's `[box] name` in `minimal.toml`. If a box on
+the host already has that name, in any state, `min session start` refuses and
+creates nothing. Attach
 to the existing session when you mean to rejoin it, or pass another
 `--name <NAME>` for a second session from the same entry. Once two sessions share a
 project directory, a bare `min session attach` there cannot choose between
