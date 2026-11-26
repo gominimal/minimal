@@ -1923,8 +1923,11 @@ fn held_name_refusal_hides_the_holder_and_a_bad_name_exits_3() {
 #[test]
 fn own_address_held_name_refusal_exits_2_and_names_the_holder() {
     let holder = boxes::SessionId::parse_str("0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b").unwrap();
-    let error =
-        registration_held_name_refusal("dev", "Dev", Some((holder, Some("Dev".to_string()))));
+    let error = registration_held_name_refusal(
+        "dev",
+        "Dev",
+        Some((holder, Some("Dev".to_string()), Some("running".to_string()))),
+    );
     let refusal = error
         .downcast_ref::<minimald_rpc::HeldNameRefusal>()
         .expect("main.rs maps this error to exit 2");
@@ -1936,6 +1939,22 @@ fn own_address_held_name_refusal_exits_2_and_names_the_holder() {
          (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) holds that name. Rename that session \
          with `min box rename 0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b <new-name>`, \
          or choose another name."
+    );
+
+    // The holder can stop before the daemon reads it: the refusal says
+    // the state the record has, not `running`.
+    let stopped = registration_held_name_refusal(
+        "dev",
+        "Dev",
+        Some((holder, Some("Dev".to_string()), Some("stopped".to_string()))),
+    );
+    let refusal = stopped
+        .downcast_ref::<minimald_rpc::HeldNameRefusal>()
+        .expect("a stopped holder is still exit 2");
+    assert_eq!(refusal.state.as_deref(), Some("stopped"));
+    assert!(
+        format!("{stopped:#}").contains("the stopped session `Dev`"),
+        "{stopped:#}"
     );
 
     let unread = registration_held_name_refusal("dev", "Dev", None);

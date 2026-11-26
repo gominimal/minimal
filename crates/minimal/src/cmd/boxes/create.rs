@@ -4050,19 +4050,23 @@ impl std::fmt::Display for DaemonCreateRefusal {
 
 impl std::error::Error for DaemonCreateRefusal {}
 
-/// The id and name of the box that holds `held`, read from the daemon by
-/// name. `None` when the read fails or finds no box.
+/// The id, name and state word of the box that holds `held`, read from
+/// the daemon by name. `None` when the read fails or finds no box.
 async fn held_name_holder(
     client: &mut minimal_client::Client,
     held: &str,
-) -> Option<(boxes::SessionId, Option<String>)> {
+) -> Option<(boxes::SessionId, Option<String>, Option<String>)> {
     match client
         .oneshot_rpc::<minimald_rpc::GetSessionRecord>(minimald_rpc::GetSessionRecordRequest::Name(
             held.to_string(),
         ))
         .await
     {
-        Ok(reply) => reply.record.map(|record| (record.id, record.name)),
+        Ok(reply) => reply.record.map(|record| {
+            let state = boxes::box_name::NamedBox::from_record(&record)
+                .map(|named| named.state_word().to_string());
+            (record.id, record.name, state)
+        }),
         Err(error) => {
             tracing::warn!(held_name = %held, %error, "could not read the box that holds the name");
             None
@@ -4073,31 +4077,30 @@ async fn held_name_holder(
 /// The error an own-address create ends with when the VM host refused its
 /// registration because a live row holds `held` (BOX-163). It is the
 /// held-name refusal a daemon create sends, so `min` exits 2. It names the
-/// holder's id and state when `holder` gives its id and name, and the held
-/// spelling alone when the holder could not be read.
+/// holder's id when `holder` gives its id and name, and its state as the
+/// daemon's record of it reads. With no holder read, it names the held
+/// spelling alone, with no state.
 pub(crate) fn registration_held_name_refusal(
     name: &str,
     held: &str,
-    holder: Option<(boxes::SessionId, Option<String>)>,
+    holder: Option<(boxes::SessionId, Option<String>, Option<String>)>,
 ) -> anyhow::Error {
-    let (holder, holder_name) = match holder {
-        Some((id, name)) => (Some(id), name),
-        None => (None, None),
+    let (holder, holder_name, state) = match holder {
+        Some((id, name, state)) => (Some(id), name, state),
+        None => (None, None, None),
     };
-    // A live row holds the name, so a holder the daemon read runs. With
-    // no holder read, nothing says which box that is or its state.
     let refusal = minimald_rpc::HeldNameRefusal {
         name: name.to_string(),
         holder,
         holder_name: Some(holder_name.unwrap_or_else(|| held.to_string())),
-        state: holder.map(|_| "running".to_string()),
+        state,
     };
     tracing::info!(
         name = %refusal.name,
         holder = ?refusal.holder,
         holder_name = ?refusal.holder_name,
         exit_code = minimald_rpc::HeldNameRefusal::EXIT_CODE,
-        "the box registration was refused: a running box holds the name"
+        "the box registration was refused: another box holds the name"
     );
     anyhow::Error::new(refusal)
 }
