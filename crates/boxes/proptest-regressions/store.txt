@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 13da21074c8fcd8a34123764460236f74b5aeb1ce0e43a66eb8b10b2a04b109b # shrinks to ops = [Stop(9875374806374746705), Exit(8869650993617069123), Reap(3258502696810520156), Exit(4569875180341184900), Resume(1297950999446060467), Rename(15036227689100729921, 1), Create { name: 0, fresh: true }, Exit(13508942438154870239), Create { name: 2, fresh: false }, Exit(7604275650214382428), Stop(5347328719272486442), Create { name: 2, fresh: false }, Create { name: 2, fresh: true }, Reap(17251414974712482969), Exit(15361523629240947647), Create { name: 0, fresh: false }, Reap(4061380850215332097), Stop(3081454223689521689), Exit(14166491224727525559), Reap(1008654381929524697), Resume(7628722897890792942)]
