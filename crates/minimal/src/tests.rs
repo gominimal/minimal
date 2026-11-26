@@ -4100,9 +4100,9 @@ fn numbered_reply(
     took: &str,
     not_taken: minimald_rpc::NameNotTaken,
 ) -> minimald_rpc::CreateSessionResponse {
-    let mut reply: minimald_rpc::CreateSessionResponse = serde_json_lenient::from_str(&format!(
-        r#"{{"id":"0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7c"}}"#
-    ))
+    let mut reply: minimald_rpc::CreateSessionResponse = serde_json_lenient::from_str(
+        r#"{"id":"0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7c"}"#,
+    )
     .expect("a create reply needs only its id");
     reply.name = Some(took.to_string());
     reply.name_not_taken = Some(not_taken);
@@ -4273,14 +4273,13 @@ fn unattached_create_numbered_excluded_name_names_no_box() {
         (
             "self",
             NameTakenReason::Reserved,
-            "The box is named self-1, because the name self is reserved. Run min box \
-             prune to remove stopped boxes.",
+            "The box is named self-1, because the name self is reserved.",
         ),
         (
             "0192f3c4",
             NameTakenReason::BoxIdForm,
             "The box is named 0192f3c4-1, because the name 0192f3c4 has the form of a \
-             box id. Run min box prune to remove stopped boxes.",
+             box id.",
         ),
     ];
     for (name, reason, text) in cases {
@@ -4294,7 +4293,7 @@ fn unattached_create_numbered_excluded_name_names_no_box() {
         let line = numbered_line_for_start(false, &reply, Some(HolderVerb::Attach))
             .expect("the box took a number");
         assert_eq!(line, text, "{name}");
-        for word in ["has it", "attach", "logs", "restart"] {
+        for word in ["has it", "attach", "logs", "restart", "min box"] {
             assert!(!line.contains(word), "{word}: {line}");
         }
     }
