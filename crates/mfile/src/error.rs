@@ -200,8 +200,11 @@ impl fmt::Display for EntryHeader<'_> {
     }
 }
 
-/// `words` with its first letter in upper case, to open a sentence.
-fn sentence_start(words: &str) -> String {
+/// `words` with its first letter in upper case, to open a sentence. A
+/// label that starts with a backtick, such as "`[sessions.dev]` in
+/// minimal.toml", is unchanged. The label builders keep labels lower case
+/// because most messages use them mid-sentence.
+pub(crate) fn sentence_start(words: &str) -> String {
     let mut chars = words.chars();
     match chars.next() {
         Some(first) => first.to_uppercase().chain(chars).collect(),
@@ -469,11 +472,13 @@ impl fmt::Display for Error {
                 second,
             } => write!(
                 f,
-                "The variable `{name}` has two different values. {first} sets one \
+                "The variable `{name}` has two different values. {} sets one \
                  value, and {second} sets the other. A loadout cannot change a \
                  variable that is already set. Remove `{name}` from one of them, \
                  or add `{name}` to the `ignore` list under `[vars]` in \
-                 user_policy.toml to drop every value of `{name}`."
+                 user_policy.toml to drop every value of `{name}`.",
+                // The first layer starts a sentence. `second` is mid-sentence.
+                sentence_start(first)
             ),
             Error::RetiredVarKey { key, table, file } => match table {
                 Some(table) => write!(

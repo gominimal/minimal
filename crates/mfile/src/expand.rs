@@ -284,20 +284,6 @@ impl StoredVar {
     }
 }
 
-/// `label` with its first character in upper case when that character is
-/// an ASCII lower-case letter. A label that starts with a backtick, such as
-/// "`[sessions.dev]` in minimal.toml", is unchanged.
-fn sentence_start(label: &str) -> std::borrow::Cow<'_, str> {
-    match label.as_bytes().first() {
-        Some(c) if c.is_ascii_lowercase() => {
-            let mut s = label.to_owned();
-            s[..1].make_ascii_uppercase();
-            std::borrow::Cow::Owned(s)
-        }
-        _ => std::borrow::Cow::Borrowed(label),
-    }
-}
-
 impl std::fmt::Display for SecretNameWarning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -307,7 +293,7 @@ impl std::fmt::Display for SecretNameWarning {
         )?;
         // The label starts a sentence here. Other messages use the same
         // label mid-sentence, so the label builders keep it lower case.
-        let layer = sentence_start(&self.layer);
+        let layer = crate::error::sentence_start(&self.layer);
         match (&self.origin.layer, &self.file) {
             (Layer::Loadouts, Some(file)) => {
                 write!(f, "{layer} sets it, in {}. ", file.display())?;
@@ -4157,6 +4143,27 @@ mod tests {
         let w = &e.report.secret_name_warnings[1];
         assert_eq!((w.name.as_str(), w.file.as_ref()), ("MY_SECRET", None));
         assert!(w.to_string().contains("The loadout `l` sets it. "), "{w}");
+        // A type default's label starts its sentence upper case too.
+        let typed = Layers {
+            type_defaults: vec![(
+                "session".to_owned(),
+                table("env_vars = { TYPE_TOKEN = \"x\" }"),
+            )],
+            ..Layers::default()
+        };
+        let e = expand_in(file, "dev", typed).unwrap();
+        let w = e
+            .report
+            .secret_name_warnings
+            .iter()
+            .find(|w| w.name == "TYPE_TOKEN")
+            .expect("a warning for the type default's variable");
+        assert_eq!(w.origin.layer, Layer::TypeDefaults);
+        assert!(
+            w.to_string()
+                .contains("The built-in `session` box type sets it. "),
+            "{w}"
+        );
         // An inherit stores no value, so the text does not say "as written".
         let inherit = expand_in(
             "[sessions.dev]\nenv_vars = { GH_TOKEN = { inherit = true }, \
@@ -4584,7 +4591,16 @@ mod tests {
         assert_eq!(err.exit_code(), Some(3));
         assert_eq!(
             err.to_string(),
-            conflict("N", "the loadout `rust`", "the loadout `ai`")
+            conflict("N", "The loadout `rust`", "the loadout `ai`")
+        );
+        // A first layer that is a type default starts its sentence upper case.
+        let mut typed = vars_layers("env_vars = { T = \"loadout\" }", &[]);
+        typed.type_defaults = vec![("session".to_owned(), table("env_vars = { T = \"type\" }"))];
+        let err = expand_in(file, "dev", typed).expect_err("a loadout against a type default");
+        assert!(matches!(err, Error::LoadoutVarConflict { .. }), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            conflict("T", "The built-in `session` box type", "the loadout `l`")
         );
         // The same values pass, and a sealed entry checks nothing.
         expand_in(
