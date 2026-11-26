@@ -2868,6 +2868,63 @@ fn wait_refusing(
     }
 }
 
+/// Puts `command` back on the acquisition's queue, behind any request
+/// already waiting, for the next pass to serve. Refused when the queue is
+/// gone.
+fn requeue_command(status: &AnswererStatus, command: HandoverCommand) {
+    match status.sender() {
+        Some(sender) => {
+            if let Err(std::sync::mpsc::SendError(command)) = sender.send(command) {
+                refuse_command(command, NO_ANSWERER);
+            }
+        }
+        None => refuse_command(command, NO_ANSWERER),
+    }
+}
+
+/// [`wait_refusing`] for a hook port held by a process with no answerer
+/// channel, where every box address request checks the port again. Still
+/// held, the request is refused naming the holder that holds it now. Free,
+/// the request goes back on the queue and the wait ends, so the next pass
+/// takes the port and answers it.
+fn wait_refusing_held_port(
+    pings: &std::sync::mpsc::Receiver<()>,
+    commands: &std::sync::mpsc::Receiver<HandoverCommand>,
+    status: &AnswererStatus,
+    port: u16,
+    bound: Duration,
+) {
+    let deadline = Instant::now() + bound;
+    loop {
+        while let Ok(command) = commands.try_recv() {
+            if !matches!(command, HandoverCommand::Allocate { .. }) {
+                refuse_command(command, NO_ANSWERER);
+                continue;
+            }
+            if UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).is_err() {
+                let holder = hook_port_holder(port);
+                refuse_command(command, &channelless_holder_error(port, holder));
+                continue;
+            }
+            // The probe's socket is dropped here, so the next pass binds the
+            // port.
+            requeue_command(status, command);
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        match pings.recv_timeout(remaining.min(CONNECTION_POLL)) {
+            Ok(()) => return,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                std::thread::sleep(remaining.min(CONNECTION_POLL));
+            }
+        }
+    }
+}
+
 /// The process holding UDP `127.0.0.1:port`, as its pid and executable,
 /// when the host lets this process see it: on Linux by the socket's inode
 /// in `/proc/net/udp` and the fd that names it, on macOS by `lsof`. `None`
@@ -2938,6 +2995,29 @@ fn hook_port_holder(port: u16) -> Option<(u32, String)> {
     }
 }
 
+/// The instance number of the native daemon `pid`, from the
+/// `--instance-num` its command line carries: 0, its default, when the
+/// command line has none or cannot be read.
+fn native_instance(pid: u32) -> u32 {
+    std::fs::read(format!("/proc/{pid}/cmdline")).map_or(0, |cmdline| instance_num_in(&cmdline))
+}
+
+/// The `--instance-num` value in a NUL-separated command line, or 0.
+fn instance_num_in(cmdline: &[u8]) -> u32 {
+    let args: Vec<&[u8]> = cmdline.split(|byte| *byte == 0).collect();
+    args.iter()
+        .enumerate()
+        .find_map(|(at, arg)| {
+            let value = match arg.strip_prefix(b"--instance-num") {
+                Some([]) => args.get(at + 1).copied()?,
+                Some([b'=', value @ ..]) => value,
+                _ => return None,
+            };
+            std::str::from_utf8(value).ok()?.parse().ok()
+        })
+        .unwrap_or(0)
+}
+
 /// The error a node with no answerer channel and the hook port held
 /// surfaces, and every box registration fails with: the port, the holder
 /// when known, and the remedy for its kind.
@@ -2947,6 +3027,7 @@ fn channelless_holder_error(port: u16, holder: Option<(u32, String)>) -> String 
             .file_name()
             .is_some_and(|name| name == "minimald")
     });
+    let host = holder.as_ref().map_or(0, |(pid, _)| native_instance(*pid));
     let who = holder.map_or_else(
         || "a process this daemon cannot identify".to_string(),
         |(pid, exe)| format!("pid {pid} ({exe})"),
@@ -2955,8 +3036,8 @@ fn channelless_holder_error(port: u16, holder: Option<(u32, String)>) -> String 
         format!(
             "port 127.0.0.1:{port}, which box names are answered on, is in use by a Minimal \
              daemon running directly on this machine ({who}), so no box in the VM can be given \
-             an address; run `min finalize-install` to install Minimal's DNS service on that \
-             port instead"
+             an address; run `min host stop local{host}` to stop that daemon and the boxes \
+             running on it, then try again"
         )
     } else {
         format!(
@@ -3803,6 +3884,14 @@ fn acquire(
                         );
                     }
                     Err((queued, last)) => {
+                        // The holder can leave inside the wait: then the
+                        // next pass takes the port and serves the requests.
+                        if UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
+                            for command in queued {
+                                requeue_command(status, command);
+                            }
+                            continue;
+                        }
                         let why = channelless_holder_error(port, hook_port_holder(port));
                         for command in queued {
                             refuse_command(command, &why);
@@ -3822,7 +3911,7 @@ fn acquire(
                                 paths.interim.display()
                             ),
                         );
-                        wait_refusing(&pings, &commands, PORT_RECHECK, &why);
+                        wait_refusing_held_port(&pings, &commands, status, port, PORT_RECHECK);
                     }
                 }
             }
@@ -7546,14 +7635,70 @@ mod tests {
             refused.contains("free the port, then try again"),
             "the error gives the remedy: {refused}"
         );
-        // The native remedy, for a minimald holder.
-        let native = channelless_holder_error(port, Some((42, "/usr/bin/minimald".to_string())));
-        assert!(
-            native.contains("run `min finalize-install` to install Minimal's DNS service")
-                && native.contains("pid 42"),
-            "{native}"
+        // The native remedy, for a minimald holder: the command that stops it.
+        let native = channelless_holder_error(port, Some((0, "/usr/bin/minimald".to_string())));
+        assert_eq!(
+            native,
+            format!(
+                "port 127.0.0.1:{port}, which box names are answered on, is in use by a Minimal \
+                 daemon running directly on this machine (pid 0 (/usr/bin/minimald)), so no box \
+                 in the VM can be given an address; run `min host stop local0` to stop that \
+                 daemon and the boxes running on it, then try again"
+            )
         );
         drop(squatter);
+    }
+
+    /// A box registration checks the held port again: once the holder lets
+    /// it go, the next registration is answered at once, not after the
+    /// re-check cadence, and no refusal names the holder that left.
+    #[test]
+    fn registration_after_the_holder_leaves_is_answered() {
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channels");
+        let squatter =
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("a foreign holder binds a port");
+        let port = squatter.local_addr().expect("the holder's port").port();
+        let status = start_daemon(
+            web_registry().0,
+            port,
+            test_paths(&dir, RELEASE_WINDOW),
+            "node-a",
+        );
+        await_status_is(
+            &status,
+            ZoneAnswererStatus::PortHeldNoChannel { port },
+            "the daemon never surfaced the held port",
+        );
+        status
+            .allocate("box")
+            .expect_err("no box is handed an address while the port is held");
+        drop(squatter);
+        let asked = Instant::now();
+        status
+            .allocate("box")
+            .expect("the freed port is taken and the box handed an address");
+        assert!(
+            asked.elapsed() < PORT_RECHECK,
+            "answered on the registration, not the re-check cadence: {:?}",
+            asked.elapsed()
+        );
+    }
+
+    /// The native daemon's instance comes from its `--instance-num`, in
+    /// either spelling, and is 0 without one.
+    #[test]
+    fn native_instance_reads_the_instance_num_argument() {
+        let cmdline = |args: &str| args.replace(' ', "\0").into_bytes();
+        assert_eq!(
+            instance_num_in(&cmdline("/usr/bin/minimald run --instance-num 3 ")),
+            3
+        );
+        assert_eq!(
+            instance_num_in(&cmdline("minimald run --instance-num=2 ")),
+            2
+        );
+        assert_eq!(instance_num_in(&cmdline("minimald run ")), 0);
+        assert_eq!(instance_num_in(&cmdline("minimald --instance-num ")), 0);
     }
 
     /// A release whose service never comes re-binds the interim on its own
