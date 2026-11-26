@@ -4692,6 +4692,7 @@ pub(crate) struct ProjectChecks {
 ///
 /// Fails on a `minimal.toml` that does not load, on network settings the
 /// box cannot have, and on a grant the box cannot be given.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn check_project(
     global: &GlobalArgs,
     args: &mut ActivateArgs,
