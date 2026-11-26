@@ -2047,7 +2047,7 @@ impl SelectedLoadouts {
     /// The layer of each loadout, with its name and file: the keys that
     /// BOX-167 applies, without the vars that the policy ignores, and the
     /// retired variable keys, which the expansion refuses (BOX-206).
-    fn layers(&self) -> anyhow::Result<Vec<mfile::expand::LoadoutLayer>> {
+    pub(crate) fn layers(&self) -> anyhow::Result<Vec<mfile::expand::LoadoutLayer>> {
         self.loadouts
             .iter()
             .map(|loadout| loadout_layer(loadout, self.ignore.as_ref()))
@@ -2443,13 +2443,14 @@ pub(crate) fn box_entry(
 }
 
 /// A table for each type of a chain, with the type's name.
-type TypeTables = Vec<(String, toml::Table)>;
+pub(crate) type TypeTables = Vec<(String, toml::Table)>;
 
 /// The defaults and the constraints of each type in the chain of `entry`,
 /// as the start's loadout gate reads them: the resolved chain, or the
 /// built-in layers of a built-in type name that does not resolve. Empty
-/// for any other name, which the gate already refused.
-fn entry_type_layers(
+/// for any other name, which the gate already refused. `min box spec
+/// <entry>` reads the same layers, so its loadouts fold as the start's do.
+pub(crate) fn entry_type_layers(
     doc: &toml::Table,
     entry: &mfile::entry::BoxEntry,
 ) -> (TypeTables, TypeTables) {
@@ -4510,8 +4511,8 @@ pub(crate) fn network_override_policy(
 
 /// The loadouts an activation resolves (BCLI-073): each `--loadout` in
 /// place of the client config's `default_loadouts`, or none under
-/// `--no-loadouts`. The stored spec does not record the selected loadouts
-/// yet: <https://github.com/gominimal/minimal/issues/3236>.
+/// `--no-loadouts`. `min box spec <entry>` takes the same selection and
+/// folds each selected loadout into the spec it renders (BCLI-075).
 pub(crate) fn start_loadout_selection(args: &ActivateArgs) -> loadouts::LoadoutSelection {
     loadouts::LoadoutSelection::from_flags(&args.loadout, args.no_loadouts)
 }

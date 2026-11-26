@@ -733,7 +733,10 @@ fn origin_label(origin: &mfile::expand::Origin, entry: &mfile::entry::BoxEntry) 
         Layer::DefaultsType => format!("[defaults.{}]", entry.box_type.as_deref().unwrap_or("-")),
         Layer::Entry if entry.implicit => "the implicit default entry".to_owned(),
         Layer::Entry => format!("[{}.{}]", entry.table.key(), entry.name),
-        Layer::Loadouts => "loadouts".to_owned(),
+        Layer::Loadouts => match origin.loadout.as_deref() {
+            Some(name) => format!("loadout {name}"),
+            None => "loadouts".to_owned(),
+        },
         Layer::Overrides => COMMAND_LINE.to_owned(),
     }
 }
@@ -1059,6 +1062,95 @@ fn expand_entry(
         entry.box_type.as_deref(),
         &project_types,
     );
+    let box_type = entry
+        .box_type
+        .clone()
+        .unwrap_or_else(|| boxes::SESSION_BOX_TYPE.to_owned());
+    let overrides = &args.overrides;
+    if box_type == boxes::TASK_BOX_TYPE {
+        // `min box start` refuses these two flags for a task entry, so the
+        // spec refuses them the same way (`StartEntryRefusal::FlagUnsupported`).
+        let unsupported = [
+            (!overrides.ingress.is_empty(), "--ingress"),
+            (!overrides.loadout.is_empty(), "--loadout"),
+        ];
+        if let Some((_, flag)) = unsupported.into_iter().find(|(given, _)| *given) {
+            tracing::info!(verb = "box spec", entry = %entry.name, outcome = "refused", flag = %flag);
+            return Err(crate::InitRefusal {
+                code: 2,
+                message: format!(
+                    "min box spec does not take {flag} for {name}. A box from a task \
+                     entry does not take {flag}. Run min box spec {name} without {flag}.",
+                    name = entry.name
+                ),
+            }
+            .into());
+        }
+    }
+    // The box's loadout mode, read before any loadout as the start reads
+    // it, for a task entry too. A sealed box selects no loadout (BOX-171,
+    // BOX-173). Then the loadouts `min box start` or `min task run`
+    // selects, read from the same client config, before the expansion as
+    // the start reads them. A missing or malformed loadout fails here as
+    // it fails the start. `--no-loadouts` selects none (BCLI-075).
+    let loadout_mode = crate::loadouts::entry_loadout_gate(Some(&bytes), entry, &overrides.loadout)
+        .map_err(invalid)?;
+    let cfg = crate::config::read_client_config(global)?;
+    let active = crate::loadouts::resolve_active_loadouts(
+        crate::loadouts::gate_selection(
+            crate::loadouts::LoadoutSelection::from_flags(
+                &overrides.loadout,
+                overrides.other.no_loadouts,
+            ),
+            loadout_mode,
+        ),
+        &cfg,
+        global,
+    )?;
+    // BOX-172: a loadout that sets `loadout_mode` fails the start, so it
+    // fails the spec the same way.
+    if let Some(loadout) = active.loadouts.iter().find(|l| l.sets_loadout_mode()) {
+        return Err(invalid(mfile::Error::LoadoutSetsLoadoutMode {
+            loadout: Some(loadout.name().as_ref().to_owned()),
+        })
+        .into());
+    }
+    // BCLI-077, BOX-064, BOX-183: each selected loadout is a layer of the
+    // expansion, with the user policy's var `ignore` list applied, as
+    // `min box start` builds its selected-loadouts layer. BOX-206, BOX-207:
+    // a loadout that sets `vars` or `vars_lenient`, or a variable name that
+    // is not POSIX-shaped, fails the start, so it fails the spec the same
+    // way.
+    let selected = crate::SelectedLoadouts {
+        loadouts: active.loadouts,
+        ignore: Some(
+            crate::config::read_user_policy(global)?
+                .vars()
+                .ignore()
+                .clone(),
+        ),
+    };
+    let loadout_layers = selected.layers()?;
+    for layer in &loadout_layers {
+        mfile::expand::check_loadout_vars(layer).map_err(invalid)?;
+    }
+    let loadouts = Some(
+        selected
+            .loadouts
+            .iter()
+            .map(|loadout| loadout.name().as_ref().to_owned())
+            .collect(),
+    );
+    // BOX-064, BOX-179: as `min box start` expands the whole spec, with
+    // the type chain's layers, so the loadout gate opens as the start's
+    // gate did, and with this process's value of each `inherit` name
+    // (BOX-183, BOX-184).
+    layers.loadouts = loadout_layers;
+    (layers.type_defaults, layers.type_constraints) = crate::entry_type_layers(&doc, entry);
+    layers.host_vars = mfile::expand::inherited_var_names(entry, &layers)
+        .into_iter()
+        .filter_map(|name| std::env::var(&name).ok().map(|value| (name, value)))
+        .collect();
     // BOX-071: the client's `[secret-store-rules]` write each store
     // reference's `upstream` and `inject` into the expanded spec, as the
     // create writes them into the spec it sends. They are read once, only
@@ -1071,6 +1163,20 @@ fn expand_entry(
     let mut sources = std::collections::BTreeMap::new();
     for (key, origin) in &expansion.report.values {
         sources.insert(key.clone(), origin_labels(origin, entry));
+    }
+    // BCLI-077, BOX-180: each variable of `env_vars` names the one layer
+    // whose value the merge kept, a selected loadout included.
+    for (name, origin) in &expansion.report.env_vars {
+        sources.insert(
+            format!("{}.{name}", mfile::expand::ENV_VARS_KEY),
+            vec![origin_label(origin, entry)],
+        );
+    }
+    // BCLI-076: with `--no-hooks` the spec carries no lifecycle hook, from
+    // the project or from a loadout, as the start's stored spec does.
+    if overrides.other.no_hooks {
+        spec.remove("lifecycle_hooks");
+        sources.retain(|key, _| key != "lifecycle_hooks" && !key.starts_with("lifecycle_hooks."));
     }
     // gominimal/arch#188: `network` merges by key, so each key below it
     // names its own layer, and `network` names every layer that set one of
@@ -1100,75 +1206,10 @@ fn expand_entry(
             }
         }
     }
-    let box_type = entry
-        .box_type
-        .clone()
-        .unwrap_or_else(|| boxes::SESSION_BOX_TYPE.to_owned());
-
     // BCLI-021: the network that `min box start` sends with the same
     // flags, from the functions it calls.
-    let overrides = &args.overrides;
     let network_label = sources.get("network").cloned();
     let network_source = |key: &str| network_origins.get(key).cloned().unwrap_or_default();
-    if box_type == boxes::TASK_BOX_TYPE {
-        // `min box start` refuses these two flags for a task entry, so the
-        // spec refuses them the same way (`StartEntryRefusal::FlagUnsupported`).
-        let unsupported = [
-            (!overrides.ingress.is_empty(), "--ingress"),
-            (!overrides.loadout.is_empty(), "--loadout"),
-        ];
-        if let Some((_, flag)) = unsupported.into_iter().find(|(given, _)| *given) {
-            tracing::info!(verb = "box spec", entry = %entry.name, outcome = "refused", flag = %flag);
-            return Err(crate::InitRefusal {
-                code: 2,
-                message: format!(
-                    "min box spec does not take {flag} for {name}. A box from a task \
-                     entry does not take {flag}. Run min box spec {name} without {flag}.",
-                    name = entry.name
-                ),
-            }
-            .into());
-        }
-    }
-    // The loadouts `min box start` or `min task run` selects, read from
-    // the same client config. A missing or malformed loadout fails here as
-    // it fails the start. Folding their values into the spec is #3236.
-    // The box's loadout mode, read before any loadout as the start reads
-    // it, for a task entry too. A sealed box selects no loadout (BOX-171,
-    // BOX-173).
-    let loadout_mode = crate::loadouts::entry_loadout_gate(Some(&bytes), entry, &overrides.loadout)
-        .map_err(invalid)?;
-    let cfg = crate::config::read_client_config(global)?;
-    let active = crate::loadouts::resolve_active_loadouts(
-        crate::loadouts::gate_selection(
-            crate::loadouts::LoadoutSelection::from_flags(&overrides.loadout, false),
-            loadout_mode,
-        ),
-        &cfg,
-        global,
-    )?;
-    // BOX-172: a loadout that sets `loadout_mode` fails the start, so it
-    // fails the spec the same way.
-    if let Some(loadout) = active.loadouts.iter().find(|l| l.sets_loadout_mode()) {
-        return Err(invalid(mfile::Error::LoadoutSetsLoadoutMode {
-            loadout: Some(loadout.name().as_ref().to_owned()),
-        })
-        .into());
-    }
-    // BOX-206, BOX-207: a loadout that sets `vars` or `vars_lenient`, or a
-    // variable name that is not POSIX-shaped, fails the start, so it fails
-    // the spec the same way.
-    for loadout in &active.loadouts {
-        let layer = crate::loadout_layer(loadout, None)?;
-        mfile::expand::check_loadout_vars(&layer).map_err(invalid)?;
-    }
-    let loadouts = Some(
-        active
-            .loadouts
-            .iter()
-            .map(|loadout| loadout.name().as_ref().to_owned())
-            .collect(),
-    );
     let mut ingress_sources = vec![COMMAND_LINE.to_owned()];
     let mut none_flag_cleared = false;
     let (mode, mode_source, egress, ingress) = if box_type == boxes::TASK_BOX_TYPE {
