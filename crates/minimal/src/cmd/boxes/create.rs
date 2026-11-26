@@ -4684,8 +4684,9 @@ pub(crate) struct ProjectChecks {
 /// share: the entry's `[network]`, `[secrets]` and Box Egress Proxy
 /// settings, with the flags (`flag_overrides` and `quic443`) over them.
 /// Sets `args.network` to the box's mode, so a later
-/// [`ActivateArgs::network_mode`] gives it. Every refusal comes before
-/// anything is created.
+/// [`ActivateArgs::network_mode`] gives it. `store` is the host's native
+/// store, which a store reference to it needs this host to be able to use.
+/// Every refusal comes before anything is created.
 ///
 /// # Errors
 ///
@@ -4699,6 +4700,7 @@ pub(crate) fn check_project(
     quic443: Option<boxes::core::bep::Quic443>,
     flag_overrides: (Vec<boxes::PortMapping>, Option<boxes::EgressPolicy>),
     prompts: ProjectPrompts,
+    store: &dyn bep::store::SecretStore,
 ) -> Result<ProjectChecks, anyhow::Error> {
     let (port_mappings, egress) = flag_overrides;
     let (project_bep, project_secrets, project_env, project_quic443) =
@@ -4776,7 +4778,7 @@ pub(crate) fn check_project(
         network,
         policy.egress.as_ref(),
         can_ask,
-        &bep::store::HostStore,
+        store,
     )?;
     let store_grants = store_grants(&project_secrets, &accepted_store_rules)?;
     // BEP-062: a `dns` or `both` box resolves each accepted rule's
@@ -4855,6 +4857,7 @@ pub(crate) async fn activate_box(
                 options.quic443,
                 (port_mappings, egress),
                 ProjectPrompts::Terminal,
+                &bep::store::HostStore,
             )
         })
         .await?;

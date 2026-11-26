@@ -1048,6 +1048,7 @@ fn put_picked_entry(
         None,
         (Vec::new(), None),
         crate::ProjectPrompts::Dashboard,
+        &bep::store::HostStore,
     )?;
     request.config.network = args.network_mode().into();
     request.config.policy = checks.policy;
@@ -2126,6 +2127,7 @@ mod tests {
             options.quic443,
             flags,
             crate::ProjectPrompts::Terminal,
+            &bep::store::MemorySecretStore::default(),
         )
         .expect("min box start dev passes its project checks");
         let mut started = fresh(args.network_mode().into(), checks.policy);
