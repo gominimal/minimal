@@ -1837,7 +1837,8 @@ fn held_name_refusal_exits_2_and_names_the_holder() {
     let reply = minimald_rpc::HeldNameRefusal {
         name: "default".to_string(),
         holder: Some(holder),
-        holder_name: "Default".to_string(),
+        holder_name: Some("Default".to_string()),
+        state: Some("running".to_string()),
     }
     .to_string();
 
@@ -1847,7 +1848,7 @@ fn held_name_refusal_exits_2_and_names_the_holder() {
         .expect("main.rs maps this error to its exit code");
     assert_eq!(minimald_rpc::HeldNameRefusal::EXIT_CODE, 2);
     assert_eq!(refusal.holder, Some(holder));
-    assert_eq!(refusal.holder_name, "Default");
+    assert_eq!(refusal.holder_name.as_deref(), Some("Default"));
     let printed = format!("{error:#}");
     assert_eq!(
         printed,
@@ -1871,15 +1872,62 @@ fn held_name_refusal_exits_2_and_names_the_holder() {
     assert_eq!(format!("{other:#}"), "the project path is not a directory");
 }
 
+/// BOX-007, BOX-163: a create refused because a box the person may not
+/// read has the name says only that the name is taken, and exits 2. A
+/// `--name` that breaks a naming rule exits 3, from a daemon that sends
+/// the exit code and from one that predates it.
+#[test]
+fn held_name_refusal_hides_the_holder_and_a_bad_name_exits_3() {
+    let hidden = minimald_rpc::HeldNameRefusal {
+        name: "api".to_string(),
+        holder: None,
+        holder_name: None,
+        state: None,
+    }
+    .to_string();
+    let error = create_refusal(hidden.clone(), None, None, None);
+    assert!(
+        error
+            .downcast_ref::<minimald_rpc::HeldNameRefusal>()
+            .is_some(),
+        "main.rs maps this error to exit 2"
+    );
+    assert_eq!(
+        format!("{error:#}"),
+        "Cannot create a session named `api`: the name is taken. Choose another name."
+    );
+    let start = start_refusal(error, StartVerb::Box, "api");
+    assert_eq!(
+        format!("{start:#}"),
+        "Cannot start api. The name api is taken. Run min box start api --name <name> \
+         to start a box from the entry under another name."
+    );
+
+    let rule = boxes::box_name::check_written_name("self")
+        .unwrap_err()
+        .to_string();
+    for exit_code in [Some(3), None] {
+        let error = create_refusal(rule.clone(), None, exit_code, None);
+        let refusal = error
+            .downcast_ref::<DaemonCreateRefusal>()
+            .unwrap_or_else(|| panic!("a typed refusal: {error:#}"));
+        assert_eq!(refusal.exit_code, 3);
+        assert_eq!(format!("{error:#}"), rule);
+    }
+}
+
 /// BOX-163: an own-address create whose VM host registration is refused
 /// because a live row holds the name ends `min` with exit 2. The error names
-/// the holder's id, read from the daemon. When the holder cannot be read,
-/// it is still exit 2 and names the held spelling.
+/// the holder's id and state, read from the daemon. When the holder cannot
+/// be read, it is still exit 2 and names the held spelling, with no state.
 #[test]
 fn own_address_held_name_refusal_exits_2_and_names_the_holder() {
     let holder = boxes::SessionId::parse_str("0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b").unwrap();
-    let error =
-        registration_held_name_refusal("dev", "Dev", Some((holder, Some("Dev".to_string()))));
+    let error = registration_held_name_refusal(
+        "dev",
+        "Dev",
+        Some((holder, Some("Dev".to_string()), Some("running".to_string()))),
+    );
     let refusal = error
         .downcast_ref::<minimald_rpc::HeldNameRefusal>()
         .expect("main.rs maps this error to exit 2");
@@ -1893,14 +1941,31 @@ fn own_address_held_name_refusal_exits_2_and_names_the_holder() {
          or choose another name."
     );
 
+    // The holder can stop before the daemon reads it: the refusal says
+    // the state the record has, not `running`.
+    let stopped = registration_held_name_refusal(
+        "dev",
+        "Dev",
+        Some((holder, Some("Dev".to_string()), Some("stopped".to_string()))),
+    );
+    let refusal = stopped
+        .downcast_ref::<minimald_rpc::HeldNameRefusal>()
+        .expect("a stopped holder is still exit 2");
+    assert_eq!(refusal.state.as_deref(), Some("stopped"));
+    assert!(
+        format!("{stopped:#}").contains("the stopped session `Dev`"),
+        "{stopped:#}"
+    );
+
     let unread = registration_held_name_refusal("dev", "Dev", None);
     let refusal = unread
         .downcast_ref::<minimald_rpc::HeldNameRefusal>()
         .expect("an unread holder is still exit 2");
     assert_eq!(refusal.holder, None);
+    assert_eq!(refusal.state, None);
     assert_eq!(
         format!("{unread:#}"),
-        "Cannot create a session named `dev`: the running session `Dev` holds that name. \
+        "Cannot create a session named `dev`: the session `Dev` holds that name. \
          Choose another name."
     );
     assert_eq!(
@@ -3969,7 +4034,8 @@ fn create_name_held_exit2_names_holder_hints_name_flag() {
     let reply = minimald_rpc::HeldNameRefusal {
         name: "default".to_string(),
         holder: Some(holder),
-        holder_name: "default".to_string(),
+        holder_name: Some("default".to_string()),
+        state: Some("running".to_string()),
     }
     .to_string();
 
@@ -3999,7 +4065,7 @@ fn create_name_held_exit2_names_holder_hints_name_flag() {
     assert!(unread.downcast_ref::<StartNameHeld>().is_some());
     assert_eq!(
         format!("{unread:#}"),
-        "Cannot start dev. The running box dev holds the name dev. Run \
+        "Cannot start dev. The box dev holds the name dev. Run \
          min session start dev --name <name> to start a box from the entry under \
          another name."
     );
@@ -8547,9 +8613,9 @@ async fn box_name_resolves_vm_without_flag_refuses_a_name_two_vms_hold() {
 /// BCLI-002, NET-058: a box verb that names a box on a stopped VM is refused
 /// with the VM's name and the command that starts it, and exits 4. The box
 /// is found by its name, its id and its `provider/host/name`. A name that a
-/// running VM's box and a stopped VM's records both hold resolves to the
-/// running box. A name that a running VM holds only as a box that does not
-/// run, and that a stopped VM's records hold too, is ambiguous and exits 2.
+/// running VM's box and a stopped VM's records both hold is ambiguous, in
+/// any state, and exits 2 (BOX-005); its `provider/host/name` finds the
+/// running box.
 /// `min box spec` refuses the box on the stopped VM as `min box show` does,
 /// and a name that no VM holds is not found.
 #[tokio::test]
@@ -8590,12 +8656,54 @@ async fn box_verb_on_stopped_vm_box_refuses_with_start_hint() {
         assert_eq!(refusal.code(), "not_found", "{address}");
     }
 
-    // A running VM's box wins over a stopped VM's record of the same name.
-    let resolved = cmd::resolve_box_on_local_hosts(&global, "api", "box show")
+    // A running VM's box and a stopped VM's record of the same name are
+    // ambiguous, and the qualified address finds the running box.
+    let err = cmd::resolve_box_on_local_hosts(&global, "api", "box show")
         .await
-        .expect("the running box resolves");
+        .expect_err("two hosts hold 'api'");
+    let refusal = err
+        .downcast_ref::<BoxAddressRefusal>()
+        .expect("the refusal is a box address refusal");
+    assert!(
+        matches!(refusal, BoxAddressRefusal::Ambiguous { .. }),
+        "{refusal:?}"
+    );
+    assert_eq!(refusal.exit_code(), 2);
+    let resolved =
+        cmd::resolve_box_on_local_hosts(&global, "local-minvmd/local-minvmd0/api", "box show")
+            .await
+            .expect("the running box resolves");
     assert_eq!(resolved.box_id, api);
     assert!(resolved.host.selected, "{}", resolved.host.host);
+
+    // A type noun is `min box` filtered to its type. The stopped VM's
+    // record carries no type, so the session noun sees both boxes: the
+    // name is ambiguous, and the qualified address finds the running box.
+    let err = cmd::resolve_box_of_type(
+        local_hosts(&global).expect("the local hosts"),
+        "api",
+        "session",
+        "session stop",
+    )
+    .await
+    .expect_err("two hosts hold 'api' under the type noun");
+    let refusal = err
+        .downcast_ref::<BoxAddressRefusal>()
+        .expect("the refusal is a box address refusal");
+    assert!(
+        matches!(refusal, BoxAddressRefusal::Ambiguous { .. }),
+        "{refusal:?}"
+    );
+    assert_eq!(refusal.exit_code(), 2);
+    let resolved = cmd::resolve_box_of_type(
+        local_hosts(&global).expect("the local hosts"),
+        "local-minvmd/local-minvmd0/api",
+        "session",
+        "session stop",
+    )
+    .await
+    .expect("the qualified address resolves under the type noun");
+    assert_eq!(resolved.box_id, api);
 
     // `min box spec` resolves through the same lookup, so it refuses the box
     // on the stopped VM the same way.
@@ -10031,8 +10139,8 @@ fn box_address_accepts_id_name_and_qualified() {
     let by_name = resolve("DB");
     assert_eq!((by_name.box_id, by_name.host), (db.box_id, beta.clone()));
     // A name a running box holds on one host and a stopped box holds on
-    // another resolves to the running box.
-    assert_eq!(resolve("web").box_id, web.box_id);
+    // another is ambiguous (BOX-005, BOX-007).
+    assert_eq!(refused("web", &listings).1, 2);
     // `provider/host/name` picks the box on that host.
     let qualified = resolve("local-minvmd/beta.local-minvmd0/web");
     assert_eq!(
@@ -10064,6 +10172,46 @@ fn box_address_accepts_id_name_and_qualified() {
         parse_box_address("a/b"),
         BoxAddress::Unqualified("a/b"),
         "two parts are not provider/host/name"
+    );
+}
+
+/// BCLI-002, BOX-005, BOX-007: a name that boxes on more than one host
+/// have, in any state, is refused with exit 2 and lists every box, even
+/// when one host runs its box. On one host alone, the running box wins.
+#[test]
+fn name_on_two_hosts_in_any_state_is_ambiguous() {
+    let running = address_entry("0199f000-0000-7000-8000-000000000001", "web", "running");
+    let stopped = address_entry("0199f200-0000-7000-8000-000000000003", "Web", "stopped");
+    let older = address_entry("0199f100-0000-7000-8000-000000000002", "web", "exited");
+    let listings = [
+        answered(
+            address_host(LOCAL_MINVMD_PROVIDER, "alpha.local-minvmd0", true),
+            vec![running.clone()],
+        ),
+        answered(
+            address_host(LOCAL_MINVMD_PROVIDER, "beta.local-minvmd0", false),
+            vec![stopped],
+        ),
+    ];
+    let (message, code) = refused("web", &listings);
+    assert_eq!(code, 2);
+    assert_eq!(
+        message,
+        "web matches boxes on more than one host:\n\
+         \x20 local-minvmd/alpha.local-minvmd0/web  running  0199f000-0000-7000-8000-000000000001\n\
+         \x20 local-minvmd/beta.local-minvmd0/Web  stopped  0199f200-0000-7000-8000-000000000003\n\
+         Name one as provider/host/name."
+    );
+
+    let one_host = [answered(
+        address_host(LOCAL_MINVMD_PROVIDER, "alpha.local-minvmd0", true),
+        vec![older, running.clone()],
+    )];
+    assert_eq!(
+        resolve_box_address("web", &one_host)
+            .expect("one host keeps every box of the name")
+            .box_id,
+        running.box_id
     );
 }
 
@@ -11409,6 +11557,19 @@ fn box_state_dir(state: &std::path::Path, id: boxes::SessionId) -> std::path::Pa
                 .is_ok_and(|record| record.contains(&id.to_string()))
         })
         .expect("the box's state dir")
+}
+
+/// Renames the record of box `id` to `name` on disk, under the daemon state
+/// dir `state`. A create or a rename never gives a box a name another box
+/// on the host has (BOX-007, BOX-163), but a store written before that
+/// rule can hold two boxes of one name, and the daemon reads the name from
+/// the record.
+fn rename_stored_record(state: &std::path::Path, id: boxes::SessionId, name: &str) {
+    let path = box_state_dir(state, id).join("record.json");
+    let mut record: boxes::Record =
+        serde_json_lenient::from_slice(&std::fs::read(&path).unwrap()).expect("the box's record");
+    record.name = Some(name.to_owned());
+    std::fs::write(&path, serde_json_lenient::to_vec(&record).unwrap()).unwrap();
 }
 
 /// Appends the exec event `kind` for `exec_id` to the events of box `id`
@@ -16364,6 +16525,7 @@ async fn type_noun_verbs_alias_box_forms() {
 
     let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
     let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let state_path = state.path().to_path_buf();
     let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
     let project = tempfile::tempdir().expect("a temp project dir");
     let project = project.path().to_str().expect("a UTF-8 project path");
@@ -16516,7 +16678,9 @@ async fn type_noun_verbs_alias_box_forms() {
 
     // A stopped session box and a running task box hold the same name, and
     // the task box runs an exec. A session stop with `--exec` does not stop
-    // the task box's exec.
+    // the task box's exec. A create never takes a stopped box's name
+    // (BOX-007), so the two boxes of one name come from a store written
+    // before that rule.
     let twin_session =
         minimald::test_harness::create_configured_session(&mut daemon, "twin", project).await;
     let mut out = Vec::new();
@@ -16524,7 +16688,8 @@ async fn type_noun_verbs_alias_box_forms() {
         .await
         .expect("the session box stops")
         .expect("a box stop");
-    let twin_task = create_configured_task(&mut daemon, "twin", project).await;
+    let twin_task = create_configured_task(&mut daemon, "twin-b", project).await;
+    rename_stored_record(&state_path, twin_task, "twin");
     let _task_exec = server.list_running_exec(twin_task, FIRST_EXEC_ID, &["sleep", "600"], false);
     let exec_stop = BoxStopArgs {
         target: "twin".to_owned(),
@@ -16553,7 +16718,8 @@ async fn type_noun_verbs_alias_box_forms() {
         ],
         "the task box's exec runs on\n{text}"
     );
-    for (box_type, id) in [(task, twin_task), (session, twin_session)] {
+    // The session box holds the name's row in the store, so it goes first.
+    for (box_type, id) in [(session, twin_session), (task, twin_task)] {
         cmd::typed_box_rm_on_hosts(
             hosts(),
             &rm(&id.to_string()),
@@ -16841,15 +17007,19 @@ async fn named_attach_finds_box_only_another_vm_knows() {
 
 /// BCLI-007: a resume of a box with a terminal whose name a running box on
 /// its host holds fails with exit 2. The refusal names the running box and
-/// the renames that free the name, and notes the volume refusal.
+/// the renames that free the name, and notes the volume refusal. A create
+/// never takes a stopped box's name (BOX-007), so the two boxes of one name
+/// come from a store written before that rule.
 #[tokio::test]
 async fn resume_name_conflict_exit2_names_holder() {
-    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    let (alpha, state) = exec_attach_host("alpha.local-minvmd0").await;
     let web = alpha.create("web", Some(true)).await;
     alpha.stop("web").await;
-    // A running box with no terminal takes the name. It is no candidate of
-    // the bare form, so the bare form still finds the stopped box.
-    let holder = alpha.create("web", Some(false)).await;
+    // A running box with no terminal has the name, as an older store can
+    // hold it. It is no candidate of the bare form, so the bare form still
+    // finds the stopped box.
+    let holder = alpha.create("web-b", Some(false)).await;
+    rename_stored_record(&state, holder, "web");
     let hosts = [alpha.host.clone()];
     let scope = alpha.scope();
     let id = web.to_string();
@@ -16887,7 +17057,7 @@ async fn resume_name_conflict_exit2_names_holder() {
 #[tokio::test]
 async fn resume_non_pty_box_exit2_hint_by_lifetime() {
     use minimald_rpc::CreatingVerb;
-    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    let (alpha, state) = exec_attach_host("alpha.local-minvmd0").await;
     alpha
         .create_with(
             "agent",
@@ -16917,8 +17087,11 @@ async fn resume_non_pty_box_exit2_hint_by_lifetime() {
         );
     }
 
-    // A running box that holds the name does not change the refusal.
-    alpha.create("job", Some(true)).await;
+    // A running box that holds the name does not change the refusal. A
+    // create never takes a stopped box's name (BOX-007), so the running
+    // `job` comes from a store written before that rule.
+    let running = alpha.create("job-b", Some(true)).await;
+    rename_stored_record(&state, running, "job");
     let id = job.to_string();
     let (message, code) = refused_by(AttachVerb::BoxResume, &hosts, Some(&id), None).await;
     assert_eq!(code, 2, "{message}");
@@ -23548,11 +23721,12 @@ fn refusals_exit_with_the_table_code() {
         "{err:#}"
     );
 
-    // `min box rename` to a name the store refuses: usage (2), says box.
+    // `min box rename` to a name an older daemon's store refuses: a
+    // naming rule (3), says box.
     let daemon = "invalid box name: must be a single DNS label";
     let err = anyhow::Error::from(BoxRenameRefusal::from_error(daemon).expect("a refusal"));
-    assert!(err.downcast_ref::<BoxRenameRefusal>().is_some(), "{err:#}");
-    assert_eq!(BoxRenameRefusal::EXIT_CODE, 2);
+    let refusal = err.downcast_ref::<BoxRenameRefusal>().expect("typed");
+    assert_eq!(refusal.exit_code(), 3);
     assert_eq!(format!("{err:#}"), daemon);
     assert!(BoxRenameRefusal::from_error("some other failure").is_none());
 

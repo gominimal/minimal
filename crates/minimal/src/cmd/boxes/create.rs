@@ -803,20 +803,29 @@ impl std::fmt::Display for StartNameHeld {
             name,
             holder,
             holder_name,
+            state,
         } = &self.refusal;
         let entry = printable(&self.entry);
         let name = printable(name);
-        let holder_name = printable(holder_name);
-        match holder {
-            Some(holder) => write!(
+        // The daemon names the holder and its state only to the person
+        // who may read that box. Otherwise the name is only taken.
+        let state = state
+            .as_deref()
+            .map(|state| format!("{} ", printable(state)))
+            .unwrap_or_default();
+        match (holder_name, holder) {
+            (Some(holder_name), Some(holder)) => write!(
                 f,
-                "Cannot start {entry}. The running box {holder_name} ({holder}) holds the \
+                "Cannot start {entry}. The {state}box {holder_name} ({holder}) holds the \
                  name {name}.",
+                holder_name = printable(holder_name),
             )?,
-            None => write!(
+            (Some(holder_name), None) => write!(
                 f,
-                "Cannot start {entry}. The running box {holder_name} holds the name {name}.",
+                "Cannot start {entry}. The {state}box {holder_name} holds the name {name}.",
+                holder_name = printable(holder_name),
             )?,
+            (None, _) => write!(f, "Cannot start {entry}. The name {name} is taken.")?,
         }
         write!(
             f,
@@ -3972,7 +3981,8 @@ pub(crate) async fn daemon_box_name(
 }
 
 /// The error a refused create ends the command with. A held name ends it
-/// with exit 2, naming the holder (BOX-163). A refusal the daemon gave an
+/// with exit 2, naming the holder to its reader (BOX-007, BOX-163). A
+/// requested name that breaks a naming rule ends it with exit 3. A refusal the daemon gave an
 /// exit code keeps that code and its defined error (#3276). Any other
 /// refusal is the daemon's text as it is.
 pub(crate) fn create_refusal(
@@ -3985,12 +3995,20 @@ pub(crate) fn create_refusal(
         tracing::info!(
             name = %refusal.name,
             holder = ?refusal.holder,
-            holder_name = %refusal.holder_name,
+            holder_shown = refusal.holder_name.is_some(),
             exit_code = minimald_rpc::HeldNameRefusal::EXIT_CODE,
-            "the create was refused: a running box holds the name"
+            "the create was refused: another box has the name"
         );
         return anyhow::Error::new(refusal);
     }
+    // BOX-007: a daemon that predates the reply's exit code refuses a
+    // `--name` that breaks a naming rule with this text alone. It is the
+    // same refusal, so it ends with the same exit code.
+    let exit_code = exit_code.or_else(|| {
+        (boxes::box_name::NameRuleRefusal::is_text(&error)
+            || error.starts_with("invalid box name: "))
+        .then_some(minimald_rpc::NAME_RULE_EXIT_CODE)
+    });
     match exit_code {
         Some(exit_code) => {
             tracing::info!(
@@ -4033,19 +4051,23 @@ impl std::fmt::Display for DaemonCreateRefusal {
 
 impl std::error::Error for DaemonCreateRefusal {}
 
-/// The id and name of the box that holds `held`, read from the daemon by
-/// name. `None` when the read fails or finds no box.
+/// The id, name and state word of the box that holds `held`, read from
+/// the daemon by name. `None` when the read fails or finds no box.
 async fn held_name_holder(
     client: &mut minimal_client::Client,
     held: &str,
-) -> Option<(boxes::SessionId, Option<String>)> {
+) -> Option<(boxes::SessionId, Option<String>, Option<String>)> {
     match client
         .oneshot_rpc::<minimald_rpc::GetSessionRecord>(minimald_rpc::GetSessionRecordRequest::Name(
             held.to_string(),
         ))
         .await
     {
-        Ok(reply) => reply.record.map(|record| (record.id, record.name)),
+        Ok(reply) => reply.record.map(|record| {
+            let state = boxes::box_name::NamedBox::from_record(&record)
+                .map(|named| named.state_word().to_string());
+            (record.id, record.name, state)
+        }),
         Err(error) => {
             tracing::warn!(held_name = %held, %error, "could not read the box that holds the name");
             None
@@ -4056,28 +4078,30 @@ async fn held_name_holder(
 /// The error an own-address create ends with when the VM host refused its
 /// registration because a live row holds `held` (BOX-163). It is the
 /// held-name refusal a daemon create sends, so `min` exits 2. It names the
-/// holder's id when `holder` gives its id and name, and the held spelling
-/// alone when the holder could not be read.
+/// holder's id when `holder` gives its id and name, and its state as the
+/// daemon's record of it reads. With no holder read, it names the held
+/// spelling alone, with no state.
 pub(crate) fn registration_held_name_refusal(
     name: &str,
     held: &str,
-    holder: Option<(boxes::SessionId, Option<String>)>,
+    holder: Option<(boxes::SessionId, Option<String>, Option<String>)>,
 ) -> anyhow::Error {
-    let (holder, holder_name) = match holder {
-        Some((id, name)) => (Some(id), name),
-        None => (None, None),
+    let (holder, holder_name, state) = match holder {
+        Some((id, name, state)) => (Some(id), name, state),
+        None => (None, None, None),
     };
     let refusal = minimald_rpc::HeldNameRefusal {
         name: name.to_string(),
         holder,
-        holder_name: holder_name.unwrap_or_else(|| held.to_string()),
+        holder_name: Some(holder_name.unwrap_or_else(|| held.to_string())),
+        state,
     };
     tracing::info!(
         name = %refusal.name,
         holder = ?refusal.holder,
-        holder_name = %refusal.holder_name,
+        holder_name = ?refusal.holder_name,
         exit_code = minimald_rpc::HeldNameRefusal::EXIT_CODE,
-        "the box registration was refused: a running box holds the name"
+        "the box registration was refused: another box holds the name"
     );
     anyhow::Error::new(refusal)
 }
@@ -6083,7 +6107,8 @@ mod tests {
                     refusal: minimald_rpc::HeldNameRefusal {
                         name: bad.clone(),
                         holder,
-                        holder_name: bad.clone(),
+                        holder_name: Some(bad.clone()),
+                        state: Some(bad.clone()),
                     },
                 }
                 .to_string(),

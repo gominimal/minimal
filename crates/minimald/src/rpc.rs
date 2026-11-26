@@ -670,18 +670,18 @@ async fn serve_create_session(
                         name_not_taken,
                     })
                 }
-                // BOX-163: a running box holds the name. The reply names the
-                // holder, so the client can say who holds it and exit 2.
+                // BOX-007, BOX-163: another box has the name, in any state.
+                // The reply names the holder and its state only to a caller
+                // who may read it, and the client exits 2.
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    CreateSessionReply::refused(match held_name_refusal(&e) {
+                    CreateSessionReply::refused(match held_name_refusal(&e, caller.as_deref()) {
                         Some(refusal) => {
                             tracing::info!(
                                 name = %refusal.name,
                                 holder = ?refusal.holder,
-                                holder_name = %refusal.holder_name,
+                                holder_shown = refusal.holder_name.is_some(),
                                 fresh_instance,
-                                "create refused: a running box holds the name; \
-                                 the reply names the holder"
+                                "create refused: another box has the name"
                             );
                             refusal.to_string()
                         }
@@ -1462,26 +1462,90 @@ async fn serve_finalize_session(
         .await
 }
 
-/// The wire refusal of a create whose name a running box holds
-/// (BOX-163), when the manager's `AlreadyExists` carries its holder.
-fn held_name_refusal(error: &std::io::Error) -> Option<minimald_rpc::HeldNameRefusal> {
+/// The wire refusal of a create whose name another box has (BOX-007,
+/// BOX-163), when the manager's `AlreadyExists` carries its holder. The
+/// holder, its name and its state are in the reply only when `caller` may
+/// read that box. Otherwise the reply says only that the name is taken.
+pub(crate) fn held_name_refusal(
+    error: &std::io::Error,
+    caller: Option<&str>,
+) -> Option<minimald_rpc::HeldNameRefusal> {
     let refusal = error
         .get_ref()?
         .downcast_ref::<crate::box_manager::HeldNameRefusal>()?;
+    let readable = caller_may_read(&refusal.creator, caller);
     Some(minimald_rpc::HeldNameRefusal {
         name: refusal.name.clone(),
-        holder: Some(refusal.holder),
-        holder_name: refusal.holder_name.clone(),
+        holder: readable.then_some(refusal.holder),
+        holder_name: readable.then(|| refusal.holder_name.clone()),
+        state: readable.then(|| refusal.state.to_string()),
     })
+}
+
+/// Whether `caller` may read a box whose record names `creator`: the record
+/// was read and names the caller as its creator. A record with no creator,
+/// or one that was not read, is not readable (default deny).
+fn caller_may_read(creator: &crate::box_manager::HolderCreator, caller: Option<&str>) -> bool {
+    use crate::box_manager::HolderCreator;
+    match creator {
+        HolderCreator::User(owner) => caller == Some(owner.as_str()),
+        HolderCreator::NoCreator | HolderCreator::Unread => false,
+    }
+}
+
+/// The text a rename's refusal sends `caller` (BOX-007, BOX-010). A name
+/// that another box has names that box and its state only when the
+/// caller may read it, and otherwise says only that the name is taken.
+/// Any other error keeps its own text.
+pub(crate) async fn rename_error_text(
+    mngr: &crate::box_manager::BoxManagerHandle,
+    error: &std::io::Error,
+    caller: Option<&str>,
+) -> String {
+    use boxes::box_name::RenameRefusal;
+    let Some(refusal) = error
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<RenameRefusal>())
+    else {
+        return error.to_string();
+    };
+    let RenameRefusal::Held { holder, .. } = refusal else {
+        return refusal.to_string();
+    };
+    let creator = match mngr
+        .get_record(crate::box_manager::BoxKeyPredicate::Id(*holder))
+        .await
+    {
+        Ok(Some(record)) => match record.username {
+            Some(user) => crate::box_manager::HolderCreator::User(user),
+            None => crate::box_manager::HolderCreator::NoCreator,
+        },
+        Ok(None) | Err(_) => crate::box_manager::HolderCreator::Unread,
+    };
+    let readable = caller_may_read(&creator, caller);
+    tracing::info!(
+        holder = %holder,
+        holder_shown = readable,
+        exit_code = refusal.exit_code(),
+        "rename refused: another box has the name"
+    );
+    if readable {
+        refusal.to_string()
+    } else {
+        refusal.hidden_text()
+    }
 }
 
 /// `RenameSession`: resolves the session's actor (spinning it up from
 /// disk if needed) and lets it persist the new name and relink its
 /// PTask hostname. A name collision surfaces as the store's
-/// `AlreadyExists` in the `Errorable::Err` text.
+/// `AlreadyExists` in the `Errorable::Err` text, which names the holder
+/// only to a caller who may read it. The text carries the refusal's exit
+/// code ([`minimald_rpc::rename_refusal_exit_code`]).
 async fn serve_rename_session(
     s: ServerStateHandle,
     c: RuChannel<Msg>,
+    ssh_username: Option<String>,
 ) -> Result<(), ConnectionError> {
     RenameSession
         .handle_channel(c, async |req| {
@@ -1507,7 +1571,12 @@ async fn serve_rename_session(
             match res {
                 Ok(()) => Ok(Errorable::Ok(RenameSessionResponse)),
                 Err(e) => Ok(Errorable::Err {
-                    error: e.to_string(),
+                    error: rename_error_text(
+                        &s.sessions_manager().await,
+                        &e,
+                        ssh_username.as_deref(),
+                    )
+                    .await,
                 }),
             }
         })
@@ -3819,7 +3888,7 @@ pub async fn handle_ssh_rpc(
         minimald_rpc::PrepareBuildBoxes::NAME => serve!(serve_prepare_build_boxes(s, channel)),
         SubmitVerdict::NAME => serve!(serve_submit_verdict(s, channel)),
         FinalizeSession::NAME => serve!(serve_finalize_session(s, channel)),
-        RenameSession::NAME => serve!(serve_rename_session(s, channel)),
+        RenameSession::NAME => serve!(serve_rename_session(s, channel, ssh_username)),
         DestroySession::NAME => serve!(serve_destroy_session(s, channel)),
         minimald_rpc::StopBox::NAME => serve!(serve_stop_box(s, channel)),
         minimald_rpc::RestartBox::NAME => serve!(serve_restart_box(s, channel)),
@@ -4000,17 +4069,13 @@ fn name_not_taken_reply(
     not_taken: &crate::box_manager::NotTakenName,
     caller: Option<&str>,
 ) -> minimald_rpc::NameNotTaken {
-    use crate::box_manager::HolderCreator;
     use boxes::box_name::DerivedNameTaken;
     let reason = match &not_taken.reason {
         DerivedNameTaken::Held(holder) => {
             // Default deny: only a read record whose creator is the caller
             // names its box. A record with no creator, or one not read,
             // hides it.
-            let readable = match &not_taken.holder_creator {
-                HolderCreator::User(owner) => caller == Some(owner.as_str()),
-                HolderCreator::NoCreator | HolderCreator::Unread => false,
-            };
+            let readable = caller_may_read(&not_taken.holder_creator, caller);
             minimald_rpc::NameTakenReason::Held {
                 holder: readable.then(|| minimald_rpc::NameHolder {
                     id: holder.id,
@@ -4181,8 +4246,16 @@ mod create_naming_tests {
             HeldNameRefusal {
                 name: "web-dev".to_string(),
                 holder: Some(holder),
-                holder_name: "web-dev".to_string(),
+                holder_name: Some("web-dev".to_string()),
+                state: refusal.state.clone(),
             }
+        );
+        assert!(
+            matches!(
+                refusal.state.as_deref(),
+                Some("pending" | "materializing" | "running")
+            ),
+            "the holder's state is shown to its creator: {error}"
         );
         assert_eq!(HeldNameRefusal::EXIT_CODE, 2);
         assert!(error.contains(&holder.to_string()), "{error}");

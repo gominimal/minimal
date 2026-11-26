@@ -2094,6 +2094,138 @@ pub mod box_name {
         BoxId::parse_str(name).is_ok()
     }
 
+    /// The exit code of a name that a written-name check refuses
+    /// (BOX-007): the code the BOX spec gives a name that breaks a rule.
+    pub const NAME_RULE_EXIT_CODE: i32 = 3;
+
+    /// The rule a written name breaks (BOX-007).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum NameRule {
+        /// The name is not one DNS label.
+        NotDnsLabel,
+        /// The name folds to a reserved name (see [`RESERVED_NAMES`]).
+        Reserved(&'static str),
+        /// The name parses as a box id.
+        BoxIdForm,
+    }
+
+    impl NameRule {
+        /// The word for the rule, for a log line.
+        #[must_use]
+        pub fn word(self) -> &'static str {
+            match self {
+                Self::NotDnsLabel => "not_dns_label",
+                Self::Reserved(_) => "reserved",
+                Self::BoxIdForm => "box_id_form",
+            }
+        }
+    }
+
+    /// The refusal of a written name, from a create's requested name or a
+    /// rename, that breaks a naming rule (BOX-007). It ends the command
+    /// with [`NAME_RULE_EXIT_CODE`].
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct NameRuleRefusal {
+        /// The name that was asked for.
+        pub name: String,
+        /// The rule it breaks.
+        pub rule: NameRule,
+    }
+
+    impl NameRuleRefusal {
+        /// The start of the refusal's text. A client reads a reply that
+        /// starts with it as this refusal.
+        pub const LEAD: &'static str = "Cannot name a box `";
+
+        /// The exit code of the refusal.
+        #[must_use]
+        pub fn exit_code(&self) -> i32 {
+            NAME_RULE_EXIT_CODE
+        }
+
+        /// Whether `error` is the text of this refusal.
+        #[must_use]
+        pub fn is_text(error: &str) -> bool {
+            error.starts_with(Self::LEAD)
+        }
+    }
+
+    impl fmt::Display for NameRuleRefusal {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            // The name broke a rule, so it can hold any character. Escape
+            // it, so a control character cannot reach the terminal.
+            write!(f, "{}{}`: ", Self::LEAD, self.name.escape_debug())?;
+            match self.rule {
+                NameRule::NotDnsLabel => write!(
+                    f,
+                    "a box name is 1 to {BOX_NAME_MAX} ASCII letters, digits and `-`, \
+                     with no `-` at either end."
+                )?,
+                NameRule::Reserved(reserved) => {
+                    write!(f, "the name `{reserved}` is reserved.")?;
+                }
+                NameRule::BoxIdForm => f.write_str("the name has the form of a box id.")?,
+            }
+            f.write_str(" Choose another name.")
+        }
+    }
+
+    impl std::error::Error for NameRuleRefusal {}
+
+    impl From<NameRuleRefusal> for std::io::Error {
+        fn from(refusal: NameRuleRefusal) -> Self {
+            Self::new(std::io::ErrorKind::InvalidInput, refusal)
+        }
+    }
+
+    /// Checks a name that a person wrote, as a create's requested name or
+    /// a rename's new name (BOX-007): it must be one DNS label, it must
+    /// not fold to a reserved name, and it must not parse as a box id.
+    /// A derived name never comes here: a create walks past such a name.
+    ///
+    /// # Errors
+    ///
+    /// [`NameRuleRefusal`] with the first rule the name breaks.
+    pub fn check_written_name(name: &str) -> Result<(), NameRuleRefusal> {
+        let rule = if !is_dns_label(name) {
+            Some(NameRule::NotDnsLabel)
+        } else if let Some(reserved) = reserved_name(name) {
+            Some(NameRule::Reserved(reserved))
+        } else if is_box_id_form(name) {
+            Some(NameRule::BoxIdForm)
+        } else {
+            None
+        };
+        match rule {
+            None => Ok(()),
+            Some(rule) => Err(NameRuleRefusal {
+                name: name.to_string(),
+                rule,
+            }),
+        }
+    }
+
+    /// The box of `boxes`, other than `except`, that has a name folding
+    /// to `name`, in any state: the running one first, else the latest.
+    /// A stopped or exited box keeps its name, so a written name cannot
+    /// take it (BOX-007).
+    #[must_use]
+    pub fn name_holder<'a>(
+        boxes: &'a [NamedBox],
+        name: &str,
+        except: Option<BoxId>,
+    ) -> Option<&'a NamedBox> {
+        let found: Vec<&NamedBox> = candidates(boxes, name)
+            .into_iter()
+            .filter(|b| Some(b.id) != except)
+            .collect();
+        found
+            .iter()
+            .copied()
+            .find(|b| b.is_running())
+            .or_else(|| latest(found.iter().copied()))
+    }
+
     /// What a name derived from a project and an entry is made of, so the
     /// store can walk its candidates (BOX-211, BOX-213): the project name
     /// and the entry, when the spec names one other than
@@ -2381,11 +2513,9 @@ pub mod box_name {
     pub struct AmbiguousName {
         /// The name that was asked for.
         pub name: String,
-        /// `true` when running boxes of the name are on more than one
-        /// host. `false` when no box of the name runs, and retained
-        /// records of it are on more than one host.
+        /// `true` when every host that keeps a box of the name runs one.
         pub running: bool,
-        /// One entry per matching box, in host order.
+        /// One entry per matching box, in host order, in any state.
         pub candidates: Vec<Candidate>,
     }
 
@@ -2409,18 +2539,14 @@ pub mod box_name {
             } else {
                 write!(
                     f,
-                    "No box named `{}` is running. More than one host keeps a box \
-                     with that name, so the name alone does not choose one of them.",
+                    "More than one host keeps a box named `{}`. \
+                     The name alone does not choose one of them.",
                     self.name
                 )?;
             }
             f.write_str(" Use the box id. The boxes are:")?;
             for c in &self.candidates {
-                if self.running {
-                    write!(f, "\n  {}  {}  {}", c.host, c.id, c.name)?;
-                } else {
-                    write!(f, "\n  {}  {}  {}  {}", c.host, c.id, c.name, c.state)?;
-                }
+                write!(f, "\n  {}  {}  {}  {}", c.host, c.id, c.name, c.state)?;
             }
             Ok(())
         }
@@ -2432,17 +2558,14 @@ pub mod box_name {
     /// reach (BOX-005). `hosts` pairs each host's name with its records.
     ///
     /// The answer is the host and id of the one box the name selects, or
-    /// `None` when no host has a box of that name. Running boxes win: the
-    /// name selects the running box when exactly one host runs one. When
-    /// no host runs one, the name selects the latest box of the one host
-    /// that keeps records of it.
+    /// `None` when no host has a box of that name. The name selects a box
+    /// only when one host alone keeps boxes of that name, in any state.
+    /// On that host, the running box wins, else the latest.
     ///
     /// # Errors
     ///
-    /// [`AmbiguousName`] when running boxes of the name are on more than
-    /// one host, or when none runs and records of it are on more than one
-    /// host. It lists every candidate with its host, and its state when
-    /// none runs.
+    /// [`AmbiguousName`] when boxes of the name, in any state, are on more
+    /// than one host. It lists every candidate with its host and state.
     pub fn resolve_across_hosts(
         hosts: &[(String, Vec<NamedBox>)],
         name: &str,
@@ -2452,22 +2575,7 @@ pub mod box_name {
             .map(|(host, boxes)| (host.as_str(), candidates(boxes, name)))
             .filter(|(_, found)| !found.is_empty())
             .collect();
-        let running: Vec<(&str, Vec<&NamedBox>)> = matched
-            .iter()
-            .map(|(host, found)| {
-                (
-                    *host,
-                    found.iter().copied().filter(|b| b.is_running()).collect(),
-                )
-            })
-            .filter(|(_, found): &(&str, Vec<&NamedBox>)| !found.is_empty())
-            .collect();
-        let (pool, is_running) = if running.is_empty() {
-            (matched, false)
-        } else {
-            (running, true)
-        };
-        match pool.as_slice() {
+        match matched.as_slice() {
             [] => Ok(None),
             [(host, found)] => {
                 let on_host: Vec<NamedBox> = found.iter().map(|b| (*b).clone()).collect();
@@ -2475,8 +2583,10 @@ pub mod box_name {
             }
             _ => Err(AmbiguousName {
                 name: name.to_string(),
-                running: is_running,
-                candidates: pool
+                running: matched
+                    .iter()
+                    .all(|(_, found)| found.iter().any(|b| b.is_running())),
+                candidates: matched
                     .iter()
                     .flat_map(|(host, found)| {
                         found.iter().map(move |b| Candidate {
@@ -2495,43 +2605,67 @@ pub mod box_name {
     /// events stay as they were.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum RenameRefusal {
-        /// A running box on the same host holds the new name.
-        HeldByRunning {
+        /// The new name breaks a naming rule (BOX-007). Exit 3.
+        NameRule(NameRuleRefusal),
+        /// Another box on the same host has the new name, in any state.
+        /// Exit 2.
+        Held {
             /// The name that was asked for.
             name: String,
-            /// The running box that holds it.
+            /// The box that has it.
             holder: BoxId,
             /// The holder's name, with the case it was given.
             holder_name: String,
+            /// The holder's state word (see [`NamedBox::state_word`]).
+            state: &'static str,
         },
-        /// The new name is the reserved name `self`.
-        Reserved,
     }
 
     impl RenameRefusal {
-        /// The exit code of the refusal.
+        /// The start of the text that says only that the name is taken.
+        pub const TAKEN_LEAD: &'static str = "The name `";
+
+        /// The end of the text that says only that the name is taken.
+        pub const TAKEN_TAIL: &'static str = "` is taken. Choose another name.";
+
+        /// The exit code of the refusal: 3 for a name that breaks a
+        /// naming rule, 2 for a name another box has.
         #[must_use]
         pub fn exit_code(&self) -> i32 {
-            REFUSAL_EXIT_CODE
+            match self {
+                Self::NameRule(refusal) => refusal.exit_code(),
+                Self::Held { .. } => REFUSAL_EXIT_CODE,
+            }
+        }
+
+        /// The text of the refusal for a caller who may not read the
+        /// holder: it says only that the name is taken. A name rule
+        /// refusal names no other box, so it is the same for every caller.
+        #[must_use]
+        pub fn hidden_text(&self) -> String {
+            match self {
+                Self::NameRule(refusal) => refusal.to_string(),
+                Self::Held { name, .. } => {
+                    format!("{}{name}{}", Self::TAKEN_LEAD, Self::TAKEN_TAIL)
+                }
+            }
         }
     }
 
     impl fmt::Display for RenameRefusal {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             match self {
-                Self::HeldByRunning {
+                Self::NameRule(refusal) => refusal.fmt(f),
+                Self::Held {
                     name,
                     holder,
                     holder_name,
+                    state,
                 } => write!(
                     f,
-                    "The running session `{holder_name}` ({holder}) holds the name `{name}`. \
+                    "The {state} session `{holder_name}` ({holder}) holds the name `{name}`. \
                      Rename it with `min box rename {holder} <new-name>`, \
                      or choose another name."
-                ),
-                Self::Reserved => write!(
-                    f,
-                    "The name `{RESERVED_NAME}` is reserved. Choose another name."
                 ),
             }
         }
@@ -2542,8 +2676,8 @@ pub mod box_name {
     impl From<RenameRefusal> for std::io::Error {
         fn from(refusal: RenameRefusal) -> Self {
             let kind = match refusal {
-                RenameRefusal::HeldByRunning { .. } => std::io::ErrorKind::AlreadyExists,
-                RenameRefusal::Reserved => std::io::ErrorKind::InvalidInput,
+                RenameRefusal::Held { .. } => std::io::ErrorKind::AlreadyExists,
+                RenameRefusal::NameRule(_) => std::io::ErrorKind::InvalidInput,
             };
             Self::new(kind, refusal)
         }
@@ -2564,29 +2698,150 @@ pub mod box_name {
     }
 
     /// Checks a rename of box `id` to `new_name` on the host whose
-    /// records are `boxes` (BOX-010).
+    /// records are `boxes` (BOX-010). The naming rules come first
+    /// (BOX-007), then the other boxes.
     ///
     /// # Errors
     ///
-    /// [`RenameRefusal::Reserved`] for `self` in any case, and
-    /// [`RenameRefusal::HeldByRunning`] when another running box on the
-    /// host holds a name that folds to `new_name`.
+    /// [`RenameRefusal::NameRule`] for a name that breaks a naming rule,
+    /// and [`RenameRefusal::Held`] when another box on the host, in any
+    /// state, has a name that folds to `new_name`.
     pub fn check_rename(
         boxes: &[NamedBox],
         id: BoxId,
         new_name: &str,
     ) -> Result<(), RenameRefusal> {
-        if new_name.eq_ignore_ascii_case(RESERVED_NAME) {
-            return Err(RenameRefusal::Reserved);
-        }
-        if let Some(holder) = running_holder(boxes, new_name, Some(id)) {
-            return Err(RenameRefusal::HeldByRunning {
+        check_written_name(new_name).map_err(RenameRefusal::NameRule)?;
+        if let Some(holder) = name_holder(boxes, new_name, Some(id)) {
+            return Err(RenameRefusal::Held {
                 name: new_name.to_string(),
                 holder: holder.id,
                 holder_name: holder.name.clone(),
+                state: holder.state_word(),
             });
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn named(n: u128, name: &str, status: BoxState) -> NamedBox {
+            NamedBox {
+                id: BoxId::from(uuid::Uuid::from_u128(n)),
+                name: name.to_string(),
+                status,
+            }
+        }
+
+        // BOX-007: a written name is one DNS label, not reserved and not
+        // of box-id form. Each refusal exits 3.
+        #[test]
+        fn written_name_rule() {
+            for good in ["dev", "Dev-2", "a", &"a".repeat(BOX_NAME_MAX), "my-self"] {
+                assert_eq!(check_written_name(good), Ok(()), "{good}");
+            }
+            let cases = [
+                ("", NameRule::NotDnsLabel),
+                (" dev", NameRule::NotDnsLabel),
+                ("dev\n", NameRule::NotDnsLabel),
+                ("-dev", NameRule::NotDnsLabel),
+                ("dev-", NameRule::NotDnsLabel),
+                ("de_v", NameRule::NotDnsLabel),
+                ("de.v", NameRule::NotDnsLabel),
+                (&"a".repeat(BOX_NAME_MAX + 1), NameRule::NotDnsLabel),
+                ("self", NameRule::Reserved("self")),
+                ("SELF", NameRule::Reserved("self")),
+                ("localhost", NameRule::Reserved("localhost")),
+                ("local", NameRule::Reserved("local")),
+                ("0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b", NameRule::BoxIdForm),
+                ("0192f3c45d6e7f809a1b2c3d4e5f6a7b", NameRule::BoxIdForm),
+            ];
+            for (bad, rule) in cases {
+                let refusal = check_written_name(bad).expect_err(bad);
+                assert_eq!(refusal.rule, rule, "{bad:?}");
+                assert_eq!(refusal.exit_code(), 3, "{bad:?}");
+                let text = refusal.to_string();
+                assert!(NameRuleRefusal::is_text(&text), "{text}");
+                assert!(!text.contains('\n'), "{text:?}");
+                assert!(text.ends_with(" Choose another name."), "{text}");
+            }
+            assert_eq!(
+                check_written_name("self").unwrap_err().to_string(),
+                "Cannot name a box `self`: the name `self` is reserved. Choose another name."
+            );
+            assert_eq!(
+                check_written_name("a b").unwrap_err().to_string(),
+                "Cannot name a box `a b`: a box name is 1 to 63 ASCII letters, digits \
+                 and `-`, with no `-` at either end. Choose another name."
+            );
+        }
+
+        // BOX-007, BOX-010: a rename tests the naming rules before it looks
+        // at any other box, and any box that has the name, in any state,
+        // refuses it with exit 2.
+        #[test]
+        fn rename_checks_the_name_rule_before_the_holder() {
+            let me = named(1, "me", BoxState::Active);
+            // A box named `self` cannot exist, but a rule refusal comes
+            // first even when the records say otherwise.
+            let odd = named(2, "self", BoxState::Active);
+            let refusal = check_rename(&[me.clone(), odd], me.id, "self").unwrap_err();
+            assert!(matches!(refusal, RenameRefusal::NameRule(_)), "{refusal:?}");
+            assert_eq!(refusal.exit_code(), 3);
+
+            for status in [
+                BoxState::Stopped,
+                BoxState::Exited,
+                BoxState::Active,
+                BoxState::Pending,
+            ] {
+                let other = named(3, "api", status);
+                let refusal = check_rename(&[me.clone(), other.clone()], me.id, "API").unwrap_err();
+                assert_eq!(
+                    refusal,
+                    RenameRefusal::Held {
+                        name: "API".to_string(),
+                        holder: other.id,
+                        holder_name: "api".to_string(),
+                        state: other.state_word(),
+                    }
+                );
+                assert_eq!(refusal.exit_code(), 2);
+                assert_eq!(
+                    refusal.hidden_text(),
+                    "The name `API` is taken. Choose another name."
+                );
+            }
+            // The box's own name, in another case, is free for it.
+            assert_eq!(check_rename(std::slice::from_ref(&me), me.id, "ME"), Ok(()));
+        }
+
+        // BOX-005: a name on more than one host is ambiguous in any state,
+        // even when one host runs a box of it.
+        #[test]
+        fn written_name_rule_ambiguity_counts_every_state() {
+            let hosts = vec![
+                ("a".to_string(), vec![named(1, "dev", BoxState::Active)]),
+                ("b".to_string(), vec![named(2, "dev", BoxState::Stopped)]),
+            ];
+            let err = resolve_across_hosts(&hosts, "dev").unwrap_err();
+            assert_eq!(err.candidates.len(), 2);
+            assert!(!err.running);
+            assert_eq!(err.exit_code(), 2);
+            let one = vec![(
+                "a".to_string(),
+                vec![
+                    named(1, "dev", BoxState::Stopped),
+                    named(2, "dev", BoxState::Active),
+                ],
+            )];
+            assert_eq!(
+                resolve_across_hosts(&one, "dev").unwrap(),
+                Some(("a".to_string(), named(2, "dev", BoxState::Active).id))
+            );
+        }
     }
 }
 
@@ -4194,8 +4449,8 @@ mod tests {
         }
 
         /// BOX-005: running boxes of the name on two hosts are ambiguous.
-        /// The refusal exits 2, lists each candidate with its host, and
-        /// picks none. A stopped box elsewhere does not join the list.
+        /// The refusal exits 2, lists each candidate with its host and
+        /// state, and picks none.
         #[test]
         fn unqualified_name_running_on_two_hosts_refused_exit2_lists_candidates() {
             let hosts = vec![
@@ -4210,10 +4465,6 @@ mod tests {
                     "local-minvmd0".to_string(),
                     vec![named(2, "dev", BoxState::Active)],
                 ),
-                (
-                    "remote0".to_string(),
-                    vec![named(3, "dev", BoxState::Exited)],
-                ),
             ];
             let err = resolve_across_hosts(&hosts, "dev").unwrap_err();
             assert_eq!(err.exit_code(), 2);
@@ -4223,6 +4474,12 @@ mod tests {
                     name: "dev".to_string(),
                     running: true,
                     candidates: vec![
+                        Candidate {
+                            host: "local0".to_string(),
+                            id: id(1),
+                            name: "dev".to_string(),
+                            state: "stopped",
+                        },
                         Candidate {
                             host: "local0".to_string(),
                             id: id(4),
@@ -4244,17 +4501,23 @@ mod tests {
                 "local-minvmd0",
                 &id(4).to_string(),
                 &id(2).to_string(),
+                "are running on more than one host",
             ] {
                 assert!(text.contains(want), "`{want}` missing from: {text}");
             }
-            assert!(!text.contains("remote0"), "{text}");
 
-            // One host runs it: that box answers, whatever the others keep.
-            let one_running = vec![hosts[0].clone(), hosts[2].clone()];
-            assert_eq!(
-                resolve_across_hosts(&one_running, "dev").unwrap(),
-                Some(("local0".to_string(), id(4)))
-            );
+            // One host runs it and another keeps an exited box of it: the
+            // name is ambiguous in any state (BOX-007).
+            let one_running = vec![
+                hosts[0].clone(),
+                (
+                    "remote0".to_string(),
+                    vec![named(3, "dev", BoxState::Exited)],
+                ),
+            ];
+            let err = resolve_across_hosts(&one_running, "dev").unwrap_err();
+            assert!(!err.running);
+            assert_eq!(err.candidates.len(), 3);
             // No host has it.
             assert_eq!(resolve_across_hosts(&hosts, "web").unwrap(), None);
         }
@@ -4303,7 +4566,7 @@ mod tests {
                 "local-minvmd0  ",
                 "stopped",
                 "exited",
-                "No box named `dev` is running",
+                "More than one host keeps a box named `dev`",
             ] {
                 assert!(text.contains(want), "`{want}` missing from: {text}");
             }
