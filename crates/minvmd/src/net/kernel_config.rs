@@ -29,6 +29,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Arc;
 
 use boxes::core::egress::{IPPROTO_TCP, IPPROTO_UDP};
 use boxes::{EgressPolicy, IpProto, SessionId};
@@ -190,6 +191,10 @@ pub(crate) struct KernelConfig {
     /// By session: the resident `host_ip` boxes' policies, in session order.
     members: BTreeMap<SessionId, MemberRules>,
     alias_inputs: AliasInputs,
+    /// The exposure list last given ([`Self::set_exposures`]), kept so a
+    /// list the exposure table hands out again unchanged is known as given
+    /// without comparing its entries.
+    exposures_from: Option<Arc<[HostExposure]>>,
     /// How many times an operation found the configuration different from
     /// the registry and it was rebuilt.
     divergences: u64,
@@ -230,6 +235,7 @@ impl KernelConfig {
             row_policies: BTreeMap::new(),
             members: BTreeMap::new(),
             alias_inputs: AliasInputs::default(),
+            exposures_from: None,
             divergences: 0,
         })
     }
@@ -490,6 +496,31 @@ impl KernelConfig {
         self.refresh_alias();
     }
 
+    /// Whether `open` is the exposure list last given, the same list the
+    /// exposure table handed out then.
+    pub(crate) fn holds_exposures(&self, open: &Arc<[HostExposure]>) -> bool {
+        // Identity, not contents: this relies on `HostExposures::current`
+        // handing back the same `Arc` while neither the table nor the
+        // listeners change.
+        self.exposures_from
+            .as_ref()
+            .is_some_and(|given| Arc::ptr_eq(given, open))
+    }
+
+    /// Sets the host exposures the alias opens at, as the exposure table
+    /// gives them with Minimal's own listeners' ports left out, and the
+    /// alias's state from them. Whether the configuration changed: `false`
+    /// when the list holds the exposures already set.
+    pub(crate) fn set_exposures(&mut self, open: &Arc<[HostExposure]>) -> bool {
+        self.exposures_from = Some(Arc::clone(open));
+        if self.alias_inputs.exposures.as_slice() == open.as_ref() {
+            return false;
+        }
+        self.alias_inputs.exposures = open.to_vec();
+        self.refresh_alias();
+        true
+    }
+
     /// Rebuilds the configuration from the registry's `rows` after `cause`
     /// showed it different from them: counted, logged, and each row built
     /// again from its kept policy by the builders a registration uses. The
@@ -547,6 +578,7 @@ impl KernelConfig {
         fresh.members = std::mem::take(&mut self.members);
         fresh.sync_members();
         fresh.alias_inputs = std::mem::take(&mut self.alias_inputs);
+        fresh.exposures_from = self.exposures_from.take();
         fresh.refresh_alias();
         fresh.config.adopt_baseline(
             self.config.sources.node_in_force(),
@@ -656,6 +688,23 @@ impl KernelConfig {
             assert!(same_rules(mine.rules.get(), theirs.rules.get()));
             assert_eq!(mine.resolves_names, theirs.resolves_names);
         }
+    }
+
+    /// Panics unless the alias's state is the one built from the node row's
+    /// `hostname_proxy` ports, which the registry holds, and from this
+    /// holder's own baseline ports and exposures, which no registry holds:
+    /// so this checks the hostname-proxy part, and the exposures rest on the
+    /// test that writes an exposure file and reads the kernel's arm.
+    pub(crate) fn assert_alias_built_from(&self, hostname_proxy: &[u16]) {
+        let want = alias_state(
+            hostname_proxy,
+            &self.alias_inputs.baseline_alias_ports,
+            &self.alias_inputs.exposures,
+        );
+        let alias = &self.config.alias;
+        assert_eq!(alias.node_ports, want.node_ports, "the alias's node ports");
+        assert_eq!(alias.held, want.held, "the alias's held ports");
+        assert_eq!(alias.exposures, want.exposures, "the alias's exposures");
     }
 
     /// The declaration of the registered row at `key`.
@@ -901,7 +950,7 @@ mod tests {
 
     use crate::box_registry::{BoxRegistration, BoxRegistry};
     use crate::net::answerer::DEFAULT_ANSWERER_PORT;
-    use crate::net::egress_gate::test_support::gate_decides;
+    use crate::net::egress_gate::test_support::{NC7_EXPOSURE, gate_decides};
 
     /// A /24 carved from the default block: the gateway is .1, the cohort
     /// .251, the proxy peer .252, the node .253 and the host alias .254.
@@ -1281,7 +1330,8 @@ mod tests {
     /// A configuration just made, with nothing registered and no baseline
     /// adopted, holds Minimal's own listeners' ports at the alias (the
     /// answerer's and the Box Egress Proxy's), as the gate's listeners always
-    /// have.
+    /// have: an exposure pushed at one of them is not open for the kernel's
+    /// arm, while one at another port is.
     #[test]
     fn a_new_configuration_holds_minimals_own_listener_ports_at_the_alias() {
         let fresh = KernelConfig::new(subnet()).expect("the subnet makes a plan");
@@ -1292,6 +1342,33 @@ mod tests {
             vec![held(DEFAULT_ANSWERER_PORT), held(proxy)]
         );
         assert!(fresh.config().alias.exposures.is_empty());
+
+        let row = at(9);
+        let registry = BoxRegistry::new(subnet());
+        registry.register(BoxRegistration::new("probe", row, Ipv4Addr::LOCALHOST));
+        registry.table().push_exposures(&Arc::from(vec![
+            HostExposure::tcp(proxy),
+            HostExposure::tcp(8080),
+        ]));
+        let alias_arm = |port: u16| {
+            let probe = probe(
+                "a SYN to the alias",
+                subnet().host_alias().octets(),
+                TCP,
+                port,
+            );
+            match registry
+                .kernel_for_tests()
+                .config()
+                .egress_first(&frame_of(row, &probe), APEX)
+            {
+                First::Frame { arm, .. } => arm,
+                other => panic!("a whole frame: {other:?}"),
+            }
+        };
+        let closed = netcore::split::Arm::Row(0, netcore::row::RowArm::AliasClosed);
+        assert_eq!(alias_arm(proxy), closed, "the proxy's port is held");
+        assert_ne!(alias_arm(8080), closed, "another exposed port is open");
     }
 
     #[test]
@@ -1396,8 +1473,9 @@ mod tests {
     /// mixed (10/8 and 198.51.100/24 allowed, 10.1/16 denied inside it, TCP
     /// and UDP only) and the written-out allow-all with its IPv6 half, in
     /// that order. The row is at 100.64.7.9 on 100.64.7.0/24: gateway .1,
-    /// proxy .252, node .253, alias .254. Filled by reading the gate, the
-    /// relay and the kernel, not by running them.
+    /// proxy .252, node .253, alias .254; the host exposes TCP 8080 at the
+    /// alias. Filled by reading the gate, the relay and the kernel, not by
+    /// running them.
     fn nc7_table() -> Vec<(Probe, [Said; 5])> {
         let gateway = [100, 64, 7, 1];
         let proxy = [100, 64, 7, 252];
@@ -1432,8 +1510,27 @@ mod tests {
             ),
             (probe("the proxy, TCP 3128", proxy, TCP, 3128), [LANE; 5]),
             (
-                probe("the alias, TCP 5432", [100, 64, 7, 254], TCP, 5432),
+                probe(
+                    "the alias, TCP 5432, no exposure",
+                    [100, 64, 7, 254],
+                    TCP,
+                    5432,
+                ),
                 [ALIAS; 5],
+            ),
+            // Open only to a row that names the host. An allow list that is
+            // absent or covers every address names it; the deny-all and the
+            // mixed rows do not (the alias is in none of their lists and
+            // they declare no DNS host), so the alias stays closed to them
+            // at the exposure too: their drops are not an exposure failing.
+            (
+                probe(
+                    "the alias, TCP 8080, an exposure",
+                    [100, 64, 7, 254],
+                    TCP,
+                    8080,
+                ),
+                [ADMIT, ADMIT, ALIAS, ALIAS, ADMIT],
             ),
             (
                 probe("link-local", [169, 254, 169, 254], TCP, 80),
@@ -1793,6 +1890,11 @@ mod tests {
             registration = registration.with_egress_policy(policy);
         }
         registry.register(registration);
+        // The exposure both sides decide under, given to the kernel where
+        // the frame path would give it.
+        registry
+            .table()
+            .push_exposures(&Arc::from(vec![NC7_EXPOSURE]));
         registry.assert_kernel_in_step();
         let frame = frame_of(row, probe);
         let relay = gate_decides(&registry, &frame).err();

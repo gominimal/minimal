@@ -673,6 +673,10 @@ impl<'a> AliasOpenings<'a> {
         // flow, so it records a listener that shadows an entry even when
         // the check below refuses the frame.
         let exposures = self.baseline.host_exposure_ports(&held);
+        // The network kernel's configuration takes the exposures where the
+        // frame path reads them, with no registry lock held. The two answers
+        // above are given without the table and do not depend on it.
+        self.table.push_exposures(&exposures);
         if held.iter().any(|holder| holder.holds_port(protocol, port)) {
             // Minimal's own listener, refused ahead of the exposures at
             // each flow (NET-162), even when a table entry names the port.
@@ -7900,18 +7904,23 @@ pub(crate) mod test_support {
     use crate::box_registry::BoxRegistry;
     use crate::net::baseline::NodePlaneBaseline;
 
+    /// The one host exposure NC7's frames are decided under: TCP 8080.
+    pub(crate) const NC7_EXPOSURE: crate::net::host_exposures::HostExposure =
+        crate::net::host_exposures::HostExposure::tcp(8080);
+
     /// The relay's decision for one frame a box sent, on `registry`'s table,
     /// in the relay's own order ([`super::relay_frames_to_switch`]): the
     /// frame's summary and L4 read as the relay reads them,
     /// [`super::gate_verdict`] called whole, and for an admit the deny-all
     /// DNS check under the relay's own condition (a UDP frame whose L4
     /// destination port is the resolver's, whose datagram can be taken).
-    /// The built-in baseline with no host exposure, an empty DNS admission
-    /// table and empty reply tables: no reply, refusal or pin admits
-    /// anything. `Ok` is an admit; a drop answers its rule.
+    /// The built-in baseline with one host exposure, [`NC7_EXPOSURE`], an
+    /// empty DNS admission table and empty reply tables: no reply, refusal
+    /// or pin admits anything. `Ok` is an admit; a drop answers its rule.
     pub(crate) fn gate_decides(registry: &BoxRegistry, frame: &[u8]) -> Result<(), &'static str> {
         let table = registry.table();
-        let baseline = NodePlaneBaseline::built_in(table.subnet());
+        let baseline =
+            NodePlaneBaseline::built_in(table.subnet()).with_host_exposure(vec![NC7_EXPOSURE]);
         let pins = crate::net::dns_pins::DnsPins::new(table.subnet());
         let summary = boxes::core::egress::summarize(frame);
         let l4 = crate::net::dns_pins::parse_ipv4_l4(frame);
@@ -17463,6 +17472,122 @@ mod tests {
             &dns_pins::DnsPins::new(SUBNET),
             &ReplyTables::new(),
         )
+    }
+
+    /// The network kernel's configuration takes the host exposures where the
+    /// frame path reads the exposure table: an entry written to the table
+    /// opens the alias at its port for the kernel's arm, and its removal
+    /// closes it, as does a listener of Minimal's that comes to hold the
+    /// port, each seen by the next frame to the alias.
+    #[test]
+    fn an_exposure_read_on_the_frame_path_opens_and_closes_the_alias_for_the_kernel() {
+        use netcore::row::RowArm;
+        use netcore::split::{Arm, First};
+
+        const APEX: &[u8] = b"\x03min\x08internal\x00";
+        // A whole TCP SYN from the row to the alias at 8080.
+        let alias = SUBNET.host_alias();
+        let mut frame = vec![0x52, 0x54, 0, 0, 0, 1, 0x52, 0x54, 0, 0, 0, 2, 0x08, 0x00];
+        frame.extend_from_slice(&[0x45, 0, 0, 40, 0, 0, 0, 0, 64, 6, 0, 0]);
+        frame.extend_from_slice(&LEASE);
+        frame.extend_from_slice(&alias.octets());
+        frame.extend_from_slice(&40000u16.to_be_bytes());
+        frame.extend_from_slice(&8080u16.to_be_bytes());
+        frame.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0, 0x50, 0x02, 0xff, 0xff, 0, 0, 0, 0]);
+
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(BoxRegistration::new(
+            "open",
+            Ipv4Addr::from(LEASE),
+            Ipv4Addr::LOCALHOST,
+        ));
+        let table = registry.table();
+        let record = table.by_source(LEASE).expect("the row is held");
+        let dir = TempDir::new().expect("temp dir");
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "[host-exposures]\nweb = { proto = \"tcp\", port = 8080 }\n",
+        )
+        .expect("the test writes its table");
+        let baseline = NodePlaneBaseline::built_in(SUBNET).with_host_exposures(
+            crate::net::host_exposures::HostExposures::at(config.clone(), Duration::ZERO),
+        );
+        let gate_opens =
+            || super::AliasOpenings::for_box(&baseline, &table, &record).admit(Some((6, 8080)));
+        let kernel_arm = || match registry
+            .kernel_for_tests()
+            .config()
+            .egress_first(&frame, APEX)
+        {
+            First::Frame { arm, .. } => arm,
+            other => panic!("not a frame: {other:?}"),
+        };
+
+        assert!(gate_opens(), "the gate opens the alias at the exposure");
+        assert!(
+            matches!(kernel_arm(), Arm::Row(_, RowArm::Rules)),
+            "the kernel's arm admits the row at the exposure"
+        );
+        assert_eq!(
+            registry.kernel_for_tests().config().alias.exposures,
+            vec![netcore::alias::Exposure {
+                proto: 6,
+                port: 8080
+            }]
+        );
+
+        std::fs::write(&config, "[host-exposures]\n").expect("the test empties its table");
+        assert!(
+            !gate_opens(),
+            "the gate closes the alias once the entry is gone"
+        );
+        assert!(
+            matches!(kernel_arm(), Arm::Row(_, RowArm::AliasClosed)),
+            "the kernel's arm closes the alias once the entry is gone"
+        );
+        assert!(
+            registry
+                .kernel_for_tests()
+                .config()
+                .alias
+                .exposures
+                .is_empty()
+        );
+        registry.assert_kernel_in_step();
+
+        // The entry back, open again; then the node's row comes to hold its
+        // port, as the hostname proxy's: the next frame to the alias hands
+        // over a list without it, and the kernel's arm closes the alias.
+        std::fs::write(
+            &config,
+            "[host-exposures]\nweb = { proto = \"tcp\", port = 8080 }\n",
+        )
+        .expect("the test writes its table again");
+        assert!(
+            gate_opens(),
+            "the gate opens the alias at the exposure again"
+        );
+        assert!(matches!(kernel_arm(), Arm::Row(_, RowArm::Rules)));
+        registry.register_node_namespace(8080);
+        assert!(
+            !gate_opens(),
+            "the gate refuses the port the node's listener holds"
+        );
+        assert!(
+            matches!(kernel_arm(), Arm::Row(_, RowArm::AliasClosed)),
+            "the kernel's arm closes the alias at a port a listener holds"
+        );
+        assert!(
+            registry
+                .kernel_for_tests()
+                .config()
+                .alias
+                .exposures
+                .is_empty(),
+            "the list handed over no longer has the held port"
+        );
+        registry.assert_kernel_in_step();
     }
 
     /// A box with its own address, an allow-all one included, reaches the

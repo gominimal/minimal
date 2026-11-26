@@ -70,6 +70,7 @@ use boxes::{DynamicIngress, EgressPolicy, IpProto};
 use switch::SwitchSubnet;
 
 use crate::bep_attach::BoxId;
+use crate::net::host_exposures::HostExposure;
 use crate::net::kernel_config::{Diverged, KernelConfig, MemberFacts, RowFacts, RowShape};
 
 /// The per-row cap on runtime-admitted ports (NET-138): the row's
@@ -7511,6 +7512,7 @@ impl BoxRegistry {
             revoking: Arc::clone(&self.revoking),
             row_epoch: Arc::clone(&self.row_epoch),
             mirror_ledger: Arc::clone(&self.mirror_ledger),
+            kernel: Arc::clone(&self.kernel),
         }
     }
 
@@ -7798,6 +7800,15 @@ impl BoxRegistry {
     #[cfg(test)]
     pub(crate) fn assert_kernel_in_step(&self) {
         let rebuilt = self.kernel_from_registry();
+        // The node row's ports, read before the configuration's lock is
+        // taken, which is never held above a registry lock.
+        let node_ports: Vec<u16> = self
+            .rows
+            .read()
+            .expect("the row lock is never held across a panic")
+            .get(&self.subnet.daemon_ip().octets())
+            .map(|node| node.admitted_ports().to_vec())
+            .unwrap_or_default();
         let live = self
             .kernel
             .read()
@@ -7808,6 +7819,12 @@ impl BoxRegistry {
             "the kernel's configuration never differed from the registry"
         );
         live.assert_in_step_with(&rebuilt);
+        // The alias's exposures and baseline ports are compared with the
+        // holder's own inputs, which no registry holds: this checks the
+        // hostname-proxy part, taken from the node row the registry holds,
+        // and the exposures rest on the test that writes an exposure file
+        // and reads the kernel's arm.
+        live.assert_alias_built_from(&node_ports);
     }
 
     /// A `host_ip` box's policy from its client's declared one, filled under
@@ -9618,9 +9635,33 @@ pub struct BoxTable {
     revoking: Arc<Revoking>,
     row_epoch: Arc<AtomicU64>,
     mirror_ledger: MirrorLedgerSlot,
+    /// The network kernel's configuration the registry keeps, shared.
+    kernel: Arc<RwLock<KernelConfig>>,
 }
 
 impl BoxTable {
+    /// Gives the network kernel's configuration the host exposures the
+    /// frame path read from the exposure table (`open`, with Minimal's own
+    /// listeners' ports left out). Called where the frame path reads the
+    /// table, with no registry lock held: the configuration's lock is taken
+    /// alone, for reading to see whether `open` is the list already given,
+    /// and for writing only when it is not. Whether the configuration
+    /// changed.
+    pub(crate) fn push_exposures(&self, open: &Arc<[HostExposure]>) -> bool {
+        let given = self
+            .kernel
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .holds_exposures(open);
+        if given {
+            return false;
+        }
+        self.kernel
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_exposures(open)
+    }
+
     /// Leaves the egress gate's publish ledger for the node mirror's binder
     /// (NET-138). The gate calls it when it starts, and a later gate's
     /// ledger replaces an earlier one's.
