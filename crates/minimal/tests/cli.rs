@@ -1785,7 +1785,7 @@ async fn box_spec_entry_warns_on_a_loadout_only_secret_name() {
     );
     let line = format!(
         "warning: the variable GH_TOKEN in `env_vars` has a name that looks like a \
-         secret's. the loadout `gh` sets it, in {}. A box from this entry stores its \
+         secret's. The loadout `gh` sets it, in {}. A box from this entry stores its \
          value as written in the box's spec. Put a secret value in a `[secrets]` \
          entry to keep it out of the spec.\n",
         gh.display()

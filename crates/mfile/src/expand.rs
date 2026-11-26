@@ -284,6 +284,20 @@ impl StoredVar {
     }
 }
 
+/// `label` with its first character in upper case when that character is
+/// an ASCII lower-case letter. A label that starts with a backtick, such as
+/// "`[sessions.dev]` in minimal.toml", is unchanged.
+fn sentence_start(label: &str) -> std::borrow::Cow<'_, str> {
+    match label.as_bytes().first() {
+        Some(c) if c.is_ascii_lowercase() => {
+            let mut s = label.to_owned();
+            s[..1].make_ascii_uppercase();
+            std::borrow::Cow::Owned(s)
+        }
+        _ => std::borrow::Cow::Borrowed(label),
+    }
+}
+
 impl std::fmt::Display for SecretNameWarning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -291,11 +305,14 @@ impl std::fmt::Display for SecretNameWarning {
             "the variable {} in `env_vars` has a name that looks like a secret's. ",
             self.name
         )?;
+        // The label starts a sentence here. Other messages use the same
+        // label mid-sentence, so the label builders keep it lower case.
+        let layer = sentence_start(&self.layer);
         match (&self.origin.layer, &self.file) {
             (Layer::Loadouts, Some(file)) => {
-                write!(f, "{} sets it, in {}. ", self.layer, file.display())?;
+                write!(f, "{layer} sets it, in {}. ", file.display())?;
             }
-            _ => write!(f, "{} sets it. ", self.layer)?,
+            _ => write!(f, "{layer} sets it. ")?,
         }
         // BOX-230 stores the value as written. An inherit with no default
         // has no value in the spec, so the text says what the spec holds.
@@ -4125,7 +4142,7 @@ mod tests {
         );
         assert!(
             text[1].contains(&format!(
-                "the loadout `gh` sets it, in {}. ",
+                "The loadout `gh` sets it, in {}. ",
                 path.display()
             )),
             "{}",
@@ -4139,7 +4156,7 @@ mod tests {
         let e = expand_in(file, "dev", builtin).unwrap();
         let w = &e.report.secret_name_warnings[1];
         assert_eq!((w.name.as_str(), w.file.as_ref()), ("MY_SECRET", None));
-        assert!(w.to_string().contains("the loadout `l` sets it. "), "{w}");
+        assert!(w.to_string().contains("The loadout `l` sets it. "), "{w}");
         // An inherit stores no value, so the text does not say "as written".
         let inherit = expand_in(
             "[sessions.dev]\nenv_vars = { GH_TOKEN = { inherit = true }, \
