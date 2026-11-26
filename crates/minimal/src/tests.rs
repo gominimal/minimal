@@ -4279,6 +4279,24 @@ fn unattached_create_numbered_prints_one_stderr_line() {
         assert!(!line.contains('\n'), "one line: {line}");
     }
 
+    // A running box that runs until stopped still gets the restart
+    // sentence: the verb follows the stored spec, not the state.
+    let running = numbered_reply(
+        "dev-1",
+        minimald_rpc::NameNotTaken {
+            name: "dev".to_string(),
+            reason: held_by("dev", "running"),
+        },
+    );
+    assert_eq!(
+        numbered_line_for_start(false, &running, Some(HolderVerb::Restart)).as_deref(),
+        Some(
+            "The box is named dev-1, because the name dev is taken. The running box \
+             dev (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) has it. Run min box restart \
+             dev to start it again. Run min box prune to remove stopped boxes."
+        )
+    );
+
     // A box that took the name it derived prints nothing.
     let mut first = reply.clone();
     first.name_not_taken = None;
