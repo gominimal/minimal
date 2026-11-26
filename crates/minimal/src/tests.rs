@@ -4100,10 +4100,9 @@ fn numbered_reply(
     took: &str,
     not_taken: minimald_rpc::NameNotTaken,
 ) -> minimald_rpc::CreateSessionResponse {
-    let mut reply: minimald_rpc::CreateSessionResponse = serde_json_lenient::from_str(
-        r#"{"id":"0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7c"}"#,
-    )
-    .expect("a create reply needs only its id");
+    let mut reply: minimald_rpc::CreateSessionResponse =
+        serde_json_lenient::from_str(r#"{"id":"0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7c"}"#)
+            .expect("a create reply needs only its id");
     reply.name = Some(took.to_string());
     reply.name_not_taken = Some(not_taken);
     reply
