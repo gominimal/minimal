@@ -19883,10 +19883,7 @@ async fn box_spec_renders_formats_secrets_as_refs() {
     // The built-in `default` loadout folds its `env_vars` into the spec
     // before `network` (BCLI-021).
     assert!(yaml.contains("\nspec:\n  env_vars:\n"), "{yaml}");
-    assert!(
-        yaml.contains("\n  network:\n    mode: host_ip\n"),
-        "{yaml}"
-    );
+    assert!(yaml.contains("\n  network:\n    mode: host_ip\n"), "{yaml}");
     assert!(yaml.ends_with("\ntype: session\n"), "{yaml}");
     assert!(
         yaml.contains("  packages:\n    - curl\n    - git\n"),
