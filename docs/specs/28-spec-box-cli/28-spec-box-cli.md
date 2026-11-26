@@ -174,6 +174,10 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
 - **BCLI-017** WHEN `min init` runs with no entry THE SYSTEM SHALL scaffold a `minimal.toml` in the entry-based shape.
   tier:     T0
   verify:   cargo nextest run -p minimal init_scaffolds_entry_shape
+  - WHEN `min init` runs with no entry THE SYSTEM SHALL name the session entry of the scaffold `default`.
+    <!-- event-driven; BOX-211 gives the bare project name only to the entry `default`, so the first box of a new project is `<project>`. A `minimal.toml` that already declares another session entry keeps it: nothing rewrites an existing file -->
+    tier:   T0
+    verify: cargo nextest run -p minimal init_scaffolds_entry_shape
 
 - **BCLI-018** WHEN `min init <entry> --type <type>` runs THE SYSTEM SHALL append that one entry.
   tier:     T0
