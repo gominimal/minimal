@@ -3403,10 +3403,22 @@ async fn start_with_a_box_for_the_path_prints_no_warning() {
         let (stdout, stderr) = (read(out), read(err));
         result
             .unwrap_or_else(|e| panic!("{verb:?} round {round}: the start fails: {e:#}\n{stderr}"));
-        assert_eq!(
-            stderr, "",
-            "{verb:?} round {round}: the start prints nothing on stderr"
-        );
+        // The first start takes the derived name. The later two take a
+        // number, and an unattached start says so in one line (BCLI-081).
+        // Nothing else reaches stderr.
+        if round == 0 {
+            assert_eq!(
+                stderr, "",
+                "{verb:?} round {round}: the start prints nothing on stderr"
+            );
+        } else {
+            assert!(
+                stderr.starts_with("The box is named ")
+                    && stderr.ends_with(" Run min box prune to remove stopped boxes.\n")
+                    && stderr.matches('\n').count() == 1,
+                "{verb:?} round {round}: the start prints only the numbered line: {stderr:?}"
+            );
+        }
         let id = stdout
             .strip_suffix('\n')
             .unwrap_or_else(|| panic!("{verb:?} round {round}: stdout is one line: {stdout:?}"));
@@ -3484,7 +3496,7 @@ async fn unattached_start_closes_stdin_and_hints_run_logs_wait() {
     let text = std::fs::read_to_string(manifest.join("src/cmd/boxes/create.rs")).unwrap();
     let body = function_body(&text, "start_entry").expect("create.rs defines start_entry");
     for step in [
-        "let id = crate::task::run_entry(global, run).await?;",
+        "let id = crate::task::run_entry(global, run)",
         "crate::output::record_box_id(&id.to_string());",
         "unattached_start_hint(&entry, id)",
     ] {
