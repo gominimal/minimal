@@ -20433,10 +20433,10 @@ async fn box_spec_renders_formats_secrets_as_refs() {
         yaml.starts_with("entry: default\nloadouts:\n  - default\nschema: min/v1/spec\nsources:\n"),
         "{yaml}"
     );
-    assert!(
-        yaml.contains("\nspec:\n  network:\n    mode: host_ip\n"),
-        "{yaml}"
-    );
+    // The built-in `default` loadout folds its `env_vars` into the spec
+    // before `network` (BCLI-021).
+    assert!(yaml.contains("\nspec:\n  env_vars:\n"), "{yaml}");
+    assert!(yaml.contains("\n  network:\n    mode: host_ip\n"), "{yaml}");
     assert!(yaml.ends_with("\ntype: session\n"), "{yaml}");
     assert!(
         yaml.contains("  packages:\n    - curl\n    - git\n"),
@@ -21139,6 +21139,12 @@ async fn box_spec_entry_loadouts_resolve_as_start() {
     .expect("the entry renders");
     let doc: serde_json_lenient::Value = serde_json_lenient::from_str(&json).expect("JSON");
     assert_eq!(doc["loadouts"], serde_json_lenient::json!(["dev"]));
+    // BCLI-021: the loadout's packages are in the spec, after the entry's.
+    assert_eq!(
+        doc["spec"]["packages"],
+        serde_json_lenient::json!(["git", "helix"]),
+        "{json}"
+    );
     let yaml = box_spec_text(
         &global,
         &[
@@ -21188,6 +21194,222 @@ async fn box_spec_entry_loadouts_resolve_as_start() {
     .await
     .expect_err("the spec fails");
     assert_eq!(format!("{error:#}"), format!("{expected:#}"));
+}
+
+// BCLI-021, BCLI-077: `min box spec <entry>` folds each selected loadout
+// into the spec it renders, as `min box start` folds it into the spec it
+// stores. Each package and variable a loadout adds names that loadout.
+#[tokio::test]
+async fn box_spec_entry_folds_selected_loadouts_as_start() {
+    let (project, global) = spec_project(
+        "[sessions.default]\npackages = [\"git\"]\n\
+         env_vars = { EDITOR = \"vi\" }\n\
+         lifecycle_hooks = [{ on_activate = { type = \"inline\", value = \"echo project\" } }]\n",
+    );
+    let loadouts = global.config_dir.clone().unwrap().join("minimal/loadouts");
+    std::fs::create_dir_all(&loadouts).unwrap();
+    std::fs::write(
+        loadouts.join("dev.toml"),
+        "packages = [\"helix\"]\n\
+         [env_vars]\nPAGER = \"less\"\n\
+         [[lifecycle_hooks]]\non_activate = { type = \"inline\", value = \"echo dev\" }\n",
+    )
+    .unwrap();
+
+    let json = box_spec_text(
+        &global,
+        &[
+            "min",
+            "box",
+            "spec",
+            "default",
+            "--loadout",
+            "dev",
+            "-o",
+            "json",
+        ],
+    )
+    .await
+    .expect("the entry renders");
+    let doc: serde_json_lenient::Value = serde_json_lenient::from_str(&json).expect("JSON");
+    let spec = &doc["spec"];
+    assert_eq!(
+        spec["packages"],
+        serde_json_lenient::json!(["git", "helix"])
+    );
+    assert_eq!(spec["env_vars"]["EDITOR"], "vi", "{json}");
+    assert_eq!(spec["env_vars"]["PAGER"], "less", "{json}");
+    assert_eq!(
+        doc["sources"]["env_vars.PAGER"],
+        serde_json_lenient::json!(["loadout dev"]),
+        "{json}"
+    );
+    assert_eq!(
+        doc["sources"]["env_vars.EDITOR"],
+        serde_json_lenient::json!(["[sessions.default]"]),
+        "{json}"
+    );
+
+    // The same keys as the spec a start with the same loadout stores.
+    let root = camino::Utf8Path::from_path(project.path()).expect("a UTF-8 project path");
+    let cfg = crate::config::read_client_config(&global).unwrap();
+    let selected = crate::SelectedLoadouts {
+        loadouts: crate::loadouts::resolve_active_loadouts(
+            crate::loadouts::LoadoutSelection::from_flags(&["dev".to_owned()], false),
+            &cfg,
+            &global,
+        )
+        .expect("the loadout resolves")
+        .loadouts,
+        ignore: None,
+    };
+    let start = crate::session_box_expansion(root, Some("default"), true, &selected)
+        .expect("the entry expands")
+        .expect("the project declares the entry");
+    for key in ["packages", "env_vars", "lifecycle_hooks"] {
+        let started = serde_json_lenient::to_value(&start.spec[key]).unwrap();
+        assert_eq!(spec[key], started, "{key}: {json}");
+    }
+
+    let toml = box_spec_text(
+        &global,
+        &["min", "box", "spec", "default", "--loadout", "dev"],
+    )
+    .await
+    .expect("the entry renders");
+    assert!(
+        toml.contains("\n# env_vars.PAGER: from loadout dev\n"),
+        "{toml}"
+    );
+
+    // BCLI-075: `--no-loadouts` selects none, so nothing of `dev` folds in.
+    let json = box_spec_text(
+        &global,
+        &[
+            "min",
+            "box",
+            "spec",
+            "default",
+            "--no-loadouts",
+            "-o",
+            "json",
+        ],
+    )
+    .await
+    .expect("the entry renders");
+    let doc: serde_json_lenient::Value = serde_json_lenient::from_str(&json).expect("JSON");
+    assert_eq!(doc["loadouts"], serde_json_lenient::json!([]), "{json}");
+    assert_eq!(doc["spec"]["packages"], serde_json_lenient::json!(["git"]));
+    assert!(doc["spec"]["env_vars"].get("PAGER").is_none(), "{json}");
+}
+
+// BCLI-021, BCLI-075: with no loadout on disk and no `default_loadouts`,
+// `min box spec <entry>` folds in the built-in `default` loadout, as the
+// start does, and names it. `--no-loadouts` leaves it out.
+#[tokio::test]
+async fn box_spec_entry_shows_builtin_default_loadout() {
+    let (_project, global) = spec_project("[sessions.default]\npackages = [\"git\"]\n");
+
+    let json = box_spec_text(&global, &["min", "box", "spec", "default", "-o", "json"])
+        .await
+        .expect("the entry renders");
+    let doc: serde_json_lenient::Value = serde_json_lenient::from_str(&json).expect("JSON");
+    assert_eq!(doc["loadouts"], serde_json_lenient::json!(["default"]));
+    assert_eq!(doc["spec"]["env_vars"]["PS1"], "minimal:\\w\\$ ", "{json}");
+    assert_eq!(
+        doc["sources"]["env_vars.PS1"],
+        serde_json_lenient::json!(["loadout default"]),
+        "{json}"
+    );
+
+    let json = box_spec_text(
+        &global,
+        &[
+            "min",
+            "box",
+            "spec",
+            "default",
+            "--no-loadouts",
+            "-o",
+            "json",
+        ],
+    )
+    .await
+    .expect("the entry renders");
+    let doc: serde_json_lenient::Value = serde_json_lenient::from_str(&json).expect("JSON");
+    assert_eq!(doc["loadouts"], serde_json_lenient::json!([]));
+    assert!(doc["spec"].get("env_vars").is_none(), "{json}");
+    let toml = box_spec_text(&global, &["min", "box", "spec", "default", "--no-loadouts"])
+        .await
+        .expect("the entry renders");
+    assert!(toml.contains("\n# Loadouts: none.\n"), "{toml}");
+}
+
+// BCLI-076: with `--no-hooks`, `min box spec <entry>` renders no lifecycle
+// hook, from the project or from a loadout. Without it, both render.
+#[tokio::test]
+async fn box_spec_entry_no_hooks_renders_no_hook() {
+    let (_project, global) = spec_project(
+        "[sessions.default]\n\
+         lifecycle_hooks = [{ on_activate = { type = \"inline\", value = \"echo project\" } }]\n",
+    );
+    let loadouts = global.config_dir.clone().unwrap().join("minimal/loadouts");
+    std::fs::create_dir_all(&loadouts).unwrap();
+    std::fs::write(
+        loadouts.join("dev.toml"),
+        "[[lifecycle_hooks]]\non_activate = { type = \"inline\", value = \"echo dev\" }\n",
+    )
+    .unwrap();
+
+    let json = box_spec_text(
+        &global,
+        &[
+            "min",
+            "box",
+            "spec",
+            "default",
+            "--loadout",
+            "dev",
+            "-o",
+            "json",
+        ],
+    )
+    .await
+    .expect("the entry renders");
+    let doc: serde_json_lenient::Value = serde_json_lenient::from_str(&json).expect("JSON");
+    let hooks = doc["spec"]["lifecycle_hooks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("hooks render: {json}"));
+    assert_eq!(hooks.len(), 2, "{json}");
+
+    for argv in [
+        &[
+            "min",
+            "box",
+            "spec",
+            "default",
+            "--loadout",
+            "dev",
+            "--no-hooks",
+            "-o",
+            "json",
+        ][..],
+        &[
+            "min",
+            "box",
+            "spec",
+            "default",
+            "--loadout",
+            "dev",
+            "--no-hooks",
+        ][..],
+    ] {
+        let text = box_spec_text(&global, argv)
+            .await
+            .expect("the entry renders");
+        assert!(!text.contains("lifecycle_hooks"), "{argv:?}: {text}");
+        assert!(!text.contains("echo"), "{argv:?}: {text}");
+    }
 }
 
 /// The project file error that a start ends with. It keeps the start text.

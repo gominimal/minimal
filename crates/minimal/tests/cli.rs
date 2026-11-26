@@ -1746,6 +1746,62 @@ async fn box_spec_entry_prints_secret_name_warnings_on_stderr() {
     assert_eq!(doc["spec"]["env_vars"]["GITHUB_TOKEN"], "x", "{stdout}");
 }
 
+/// BCLI-084, BCLI-077, BOX-231: a variable that only a selected loadout
+/// sets is in the spec `min box spec <entry>` renders, so its stderr
+/// warning names the loadout and the loadout's file. stdout stays the
+/// spec.
+#[tokio::test]
+async fn box_spec_entry_warns_on_a_loadout_only_secret_name() {
+    let (_daemon, args) = setup().await;
+    let minimal_dir = args.minimal_dir.clone().expect("setup points at a tempdir");
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "[sessions.dev]\nenv_vars = { EDITOR = \"hx\" }\n",
+    )
+    .unwrap();
+    let config_dir = tempfile::TempDir::new().unwrap();
+    let loadouts = config_dir.path().join("minimal/loadouts");
+    std::fs::create_dir_all(&loadouts).unwrap();
+    let gh = loadouts.join("gh.toml");
+    std::fs::write(&gh, "[env_vars]\nGH_TOKEN = \"x\"\n").unwrap();
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .current_dir(project.path())
+        .env("MIN_PROVIDER", "local")
+        .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
+        .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+        .arg("--no-input")
+        .args(["box", "spec", "dev", "--loadout", "gh", "-o", "json"])
+        .env_remove("RUST_LOG")
+        .output()
+        .await
+        .expect("the min binary should be invocable");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "min box spec dev --loadout gh: stdout={stdout} stderr={stderr}"
+    );
+    let line = format!(
+        "warning: the variable GH_TOKEN in `env_vars` has a name that looks like a \
+         secret's. The loadout `gh` sets it, in {}. A box from this entry stores its \
+         value as written in the box's spec. Put a secret value in a `[secrets]` \
+         entry to keep it out of the spec.\n",
+        gh.display()
+    );
+    assert_eq!(
+        stderr.matches(&line).count(),
+        1,
+        "one warning line on stderr: {stderr}"
+    );
+    assert_eq!(stderr.matches("warning:").count(), 1, "{stderr}");
+    let doc: serde_json_lenient::Value =
+        serde_json_lenient::from_str(stdout.trim()).expect("stdout parses as JSON");
+    assert_eq!(doc["spec"]["env_vars"]["GH_TOKEN"], "x", "{stdout}");
+    assert_eq!(doc["spec"]["env_vars"]["EDITOR"], "hx", "{stdout}");
+}
+
 // --- box rm (BCLI-042 removed `min session destroy`) ---
 
 #[tokio::test]
