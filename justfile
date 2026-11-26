@@ -158,11 +158,68 @@ initramfs-nodocker:
 #
 # Build minvmd and bep (debug); codesign is the last touch.
 [macos]
-minvmd-build:
-    cargo build -p bep --bin bep --locked
-    codesign --force -s "${BEP_CODESIGN_IDENTITY:--}" {{minvmd-dir}}/bep
+minvmd-build: bep-build
     cargo build -p minvmd --bin minvmd --locked
     codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - {{minvmd-bin}}
+
+# Build bep (debug) and sign it, ad hoc unless BEP_CODESIGN_IDENTITY is set.
+[macos]
+bep-build:
+    cargo build -p bep --bin bep --locked
+    codesign --force -s "${BEP_CODESIGN_IDENTITY:--}" {{minvmd-dir}}/bep
+
+# The recovery when bep refuses to start or prompts for the Keychain: after
+# a rebuild changes an ad-hoc-signed bep, the Keychain refuses or prompts it
+# for the keys and secrets the old binary made, or a start killed mid-way
+# left a role without a key. It builds bep first, so the keys belong to the
+# binary minvmd starts. With no ROLES it replaces all three (sealing, root,
+# signing). Then it asks again for each secret the new bep cannot read;
+# `min secret set` with no rule flag keeps the secret's rule. `restart`
+# reaps this checkout's VMs, which ends running boxes, and runs `just up`,
+# or `just up-nodocker` when `nodocker` is given or no Docker daemon answers
+# `docker info`. A full `up` rebuilds the guest minimald too, so a `min`
+# rebuilt here at a newer commit does not refuse the old daemon.
+# Values sealed to the old keys stop working, so boxes created before must
+# be re-created.
+#
+# Replace the Box Egress Proxy's keys, store unreadable secrets again (`restart` also restarts the stack).
+[macos]
+bep-replace-keys *args: bep-build minimal-cli
+    #!/usr/bin/env sh
+    set -e
+    roles=""
+    restart=""
+    up=""
+    for arg in {{args}}; do
+      case "$arg" in
+        restart) restart=1 ;;
+        nodocker) up=up-nodocker ;;
+        sealing|root|signing) roles="$roles $arg" ;;
+        *) echo "Unknown argument $arg. Give sealing, root, signing, restart or nodocker." >&2; exit 2 ;;
+      esac
+    done
+    for role in ${roles:-sealing root signing}; do
+      "{{minvmd-dir}}/bep" --replace-key "$role"
+    done
+    unreadable=$("{{min-bin}}" secret list | awk '/^[^ ]/ { id = $1 } /proxy reads it freely: no/ { print id }')
+    for id in $unreadable; do
+      echo "The proxy cannot read the secret $id. Enter its value to store it again."
+      "{{min-bin}}" secret set "$id"
+    done
+    running=$("{{min-bin}}" ls | awk '$4 == "running" { print $2 " (" $1 ")" }' || true)
+    if [ -n "$running" ]; then
+      echo "These boxes hold values sealed to the old keys. Re-create each one:"
+      echo "$running" | sed 's/^/  /'
+    fi
+    if [ -z "$up" ]; then
+      if docker info >/dev/null 2>&1; then up=up; else up=up-nodocker; fi
+    fi
+    if [ -n "$restart" ]; then
+      "{{just_executable()}}" reap
+      "{{just_executable()}}" "$up"
+    else
+      echo "Run \`just reap\` then \`just $up\`, so minvmd starts the proxy with the new keys."
+    fi
 
 # The same target and linkage the release ships, so the dev stack exercises
 # what users run. MINVMD_REQUIRE_LIBKRUN makes a missing libkrun.a an error
