@@ -236,9 +236,9 @@ impl std::error::Error for BoxAddressRefusal {}
 
 /// Resolves `address` over what each local host answered.
 ///
-/// A full id resolves to the host that lists it. A name resolves to the
-/// running box that holds it. With none running, it resolves to the most
-/// recent box that held it, when all of those are on one host. Else the
+/// A full id resolves to the host that lists it. A name resolves only when
+/// the boxes that have it, in any state, are all on one host: to the
+/// running one there, else the most recent one. Else the
 /// start of an id resolves to the one box whose id starts with it. An
 /// unqualified address that is not a listed full id resolves nothing while
 /// any host does not answer, because the box can be on that host.
@@ -318,7 +318,7 @@ pub(crate) fn resolve_box_address(
             .filter_map(|l| l.boxes.as_ref().ok().map(|boxes| (l, boxes)))
     };
 
-    // Each host's boxes that hold the name, running first.
+    // Each host's boxes that hold the name, in any state.
     let named: Vec<(&HostListing, Vec<&minimald_rpc::BoxListingEntry>)> = answered()
         .map(|(l, boxes)| {
             let matches: Vec<_> = boxes.iter().filter(|e| holds_name(e, address)).collect();
@@ -326,39 +326,18 @@ pub(crate) fn resolve_box_address(
         })
         .filter(|(_, matches)| !matches.is_empty())
         .collect();
-    let running: Vec<_> = named
-        .iter()
-        .filter(|(_, matches)| matches.iter().any(|e| e.state == "running"))
-        .collect();
-    let candidates = |hosts: &[&(&HostListing, Vec<&minimald_rpc::BoxListingEntry>)],
-                      only_running: bool| {
-        hosts
-            .iter()
-            .flat_map(|(l, matches)| {
-                matches
-                    .iter()
-                    .filter(move |e| !only_running || e.state == "running")
-                    .map(|e| candidate(l, e))
-            })
-            .collect::<Vec<_>>()
-    };
-    let chosen = match running.as_slice() {
-        [one] => Some(*one),
-        [] => match named.as_slice() {
-            [one] => Some(one),
-            [] => None,
-            several => {
-                let all: Vec<_> = several.iter().collect();
-                return Err(BoxAddressRefusal::Ambiguous {
-                    name: address.to_owned(),
-                    candidates: candidates(&all, false),
-                });
-            }
-        },
+    // BCLI-002, BOX-005: a name that boxes on more than one host have, in
+    // any state, chooses none of them, even when one host runs its box.
+    let chosen = match named.as_slice() {
+        [one] => Some(one),
+        [] => None,
         several => {
             return Err(BoxAddressRefusal::Ambiguous {
                 name: address.to_owned(),
-                candidates: candidates(several, true),
+                candidates: several
+                    .iter()
+                    .flat_map(|(l, matches)| matches.iter().map(|e| candidate(l, e)))
+                    .collect(),
             });
         }
     };

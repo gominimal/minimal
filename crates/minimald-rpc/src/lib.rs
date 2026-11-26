@@ -2504,8 +2504,13 @@ pub struct CreateSessionRequest {
     /// Whether the create asks for a fresh instance (BOX-163). The daemon
     /// names the box `<name>-<n>`, with the smallest `n` that no retained
     /// record on the host uses, and never refuses it for a held name.
+    /// Nobody wrote `<name>-<n>`, so a reserved or box-id-form `<name>`
+    /// takes a number too (`local` becomes `local-1`). Only a `<name>`
+    /// that is not one DNS label refuses it, with [`NAME_RULE_EXIT_CODE`].
     /// `false`, the default, names the box `<name>`. A requested name
-    /// that a running box holds refuses the create ([`HeldNameRefusal`]).
+    /// that any retained box has, in any state, refuses the create
+    /// ([`HeldNameRefusal`]), and one that breaks a naming rule refuses
+    /// it with [`NAME_RULE_EXIT_CODE`].
     /// A derived name is never refused: when a retained record in any
     /// state has it, or it is reserved or of box-id form, the box takes
     /// the smallest free `<name>-<n>`, and the reply's
@@ -2515,24 +2520,65 @@ pub struct CreateSessionRequest {
     pub fresh_instance: bool,
 }
 
-/// The refusal of a [`CreateSession`] whose name a running box on the host
-/// holds (BOX-163). It names the holder, as a rename's refusal does
-/// (BOX-010). The daemon sends its [`Display`](std::fmt::Display) text as
-/// the reply's error, and a client reads the holder back with
-/// [`Self::from_error`], so one definition spells and parses it.
+/// The refusal of a [`CreateSession`] whose name another box on the host
+/// has, in any state (BOX-007, BOX-163). The daemon sends its
+/// [`Display`](std::fmt::Display) text as the reply's error, and a client
+/// reads it back with [`Self::from_error`], so one definition spells and
+/// parses it.
 ///
-/// `holder` is `None` only on the client: the VM host refused the box's
-/// registration under the name, and the in-VM daemon could not say which
-/// box holds it. The refusal then names the held spelling alone, and still
-/// ends the command with [`Self::EXIT_CODE`].
+/// The refusal names the holder and its state only to a caller who may
+/// read that box: the daemon read its record, and it names the caller as
+/// its creator. For any other caller, `holder_name` is `None`, and the
+/// text says only that the name is taken.
+///
+/// `holder` is `None` with a `holder_name` on the client too: the VM host
+/// refused the box's registration under the name, and the in-VM daemon
+/// could not say which box holds it. The refusal then names the held
+/// spelling alone. Every form ends the command with [`Self::EXIT_CODE`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeldNameRefusal {
     /// The name the create asked for.
     pub name: String,
-    /// The running box that holds the name, when it is known.
+    /// The box that has the name, when it is known and the caller may
+    /// read it.
     pub holder: Option<SessionId>,
-    /// The holder's name, with the case it was given.
-    pub holder_name: String,
+    /// The holder's name, with the case it was given, when the caller may
+    /// read it.
+    pub holder_name: Option<String>,
+    /// The holder's state word (`running`, `stopped`, ...), when it is
+    /// known and the caller may read it.
+    pub state: Option<String>,
+}
+
+/// The exit code a client ends with when the daemon refuses a create's
+/// requested name or a rename's new name for a naming rule (BOX-007):
+/// not one DNS label, reserved, or of box-id form. The reply's text is
+/// [`boxes::box_name::NameRuleRefusal`]'s.
+pub const NAME_RULE_EXIT_CODE: u8 = 3;
+
+/// The exit code of a [`RenameSession`] refusal, read from the reply's
+/// error: [`NAME_RULE_EXIT_CODE`] for a name that breaks a naming rule,
+/// [`HeldNameRefusal::EXIT_CODE`] for a name another box has, and `None`
+/// for any other failure. A daemon that predates BOX-007 sends
+/// `invalid box name: ...` for a name rule and `The name \`self\` is
+/// reserved. ...` for `self`, and those read as the name-rule code too.
+#[must_use]
+pub fn rename_refusal_exit_code(error: &str) -> Option<u8> {
+    use boxes::box_name::{NameRuleRefusal, RenameRefusal};
+    let name_rule = NameRuleRefusal::is_text(error)
+        || error.starts_with("invalid box name: ")
+        || error == "The name `self` is reserved. Choose another name.";
+    // The holder is named to its reader, else the name is said to be taken.
+    let held = (error.starts_with("The ") && error.contains(" holds the name `"))
+        || (error.starts_with(RenameRefusal::TAKEN_LEAD)
+            && error.ends_with(RenameRefusal::TAKEN_TAIL));
+    if name_rule {
+        Some(NAME_RULE_EXIT_CODE)
+    } else if held {
+        Some(HeldNameRefusal::EXIT_CODE)
+    } else {
+        None
+    }
 }
 
 impl HeldNameRefusal {
@@ -2541,14 +2587,27 @@ impl HeldNameRefusal {
     pub const EXIT_CODE: u8 = 2;
 
     const HEAD: &'static str = "Cannot create a session named `";
-    const TAKEN: &'static str = "`: the running session `";
+    const NAME_END: &'static str = "`: ";
+    const TAKEN: &'static str = "the name is taken.";
+    const SESSION: &'static str = "session `";
     const HOLDS: &'static str = " holds that name.";
 
     /// The refusal a create reply's `error` carries, or `None` when the
     /// error is any other failure.
     pub fn from_error(error: &str) -> Option<Self> {
         let rest = error.strip_prefix(Self::HEAD)?;
-        let (name, rest) = rest.split_once(Self::TAKEN)?;
+        let (name, rest) = rest.split_once(Self::NAME_END)?;
+        if rest.starts_with(Self::TAKEN) {
+            return Some(Self {
+                name: name.to_string(),
+                holder: None,
+                holder_name: None,
+                state: None,
+            });
+        }
+        let rest = rest.strip_prefix("the ")?;
+        let (state, rest) = rest.split_once(Self::SESSION)?;
+        let state = state.trim_end();
         // A box name is a DNS label, so it holds no backtick.
         let (holder_name, rest) = rest.split_once('`')?;
         let holder = if rest.starts_with(Self::HOLDS) {
@@ -2563,7 +2622,8 @@ impl HeldNameRefusal {
         Some(Self {
             name: name.to_string(),
             holder,
-            holder_name: holder_name.to_string(),
+            holder_name: Some(holder_name.to_string()),
+            state: (!state.is_empty()).then(|| state.to_string()),
         })
     }
 }
@@ -2574,18 +2634,26 @@ impl std::fmt::Display for HeldNameRefusal {
             name,
             holder,
             holder_name,
+            state,
         } = self;
-        let (head, taken, holds) = (Self::HEAD, Self::TAKEN, Self::HOLDS);
+        let (head, end, holds) = (Self::HEAD, Self::NAME_END, Self::HOLDS);
+        let Some(holder_name) = holder_name else {
+            return write!(f, "{head}{name}{end}{} Choose another name.", Self::TAKEN);
+        };
+        let state = state
+            .as_deref()
+            .map(|s| format!("{s} "))
+            .unwrap_or_default();
         match holder {
             Some(holder) => write!(
                 f,
-                "{head}{name}{taken}{holder_name}` ({holder}){holds} \
+                "{head}{name}{end}the {state}session `{holder_name}` ({holder}){holds} \
                  Rename that session with `min box rename {holder} <new-name>`, \
                  or choose another name.",
             ),
             None => write!(
                 f,
-                "{head}{name}{taken}{holder_name}`{holds} Choose another name.",
+                "{head}{name}{end}the {state}session `{holder_name}`{holds} Choose another name.",
             ),
         }
     }
