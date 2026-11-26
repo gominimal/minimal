@@ -15467,8 +15467,8 @@ fn show_and_prune_dry_run_report_disk_unit_boundaries() {
 /// `write_init_plan`, the write half of `run_init_flow`, with the plan the
 /// project initializer returns, and reads the file it writes. That file
 /// loads through mfile with no legacy-table hint and no unknown-field
-/// warning, and a session start on it sends the `[defaults.session]`
-/// packages (D3112).
+/// warning, it has no `[defaults]`, and a session start on it sends the
+/// packages that `[sessions.default]` holds (D3112).
 #[test]
 fn init_scaffolds_entry_shape_loads_and_starts_with_its_packages() {
     // The initializer's own output (`op::project::init::generate_mfile`,
@@ -15494,10 +15494,10 @@ fn init_scaffolds_entry_shape_loads_and_starts_with_its_packages() {
     let written = std::fs::read_to_string(&toml_path).unwrap();
     let doc: toml::Table = written.parse().expect("the scaffold parses");
     assert!(doc.get("session").is_none(), "{written}");
-    assert!(doc["sessions"]["default"].is_table(), "{written}");
+    assert!(doc.get("defaults").is_none(), "no [defaults]:\n{written}");
     assert_eq!(
-        doc["defaults"]["task"]["state_key"].as_str(),
-        Some("dev"),
+        doc["sessions"]["default"]["packages"],
+        toml::Value::Array(vec!["base".into(), "vim".into(), "git".into()]),
         "{written}"
     );
     // The legacy tables are what make a load print a hint. The written
@@ -23256,7 +23256,7 @@ async fn spec_type_init_end_to_end() {
             &[
                 "# The spec of entry default (type session).",
                 "# type: from [sessions.default]\ntype = \"session\"\n",
-                "# packages: from [defaults.session]\npackages = [\"base\", \"git\"]\n",
+                "# packages: from [sessions.default]\npackages = [\"base\", \"git\"]\n",
                 "# network.mode: from the default\n",
             ][..],
         ),

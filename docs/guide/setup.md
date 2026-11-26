@@ -27,27 +27,20 @@ locked_commit = "9d36aa3d0fec09658fe3bbc676beeae49a89c53d"
 [stack]
 use = "rust"
 
-[defaults.task]
-state_key = "dev"
-
-[defaults.session] # min session attach
-packages = ["base", "vim"]
-
 [sessions.default]
+packages = ["base", "vim"]
 ```
 
 - `[upstream]` pins the software supply chain: the package registry and the exact commit it is read from.
 - `[stack]` declares how the project builds. See the [stack reference](../reference/stack-specs.md).
-- `[defaults.task]` sets defaults for the project's tasks, such as the `state_key` that tasks share persistent state under.
-- `[defaults.session]` is the one that matters for day-to-day work: it lists the tools every contributor's session gets. See the [`minimal.toml` reference](../reference/minimal-dot-toml.md) for the full schema.
-- `[sessions.default]` declares the project's session. A session started from it is named after the project directory.
+- `[sessions.default]` declares the project's session and lists the tools every contributor's session gets. A session started from it is named after the project directory. See the [`minimal.toml` reference](../reference/minimal-dot-toml.md) for the full schema.
 
 ## Declare your session's tools
 
-Edit the `packages` list under `[defaults.session]` to add whatever your team works with. Extend the existing list; do not add a second `[defaults.session]` table, since TOML does not allow a table to be defined twice.
+Edit the `packages` list under `[sessions.default]` to add whatever your team works with. Extend the existing list; do not add a second `[sessions.default]` table, since TOML does not allow a table to be defined twice.
 
 ```toml
-[defaults.session] # min session attach
+[sessions.default]
 packages = ["base", "vim", "git", "gh", "ripgrep", "claude-code"]
 ```
 
@@ -61,6 +54,6 @@ Create and attach to an isolated session for the project:
 min session start
 ```
 
-Minimal builds or fetches the declared packages, composes them into a sandbox seeded with a copy of your project (streamed in as a tarball), and drops you into a shell inside it. The `[defaults.session]` tools are on your `PATH`, and nothing touches the host. Type `exit` to leave; the session stays up, so you can `min session attach` back to it later.
+Minimal builds or fetches the declared packages, composes them into a sandbox seeded with a copy of your project (streamed in as a tarball), and drops you into a shell inside it. The `[sessions.default]` tools are on your `PATH`, and nothing touches the host. Type `exit` to leave; the session stays up, so you can `min session attach` back to it later.
 
 Next: [start a dev shell](./dev-shell.md), or [work alongside an agent](./agents.md).
