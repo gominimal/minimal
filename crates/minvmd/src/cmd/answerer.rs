@@ -56,7 +56,7 @@ const HANDED_SOCKET_LIMIT: usize = 1024;
 ///
 /// Without it, this is the service: receive the manager's sockets, serve the
 /// zone from them, for as long as the manager keeps the process running.
-pub fn run(protocol_version: bool) -> Result<()> {
+pub fn run(protocol_version: bool, admit_group: Option<&str>) -> Result<()> {
     if protocol_version {
         println!("{}", answerer::CHANNEL_PROTOCOL_VERSION);
         return Ok(());
@@ -71,13 +71,28 @@ pub fn run(protocol_version: bool) -> Result<()> {
     // daemons can publish rows to the machine's one answerer.
     //
     // SAFETY: geteuid only reads the process's own uid.
-    let expected_uid = unsafe { libc::geteuid() };
+    let own_uid = unsafe { libc::geteuid() };
+    // The unit may name a group whose members publish here too (the
+    // macOS package's `_minimal` group: one service for a Mac's users).
+    let admission = match admit_group {
+        None => answerer::Admission::uid(own_uid),
+        Some(group) => {
+            let gid = answerer::group_id(group)
+                .with_context(|| {
+                    format!("--admit-group {group}: the group could not be looked up")
+                })?
+                .with_context(|| format!("--admit-group {group}: no such group on this host"))?;
+            // The name is the unit's argument, for the life of the service.
+            let name: &'static str = Box::leak(group.to_owned().into_boxed_str());
+            answerer::Admission::uid_and_group(own_uid, answerer::AdmittedGroup { name, gid })
+        }
+    };
     // The stop flag is never set: the manager's stop of the service is the
     // process's, and SIGTERM's default is the whole stop.
     answerer::serve_service(
         listener,
         channel,
-        expected_uid,
+        admission,
         Arc::new(AtomicBool::new(false)),
     );
     Ok(())
