@@ -979,7 +979,6 @@ pub(crate) fn numbered_name_line(
                         }),
                 );
             }
-            line.push_str(" Run min box prune to remove stopped boxes.");
         }
         NameTakenReason::Reserved => {
             line.push_str(&format!("the name {wanted} is reserved."));
@@ -988,6 +987,7 @@ pub(crate) fn numbered_name_line(
             line.push_str(&format!("the name {wanted} has the form of a box id."));
         }
     }
+    line.push_str(" Run min box prune to remove stopped boxes.");
     line
 }
 

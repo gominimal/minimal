@@ -4291,7 +4291,7 @@ fn unattached_create_numbered_prints_one_stderr_line() {
 }
 
 // BCLI-081: a derived name that the form rule excludes is named as such,
-// and the line names no box.
+// the line names no box, and it names `min box prune`.
 #[test]
 fn unattached_create_numbered_excluded_name_names_no_box() {
     use minimald_rpc::NameTakenReason;
@@ -4299,13 +4299,14 @@ fn unattached_create_numbered_excluded_name_names_no_box() {
         (
             "self",
             NameTakenReason::Reserved,
-            "The box is named self-1, because the name self is reserved.",
+            "The box is named self-1, because the name self is reserved. Run min box \
+             prune to remove stopped boxes.",
         ),
         (
             "0192f3c4",
             NameTakenReason::BoxIdForm,
             "The box is named 0192f3c4-1, because the name 0192f3c4 has the form of a \
-             box id.",
+             box id. Run min box prune to remove stopped boxes.",
         ),
     ];
     for (name, reason, text) in cases {
@@ -4319,7 +4320,7 @@ fn unattached_create_numbered_excluded_name_names_no_box() {
         let line = numbered_line_for_start(false, &reply, Some(HolderVerb::Attach))
             .expect("the box took a number");
         assert_eq!(line, text, "{name}");
-        for word in ["has it", "attach", "logs", "restart", "min box"] {
+        for word in ["has it", "attach", "logs", "restart"] {
             assert!(!line.contains(word), "{word}: {line}");
         }
     }

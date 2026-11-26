@@ -126,8 +126,8 @@ which removes that box and frees the name. Attach
 to the existing session when you mean to rejoin it, or pass another
 `--name <NAME>` for a second session from the same entry. A `--detach` start of
 a session that takes a number prints one line on stderr. The line names the
-name that the session took. When another box has the name, the line also names
-`min box prune`, which removes stopped boxes. Once two sessions share a
+name that the session took. The line always names `min box prune`, which
+removes stopped boxes. Once two sessions share a
 project directory, a bare `min session attach` there cannot choose between
 them. When more than one session can match, the command lists them and exits
 with code 2.
