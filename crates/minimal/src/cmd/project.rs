@@ -561,7 +561,7 @@ impl InitOutcome {
 /// missing-mfile prompt.
 ///
 /// The file is always written in the entry shape (BCLI-017):
-/// [`to_entry_shape`] adds the `[boxes.default]` session entry to the
+/// [`to_entry_shape`] adds the `[sessions.default]` session entry to the
 /// initializer's `[defaults.task]` and `[defaults.session]`.
 pub(crate) fn run_init_flow(
     config: mctx::Config,
@@ -766,14 +766,14 @@ fn check_entry_name(entry: &str) -> Result<(), InitRefusal> {
 
 /// Rewrite the scaffold that the project initializer generates into the
 /// entry shape (BCLI-017): the file declares one session entry,
-/// `[boxes.default]`, so the first `min session start` names its box
+/// `[sessions.default]`, so the first `min session start` names its box
 /// after the project. The initializer writes `[defaults.task]` and
 /// `[defaults.session]`, and those are kept as they are. A legacy
 /// `[session]` table still becomes `[defaults.session]`, and a legacy
 /// `[defaults] state_key` becomes `[defaults.task] state_key` (BOX-050,
 /// BOX-051).
 pub(crate) fn to_entry_shape(legacy: &str) -> Result<String, anyhow::Error> {
-    use toml_edit::{DocumentMut, Item, Table, value};
+    use toml_edit::{DocumentMut, Item, Table};
     let mut doc: DocumentMut = legacy
         .parse()
         .context("reading the generated minimal.toml")?;
@@ -799,12 +799,11 @@ pub(crate) fn to_entry_shape(legacy: &str) -> Result<String, anyhow::Error> {
         defaults.insert("task", Item::Table(task));
     }
 
-    let mut entry = Table::new();
-    entry.insert("type", value("session"));
-    let mut boxes = Table::new();
-    boxes.set_implicit(true);
-    boxes.insert(mfile::entry::DEFAULT_ENTRY_NAME, Item::Table(entry));
-    doc.insert("boxes", Item::Table(boxes));
+    // `[sessions.*]` sets the type `session`, so the entry has no `type` key.
+    let mut sessions = Table::new();
+    sessions.set_implicit(true);
+    sessions.insert(mfile::entry::DEFAULT_ENTRY_NAME, Item::Table(Table::new()));
+    doc.insert("sessions", Item::Table(sessions));
     Ok(doc.to_string())
 }
 
@@ -1410,11 +1409,11 @@ mod init_tests {
             doc["defaults"].get("state_key").is_none(),
             "no legacy state_key:\n{shaped}"
         );
-        assert_eq!(
-            doc["boxes"]["default"]["type"].as_str(),
-            Some("session"),
-            "{shaped}"
-        );
+        let entry = doc["sessions"]["default"]
+            .as_table()
+            .unwrap_or_else(|| panic!("[sessions.default] is a table:\n{shaped}"));
+        assert!(entry.get("type").is_none(), "no type key:\n{shaped}");
+        assert!(doc.get("boxes").is_none(), "no [boxes]:\n{shaped}");
         assert_eq!(
             doc["defaults"]["task"]["state_key"].as_str(),
             Some("dev"),
@@ -1441,9 +1440,9 @@ mod init_tests {
         let after_text = read(&dir);
         let after: toml::Table = after_text.parse().unwrap();
         let boxes = after["boxes"].as_table().unwrap();
-        assert_eq!(boxes.len(), 2, "{after_text}");
+        assert_eq!(boxes.len(), 1, "{after_text}");
         assert_eq!(boxes["build"]["type"].as_str(), Some("task"));
-        assert_eq!(boxes["default"], before["boxes"]["default"]);
+        assert_eq!(after["sessions"]["default"], before["sessions"]["default"]);
         assert_eq!(
             after["upstream"], before["upstream"],
             "the rest of the file is kept"
@@ -1467,7 +1466,7 @@ mod init_tests {
     // BCLI-018: a [box_types] entry with no extends is invalid minimal.toml.
     #[test]
     fn init_box_type_without_extends_exit3_appends_nothing() {
-        let original = "[box_types.web]\nimage = \"x\"\n\n[boxes.default]\ntype = \"session\"\n";
+        let original = "[box_types.web]\nimage = \"x\"\n\n[sessions.default]\n";
         let dir = project(original);
         let refusal = run(&dir, &["init", "x", "--type", "web"]).unwrap_err();
         assert_eq!(refusal.code, 3, "{}", refusal.message);
@@ -1495,8 +1494,7 @@ mod init_tests {
     // BCLI-018, BOX-063
     #[test]
     fn init_refused_type_exit3_appends_nothing() {
-        let original =
-            "[box_types.reviewer]\nextends = \"agent\"\n\n[boxes.default]\ntype = \"session\"\n";
+        let original = "[box_types.reviewer]\nextends = \"agent\"\n\n[sessions.default]\n";
         let dir = project(original);
         for ty in ["agent", "service", "build", "container-build", "reviewer"] {
             let refusal = run(&dir, &["init", "bot", "--type", ty]).unwrap_err();
@@ -1648,7 +1646,7 @@ mod init_tests {
     // exit 3, and the refusal names the file.
     #[test]
     fn init_invalid_mfile_exit3_appends_nothing() {
-        const BROKEN: &str = "[boxes.default\ntype = \"session\"\n";
+        const BROKEN: &str = "[sessions.default\npackages = [\"base\"]\n";
         let root = project(BROKEN);
         let sub = root.path().join("src");
         std::fs::create_dir(&sub).expect("create the subdirectory");

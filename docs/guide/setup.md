@@ -33,15 +33,14 @@ state_key = "dev"
 [defaults.session] # min session attach
 packages = ["base", "vim"]
 
-[boxes.default]
-type = "session"
+[sessions.default]
 ```
 
 - `[upstream]` pins the software supply chain: the package registry and the exact commit it is read from.
 - `[stack]` declares how the project builds. See the [stack reference](../reference/stack-specs.md).
 - `[defaults.task]` sets defaults for the project's tasks, such as the `state_key` that tasks share persistent state under.
 - `[defaults.session]` is the one that matters for day-to-day work: it lists the tools every contributor's session gets. See the [`minimal.toml` reference](../reference/minimal-dot-toml.md) for the full schema.
-- `[boxes.default]` declares the project's session, `default`. A `min session start` with no entry name starts it, and the box takes the project name.
+- `[sessions.default]` declares the project's session. A session started from it is named after the project directory.
 
 ## Declare your session's tools
 

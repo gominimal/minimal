@@ -15333,11 +15333,7 @@ fn init_scaffolds_entry_shape_loads_and_starts_with_its_packages() {
     let written = std::fs::read_to_string(&toml_path).unwrap();
     let doc: toml::Table = written.parse().expect("the scaffold parses");
     assert!(doc.get("session").is_none(), "{written}");
-    assert_eq!(
-        doc["boxes"]["default"]["type"].as_str(),
-        Some("session"),
-        "{written}"
-    );
+    assert!(doc["sessions"]["default"].is_table(), "{written}");
     assert_eq!(
         doc["defaults"]["task"]["state_key"].as_str(),
         Some("dev"),
@@ -22986,12 +22982,14 @@ async fn spec_type_init_end_to_end() {
         .unwrap()
         .parse()
         .expect("the file parses");
-    for (entry, box_type) in [
-        ("dev", "session"),
-        ("default", "session"),
-        ("build", "task"),
-        ("web", "rust-dev"),
-    ] {
+    // The scaffold's entry is `[sessions.default]`, and `[sessions.*]` sets
+    // the type, so it has no `type` key. `min init <entry> --type <type>`
+    // appends under `[boxes]`.
+    let scaffolded = doc["sessions"]["default"]
+        .as_table()
+        .unwrap_or_else(|| panic!("[sessions.default] is a table\n{doc}\n{ran}"));
+    assert!(scaffolded.get("type").is_none(), "{doc}\n{ran}");
+    for (entry, box_type) in [("dev", "session"), ("build", "task"), ("web", "rust-dev")] {
         assert_eq!(
             doc["boxes"][entry]["type"].as_str(),
             Some(box_type),
@@ -23084,7 +23082,7 @@ async fn spec_type_init_end_to_end() {
             "default",
             &[
                 "# The spec of entry default (type session).",
-                "# type: from [boxes.default]\ntype = \"session\"\n",
+                "# type: from [sessions.default]\ntype = \"session\"\n",
                 "# packages: from [defaults.session]\npackages = [\"base\", \"git\"]\n",
                 "# network.mode: from the default\n",
             ][..],
