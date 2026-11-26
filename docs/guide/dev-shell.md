@@ -14,7 +14,7 @@ From your project directory, start a session and attach to it in one step:
 $ min session start
 ```
 
-This creates a session for the project and drops you into its interactive shell. Pass `--detach` to create the session without attaching, and `min session start <entry>` to start a named session entry of the project.
+This creates a session for the project and drops you into its interactive shell. Pass `--detach` to create the session without attaching, and `min session start <entry>` to start another session entry of the project.
 
 Activation uploads your project files into the session's workspace, so the shell starts with a copy of your project. Edits you make inside stay in the session. To bring them back to the host, use `git push min://<session>`. Committing inside the session and pulling from it also works.
 
