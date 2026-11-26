@@ -380,7 +380,7 @@ Runs a task that the project's `minimal.toml` declares, in a box of its own.
 The command exits with the task's exit code. The task runs without a
 terminal. Its stdin, stdout and stderr are the command's. The box takes the
 name given with `--name`, else the task's `[box] name`. Without either, the
-box is named `<project>-<TASK>`, with `-<n>` added when a box already holds
+host names the box `<project>-<TASK>`, and adds `-<n>` when a box already holds
 that name. The box stays when the task ends: `min box show <NAME>` shows it
 and `min box rm <NAME>` removes it.
 
@@ -443,8 +443,8 @@ min box run [OPTIONS] <ENTRY> [ARGS]...
 Creates a box from an entry of the project, runs it without a terminal, and
 exits with its exit code. The command's stdin, stdout and stderr are the
 box's. The box takes the name given with `--name`, else the entry's
-`[box] name`. Without either, the box is named `<project>-<ENTRY>`, with
-`-<n>` added when a box already holds that name.
+`[box] name`. Without either, the host names the box `<project>-<ENTRY>`,
+and adds `-<n>` when a box already holds that name.
 
 | Flag | Description |
 |------|-------------|
@@ -474,7 +474,7 @@ keep only the boxes that match. When you give both, a box must match both.
 |------|-------|-------------|
 | `--all` | | List the boxes of every project |
 | `--type <TYPE>` | | List only the boxes of this type, such as `session` or `task` |
-| `--parent <BOX>` | | List only the child boxes of this box: its id, the start of its id, or its name |
+| `--parent <BOX>` | | List only the child boxes of this box. Give the box's id, a prefix of the id or the name |
 | `--output json` | `-o` | Write the boxes as one JSON array, one object for each box, and nothing else |
 
 ### `box attach`
@@ -755,7 +755,7 @@ The TOML form starts with the box's name and its origin, as the box's record
 holds them. The origin says whether a person wrote the name or the host
 derived it from the project name and the entry. After `min box rename`, the
 form shows the new name. A `[box] name` in the stored spec is the name the
-entry asks for when a box is created from it. The form labels it so, because
+entry asks each new box from it to take. The form labels it so, because
 it is not the name of the box.
 
 The spec of a box lists its
