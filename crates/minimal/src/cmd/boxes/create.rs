@@ -793,14 +793,11 @@ pub enum HolderVerb {
 }
 
 impl HolderVerb {
-    /// The sentence that names the verb for the box `name` in the state
-    /// `state`, or `None` where the verb does not fit that state. A running
-    /// box gets no restart sentence, because it does not need a new start.
-    fn sentence(self, name: &str, state: Option<&str>) -> Option<String> {
+    /// The sentence that names the verb for the box `name`.
+    fn sentence(self, name: &str) -> String {
         match self {
-            Self::Attach => Some(format!("Run min box attach {name} to go back into it.")),
-            Self::Restart if state == Some("running") => None,
-            Self::Restart => Some(format!("Run min box restart {name} to start it again.")),
+            Self::Attach => format!("Run min box attach {name} to go back into it."),
+            Self::Restart => format!("Run min box restart {name} to start it again."),
         }
     }
 }
@@ -919,11 +916,8 @@ impl std::fmt::Display for StartNameHeld {
                 Some(holder) => write!(f, " The {state}box {holder_name} ({holder}) has it.")?,
                 None => write!(f, " The {state}box {holder_name} has it.")?,
             }
-            if let Some(sentence) = self
-                .verb
-                .and_then(|verb| verb.sentence(&holder_name, state_word.as_deref()))
-            {
-                write!(f, " {sentence}")?;
+            if let Some(verb) = self.verb {
+                write!(f, " {}", verb.sentence(&holder_name))?;
             }
             let force = if state_word.as_deref() == Some("running") {
                 "--force "
@@ -965,19 +959,16 @@ pub(crate) fn numbered_name_line(
             line.push_str(&format!("the name {wanted} is taken."));
             if let Some(holder) = holder {
                 let holder_name = printable(&holder.name);
-                let state = printable(&holder.state);
                 line.push_str(&format!(
                     " The {state} box {holder_name} ({id}) has it.",
+                    state = printable(&holder.state),
                     id = holder.id,
                 ));
                 line.push(' ');
-                line.push_str(
-                    &verb
-                        .and_then(|verb| verb.sentence(&holder_name, Some(&state)))
-                        .unwrap_or_else(|| {
-                            format!("Run min box logs {holder_name} for its output.")
-                        }),
-                );
+                line.push_str(&match verb {
+                    Some(verb) => verb.sentence(&holder_name),
+                    None => format!("Run min box logs {holder_name} for its output."),
+                });
             }
         }
         NameTakenReason::Reserved => {
