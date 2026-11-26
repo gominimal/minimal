@@ -4170,7 +4170,7 @@ fn create_written_name_held_exit2_names_holder_and_next_steps() {
             "min task run",
             "Cannot start web. The name api is taken. The running box api \
              (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) has it. Run min box restart api to \
-             start it again. Run min box rm --force api to remove it and free the \
+             restart it. Run min box rm --force api to remove it and free the \
              name. Run min task run web --name <name> to start a box from the entry \
              under another name.",
         ),
@@ -4180,7 +4180,7 @@ fn create_written_name_held_exit2_names_holder_and_next_steps() {
             "min box start",
             "Cannot start web. The name api is taken. The stopped box api \
              (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) has it. Run min box restart api to \
-             start it again. Run min box rm api to remove it and free the name. Run \
+             restart it. Run min box rm api to remove it and free the name. Run \
              min box start web --name <name> to start a box from the entry under \
              another name.",
         ),
@@ -4257,7 +4257,7 @@ fn unattached_create_numbered_prints_one_stderr_line() {
             Some(HolderVerb::Restart),
             "The box is named dev-1, because the name dev is taken. The stopped box \
              dev (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) has it. Run min box restart dev \
-             to start it again. Run min box prune to remove stopped boxes.",
+             to restart it. Run min box prune to remove stopped boxes.",
         ),
         (
             None,
@@ -4293,7 +4293,7 @@ fn unattached_create_numbered_prints_one_stderr_line() {
         Some(
             "The box is named dev-1, because the name dev is taken. The running box \
              dev (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) has it. Run min box restart \
-             dev to start it again. Run min box prune to remove stopped boxes."
+             dev to restart it. Run min box prune to remove stopped boxes."
         )
     );
 

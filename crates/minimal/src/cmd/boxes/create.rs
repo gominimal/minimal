@@ -797,7 +797,7 @@ impl HolderVerb {
     fn sentence(self, name: &str) -> String {
         match self {
             Self::Attach => format!("Run min box attach {name} to go back into it."),
-            Self::Restart => format!("Run min box restart {name} to start it again."),
+            Self::Restart => format!("Run min box restart {name} to restart it."),
         }
     }
 }
