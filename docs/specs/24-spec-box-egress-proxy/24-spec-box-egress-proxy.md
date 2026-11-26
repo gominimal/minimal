@@ -5,7 +5,7 @@ owner: norrietaylor
 epic: gominimal/inbox#625
 arch: https://github.com/gominimal/arch/blob/5c1201517ba07347344fb9725efb06ee39d5c03e/specs/authn-authz/gatehouse-spec.md
 arch_sha: "5c1201517ba07347344fb9725efb06ee39d5c03e"
-updated: 2026-11-12
+updated: 2026-11-26
 ---
 
 # BEP — Local Box Egress Proxy — sealed GitHub credentials and host-store secrets without Gatehouse
@@ -74,6 +74,12 @@ BEP-088 to BEP-090 comes from the architecture instead. Gatehouse §6.10 asks
 for hardware custody where the host offers it, and names TPM 2.0 for Linux.
 The owner chose the Secret Service fallback on 2026-11-12, after the experiment
 on [#2436](https://github.com/gominimal/minimal/issues/2436).
+
+On a Linux host the native store for `min secret` and for store references is
+Secret Service (BEP-091). The architecture names Linux Secret Service among
+the host stores a store reference can name, and leaves the Linux default open.
+This document closes it for the native store alone. The other stores on that
+list stay follow-on work (Non-goals).
 
 ## Users and stories
 
@@ -871,7 +877,7 @@ Setting secrets
 - **BEP-050** WHEN `min secret set <id> [--store <s>]` is run THE SYSTEM SHALL read the value from the terminal or standard input, store it under `<id>` in the named store or, with no `--store`, in the host's native store, and output the identifier and no value.
   tier:     T0
   verify:   cargo nextest run -p minimal secret_set_stores_in_keychain_and_prints_id_only
-  <!-- the architecture's `min secret` reference: one grammar, the store deciding which fields are the caller's; the host's native store is the macOS Keychain here, the Linux default waits on the store roster -->
+  <!-- the architecture's `min secret` reference: one grammar, the store deciding which fields are the caller's; the host's native store is the macOS Keychain on macOS and Secret Service on Linux (BEP-091), and a store reference names it `keychain` on both -->
   - IF the value is supplied as a command-line argument or through an environment-variable flag THEN THE SYSTEM SHALL refuse the command and name the terminal and standard input as the accepted sources.
     tier:   T0
     verify: cargo nextest run -p minimal secret_set_refuses_value_argument_and_env_flag
@@ -882,9 +888,10 @@ Setting secrets
     tier:   T0
     verify: cargo nextest run -p minimal secret_set_refuses_gatehouse_store
 
-- **BEP-051** WHEN `min secret set` stores an item THE SYSTEM SHALL set the item's access control so that the proxy process reads it without a prompt and any other application prompts.
+- **BEP-051** WHERE the host's native store is the macOS Keychain, WHEN `min secret set` stores an item THE SYSTEM SHALL set the item's access control so that the proxy process reads it without a prompt and any other application prompts.
   tier:     T0
   verify:   cargo nextest run -p minimal secret_item_acl_admits_proxy_only
+  <!-- Secret Service has no access control per program: every program of the user reads an unlocked item, so on Linux no item names the proxy, and the process identity is the user (Design reasoning, "Process identity on Linux is the user") -->
   - IF the proxy binary is not at the path the item's access control would name THEN THE SYSTEM SHALL refuse the command, naming that path, before reading the value.
     tier:   T0
     verify: cargo nextest run -p minimal secret_set_refuses_when_proxy_binary_absent
@@ -893,10 +900,25 @@ Setting secrets
 - **BEP-052** WHEN `min secret list [--store <s>]` is run THE SYSTEM SHALL output, for each stored identifier: its store; the authorities and the injection form the matching `[secret-store-rules]` rule registers for it; the consent rule or `none`; and whether the item's access control carries the entry `set` created for the proxy's process identity; and output no value.
   tier:     T0
   verify:   cargo nextest run -p minimal secret_list_shows_metadata_without_values
+  <!-- in Secret Service the proxy's process identity is the user, so every item admits it, and the listing says that every program of the user reads the item -->
 
 - **BEP-053** WHEN `min secret rm <id> [--store <s>]` completes THE SYSTEM SHALL have removed the item from that store.
   tier:     T0
   verify:   cargo nextest run -p minimal secret_rm_removes_item
+
+- **BEP-091** WHERE the host is Linux THE SYSTEM SHALL keep each item of the host's native store in the user's Secret Service, under its identifier, for `min secret set`, `min secret list` and `min secret rm` and for the proxy's read of a store reference.
+  tier:     T0
+  verify:   cargo nextest run -p bep linux_native_store_is_secret_service
+  <!-- the store that the GitHub sign-in uses on Linux; a store reference names it `keychain`, as on macOS, so one project file names the native store on both hosts; a listing reads identifiers only, never a value -->
+  - IF `secret-tool` is not installed, no Secret Service answers in the session, or the keyring is locked THEN THE SYSTEM SHALL refuse `min secret set`, `min secret list` and `min secret rm`, before reading a value, and report which of the three it is and, for the first two, what to install or set up.
+    tier:   T0
+    verify: cargo nextest run -p bep linux_native_store_refusals_name_what_to_install
+    <!-- unwanted; no command unlocks a keyring on every desktop, so the locked case states the situation -->
+
+- **BEP-092** IF a box spec declares a store reference to the host's native store and this host cannot use that store THEN THE SYSTEM SHALL refuse the creation with exit 3 before it seals a value, and report the store's reason and next step.
+  tier:     T0
+  verify:   cargo nextest run -p minimal store_reference_refused_when_the_host_store_does_not_answer
+  <!-- unwanted; without it the box starts and every credentialed request fails; the check runs after the deny-set and egress checks (BEP-034, BEP-036) and before the rule check (BEP-035), because a rule cannot make an unusable store readable -->
 
 - **BEP-054** WHEN `min secret set <id>` replaces an existing item THE SYSTEM SHALL inject the new value in the next request that redeems a reference to `<id>`, with no restart of the proxy or the box.
   tier:     T0
@@ -939,7 +961,7 @@ Setting secrets
 
 - Caching public artifacts through the proxy: a separate story, not yet filed.
 - Presets for Slack, Google Drive, Notion and other services whose clients sign in through OAuth with tokens that expire. A stored secret stops working when its token expires. Each such service needs a module with a sign-in flow and renewal at the proxy, as the GitHub module has, and follows the Anthropic and MCP module epics.
-- Anthropic and MCP upstream modules; 1Password, LastPass, Linux Secret Service, `pass` and Bitwarden store backends: follow-on epics reusing this document's module and resolver seams (Gatehouse §6.10 store members lists the roster). This document uses Secret Service for the proxy's own keys on a Linux host with no TPM (BEP-088). It does not use it as a `min secret` store.
+- Anthropic and MCP upstream modules; 1Password, LastPass, `pass` and Bitwarden store backends: follow-on epics reusing this document's module and resolver seams (Gatehouse §6.10 store members lists the roster). This document uses Secret Service for the proxy's own keys on a Linux host with no TPM (BEP-088), and as the host's native store on Linux (BEP-091).
 - The Gatehouse-hosted proxy, the enrolled `gateway` helper, the tenant secret store and the revocation feed: [GHI](https://github.com/gominimal/gatehouse/pull/1), Gatehouse §6.10, §6.11, §8.6. With a Gatehouse configured, `min` delegates sign-in, minting and sealing to it; nothing here forecloses that and the envelope is the same.
 - Repository narrowing of a locally minted GitHub member: later work, the §6.4 scoped-token endpoint against the local App under the embedded client secret (Gatehouse §14.4 item 7); an open question below records the residual meanwhile.
 - An in-box re-mint path for a locally minted member or store handle: none is needed un-enrolled, because both are references resolved at the proxy on each request (BEP-005, BEP-063), and Gatehouse v1.23 closed §14.4 item 7's re-mint surface by construction. A box is re-created only for what a reference cannot cross: the root's expiry and a sealing-key or root replacement (BEP-060).
@@ -973,9 +995,10 @@ aside because guidance has nothing to verify.
 **Host-OS-neutral requirements, one module and one store bound.** The
 redemption, CA, steering and audit requirements are written over "a module's
 host set" and "the host keychain" so a second module or a Linux host fits
-without rewording. GitHub is the only module and macOS Keychain the only store
-this document instantiates, because the epic scoped the first slice of the
-secrets plane to one of each. A macOS-only reading was rejected because it bakes
+without rewording. This document instantiates one module, GitHub, and one
+store, the host's native store. The epic scoped the first slice of the secrets
+plane to one of each. The native store is the macOS Keychain on macOS and
+Secret Service on Linux. A macOS-only reading was rejected because it bakes
 platform assumptions into the crates the hosted form will import; a generic
 store abstraction from day one was rejected because it adds a resolver surface
 the demo does not exercise.
@@ -1227,9 +1250,29 @@ Security considerations. A dedicated proxy user
 ([gominimal/inbox#1184](https://github.com/gominimal/inbox/issues/1184))
 makes the file readable by the proxy alone.
 
-**Generality:** the requirements hold on any LocalVM host OS and for any
-upstream module declaring a host set; GitHub and the macOS Keychain are the
-only module and store this document binds, and a second store needs only a
+**Store items on Linux.** On Linux, `min secret`
+keeps each value in Secret Service, and the proxy reads it from there at each
+request (BEP-091). We considered sealing each value to the TPM, as the proxy's
+keys are. The TPM keeps a value on this machine alone. But many developer
+machines and VMs have no usable TPM, and BEP-088 already falls back to Secret
+Service for keys there. The proxy reads a value at every request that injects
+it (BEP-033). A TPM store costs a TPM load and an unseal for each request, and
+each replaced value needs a new sealed object. Secret Service stores, replaces
+and lists items by attribute. It already holds the GitHub sign-in on Linux, so
+a host where `min auth login` works can also store secrets.
+
+We also considered a new store name, such as `secret-service`, for a store
+reference. We kept `keychain`, the name of the host's native store. A project
+file that one person uses on macOS and another on Linux then names the same
+store. The cost is the one that "Process identity on Linux is the user"
+records. Every program of the user reads an unlocked item, so BEP-051's
+control per program does not hold on Linux. A host with no Secret Service in
+its session has no native store, and creation refuses a box that references
+one (BEP-092).
+
+**Generality.** The requirements hold on any LocalVM host OS and for any
+upstream module declaring a host set. GitHub and the host's native store are
+the only module and store this document binds. A second store needs only a
 resolver behind the same seam.
 
 ## Security considerations
@@ -1301,9 +1344,9 @@ per-request Keychain access control.
   covered by: BEP-004, BEP-038, BEP-040, BEP-050, BEP-052
 
 - **Invariant:** THE SYSTEM SHALL grant unattended access to the signing key, the sealing key and store items to the proxy's process identity alone, which on a Linux host is the proxy's OS user.
-  enforced by: keychain access control bound to the proxy's code signature on macOS, a TPM key's authorization value in a file only the proxy's user reads on Linux, and process separation
-  covered by: BEP-014, BEP-051, BEP-059, BEP-060, BEP-072, BEP-088, BEP-089
-  <!-- On Linux the proxy's identity is its OS user. Today that is the operator's login user, and a key in Secret Service has no control per program. So on a Linux host this invariant holds only up to the operator's user (Design reasoning, "Process identity on Linux is the user"). -->
+  enforced by: keychain access control bound to the proxy's code signature on macOS, a TPM key's authorization value in a file only the proxy's user reads on Linux, and process separation. On Linux, Secret Service holds keys and store items for the user's session.
+  covered by: BEP-014, BEP-051, BEP-059, BEP-060, BEP-072, BEP-088, BEP-089, BEP-091
+  <!-- On Linux the proxy's identity is its OS user. Today that is the operator's login user, and a key or a store item in Secret Service has no control per program. So on a Linux host this invariant holds only up to the operator's user (Design reasoning, "Process identity on Linux is the user"). -->
 
   <!-- The proxy, gvproxy and the VM run as the same login user, so process separation keeps them in separate processes but not under separate users. The user split is deferred to gominimal/inbox#1184. Custody on a real macOS keychain is unproven: gominimal/minimal#2436 is open because the login keychain was observed to make keys exportable. -->
 

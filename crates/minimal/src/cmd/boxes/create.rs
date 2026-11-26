@@ -1308,6 +1308,16 @@ pub enum GrantNotDelivered {
         /// The reference, `<store>:<id>` or `<id>`.
         item: String,
     },
+    /// The reference reads the host's native store, and that store cannot
+    /// be used on this host, so the proxy could read no value for it.
+    StoreUnavailable {
+        /// The grant's name.
+        grant: String,
+        /// The reference, `<store>:<id>` or `<id>`.
+        item: String,
+        /// Why the store cannot be used, and what to do, as the store says.
+        reason: String,
+    },
     /// The item's rule sets `action = "deny"`.
     StoreReferenceDenied {
         /// The grant's name.
@@ -1355,6 +1365,17 @@ impl std::fmt::Display for GrantNotDelivered {
                  reads the item {item} from the host's secret store, and no rule in \
                  [secret-store-rules] in your config.toml names that item. Add a rule for \
                  it, or remove the secret from {name}. Run `min dirs` to find config.toml.",
+                name = mfile::MFILE_NAME,
+            ),
+            Self::StoreUnavailable {
+                grant,
+                item,
+                reason,
+            } => write!(
+                f,
+                "Cannot create the box: the secret {grant} in [defaults.session.secrets] \
+                 in {name} reads the item {item} from the host's secret store, and this \
+                 host cannot use that store. {reason}",
                 name = mfile::MFILE_NAME,
             ),
             Self::StoreReferenceDenied { grant, item } => write!(
@@ -2791,35 +2812,35 @@ pub(crate) fn creation_host(
 ///
 /// [`boxes::core::bep::ActivationRefused`] for a reference to the GitHub
 /// sign-in item or a rule upstream outside the egress (BEP-034, BEP-036),
-/// and [`GrantNotDelivered`] for a reference with no rule or one its rule
-/// denies (BEP-035). Each ends the run with exit 3.
+/// and [`GrantNotDelivered`] for a reference to a host store this host
+/// cannot use, a reference with no rule, or one its rule denies (BEP-035).
+/// Each ends the run with exit 3.
 fn check_store_grants(
     global: &GlobalArgs,
     secrets: &boxes::core::bep::SecretGrants,
     network: boxes::NetworkMode,
     egress: Option<&boxes::EgressPolicy>,
     can_ask: bool,
+    store: &dyn bep::store::SecretStore,
 ) -> Result<boxes::core::bep::StoreRules, anyhow::Error> {
     if boxes::core::bep::store_references(secrets).next().is_none() {
         return Ok(boxes::core::bep::StoreRules::new());
     }
     let (_, rules) = crate::config::read_client_config_and_store_rules(global)?;
-    accept_store_references(secrets, network, egress, &rules, can_ask, &mut |question| {
-        crate::cmd::confirm(question, false)
-    })
+    accept_store_references_in(
+        secrets,
+        network,
+        egress,
+        &rules,
+        can_ask,
+        &mut |question| crate::cmd::confirm(question, false),
+        store,
+    )
 }
 
-/// Judges each store reference in `secrets` against `rules`, and gives the
-/// rules of the references it accepts, by item. First every reference is
-/// checked against the deny set and the egress (BEP-034, BEP-036). Then a
-/// reference with no rule, a `deny` rule, or an `ask` rule without
-/// `can_ask` is refused (BEP-035). Only when no reference is refused does
-/// it call `ask`, once per distinct item that an `ask` rule names. Logs one
-/// info line naming each reference checked and its outcome.
-///
-/// # Errors
-///
-/// As [`check_store_grants`] says. `ask`'s own error ends the check.
+/// [`accept_store_references_in`] with a native store that this host can
+/// use.
+#[cfg(test)]
 fn accept_store_references(
     secrets: &boxes::core::bep::SecretGrants,
     network: boxes::NetworkMode,
@@ -2827,6 +2848,39 @@ fn accept_store_references(
     rules: &boxes::core::bep::StoreRules,
     can_ask: bool,
     ask: &mut dyn FnMut(&str) -> Result<bool, anyhow::Error>,
+) -> Result<boxes::core::bep::StoreRules, anyhow::Error> {
+    accept_store_references_in(
+        secrets,
+        network,
+        egress,
+        rules,
+        can_ask,
+        ask,
+        &bep::store::MemorySecretStore::default(),
+    )
+}
+
+/// Judges each store reference in `secrets` against `rules`, and gives the
+/// rules of the references it accepts, by item. First every reference is
+/// checked against the deny set and the egress (BEP-034, BEP-036). Then a
+/// reference to the native store is refused when `store`, that store, says
+/// this host cannot use it, so no rule is asked for that could not help.
+/// Then a reference with no rule, a `deny` rule, or an `ask` rule without
+/// `can_ask` is refused (BEP-035). Only when no reference is refused does
+/// it call `ask`, once per distinct item that an `ask` rule names. Logs one
+/// info line naming each reference checked and its outcome.
+///
+/// # Errors
+///
+/// As [`check_store_grants`] says. `ask`'s own error ends the check.
+fn accept_store_references_in(
+    secrets: &boxes::core::bep::SecretGrants,
+    network: boxes::NetworkMode,
+    egress: Option<&boxes::EgressPolicy>,
+    rules: &boxes::core::bep::StoreRules,
+    can_ask: bool,
+    ask: &mut dyn FnMut(&str) -> Result<bool, anyhow::Error>,
+    store: &dyn bep::store::SecretStore,
 ) -> Result<boxes::core::bep::StoreRules, anyhow::Error> {
     use boxes::core::bep::{StoreConsent, check_store_references, store_consent, store_references};
     let module_hosts = crate::config::store_module_hosts();
@@ -2841,6 +2895,22 @@ fn accept_store_references(
                     .map(|refusal| format!("refused: {refusal}")),
             );
             return Err(anyhow::Error::from(refused));
+        }
+        // The proxy reads a native-store item from this host's store at
+        // each request, so a store this host cannot use refuses the box now,
+        // not its first request.
+        if let Some(reference) = store_references(secrets)
+            .find(|reference| reference.store == boxes::core::bep::NATIVE_STORE)
+            && let Err(error) = store.check_available()
+        {
+            let item = reference.item();
+            checked.push(format!("{item}: the host store cannot be used"));
+            return Err(GrantNotDelivered::StoreUnavailable {
+                grant: reference.grant.to_owned(),
+                item,
+                reason: error.to_string(),
+            }
+            .into());
         }
         // Every refusal that needs no answer comes first, so the person is
         // never asked about a creation that a later reference refuses.
@@ -4706,6 +4776,7 @@ pub(crate) fn check_project(
         network,
         policy.egress.as_ref(),
         can_ask,
+        &bep::store::HostStore,
     )?;
     let store_grants = store_grants(&project_secrets, &accepted_store_rules)?;
     // BEP-062: a `dns` or `both` box resolves each accepted rule's
@@ -7348,6 +7419,98 @@ mod tests {
         panic!("asked with no terminal: {question}")
     }
 
+    /// A native store that this host cannot use, as on a Linux host where
+    /// no Secret Service answers.
+    struct NoAnswerStore;
+    impl bep::store::SecretStore for NoAnswerStore {
+        fn name(&self) -> &'static str {
+            bep::store::NATIVE_STORE
+        }
+        fn set(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: &std::path::Path,
+        ) -> Result<(), bep::store::StoreError> {
+            panic!("set was called")
+        }
+        fn list(
+            &self,
+            _: &std::path::Path,
+        ) -> Result<Vec<bep::store::ItemInfo>, bep::store::StoreError> {
+            panic!("list was called")
+        }
+        fn remove(&self, _: &str) -> Result<bool, bep::store::StoreError> {
+            panic!("remove was called")
+        }
+        fn check_available(&self) -> Result<(), bep::store::StoreError> {
+            Err(bep::store::StoreError::NoSecretService {
+                detail: "secret-tool: Cannot autolaunch D-Bus without X11 $DISPLAY".into(),
+            })
+        }
+    }
+
+    // A store reference to a host store this host cannot use is refused at
+    // creation, with the store's reason and next step, whether or not a
+    // rule names the item. No rule is asked for, since a rule would not let
+    // the proxy read the item, and nothing is minted.
+    #[test]
+    fn store_reference_refused_when_the_host_store_does_not_answer() {
+        use bep::store::SecretStore as _;
+        let egress = egress_of(&["api.openai.com"]);
+        let expected = GrantNotDelivered::StoreUnavailable {
+            grant: "OPENAI_KEY".into(),
+            item: "openai-key".into(),
+            reason: NoAnswerStore.check_available().unwrap_err().to_string(),
+        };
+        for rules in [boxes::core::bep::StoreRules::new(), store_rule(None)] {
+            let err = accept_store_references_in(
+                &store_grant(),
+                boxes::NetworkMode::OwnIp,
+                Some(&egress),
+                &rules,
+                true,
+                &mut never_ask,
+                &NoAnswerStore,
+            )
+            .expect_err("the host store cannot be used");
+            assert_eq!(err.downcast_ref::<GrantNotDelivered>(), Some(&expected));
+        }
+        assert_eq!(
+            expected.to_string(),
+            "Cannot create the box: the secret OPENAI_KEY in [defaults.session.secrets] in \
+             minimal.toml reads the item openai-key from the host's secret store, and this \
+             host cannot use that store. `min secret` keeps secrets in Secret Service on \
+             Linux, and no Secret Service answered in this login session: secret-tool: \
+             Cannot autolaunch D-Bus without X11 $DISPLAY. Install a Secret Service provider \
+             such as GNOME Keyring (the `gnome-keyring` package), and run the command again \
+             in a login session that starts it."
+        );
+
+        // A reference to another store reads nothing from the host store,
+        // so the host store decides nothing for it.
+        let mut grants = store_grant();
+        grants.insert(
+            "OPENAI_KEY".into(),
+            toml::from_str("source = \"store\"\nstore = \"vault\"\nid = \"openai-key\"")
+                .expect("a store reference parses"),
+        );
+        let err = accept_store_references_in(
+            &grants,
+            boxes::NetworkMode::OwnIp,
+            Some(&egress),
+            &boxes::core::bep::StoreRules::new(),
+            true,
+            &mut never_ask,
+            &NoAnswerStore,
+        )
+        .expect_err("no rule");
+        assert!(matches!(
+            err.downcast_ref::<GrantNotDelivered>(),
+            Some(GrantNotDelivered::NoStoreRule { .. })
+        ));
+    }
+
     // BEP-062: the upstream of each store rule the creation accepts rides
     // the box's policy beside its grants, so a `dns` box's gate can steer
     // it. A box with no store reference carries none, and serializes as it
@@ -7583,6 +7746,7 @@ mod tests {
             boxes::NetworkMode::OwnIp,
             Some(&egress),
             false,
+            &bep::store::MemorySecretStore::default(),
         )
         .expect_err("a reference with no rule is refused");
         let refused = err
@@ -7608,6 +7772,7 @@ mod tests {
             boxes::NetworkMode::OwnIp,
             None,
             false,
+            &bep::store::MemorySecretStore::default(),
         )
         .expect("no store reference, nothing to refuse");
         assert!(none.is_empty());
@@ -8164,7 +8329,16 @@ mod tests {
             resolver,
             &spec_env,
         )
-        .and_then(|_| check_store_grants(global, &secrets, network, policy.egress.as_ref(), false))
+        .and_then(|_| {
+            check_store_grants(
+                global,
+                &secrets,
+                network,
+                policy.egress.as_ref(),
+                false,
+                &bep::store::MemorySecretStore::default(),
+            )
+        })
         .expect_err("the start refuses");
         let refused = err
             .downcast_ref::<boxes::core::bep::ActivationRefused>()

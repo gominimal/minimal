@@ -3,8 +3,10 @@
 //!
 //! `set` reads the value from the terminal or from standard input, never
 //! from an argument or an environment variable, and prints only the
-//! identifier. The item's access control lets the proxy binary read it
-//! without a prompt (BEP-051, `bep::store`). `list` prints metadata and no
+//! identifier. On macOS the item's access control lets the proxy binary read
+//! it without a prompt (BEP-051, `bep::store`). On Linux the store is Secret
+//! Service, where every program of the user reads the item, so no proxy path
+//! is checked or shown. `list` prints metadata and no
 //! value. Each `set` and `rm` logs one info line with the store and the
 //! identifier, never the value.
 
@@ -160,6 +162,9 @@ fn set_proxy(
     store
         .check_available()
         .context("min secret set did not read the value")?;
+    if !store.binds_program() {
+        return Ok(PathBuf::new());
+    }
     resolve().context("min secret set did not read the value")
 }
 
@@ -678,18 +683,22 @@ pub(crate) fn run_set_with_rule(
     store
         .check_available()
         .context("min secret set did not read the value")?;
-    if !proxy.is_absolute() || !proxy.is_file() {
-        bail!(
-            "min secret set did not read the value: the Box Egress Proxy program is not at {}. \
-             Only that program can read the stored secret without a prompt. \
-             Set {} to the path of the `bep` program, and run the command again.",
-            proxy.display(),
-            bep::store::PROXY_BIN_ENV
-        );
+    // A store whose items name no program has no access control to point
+    // at the proxy, so the proxy path decides nothing there.
+    if store.binds_program() {
+        if !proxy.is_absolute() || !proxy.is_file() {
+            bail!(
+                "min secret set did not read the value: the Box Egress Proxy program is not at {}. \
+                 Only that program can read the stored secret without a prompt. \
+                 Set {} to the path of the `bep` program, and run the command again.",
+                proxy.display(),
+                bep::store::PROXY_BIN_ENV
+            );
+        }
+        // Review finding 4369438785: the access control trusts this program,
+        // so nobody but the current user or root can change it.
+        bep::store::check_proxy_binary(proxy).context("min secret set did not read the value")?;
     }
-    // Review finding 4369438785: the access control trusts this program, so
-    // nobody but the current user or root can change it.
-    bep::store::check_proxy_binary(proxy).context("min secret set did not read the value")?;
     let control = target.as_ref().and_then(|target| target.control);
     // BEP-079: the rule is checked, and any change confirmed, before the
     // value is read.
@@ -886,6 +895,7 @@ pub(crate) fn run_list(
             Some(StoreAction::Deny) => "deny",
         };
         let access = match proxy {
+            _ if !store.binds_program() => PROXY_READS_AS_USER.to_owned(),
             Err(_) => "unknown".to_owned(),
             Ok(proxy) if item.proxy_access => format!("yes, {}", proxy.display()),
             Ok(_) => "no".to_owned(),
@@ -897,12 +907,16 @@ pub(crate) fn run_list(
         writeln!(out, "  consent:               {consent}")?;
         writeln!(out, "  proxy reads it freely: {access}")?;
     }
-    if let Err(e) = proxy {
+    if let (true, Err(e)) = (store.binds_program(), proxy) {
         writeln!(out)?;
         writeln!(out, "min secret list shows proxy access as unknown: {e:#}")?;
     }
     Ok(())
 }
+
+/// The access column of `list` for a store where every program of the user
+/// reads every item, as in Secret Service.
+pub(crate) const PROXY_READS_AS_USER: &str = "yes, as every program you run can";
 
 /// The injection form of `rule`, as the list shows it.
 fn injection(rule: &StoreRuleConfig) -> String {
@@ -1345,6 +1359,70 @@ mod tests {
             set_proxy(&store, || resolve_proxy(None, None)).expect_err("refused")
         );
         assert!(text.contains("no `minvmd` program is on PATH"), "{text}");
+    }
+
+    /// A store where every program of the user reads every item, as
+    /// [`HostStore`] is on Linux.
+    #[derive(Default)]
+    struct UserWideStore(MemorySecretStore);
+    impl SecretStore for UserWideStore {
+        fn name(&self) -> &'static str {
+            NATIVE_STORE
+        }
+        fn set(&self, id: &str, value: &[u8], proxy: &Path) -> Result<(), StoreError> {
+            self.0.set(id, value, proxy)
+        }
+        fn list(&self, proxy: &Path) -> Result<Vec<bep::store::ItemInfo>, StoreError> {
+            self.0.list(proxy)
+        }
+        fn remove(&self, id: &str) -> Result<bool, StoreError> {
+            self.0.remove(id)
+        }
+        fn binds_program(&self) -> bool {
+            false
+        }
+    }
+
+    // On Linux the store names no program, so `set` needs no proxy path,
+    // and `list` shows that every program of the user reads each item.
+    #[test]
+    fn secret_commands_on_a_store_that_names_no_program() {
+        let store = UserWideStore::default();
+        let proxy = set_proxy(&store, || panic!("the proxy path was resolved")).unwrap();
+        let mut out = Vec::new();
+        run_set(
+            &store,
+            &set_args(&["claude"]),
+            &proxy,
+            ValueSource::Stdin,
+            &mut no_terminal,
+            &mut &b"sk-ant-secret"[..],
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out, b"claude\n");
+        assert_eq!(
+            store.0.value("claude").as_deref(),
+            Some(&b"sk-ant-secret"[..])
+        );
+
+        let none = tempfile::tempdir().unwrap();
+        let empty = std::env::join_paths([none.path()]).unwrap();
+        let missing = resolve_proxy(None, Some(&empty)).expect_err("no minvmd");
+        for proxy in [Ok(Path::new("/opt/minimal/bep")), Err(&missing)] {
+            let mut out = Vec::new();
+            run_list(&store, &StoreRules::new(), proxy, &mut out).unwrap();
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                "claude
+  store:                 keychain
+  upstream:              none (no [secret-store-rules] rule)
+  injection:             none
+  consent:               none
+  proxy reads it freely: yes, as every program you run can
+"
+            );
+        }
     }
 
     #[test]

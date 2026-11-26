@@ -47,19 +47,19 @@ pub const TIMEOUT: Duration = Duration::from_secs(60);
 /// autolaunched, can hold the pipes open after it. The output that
 /// `secret-tool` wrote is in the pipe when it exits, so a short wait reads
 /// all of it.
-const DRAIN_GRACE: Duration = Duration::from_secs(1);
+pub(crate) const DRAIN_GRACE: Duration = Duration::from_secs(1);
 
 /// The exit code of a `secret-tool lookup` or `clear` that matched no item.
-const NO_MATCH: i32 = 1;
+pub(crate) const NO_MATCH: i32 = 1;
 
 /// Parts of `secret-tool`'s error output that say the keyring is locked:
 /// libsecret's "locked object" and "locked collection" errors.
-const LOCKED: &[&str] = &["locked object", "locked collection", "collection is locked"];
+pub(crate) const LOCKED: &[&str] = &["locked object", "locked collection", "collection is locked"];
 
 /// Parts of `secret-tool`'s error output that say this session has no
 /// Secret Service: no session bus, or no keyring daemon on it. Each is a
 /// phrase from GDBus or the bus, not a bare word that other errors share.
-const UNREACHABLE: &[&str] = &[
+pub(crate) const UNREACHABLE: &[&str] = &[
     "could not connect:",
     "cannot autolaunch d-bus",
     "the name org.freedesktop.secrets was not provided",
@@ -286,12 +286,12 @@ impl SecretService {
     }
 }
 
-fn blank(bytes: &[u8]) -> bool {
+pub(crate) fn blank(bytes: &[u8]) -> bool {
     bytes.iter().all(u8::is_ascii_whitespace)
 }
 
 /// The output of one pipe, which a thread of its own reads.
-struct Drain {
+pub(crate) struct Drain {
     buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     done: std::sync::mpsc::Receiver<()>,
 }
@@ -302,7 +302,7 @@ impl Drain {
     /// A pipe that another process holds open past `deadline` does not
     /// stop the caller: the thread reads on, detached, until that process
     /// closes the pipe.
-    fn collect(self, deadline: Instant) -> (Vec<u8>, bool) {
+    pub(crate) fn collect(self, deadline: Instant) -> (Vec<u8>, bool) {
         let wait = deadline.saturating_duration_since(Instant::now());
         let ended = self.done.recv_timeout(wait).is_ok();
         let mut buf = self
@@ -315,7 +315,7 @@ impl Drain {
 
 /// Reads all of `pipe` on its own thread, so a full pipe never blocks the
 /// child while the caller waits for it.
-fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> Drain {
+pub(crate) fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> Drain {
     let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let (tx, done) = std::sync::mpsc::channel();
     let shared = std::sync::Arc::clone(&buf);
