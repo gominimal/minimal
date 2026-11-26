@@ -19880,8 +19880,11 @@ async fn box_spec_renders_formats_secrets_as_refs() {
         yaml.starts_with("entry: default\nloadouts:\n  - default\nschema: min/v1/spec\nsources:\n"),
         "{yaml}"
     );
+    // The built-in `default` loadout folds its `env_vars` into the spec
+    // before `network` (BCLI-021).
+    assert!(yaml.contains("\nspec:\n  env_vars:\n"), "{yaml}");
     assert!(
-        yaml.contains("\nspec:\n  network:\n    mode: host_ip\n"),
+        yaml.contains("\n  network:\n    mode: host_ip\n"),
         "{yaml}"
     );
     assert!(yaml.ends_with("\ntype: session\n"), "{yaml}");
