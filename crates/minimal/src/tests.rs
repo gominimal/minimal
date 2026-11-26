@@ -4157,10 +4157,19 @@ fn create_written_name_held_exit2_names_holder_and_next_steps() {
             Some(HolderVerb::Restart),
             "min task run",
             "Cannot start web. The name api is taken. The running box api \
+             (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) has it. Run min box rm --force api \
+             to remove it and free the name. Run min task run web --name <name> to \
+             start a box from the entry under another name.",
+        ),
+        (
+            "stopped",
+            Some(HolderVerb::Restart),
+            "min box start",
+            "Cannot start web. The name api is taken. The stopped box api \
              (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) has it. Run min box restart api to \
-             start it again. Run min box rm --force api to remove it and free the \
-             name. Run min task run web --name <name> to start a box from the entry \
-             under another name.",
+             start it again. Run min box rm api to remove it and free the name. Run \
+             min box start web --name <name> to start a box from the entry under \
+             another name.",
         ),
         (
             "exited",
@@ -4256,6 +4265,24 @@ fn unattached_create_numbered_prints_one_stderr_line() {
         assert_eq!(line, text, "{verb:?}");
         assert!(!line.contains('\n'), "one line: {line}");
     }
+
+    // A running box that has the name gets no restart sentence: it does
+    // not need a new start.
+    let running = numbered_reply(
+        "dev-1",
+        minimald_rpc::NameNotTaken {
+            name: "dev".to_string(),
+            reason: held_by("dev", "running"),
+        },
+    );
+    assert_eq!(
+        numbered_line_for_start(false, &running, Some(HolderVerb::Restart)).as_deref(),
+        Some(
+            "The box is named dev-1, because the name dev is taken. The running box \
+             dev (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) has it. Run min box logs dev \
+             for its output. Run min box prune to remove stopped boxes."
+        )
+    );
 
     // A box that took the name it derived prints nothing.
     let mut first = reply.clone();

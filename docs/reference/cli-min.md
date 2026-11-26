@@ -440,7 +440,8 @@ the host has that name in any state, the command refuses with exit code 2 and
 creates nothing. The refusal says that the name is taken. When you can read
 the box that has the name, the refusal also names that box and its state. It
 names `min box attach <name>` for a box with a terminal, or
-`min box restart <name>` for a box that runs until stopped. It also names
+`min box restart <name>` for a box that runs until stopped and is not
+running. It also names
 `min box rm <name>`, or `min box rm --force <name>` for a running box, which
 removes that box and frees the name. Every refusal names `--name <name>`,
 which starts a box from the entry under another name.
