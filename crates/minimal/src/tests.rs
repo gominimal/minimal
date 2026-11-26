@@ -3403,10 +3403,22 @@ async fn start_with_a_box_for_the_path_prints_no_warning() {
         let (stdout, stderr) = (read(out), read(err));
         result
             .unwrap_or_else(|e| panic!("{verb:?} round {round}: the start fails: {e:#}\n{stderr}"));
-        assert_eq!(
-            stderr, "",
-            "{verb:?} round {round}: the start prints nothing on stderr"
-        );
+        // The first start takes the derived name. The later two take a
+        // number, and an unattached start says so in one line (BCLI-081).
+        // Nothing else reaches stderr.
+        if round == 0 {
+            assert_eq!(
+                stderr, "",
+                "{verb:?} round {round}: the start prints nothing on stderr"
+            );
+        } else {
+            assert!(
+                stderr.starts_with("The box is named ")
+                    && stderr.ends_with(" Run min box prune to remove stopped boxes.\n")
+                    && stderr.matches('\n').count() == 1,
+                "{verb:?} round {round}: the start prints only the numbered line: {stderr:?}"
+            );
+        }
         let id = stdout
             .strip_suffix('\n')
             .unwrap_or_else(|| panic!("{verb:?} round {round}: stdout is one line: {stdout:?}"));
@@ -3484,7 +3496,7 @@ async fn unattached_start_closes_stdin_and_hints_run_logs_wait() {
     let text = std::fs::read_to_string(manifest.join("src/cmd/boxes/create.rs")).unwrap();
     let body = function_body(&text, "start_entry").expect("create.rs defines start_entry");
     for step in [
-        "let id = crate::task::run_entry(global, run).await?;",
+        "let id = crate::task::run_entry(global, run)",
         "crate::output::record_box_id(&id.to_string());",
         "unattached_start_hint(&entry, id)",
     ] {
@@ -4051,10 +4063,10 @@ fn create_name_held_exit2_names_holder_hints_name_flag() {
     assert_eq!(held.refusal.holder, Some(holder));
     assert_eq!(
         format!("{error:#}"),
-        "Cannot start default. The running box default \
-         (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) holds the name default. Run \
-         min box start default --name <name> to start a box from the entry under \
-         another name."
+        "Cannot start default. The name default is taken. The running box default \
+         (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) has it. Run min box rm --force default \
+         to remove it and free the name. Run min box start default --name <name> to \
+         start a box from the entry under another name."
     );
 
     let unread = start_refusal(
@@ -4065,9 +4077,9 @@ fn create_name_held_exit2_names_holder_hints_name_flag() {
     assert!(unread.downcast_ref::<StartNameHeld>().is_some());
     assert_eq!(
         format!("{unread:#}"),
-        "Cannot start dev. The box dev holds the name dev. Run \
-         min session start dev --name <name> to start a box from the entry under \
-         another name."
+        "Cannot start dev. The name dev is taken. The box dev has it. Run min box rm \
+         dev to remove it and free the name. Run min session start dev --name <name> \
+         to start a box from the entry under another name."
     );
 
     let other = start_refusal(anyhow::anyhow!("boom"), StartVerb::Box, "dev");
@@ -4087,6 +4099,335 @@ fn create_name_held_exit2_names_holder_hints_name_flag() {
         let printed = format!("{:#}", start_refusal(from_daemon, verb, "dev"));
         assert_eq!(printed, port.to_string(), "{verb:?}");
     }
+}
+
+/// The id of the box that has a name, in the held-name tests.
+fn held_name_holder() -> boxes::SessionId {
+    boxes::SessionId::parse_str("0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b").unwrap()
+}
+
+/// A create reply for a box that took `took`, because it did not get
+/// `not_taken`.
+fn numbered_reply(
+    took: &str,
+    not_taken: minimald_rpc::NameNotTaken,
+) -> minimald_rpc::CreateSessionResponse {
+    let mut reply: minimald_rpc::CreateSessionResponse =
+        serde_json_lenient::from_str(r#"{"id":"0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7c"}"#)
+            .expect("a create reply needs only its id");
+    reply.name = Some(took.to_string());
+    reply.name_not_taken = Some(not_taken);
+    reply
+}
+
+/// The reason a derived name was taken by the box `holder`, in `state`.
+fn held_by(name: &str, state: &str) -> minimald_rpc::NameTakenReason {
+    minimald_rpc::NameTakenReason::Held {
+        holder: Some(minimald_rpc::NameHolder {
+            id: held_name_holder(),
+            name: name.to_string(),
+            state: state.to_string(),
+        }),
+    }
+}
+
+// BCLI-069: a written name that a box has refuses the create with exit
+// 2. To a caller who may read that box, the refusal names it, its state,
+// the verb that goes back into it, `min box rm` and `--name`.
+#[test]
+fn create_written_name_held_exit2_names_holder_and_next_steps() {
+    let refusal = |state: &str| minimald_rpc::HeldNameRefusal {
+        name: "api".to_string(),
+        holder: Some(held_name_holder()),
+        holder_name: Some("api".to_string()),
+        state: Some(state.to_string()),
+    };
+    let error = start_refusal(
+        create_refusal(refusal("stopped").to_string(), None, None, None),
+        StartVerb::Box,
+        "web",
+    );
+    let held = error
+        .downcast_ref::<StartNameHeld>()
+        .expect("main.rs maps this error to exit 2");
+    assert_eq!(StartNameHeld::EXIT_CODE, 2);
+    assert_eq!(held.refusal.holder, Some(held_name_holder()));
+
+    let cases = [
+        (
+            "stopped",
+            Some(HolderVerb::Attach),
+            "min box start",
+            "Cannot start web. The name api is taken. The stopped box api \
+             (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) has it. Run min box attach api to \
+             go back into it. Run min box rm api to remove it and free the name. Run \
+             min box start web --name <name> to start a box from the entry under \
+             another name.",
+        ),
+        (
+            "running",
+            Some(HolderVerb::Restart),
+            "min task run",
+            "Cannot start web. The name api is taken. The running box api \
+             (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) has it. Run min box restart api to \
+             restart it. Run min box rm --force api to remove it and free the \
+             name. Run min task run web --name <name> to start a box from the entry \
+             under another name.",
+        ),
+        (
+            "stopped",
+            Some(HolderVerb::Restart),
+            "min box start",
+            "Cannot start web. The name api is taken. The stopped box api \
+             (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) has it. Run min box restart api to \
+             restart it. Run min box rm api to remove it and free the name. Run \
+             min box start web --name <name> to start a box from the entry under \
+             another name.",
+        ),
+        (
+            "exited",
+            None,
+            "min box run",
+            "Cannot start web. The name api is taken. The exited box api \
+             (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) has it. Run min box rm api to \
+             remove it and free the name. Run min box run web --name <name> to start \
+             a box from the entry under another name.",
+        ),
+    ];
+    for (state, verb, command, text) in cases {
+        let held = StartNameHeld {
+            command,
+            entry: "web".to_string(),
+            refusal: refusal(state),
+            verb,
+        };
+        assert_eq!(held.to_string(), text, "{state}");
+        assert!(!held.to_string().contains('\n'), "{state}");
+    }
+}
+
+// BCLI-069: a caller who may not read the box that has the name learns
+// only that the name is taken, and `--name`.
+#[test]
+fn create_written_name_held_without_box_read_names_no_box() {
+    let hidden = minimald_rpc::HeldNameRefusal {
+        name: "api".to_string(),
+        holder: None,
+        holder_name: None,
+        state: None,
+    };
+    let error = start_refusal(
+        create_refusal(hidden.to_string(), None, None, None),
+        StartVerb::Session,
+        "web",
+    );
+    let held = error
+        .downcast_ref::<StartNameHeld>()
+        .expect("main.rs maps this error to exit 2");
+    // Even a verb read by mistake does not print without the box.
+    let held = StartNameHeld {
+        verb: Some(HolderVerb::Attach),
+        ..held.clone()
+    };
+    let text = held.to_string();
+    assert_eq!(
+        text,
+        "Cannot start web. The name api is taken. Run min session start web \
+         --name <name> to start a box from the entry under another name."
+    );
+    for word in ["box api", "attach", "restart", "min box rm", "0192f3c4"] {
+        assert!(!text.contains(word), "{word}: {text}");
+    }
+}
+
+// BCLI-081: an unattached create whose box took a number prints one
+// stderr line. It names the name the box took, the name it did not get,
+// the box that has that name, its state, the verb that fits, and
+// `min box prune`.
+#[test]
+fn unattached_create_numbered_prints_one_stderr_line() {
+    let cases = [
+        (
+            Some(HolderVerb::Attach),
+            "The box is named dev-1, because the name dev is taken. The stopped box \
+             dev (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) has it. Run min box attach dev \
+             to go back into it. Run min box prune to remove stopped boxes.",
+        ),
+        (
+            Some(HolderVerb::Restart),
+            "The box is named dev-1, because the name dev is taken. The stopped box \
+             dev (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) has it. Run min box restart dev \
+             to restart it. Run min box prune to remove stopped boxes.",
+        ),
+        (
+            None,
+            "The box is named dev-1, because the name dev is taken. The stopped box \
+             dev (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) has it. Run min box logs dev \
+             for its output. Run min box prune to remove stopped boxes.",
+        ),
+    ];
+    let reply = numbered_reply(
+        "dev-1",
+        minimald_rpc::NameNotTaken {
+            name: "dev".to_string(),
+            reason: held_by("dev", "stopped"),
+        },
+    );
+    for (verb, text) in cases {
+        let line = numbered_line_for_start(false, &reply, verb).expect("the box took a number");
+        assert_eq!(line, text, "{verb:?}");
+        assert!(!line.contains('\n'), "one line: {line}");
+    }
+
+    // A running box that runs until stopped still gets the restart
+    // sentence: the verb follows the stored spec, not the state.
+    let running = numbered_reply(
+        "dev-1",
+        minimald_rpc::NameNotTaken {
+            name: "dev".to_string(),
+            reason: held_by("dev", "running"),
+        },
+    );
+    assert_eq!(
+        numbered_line_for_start(false, &running, Some(HolderVerb::Restart)).as_deref(),
+        Some(
+            "The box is named dev-1, because the name dev is taken. The running box \
+             dev (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) has it. Run min box restart \
+             dev to restart it. Run min box prune to remove stopped boxes."
+        )
+    );
+
+    // A box that took the name it derived prints nothing.
+    let mut first = reply.clone();
+    first.name_not_taken = None;
+    assert_eq!(numbered_line_for_start(false, &first, None), None);
+}
+
+// BCLI-081: a derived name that the form rule excludes is named as such,
+// the line names no box, and it names `min box prune`.
+#[test]
+fn unattached_create_numbered_excluded_name_names_no_box() {
+    use minimald_rpc::NameTakenReason;
+    let cases = [
+        (
+            "self",
+            NameTakenReason::Reserved,
+            "The box is named self-1, because the name self is reserved. Run min box \
+             prune to remove stopped boxes.",
+        ),
+        (
+            "0192f3c4",
+            NameTakenReason::BoxIdForm,
+            "The box is named 0192f3c4-1, because the name 0192f3c4 has the form of a \
+             box id. Run min box prune to remove stopped boxes.",
+        ),
+    ];
+    for (name, reason, text) in cases {
+        let reply = numbered_reply(
+            &format!("{name}-1"),
+            minimald_rpc::NameNotTaken {
+                name: name.to_string(),
+                reason,
+            },
+        );
+        let line = numbered_line_for_start(false, &reply, Some(HolderVerb::Attach))
+            .expect("the box took a number");
+        assert_eq!(line, text, "{name}");
+        for word in ["has it", "attach", "logs", "restart"] {
+            assert!(!line.contains(word), "{word}: {line}");
+        }
+    }
+}
+
+// BCLI-081: a caller who may not read the box that has the derived name
+// learns that the name is taken, the name the box took, and
+// `min box prune`, and nothing about the other box.
+#[test]
+fn unattached_create_numbered_without_box_read_names_no_box() {
+    let reply = numbered_reply(
+        "dev-2",
+        minimald_rpc::NameNotTaken {
+            name: "dev".to_string(),
+            reason: minimald_rpc::NameTakenReason::Held { holder: None },
+        },
+    );
+    let line = numbered_line_for_start(false, &reply, Some(HolderVerb::Attach))
+        .expect("the box took a number");
+    assert_eq!(
+        line,
+        "The box is named dev-2, because the name dev is taken. Run min box prune to \
+         remove stopped boxes."
+    );
+    for word in [
+        "has it",
+        "attach",
+        "logs",
+        "restart",
+        "The stopped",
+        "0192f3c4",
+    ] {
+        assert!(!line.contains(word), "{word}: {line}");
+    }
+}
+
+// BCLI-082: a start that attaches this terminal prints nothing about the
+// box's name before the shell, whatever the reason the box took a number.
+#[test]
+fn attached_start_numbered_prints_nothing_before_shell() {
+    use minimald_rpc::NameTakenReason;
+    for reason in [
+        held_by("dev", "running"),
+        NameTakenReason::Held { holder: None },
+        NameTakenReason::Reserved,
+        NameTakenReason::BoxIdForm,
+    ] {
+        let reply = numbered_reply(
+            "dev-1",
+            minimald_rpc::NameNotTaken {
+                name: "dev".to_string(),
+                reason: reason.clone(),
+            },
+        );
+        assert_eq!(
+            numbered_line_for_start(true, &reply, Some(HolderVerb::Attach)),
+            None,
+            "{reason:?}"
+        );
+        assert!(
+            numbered_line_for_start(false, &reply, None).is_some(),
+            "{reason:?}"
+        );
+    }
+}
+
+// BCLI-069, BCLI-081: the verb that goes back into a box comes from its
+// stored spec: `attach` for `pty_enabled`, `restart` for
+// `lifetime = "until_stopped"`, else none.
+#[test]
+fn holder_verb_reads_the_stored_spec() {
+    let spec =
+        |text: &str| serde_json_lenient::from_str::<serde_json_lenient::Value>(text).unwrap();
+    let cases = [
+        (
+            r#"{"io":{"pty_enabled":true},"box":{"lifetime":"until_stopped"}}"#,
+            Some(HolderVerb::Attach),
+        ),
+        (r#"{"io":{"pty_enabled":true}}"#, Some(HolderVerb::Attach)),
+        (
+            r#"{"io":{"pty_enabled":false},"box":{"lifetime":"until_stopped"}}"#,
+            Some(HolderVerb::Restart),
+        ),
+        (
+            r#"{"io":{"pty_enabled":false},"box":{"lifetime":"until_entrypoint_exits"}}"#,
+            None,
+        ),
+        (r#"{}"#, None),
+    ];
+    for (text, verb) in cases {
+        assert_eq!(holder_verb(Some(&spec(text))), verb, "{text}");
+    }
+    // A box with no stored spec has no verb.
+    assert_eq!(holder_verb(None), None);
 }
 
 // BCLI-071: a bare `min session start` starts the `default` session entry,
