@@ -735,14 +735,30 @@ use another project, give `--repo-dir <DIR>` (short `-C`).
 `min box spec <ENTRY>` shows the spec that `min box start <ENTRY>` sends to
 the host, before any box exists. A comment or a `sources` field names the
 layer that set each value. A secret shows only as its reference, never as its
-value. The output also names the loadouts that `min box start` applies. When
-the entry declares a broker secret, the Box Egress Proxy rows follow.
+value. When the entry declares a broker secret, the Box Egress Proxy rows
+follow.
+
+The output names the loadouts that `min box start` applies, and the spec
+includes their values, as the spec of a started box does. A package, a
+variable or a lifecycle hook from a loadout names that loadout as its layer,
+for example `loadout dev`. Each variable of `env_vars` shows once, with the
+value that the box gets, and names the layer that set that value. With no
+`--loadout` and no `default_loadouts`, the `default` loadout applies: your
+`default` loadout file, or the built-in `default` loadout when there is no
+such file. An entry with `loadout_mode = "sealed"` applies no loadout.
+
+A variable whose name looks like a secret's, such as `GITHUB_TOKEN`, gets a
+warning on stderr. The warning names the layer that set the variable, and
+the loadout file for a variable from a loadout. Put a secret value in a
+`[secrets]` entry to keep it out of the spec.
 
 | Flag | Short | Description |
 |------|-------|-------------|
 | `--output <toml\|json\|yaml>` | `-o` | The format of the spec. The default is `toml` |
 | `--network`, `--ingress`, `--allow-subnets`, `--allow-dns-hosts`, `--allow-protocols`, `--deny-subnets`, `--deny-all-egress` | | Overrides of the entry's `[network]` keys, as on [`session start`](#session-start) |
 | `--loadout <NAME>` | | Apply the named loadout, as on [`session start`](#session-start). Repeatable |
+| `--no-loadouts` | | Apply no loadouts, and not the config file's `default_loadouts` either. Cannot be combined with `--loadout` |
+| `--no-hooks` | | Show the spec with no lifecycle hook, from the loadouts or from `minimal.toml`, as a box started with `--no-hooks` stores it |
 
 A task entry refuses `--ingress` and `--loadout` with exit code 2, as
 `min box start` does.
