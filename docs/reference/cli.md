@@ -52,7 +52,7 @@ These top-level forms are intentional exceptions to the convention.
 
 | Form | What it does, and why it stays |
 |------|--------------|
-| `min` | In a terminal, attaches to the session box for the current directory. With no such box, it attaches to the only session box, or opens a picker when there are more. With no session box at all, it starts one from the current directory and attaches. Without a terminal, prints a read-only state report on stderr. [`min`](./cli-min.md) describes how it picks the box. `min --help` prints the help. |
+| `min` | In a terminal, attaches to the session box of the current directory when exactly one matches, and opens a picker of them when several match. When none matches, it attaches to the only session box, or opens a picker of all of them. With no session box at all, it starts one from the current directory and attaches. With `--no-input`, a choice that needs the picker ends with an error that lists the boxes. Without a terminal, prints a read-only state report on stderr. [`min`](./cli-min.md) describes how it picks the box. `min --help` prints the help. |
 | `min ls` | The most-used command keeps its bare form, with the `--raw` and `--json` flags that scripts read. It is not an alias of `min session list`, which is `min box list` limited to session boxes. |
 | `min init`, `min add`, `min update` | Pass through to the `mip` commands of the same name. The same spelling in the two CLIs is more useful than the noun form. |
 | `min login` | The same as `min auth login`. |
