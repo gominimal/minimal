@@ -9,7 +9,7 @@
 //! External tools are host-side extras used when present: `ps` for the table
 //! (a `/proc` scrape stands in), macOS `sample`, and one `lsof` over the set.
 
-// `Cow` and the placeholder are only reachable from the Linux `/proc` scrape,
+// `Cow` and the argv scrub are only reachable from the Linux `/proc` scrape,
 // which is the one path with true argv boundaries to redact per element.
 #[cfg(target_os = "linux")]
 use std::borrow::Cow;
@@ -20,7 +20,7 @@ use crate::capture::command_stdout;
 use crate::manifest::Redaction;
 use crate::redact::is_sensitive_key;
 #[cfg(target_os = "linux")]
-use crate::redact::redaction_placeholder;
+use crate::redact::scrub_argv;
 
 /// Timeout for `ps`; a wedged process table must not eat the collector budget.
 const PS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -44,28 +44,6 @@ fn argv0_matches(args: &str, markers: &[&str]) -> bool {
     })
 }
 
-/// Scrubs one *true* argv element: a `key=value` whose key trips the
-/// [sensitive-key policy](is_sensitive_key) has its entire value replaced by
-/// the redaction placeholder — spaces included, because the element boundary
-/// is known here.
-///
-/// Only the `/proc` scrape has real argv boundaries to work with, so this is
-/// Linux-only; everywhere else [`scrub_flattened`] takes over.
-#[cfg(target_os = "linux")]
-fn scrub_arg(arg: &str) -> Cow<'_, str> {
-    match arg.split_once('=') {
-        Some((key, value)) if is_sensitive_key(key) => {
-            let placeholder =
-                redaction_placeholder(&serde_json_lenient::Value::String(value.to_string()));
-            Cow::Owned(format!(
-                "{key}={}",
-                placeholder.as_str().unwrap_or("<redacted>")
-            ))
-        }
-        _ => Cow::Borrowed(arg),
-    }
-}
-
 /// Scrubs a command line whose argv boundaries are already lost. `ps` joins
 /// arguments with spaces, so `--password=hunter two` is indistinguishable from
 /// a secret followed by a separate argument; masking only up to the first space
@@ -75,7 +53,8 @@ fn scrub_arg(arg: &str) -> Cow<'_, str> {
 /// of the line goes with it. A truncated process line is a far smaller loss
 /// than a half-masked secret in a bundle that gets mailed out. Where the real
 /// boundaries survive — the `/proc` scrape, whose argv is NUL-separated —
-/// [`scrub_arg`] is used per element instead and nothing is over-redacted.
+/// [`crate::redact::scrub_argv`] is used per element instead and nothing is
+/// over-redacted.
 ///
 /// Public because a process argv is not the only space-joined command line a
 /// bundle carries: the kernel boot line (`/proc/cmdline`) is one too, with the
@@ -199,10 +178,7 @@ fn proc_table_text(markers: &[&str]) -> Result<String, anyhow::Error> {
                 .first()
                 .is_some_and(|argv0| argv0_matches(argv0, markers));
             let cmd = if ours {
-                argv.iter()
-                    .map(|arg| scrub_arg(arg))
-                    .collect::<Vec<_>>()
-                    .join(" ")
+                scrub_argv(&argv).join(" ")
             } else {
                 // `comm` is the process name only, never its arguments.
                 std::fs::read_to_string(format!("/proc/{pid}/comm"))
@@ -604,7 +580,7 @@ fn proc_scrape(markers: &[&str]) -> Result<(String, Vec<u32>), anyhow::Error> {
             continue;
         };
         if argv0_matches(argv0, markers) {
-            let scrubbed: Vec<Cow<'_, str>> = argv.iter().map(|a| scrub_arg(a)).collect();
+            let scrubbed: Vec<Cow<'_, str>> = scrub_argv(&argv);
             let _ = writeln!(text, "{pid} {}", scrubbed.join(" "));
             pids.push(pid);
         }
@@ -701,19 +677,37 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn scrub_arg_masks_the_whole_value_including_spaces() {
+    fn scrub_argv_masks_the_whole_value_including_spaces() {
         // True argv boundaries: the entire value is masked, spaces and all.
+        let argv = ["min", "--password=hunter two", "--port=8080", "--flag"];
+        let scrubbed = scrub_argv(&argv);
         assert_eq!(
-            scrub_arg("--password=hunter two"),
-            "--password=<redacted:len=10>",
+            scrubbed[1], "--password=<redacted:len=10>",
             "a value with spaces must not be half-masked"
         );
-        assert_eq!(
-            scrub_arg("--port=8080"),
-            "--port=8080",
-            "non-sensitive kept"
-        );
-        assert_eq!(scrub_arg("--flag"), "--flag", "non key=value untouched");
+        assert_eq!(scrubbed[2], "--port=8080", "non-sensitive kept");
+        assert_eq!(scrubbed[3], "--flag", "non key=value untouched");
+    }
+
+    /// The process table scrubs an argv with the rules a bundle's events
+    /// get: the userinfo of a URL whose user name holds a sensitive word is
+    /// masked, and so is the value after a sensitive flag given as its own
+    /// element.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scrub_argv_masks_url_userinfo_and_a_separate_flag_value() {
+        let argv = [
+            "min",
+            "https://x-access-token:procUrlPassword0123@example.test/r.git?ref=main",
+            "--token",
+            "procFlagValue0123",
+        ];
+        let line = scrub_argv(&argv).join(" ");
+        assert!(!line.contains("procUrlPassword0123"), "{line}");
+        assert!(!line.contains("procFlagValue0123"), "{line}");
+        assert!(line.starts_with("min https://"), "{line}");
+        assert!(line.contains("@example.test/r.git?ref=main"), "{line}");
+        assert!(line.ends_with("--token <redacted:len=17>"), "{line}");
     }
 
     #[test]

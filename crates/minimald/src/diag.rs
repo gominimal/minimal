@@ -26,7 +26,7 @@ use russh::{Channel as RuChannel, server::Msg};
 use serde::Serialize;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-use diagnostics::redact::{masked_process_env, redact_json};
+use diagnostics::redact::{ArgvScrubber, masked_process_env, redact_json, scrub_secrets};
 use diagnostics::{BundleSink, BundleWriter, LOG_TAIL_CAP, Redaction};
 
 use crate::ChannelConfig;
@@ -698,20 +698,22 @@ async fn sessions<W: BundleSink>(
         }
         // The box's lifecycle events (BOX-040) travel beside its record:
         // the record says where the box is, the events say how it got
-        // there. An event's `data` can carry user data, such as a box name
-        // or an exit reason, so each line is redacted like the record,
-        // tail-capped like a log. An absent file is a box created before
-        // events were written.
+        // there. An event's `data` can carry user data, such as a box name,
+        // an exit reason or an exec's argv, so each line is redacted like
+        // the record, its strings are scrubbed like a log line, and the
+        // file is tail-capped like a log. An absent file is a box created
+        // before events were written.
         let events = format!("sessions/{short}/{}", boxes::events::EVENTS_FILE);
         match read_events_tail(&entry.path().join(boxes::events::EVENTS_FILE)).await {
             Ok(Some((bytes, capped))) => {
-                let redaction = if capped {
-                    Redaction::TailCapped
-                } else {
-                    Redaction::Keys
+                let (lines, scrubbed) = redact_event_lines(&bytes);
+                let redaction = match (capped, scrubbed) {
+                    (true, true) => Redaction::TailCappedScrubbed,
+                    (true, false) => Redaction::TailCapped,
+                    (false, true) => Redaction::Scrubbed,
+                    (false, false) => Redaction::Keys,
                 };
-                w.add_bytes(&events, &redact_event_lines(&bytes), redaction)
-                    .await?;
+                w.add_bytes(&events, &lines, redaction).await?;
             }
             Ok(None) => {}
             Err(e) => w.skip(events, format!("unreadable: {e:#}")),
@@ -871,10 +873,13 @@ async fn read_events_tail(path: &Path) -> Result<Option<(Vec<u8>, bool)>, anyhow
 }
 
 /// Redacts each line of a box's events file as [`redact_json`] redacts a
-/// record, and writes each back as one line. A line that does not decode is
-/// replaced by [`WITHHELD_EVENT_LINE`]. Blank lines go.
-fn redact_event_lines(bytes: &[u8]) -> Vec<u8> {
+/// record, scrubs its strings with [`scrub_event_strings`], and writes each
+/// back as one line. A line that does not decode is replaced by
+/// [`WITHHELD_EVENT_LINE`]. Blank lines go. The bool is true when the scrub
+/// changed a string, which the manifest records.
+fn redact_event_lines(bytes: &[u8]) -> (Vec<u8>, bool) {
     let mut out = Vec::with_capacity(bytes.len());
+    let mut scrubbed = false;
     for line in bytes.split(|b| *b == b'\n') {
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
@@ -882,6 +887,7 @@ fn redact_event_lines(bytes: &[u8]) -> Vec<u8> {
         match serde_json_lenient::from_slice::<serde_json_lenient::Value>(line) {
             Ok(mut value) => {
                 redact_json(&mut value);
+                scrubbed |= scrub_event_strings(&mut value);
                 match serde_json_lenient::to_vec(&value) {
                     Ok(json) => out.extend_from_slice(&json),
                     Err(_) => out.extend_from_slice(WITHHELD_EVENT_LINE.as_bytes()),
@@ -891,7 +897,65 @@ fn redact_event_lines(bytes: &[u8]) -> Vec<u8> {
         }
         out.push(b'\n');
     }
-    out
+    (out, scrubbed)
+}
+
+/// Scrubs every string in an event as a log line is scrubbed
+/// ([`scrub_secrets`]), and says whether any changed. Key names do not find
+/// a credential inside a value: an exec event's `argv` is a list of strings
+/// the client sent, and an argument can be a header, a URL or a token.
+///
+/// The strings of a list are scrubbed as the elements of an argv, with an
+/// [`ArgvScrubber`], the rule the process table of a bundle uses too: the
+/// string after a sensitive flag (`--token`, then its value) is masked
+/// whole, and an assignment or a header under a sensitive name
+/// (`-password=two words`, `X-Api-Key: v`) keeps its name and loses its
+/// whole value. A list item that is not a string breaks the argv: the
+/// string after it starts a new one.
+///
+/// The flag and assignment rules read a name as
+/// [`diagnostics::redact::is_sensitive_key`] does, by the parts it holds. A flag such as `--keyring` or `--author` is therefore
+/// masked too, with its value: the bundle loses that argument and keeps no
+/// secret, the same choice the key redaction makes for a record's members.
+fn scrub_event_strings(value: &mut serde_json_lenient::Value) -> bool {
+    use serde_json_lenient::Value;
+    use std::borrow::Cow;
+    match value {
+        Value::String(text) => match scrub_secrets(text) {
+            Cow::Owned(clean) => {
+                *text = clean;
+                true
+            }
+            Cow::Borrowed(_) => false,
+        },
+        Value::Array(items) => {
+            let mut changed = false;
+            let mut scrubber = ArgvScrubber::default();
+            for item in items.iter_mut() {
+                match item {
+                    Value::String(text) => {
+                        if let Cow::Owned(clean) = scrubber.scrub_next(text) {
+                            *text = clean;
+                            changed = true;
+                        }
+                    }
+                    other => {
+                        changed |= scrub_event_strings(other);
+                        scrubber = ArgvScrubber::default();
+                    }
+                }
+            }
+            changed
+        }
+        Value::Object(map) => {
+            let mut changed = false;
+            for (_, child) in map.iter_mut() {
+                changed |= scrub_event_strings(child);
+            }
+            changed
+        }
+        _ => false,
+    }
 }
 
 /// The `io::ErrorKind` behind an [`anyhow::Error`], if one is in its chain.
@@ -1662,6 +1726,300 @@ mod tests {
         assert_eq!(renamed["type"], "renamed");
         assert_eq!(renamed["data"]["new_name"], "kept-name");
         assert_eq!(lines[2], WITHHELD_EVENT_LINE);
+    }
+
+    /// An exec event carries the argv the client sent (BOX-152), and an
+    /// argument can be a credential: a header, a token, the value after a
+    /// flag. None of them travels in the bundle, the line still decodes with
+    /// the rest of the argv in place, and the manifest says the file was
+    /// scrubbed.
+    #[tokio::test]
+    async fn diag_bundle_scrubs_exec_argv_in_box_events() {
+        use std::io::Write as _;
+
+        let server = TestServer::new().await;
+        {
+            let mut client = server.connect().await;
+            crate::test_harness::create_configured_session(&mut client, "diag-argv", "/tmp").await;
+        }
+        let state_dir = server.state.minimal_state_dir().await;
+        let sessions_dir = state_dir.as_utf8_path().as_std_path().join("sessions");
+        let events_path = std::fs::read_dir(&sessions_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path().join(boxes::events::EVENTS_FILE))
+            .find(|path| path.exists())
+            .expect("the box should have an events file");
+        let created = std::fs::read(&events_path).unwrap();
+        let mut event: boxes::events::BoxEvent =
+            serde_json_lenient::from_slice(created.split(|b| *b == b'\n').next().unwrap()).unwrap();
+        event.kind = boxes::events::BoxEventType::ExecStarted;
+        event.data.insert(
+            boxes::events::exec_data::ARGV.to_owned(),
+            serde_json_lenient::json!([
+                "curl",
+                "-H",
+                "Authorization: Bearer ghp_argvHeaderExample0123",
+                "--token",
+                "plain-value-after-a-flag",
+                "--password=hunter2-in-a-flag",
+                "--db-password=correct horse battery staple",
+                "https://example.test/",
+            ]),
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&events_path)
+            .unwrap();
+        file.write_all(&event.to_line().unwrap()).unwrap();
+        event.data.insert(
+            boxes::events::exec_data::ARGV.to_owned(),
+            serde_json_lenient::json!(["sh", "-c", "echo ghp_argvShellExample0123 >/dev/null"]),
+        );
+        file.write_all(&event.to_line().unwrap()).unwrap();
+        drop(file);
+
+        let files = fetch_bundle(&server).await;
+        let bundled = files
+            .iter()
+            .find(|(path, _)| path.ends_with(boxes::events::EVENTS_FILE))
+            .map(|(_, contents)| String::from_utf8(contents.clone()).unwrap())
+            .expect("the box's events file should be bundled");
+        for secret in [
+            "ghp_argvHeaderExample0123",
+            "plain-value-after-a-flag",
+            "hunter2-in-a-flag",
+            "correct",
+            "horse",
+            "battery",
+            "staple",
+            "ghp_argvShellExample0123",
+        ] {
+            assert!(
+                !bundled.contains(secret),
+                "{secret} travels in the bundle: {bundled}"
+            );
+        }
+        let lines: Vec<&str> = bundled.lines().collect();
+        assert_eq!(
+            lines.len(),
+            3,
+            "one bundled line per events line: {bundled}"
+        );
+        let curl: serde_json_lenient::Value = serde_json_lenient::from_str(lines[1]).unwrap();
+        assert_eq!(curl["type"], "exec_started");
+        let argv = curl["data"]["argv"].as_array().unwrap();
+        assert_eq!(argv.len(), 8, "the argv keeps its length: {argv:?}");
+        assert_eq!(argv[0], "curl");
+        assert_eq!(argv[1], "-H");
+        assert_eq!(argv[3], "--token");
+        assert_eq!(argv[6], "--db-password=<redacted:len=28>");
+        assert_eq!(argv[7], "https://example.test/");
+        let shell: serde_json_lenient::Value = serde_json_lenient::from_str(lines[2]).unwrap();
+        assert_eq!(shell["data"]["argv"][0], "sh");
+        assert_eq!(shell["data"]["argv"][1], "-c");
+
+        let manifest = files
+            .iter()
+            .find(|(path, _)| path.ends_with("manifest.json"))
+            .map(|(_, contents)| String::from_utf8(contents.clone()).unwrap())
+            .expect("the bundle has a manifest");
+        let manifest: serde_json_lenient::Value = serde_json_lenient::from_str(&manifest).unwrap();
+        let entry = manifest["collected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| {
+                entry["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with(boxes::events::EVENTS_FILE))
+            })
+            .expect("the manifest lists the events file");
+        assert_eq!(entry["redaction"], "scrubbed");
+    }
+
+    /// An events file over the cap travels as its tail, scrubbed like the
+    /// whole file, and the manifest says both: `tail-capped-scrubbed`. The
+    /// argument is an assignment under a one-dash name whose value has
+    /// spaces, and no word of the value travels.
+    #[tokio::test]
+    async fn diag_bundle_scrubs_a_capped_events_tail() {
+        use std::io::Write as _;
+
+        let server = TestServer::new().await;
+        {
+            let mut client = server.connect().await;
+            crate::test_harness::create_configured_session(&mut client, "diag-capped", "/tmp")
+                .await;
+        }
+        let state_dir = server.state.minimal_state_dir().await;
+        let sessions_dir = state_dir.as_utf8_path().as_std_path().join("sessions");
+        let events_path = std::fs::read_dir(&sessions_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path().join(boxes::events::EVENTS_FILE))
+            .find(|path| path.exists())
+            .expect("the box should have an events file");
+        let created = std::fs::read(&events_path).unwrap();
+        let mut event: boxes::events::BoxEvent =
+            serde_json_lenient::from_slice(created.split(|b| *b == b'\n').next().unwrap()).unwrap();
+        event.kind = boxes::events::BoxEventType::ExecStarted;
+        event.data.insert(
+            boxes::events::exec_data::ARGV.to_owned(),
+            serde_json_lenient::json!(["tool", "-password=correct horse battery staple"]),
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&events_path)
+            .unwrap();
+        // One line longer than the cap, so the tail starts inside it and the
+        // read drops it whole.
+        let mut filler = vec![b'x'; usize::try_from(MAX_SESSION_FILE_BYTES).unwrap() + 1];
+        filler.push(b'\n');
+        file.write_all(&filler).unwrap();
+        file.write_all(&event.to_line().unwrap()).unwrap();
+        drop(file);
+
+        let files = fetch_bundle(&server).await;
+        let bundled = files
+            .iter()
+            .find(|(path, _)| path.ends_with(boxes::events::EVENTS_FILE))
+            .map(|(_, contents)| String::from_utf8(contents.clone()).unwrap())
+            .expect("the box's events file should be bundled");
+        for word in ["correct", "horse", "battery", "staple"] {
+            assert!(
+                !bundled.contains(word),
+                "{word} travels in the bundle: {bundled}"
+            );
+        }
+        let lines: Vec<&str> = bundled.lines().collect();
+        assert_eq!(lines.len(), 1, "only the tail's whole lines: {bundled}");
+        let exec: serde_json_lenient::Value = serde_json_lenient::from_str(lines[0]).unwrap();
+        assert_eq!(exec["data"]["argv"][1], "-password=<redacted:len=28>");
+
+        let manifest = files
+            .iter()
+            .find(|(path, _)| path.ends_with("manifest.json"))
+            .map(|(_, contents)| String::from_utf8(contents.clone()).unwrap())
+            .expect("the bundle has a manifest");
+        let manifest: serde_json_lenient::Value = serde_json_lenient::from_str(&manifest).unwrap();
+        let entry = manifest["collected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| {
+                entry["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with(boxes::events::EVENTS_FILE))
+            })
+            .expect("the manifest lists the events file");
+        assert_eq!(entry["redaction"], "tail-capped-scrubbed");
+    }
+
+    /// The scrub of an event's strings changes nothing in an event with no
+    /// credential, and says so, so its file stays recorded as redacted by
+    /// key.
+    #[test]
+    fn scrub_event_strings_leaves_a_clean_event_alone() {
+        let mut event = serde_json_lenient::json!({
+            "type": "exec_started",
+            "data": {"argv": ["make", "test", "--jobs", "4", "task-runner"], "pty": false},
+        });
+        let before = event.clone();
+        assert!(!scrub_event_strings(&mut event));
+        assert_eq!(event, before);
+    }
+
+    /// An argument that is one assignment under a sensitive name loses its
+    /// whole value, spaces included, and keeps its name, whatever form the
+    /// name has: two dashes, one dash, a `-D` property, a dotted key, or a
+    /// variable inside a flag's value. A shell line or a header with a
+    /// sensitive word before an `=` is not taken for an assignment: it goes
+    /// to the log scrub, which finds the credential in it. An already masked
+    /// value is left as it is, and a value that only starts like one is not.
+    #[test]
+    fn scrub_event_strings_masks_the_whole_value_of_a_sensitive_assignment() {
+        let mut event = serde_json_lenient::json!({
+            "data": {"argv": [
+                "tool",
+                "--password=correct horse battery staple",
+                "API_TOKEN=a b",
+                "--jobs=4",
+                "curl -H 'Authorization: Bearer ghp_shellLineExample0123' https://example.test/?q=1",
+                "--secret=<redacted:len=3>",
+                "-password=correct horse battery staple",
+                "-Dpassword=a b",
+                "db.password=a b",
+                "--env=API_TOKEN=a b",
+                "--password=<redacted:len=3> tail",
+            ]},
+        });
+        assert!(scrub_event_strings(&mut event));
+        let argv = event["data"]["argv"].as_array().unwrap();
+        assert_eq!(argv.len(), 11, "the argv keeps its length: {argv:?}");
+        assert_eq!(argv[1], "--password=<redacted:len=28>");
+        assert_eq!(argv[2], "API_TOKEN=<redacted:len=3>");
+        assert_eq!(argv[3], "--jobs=4");
+        let shell = argv[4].as_str().unwrap();
+        assert!(!shell.contains("ghp_shellLineExample0123"), "{shell}");
+        assert!(shell.starts_with("curl -H "), "{shell}");
+        assert_eq!(argv[5], "--secret=<redacted:len=3>");
+        assert_eq!(argv[6], "-password=<redacted:len=28>");
+        assert_eq!(argv[7], "-Dpassword=<redacted:len=3>");
+        assert_eq!(argv[8], "db.password=<redacted:len=3>");
+        assert_eq!(argv[9], "--env=API_TOKEN=<redacted:len=3>");
+        assert_eq!(argv[10], "--password=<redacted:len=21>");
+    }
+
+    /// A URL is not an assignment, whatever word stands before an `=`: its
+    /// user name can hold `token` or `auth`. It goes to the log scrub, which
+    /// masks the userinfo.
+    #[test]
+    fn scrub_event_strings_sends_a_url_to_the_log_scrub() {
+        let mut event = serde_json_lenient::json!({
+            "data": {"argv": [
+                "git",
+                "clone",
+                "https://x-access-token:userinfoPassword0123@example.test/o/r.git?ref=main",
+                "https://oauth2:anotherPassword4567@example.test/o/r.git?a=b",
+            ]},
+        });
+        assert!(scrub_event_strings(&mut event));
+        let argv = event["data"]["argv"].as_array().unwrap();
+        let first = argv[2].as_str().unwrap();
+        assert!(!first.contains("userinfoPassword0123"), "{first}");
+        assert!(first.ends_with("@example.test/o/r.git?ref=main"), "{first}");
+        let second = argv[3].as_str().unwrap();
+        assert!(!second.contains("anotherPassword4567"), "{second}");
+        assert!(second.ends_with("@example.test/o/r.git?a=b"), "{second}");
+    }
+
+    /// The value after a sensitive flag is masked whole, after two dashes
+    /// and after one. A long flag right after a sensitive flag is not taken
+    /// for its value, and a flag with no following string masks nothing.
+    #[test]
+    fn scrub_event_strings_masks_the_value_after_a_sensitive_flag() {
+        let mut event = serde_json_lenient::json!({
+            "data": {"argv": [
+                "tool",
+                "--api-key",
+                "abc",
+                "--verbose",
+                "-token",
+                "value",
+                "--token",
+                "--verbose",
+                "--token",
+            ]},
+        });
+        assert!(scrub_event_strings(&mut event));
+        let argv = event["data"]["argv"].as_array().unwrap();
+        assert_eq!(argv[1], "--api-key");
+        assert_eq!(argv[2], "<redacted:len=3>");
+        assert_eq!(argv[3], "--verbose");
+        assert_eq!(argv[4], "-token");
+        assert_eq!(argv[5], "<redacted:len=5>");
+        assert_eq!(argv[6], "--token");
+        assert_eq!(argv[7], "--verbose");
+        assert_eq!(argv[8], "--token");
     }
 
     /// An unreadable `sessions/` is a fact about the bundle, not an empty
