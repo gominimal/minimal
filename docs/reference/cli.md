@@ -48,7 +48,8 @@ The convention has these rules:
 
 ### Documented exceptions
 
-These top-level forms are intentional exceptions to the convention.
+This table lists the bare forms that do the job of a noun form, and the
+passthroughs to `mip`. They are intentional exceptions to the convention.
 
 | Form | What it does, and why it stays |
 |------|--------------|
@@ -76,5 +77,4 @@ These top-level forms are intentional exceptions to the convention.
 ## In-sandbox helper commands
 
 Inside a box, `/usr/bin/min` is a helper with its own small set of commands,
-not the session CLI. Run `min` with no arguments inside the box to list
-them. [Sandbox operations](./sandbox-operations.md) describes each one.
+not the session CLI. Run `min --help` inside the box to list them. [Sandbox operations](./sandbox-operations.md) describes each one.
