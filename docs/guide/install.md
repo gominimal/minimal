@@ -133,7 +133,8 @@ large sparse file. The copy commands below keep it sparse.
 #### Go back to 0.7
 
 A 0.7 daemon that meets 0.8 state can fail to start, or start without the boxes
-that 0.8 changed. To go back, put your copy back in place first. The boxes that
+that 0.8 changed. In the other direction, a 0.8 release that meets box state
+from a newer release stops and changes nothing, and its message says so. To go back, put your copy back in place first. The boxes that
 you made on 0.8 are lost.
 
 1. Stop the 0.8 hosts. Run `min host list` to see their names, then stop each
