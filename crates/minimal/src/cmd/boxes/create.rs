@@ -1454,17 +1454,28 @@ fn project_secrets_table(project: &camino::Utf8Path, entry: Option<&str>) -> Str
         )
 }
 
-/// The table that declares the expanded spec's `secrets`, as
-/// [`crate::cmd::box_spec::setting_table`] names it. A legacy top-level
-/// `[session]` loads as `[defaults.session]` (BOX-050), so when only the
-/// legacy table of the file `bytes` declares `secrets`, it is named
-/// [`LEGACY_SESSION_SECRETS_TABLE`]. A `[defaults.session.secrets]` beside it
-/// replaces it, and is named then.
+/// The table that declares the expanded spec's `secrets`, for the store
+/// refusals. A project Box Type's `defaults` is named as its own table,
+/// `[box_types.<name>.defaults.secrets]`. Every other layer is named as
+/// [`crate::cmd::box_spec::setting_table`] names it. That helper names the
+/// table to edit, and for a type's defaults that is the entry's own table,
+/// which replaces them, so it is not used for that layer here. A legacy
+/// top-level `[session]` loads as `[defaults.session]` (BOX-050), so when
+/// only the legacy table of the file `bytes` declares `secrets`, it is
+/// named [`LEGACY_SESSION_SECRETS_TABLE`]. A `[defaults.session.secrets]`
+/// beside it replaces it, and is named then.
 fn secrets_table(
     report: &mfile::expand::ExpansionReport,
     entry: &mfile::entry::BoxEntry,
     bytes: &[u8],
 ) -> String {
+    if let Some(mfile::expand::ValueOrigin::Value(origin)) = report.values.get("secrets")
+        && origin.layer == mfile::expand::Layer::TypeDefaults
+        && let Some(name) = origin.box_type.as_deref()
+        && !mfile::box_types::BUILTIN_BOX_TYPES.contains(&name)
+    {
+        return format!("[box_types.{name}.defaults.secrets]");
+    }
     let table = crate::cmd::box_spec::setting_table(report, entry, "secrets", "secrets");
     if table != boxes::core::bep::SESSION_SECRETS_TABLE {
         return table;
@@ -7811,6 +7822,15 @@ mod tests {
                 "[defaults.session.secrets]",
             ),
             (
+                format!(
+                    "[box_types.mydev]\nextends = \"session\"\n\
+                     [box_types.mydev.defaults.secrets.OPENAI_KEY]\n{grant}\
+                     [boxes.dev]\ntype = \"mydev\"\n"
+                ),
+                Some("dev"),
+                "[box_types.mydev.defaults.secrets]",
+            ),
+            (
                 format!("[session.secrets.OPENAI_KEY]\n{grant}"),
                 None,
                 "[session.secrets]",
@@ -7863,6 +7883,20 @@ mod tests {
              rule in [secret-store-rules] in your config.toml names that item. Add a rule \
              for it, or remove the secret from minimal.toml. Run `min dirs` to find \
              config.toml."
+        );
+        let type_defaults = GrantNotDelivered::ItemNotStored {
+            grant: "OPENAI_KEY".into(),
+            item: "openai-key".into(),
+            place: "Secret Service".into(),
+            table: "[box_types.mydev.defaults.secrets]".into(),
+        };
+        assert_eq!(
+            type_defaults.to_string(),
+            "Cannot create the box: the secret OPENAI_KEY in \
+             [box_types.mydev.defaults.secrets] in minimal.toml reads the item openai-key \
+             from the host's secret store, and no secret named openai-key is stored in \
+             Secret Service. Store it with `min secret set openai-key`, then create the box \
+             again."
         );
         let loadout = GrantNotDelivered::StoreReferenceDenied {
             grant: "OPENAI_KEY".into(),
