@@ -566,7 +566,7 @@ pub async fn serve<T: Zone>(socket: UdpSocket, answerer: ZoneAnswerer<T>) -> io:
 /// service gates on: one number for the whole wire — the hello's fields,
 /// the publish's, the reply's. The service a NET-122 step installs answers
 /// it; a future wire bumps both sides together.
-const CHANNEL_PROTOCOL_VERSION: u32 = 3;
+const CHANNEL_PROTOCOL_VERSION: u32 = zone_answer::CHANNEL_PROTOCOL_VERSION;
 
 /// The machine-global channel socket the installed answerer service's unit
 /// holds (NET-122's host service): one per host, whatever this daemon's
@@ -4636,6 +4636,100 @@ mod tests {
         let mut registry = registry(false);
         let waiter = registry.zone_change_waiter();
         assert!(runtime.block_on(waiter.wait(Duration::ZERO)));
+    }
+
+    /// The VM host daemon's snapshot of every type the channel carries. The
+    /// installed answerer speaks this wire, and this daemon's copies of the
+    /// node-side types must fit it.
+    const WIRE_SNAPSHOT: &str = include_str!("../../../minvmd/tests/golden/answerer_channel.json");
+
+    /// Asserts that `sent`, as this daemon writes it, fits the pinned `ty`.
+    /// It must carry every field the answerer requires and no field the
+    /// answerer does not know, each as the JSON type the answerer reads.
+    fn assert_fits_the_wire<T: Serialize>(types: &serde_json_lenient::Value, ty: &str, sent: &T) {
+        let full = types[ty]["full"]
+            .as_object()
+            .unwrap_or_else(|| panic!("the wire snapshot has no {ty}"));
+        let required = types[ty]["minimal"].as_object().unwrap_or(full);
+        let sent = serde_json_lenient::to_value(sent).expect("the line serializes");
+        let sent = sent.as_object().expect("a channel line is a JSON object");
+        for field in required.keys() {
+            assert!(
+                sent.contains_key(field),
+                "this daemon's {ty} leaves out `{field}`, which the answerer requires"
+            );
+        }
+        for (field, value) in sent {
+            let pinned = full.get(field).unwrap_or_else(|| {
+                panic!(
+                    "this daemon's {ty} sends `{field}`, which the wire snapshot does not \
+                     have. Add the field to the VM host daemon's {ty} in \
+                     crates/minvmd/src/net/answerer.rs; its snapshot test says what to do next."
+                )
+            });
+            assert_eq!(
+                std::mem::discriminant(value),
+                std::mem::discriminant(pinned),
+                "this daemon's {ty} sends `{field}` as another JSON type than the wire's"
+            );
+        }
+    }
+
+    /// This daemon keeps its own copies of the channel's node-side types.
+    /// They must fit the wire the VM host daemon's snapshot pins for this
+    /// protocol version, in what this daemon sends and in what it reads.
+    #[test]
+    fn channel_lines_fit_the_wire_snapshot() {
+        let snapshot: serde_json_lenient::Value =
+            serde_json_lenient::from_str(WIRE_SNAPSHOT).expect("the snapshot is JSON");
+        assert_eq!(
+            snapshot["version"], CHANNEL_PROTOCOL_VERSION,
+            "the wire snapshot is for another protocol version than this daemon speaks"
+        );
+        let types = &snapshot["types"];
+
+        let row = RegisteredRow {
+            name: "web.min.internal".to_string(),
+            address: Some(Ipv4Addr::new(127, 0, 64, 9)),
+            live: true,
+        };
+        assert_fits_the_wire(
+            types,
+            "Hello",
+            &Hello {
+                node: "/var/lib/minimal#native".to_string(),
+                version: CHANNEL_PROTOCOL_VERSION,
+            },
+        );
+        assert_fits_the_wire(types, "RegisteredRow", &row);
+        assert_fits_the_wire(types, "PublishRequest", &PublishRequest { rows: vec![row] });
+
+        // Both forms of the answerer's reply parse, and the refused rows a
+        // full reply carries come through whole.
+        for form in ["full", "minimal"] {
+            let pinned = &types["RegistrationReply"][form];
+            let reply: RegistrationReply = serde_json_lenient::from_value(pinned.clone())
+                .unwrap_or_else(|error| panic!("the {form} reply does not parse: {error}"));
+            assert_eq!(pinned["ok"], reply.ok);
+            assert_eq!(pinned["error"].as_str(), reply.error.as_deref());
+            assert_eq!(pinned["holder"].as_str(), reply.holder.as_deref());
+            let refused: Vec<RefusedRow> = match pinned.get("refused") {
+                Some(rows) => {
+                    serde_json_lenient::from_value(rows.clone()).expect("the refused rows parse")
+                }
+                None => Vec::new(),
+            };
+            assert_eq!(refused, reply.refused);
+            assert_fits_the_wire(types, "RegistrationReply", &reply);
+        }
+        assert_fits_the_wire(
+            types,
+            "RefusedRow",
+            &RefusedRow {
+                name: "web.min.internal".to_string(),
+                reason: "another node holds the name".to_string(),
+            },
+        );
     }
 }
 

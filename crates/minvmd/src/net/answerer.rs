@@ -140,7 +140,7 @@ const MAX_DATAGRAM: usize = 4096;
 /// own (this constant, the same install), re-surfacing the privileged step
 /// on a mismatch so an upgrade re-runs it and the installed copy is never
 /// left speaking a wire the daemon no longer understands.
-pub const CHANNEL_PROTOCOL_VERSION: u32 = 3;
+pub const CHANNEL_PROTOCOL_VERSION: u32 = zone_answer::CHANNEL_PROTOCOL_VERSION;
 
 /// How long the serving side waits for a connecting node's hello before
 /// dropping the connection: a connection that never speaks is a stray
@@ -6019,6 +6019,75 @@ mod tests {
             .expect("the channel's thread ends when its stop is set");
     }
 
+    /// The answerer refuses a node that speaks the previous protocol
+    /// version at its hello. The reason names both numbers, and the
+    /// answerer holds none of the node's rows.
+    #[test]
+    fn answerer_channel_refuses_a_hello_from_the_previous_protocol_version() {
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
+        let channel = dir.path().join(CHANNEL_SOCK_FILE);
+        let listener = UnixListener::bind(&channel).expect("the channel binds");
+        // SAFETY: geteuid only reads the process's own uid.
+        let expected_uid = unsafe { libc::geteuid() };
+        let registered = Arc::new(RegisteredTables::new());
+        let tables = Arc::clone(&registered);
+        let stop = Arc::new(AtomicBool::new(false));
+        let gate = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("test-zone-old-hello".to_string())
+            .spawn(move || {
+                serve_channel(listener, tables, expected_uid, None, SERVICE_HOLDER, gate);
+            })
+            .expect("the channel's thread spawns");
+
+        let previous = CHANNEL_PROTOCOL_VERSION - 1;
+        let mut stream = UnixStream::connect(&channel).expect("the channel accepts");
+        stream
+            .set_read_timeout(Some(CHANNEL_REPLY_TIMEOUT))
+            .expect("the read bound arms");
+        write_line(
+            &mut stream,
+            &Hello {
+                node: "vm-old".to_string(),
+                version: previous,
+            },
+        )
+        .expect("the hello is written");
+        let reply = read_reply_line(&mut stream)
+            .expect("the hello reply reads")
+            .expect("the answerer answered the old hello");
+        let reply: RegistrationReply =
+            serde_json_lenient::from_str(reply.trim()).expect("the hello reply parses");
+        assert!(
+            !reply.ok,
+            "a hello from another protocol version is refused"
+        );
+        assert_eq!(
+            reply.error.as_deref(),
+            Some(
+                format!(
+                    "this answerer speaks channel protocol {CHANNEL_PROTOCOL_VERSION}; the node \
+                     said {previous}"
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            read_reply_line(&mut stream).ok().flatten(),
+            None,
+            "the answerer closes the connection after the refusal"
+        );
+        assert!(
+            registered.is_empty(),
+            "a refused node's rows are never held"
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        handle
+            .join()
+            .expect("the channel's thread ends when its stop is set");
+    }
+
     #[test]
     fn foreign_refusals_past_the_cap_close_bare() {
         let _slots = hold_refusal_slots();
@@ -7893,5 +7962,207 @@ mod tests {
         assert!(registry.retire_host_ip_box(web, minimald_rpc::HostIpBoxEnd::Destroyed));
         assert_nodata(&ask_a(&own, "web"), "the ended box's name answers NODATA");
         assert_eq!(a_answer(&ask_a(&own, "api")), node);
+    }
+
+    /// The checked-in snapshot of every type the channel carries, with the
+    /// protocol version it belongs to. The native daemon's copies of the
+    /// node-side types are checked against the same file.
+    const WIRE_SNAPSHOT: &str = include_str!("../../tests/golden/answerer_channel.json");
+
+    /// Serializes one wire value whose every field is set, and checks that
+    /// each field is in the JSON. The pattern names every field of the type,
+    /// so a field added to it fails the build here until the sample sets it.
+    macro_rules! full_sample {
+        ($ty:ident { $($field:ident: $value:expr),+ $(,)? }) => {{
+            let sample = $ty { $($field: $value),+ };
+            let $ty { $($field: _),+ } = &sample;
+            let json = serde_json_lenient::to_value(&sample).expect("the sample serializes");
+            for field in [$(stringify!($field)),+] {
+                assert!(
+                    json.get(field).is_some(),
+                    "the full {} sample must put `{field}` on the wire",
+                    stringify!($ty)
+                );
+            }
+            json
+        }};
+    }
+
+    /// One wire value with every optional field left out.
+    fn minimal_sample<T: Serialize>(sample: &T) -> serde_json_lenient::Value {
+        serde_json_lenient::to_value(sample).expect("the sample serializes")
+    }
+
+    /// Every type the channel carries, as JSON. `full` has every field set.
+    /// `minimal`, for a type with optional fields, leaves each of them out.
+    fn wire_document() -> serde_json_lenient::Value {
+        let address = Ipv4Addr::new(127, 0, 64, 9);
+        let row = || RegisteredRow {
+            name: "web.min.internal".to_string(),
+            address: Some(address),
+            live: true,
+            address_only: true,
+            node_address: true,
+        };
+        let bare_row = || RegisteredRow {
+            name: "web.min.internal".to_string(),
+            address: None,
+            live: false,
+            address_only: false,
+            node_address: false,
+        };
+        let refused = || RefusedRow {
+            name: "web.min.internal".to_string(),
+            reason: "another node holds the name".to_string(),
+        };
+        serde_json_lenient::json!({
+            "version": CHANNEL_PROTOCOL_VERSION,
+            "types": {
+                "Hello": {
+                    "full": full_sample!(Hello {
+                        node: "/var/lib/minimal#default".to_string(),
+                        version: CHANNEL_PROTOCOL_VERSION,
+                    }),
+                },
+                "RegisteredRow": {
+                    "full": full_sample!(RegisteredRow {
+                        name: row().name,
+                        address: row().address,
+                        live: true,
+                        address_only: true,
+                        node_address: true,
+                    }),
+                    "minimal": minimal_sample(&bare_row()),
+                },
+                "PublishRequest": {
+                    "full": full_sample!(PublishRequest { rows: vec![row(), bare_row()] }),
+                },
+                "AllocateRequest": {
+                    "full": full_sample!(AllocateRequest {
+                        allocate: "web".to_string(),
+                        keep: Some(address),
+                    }),
+                    "minimal": minimal_sample(&AllocateRequest {
+                        allocate: "web".to_string(),
+                        keep: None,
+                    }),
+                },
+                "ReleaseAddressRequest": {
+                    "full": full_sample!(ReleaseAddressRequest { release: "web".to_string() }),
+                },
+                "RefusedRow": {
+                    "full": full_sample!(RefusedRow {
+                        name: refused().name,
+                        reason: refused().reason,
+                    }),
+                },
+                "RegistrationReply": {
+                    "full": full_sample!(RegistrationReply {
+                        ok: true,
+                        error: Some("the answerer refused the line".to_string()),
+                        refused: vec![refused()],
+                        holder: Some(SERVICE_HOLDER.to_string()),
+                        address: Some(address),
+                    }),
+                    "minimal": minimal_sample(&RegistrationReply::published(Vec::new())),
+                },
+            },
+        })
+    }
+
+    /// Asserts that both pinned forms of `ty` parse back into `T` and
+    /// serialize to the same JSON, so a `default` taken off a field fails
+    /// on the minimal form.
+    fn assert_round_trips<T: Serialize + serde::de::DeserializeOwned>(
+        document: &serde_json_lenient::Value,
+        ty: &str,
+    ) {
+        let forms = document["types"][ty]
+            .as_object()
+            .unwrap_or_else(|| panic!("the wire document has no {ty}"));
+        for (form, json) in forms {
+            let parsed: T = serde_json_lenient::from_value(json.clone())
+                .unwrap_or_else(|error| panic!("the {form} {ty} does not parse: {error}"));
+            assert_eq!(
+                &serde_json_lenient::to_value(&parsed).expect("the value serializes"),
+                json,
+                "the {form} {ty} changes when it is read and written again"
+            );
+        }
+    }
+
+    /// Fails when a channel type changes shape while
+    /// [`CHANNEL_PROTOCOL_VERSION`] stays the same. An installed answerer
+    /// from an earlier release accepts any hello that carries its own
+    /// number, so it would misread the changed line and report nothing.
+    #[test]
+    fn channel_wire_matches_the_snapshot_for_its_protocol_version() {
+        let document = wire_document();
+        let mut actual =
+            serde_json_lenient::to_string_pretty(&document).expect("the wire document renders");
+        actual.push('\n');
+        if actual != WIRE_SNAPSHOT {
+            let pinned: serde_json_lenient::Value =
+                serde_json_lenient::from_str(WIRE_SNAPSHOT).expect("the snapshot is JSON");
+            let refresh = "ANSWERER_WIRE_BLESS=1 just test-one channel_wire_matches_the_snapshot";
+            if pinned["version"] == CHANNEL_PROTOCOL_VERSION {
+                panic!(
+                    "The answerer channel's wire types changed and CHANNEL_PROTOCOL_VERSION is \
+                     still {CHANNEL_PROTOCOL_VERSION}. An installed minzoned from an earlier \
+                     release would accept this daemon's hello and misread its lines. Bump \
+                     CHANNEL_PROTOCOL_VERSION in crates/boxes/src/core/zone_answer.rs, then \
+                     refresh the snapshot with `{refresh}`.\n\
+                     snapshot:\n{WIRE_SNAPSHOT}\nnow:\n{actual}"
+                );
+            }
+            if std::env::var_os("ANSWERER_WIRE_BLESS").is_none() {
+                panic!(
+                    "CHANNEL_PROTOCOL_VERSION is {CHANNEL_PROTOCOL_VERSION} and \
+                     crates/minvmd/tests/golden/answerer_channel.json pins version {}. Refresh \
+                     the snapshot with `{refresh}`.",
+                    pinned["version"]
+                );
+            }
+            std::fs::write(
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/golden/answerer_channel.json"
+                ),
+                &actual,
+            )
+            .expect("the snapshot writes");
+        }
+
+        assert_round_trips::<Hello>(&document, "Hello");
+        assert_round_trips::<RegisteredRow>(&document, "RegisteredRow");
+        assert_round_trips::<PublishRequest>(&document, "PublishRequest");
+        assert_round_trips::<AllocateRequest>(&document, "AllocateRequest");
+        assert_round_trips::<ReleaseAddressRequest>(&document, "ReleaseAddressRequest");
+        assert_round_trips::<RefusedRow>(&document, "RefusedRow");
+        assert_round_trips::<RegistrationReply>(&document, "RegistrationReply");
+
+        // The answerer reads every line after the hello as a `NodeLine`,
+        // which has no tag, so each request must still parse as its own
+        // variant.
+        let node_line = |ty: &str, form: &str| {
+            parse_node_line(&document["types"][ty][form].to_string())
+                .unwrap_or_else(|error| panic!("the {form} {ty} is not a node line: {error}"))
+        };
+        assert!(matches!(
+            node_line("PublishRequest", "full"),
+            NodeLine::Publish(_)
+        ));
+        assert!(matches!(
+            node_line("AllocateRequest", "full"),
+            NodeLine::Allocate(_)
+        ));
+        assert!(matches!(
+            node_line("AllocateRequest", "minimal"),
+            NodeLine::Allocate(_)
+        ));
+        assert!(matches!(
+            node_line("ReleaseAddressRequest", "full"),
+            NodeLine::Release(_)
+        ));
     }
 }

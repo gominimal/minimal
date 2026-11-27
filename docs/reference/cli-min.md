@@ -1010,6 +1010,15 @@ from an earlier release has a bare `minzoned` program in the same directory
 and a script for the local range. The next `min finalize-install` replaces
 both with the bundle.
 
+After an upgrade, the box-name service on this host can be the one that an
+earlier release installed. When it speaks an older protocol than this
+release's daemon, it refuses the daemon. The hostname proxy then serves box
+names, and the host line ends with `; finish setup: min finalize-install`.
+`min finalize-install --show` lists the names item as missing and gives the
+reason, `the installed DNS service speaks protocol <installed>, not this daemon's <daemon>`.
+The next `min finalize-install` replaces the service with this release's
+copy.
+
 `min finalize-install` prints the summary of what is missing. It writes the
 script to a temporary file that only you can read (mode `0600`) and runs it
 with `sudo sh`, so `sudo` asks for your password once. It then removes the

@@ -3084,6 +3084,13 @@ mod tests {
                 requirement: None,
             },
         };
+        // The service an upgrade leaves behind speaks the protocol before
+        // this daemon's, and refuses the daemon on its channel.
+        let daemon = minvmd::net::answerer::CHANNEL_PROTOCOL_VERSION;
+        let previous = daemon - 1;
+        let behind = format!(
+            "the installed DNS service speaks protocol {previous}, not this daemon's {daemon}"
+        );
         for (service, fact) in [
             (
                 AnswererStep::NotRunning,
@@ -3093,6 +3100,13 @@ mod tests {
                 AnswererStep::CopyDiffers,
                 "the installed DNS service runs a different minzoned than the one this version \
                  of Minimal ships",
+            ),
+            (
+                AnswererStep::ProtocolMismatch {
+                    installed: Some(previous),
+                    daemon,
+                },
+                behind.as_str(),
             ),
         ] {
             let item = reinstall_item(&detection, port, Some(true), &verified(service))
