@@ -86,3 +86,6 @@ Prints a shell tab-completion script for `minimald`. The shells are `bash`,
 ## Known issues
 
 - `minimald` accepts the hidden `--stdlib-dir` flag but does not use it.
+- With `--zone-answerer-port 0`, the interim answerer listens on a port that
+  the OS chooses, but the `DNS SERVICE` line of `min ls` shows port `0`.
+  Set a port other than `0` for the host's resolver to use.
