@@ -1149,9 +1149,64 @@ impl Serialize for Index {
     }
 }
 
-/// Reads `index.json` from `path`. Refuses an index whose
-/// `format_version` is newer than [`INDEX_FORMAT_VERSION`] with an
-/// `InvalidData` error that names both versions and the path.
+/// The words that open [`NewerStateFormat`]'s text. A caller that holds
+/// only the text, such as minvmd or min reading a daemon's stderr, finds
+/// the refusal by them.
+pub const NEWER_STATE_FORMAT_LEAD: &str = "A newer min wrote the box state in ";
+
+/// The refusal of a box state that a newer build wrote: `index.json`
+/// carries a `format_version` above [`INDEX_FORMAT_VERSION`]. The store
+/// returns it before it writes anything, so the newer build still reads
+/// the state as it left it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewerStateFormat {
+    /// The state dir: the directory that holds `sessions/index.json`.
+    pub state_dir: camino::Utf8PathBuf,
+    /// The format version the index carries.
+    pub found: u32,
+}
+
+impl std::fmt::Display for NewerStateFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{NEWER_STATE_FORMAT_LEAD}{}. That state has format version {}. This min reads \
+             format version {INDEX_FORMAT_VERSION} or older, and it changed nothing. Install \
+             the newer min, then run your command again.",
+            self.state_dir, self.found
+        )
+    }
+}
+
+impl std::error::Error for NewerStateFormat {}
+
+impl NewerStateFormat {
+    /// The refusal inside `err`, when `err` is one.
+    pub fn from_io(err: &std::io::Error) -> Option<&Self> {
+        err.get_ref()?.downcast_ref::<Self>()
+    }
+}
+
+/// Checks the format of the box state under `state_dir` and writes
+/// nothing. Returns a [`NewerStateFormat`] refusal, inside an
+/// `InvalidData` error, when a newer build wrote `sessions/index.json`.
+/// A state dir with no index passes.
+///
+/// # Errors
+///
+/// The refusal, or the I/O or parse error of reading the index.
+pub fn check_state_format(state_dir: &camino::Utf8Path) -> Result<(), std::io::Error> {
+    let index_file = state_dir.join("sessions/index.json");
+    if std::fs::exists(&index_file)? {
+        read_index(&index_file)?;
+    }
+    Ok(())
+}
+
+/// Reads `index.json` from `path`, which is `<state_dir>/sessions/index.json`.
+/// Refuses an index whose `format_version` is newer than
+/// [`INDEX_FORMAT_VERSION`] with an `InvalidData` error that carries a
+/// [`NewerStateFormat`].
 fn read_index(path: &camino::Utf8Path) -> Result<Index, std::io::Error> {
     #[derive(Deserialize)]
     struct Version {
@@ -1161,12 +1216,17 @@ fn read_index(path: &camino::Utf8Path) -> Result<Index, std::io::Error> {
     let bytes = std::fs::read(path)?;
     let Version { format_version } = serde_json_lenient::from_slice(&bytes)?;
     if format_version > INDEX_FORMAT_VERSION {
+        let state_dir = path
+            .parent()
+            .and_then(camino::Utf8Path::parent)
+            .unwrap_or(path)
+            .to_owned();
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!(
-                "{path} has format version {format_version}. This minimald reads format \
-                 version {INDEX_FORMAT_VERSION} or older. A newer minimald wrote this file."
-            ),
+            NewerStateFormat {
+                state_dir,
+                found: format_version,
+            },
         ));
     }
     Ok(serde_json_lenient::from_slice(&bytes)?)
@@ -1432,6 +1492,14 @@ impl DiskLoader {
     /// `index.json` can't be read.
     pub fn new(minimal_dir: DaemonAbsPath) -> Result<Self, std::io::Error> {
         let sessions_dir = minimal_dir.as_utf8_path().join("sessions");
+        // Read and check the index before any write: a newer build's state
+        // is refused with its dirs, modes and files as that build left them.
+        let index_file = sessions_dir.join("index.json");
+        let index = if std::fs::exists(&index_file)? {
+            read_index(&index_file)?
+        } else {
+            Index::default()
+        };
         if let Some(parent) = sessions_dir.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -1451,13 +1519,6 @@ impl DiskLoader {
                 tracing::debug!(sessions_dir = %sessions_dir, tightened, "box store opened");
             }
         }
-        let index_file = minimal_dir.as_utf8_path().join("sessions/index.json");
-        let index = if std::fs::exists(&index_file)? {
-            read_index(&index_file)?
-        } else {
-            Index::default()
-        };
-
         let mut this = Self { minimal_dir, index };
         if this.self_heal()? {
             this.flush_index()?;
@@ -5614,41 +5675,85 @@ mod tests {
         assert_eq!(loader.find_by_name("dev").unwrap(), Some(named_key));
     }
 
+    /// Every path under `root` with its mode and, for a file, its bytes.
+    #[cfg(unix)]
+    fn snapshot_tree(root: &std::path::Path) -> Vec<(std::path::PathBuf, u32, Option<Vec<u8>>)> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(path) = stack.pop() {
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            let bytes = meta.is_file().then(|| std::fs::read(&path).unwrap());
+            if meta.is_dir() {
+                for entry in std::fs::read_dir(&path).unwrap() {
+                    stack.push(entry.unwrap().path());
+                }
+            }
+            out.push((path, meta.permissions().mode(), bytes));
+        }
+        out.sort();
+        out
+    }
+
     /// A store whose index a newer build wrote is refused on both open
-    /// paths, and the error names the version it found.
+    /// paths, before any write: the tree keeps its bytes, its entries and
+    /// its modes, a loose mode the open would tighten included.
+    #[cfg(unix)]
     #[test]
-    fn index_with_newer_format_version_is_refused_with_a_clear_error() {
+    fn store_refuses_a_newer_format_and_changes_nothing() {
+        use std::os::unix::fs::PermissionsExt as _;
         let tmp = TempDir::new().unwrap();
         let root = loader_dir(&tmp);
         let mut loader = DiskLoader::new(root.clone()).unwrap();
         let key = loader.create(named("dev")).unwrap();
         drop(loader);
-        let index_file = root.as_utf8_path().join("sessions/index.json");
+        let sessions = root.as_utf8_path().join("sessions");
+        let index_file = sessions.join("index.json");
         let mut value: serde_json_lenient::Value =
             serde_json_lenient::from_str(&std::fs::read_to_string(&index_file).unwrap()).unwrap();
         let newer = INDEX_FORMAT_VERSION + 1;
         value["format_version"] = newer.into();
         std::fs::write(&index_file, value.to_string()).unwrap();
+        // A mode the open tightens, and an orphan the self-heal indexes:
+        // a refused open does neither.
+        std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir(sessions.join("abcde")).unwrap();
+        let before = snapshot_tree(root.as_utf8_path().as_std_path());
 
         let Err(err) = DiskLoader::new(root.clone()) else {
             panic!("an index with format version {newer} opened");
         };
         assert_eq!(err.kind(), ErrorKind::InvalidData);
-        let msg = err.to_string();
-        assert!(msg.contains(&format!("format version {newer}")), "{msg}");
-        assert!(
-            msg.contains(&format!("format version {INDEX_FORMAT_VERSION} or older")),
-            "{msg}"
-        );
-        assert!(msg.contains(index_file.as_str()), "{msg}");
+        let refusal = NewerStateFormat::from_io(&err).expect("the error is the refusal");
+        assert_eq!(refusal.found, newer);
+        assert_eq!(refusal.state_dir, root.as_utf8_path());
+        assert_eq!(snapshot_tree(root.as_utf8_path().as_std_path()), before);
 
         let err = BoxDir::find(&root, key.id()).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::InvalidData);
-        assert!(err.to_string().contains(&format!("format version {newer}")));
-        // The refusal changes nothing on disk.
-        let after: serde_json_lenient::Value =
-            serde_json_lenient::from_str(&std::fs::read_to_string(&index_file).unwrap()).unwrap();
-        assert_eq!(after["format_version"], newer);
+        assert_eq!(NewerStateFormat::from_io(&err), Some(refusal));
+        let err = check_state_format(root.as_utf8_path()).unwrap_err();
+        assert_eq!(NewerStateFormat::from_io(&err), Some(refusal));
+        assert_eq!(snapshot_tree(root.as_utf8_path().as_std_path()), before);
+    }
+
+    /// The text a person reads for a newer state format: it names the
+    /// state dir and both versions, and the next step.
+    #[test]
+    fn newer_state_format_refusal_text_is_pinned() {
+        let refusal = NewerStateFormat {
+            state_dir: "/home/u/.local/state/minimal".into(),
+            found: 2,
+        };
+        assert_eq!(
+            refusal.to_string(),
+            "A newer min wrote the box state in /home/u/.local/state/minimal. That state has \
+             format version 2. This min reads format version 1 or older, and it changed \
+             nothing. Install the newer min, then run your command again."
+        );
+        assert!(refusal.to_string().starts_with(NEWER_STATE_FORMAT_LEAD));
+        // An open with no index passes the check.
+        let tmp = TempDir::new().unwrap();
+        check_state_format(camino::Utf8Path::from_path(tmp.path()).unwrap()).unwrap();
     }
 
     proptest! {
