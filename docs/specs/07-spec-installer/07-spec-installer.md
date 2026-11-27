@@ -820,7 +820,7 @@ next step rather than a footnote after it. No card on a failed install, and
 none in uninstall mode.
 
 **R10.5**, **The card after an upgrade from 0.7.** When R5.7 finds a 0.7
-`min` on disk, the closing card shall also name `min box list`,
+`min` on disk, the closing card shall also name `min box list --all`,
 `min box attach <box>` and `min box rm <box>`, one row each, with what each
 does. When R5.7 made a copy, the card also says where the copy is. The rows
 print with `--skip-state-archive` too. An install that is not an upgrade from

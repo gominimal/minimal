@@ -2137,8 +2137,8 @@ say "  $mark ${b}min$rst                               ${dim}build the sandbox a
 # After an upgrade from 0.7, the commands that work on the boxes the
 # earlier release left, and where the copy of its state is.
 if [ -n "$upgrade_from_0_7" ]; then
-    say "  $mark ${b}min box list$rst                      ${dim}list your boxes$rst"
-    say "  $mark ${b}min box attach <box>$rst              ${dim}open a shell in a running box$rst"
+    say "  $mark ${b}min box list --all$rst                ${dim}list your boxes in every project$rst"
+    say "  $mark ${b}min box attach <box>$rst              ${dim}open a shell in a box, and start it again if it stopped$rst"
     say "  $mark ${b}min box rm <box>$rst                  ${dim}remove a box$rst"
     if [ -n "$archive_dest" ]; then
         say ""

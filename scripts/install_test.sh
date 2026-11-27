@@ -4460,9 +4460,9 @@ case_state_archive_on_upgrade_from_0_7() {
         diff -r "$root/sa1.before" "$HSA/xdg-state/minimal.0.7.3"
     want_ok "the table shows the saved copy (R5.7)" \
         grep -q "box state  *saved  *~/xdg-state/minimal.0.7.3" "$OUT"
-    want_ok "the card names min box list (R10.5)" grep -q "> min box list  *list your boxes" "$OUT"
+    want_ok "the card names min box list --all (R10.5)" grep -q "> min box list --all  *list your boxes in every project" "$OUT"
     want_ok "the card names min box attach (R10.5)" \
-        grep -q "> min box attach <box>  *open a shell in a running box" "$OUT"
+        grep -q "> min box attach <box>  *open a shell in a box, and start it again if it stopped" "$OUT"
     want_ok "the card names min box rm (R10.5)" grep -q "> min box rm <box>  *remove a box" "$OUT"
     want_ok "the card says where the copy is (R10.5)" \
         grep -qF "A copy of the box state from Minimal 0.7.3 is in ~/xdg-state/minimal.0.7.3." "$OUT"
