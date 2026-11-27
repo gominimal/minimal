@@ -801,9 +801,10 @@ The output names the loadouts that `min box start` applies, and the spec
 includes their values. A package, a variable or a lifecycle hook from a
 loadout names that loadout as its layer, such as `loadout dev`. Each
 variable of `env_vars` shows once, with the value that the box gets, and
-names the layer that set that value. With no `--loadout` and no `default_loadouts`, the `default` loadout applies: your
-`default` loadout file, or the built-in `default` loadout when there is no
-such file. An entry with `loadout_mode = "sealed"` applies no loadout.
+names the layer that set that value. With no `--loadout` and no
+`default_loadouts`, the `default` loadout applies: your `default` loadout
+file, or the built-in `default` loadout when there is no such file. An entry
+with `loadout_mode = "sealed"` applies no loadout.
 
 A variable whose name looks like a secret's, such as `GITHUB_TOKEN`, gets a
 warning on stderr. The warning names the layer that set the variable, and
