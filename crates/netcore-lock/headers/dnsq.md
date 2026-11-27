@@ -1,0 +1,1 @@
+`dnsq`: whether a DNS query asks only about names in one zone, read from bytes a guest chose. Each control below breaks one thing in a copy of the crate; the verifier must reject the copy in the functions named, and the last run's places are shown beside them.

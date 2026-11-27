@@ -1,3 +1,8 @@
 packages/gcc/prebuilt/usr/libexec/gcc/x86_64-pc-linux-gnu/15.2.0/cc1 filter=lfs diff=lfs merge=lfs -text
 packages/gcc/prebuilt/usr/libexec/gcc/x86_64-pc-linux-gnu/15.2.0/cc1plus filter=lfs diff=lfs merge=lfs -text
 packages/linux_headers/linux-6.12.43.tar.xz filter=lfs diff=lfs merge=lfs -text
+# netcore's locks and the files generated from its control manifest: collapsed in diffs.
+crates/netcore-lock/STATEMENTS.lock linguist-generated=true
+crates/netcore-lock/VIEW.lock linguist-generated=true
+crates/netcore-lock/results/*.tsv linguist-generated=true
+crates/netcore/verus/*.md linguist-generated=true

@@ -1,0 +1,1 @@
+`answer`: a DNS answer, from the addresses the reply carried to what the box's tables hold, address by address. Each control below breaks one thing in a copy of the crate; the verifier must reject the copy in the functions named, and the last run's places are shown beside them.

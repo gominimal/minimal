@@ -1,0 +1,1 @@
+`isolation`: that a box's frame is admitted only through its own tables or the rules it declared. Each control below breaks one thing in a copy of the crate; the verifier must reject the copy in the functions named, and the last run's places are shown beside them.

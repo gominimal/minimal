@@ -1,0 +1,1 @@
+`cohort`: the decision for a frame from the boxes that share the host's address. Each control below breaks one thing in a copy of the crate; the verifier must reject the copy in the functions named, and the last run's places are shown beside them.

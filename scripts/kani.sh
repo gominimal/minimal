@@ -17,6 +17,13 @@
 # chain: an edit or removal of a record with a successor fails
 # verification).
 #
+# `scripts/kani.sh netcore` runs the network kernel's harnesses instead,
+# in a job of their own: its default feature set, four harnesses at a
+# time. `scripts/kani.sh netcore-heavy <harness>` runs one of the three
+# behind the crate's `kani-full` feature that need most of a runner's
+# memory, alone (see "Measured cost" below). The rest of `kani-full` is
+# not run here.
+#
 # Install: cargo install --locked kani-verifier --version 0.68.0
 #          && cargo kani setup
 # Pin EXACTLY 0.68.0+, for two reasons. Releases older than 0.67.0 give
@@ -36,6 +43,10 @@
 #
 # Sequential on purpose: -j once OOMed CBMC running four byte-level
 # harnesses at once; the whole suite solves in seconds sequentially.
+# netcore is the exception: its default set is 112 harnesses, none above
+# 2.3 GB, so it runs with --jobs 4; its three heavy harnesses (8 to 8.7 GB
+# each) run one to a job, since one of them beside three others reached a
+# 14 GB ceiling.
 #
 # Measured cost (2026-10-07, Kani 0.68.0 / CBMC 6.11.0, on the lab box: a
 # Dell R730, 2x Xeon E5-2680 v3, 48 threads, 377 GB). Each run sat in a
@@ -51,6 +62,11 @@
 # 16 GB scope; no OOM event in any run. sessions sets the peak. On
 # GitHub-hosted CI (run 37364930742, "CI (Kani proofs)", 2026-10-05,
 # ubuntu-24.04) all 27 harnesses passed, minvmd in about 66 s.
+# netcore (2026-11-27, Kani 0.68.0, the lab box, 4 CPUs, a 14 GB scope
+# with swap off): the default set, 112/112 at --jobs 4, in 933 s at a
+# 9.1 GB peak; each heavy harness alone in 1130 s, 472 s and 379 s at
+# 8.1, 8.6 and 8.8 GB. With a heavy one among four at once the scope
+# reached 14 GB and was stopped.
 #
 # Memory guard: a box that runs the lane as one job has nothing else
 # between one harness's CBMC and the machine. On 2026-10-05 an uncapped
@@ -86,6 +102,28 @@
 # process's address space (CBMC is one process). The 1157 s run above
 # took the ulimit path, with no user manager reachable.
 set -eu
+
+# Which lane: the proved crates above (no argument), netcore's default
+# set, or one of netcore's heavy harnesses by name.
+NETCORE_HEAVY="dnsq::proofs::heavy::kani_too_short_refuses
+dnsq::proofs::heavy::kani_a_bad_header_refuses
+dnsq::proofs::heavy::kani_one_shortest_question_agrees"
+lane="${1:-}"
+harness="${2:-}"
+case "$lane" in
+    "" | netcore) ;;
+    netcore-heavy)
+        if ! printf '%s\n' "$NETCORE_HEAVY" | grep -qx -- "$harness"; then
+            echo "FATAL: netcore-heavy takes one of:" >&2
+            printf '%s\n' "$NETCORE_HEAVY" | sed 's/^/  /' >&2
+            exit 2
+        fi
+        ;;
+    *)
+        echo "usage: scripts/kani.sh [netcore | netcore-heavy <harness>]" >&2
+        exit 2
+        ;;
+esac
 
 # Build artifacts land in the REAL workspace's target dir (not the
 # scratch copy): CI's rust-cache persists ./target across runs and
@@ -233,17 +271,17 @@ fi
 # status, so no --wait (systemd-run refuses --wait with --scope). Not -q:
 # the "Running scope as unit: run-….scope" line names the unit to watch
 # (`systemctl --user status run-….scope` shows its memory while it runs).
-kani_crate() { # crate
+kani_crate() { # crate [cargo kani arguments]
     case "$kani_guard" in
         scope)
             systemd-run --user --scope -p MemoryMax="$KANI_MEM_MAX" -p MemorySwapMax=0 \
-                cargo kani -p "$1" --output-format=terse
+                cargo kani -p "$@" --output-format=terse
             ;;
         ulimit)
             # shellcheck disable=SC3045 # ulimit -v is not POSIX; dash, bash and busybox sh have it
-            (ulimit -v "$kani_mem_kib" && exec cargo kani -p "$1" --output-format=terse)
+            (ulimit -v "$kani_mem_kib" && exec cargo kani -p "$@" --output-format=terse)
             ;;
-        *) cargo kani -p "$1" --output-format=terse ;;
+        *) cargo kani -p "$@" --output-format=terse ;;
     esac
 }
 
@@ -253,12 +291,15 @@ kani_crate() { # crate
 # Streams output while running (a silent 8-minute compile is
 # undiagnosable in CI); avoids pipe-to-tee, which swallows exit status
 # in POSIX sh. The log file lives in the scratch ws, cleaned by trap.
-expect() { # crate expected_count
-    log="$ws/kani-$1.log"
-    kani_crate "$1" 2>&1 | tee "$log"
+expect() { # crate expected_count [cargo kani arguments]
+    crate="$1"
+    want="$2"
+    shift 2
+    log="$ws/kani-$crate.log"
+    kani_crate "$crate" "$@" 2>&1 | tee "$log"
     # tee masks cargo's status (no pipefail in sh): the count grep below
     # is the gate, and a failed run cannot print the success line.
-    grep -q "Complete - $2 successfully verified harnesses, 0 failures" "$log" || {
+    grep -q "Complete - $want successfully verified harnesses, 0 failures" "$log" || {
         # Say which kind of failure this is: a dependency that will not
         # build is not a proof regression, though the count message reads
         # like one (three canary nights were read that way). A log with no
@@ -270,15 +311,21 @@ expect() { # crate expected_count
         # sits between `error` and the colon, so neither an anchored nor an
         # unanchored `error: could not compile` can match.
         if grep -q 'could not compile' "$log"; then
-            echo "FATAL: $1 proof build failed to COMPILE — not a proof result; see the rustc error above" >&2
+            echo "FATAL: $crate proof build failed to COMPILE — not a proof result; see the rustc error above" >&2
         else
-            echo "FATAL: expected $2 verified harnesses in $1 — vacuous or failing lane" >&2
+            echo "FATAL: expected $want verified harnesses in $crate — vacuous or failing lane" >&2
         fi
         exit 1
     }
 }
-expect boxes 12
-expect rcache 3
-expect mlog 9
-expect minvmd 5
-expect bep 12
+case "$lane" in
+    "")
+        expect boxes 12
+        expect rcache 3
+        expect mlog 9
+        expect minvmd 5
+        expect bep 12
+        ;;
+    netcore) expect netcore 112 --jobs 4 ;;
+    netcore-heavy) expect netcore 1 --features kani-full --exact --harness "$harness" ;;
+esac

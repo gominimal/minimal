@@ -1,0 +1,1 @@
+`plan`: the address plan of one switch block: the switch's own addresses and those a box may lease. Each control below breaks one thing in a copy of the crate; the verifier must reject the copy in the functions named, and the last run's places are shown beside them.

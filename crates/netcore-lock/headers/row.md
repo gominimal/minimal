@@ -1,0 +1,1 @@
+`row`: the decision for a frame from a registered row as far as it can be made without a table. Each control below breaks one thing in a copy of the crate; the verifier must reject the copy in the functions named, and the last run's places are shown beside them.

@@ -1,0 +1,1 @@
+`finish`: the entry points that take a frame's facts through a box's tables to an outcome, in both directions. Each control below breaks one thing in a copy of the crate; the verifier must reject the copy in the functions named, and the last run's places are shown beside them.

@@ -1,0 +1,864 @@
+# run run-1; tree b223ffe65a5d46e8; verifier Verus 0.2026.11.02.8bf68ee; flags the run was given (stated, not read from an output): --rlimit 0.3, no seed flag (Verus's default seed)
+id	text	verdict	verified	errors	places	cost	note
+alias:1	tree b223ffe65a5d46e8	rejected_within	891	1	alias.rs:238 alias_open		
+alias:10	tree b223ffe65a5d46e8	rejected_within	891	1	alias.rs:157 theorem_ao5		
+alias:11	tree b223ffe65a5d46e8	rejected_within	891	1	alias.rs:130 theorem_ao2		
+alias:2	tree b223ffe65a5d46e8	rejected_within	891	1	alias.rs:238 alias_open		
+alias:3	tree b223ffe65a5d46e8	rejected_within	891	1	alias.rs:238 alias_open		
+alias:4	tree b223ffe65a5d46e8	rejected_within	891	1	alias.rs:238 alias_open		
+alias:5	tree b223ffe65a5d46e8	rejected_within	891	1	alias.rs:214 any_exposure		
+alias:6	tree b223ffe65a5d46e8	rejected_within	891	1	alias.rs:195 any_holder		
+alias:7	tree b223ffe65a5d46e8	rejected_within	891	1	alias.rs:174 within		
+alias:8	tree b223ffe65a5d46e8	rejected_within	890	2	alias.rs:137 theorem_ao3; alias.rs:158 theorem_ao5		
+alias:9	tree b223ffe65a5d46e8	rejected_within	890	2	alias.rs:146 theorem_ao4; alias.rs:158 theorem_ao5		
+added:T2-1	tree b223ffe65a5d46e8	rejected_within	891	1	answer.rs:300 passing_of		
+added:T2-3	tree b223ffe65a5d46e8	rejected_within	891	1	answer.rs:364 answer		
+added:T2-4	tree b223ffe65a5d46e8	rejected_within	891	1	answer.rs:364 answer		
+added:T2-5	tree b223ffe65a5d46e8	rejected_within	891	1	answer.rs:335 answer		
+added:T2-6	tree b223ffe65a5d46e8	rejected_within	890	1	answer.rs:335 answer		
+answer:Z-1	tree b223ffe65a5d46e8	rejected_within	891	1	answer.rs:230 theorem_ta4_no_room_is_quota_or_capacity		
+answer:Z-2	tree b223ffe65a5d46e8	rejected_within	890	2	answer.rs:196 lemma_passing_from; answer.rs:277 theorem_ta5_a_new_admission_passed_the_check	answer.rs:240 theorem_ta5_a_new_admission_passed_the_check rlimit 239684	
+added:M-10	tree b223ffe65a5d46e8	rejected_within	891	1	cohort.rs:351 theorem_cv7_member_is_its_row; cohort.rs:353 theorem_cv7_member_is_its_row		
+added:M-8	tree b223ffe65a5d46e8	rejected_within	891	1	cohort.rs:351 theorem_cv7_member_is_its_row; cohort.rs:353 theorem_cv7_member_is_its_row		
+added:M-9	tree b223ffe65a5d46e8	rejected_within	891	1	cohort.rs:351 theorem_cv7_member_is_its_row; cohort.rs:353 theorem_cv7_member_is_its_row		
+cohort:1	tree b223ffe65a5d46e8	rejected_within	890	2	cohort.rs:491 decide_cohort; cohort.rs:491 decide_cohort; cohort.rs:491 decide_cohort; cohort.rs:545 decide_cohort		
+cohort:10	tree b223ffe65a5d46e8	rejected_within	891	1	cohort.rs:293 theorem_cv3_named		
+cohort:11	tree b223ffe65a5d46e8	rejected_within	890	2	cohort.rs:303 theorem_cv4; cohort.rs:433 theorem_cj2_no_port_opening_admits_a_frame_without_ports; cohort.rs:435 theorem_cj2_no_port_opening_admits_a_frame_without_ports		
+cohort:12	tree b223ffe65a5d46e8	rejected_within	890	2	cohort.rs:311 theorem_cv5; cohort.rs:434 theorem_cj2_no_port_opening_admits_a_frame_without_ports		
+cohort:13	tree b223ffe65a5d46e8	rejected_within	890	2	cohort.rs:328 theorem_cv6; cohort.rs:352 theorem_cv7_member_is_its_row; cohort.rs:354 theorem_cv7_member_is_its_row		
+cohort:14	tree b223ffe65a5d46e8	rejected_within	891	1	cohort.rs:366 theorem_cv8		
+cohort:2	tree b223ffe65a5d46e8	rejected_within	891	1	cohort.rs:542 decide_cohort		
+cohort:3	tree b223ffe65a5d46e8	rejected_within	891	1	cohort.rs:491 decide_cohort		
+cohort:4	tree b223ffe65a5d46e8	rejected_within	891	1	cohort.rs:491 decide_cohort; cohort.rs:491 decide_cohort; cohort.rs:491 decide_cohort		
+cohort:5	tree b223ffe65a5d46e8	rejected_within	891	1	cohort.rs:452 member_says		
+cohort:6	tree b223ffe65a5d46e8	rejected_within	891	1	cohort.rs:452 member_says		
+cohort:7	tree b223ffe65a5d46e8	rejected_within	891	1	cohort.rs:591 judge_cohort		
+cohort:8	tree b223ffe65a5d46e8	rejected_within	891	1	cohort.rs:591 judge_cohort		
+cohort:9	tree b223ffe65a5d46e8	rejected_within	890	2	cohort.rs:269 theorem_cv2; cohort.rs:301 theorem_cv4		
+cohort:Z-2	tree b223ffe65a5d46e8	rejected_within	890	2	cohort.rs:261 theorem_cv0; cohort.rs:491 decide_cohort		
+cohort:Z-3	tree b223ffe65a5d46e8	rejected_within	888	4	cohort.rs:282 theorem_cv3; cohort.rs:293 theorem_cv3_named; cohort.rs:434 theorem_cj2_no_port_opening_admits_a_frame_without_ports; cohort.rs:491 decide_cohort		
+cohort:Z-4	tree b223ffe65a5d46e8	rejected_within	889	3	cohort.rs:338 theorem_cv7; cohort.rs:491 decide_cohort; cohort.rs:491 decide_cohort		
+flow:C1	tree b223ffe65a5d46e8	rejected_within	891	1	cohort.rs:591 judge_cohort; cohort.rs:591 judge_cohort; cohort.rs:591 judge_cohort; cohort.rs:591 judge_cohort		
+gate:C15	tree b223ffe65a5d46e8	rejected_within	891	1	cohort.rs:681 cohort_judged_admits		
+isolation:Z-3	tree b223ffe65a5d46e8	rejected_within	890	2	isolation.rs:182 theorem_is1_cohort; isolation.rs:183 theorem_is1_cohort; isolation.rs:260 theorem_is2_cohort		
+review2:3	tree b223ffe65a5d46e8	rejected_within	891	1	cohort.rs:591 judge_cohort		
+split:Z-5	tree b223ffe65a5d46e8	rejected_within	888	4	cohort.rs:433 theorem_cj2_no_port_opening_admits_a_frame_without_ports; cohort.rs:434 theorem_cj2_no_port_opening_admits_a_frame_without_ports; cohort.rs:435 theorem_cj2_no_port_opening_admits_a_frame_without_ports; isolation.rs:182 theorem_is1_cohort; isolation.rs:183 theorem_is1_cohort; isolation.rs:260 theorem_is2_cohort; split.rs:461 theorem_ep2_the_cohort_is_admitted_by_its_arm_or_a_named_way		
+ag-cPL2-DA1	tree b223ffe65a5d46e8	rejected_within	891	1	dnsa.rs:915 piece		
+ag-cPL2-DA10	tree b223ffe65a5d46e8	rejected_within	890	1	dnsa.rs:1339 answer_addresses		
+ag-cPL2-DA11	tree b223ffe65a5d46e8	rejected_within	891	1	dnsa.rs:949 lower_byte; dnsa.rs:953 lower_byte		
+ag-cPL2-DA11b	tree b223ffe65a5d46e8	rejected_within	891	1	dnsa.rs:949 lower_byte		
+ag-cPL2-DA2	tree b223ffe65a5d46e8	rejected_within	891	1	dnsa.rs:1224 take; dnsa.rs:1224 take		
+ag-cPL2-DA3	tree b223ffe65a5d46e8	rejected_within	891	1	dnsa.rs:1224 take		
+ag-cPL2-DA4	tree b223ffe65a5d46e8	rejected_within	891	1	dnsa.rs:1224 take		
+ag-cPL2-DA5	tree b223ffe65a5d46e8	rejected_within	891	1	dnsa.rs:1294 read_opening; dnsa.rs:1294 read_opening; dnsa.rs:1294 read_opening; dnsa.rs:1294 read_opening; dnsa.rs:1294 read_opening		
+ag-cPL2-DA6	tree b223ffe65a5d46e8	rejected_within	891	1	dnsa.rs:1224 take		
+ag-cPL2-DA7	tree b223ffe65a5d46e8	rejected_within	891	1	dnsa.rs:982 copy_label		
+ag-cPL2-DA8	tree b223ffe65a5d46e8	rejected_within	891	1	dnsa.rs:440 theorem_da3_addresses_come_from_the_chain		
+ag-cPL2-DA9	tree b223ffe65a5d46e8	rejected_within	891	1	dnsa.rs:442 theorem_da3_addresses_come_from_the_chain	dnsa.rs:399 theorem_da3_addresses_come_from_the_chain rlimit 670306	
+added:P-1	tree b223ffe65a5d46e8	rejected_within	891	1	dnsq.rs:259 end_of_name		
+added:P-11	tree b223ffe65a5d46e8	rejected_within	890	2	dnsq.rs:218 lemma_questions_start; dnsq.rs:219 lemma_questions_start; dnsq.rs:224 lemma_questions_start; dnsq.rs:467 zone_query		
+added:P-2	tree b223ffe65a5d46e8	rejected_within	891	1	dnsq.rs:273 end_of_name		
+added:P-4	tree b223ffe65a5d46e8	rejected_within	891	1	dnsq.rs:451 zone_query		
+added:P-5	tree b223ffe65a5d46e8	rejected_within	891	1	dnsq.rs:384 question		
+added:P-6	tree b223ffe65a5d46e8	rejected_within	891	1	dnsq.rs:386 question		
+added:P-7	tree b223ffe65a5d46e8	rejected_within	891	1	dnsq.rs:272 end_of_name		
+added:P-8	tree b223ffe65a5d46e8	rejected_within	891	1	dnsq.rs:454 zone_query		
+added:P-9	tree b223ffe65a5d46e8	rejected_within	891	1	dnsq.rs:176 theorem_dq4_every_question_is_for_a_zone_name		
+dnsq:Z-1	tree b223ffe65a5d46e8	rejected_within	890	2	dnsq.rs:177 theorem_dq4_every_question_is_for_a_zone_name; dnsq.rs:191 theorem_dq4_every_question_is_for_a_zone_name; dnsq.rs:204 theorem_dq5_one_bad_question_refuses		
+finish:Z-1	tree b223ffe65a5d46e8	rejected_within	890	2	finish.rs:292 theorem_fn1_a_drop_admits_nothing; finish.rs:320 dropped		
+added:S-1	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2377 Flows::capacity		
+added:S-2	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2386 Flows::is_full		
+ag-cPL2-FC1	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2922 Flows::drop_closed; flow.rs:2928 Flows::drop_closed; flow.rs:2929 Flows::drop_closed; flow.rs:2931 Flows::drop_closed		
+ag-cPL2-FC10	tree b223ffe65a5d46e8	rejected_within	879	13	flow.rs:1123 lemma_reply_refreshed_udp; flow.rs:1183 lemma_reply_refreshed_tcp; flow.rs:2512 Flows::reply; flow.rs:984 lemma_inbound_refreshed; flow.rs:1245 lemma_inbound_reopened; flow.rs:2736 Flows::touch_expired; flow.rs:1306 lemma_inbound_inserted; flow.rs:1363 lemma_gave_up; flow.rs:2847 Flows::open_at_capacity; flow.rs:2855 Flows::open_at_capacity; flow.rs:2855 Flows::open_at_capacity; flow.rs:1726 theorem_g6r_a_clear_mark_holds_none; flow.rs:1743 theorem_g6r_a_set_mark_is_a_closed_conversation; flow.rs:3051 Flows::expire; flow.rs:3080 Flows::end_port		
+ag-cPL2-FC11	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:1742 theorem_g6r_a_set_mark_is_a_closed_conversation		
+ag-cPL2-FC12	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:3096 Flows::clear		
+ag-cPL2-FC13	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:3034 Flows::expire; flow.rs:3052 Flows::expire		
+ag-cPL2-FC2	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2875 Flows::open_at_capacity		
+ag-cPL2-FC3	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2540 Flows::reply		
+ag-cPL2-FC4	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2659 Flows::step_live; flow.rs:2665 Flows::step_live		
+ag-cPL2-FC5	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2925 Flows::drop_closed		
+ag-cPL2-FC6	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2924 Flows::drop_closed		
+ag-cPL2-FC8	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2845 Flows::open_at_capacity; flow.rs:2855 Flows::open_at_capacity		
+ag-cPL2-FC9	tree b223ffe65a5d46e8	rejected_within	889	3	flow.rs:1670 theorem_g6n_off; flow.rs:1690 theorem_g6q_the_closed_yield; flow.rs:1855 theorem_g6n_inbound_keeps_the_floor		
+ag-qPL2-fc9s	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:1872 theorem_g6n_inbound_keeps_the_floor		
+flow:1	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2501 Flows::reply; flow.rs:2521 Flows::reply; flow.rs:2523 Flows::reply		
+flow:10	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2668 Flows::step_live		
+flow:13	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2154 key		
+flow:13b	tree b223ffe65a5d46e8	rejected_within	890	2	flow.rs:615 lemma_at_port_key; flow.rs:653 lemma_key_injective		
+flow:14'	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2324 Flows::new		
+flow:14b	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2324 Flows::new		
+flow:15	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2668 Flows::step_live		
+flow:16	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2668 Flows::step_live		
+flow:17	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2542 Flows::reply		
+flow:18	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2540 Flows::reply		
+flow:19	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2750 Flows::touch_expired		
+flow:2	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2508 Flows::reply; flow.rs:2534 Flows::reply; flow.rs:2536 Flows::reply		
+flow:20	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2662 Flows::step_live; flow.rs:2668 Flows::step_live		
+flow:21	tree b223ffe65a5d46e8	rejected_within	890	2	flow.rs:1522 theorem_g6h_tcp_is_never_replied; flow.rs:1536 theorem_g6f_unreplied_window; flow.rs:1537 theorem_g6f_unreplied_window; flow.rs:1539 theorem_g6f_unreplied_window		
+flow:23	tree b223ffe65a5d46e8	rejected_within	889	3	flow.rs:2611 Flows::step_live; flow.rs:2667 Flows::step_live; flow.rs:1522 theorem_g6h_tcp_is_never_replied; flow.rs:1536 theorem_g6f_unreplied_window; flow.rs:1537 theorem_g6f_unreplied_window; flow.rs:1539 theorem_g6f_unreplied_window		
+flow:3	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2508 Flows::reply; flow.rs:2536 Flows::reply		
+flow:4	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2494 Flows::reply; flow.rs:2514 Flows::reply; flow.rs:2540 Flows::reply; flow.rs:2542 Flows::reply		
+flow:5	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2451 Flows::reply; flow.rs:2452 Flows::reply		
+flow:7	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2746 Flows::touch_expired		
+flow:8	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2557 Flows::inbound; flow.rs:2579 Flows::inbound; flow.rs:2585 Flows::inbound; flow.rs:2588 Flows::inbound		
+flow:9	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2582 Flows::inbound; flow.rs:2588 Flows::inbound; flow.rs:2591 Flows::inbound		
+flow:F-2	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2963 Flows::give_up_and_open; flow.rs:3007 Flows::give_up_and_open		
+flow:F-3	tree b223ffe65a5d46e8	rejected_within	888	4	flow.rs:2230 class_of_entry; flow.rs:1603 theorem_g6n_floor; flow.rs:1625 theorem_g6n_answered_is_kept; flow.rs:1897 theorem_g6n_longer_life_keeps_the_floor		
+flow:F1	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2452 Flows::reply		
+flow:F17	tree b223ffe65a5d46e8	rejected_within	887	5	flow.rs:1077 lemma_reply_refused; flow.rs:1822 theorem_g6n_reply_keeps_others; judge.rs:201 lemma_refused_reply_missed; judge.rs:675 lemma_judged_refusal; judge.rs:691 lemma_answers_refused		
+flow:F18	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2690 Flows::touch_expired		
+flow:F2	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2513 Flows::reply		
+flow:F3	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2451 Flows::reply; flow.rs:2476 Flows::reply		
+flow:F5	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2690 Flows::touch_expired		
+flow:FB1	tree b223ffe65a5d46e8	rejected_within	889	3	flow.rs:2999 Flows::give_up_and_open; flow.rs:2885 Flows::open_at_capacity; flow.rs:2899 Flows::open_at_capacity; flow.rs:2797 Flows::open_new		
+flow:FB3	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2324 Flows::new		
+flow:FC1	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2771 Flows::open_new; flow.rs:2821 Flows::open_new		
+flow:FC2	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2771 Flows::open_new; flow.rs:2772 Flows::open_new; flow.rs:2812 Flows::open_new; flow.rs:2822 Flows::open_new		
+flow:FC3	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2770 Flows::open_new; flow.rs:2772 Flows::open_new		
+flow:FC4	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:3095 Flows::clear		
+flow:FC5	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:1487 lemma_inbound_at_capacity		
+flow:FC6	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:1487 lemma_inbound_at_capacity		
+flow:FC8	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2324 Flows::new		
+flow:GS2	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2768 end_tables_port		
+flow:L-10	tree b223ffe65a5d46e8	rejected_within	887	5	flow.rs:896 lemma_tcp_after; flow.rs:1050 lemma_inbound_reset; flow.rs:981 lemma_inbound_refreshed; flow.rs:2324 Flows::new; flow.rs:1955 theorem_g6c_life		
+flow:L-11	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2324 Flows::new		
+flow:L-12	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:894 lemma_tcp_after		
+flow:L-14	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:1959 theorem_g6c_life		
+flow:L-2i	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2662 Flows::step_live; flow.rs:2668 Flows::step_live		
+flow:L-6	tree b223ffe65a5d46e8	rejected_within	890	2	flow.rs:1924 theorem_g6c_reset_lingers; flow.rs:1956 theorem_g6c_life		
+flow:L-7	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:1963 theorem_g6c_life		
+flow:L-8	tree b223ffe65a5d46e8	rejected_within	890	2	flow.rs:1957 theorem_g6c_life; flow.rs:1963 theorem_g6c_life	flow.rs:1915 theorem_g6c_reset_lingers rlimit 900000	
+flow:L-9	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2662 Flows::step_live; flow.rs:2668 Flows::step_live		
+flow:N-1	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2452 Flows::reply		
+flow:N-3	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2180 tcp_value_of		
+flow:N-5	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2209 tcp_deadline_of		
+flow:N-6	tree b223ffe65a5d46e8	rejected_within	890	2	flow.rs:1907 theorem_g6c_reset_closes; flow.rs:1924 theorem_g6c_reset_lingers		
+flow:N-7	tree b223ffe65a5d46e8	rejected_within	890	2	flow.rs:1924 theorem_g6c_reset_lingers; flow.rs:1956 theorem_g6c_life		
+flow:N-8	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:1941 theorem_g6c_reset_lingers		
+flow:O-1	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2230 class_of_entry		
+flow:O-10	tree b223ffe65a5d46e8	rejected_within	890	2	flow.rs:897 lemma_tcp_after; flow.rs:1579 theorem_g6c_reopens		
+flow:O-11	tree b223ffe65a5d46e8	rejected_within	889	3	flow.rs:897 lemma_tcp_after; flow.rs:1581 theorem_g6c_reopens; flow.rs:1590 theorem_g6h_only_the_box_answers		
+flow:O-12	tree b223ffe65a5d46e8	rejected_within	890	2	flow.rs:1603 theorem_g6n_floor; flow.rs:1625 theorem_g6n_answered_is_kept		
+flow:O-14	tree b223ffe65a5d46e8	rejected_within	890	2	flow.rs:1658 theorem_g6n_one; flow.rs:1869 theorem_g6n_inbound_keeps_the_floor		
+flow:O-15	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2324 Flows::new		
+flow:O-16	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2612 Flows::step_live; flow.rs:2668 Flows::step_live		
+flow:O-16s	tree b223ffe65a5d46e8	rejected_within	889	3	flow.rs:975 lemma_inbound_refreshed; flow.rs:1003 lemma_inbound_refreshed; flow.rs:1522 theorem_g6h_tcp_is_never_replied; flow.rs:1536 theorem_g6f_unreplied_window		
+flow:O-17	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2809 Flows::open_new; flow.rs:2819 Flows::open_new		
+flow:O-18	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2812 Flows::open_new; flow.rs:2822 Flows::open_new		
+flow:O-19	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2690 Flows::touch_expired		
+flow:O-2	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2230 class_of_entry		
+flow:O-3	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2287 Flows::victim		
+flow:O-4	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2287 Flows::victim		
+flow:O-5	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2287 Flows::victim		
+flow:O-7	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2963 Flows::give_up_and_open		
+flow:O-8	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:3003 Flows::give_up_and_open; flow.rs:3011 Flows::give_up_and_open		
+flow:O-9	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2180 tcp_value_of		
+flow:R11	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2690 Flows::touch_expired; flow.rs:2733 Flows::touch_expired		
+flow:W1'	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2767 Flows::open_new; flow.rs:2771 Flows::open_new; flow.rs:2812 Flows::open_new; flow.rs:2822 Flows::open_new		
+flow:Z-1	tree b223ffe65a5d46e8	rejected_within	890	2	flow.rs:2180 tcp_value_of; flow.rs:1559 theorem_g6c_fin_marks; flow.rs:1560 theorem_g6c_fin_marks		
+flow:Z-2	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:1704 theorem_g6q_no_refusal_over_a_closed_record		
+flow:Z-3	tree b223ffe65a5d46e8	rejected_within	889	3	flow.rs:2180 tcp_value_of; flow.rs:1562 theorem_g6c_fin_marks; flow.rs:1714 theorem_g6q_only_the_closed		
+flow:Z-4	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:1759 theorem_g6n_sweep_first		
+flow:Z-6	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:1999 theorem_g6m_the_box_is_heard_after_its_fin		
+pool:39	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2750 Flows::touch_expired		
+review2:14	tree b223ffe65a5d46e8	rejected_within	886	6	judge.rs:221 lemma_reply_answers; judge.rs:201 lemma_refused_reply_missed; judge.rs:661 lemma_judged_reply; judge.rs:675 lemma_judged_refusal; judge.rs:676 lemma_judged_refusal; judge.rs:691 lemma_answers_refused; judge.rs:575 lemma_row_post_keeps_owners		
+review3:2	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2540 Flows::reply		
+review3:3	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2668 Flows::step_live		
+swapnew/rv2	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2575 Flows::inbound; flow.rs:2582 Flows::inbound		
+swapnew/st2a	tree b223ffe65a5d46e8	rejected_within	878	14	flow.rs:1130 lemma_reply_refreshed_udp; flow.rs:1187 lemma_reply_refreshed_tcp; flow.rs:1192 lemma_reply_refreshed_tcp; flow.rs:2510 Flows::reply; flow.rs:1057 lemma_inbound_reset; flow.rs:1062 lemma_inbound_reset; flow.rs:991 lemma_inbound_refreshed; flow.rs:998 lemma_inbound_refreshed; flow.rs:1248 lemma_inbound_reopened; flow.rs:2734 Flows::touch_expired; flow.rs:1309 lemma_inbound_inserted; flow.rs:2942 Flows::drop_closed; flow.rs:1443 lemma_room_from_closed; flow.rs:1394 lemma_gave_up; flow.rs:1854 theorem_g6n_inbound_keeps_the_floor; flow.rs:3049 Flows::expire; flow.rs:3078 Flows::end_port		
+sweep:E11	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:628 theorem_g6j_ended_port_holds_no_record		
+sweep:E12	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:640 theorem_g6j_other_records_stay		
+sweep:E3	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:3068 Flows::end_port		
+tighten:T5	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2540 Flows::reply		
+tighten:T6	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2545 Flows::reply		
+tighten:T7	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2661 Flows::step_live		
+tighten:T8	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2582 Flows::inbound; flow.rs:2588 Flows::inbound; flow.rs:2591 Flows::inbound		
+views:V3	tree b223ffe65a5d46e8	rejected_within	891	1	flow.rs:2430 Flows::has_live		
+added:V1-2	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:475 parse_udp		
+added:V1-3	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:573 parse_l4		
+added:V1-4	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:503 parse_udp		
+added:V1-5	tree b223ffe65a5d46e8	rejected_within	890	2	frame.rs:400 lemma_l4_udp; frame.rs:501 parse_udp		
+frame2/c11	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:526 parse_l4		
+frame:1	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:583 parse_frame; frame.rs:649 parse_frame		
+frame:10	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:526 parse_l4; frame.rs:577 parse_l4; frame.rs:577 parse_l4		
+frame:11	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:475 parse_udp		
+frame:12	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:584 parse_frame		
+frame:13	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:583 parse_frame		
+frame:14	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:585 parse_frame		
+frame:2	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:583 parse_frame; frame.rs:649 parse_frame		
+frame:3	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:583 parse_frame; frame.rs:649 parse_frame		
+frame:4	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:583 parse_frame; frame.rs:649 parse_frame		
+frame:5	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:552 parse_l4; frame.rs:558 parse_l4; frame.rs:562 parse_l4; frame.rs:573 parse_l4; frame.rs:576 parse_l4		
+frame:6	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:562 parse_l4; frame.rs:569 parse_l4		
+frame:7	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:562 parse_l4		
+frame:8	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:493 parse_udp; frame.rs:501 parse_udp		
+frame:9	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:509 parse_udp		
+pr1/c01	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:583 parse_frame; frame.rs:649 parse_frame		
+pr1/c02	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:583 parse_frame; frame.rs:649 parse_frame		
+pr1/c03	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:583 parse_frame; frame.rs:649 parse_frame		
+pr1/c04	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:583 parse_frame; frame.rs:649 parse_frame		
+pr1/c05	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:552 parse_l4; frame.rs:558 parse_l4; frame.rs:562 parse_l4; frame.rs:573 parse_l4; frame.rs:576 parse_l4		
+pr1/c06	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:562 parse_l4; frame.rs:569 parse_l4		
+pr1/c07	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:562 parse_l4		
+pr1/c10	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:526 parse_l4; frame.rs:577 parse_l4; frame.rs:577 parse_l4		
+pr1/c11	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:526 parse_l4		
+pr1/c12	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:584 parse_frame		
+pr1/c13	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:583 parse_frame		
+pr1/c14	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:585 parse_frame		
+premise/pf1	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:293 lemma_l4_bounds; frame.rs:294 lemma_l4_bounds; frame.rs:295 lemma_l4_bounds		
+premise/pf2	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:309 lemma_small_usize		
+premise/pf3	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:319 lemma_l4_later		
+premise/pf4	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:329 lemma_l4_no_ports		
+premise/pf5	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:342 lemma_l4_short_tcp		
+premise/pf6	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:356 lemma_l4_short_udp		
+premise/pf7	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:375 lemma_l4_tcp		
+premise/pf8	tree b223ffe65a5d46e8	rejected_within	891	1	frame.rs:403 lemma_l4_udp		
+added:W1-2	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2108 Gate::egress		
+floor:L1	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1774 Gate::dns_answer; gate.rs:1801 Gate::dns_answer		
+floor:L11	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1774 Gate::dns_answer		
+floor:L2	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1774 Gate::dns_answer; gate.rs:1801 Gate::dns_answer		
+floor:L7	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1774 Gate::dns_answer		
+flow:MT2	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2280 Gate::ingress; gate.rs:2280 Gate::ingress; gate.rs:2280 Gate::ingress		
+gate-dns:A1	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1880 Gate::dns_answer_given		
+gate-dns:A10	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:765 theorem_gd1_b_unnamed_table_is_untouched; gate.rs:766 theorem_gd1_b_unnamed_table_is_untouched		
+gate-dns:A11	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:784 theorem_gd1_d_admitted_by_its_own_question		
+gate-dns:A2	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1880 Gate::dns_answer_given		
+gate-dns:A3	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1932 Gate::dns_answer_given		
+gate-dns:A4	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1881 Gate::dns_answer_given		
+gate-dns:A5	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1938 Gate::dns_answer_given		
+gate-dns:A6	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1935 Gate::dns_answer_given		
+gate-dns:A7	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1929 Gate::dns_answer_given; gate.rs:1938 Gate::dns_answer_given		
+gate-dns:A8	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2856 resolve_in		
+gate-dns:A9	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:744 theorem_gd1_a_answer_reaches_the_asked_table		
+gate-dns:B1	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1957 Gate::adopt_baseline		
+gate-dns:B10	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:894 theorem_gb1_a_adopting_empties_the_nodes_dns		
+gate-dns:B2	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1957 Gate::adopt_baseline		
+gate-dns:B3	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1957 Gate::adopt_baseline		
+gate-dns:B4	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1957 Gate::adopt_baseline		
+gate-dns:B5	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1957 Gate::adopt_baseline		
+gate-dns:B6	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1957 Gate::adopt_baseline		
+gate-dns:B8	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1983 Gate::clear_cohort_dns; gate.rs:1986 Gate::clear_cohort_dns		
+gate-dns:B9	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:903 theorem_gb1_b_adopting_keeps_the_cohorts_dns		
+gate-dns:D1	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1567 Gate::new		
+gate-dns:D10	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1742 Gate::dns_ask; gate.rs:1757 Gate::dns_ask		
+gate-dns:D11	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2839 ask_in		
+gate-dns:D12	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2883 expire_in		
+gate-dns:D13	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:647 theorem_marked_node_query_is_the_cohorts		
+gate-dns:D14	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:536 theorem_gd0_a_new_gate_lifts_nothing		
+gate-dns:D2	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1567 Gate::new		
+gate-dns:D3	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1567 Gate::new		
+gate-dns:D4	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1567 Gate::new		
+gate-dns:D5	tree b223ffe65a5d46e8	rejected_within	890	2	gate.rs:2808 reset_rows; gate.rs:2822 reset_rows		
+gate-dns:D6	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1663 Gate::ask_table		
+gate-dns:D7	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1663 Gate::ask_table		
+gate-dns:D8	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1663 Gate::ask_table		
+gate-dns:D9	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1754 Gate::dns_ask		
+gate:1	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2104 Gate::egress; gate.rs:2108 Gate::egress; gate.rs:2221 Gate::egress		
+gate:10	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2276 Gate::ingress; gate.rs:2280 Gate::ingress; gate.rs:2373 Gate::ingress		
+gate:11	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2280 Gate::ingress		
+gate:12	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2280 Gate::ingress; gate.rs:2280 Gate::ingress; gate.rs:2280 Gate::ingress		
+gate:14	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2280 Gate::ingress; gate.rs:2280 Gate::ingress; gate.rs:2280 Gate::ingress		
+gate:15	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2280 Gate::ingress; gate.rs:2280 Gate::ingress; gate.rs:2280 Gate::ingress		
+gate:16	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2280 Gate::ingress; gate.rs:2280 Gate::ingress; gate.rs:2280 Gate::ingress		
+gate:17	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2715 Gate::retract		
+gate:18	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2108 Gate::egress		
+gate:19	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2108 Gate::egress		
+gate:2	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1620 Gate::new		
+gate:20	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2108 Gate::egress		
+gate:21	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2108 Gate::egress		
+gate:22	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2627 Gate::set_alias		
+gate:23	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2075 Gate::box_name		
+gate:24	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2038 Gate::box_name; gate.rs:2075 Gate::box_name		
+gate:25	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2090 Gate::box_name		
+gate:26	tree b223ffe65a5d46e8	rejected_within	890	2	gate.rs:2038 Gate::box_name; gate.rs:2038 Gate::box_name		
+gate:27	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2108 Gate::egress		
+gate:28	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2038 Gate::box_name		
+gate:29	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1617 Gate::new		
+gate:3	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1620 Gate::new		
+gate:30	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1617 Gate::new		
+gate:31	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1567 Gate::new; gate.rs:1618 Gate::new		
+gate:32	tree b223ffe65a5d46e8	rejected_within	890	2	gate.rs:2106 Gate::egress; gate.rs:2278 Gate::ingress		
+gate:33	tree b223ffe65a5d46e8	rejected_within	890	2	gate.rs:2106 Gate::egress; gate.rs:2278 Gate::ingress		
+gate:34	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2106 Gate::egress		
+gate:35	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2106 Gate::egress		
+gate:36	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2903 Decision::admits		
+gate:37	tree b223ffe65a5d46e8	rejected_within	890	2	gate.rs:2107 Gate::egress; report.rs:336 theorem_rp1_egress		
+gate:38	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2919 Arrived::delivers		
+gate:39	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2280 Gate::ingress		
+gate:4	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1614 Gate::new		
+gate:40	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2108 Gate::egress		
+gate:41	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2280 Gate::ingress		
+gate:42	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2280 Gate::ingress; gate.rs:2280 Gate::ingress		
+gate:43	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1617 Gate::new		
+gate:44	tree b223ffe65a5d46e8	rejected_within	890	2	gate.rs:2106 Gate::egress; gate.rs:2278 Gate::ingress		
+gate:45	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2395 Gate::register		
+gate:46	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2390 Gate::register; gate.rs:2392 Gate::register		
+gate:47	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2436 Gate::retire; gate.rs:2439 Gate::retire		
+gate:48	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:391 theorem_fresh_admits_nothing		
+gate:49	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2390 Gate::register; gate.rs:2395 Gate::register		
+gate:5	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2107 Gate::egress; gate.rs:2108 Gate::egress; gate.rs:2205 Gate::egress; gate.rs:2208 Gate::egress; gate.rs:2209 Gate::egress; gate.rs:2210 Gate::egress; gate.rs:2214 Gate::egress; gate.rs:2215 Gate::egress; gate.rs:2218 Gate::egress		
+gate:51	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2893 set_name; gate.rs:2897 set_name		
+gate:52	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2568 Gate::rename; gate.rs:2569 Gate::rename		
+gate:54	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2456 Gate::row_at		
+gate:55	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2782 clear_tables		
+gate:56	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2782 clear_tables		
+gate:57	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2782 clear_tables		
+gate:58	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2509 Gate::clear_at; gate.rs:2513 Gate::clear_at		
+gate:59	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:450 lemma_cleared_records_keeps_dns		
+gate:6	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2108 Gate::egress		
+gate:7	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2108 Gate::egress		
+gate:8	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2108 Gate::egress		
+gate:O1	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2104 Gate::egress; gate.rs:2108 Gate::egress; gate.rs:2206 Gate::egress; gate.rs:2207 Gate::egress; gate.rs:2208 Gate::egress; gate.rs:2212 Gate::egress; gate.rs:2213 Gate::egress; gate.rs:2216 Gate::egress; gate.rs:2217 Gate::egress		
+gate:O2	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1298 lemma_rows_bound_at; gate.rs:1299 lemma_rows_bound_at; gate.rs:1303 lemma_rows_bound_at; gate.rs:1304 lemma_rows_bound_at		
+gate:Z-1	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:543 theorem_reset_admits_no_lift		
+gate:Z-2	tree b223ffe65a5d46e8	rejected_within	890	2	gate.rs:660 theorem_row_question_is_the_rows_own; gate.rs:1663 Gate::ask_table		
+gate:Z-3	tree b223ffe65a5d46e8	rejected_within	890	2	gate.rs:754 theorem_gd1_a_offered_tables_differ; gate.rs:1663 Gate::ask_table		
+landingd/ts1	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2589 Gate::rename_at; gate.rs:2591 Gate::rename_at		
+landingd/ts2	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2591 Gate::rename_at		
+landingd/ts3	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1774 Gate::dns_answer; gate.rs:1797 Gate::dns_answer		
+landingd/ts4	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1770 Gate::dns_answer		
+origin:G50	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2390 Gate::register; gate.rs:2392 Gate::register; gate.rs:2395 Gate::register		
+review2:6	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2108 Gate::egress		
+review2:7	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2108 Gate::egress		
+review2:8	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2699 Gate::publish		
+review3:5	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2395 Gate::register		
+sweep:E10	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2740 Gate::end_port_at		
+sweep:E13	tree b223ffe65a5d46e8	rejected_within	890	2	gate.rs:1497 theorem_gp1_b_standing_forward_keeps_the_records; gate.rs:1509 theorem_gp1_c_other_tables_are_untouched; gate.rs:1510 theorem_gp1_c_other_tables_are_untouched; gate.rs:1511 theorem_gp1_c_other_tables_are_untouched; gate.rs:1512 theorem_gp1_c_other_tables_are_untouched; gate.rs:1513 theorem_gp1_c_other_tables_are_untouched; gate.rs:1514 theorem_gp1_c_other_tables_are_untouched; gate.rs:1515 theorem_gp1_c_other_tables_are_untouched; gate.rs:1516 theorem_gp1_c_other_tables_are_untouched; gate.rs:1517 theorem_gp1_c_other_tables_are_untouched		
+sweep:E14	tree b223ffe65a5d46e8	rejected_within	890	2	gate.rs:1466 theorem_gp1_a_retracted_port_holds_no_record; gate.rs:1510 theorem_gp1_c_other_tables_are_untouched; gate.rs:1515 theorem_gp1_c_other_tables_are_untouched		
+sweep:E15	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:1467 theorem_gp1_a_retracted_port_holds_no_record; gate.rs:1471 theorem_gp1_a_retracted_port_holds_no_record; gate.rs:1484 theorem_gp1_a_retracted_port_holds_no_record; gate.rs:1485 theorem_gp1_a_retracted_port_holds_no_record		
+sweep:E4	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2715 Gate::retract		
+sweep:E5	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2715 Gate::retract		
+sweep:E6	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2715 Gate::retract		
+sweep:E7	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2715 Gate::retract		
+sweep:E8	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2740 Gate::end_port_at		
+sweep:E9	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2740 Gate::end_port_at		
+views:V6	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2661 Gate::tables_at		
+views:V7	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2661 Gate::tables_at		
+views:V8	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2646 Gate::set_members		
+views:V9	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:2641 Gate::set_members		
+flow:MT1	tree b223ffe65a5d46e8	rejected_within	891	1	ingress.rs:279 lemma_seen_post_this_box		
+ingress:1	tree b223ffe65a5d46e8	rejected_within	891	1	ingress.rs:362 observe; ingress.rs:362 observe		
+ingress:2	tree b223ffe65a5d46e8	rejected_within	891	1	ingress.rs:362 observe		
+ingress:3	tree b223ffe65a5d46e8	rejected_within	891	1	ingress.rs:362 observe		
+ingress:4	tree b223ffe65a5d46e8	rejected_within	891	1	ingress.rs:362 observe		
+ingress:5	tree b223ffe65a5d46e8	rejected_within	891	1	ingress.rs:362 observe		
+ingress:6	tree b223ffe65a5d46e8	rejected_within	891	1	ingress.rs:362 observe		
+ingress:7	tree b223ffe65a5d46e8	rejected_within	891	1	ingress.rs:362 observe		
+ingress:8	tree b223ffe65a5d46e8	rejected_within	891	1	ingress.rs:404 seen_delivers		
+ingress:M1	tree b223ffe65a5d46e8	rejected_within	889	3	ingress.rs:221 theorem_ig2_the_tables_see_whole_headers; ingress.rs:247 theorem_ig3_no_frame_both_ways; ingress.rs:248 theorem_ig3_no_frame_both_ways; ingress.rs:292 received_of		
+ingress:M2	tree b223ffe65a5d46e8	rejected_within	891	1	ingress.rs:292 received_of		
+ingress:M3	tree b223ffe65a5d46e8	rejected_within	890	2	ingress.rs:246 theorem_ig3_no_frame_both_ways; ingress.rs:292 received_of		
+ingress:M4	tree b223ffe65a5d46e8	rejected_within	890	2	ingress.rs:247 theorem_ig3_no_frame_both_ways; report.rs:429 theorem_rp1_short_headers		
+ingress:Z-1	tree b223ffe65a5d46e8	rejected_within	890	2	ingress.rs:221 theorem_ig2_the_tables_see_whole_headers; ingress.rs:292 received_of		
+review2:12	tree b223ffe65a5d46e8	rejected_within	891	1	ingress.rs:292 received_of		
+review3:1	tree b223ffe65a5d46e8	rejected_within	891	1	ingress.rs:258 lemma_seen_post_keeps_the_rest		
+review3:6	tree b223ffe65a5d46e8	rejected_within	891	1	ingress.rs:361 observe; ingress.rs:362 observe		
+review3:7	tree b223ffe65a5d46e8	rejected_within	891	1	ingress.rs:260 lemma_seen_post_keeps_the_rest		
+isolation:Z-4	tree b223ffe65a5d46e8	rejected_within	891	1	isolation.rs:285 theorem_is2_row_from_nothing		
+added:W1-1	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:911 box_ruled		
+added:W1-4	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:911 box_ruled		
+added:W1-6	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:335 lemma_box_rule_other; judge.rs:336 lemma_box_rule_other		
+added:W1-7	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:899 lift		
+flow:J1	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:831 judge_row; judge.rs:838 judge_row		
+flow:J5	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:821 judge_row; judge.rs:828 judge_row		
+flow:S5	tree b223ffe65a5d46e8	rejected_within	890	2	judge.rs:706 lemma_rules_arm; judge.rs:745 lemma_lifted		
+gate:9	tree b223ffe65a5d46e8	rejected_within	890	2	finish.rs:347 Config::finish_row; gate.rs:2104 Gate::egress		
+gate:J13	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:945 judged_admits		
+gate:J14	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:945 judged_admits		
+gate:Z-5	tree b223ffe65a5d46e8	rejected_within	890	2	gate.rs:942 theorem_bn1_the_rule_is_this_frames; split.rs:598 theorem_sp1_the_rule_is_this_frames		
+isolation:Z-1	tree b223ffe65a5d46e8	rejected_within	889	3	isolation.rs:128 theorem_is1_row; isolation.rs:129 theorem_is1_row; isolation.rs:211 theorem_is2_row; isolation.rs:286 theorem_is2_row_from_nothing		
+judge/j10	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:911 box_ruled		
+judge:1	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:799 judge_row		
+judge:10	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:377 lemma_lift_judged		
+judge:11	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:852 judge_row		
+judge:12	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:879 judge_row		
+judge:2	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:831 judge_row; judge.rs:838 judge_row		
+judge:3	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:808 judge_row; judge.rs:828 judge_row		
+judge:4	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:851 judge_row		
+judge:5	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:879 judge_row; judge.rs:888 judge_row		
+judge:6	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:879 judge_row		
+judge:7	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:765 judge_row		
+judge:8	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:899 lift		
+judge:9	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:899 lift		
+judge:Z-2	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:397 theorem_j1_box_name_is_for_this_destination; judge.rs:398 theorem_j1_box_name_is_for_this_destination		
+landingf/al1	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:739 lemma_lifted; judge.rs:740 lemma_lifted; judge.rs:742 lemma_lifted; judge.rs:744 lemma_lifted		
+landingf/al2	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:739 lemma_lifted; judge.rs:740 lemma_lifted; judge.rs:742 lemma_lifted; judge.rs:744 lemma_lifted		
+landingf/al3	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:739 lemma_lifted; judge.rs:740 lemma_lifted; judge.rs:742 lemma_lifted; judge.rs:744 lemma_lifted		
+landingf/al4	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:739 lemma_lifted; judge.rs:740 lemma_lifted; judge.rs:742 lemma_lifted; judge.rs:744 lemma_lifted; judge.rs:746 lemma_lifted		
+landingf/al5	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:739 lemma_lifted; judge.rs:740 lemma_lifted; judge.rs:742 lemma_lifted; judge.rs:744 lemma_lifted; judge.rs:746 lemma_lifted		
+landingf/al6	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:739 lemma_lifted; judge.rs:740 lemma_lifted; judge.rs:742 lemma_lifted; judge.rs:744 lemma_lifted; judge.rs:746 lemma_lifted		
+landingf/ar1	tree b223ffe65a5d46e8	rejected_within	889	3	judge.rs:705 lemma_rules_arm; judge.rs:723 lemma_judged_pins; judge.rs:724 lemma_judged_pins; judge.rs:750 lemma_lifted		
+landingf/ar2	tree b223ffe65a5d46e8	rejected_within	889	3	judge.rs:705 lemma_rules_arm; judge.rs:706 lemma_rules_arm; judge.rs:723 lemma_judged_pins; judge.rs:724 lemma_judged_pins; judge.rs:725 lemma_judged_pins; judge.rs:750 lemma_lifted		
+landingf/ar3	tree b223ffe65a5d46e8	rejected_within	889	3	judge.rs:705 lemma_rules_arm; judge.rs:706 lemma_rules_arm; judge.rs:723 lemma_judged_pins; judge.rs:724 lemma_judged_pins; judge.rs:725 lemma_judged_pins; judge.rs:750 lemma_lifted		
+landingf/ar4	tree b223ffe65a5d46e8	rejected_within	889	3	judge.rs:705 lemma_rules_arm; judge.rs:706 lemma_rules_arm; judge.rs:723 lemma_judged_pins; judge.rs:724 lemma_judged_pins; judge.rs:725 lemma_judged_pins; judge.rs:750 lemma_lifted		
+landingf/lp1	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:645 lemma_judged_arp		
+landingf/lp2	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:659 lemma_judged_reply; judge.rs:660 lemma_judged_reply		
+landingf/lp3	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:674 lemma_judged_refusal; judge.rs:675 lemma_judged_refusal		
+landingf/lp4	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:690 lemma_answers_refused		
+landingf/lp5	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:704 lemma_rules_arm; judge.rs:705 lemma_rules_arm		
+landingf/lp6	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:723 lemma_judged_pins		
+landingf/lp7	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:750 lemma_lifted		
+landingf/rv1	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:691 lemma_answers_refused		
+landingf/rv2	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:704 lemma_rules_arm; judge.rs:706 lemma_rules_arm; judge.rs:707 lemma_rules_arm		
+landingf/rv3	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:724 lemma_judged_pins; judge.rs:725 lemma_judged_pins; judge.rs:726 lemma_judged_pins		
+landingf/rv4	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:725 lemma_judged_pins		
+landingf/rv5	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:750 lemma_lifted		
+landingf/rv6	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:740 lemma_lifted; judge.rs:741 lemma_lifted; judge.rs:743 lemma_lifted; judge.rs:745 lemma_lifted; judge.rs:747 lemma_lifted; judge.rs:750 lemma_lifted		
+notes:21	tree b223ffe65a5d46e8	rejected_within	889	3	cohort.rs:591 judge_cohort; cohort.rs:591 judge_cohort; cohort.rs:591 judge_cohort; judge.rs:691 lemma_answers_refused; node.rs:441 judge_node; node.rs:441 judge_node; node.rs:441 judge_node		
+review2:1	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:765 judge_row		
+review2:4	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:765 judge_row		
+review2:5	tree b223ffe65a5d46e8	rejected_within	891	1	judge.rs:765 judge_row		
+split:Z-3	tree b223ffe65a5d46e8	rejected_within	888	4	isolation.rs:128 theorem_is1_row; isolation.rs:129 theorem_is1_row; isolation.rs:211 theorem_is2_row; judge.rs:608 theorem_j2_no_port_opening_admits_a_frame_without_ports; judge.rs:609 theorem_j2_no_port_opening_admits_a_frame_without_ports; judge.rs:610 theorem_j2_no_port_opening_admits_a_frame_without_ports; split.rs:412 theorem_ep2_a_row_is_admitted_by_its_arm_or_a_named_way		
+ledger:0	tree b223ffe65a5d46e8	rejected_within	891	1	ledger.rs:287 Ledger::new		
+ledger:1	tree b223ffe65a5d46e8	rejected_within	891	1	ledger.rs:426 Ledger::publish; ledger.rs:433 Ledger::publish; ledger.rs:441 Ledger::publish; ledger.rs:449 Ledger::publish; ledger.rs:459 Ledger::publish		
+ledger:10	tree b223ffe65a5d46e8	rejected_within	891	1	ledger.rs:537 Ledger::dials		
+ledger:11	tree b223ffe65a5d46e8	rejected_within	891	1	ledger.rs:558 Ledger::dials_in		
+ledger:12	tree b223ffe65a5d46e8	rejected_within	890	2	ledger.rs:347 Ledger::count; ledger.rs:359 Ledger::count		
+ledger:2	tree b223ffe65a5d46e8	rejected_within	891	1	ledger.rs:407 Ledger::publish; ledger.rs:408 Ledger::publish		
+ledger:3	tree b223ffe65a5d46e8	rejected_within	891	1	ledger.rs:408 Ledger::publish		
+ledger:4	tree b223ffe65a5d46e8	rejected_within	891	1	ledger.rs:426 Ledger::publish		
+ledger:5	tree b223ffe65a5d46e8	rejected_within	891	1	ledger.rs:407 Ledger::publish; ledger.rs:408 Ledger::publish		
+ledger:6	tree b223ffe65a5d46e8	rejected_within	891	1	ledger.rs:379 Ledger::oldest_interim		
+ledger:7	tree b223ffe65a5d46e8	rejected_within	891	1	ledger.rs:459 Ledger::publish		
+ledger:8	tree b223ffe65a5d46e8	rejected_within	891	1	ledger.rs:518 Ledger::retract		
+ledger:9	tree b223ffe65a5d46e8	rejected_within	891	1	ledger.rs:518 Ledger::retract		
+premise/pl1	tree b223ffe65a5d46e8	rejected_within	891	1	ledger.rs:689 lemma_publish_held		
+premise/pl2	tree b223ffe65a5d46e8	rejected_within	891	1	ledger.rs:704 lemma_publish_full		
+premise/pl3	tree b223ffe65a5d46e8	rejected_within	891	1	ledger.rs:718 lemma_publish_noted; ledger.rs:719 lemma_publish_noted		
+premise/pl4	tree b223ffe65a5d46e8	rejected_within	891	1	ledger.rs:741 lemma_publish_evicting		
+review2:10	tree b223ffe65a5d46e8	rejected_within	891	1	ledger.rs:522 Ledger::retract		
+review2:9	tree b223ffe65a5d46e8	rejected_within	891	1	ledger.rs:408 Ledger::publish; ledger.rs:459 Ledger::publish		
+flow:N1	tree b223ffe65a5d46e8	rejected_within	891	1	node.rs:441 judge_node; node.rs:441 judge_node; node.rs:441 judge_node; node.rs:441 judge_node		
+gate:N14	tree b223ffe65a5d46e8	rejected_within	891	1	node.rs:543 node_judged_admits		
+isolation:Z-2	tree b223ffe65a5d46e8	rejected_within	890	2	isolation.rs:153 theorem_is1_node; isolation.rs:154 theorem_is1_node; isolation.rs:235 theorem_is2_node		
+node:1	tree b223ffe65a5d46e8	rejected_within	891	1	node.rs:381 decide_node; node.rs:381 decide_node; node.rs:381 decide_node		
+node:10	tree b223ffe65a5d46e8	rejected_within	889	3	node.rs:198 theorem_nv4; node.rs:209 theorem_nv4_named; node.rs:346 theorem_nj2_no_port_opening_admits_a_frame_without_ports		
+node:11	tree b223ffe65a5d46e8	rejected_within	890	2	node.rs:217 theorem_nv5; node.rs:346 theorem_nj2_no_port_opening_admits_a_frame_without_ports		
+node:12	tree b223ffe65a5d46e8	rejected_within	891	1	node.rs:230 theorem_nv6		
+node:13	tree b223ffe65a5d46e8	rejected_within	891	1	node.rs:240 theorem_nv7		
+node:2	tree b223ffe65a5d46e8	rejected_within	891	1	node.rs:381 decide_node		
+node:3	tree b223ffe65a5d46e8	rejected_within	891	1	node.rs:381 decide_node		
+node:4	tree b223ffe65a5d46e8	rejected_within	891	1	node.rs:441 judge_node		
+node:5	tree b223ffe65a5d46e8	rejected_within	891	1	node.rs:441 judge_node		
+node:6	tree b223ffe65a5d46e8	rejected_within	891	1	node.rs:441 judge_node		
+node:7	tree b223ffe65a5d46e8	rejected_within	891	1	node.rs:441 judge_node; node.rs:476 judge_node; node.rs:484 judge_node; node.rs:485 judge_node		
+node:8	tree b223ffe65a5d46e8	rejected_within	890	2	node.rs:177 theorem_nv2; node.rs:345 theorem_nj2_no_port_opening_admits_a_frame_without_ports		
+node:9	tree b223ffe65a5d46e8	rejected_within	891	1	node.rs:188 theorem_nv3		
+node:Z-1	tree b223ffe65a5d46e8	rejected_within	889	3	isolation.rs:153 theorem_is1_node; isolation.rs:154 theorem_is1_node; isolation.rs:235 theorem_is2_node; node.rs:326 theorem_nj3_the_node_lift_is_for_fetches		
+review2:2	tree b223ffe65a5d46e8	rejected_within	891	1	node.rs:441 judge_node		
+split:Z-4	tree b223ffe65a5d46e8	rejected_within	888	4	isolation.rs:153 theorem_is1_node; isolation.rs:154 theorem_is1_node; isolation.rs:235 theorem_is2_node; node.rs:321 theorem_nj3_the_node_lift_is_for_fetches; split.rs:436 theorem_ep2_the_node_is_admitted_by_its_arm_or_a_named_way		
+added:M-4	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:592 Notes::refusal		
+added:M-5	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:395 theorem_n1_connect_elsewhere_adds_nothing		
+landingd/sr1	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:656 Notes::drop_expired; notes.rs:657 Notes::drop_expired		
+notes:1	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:592 Notes::refusal		
+notes:10'	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:524 Notes::note_connect; notes.rs:574 Notes::note_connect		
+notes:11'	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:413 key		
+notes:11'b	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:164 lemma_note_key_injective		
+notes:12	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:524 Notes::note_connect		
+notes:13	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:524 Notes::note_connect		
+notes:14	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:303 theorem_n1_held_is_renoted		
+notes:15	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:303 theorem_n1_held_is_renoted		
+notes:16	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:524 Notes::note_connect; notes.rs:561 Notes::note_connect		
+notes:17	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:524 Notes::note_connect; notes.rs:574 Notes::note_connect		
+notes:18	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:592 Notes::refusal		
+notes:19	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:189 lemma_not_noted; notes.rs:199 lemma_not_noted; notes.rs:201 lemma_not_noted		
+notes:2	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:592 Notes::refusal; notes.rs:592 Notes::refusal		
+notes:20	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:188 lemma_not_noted; notes.rs:198 lemma_not_noted; notes.rs:200 lemma_not_noted		
+notes:20b	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:321 theorem_n1_another_number_is_refused		
+notes:22	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:369 theorem_n1_latest_connect_only		
+notes:3'	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:592 Notes::refusal		
+notes:4'	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:629 Notes::refusal		
+notes:5	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:592 Notes::refusal		
+notes:6	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:592 Notes::refusal		
+notes:7	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:524 Notes::note_connect; notes.rs:524 Notes::note_connect		
+notes:8	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:421 answer_to		
+notes:9	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:524 Notes::note_connect; notes.rs:524 Notes::note_connect		
+notes:Z-1	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:404 theorem_n1_refusal_adds_nothing		
+review2:13	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:524 Notes::note_connect		
+swapnew/rv1	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:522 Notes::note_connect; notes.rs:524 Notes::note_connect; notes.rs:544 Notes::note_connect; notes.rs:553 Notes::note_connect; notes.rs:557 Notes::note_connect; notes.rs:562 Notes::note_connect; notes.rs:570 Notes::note_connect		
+swapnew/st1	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:561 Notes::note_connect; notes.rs:574 Notes::note_connect		
+views:LC2	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:489 Notes::live_count		
+views:V4	tree b223ffe65a5d46e8	rejected_within	891	1	notes.rs:505 Notes::has_live		
+gate-dns:B7	tree b223ffe65a5d46e8	rejected_within	891	1	origin.rs:269 Sources::set_in_force		
+gate:13	tree b223ffe65a5d46e8	rejected_within	891	1	origin.rs:335 Sources::index_of		
+gate:53	tree b223ffe65a5d46e8	rejected_within	883	9	gate.rs:1134 lemma_answered_row; gate.rs:1136 lemma_answered_row; gate.rs:1281 lemma_asked_row; gate.rs:1283 lemma_asked_row; gate.rs:1957 Gate::adopt_baseline; gate.rs:2005 Gate::dns_expire; gate.rs:2477 Gate::retire_at; origin.rs:296 Sources::add; origin.rs:188 Sources::new; split.rs:685 theorem_sp1_egress_reads_the_gates; split.rs:1183 Config::retire_at		
+gate:O9	tree b223ffe65a5d46e8	rejected_within	891	1	origin.rs:299 Sources::add		
+origin:1	tree b223ffe65a5d46e8	rejected_within	891	1	origin.rs:386 Sources::origin		
+origin:10	tree b223ffe65a5d46e8	rejected_within	891	1	origin.rs:293 Sources::add; origin.rs:297 Sources::add		
+origin:11	tree b223ffe65a5d46e8	rejected_within	891	1	origin.rs:293 Sources::add; origin.rs:297 Sources::add		
+origin:12	tree b223ffe65a5d46e8	rejected_within	891	1	origin.rs:293 Sources::add; origin.rs:297 Sources::add		
+origin:13	tree b223ffe65a5d46e8	rejected_within	891	1	origin.rs:164 theorem_rows_are_leases		
+origin:14	tree b223ffe65a5d46e8	rejected_within	891	1	origin.rs:220 Sources::new		
+origin:2	tree b223ffe65a5d46e8	rejected_within	891	1	origin.rs:386 Sources::origin; origin.rs:386 Sources::origin; origin.rs:386 Sources::origin; origin.rs:386 Sources::origin		
+origin:3	tree b223ffe65a5d46e8	rejected_within	891	1	origin.rs:386 Sources::origin		
+origin:4	tree b223ffe65a5d46e8	rejected_within	891	1	origin.rs:443 Sources::origin		
+origin:5	tree b223ffe65a5d46e8	rejected_within	891	1	origin.rs:386 Sources::origin		
+origin:6	tree b223ffe65a5d46e8	rejected_within	891	1	origin.rs:386 Sources::origin		
+origin:7	tree b223ffe65a5d46e8	rejected_within	891	1	origin.rs:442 Sources::origin		
+origin:8	tree b223ffe65a5d46e8	rejected_within	891	1	origin.rs:386 Sources::origin		
+route:6	tree b223ffe65a5d46e8	rejected_within	890	2	origin.rs:360 Sources::holds; origin.rs:370 Sources::holds		
+added:A11	tree b223ffe65a5d46e8	rejected_within	890	2	pins.rs:1806 lemma_resolve_step; pins.rs:1808 lemma_resolve_step; pins.rs:657 theorem_g5_new_is_the_names		
+added:A12	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2118 Pins::admit; pins.rs:2164 Pins::admit		
+added:M-1	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2029 Pins::ask		
+added:M-2	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2306 Pins::egress		
+added:M-6	tree b223ffe65a5d46e8	rejected_within	889	3	isolation.rs:128 theorem_is1_row; isolation.rs:153 theorem_is1_node; isolation.rs:182 theorem_is1_cohort		
+added:T2-7	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2009 Pins::admission		
+landingd/sr2	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2429 Pins::forget_flow; pins.rs:2432 Pins::forget_flow; pins.rs:2433 Pins::forget_flow; pins.rs:2434 Pins::forget_flow; pins.rs:2436 Pins::forget_flow		
+landingd/sr3	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2454 Pins::expire_admissions		
+landingd/sr4	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2457 Pins::expire_admissions; pins.rs:2459 Pins::expire_admissions; pins.rs:2462 Pins::expire_admissions		
+landingd/sr5	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2417 Pins::flow_count		
+pins:1	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2086 Pins::answer		
+pins:10	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2306 Pins::egress		
+pins:11	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2306 Pins::egress; pins.rs:2348 Pins::egress		
+pins:13	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:1903 Pins::new		
+pins:14	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2306 Pins::egress		
+pins:2	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2056 Pins::answer		
+pins:3	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2056 Pins::answer; pins.rs:2056 Pins::answer; pins.rs:2056 Pins::answer		
+pins:4	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2118 Pins::admit		
+pins:6	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2306 Pins::egress; pins.rs:2306 Pins::egress; pins.rs:2306 Pins::egress		
+pins:7	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2335 Pins::egress		
+pins:8	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2306 Pins::egress; pins.rs:2306 Pins::egress; pins.rs:2306 Pins::egress; pins.rs:2306 Pins::egress; pins.rs:2306 Pins::egress		
+pins:9	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2306 Pins::egress; pins.rs:2306 Pins::egress		
+pins:F1	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2118 Pins::admit; pins.rs:2164 Pins::admit		
+pins:F10	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2186 Pins::release_expired		
+pins:F11	tree b223ffe65a5d46e8	rejected_within	884	8	pins.rs:2195 Pins::release_expired; pins.rs:979 lemma_resolve_base; pins.rs:1822 lemma_resolve_step; pins.rs:2147 Pins::admit; pins.rs:696 theorem_g5_first_owner; pins.rs:698 theorem_g5_first_owner; pins.rs:771 theorem_gd_b_first_owner_keeps; pins.rs:2471 Pins::expire_admissions; pins.rs:2494 Pins::expire	pins.rs:943 lemma_resolve_base rlimit 278467; pins.rs:749 theorem_gd_b_first_owner_keeps rlimit 182575	
+pins:F12	tree b223ffe65a5d46e8	rejected_within	890	2	pins.rs:632 theorem_g5_admit_refuses_only_for_room; pins.rs:641 theorem_g5_admit_refuses_only_for_room; pins.rs:686 theorem_g5_first_owner; pins.rs:696 theorem_g5_first_owner; pins.rs:698 theorem_g5_first_owner		
+pins:F13	tree b223ffe65a5d46e8	rejected_within	889	3	pins.rs:1811 lemma_resolve_step; pins.rs:628 theorem_g5_admit_refuses_only_for_room; pins.rs:686 theorem_g5_first_owner		
+pins:F14	tree b223ffe65a5d46e8	rejected_within	890	2	pins.rs:2241 Pins::resolve; pins.rs:2257 Pins::resolve; pins.rs:713 theorem_g5_released_quota_is_live		
+pins:F15'	tree b223ffe65a5d46e8	rejected_within	887	5	pins.rs:979 lemma_resolve_base; pins.rs:1811 lemma_resolve_step; pins.rs:1822 lemma_resolve_step; pins.rs:1834 lemma_resolve_step; pins.rs:1837 lemma_resolve_step; pins.rs:628 theorem_g5_admit_refuses_only_for_room; pins.rs:686 theorem_g5_first_owner; pins.rs:696 theorem_g5_first_owner; pins.rs:698 theorem_g5_first_owner; pins.rs:771 theorem_gd_b_first_owner_keeps	pins.rs:943 lemma_resolve_base rlimit 562991; pins.rs:749 theorem_gd_b_first_owner_keeps rlimit 183272	
+pins:F2	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2117 Pins::admit; pins.rs:2118 Pins::admit		
+pins:F3	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2118 Pins::admit		
+pins:F4	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2118 Pins::admit		
+pins:F5	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2147 Pins::admit		
+pins:S1	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2029 Pins::ask		
+pins:S2	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2029 Pins::ask		
+pins:S3	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2118 Pins::admit		
+pins:S4	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2118 Pins::admit		
+pins:S6	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:614 theorem_g5_ask_refuses_only_for_room		
+pins:S7	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:613 theorem_g5_ask_refuses_only_for_room		
+pins:S8	tree b223ffe65a5d46e8	rejected_within	889	3	pins.rs:1834 lemma_resolve_step; pins.rs:632 theorem_g5_admit_refuses_only_for_room; pins.rs:714 theorem_g5_released_quota_is_live		
+pins:S9	tree b223ffe65a5d46e8	rejected_within	890	2	pins.rs:1837 lemma_resolve_step; pins.rs:632 theorem_g5_admit_refuses_only_for_room		
+pool:41	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2306 Pins::egress; pins.rs:2348 Pins::egress; pins.rs:2349 Pins::egress		
+resolve:R1	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2214 Pins::resolve; pins.rs:2214 Pins::resolve		
+resolve:R10	tree b223ffe65a5d46e8	rejected_within	890	2	pins.rs:1551 lemma_resolve_unpack; pins.rs:813 theorem_gd_d_entered_in_order		
+resolve:R11	tree b223ffe65a5d46e8	rejected_within	889	3	pins.rs:1556 lemma_resolve_unpack; pins.rs:736 theorem_gd_a_admitted_only_by_its_question	answer.rs:241 theorem_ta5_a_new_admission_passed_the_check rlimit 900000	
+resolve:R12	tree b223ffe65a5d46e8	rejected_within	889	3	pins.rs:1218 lemma_resolve_pack_added; pins.rs:1618 lemma_resolve_pack; pins.rs:768 theorem_gd_b_first_owner_keeps		
+resolve:R13	tree b223ffe65a5d46e8	rejected_within	889	3	pins.rs:1555 lemma_resolve_unpack; pins.rs:801 theorem_gd_c_room_admits_all	answer.rs:204 theorem_ta4_no_room_is_quota_or_capacity rlimit 900000	
+resolve:R14	tree b223ffe65a5d46e8	rejected_within	890	2	pins.rs:1556 lemma_resolve_unpack; pins.rs:839 theorem_gd_f_expired_comes_back_fresh	pins.rs:826 theorem_gd_f_expired_comes_back_fresh rlimit 566433	
+resolve:R15	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2214 Pins::resolve		
+resolve:R2	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2242 Pins::resolve; pins.rs:2258 Pins::resolve		
+resolve:R3	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2256 Pins::resolve		
+resolve:R4	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2214 Pins::resolve; pins.rs:2214 Pins::resolve; pins.rs:2251 Pins::resolve		
+resolve:R5	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2214 Pins::resolve		
+resolve:R6	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2256 Pins::resolve		
+resolve:R7	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2256 Pins::resolve; pins.rs:2257 Pins::resolve; pins.rs:2258 Pins::resolve		
+resolve:R8	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2289 Pins::expire_questions		
+resolve:R9	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:859 theorem_gd_e_released_first		
+review3:4	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2306 Pins::egress		
+swapnew/rv3	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2305 Pins::egress; pins.rs:2305 Pins::egress; pins.rs:2305 Pins::egress; pins.rs:2316 Pins::egress; pins.rs:2326 Pins::egress; pins.rs:2334 Pins::egress; pins.rs:2341 Pins::egress; pins.rs:2344 Pins::egress; pins.rs:2345 Pins::egress; pins.rs:2353 Pins::egress; pins.rs:2366 Pins::egress; pins.rs:2375 Pins::egress; pins.rs:2383 Pins::egress; pins.rs:2388 Pins::egress; pins.rs:2400 Pins::egress		
+swapnew/st3	tree b223ffe65a5d46e8	rejected_within	884	8	pins.rs:2195 Pins::release_expired; pins.rs:979 lemma_resolve_base; pins.rs:1822 lemma_resolve_step; pins.rs:2147 Pins::admit; pins.rs:696 theorem_g5_first_owner; pins.rs:698 theorem_g5_first_owner; pins.rs:771 theorem_gd_b_first_owner_keeps; pins.rs:2471 Pins::expire_admissions; pins.rs:2494 Pins::expire	pins.rs:943 lemma_resolve_base rlimit 278467; pins.rs:749 theorem_gd_b_first_owner_keeps rlimit 182575	
+tighten:P2	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2306 Pins::egress		
+tighten:T10	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2508 Pins::clear		
+tighten:T12	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2306 Pins::egress		
+tighten:T13	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2306 Pins::egress		
+tighten:T14	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2056 Pins::answer		
+tighten:T15	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2306 Pins::egress; pins.rs:2349 Pins::egress		
+tighten:T9	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2118 Pins::admit		
+tighten:W2	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2029 Pins::ask		
+tighten:W4	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:2306 Pins::egress; pins.rs:2402 Pins::egress; pins.rs:2404 Pins::egress		
+views:LC3	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:1976 Pins::live_counts; pins.rs:1977 Pins::live_counts		
+views:V5	tree b223ffe65a5d46e8	rejected_within	891	1	pins.rs:1960 Pins::asked_live		
+plan:1	tree b223ffe65a5d46e8	rejected_within	890	2	plan.rs:112 theorem_a1; plan.rs:263 Plan::last_lease		
+plan:10	tree b223ffe65a5d46e8	rejected_within	890	2	rebind.rs:128 theorem_rb1_ordinary_name_reaches_no_box; row.rs:294 theorem_shared_block		
+plan:2	tree b223ffe65a5d46e8	rejected_within	890	2	plan.rs:112 theorem_a1; plan.rs:255 Plan::first_lease		
+plan:3	tree b223ffe65a5d46e8	rejected_within	891	1	plan.rs:135 block_size		
+plan:4	tree b223ffe65a5d46e8	rejected_within	882	10	plan.rs:102 theorem_a1; plan.rs:109 theorem_a1; plan.rs:204 Plan::broadcast; plan.rs:222 Plan::host_alias; plan.rs:213 Plan::gateway; plan.rs:240 Plan::proxy_peer; plan.rs:231 Plan::node; plan.rs:121 lemma_reserved_inside; plan.rs:122 lemma_reserved_inside; plan.rs:123 lemma_reserved_inside; plan.rs:124 lemma_reserved_inside; plan.rs:125 lemma_reserved_inside; plan.rs:249 Plan::cohort; plan.rs:257 Plan::first_lease; plan.rs:265 Plan::last_lease		
+plan:5	tree b223ffe65a5d46e8	rejected_within	891	1	plan.rs:173 Plan::new		
+plan:6	tree b223ffe65a5d46e8	rejected_within	890	2	plan.rs:104 theorem_a1; plan.rs:247 Plan::cohort		
+plan:7	tree b223ffe65a5d46e8	rejected_within	891	1	plan.rs:290 Plan::is_reserved		
+plan:8	tree b223ffe65a5d46e8	rejected_within	891	1	plan.rs:263 Plan::last_lease		
+plan:9	tree b223ffe65a5d46e8	rejected_within	891	1	plan.rs:281 Plan::in_shared_range		
+plankani/ka1	tree b223ffe65a5d46e8	rejected_within	891	1	plan.rs:112 theorem_a1		
+plankani/ka2	tree b223ffe65a5d46e8	rejected_within	891	1	plan.rs:112 theorem_a1		
+plankani/ka6	tree b223ffe65a5d46e8	rejected_within	891	1	plan.rs:104 theorem_a1		
+pr1/a01	tree b223ffe65a5d46e8	rejected_within	890	2	plan.rs:112 theorem_a1; plan.rs:263 Plan::last_lease		
+pr1/a02	tree b223ffe65a5d46e8	rejected_within	890	2	plan.rs:112 theorem_a1; plan.rs:255 Plan::first_lease		
+pr1/a03	tree b223ffe65a5d46e8	rejected_within	891	1	plan.rs:135 block_size		
+pr1/a04	tree b223ffe65a5d46e8	rejected_within	882	10	plan.rs:102 theorem_a1; plan.rs:109 theorem_a1; plan.rs:204 Plan::broadcast; plan.rs:222 Plan::host_alias; plan.rs:213 Plan::gateway; plan.rs:240 Plan::proxy_peer; plan.rs:231 Plan::node; plan.rs:121 lemma_reserved_inside; plan.rs:122 lemma_reserved_inside; plan.rs:123 lemma_reserved_inside; plan.rs:124 lemma_reserved_inside; plan.rs:125 lemma_reserved_inside; plan.rs:249 Plan::cohort; plan.rs:257 Plan::first_lease; plan.rs:265 Plan::last_lease		
+pr1/a06	tree b223ffe65a5d46e8	rejected_within	890	2	plan.rs:104 theorem_a1; plan.rs:247 Plan::cohort		
+pr1/a07	tree b223ffe65a5d46e8	rejected_within	891	1	plan.rs:290 Plan::is_reserved		
+pr1/a08	tree b223ffe65a5d46e8	rejected_within	891	1	plan.rs:263 Plan::last_lease		
+pr1/a09	tree b223ffe65a5d46e8	rejected_within	891	1	plan.rs:281 Plan::in_shared_range		
+added:R-1	tree b223ffe65a5d46e8	rejected_within	891	1	policy.rs:697 Outcome::enforced		
+added:R-2	tree b223ffe65a5d46e8	rejected_within	891	1	policy.rs:697 Outcome::enforced		
+added:R-3	tree b223ffe65a5d46e8	rejected_within	891	1	policy.rs:697 Outcome::enforced		
+added:R-4	tree b223ffe65a5d46e8	rejected_within	891	1	policy.rs:727 Unenforced::accept		
+added:T-1	tree b223ffe65a5d46e8	rejected_within	891	1	policy.rs:639 effective; policy.rs:670 effective; policy.rs:674 effective		
+added:T-2	tree b223ffe65a5d46e8	rejected_within	891	1	policy.rs:639 effective; policy.rs:670 effective		
+added:T-3	tree b223ffe65a5d46e8	rejected_within	891	1	policy.rs:639 effective		
+added:T-5	tree b223ffe65a5d46e8	rejected_within	891	1	policy.rs:639 effective		
+added:T-6	tree b223ffe65a5d46e8	rejected_within	891	1	policy.rs:639 effective; policy.rs:670 effective		
+added:T-6s	tree b223ffe65a5d46e8	rejected_within	891	1	policy.rs:410 theorem_tp4_every_v4_block_is_enforced		
+added:T-7	tree b223ffe65a5d46e8	rejected_within	891	1	policy.rs:741 Effective::rules		
+policy:Z-1	tree b223ffe65a5d46e8	rejected_within	888	4	policy.rs:354 theorem_tp1_no_allow_section_reaches_nothing; policy.rs:363 theorem_tp2_deny_grants_nothing; policy.rs:396 theorem_tp3_an_allowed_block_never_narrows; policy.rs:639 effective		
+policy:Z-2	tree b223ffe65a5d46e8	rejected_within	889	3	policy.rs:363 theorem_tp2_deny_grants_nothing; policy.rs:396 theorem_tp3_an_allowed_block_never_narrows; policy.rs:639 effective		
+policy:Z-3	tree b223ffe65a5d46e8	rejected_within	890	2	policy.rs:372 theorem_tp2_reach_is_declared; policy.rs:571 split		
+policy:Z-4	tree b223ffe65a5d46e8	rejected_within	889	3	policy.rs:383 theorem_tp3_a_denied_block_never_widens; policy.rs:396 theorem_tp3_an_allowed_block_never_narrows; policy.rs:572 split		
+policy:Z-5	tree b223ffe65a5d46e8	rejected_within	889	3	policy.rs:383 theorem_tp3_a_denied_block_never_widens; policy.rs:396 theorem_tp3_an_allowed_block_never_narrows; policy.rs:572 split		
+policy:Z-6	tree b223ffe65a5d46e8	rejected_within	891	1	policy.rs:420 theorem_tp7_every_block_is_readable; policy.rs:421 theorem_tp7_every_block_is_readable		
+added:A1	tree b223ffe65a5d46e8	rejected_within	888	4	flow.rs:1439 lemma_room_from_closed; flow.rs:1389 lemma_gave_up; flow.rs:2812 Flows::open_new; pool.rs:752 theorem_added_members		
+added:A14	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:246 lemma_reclaim_tables; pool.rs:248 lemma_reclaim_tables		
+added:A2	tree b223ffe65a5d46e8	rejected_within	887	5	flow.rs:1436 lemma_room_from_closed; flow.rs:1375 lemma_gave_up; flow.rs:2812 Flows::open_new; pool.rs:759 theorem_added_members; pool.rs:317 lemma_reclaiming_given_up		
+added:A3	tree b223ffe65a5d46e8	rejected_within	887	5	flow.rs:1427 lemma_room_from_closed; flow.rs:1438 lemma_room_from_closed; flow.rs:1357 lemma_gave_up; flow.rs:1384 lemma_gave_up; flow.rs:2812 Flows::open_new; pool.rs:763 theorem_added_members; pool.rs:738 theorem_added_keeps_keys		
+added:A4	tree b223ffe65a5d46e8	rejected_within	887	5	flow.rs:1439 lemma_room_from_closed; flow.rs:1389 lemma_gave_up; flow.rs:2812 Flows::open_new; pool.rs:753 theorem_added_members; pool.rs:308 lemma_reclaiming_given_up		
+added:A5	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:754 theorem_added_members		
+added:A6	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:751 theorem_added_members		
+added:A7	tree b223ffe65a5d46e8	rejected_within	889	3	pool.rs:1404 Pool::insert; pool.rs:1618 Pool::insert_reclaiming; pool.rs:1619 Pool::insert_reclaiming; pool.rs:1912 Pool::insert_sweeping; pool.rs:1966 Pool::insert_sweeping		
+added:A8	tree b223ffe65a5d46e8	rejected_within	890	2	pool.rs:1198 Pool::push_new; pool.rs:1201 Pool::push_new	pool.rs:1790 Pool::expire rlimit 982294	
+added:A9	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:737 theorem_added_keeps_keys; pool.rs:738 theorem_added_keeps_keys		
+flow:12	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1172 Pool::set_at		
+landingf/rc1	tree b223ffe65a5d46e8	rejected_within	890	2	pool.rs:2078 Pool::release_expired; pool.rs:2139 Pool::release_expired		
+landingf/rc2	tree b223ffe65a5d46e8	rejected_within	890	2	pool.rs:2082 Pool::release_expired; pool.rs:2140 Pool::release_expired		
+landingf/rc3	tree b223ffe65a5d46e8	rejected_within	890	2	pool.rs:2083 Pool::release_expired; pool.rs:2141 Pool::release_expired		
+landingf/rc4	tree b223ffe65a5d46e8	rejected_within	890	2	pool.rs:2084 Pool::release_expired; pool.rs:2142 Pool::release_expired		
+landingf/rc5	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:2126 Pool::release_expired; pool.rs:2138 Pool::release_expired; pool.rs:2139 Pool::release_expired; pool.rs:2140 Pool::release_expired; pool.rs:2141 Pool::release_expired		
+landingf/rc6	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:2078 Pool::release_expired; pool.rs:2082 Pool::release_expired; pool.rs:2083 Pool::release_expired; pool.rs:2084 Pool::release_expired		
+onepass/o13r	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:2122 Pool::release_expired; pool.rs:2125 Pool::release_expired		
+onepass:P1	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1782 Pool::expire		
+onepass:P10	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:2021 Pool::remove_ends		
+onepass:P11	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:2038 Pool::remove_ends		
+onepass:P12	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:2024 Pool::remove_ends		
+onepass:P13	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:2019 Pool::remove_ends; pool.rs:2022 Pool::remove_ends		
+onepass:P14	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:2141 Pool::release_expired		
+onepass:P2	tree b223ffe65a5d46e8	rejected_within	890	1	pool.rs:1821 Pool::expire		
+onepass:P3	tree b223ffe65a5d46e8	rejected_within	890	2	pool.rs:1822 Pool::expire; pool.rs:1823 Pool::expire; pool.rs:1826 Pool::expire; pool.rs:1826 Pool::expire		
+onepass:P4	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1787 Pool::expire; pool.rs:1801 Pool::expire	pool.rs:1790 Pool::expire rlimit 290886	
+onepass:P5	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1780 Pool::expire		
+onepass:P6	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1779 Pool::expire; pool.rs:1783 Pool::expire		
+onepass:P7	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:2124 Pool::release_expired		
+onepass:P8	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:2142 Pool::release_expired		
+onepass:P9	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:2127 Pool::release_expired		
+onepass:T1'	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1785 Pool::expire		
+pins:12	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1304 Pool::any_live		
+pins:F6	tree b223ffe65a5d46e8	rejected_within	890	2	pool.rs:1326 Pool::holder	pool.rs:1790 Pool::expire rlimit 971307	
+pool:1	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1449 Pool::insert		
+pool:12	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1686 Pool::remove		
+pool:13	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1631 Pool::remove_at; pool.rs:1634 Pool::remove_at		
+pool:2	tree b223ffe65a5d46e8	rejected_within	890	2	pool.rs:1449 Pool::insert	pool.rs:1787 Pool::expire rlimit 980384	
+pool:3	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1452 Pool::insert		
+pool:35	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1349 Pool::set; pool.rs:1352 Pool::set; pool.rs:1353 Pool::set; pool.rs:1354 Pool::set; pool.rs:1355 Pool::set		
+pool:36	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1354 Pool::set; pool.rs:1355 Pool::set		
+pool:37	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1405 Pool::insert		
+pool:4	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1405 Pool::insert; pool.rs:1405 Pool::insert; pool.rs:1405 Pool::insert; pool.rs:1452 Pool::insert		
+pool:5	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1402 Pool::insert; pool.rs:1405 Pool::insert		
+pool:6	tree b223ffe65a5d46e8	rejected_within	890	2	pool.rs:1009 Pool::row_count; pool.rs:1021 Pool::row_count		
+pool:7	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1041 Pool::find		
+pool:8	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:944 Pool::new		
+premise/pp1	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:267 lemma_reclaiming_refreshed; pool.rs:268 lemma_reclaiming_refreshed; pool.rs:269 lemma_reclaiming_refreshed; pool.rs:271 lemma_reclaiming_refreshed		
+premise/pp4	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:351 lemma_reclaiming_new		
+premise/pr1	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:287 lemma_reclaiming_room; pool.rs:288 lemma_reclaiming_room; pool.rs:291 lemma_reclaiming_room		
+premise/pr2	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:287 lemma_reclaiming_room		
+sweep:W10	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1910 Pool::insert_sweeping		
+sweep:W2	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1862 Pool::drop_expired		
+sweep:W3	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1871 Pool::drop_expired		
+sweep:W4	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1848 Pool::drop_expired		
+sweep:W5	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1847 Pool::drop_expired		
+sweep:W8	tree b223ffe65a5d46e8	rejected_within	889	3	flow.rs:1790 lemma_dropped_keeps; flow.rs:1800 lemma_dropped_keeps; sweep.rs:192 theorem_drop_exact; slab.rs:1665 Slab::drop_expired		
+sweep:W9	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1909 Pool::insert_sweeping; pool.rs:1914 Pool::insert_sweeping		
+sweep:X1	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1909 Pool::insert_sweeping; pool.rs:1909 Pool::insert_sweeping; pool.rs:1910 Pool::insert_sweeping		
+sweep:X10	tree b223ffe65a5d46e8	rejected_within	891	1	sweep.rs:120 theorem_due_rule		
+sweep:X2	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1912 Pool::insert_sweeping		
+sweep:X3	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1912 Pool::insert_sweeping		
+sweep:X4	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1960 Pool::insert_sweeping		
+sweep:X5	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1907 Pool::insert_sweeping; pool.rs:1907 Pool::insert_sweeping		
+sweep:X6	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1910 Pool::insert_sweeping; pool.rs:1915 Pool::insert_sweeping		
+sweep:X7	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1913 Pool::insert_sweeping		
+sweep:X8	tree b223ffe65a5d46e8	rejected_within	890	2	pool.rs:90 Throttle::due	pool.rs:1790 Pool::expire rlimit 972228	
+sweep:X9	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:90 Throttle::due		
+tighten:M1	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:246 lemma_reclaim_tables; pool.rs:248 lemma_reclaim_tables		
+tighten:M2	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1523 Pool::insert_reclaiming; pool.rs:1592 Pool::insert_reclaiming; pool.rs:1618 Pool::insert_reclaiming; pool.rs:1619 Pool::insert_reclaiming		
+tighten:P1	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1523 Pool::insert_reclaiming; pool.rs:1523 Pool::insert_reclaiming; pool.rs:1585 Pool::insert_reclaiming; pool.rs:1597 Pool::insert_reclaiming; pool.rs:1608 Pool::insert_reclaiming; pool.rs:1611 Pool::insert_reclaiming		
+tighten:R1	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1461 Pool::find_expired; pool.rs:1471 Pool::find_expired		
+tighten:R2	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1523 Pool::insert_reclaiming		
+tighten:R3	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1523 Pool::insert_reclaiming		
+tighten:R4	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1523 Pool::insert_reclaiming; pool.rs:1593 Pool::insert_reclaiming		
+tighten:R5	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1486 Pool::find_expired_in_row		
+tighten:S1	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1120 Pool::lower_bound		
+tighten:S2	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1126 Pool::lower_bound		
+tighten:S3	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:933 rank_exec		
+tighten:S4	tree b223ffe65a5d46e8	rejected_within	887	5	pool.rs:586 lemma_rank_eq; pool.rs:587 lemma_rank_eq; pool.rs:933 rank_exec; slab.rs:1023 rank_exec; slab.rs:398 lemma_rank_row; slab.rs:405 lemma_rank_rows_ordered		
+tighten:S4b	tree b223ffe65a5d46e8	rejected_within	888	4	pool.rs:586 lemma_rank_eq; pool.rs:587 lemma_rank_eq; slab.rs:1023 rank_exec; slab.rs:398 lemma_rank_row; slab.rs:405 lemma_rank_rows_ordered		
+tighten:T2	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1687 Pool::remove		
+tighten:T3	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1080 Pool::get		
+tighten:T4	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1405 Pool::insert		
+views:LC1	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:984 Pool::live_count		
+views:V1	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1260 Pool::live		
+views:V2	tree b223ffe65a5d46e8	rejected_within	891	1	pool.rs:1260 Pool::live		
+floor:L10	tree b223ffe65a5d46e8	rejected_within	890	2	rebind.rs:182 theorem_floored_members; rebind.rs:184 theorem_floored_members; rebind.rs:264 floor		
+floor:L3	tree b223ffe65a5d46e8	rejected_within	891	1	rebind.rs:237 passes_floor		
+floor:L4	tree b223ffe65a5d46e8	rejected_within	891	1	rebind.rs:237 passes_floor		
+floor:L5	tree b223ffe65a5d46e8	rejected_within	891	1	rebind.rs:264 floor		
+floor:L6	tree b223ffe65a5d46e8	rejected_within	891	1	rebind.rs:264 floor		
+floor:L8	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:854 theorem_gd2_b_the_floor_excludes_the_block		
+floor:L9	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:848 theorem_gd2_b_the_floor_excludes_the_block; gate.rs:849 theorem_gd2_b_the_floor_excludes_the_block; gate.rs:850 theorem_gd2_b_the_floor_excludes_the_block; gate.rs:851 theorem_gd2_b_the_floor_excludes_the_block; gate.rs:852 theorem_gd2_b_the_floor_excludes_the_block; gate.rs:853 theorem_gd2_b_the_floor_excludes_the_block		
+gate:Z-4	tree b223ffe65a5d46e8	rejected_within	891	1	gate.rs:837 theorem_gd2_a_admitted_addresses_pass_the_floor		
+rebind:B1	tree b223ffe65a5d46e8	rejected_within	891	1	rebind.rs:314 rebind; rebind.rs:314 rebind; rebind.rs:314 rebind; rebind.rs:314 rebind; rebind.rs:314 rebind		
+rebind:B10	tree b223ffe65a5d46e8	rejected_within	891	1	rebind.rs:139 theorem_rb1_zone_name_stays_in_the_plane		
+rebind:B11	tree b223ffe65a5d46e8	rejected_within	891	1	rebind.rs:111 theorem_rb1_refused_ranges		
+rebind:B12	tree b223ffe65a5d46e8	rejected_within	891	1	rebind.rs:98 theorem_rb1_the_ranges_no_name_may_name		
+rebind:B13	tree b223ffe65a5d46e8	rejected_within	891	1	rebind.rs:98 theorem_rb1_the_ranges_no_name_may_name		
+rebind:B2	tree b223ffe65a5d46e8	rejected_within	891	1	rebind.rs:314 rebind		
+rebind:B3	tree b223ffe65a5d46e8	rejected_within	891	1	rebind.rs:314 rebind		
+rebind:B4	tree b223ffe65a5d46e8	rejected_within	891	1	rebind.rs:314 rebind		
+rebind:B5	tree b223ffe65a5d46e8	rejected_within	891	1	rebind.rs:314 rebind		
+rebind:B6	tree b223ffe65a5d46e8	rejected_within	891	1	rebind.rs:314 rebind		
+rebind:B7	tree b223ffe65a5d46e8	rejected_within	891	1	rebind.rs:314 rebind; rebind.rs:314 rebind		
+rebind:B8	tree b223ffe65a5d46e8	rejected_within	891	1	rebind.rs:289 is_own		
+rebind:B9	tree b223ffe65a5d46e8	rejected_within	891	1	rebind.rs:127 theorem_rb1_ordinary_name_reaches_no_box; rebind.rs:128 theorem_rb1_ordinary_name_reaches_no_box		
+rebind:Z-1	tree b223ffe65a5d46e8	rejected_within	890	2	rebind.rs:264 floor; rebind.rs:204 theorem_floored_identity		
+rebind:Z-2	tree b223ffe65a5d46e8	rejected_within	891	1	rebind.rs:225 theorem_floor_is_below_the_check		
+ingress:M5	tree b223ffe65a5d46e8	rejected_within	890	2	report.rs:429 theorem_rp1_short_headers; report.rs:609 heard		
+ingress:M6	tree b223ffe65a5d46e8	rejected_within	891	1	report.rs:433 theorem_rp1_short_headers		
+ingress:M7	tree b223ffe65a5d46e8	rejected_within	891	1	report.rs:609 heard		
+report:Z-1	tree b223ffe65a5d46e8	rejected_within	890	2	report.rs:347 theorem_rp1_ingress; report.rs:564 seen		
+report:Z-2	tree b223ffe65a5d46e8	rejected_within	890	2	report.rs:363 theorem_rp1_answers_and_publishes; report.rs:677 rebind		
+report:Z-3	tree b223ffe65a5d46e8	rejected_within	890	2	report.rs:399 theorem_rp1_no_frame_has_a_rule; report.rs:643 not_a_frame		
+gate:R7	tree b223ffe65a5d46e8	rejected_within	891	1	route.rs:271 route		
+review2:11	tree b223ffe65a5d46e8	rejected_within	891	1	route.rs:202 frame_of		
+route:1	tree b223ffe65a5d46e8	rejected_within	891	1	route.rs:271 route		
+route:2	tree b223ffe65a5d46e8	rejected_within	891	1	route.rs:271 route		
+route:3	tree b223ffe65a5d46e8	rejected_within	891	1	route.rs:271 route		
+route:4	tree b223ffe65a5d46e8	rejected_within	891	1	route.rs:271 route		
+route:5	tree b223ffe65a5d46e8	rejected_within	891	1	route.rs:271 route		
+route:Z-1	tree b223ffe65a5d46e8	rejected_within	890	2	route.rs:159 theorem_rt2_ports_come_from_a_whole_header; route.rs:202 frame_of		
+added:P-12	tree b223ffe65a5d46e8	rejected_within	891	1	row.rs:319 theorem_v9_no_protocol_admits_only_the_resolver; row.rs:327 theorem_v9_no_protocol_admits_only_the_resolver		
+added:P-13	tree b223ffe65a5d46e8	rejected_within	891	1	row.rs:319 theorem_v9_no_protocol_admits_only_the_resolver; row.rs:325 theorem_v9_no_protocol_admits_only_the_resolver; row.rs:326 theorem_v9_no_protocol_admits_only_the_resolver		
+added:P-14	tree b223ffe65a5d46e8	rejected_within	890	2	cohort.rs:352 theorem_cv7_member_is_its_row; cohort.rs:354 theorem_cv7_member_is_its_row; row.rs:320 theorem_v9_no_protocol_admits_only_the_resolver		
+cohort:Z-1	tree b223ffe65a5d46e8	rejected_within	891	1	cohort.rs:213 theorem_cv6_shared		
+row:1	tree b223ffe65a5d46e8	rejected_within	891	1	row.rs:427 decide_row; row.rs:427 decide_row; row.rs:427 decide_row; row.rs:427 decide_row; row.rs:427 decide_row; row.rs:427 decide_row; row.rs:427 decide_row; row.rs:427 decide_row; row.rs:427 decide_row; row.rs:427 decide_row		
+row:10	tree b223ffe65a5d46e8	rejected_within	890	2	cohort.rs:352 theorem_cv7_member_is_its_row; cohort.rs:354 theorem_cv7_member_is_its_row; row.rs:228 theorem_v3		
+row:11	tree b223ffe65a5d46e8	rejected_within	889	3	judge.rs:609 theorem_j2_no_port_opening_admits_a_frame_without_ports; row.rs:238 theorem_v4; row.rs:249 theorem_v4_named		
+row:12	tree b223ffe65a5d46e8	rejected_within	890	2	judge.rs:607 theorem_j2_no_port_opening_admits_a_frame_without_ports; judge.rs:610 theorem_j2_no_port_opening_admits_a_frame_without_ports; row.rs:261 theorem_v5		
+row:13	tree b223ffe65a5d46e8	rejected_within	890	2	judge.rs:611 theorem_j2_no_port_opening_admits_a_frame_without_ports; row.rs:269 theorem_v6		
+row:14	tree b223ffe65a5d46e8	rejected_within	889	3	cohort.rs:352 theorem_cv7_member_is_its_row; cohort.rs:354 theorem_cv7_member_is_its_row; row.rs:427 decide_row; row.rs:282 theorem_v7		
+row:15	tree b223ffe65a5d46e8	rejected_within	890	2	cohort.rs:352 theorem_cv7_member_is_its_row; cohort.rs:354 theorem_cv7_member_is_its_row; row.rs:304 theorem_v8		
+row:2	tree b223ffe65a5d46e8	rejected_within	891	1	row.rs:427 decide_row		
+row:3	tree b223ffe65a5d46e8	rejected_within	891	1	row.rs:427 decide_row; row.rs:427 decide_row; row.rs:427 decide_row; row.rs:427 decide_row; row.rs:427 decide_row; row.rs:427 decide_row		
+row:4	tree b223ffe65a5d46e8	rejected_within	891	1	row.rs:427 decide_row		
+row:5	tree b223ffe65a5d46e8	rejected_within	891	1	row.rs:427 decide_row		
+row:6	tree b223ffe65a5d46e8	rejected_within	891	1	row.rs:427 decide_row		
+row:7	tree b223ffe65a5d46e8	rejected_within	891	1	row.rs:336 mask		
+row:8	tree b223ffe65a5d46e8	rejected_within	890	2	row.rs:359 any_covers; row.rs:369 any_covers		
+row:9	tree b223ffe65a5d46e8	rejected_within	891	1	row.rs:480 arm_admits		
+views:RW1	tree b223ffe65a5d46e8	rejected_within	891	1	row.rs:427 decide_row		
+views:RW2	tree b223ffe65a5d46e8	rejected_within	891	1	row.rs:427 decide_row		
+views:RW3	tree b223ffe65a5d46e8	rejected_within	891	1	row.rs:427 decide_row		
+added:M-3	tree b223ffe65a5d46e8	rejected_within	890	2	pins.rs:2306 Pins::egress; pins.rs:2029 Pins::ask		
+added:S-3	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1077 Slab::capacity		
+ag-cPL2-FC7	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:2650 Slab::remove_valued; slab.rs:2658 Slab::remove_valued		
+premise/ps1	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:887 lemma_reclaim_refreshed		
+premise/ps2	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:917 lemma_reclaim_new_with_room; slab.rs:918 lemma_reclaim_new_with_room		
+premise/ps3	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:934 lemma_reclaim_room; slab.rs:935 lemma_reclaim_room; slab.rs:936 lemma_reclaim_room		
+premise/ps4	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:973 lemma_reclaim_new_at_quota		
+premise/ps5	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1006 lemma_reclaim_new_full		
+slab:SC1	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1416 Slab::compact; slab.rs:1423 Slab::compact		
+slab:SC11	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1477 Slab::push_new_at		
+slab:SC12	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:454 lemma_count_between		
+slab:SC2	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1393 Slab::compact; slab.rs:1430 Slab::compact		
+slab:SC3	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1393 Slab::compact; slab.rs:1398 Slab::compact; slab.rs:1432 Slab::compact		
+slab:SC4	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1474 Slab::push_new_at		
+slab:SC5	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1478 Slab::push_new_at		
+slab:SC6	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1308 Slab::row_count		
+slab:SC7	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1308 Slab::row_count		
+slab:SC8	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1301 Slab::row_count		
+slab:SD1	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1722 Slab::live		
+slab:SD10	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:2103 Slab::insert_reclaiming; slab.rs:2109 Slab::insert_reclaiming		
+slab:SD11	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:2117 Slab::insert_reclaiming; slab.rs:2121 Slab::insert_reclaiming		
+slab:SD12	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:2123 Slab::insert_reclaiming		
+slab:SD13	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:405 lemma_rank_rows_ordered		
+slab:SD2	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1753 Slab::live_count		
+slab:SD3	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1781 Slab::any_live		
+slab:SD4	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1863 Slab::clear		
+slab:SD5	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1905 Slab::find_expired; slab.rs:1908 Slab::find_expired		
+slab:SD6	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1936 Slab::find_expired_in_row		
+slab:SD7	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1953 Slab::find_expired_in_row		
+slab:SD8	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1964 Slab::find_expired_in_row		
+slab:SD9	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:2091 Slab::insert_reclaiming; slab.rs:2121 Slab::insert_reclaiming		
+slab:SE1	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:527 lemma_sweep_keep; slab.rs:530 lemma_sweep_keep; slab.rs:532 lemma_sweep_keep		
+slab:SE10	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:2418 Slab::release_expired		
+slab:SE11	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:2417 Slab::release_expired		
+slab:SE12	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:2549 Slab::remove_ends		
+slab:SE13	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:2543 Slab::remove_ends		
+slab:SE14	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:2723 Slab::insert_sweeping; slab.rs:2723 Slab::insert_sweeping; slab.rs:2724 Slab::insert_sweeping		
+slab:SE15	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:2778 Slab::insert_sweeping		
+slab:SE16	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:2724 Slab::insert_sweeping; slab.rs:2779 Slab::insert_sweeping		
+slab:SE17	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:578 lemma_sweep_end		
+slab:SE2	tree b223ffe65a5d46e8	rejected_within	887	5	slab.rs:555 lemma_sweep_drop; slab.rs:2374 Slab::release_expired; slab.rs:2225 Slab::expire; slab.rs:2653 Slab::remove_valued; slab.rs:2507 Slab::remove_ends		
+slab:SE3	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:2233 Slab::expire; slab.rs:2235 Slab::expire		
+slab:SE4	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:2231 Slab::expire		
+slab:SE5	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:2186 Slab::expire		
+slab:SE6	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:2267 Slab::expire; slab.rs:2275 Slab::expire		
+slab:SE7	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:2287 Slab::expire		
+slab:SE8	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:2223 Slab::expire		
+slab:SE9	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:2221 Slab::expire; slab.rs:2231 Slab::expire		
+slab:SF1	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1478 Slab::push_new_at		
+slab:SG1	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1322 Slab::set_at		
+slab:SG2	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1471 Slab::push_new_at		
+slab:SG3	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1882 Slab::find_expired; slab.rs:1892 Slab::find_expired		
+slab:SG4	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1877 Slab::find_expired		
+slab:SG5	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1906 Slab::find_expired		
+slab:SG6	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:2167 Slab::expire		
+slab:SG7	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:2318 Slab::release_expired		
+slab:SG8	tree b223ffe65a5d46e8	rejected_within	883	9	slab.rs:1588 Slab::remove_at; slab.rs:2317 Slab::release_expired; slab.rs:2432 Slab::release_expired; slab.rs:1340 Slab::set_at; slab.rs:740 lemma_slab_insert; slab.rs:1460 Slab::push_new_at; slab.rs:1891 Slab::find_expired; slab.rs:2166 Slab::expire; slab.rs:2289 Slab::expire; slab.rs:2702 Slab::remove_valued; slab.rs:2563 Slab::remove_ends		
+slab:SG9	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:162 lemma_floored_none_expired; slab.rs:163 lemma_floored_none_expired		
+slab:SH1	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1164 Slab::lower; slab.rs:1170 Slab::lower		
+slab:SH2	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1166 Slab::lower; slab.rs:1172 Slab::lower		
+slab:SH3	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1121 Slab::lower		
+slab:SH4	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1121 Slab::lower		
+slab:SH5	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1197 Slab::place		
+slab:SH6	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1196 Slab::place		
+slab:SH7	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1196 Slab::place		
+slab:SL1	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1166 Slab::lower; slab.rs:1172 Slab::lower		
+slab:SL10	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1345 Slab::set_at		
+slab:SL11	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1345 Slab::set_at		
+slab:SL12	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1035 Slab::new; slab.rs:1055 Slab::new		
+slab:SL14	tree b223ffe65a5d46e8	rejected_within	878	14	slab.rs:1165 Slab::lower; slab.rs:1171 Slab::lower; slab.rs:1238 Slab::place; slab.rs:1587 Slab::remove_at; slab.rs:1622 Slab::remove; slab.rs:2374 Slab::release_expired; slab.rs:1344 Slab::set_at; slab.rs:1345 Slab::set_at; slab.rs:1307 Slab::row_count; slab.rs:721 lemma_slab_insert; slab.rs:1663 Slab::drop_expired; slab.rs:1975 Slab::find_expired_in_row; slab.rs:2225 Slab::expire; slab.rs:2653 Slab::remove_valued; slab.rs:1728 Slab::live; slab.rs:2507 Slab::remove_ends		
+slab:SL15	tree b223ffe65a5d46e8	rejected_within	883	9	slab.rs:1091 Slab::at; slab.rs:1591 Slab::remove_at; slab.rs:2360 Slab::release_expired; slab.rs:1335 Slab::set_at; slab.rs:1422 Slab::compact; slab.rs:725 lemma_slab_insert; slab.rs:2211 Slab::expire; slab.rs:2634 Slab::remove_valued; slab.rs:2493 Slab::remove_ends		
+slab:SL16	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:607 theorem_sb1_probes_in_numbers		
+slab:SL2	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1147 Slab::lower; slab.rs:1166 Slab::lower		
+slab:SL5	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1199 Slab::place		
+slab:SL6	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1478 Slab::push_new_at		
+slab:SL7	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1478 Slab::push_new_at		
+slab:SL8	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1564 Slab::insert		
+slab:SL9	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1560 Slab::insert		
+slab:SR1	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1578 Slab::remove_at; slab.rs:1581 Slab::remove_at		
+slab:SR2	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1578 Slab::remove_at; slab.rs:1581 Slab::remove_at		
+slab:SR3	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1610 Slab::remove; slab.rs:1613 Slab::remove		
+slab:SR4	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1657 Slab::drop_expired		
+slab:SR5	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1665 Slab::drop_expired		
+slab:SR8	tree b223ffe65a5d46e8	rejected_within	891	1	slab.rs:1613 Slab::remove		
+added:W1-3	tree b223ffe65a5d46e8	rejected_within	891	1	split.rs:789 Config::egress_for		
+landingd/ts5	tree b223ffe65a5d46e8	rejected_within	891	1	split.rs:790 Config::egress_for; split.rs:811 Config::egress_for; split.rs:812 Config::egress_for; split.rs:813 Config::egress_for; split.rs:817 Config::egress_for; split.rs:818 Config::egress_for		
+landingd/ts6	tree b223ffe65a5d46e8	rejected_within	891	1	split.rs:790 Config::egress_for		
+split:C1	tree b223ffe65a5d46e8	rejected_within	891	1	split.rs:789 Config::egress_for		
+split:C10	tree b223ffe65a5d46e8	rejected_within	891	1	split.rs:665 theorem_sp1_egress_reads_the_gates; split.rs:666 theorem_sp1_egress_reads_the_gates		
+split:C11	tree b223ffe65a5d46e8	rejected_within	891	1	split.rs:677 theorem_sp1_egress_reads_the_gates; split.rs:684 theorem_sp1_egress_reads_the_gates		
+split:C12	tree b223ffe65a5d46e8	rejected_within	887	5	finish.rs:205 theorem_sp2_a_rows_decision_is_the_gates; finish.rs:218 theorem_sp2_a_rows_decision_is_the_gates; finish.rs:239 theorem_sp2_the_nodes_decision_is_the_gates; finish.rs:240 theorem_sp2_the_nodes_decision_is_the_gates; finish.rs:273 theorem_sp2_the_cohorts_decision_is_the_gates; finish.rs:274 theorem_sp2_the_cohorts_decision_is_the_gates; split.rs:665 theorem_sp1_egress_reads_the_gates; split.rs:666 theorem_sp1_egress_reads_the_gates; split.rs:667 theorem_sp1_egress_reads_the_gates; split.rs:668 theorem_sp1_egress_reads_the_gates; split.rs:670 theorem_sp1_egress_reads_the_gates; split.rs:684 theorem_sp1_egress_reads_the_gates; split.rs:698 theorem_sp1_ingress_reads_the_gates		
+split:C13	tree b223ffe65a5d46e8	rejected_within	891	1	split.rs:699 theorem_sp1_ingress_reads_the_gates		
+split:C2	tree b223ffe65a5d46e8	rejected_within	891	1	split.rs:789 Config::egress_for		
+split:C3	tree b223ffe65a5d46e8	rejected_within	891	1	split.rs:789 Config::egress_for		
+split:C4	tree b223ffe65a5d46e8	rejected_within	891	1	split.rs:789 Config::egress_for		
+split:C5	tree b223ffe65a5d46e8	rejected_within	891	1	split.rs:758 Config::box_name; split.rs:768 Config::box_name; split.rs:768 Config::box_name; split.rs:772 Config::box_name		
+split:C6	tree b223ffe65a5d46e8	rejected_within	891	1	split.rs:757 Config::box_name		
+split:C7	tree b223ffe65a5d46e8	rejected_within	891	1	split.rs:868 Config::ingress_for		
+split:C8	tree b223ffe65a5d46e8	rejected_within	891	1	split.rs:868 Config::ingress_for		
+split:C9	tree b223ffe65a5d46e8	rejected_within	890	2	split.rs:668 theorem_sp1_egress_reads_the_gates; split.rs:598 theorem_sp1_the_rule_is_this_frames		
+split:Z-1	tree b223ffe65a5d46e8	rejected_within	890	2	split.rs:325 theorem_ep3_a_row_that_names_nothing_asks_only_for_zone_names; split.rs:1040 Config::egress_first		
+split:Z-2	tree b223ffe65a5d46e8	rejected_within	890	2	split.rs:349 theorem_ep3_a_cohort_that_names_nothing_asks_only_for_zone_names; split.rs:1040 Config::egress_first		
+added:A13	tree b223ffe65a5d46e8	rejected_within	891	1	sweep.rs:99 lemma_swept_added		
+flow:S3	tree b223ffe65a5d46e8	rejected_within	891	1	sweep.rs:169 lemma_dropped_subset; sweep.rs:180 lemma_dropped_subset		
+sweep:W6	tree b223ffe65a5d46e8	rejected_within	889	3	flow.rs:1790 lemma_dropped_keeps; flow.rs:1798 lemma_dropped_keeps; flow.rs:1800 lemma_dropped_keeps; sweep.rs:176 lemma_dropped_subset; sweep.rs:192 theorem_drop_exact; sweep.rs:203 theorem_drop_exact; sweep.rs:212 theorem_drop_exact; sweep.rs:214 theorem_drop_exact; sweep.rs:216 theorem_drop_exact		
+sweep:W7	tree b223ffe65a5d46e8	rejected_within	889	3	flow.rs:1790 lemma_dropped_keeps; sweep.rs:169 lemma_dropped_subset; sweep.rs:179 lemma_dropped_subset; sweep.rs:180 lemma_dropped_subset; sweep.rs:192 theorem_drop_exact		
+sweep:X11	tree b223ffe65a5d46e8	rejected_within	890	2	flow.rs:2812 Flows::open_new; sweep.rs:132 theorem_sweep_exact		
+sweep:X12	tree b223ffe65a5d46e8	rejected_within	891	1	sweep.rs:132 theorem_sweep_exact		
+sweep:X13	tree b223ffe65a5d46e8	rejected_within	890	2	flow.rs:2812 Flows::open_new; sweep.rs:147 theorem_sweep_exact		

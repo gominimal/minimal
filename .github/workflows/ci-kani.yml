@@ -48,6 +48,7 @@ jobs:
         timeout-minutes: 5
         outputs:
             kani: ${{ steps.filter.outputs.kani }}
+            netcore: ${{ steps.filter.outputs.netcore }}
         steps:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
@@ -80,8 +81,18 @@ jobs:
                         # serialize via as_bytes. Direct spec-hash codec
                         # proofs are #1109 set #6 (hash-epoch work).
                         - "crates/common/src/spec_hash.rs"
+                        # minvmd's harnesses build against the network kernel.
+                        - "crates/netcore/**"
                         - ".github/workflows/ci-kani.yml"
                         - "justfile"
+                        - "Cargo.toml"
+                        - "Cargo.lock"
+                        - "scripts/kani.sh"
+                      # The network kernel's own harnesses, in a job of their
+                      # own (`scripts/kani.sh netcore`).
+                      netcore:
+                        - "crates/netcore/**"
+                        - ".github/workflows/ci-kani.yml"
                         - "Cargo.toml"
                         - "Cargo.lock"
                         - "scripts/kani.sh"
@@ -115,13 +126,84 @@ jobs:
             - name: Run proofs
               run: ./scripts/kani.sh
 
+    # The network kernel's default set: 112 harnesses, four at a time
+    # (scripts/kani.sh). Beside the job above, not after it.
+    kani-netcore:
+        needs: [changes]
+        if: github.event_name != 'pull_request' || needs.changes.outputs.netcore == 'true'
+        runs-on: ubuntu-latest
+        timeout-minutes: 60
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - uses: ./.github/actions/setup-rust
+              with:
+                  shared-key: kani
+            - name: Cache Kani install
+              id: kani-cache
+              uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+              with:
+                  path: |
+                      ~/.cargo/bin/cargo-kani
+                      ~/.cargo/bin/kani
+                      ~/.kani
+                  key: kani-${{ env.KANI_VERSION }}-${{ runner.os }}
+            - name: Install Kani
+              if: steps.kani-cache.outputs.cache-hit != 'true'
+              run: |
+                  cargo install --locked kani-verifier --version "$KANI_VERSION"
+                  cargo kani setup
+            - name: Run proofs
+              run: ./scripts/kani.sh netcore
+
+    # The three netcore harnesses that each need most of a runner's memory,
+    # one to a job (scripts/kani.sh netcore-heavy).
+    kani-netcore-heavy:
+        needs: [changes]
+        if: github.event_name != 'pull_request' || needs.changes.outputs.netcore == 'true'
+        runs-on: ubuntu-latest
+        timeout-minutes: 60
+        strategy:
+            fail-fast: false
+            matrix:
+                harness:
+                    - dnsq::proofs::heavy::kani_too_short_refuses
+                    - dnsq::proofs::heavy::kani_a_bad_header_refuses
+                    - dnsq::proofs::heavy::kani_one_shortest_question_agrees
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - uses: ./.github/actions/setup-rust
+              with:
+                  shared-key: kani
+            - name: Cache Kani install
+              id: kani-cache
+              uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+              with:
+                  path: |
+                      ~/.cargo/bin/cargo-kani
+                      ~/.cargo/bin/kani
+                      ~/.kani
+                  key: kani-${{ env.KANI_VERSION }}-${{ runner.os }}
+            - name: Install Kani
+              if: steps.kani-cache.outputs.cache-hit != 'true'
+              run: |
+                  cargo install --locked kani-verifier --version "$KANI_VERSION"
+                  cargo kani setup
+            - name: Run proofs
+              run: ./scripts/kani.sh netcore-heavy "$HARNESS"
+              env:
+                  HARNESS: ${{ matrix.harness }}
+
     # Lane aggregator, same shape as every other lane: branch protection
     # keys on this job (once the lane is promoted from advisory), so
     # adding/removing jobs above stays a workflow-only change. Skipped
     # counts as pass; failure or cancellation of any needed job fails it.
     ci-kani-success:
         if: always()
-        needs: [changes, kani]
+        needs: [changes, kani, kani-netcore, kani-netcore-heavy]
         runs-on: ubuntu-latest
         timeout-minutes: 10
         steps:

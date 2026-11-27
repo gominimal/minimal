@@ -1,0 +1,1 @@
+`policy`: from what a box declared to what is enforced, and what is reported as not enforced. Each control below breaks one thing in a copy of the crate; the verifier must reject the copy in the functions named, and the last run's places are shown beside them.

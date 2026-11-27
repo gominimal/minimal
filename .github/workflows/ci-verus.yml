@@ -1,0 +1,105 @@
+name: CI (Verus proofs)
+
+# Verus over the verified kernel crates (netcore today). The specification
+# and proof code sits under `cfg(verus_keep_ghost)`, which only Verus sets, so
+# this is the one lane that compiles it. The same run checks the crate's
+# claims against its two locks (crates/netcore-lock). ADVISORY lane: not in branch
+# protection's required contexts until it has soaked; flip by adding
+# `ci-verus-success` to the ruleset, no workflow change needed.
+#
+# ALWAYS-TRIGGERED, path-scoped INSIDE the workflow (same pattern as every
+# other lane; do NOT add trigger-level `paths:` here).
+on:
+    push:
+        branches: ["main"]
+    pull_request:
+        branches: ["main"]
+    workflow_dispatch:
+
+env:
+    CARGO_TERM_COLOR: always
+    # Pin EXACTLY, and keep it equal to scripts/verus.sh's default: the
+    # verified count and the proofs' resource use move between releases.
+    VERUS_VERSION: 0.2026.11.02.8bf68ee
+
+concurrency:
+    group: ci-verus-${{ github.ref }}
+    cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+    contents: read
+    pull-requests: read
+
+jobs:
+    changes:
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        outputs:
+            verus: ${{ steps.filter.outputs.verus }}
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Detect changes to verified crates or this lane
+              id: filter
+              if: github.event_name == 'pull_request'
+              uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v3.0.2
+              with:
+                  filters: |
+                      verus:
+                        # The rule: every crate with an `expect <crate> <n>`
+                        # line in scripts/verus.sh has a path here.
+                        - "crates/netcore/**"
+                        - "crates/netcore-lock/**"
+                        - ".github/workflows/ci-verus.yml"
+                        - "scripts/verus.sh"
+
+    verus:
+        needs: [changes]
+        if: github.event_name != 'pull_request' || needs.changes.outputs.verus == 'true'
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Cache Verus install
+              id: verus-cache
+              uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+              with:
+                  path: ~/.verus
+                  key: verus-${{ env.VERUS_VERSION }}-${{ runner.os }}
+            # The upstream release, checked against the digest GitHub records
+            # for the asset. Bump the version and the digest together.
+            - name: Install Verus
+              if: steps.verus-cache.outputs.cache-hit != 'true'
+              env:
+                  VERUS_ASSET: verus-${{ env.VERUS_VERSION }}-x86-linux.zip
+                  VERUS_SHA256: f3a0119292df8855e4435da8130bee1873b0e6a60c306accf81a08ea687bba3c
+              run: |
+                  mkdir -p ~/.verus
+                  curl --fail --location --silent --show-error \
+                    --output /tmp/verus.zip \
+                    "https://github.com/verus-lang/verus/releases/download/release/${VERUS_VERSION}/${VERUS_ASSET}"
+                  echo "${VERUS_SHA256}  /tmp/verus.zip" | sha256sum --check
+                  unzip -q /tmp/verus.zip -d ~/.verus
+            - name: Put Verus on PATH and install its toolchain
+              run: |
+                  dir="$(dirname "$(find ~/.verus -type f -name verus | head -n 1)")"
+                  echo "$dir" >> "$GITHUB_PATH"
+                  toolchain="$("$dir/verus" --version | sed -n 's/^ *Toolchain: *\([^ ]*\).*/\1/p' | head -n 1)"
+                  rustup toolchain install "$toolchain" --profile minimal
+            - name: Run proofs
+              run: ./scripts/verus.sh
+
+    # Lane aggregator, same shape as every other lane.
+    ci-verus-success:
+        if: always()
+        needs: [changes, verus]
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        steps:
+            - name: Verify all gating jobs succeeded or were skipped
+              if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+              run: exit 1
+            - run: echo "Verus lane passed"
