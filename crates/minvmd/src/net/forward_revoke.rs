@@ -98,11 +98,18 @@ pub(crate) const CHALLENGE_WINDOW: Duration = Duration::from_millis(500);
 /// already holds.
 const NOT_BOUND_BODY: &str = "proxy not found";
 
-/// The body gvproxy answers an expose with when a forward is already bound
-/// at the listener (`PortsForwarder::Expose`, as an HTTP 500). The gate
-/// answers a publish it holds back with the same status and body
-/// ([`held_answer`]), so the guest reads what the switch itself would say.
-const ALREADY_BOUND_BODY: &str = "proxy already running";
+/// How the body starts that gvproxy answers an expose with when a forward is
+/// already bound at the listener (`PortsForwarder::Expose`, as an HTTP 500):
+/// the switch goes on to name the protocol and the listener. The gate answers
+/// a publish it holds back with the same status and these words
+/// ([`held_answer`]).
+pub(crate) const ALREADY_BOUND_BODY: &str = "proxy already running";
+
+/// Whether an expose's answer says the switch already holds a forward at the
+/// listener.
+fn already_bound(status: u16, body: &str) -> bool {
+    status == 500 && body.trim_start().starts_with(ALREADY_BOUND_BODY)
+}
 
 /// The whole answer gvproxy gives an expose of a listener it already holds,
 /// as the daemon's client reads it: the status, and a body framed by its
@@ -478,7 +485,9 @@ pub(crate) async fn unexpose(
 ) -> io::Result<Unexposed> {
     let body =
         serde_json_lenient::to_vec(&UnexposeBody { local, protocol }).map_err(io::Error::other)?;
-    let (status, body) = post_forwarder(switch_sock, "unexpose", &body, bound).await?;
+    let (status, body) = post_forwarder(switch_sock, "unexpose", &body, bound)
+        .await
+        .map_err(|unanswered| unanswered.error)?;
     let body = String::from_utf8_lossy(&body);
     if (200..300).contains(&status) {
         Ok(Unexposed::Unbound)
@@ -511,20 +520,27 @@ pub(crate) enum Exposed {
     AlreadyBound,
 }
 
-/// Why an expose did not come to an [`Exposed`]. The two answers a caller
-/// must tell apart: a switch that refused bound nothing, and a switch whose
-/// answer never arrived may have bound the listener all the same.
+/// Why an expose did not come to an [`Exposed`]. The answers a caller must
+/// tell apart: a switch that refused bound nothing, an expose that was never
+/// written bound nothing, and a written expose whose answer never arrived may
+/// have bound the listener all the same.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ExposeError {
     /// The switch answered with a status that refuses the expose: nothing
     /// is bound at the listener for it.
     #[error("the switch answered the expose with HTTP {status}: {body:?}")]
     Refused { status: u16, body: String },
-    /// No status was read: the connect, write or read failed, or the bound
-    /// passed. The switch may have bound the listener before the answer was
+    /// No byte of the request was written: its body did not serialize, the
+    /// connect failed, or the bound passed before the connect completed.
+    /// The switch bound nothing for it.
+    #[error("the expose was not sent: {0}")]
+    Unsent(io::Error),
+    /// The request's write began, and no status was read: the write or the
+    /// read failed, or the bound passed. A write that failed part-way counts
+    /// here. The switch may have bound the listener before the answer was
     /// lost.
     #[error("the expose went unanswered: {0}")]
-    Unanswered(#[from] io::Error),
+    Unanswered(io::Error),
     /// The forward names a protocol the switch has no spelling for: nothing
     /// was sent.
     #[error("the forward names a protocol the switch has no spelling for")]
@@ -539,9 +555,11 @@ pub(crate) enum ExposeError {
 ///
 /// # Errors
 ///
-/// [`ExposeError::Unanswered`] for the connect, write or read error and for
-/// a timeout past `bound`; [`ExposeError::Refused`] for any other status
-/// outside 2xx.
+/// [`ExposeError::Unsent`] for a body that does not serialize, a connect
+/// error, and a timeout past `bound` before the connect completed;
+/// [`ExposeError::Unanswered`] for the write or read error and a timeout
+/// past `bound` once the write began; [`ExposeError::Refused`] for any
+/// other status outside 2xx.
 pub(crate) async fn expose(
     switch_sock: &Path,
     local: &str,
@@ -554,12 +572,20 @@ pub(crate) async fn expose(
         remote,
         protocol,
     })
-    .map_err(io::Error::other)?;
-    let (status, body) = post_forwarder(switch_sock, "expose", &body, bound).await?;
+    .map_err(|error| ExposeError::Unsent(io::Error::other(error)))?;
+    let (status, body) = post_forwarder(switch_sock, "expose", &body, bound)
+        .await
+        .map_err(|unanswered| {
+            if unanswered.written {
+                ExposeError::Unanswered(unanswered.error)
+            } else {
+                ExposeError::Unsent(unanswered.error)
+            }
+        })?;
     let body = String::from_utf8_lossy(&body);
     if (200..300).contains(&status) {
         Ok(Exposed::Bound)
-    } else if status == 500 && body.trim() == ALREADY_BOUND_BODY {
+    } else if already_bound(status, &body) {
         Ok(Exposed::AlreadyBound)
     } else {
         Err(ExposeError::Refused {
@@ -569,6 +595,15 @@ pub(crate) async fn expose(
     }
 }
 
+/// A forwarder exchange that came to no answer: the error, and whether the
+/// request's write had begun when it failed.
+struct NoAnswer {
+    error: io::Error,
+    /// `true` from the moment the write begins, so a write that fails
+    /// part-way counts as written.
+    written: bool,
+}
+
 /// One forwarder exchange with the switch at `switch_sock`, bounded by
 /// `bound`: `verb` posted with `body`, answered by a status and a body.
 async fn post_forwarder(
@@ -576,7 +611,7 @@ async fn post_forwarder(
     verb: &str,
     body: &[u8],
     bound: Duration,
-) -> io::Result<(u16, Vec<u8>)> {
+) -> Result<(u16, Vec<u8>), NoAnswer> {
     let mut request = format!(
         "POST /services/forwarder/{verb} HTTP/1.1\r\nHost: localhost\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
@@ -584,18 +619,25 @@ async fn post_forwarder(
     )
     .into_bytes();
     request.extend_from_slice(body);
-    tokio::time::timeout(bound, async {
+    let mut written = false;
+    let answered = tokio::time::timeout(bound, async {
         let mut switch = UnixStream::connect(switch_sock).await?;
+        written = true;
         switch.write_all(&request).await?;
         read_answer(&mut switch).await
     })
-    .await
-    .map_err(|_elapsed| {
-        io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!("the switch did not answer an {verb} within {bound:?}"),
-        )
-    })?
+    .await;
+    match answered {
+        Ok(Ok(answer)) => Ok(answer),
+        Ok(Err(error)) => Err(NoAnswer { error, written }),
+        Err(_elapsed) => Err(NoAnswer {
+            error: io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("the switch did not answer an {verb} within {bound:?}"),
+            ),
+            written,
+        }),
+    }
 }
 
 /// Reads an HTTP answer and returns its status code and its body, as much
@@ -828,12 +870,33 @@ pub(crate) async fn inject(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
     use tracing::Instrument as _;
 
     const BOX: [u8; 4] = [100, 64, 0, 9];
     const PEER: [u8; 4] = [100, 64, 0, 1];
     const BOX_MAC: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
     const PEER_MAC: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xdd];
+
+    #[test]
+    fn the_switchs_whole_answer_for_a_held_listener_reads_as_already_bound() {
+        assert!(already_bound(
+            500,
+            "proxy already running for tcp on 127.0.0.1:8080\n"
+        ));
+        assert!(already_bound(
+            500,
+            "proxy already running for udp on 127.0.64.3:53\n"
+        ));
+        // The gate's own answer for a publish it holds back.
+        assert!(already_bound(500, "proxy already running\n"));
+        assert!(!already_bound(
+            500,
+            "listen tcp 127.0.0.1:8080: bind: address already in use\n"
+        ));
+        assert!(!already_bound(404, "proxy already running\n"));
+        assert!(!already_bound(500, ""));
+    }
 
     /// The answer the switch's stack gives `request`, an ARP request, from
     /// the address it asks for; `None` for any other frame.

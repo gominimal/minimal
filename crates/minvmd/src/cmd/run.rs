@@ -527,10 +527,17 @@ const MIRROR_SWITCH_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// forwarder answers are one status line and a short body.
 const MIRROR_SWITCH_MAX_ANSWER: usize = 16 * 1024;
 
-/// The body gvproxy's forwarder answers an expose with when it already
-/// holds a forward at the listener: the goal state holds.
+/// How the body starts that gvproxy's forwarder answers an expose with when
+/// it already holds a forward at the listener (it goes on to name the
+/// protocol and the listener): the goal state holds.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 const SWITCH_ALREADY_BOUND: &str = "proxy already running";
+
+/// Whether the body of a 500 says the switch already holds the forward.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn switch_already_bound(answer: &str) -> bool {
+    answer.trim_start().starts_with(SWITCH_ALREADY_BOUND)
+}
 
 /// The body gvproxy's forwarder answers an unexpose with when it holds no
 /// forward at the listener: the goal state holds.
@@ -545,7 +552,10 @@ const SWITCH_NOT_BOUND: &str = "proxy not found";
 /// Each bind goes through the egress gate's publish ledger at the node's
 /// switch address ([`crate::net::egress_gate::MirrorLedger`]), noted before
 /// the expose. So the gate tracks the connections the forward carries and
-/// admits the node's replies on them. An unbind closes the listener first,
+/// admits the node's replies on them. The switch's `proxy already running`
+/// answer counts as bound only when the ledger already held this bind, as
+/// in [`proxy_reclaim_publisher`]; otherwise the bind fails and its note
+/// goes. An unbind closes the listener first,
 /// then drops the note and resets the connections the gate tracked at that
 /// port, and no other port's.
 #[derive(Debug)]
@@ -579,7 +589,7 @@ impl crate::box_registry::MirrorBinder for SwitchMirrorBinder {
         );
         let result = match post_switch_forwarder(&self.switch_sock, "expose", &body) {
             Ok((status, _)) if (200..300).contains(&status) => Ok(()),
-            Ok((500, answer)) if answer.trim() == SWITCH_ALREADY_BOUND => Ok(()),
+            Ok((500, answer)) if switch_already_bound(&answer) && !noted => Ok(()),
             Ok((_, answer)) if answer.contains("address already in use") => {
                 Err(MirrorBindError::Occupied)
             }
@@ -587,13 +597,29 @@ impl crate::box_registry::MirrorBinder for SwitchMirrorBinder {
                 "the switch answered the expose with HTTP {status}: {:?}",
                 answer.trim()
             ))),
-            Err(error) => Err(MirrorBindError::Unanswered(format!(
+            Err(SwitchNoAnswer {
+                error,
+                written: true,
+            }) => Err(MirrorBindError::Unanswered(format!(
                 "the expose went unanswered: {error}"
             ))),
+            Err(SwitchNoAnswer {
+                error,
+                written: false,
+            }) if noted => Err(MirrorBindError::Failed(format!(
+                "the expose was not sent: {error}"
+            ))),
+            Err(SwitchNoAnswer {
+                error,
+                written: false,
+            }) => Err(MirrorBindError::Unanswered(format!(
+                "the expose was not sent, and an earlier one may have bound: {error}"
+            ))),
         };
-        // A note this bind made goes when the switch bound nothing. An
-        // unanswered expose may have bound, so its note stays for the
-        // mirror's retry or undo.
+        // A note this bind made goes when the switch bound nothing, and an
+        // expose that was not sent bound nothing. A written expose left
+        // unanswered may have bound, so its note stays for the mirror's
+        // retry or undo, and a note an earlier bind left stays with it.
         if noted
             && matches!(
                 result,
@@ -617,7 +643,7 @@ impl crate::box_registry::MirrorBinder for SwitchMirrorBinder {
                     answer.trim()
                 ));
             }
-            Err(error) => {
+            Err(SwitchNoAnswer { error, .. }) => {
                 return MirrorUnbind::Unanswered(format!("the unexpose went unanswered: {error}"));
             }
         }
@@ -631,6 +657,16 @@ impl crate::box_registry::MirrorBinder for SwitchMirrorBinder {
     }
 }
 
+/// A forwarder exchange with the switch that came to no answer: the error,
+/// and whether the request was written. `written` is `true` from the moment
+/// the connect completes, so a write that fails part-way counts as written.
+#[derive(Debug)]
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+struct SwitchNoAnswer {
+    error: std::io::Error,
+    written: bool,
+}
+
 /// One forwarder exchange with the switch at `switch_sock`: `verb` posted
 /// with the JSON `body`, answered by a status and a body, bounded by
 /// [`MIRROR_SWITCH_TIMEOUT`] per read and write. Blocking: the node mirror
@@ -640,9 +676,30 @@ fn post_switch_forwarder(
     switch_sock: &std::path::Path,
     verb: &str,
     body: &str,
+) -> Result<(u16, String), SwitchNoAnswer> {
+    let mut switch = match std::os::unix::net::UnixStream::connect(switch_sock) {
+        Ok(switch) => switch,
+        Err(error) => {
+            return Err(SwitchNoAnswer {
+                error,
+                written: false,
+            });
+        }
+    };
+    switch_exchange(&mut switch, verb, body).map_err(|error| SwitchNoAnswer {
+        error,
+        written: true,
+    })
+}
+
+/// The exchange of [`post_switch_forwarder`] on a connected `switch`.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn switch_exchange(
+    switch: &mut std::os::unix::net::UnixStream,
+    verb: &str,
+    body: &str,
 ) -> std::io::Result<(u16, String)> {
     use std::io::{Read as _, Write as _};
-    let mut switch = std::os::unix::net::UnixStream::connect(switch_sock)?;
     switch.set_read_timeout(Some(MIRROR_SWITCH_TIMEOUT))?;
     switch.set_write_timeout(Some(MIRROR_SWITCH_TIMEOUT))?;
     let request = format!(
@@ -3125,12 +3182,14 @@ pub(crate) fn proxy_reclaim_publisher(
         );
         let result = match post_switch_forwarder(&switch_sock, "expose", &body) {
             Ok((status, _)) if (200..300).contains(&status) => Ok(()),
-            Ok((500, answer)) if answer.trim() == SWITCH_ALREADY_BOUND && !noted => Ok(()),
+            Ok((500, answer)) if switch_already_bound(&answer) && !noted => Ok(()),
             Ok((status, answer)) => Err(format!(
                 "the switch answered the expose with HTTP {status}: {:?}",
                 answer.trim()
             )),
-            Err(error) => Err(format!("the expose went unanswered: {error}")),
+            Err(SwitchNoAnswer { error, .. }) => {
+                Err(format!("the expose went unanswered: {error}"))
+            }
         };
         if noted && result.is_err() {
             ledger.forget_bind(listener, preferred, node);
@@ -3927,6 +3986,19 @@ mod tests {
             crate::box_registry::home_proxy_control().as_deref()
         );
         assert!(registry.proxy_control().is_some());
+    }
+
+    #[test]
+    fn the_switchs_whole_answer_for_a_held_listener_is_recognised() {
+        use super::switch_already_bound;
+        assert!(switch_already_bound(
+            "proxy already running for tcp on 100.64.0.2:8080\n"
+        ));
+        assert!(switch_already_bound("proxy already running\n"));
+        assert!(!switch_already_bound(
+            "listen tcp :8080: bind: address already in use\n"
+        ));
+        assert!(!switch_already_bound(""));
     }
 
     #[cfg(not(minvmd_libkrun))]
@@ -5805,7 +5877,8 @@ mod tests {
 
     /// A stand-in switch: answers each forwarder request on `sock` with the
     /// next of `answers` (status, body), and sends every request it read,
-    /// head and body, on the returned channel.
+    /// head and body, on the returned channel. A status of `0` is no answer
+    /// at all: the request is read and the connection closed.
     fn fake_switch(
         sock: &std::path::Path,
         answers: Vec<(u16, &'static str)>,
@@ -5838,6 +5911,9 @@ mod tests {
                 }
                 sent.send(String::from_utf8_lossy(&request).into_owned())
                     .expect("send the request");
+                if status == 0 {
+                    continue;
+                }
                 let answer = format!(
                     "HTTP/1.1 {status} X\r\nContent-Length: {}\r\n\r\n{body}",
                     body.len()
@@ -5917,6 +5993,99 @@ mod tests {
             None,
             "the unbind drops the note"
         );
+    }
+
+    // NET-138: the switch's answer for a listener it already holds counts as
+    // bound only when the ledger already held this bind. A bind that made its
+    // note fails on that answer and drops the note; the retry of a bind whose
+    // expose was written and went unanswered, whose note stayed, takes it as
+    // bound. An expose that was not sent (the connect fails) drops a note it
+    // made, and keeps a note an earlier bind left.
+    #[test]
+    fn switch_mirror_binder_takes_already_running_only_for_a_bind_it_noted_before() {
+        use crate::box_registry::{MirrorBindError, MirrorBinder as _};
+        const HELD: (u16, &str) = (500, "proxy already running for tcp on 127.0.64.9:8080\n");
+        const NO_ANSWER: (u16, &str) = (0, "");
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let sock = dir.path().join("switch.sock");
+        let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+        let _entered = runtime.enter();
+        let registry = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
+        let node = std::net::Ipv4Addr::new(192, 168, 127, 2);
+        let binder = super::SwitchMirrorBinder {
+            switch_sock: sock.clone(),
+            node,
+            table: registry.table(),
+        };
+        // The same binder with no switch at its socket: every connect fails.
+        let unreachable = super::SwitchMirrorBinder {
+            switch_sock: dir.path().join("nothing.sock"),
+            node,
+            table: registry.table(),
+        };
+        let ledger =
+            crate::net::egress_gate::TestMirrorLedger::attach(&registry.table(), sock.clone());
+        let fresh = std::net::Ipv4Addr::new(127, 0, 64, 9);
+        let retried = std::net::Ipv4Addr::new(127, 0, 64, 10);
+        let unsent = std::net::Ipv4Addr::new(127, 0, 64, 11);
+        let kept = std::net::Ipv4Addr::new(127, 0, 64, 12);
+        let requests = fake_switch(&sock, vec![HELD, NO_ANSWER, HELD, HELD, NO_ANSWER, HELD]);
+
+        assert!(
+            matches!(binder.bind(fresh, 8080), Err(MirrorBindError::Failed(_))),
+            "a listener the switch holds for a forward the ledger did not hold is not this bind"
+        );
+        requests.recv().expect("the first expose");
+        assert_eq!(
+            ledger.dials(fresh, 8080),
+            None,
+            "the failed bind drops the note it made"
+        );
+
+        // Written, then unanswered: the note stays, and the retry is bound.
+        assert!(matches!(
+            binder.bind(retried, 8080),
+            Err(MirrorBindError::Unanswered(_))
+        ));
+        requests.recv().expect("the unanswered expose");
+        assert_eq!(ledger.dials(retried, 8080), Some(node));
+        assert_eq!(
+            binder.bind(retried, 8080),
+            Ok(()),
+            "the retry of an unanswered bind finds its forward in place"
+        );
+        requests.recv().expect("the retried expose");
+        assert_eq!(ledger.dials(retried, 8080), Some(node));
+
+        // Not sent: the note it made goes, and a later answer that the switch
+        // holds the listener is not this bind.
+        assert!(matches!(
+            unreachable.bind(unsent, 8080),
+            Err(MirrorBindError::Failed(_))
+        ));
+        assert_eq!(ledger.dials(unsent, 8080), None);
+        assert!(matches!(
+            binder.bind(unsent, 8080),
+            Err(MirrorBindError::Failed(_))
+        ));
+        requests.recv().expect("the expose after the unsent one");
+        assert_eq!(ledger.dials(unsent, 8080), None);
+
+        // Written and unanswered, then not sent: the note stays through the
+        // unsent try, and the next answer that the switch holds it is bound.
+        assert!(matches!(
+            binder.bind(kept, 8080),
+            Err(MirrorBindError::Unanswered(_))
+        ));
+        requests.recv().expect("the unanswered expose");
+        assert!(matches!(
+            unreachable.bind(kept, 8080),
+            Err(MirrorBindError::Unanswered(_))
+        ));
+        assert_eq!(ledger.dials(kept, 8080), Some(node));
+        assert_eq!(binder.bind(kept, 8080), Ok(()));
+        requests.recv().expect("the expose after the unsent one");
+        assert_eq!(ledger.dials(kept, 8080), Some(node));
     }
 
     // NET-138: the upkeep opens the node's mirror only while the whole-range
