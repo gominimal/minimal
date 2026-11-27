@@ -91,6 +91,8 @@ What changes in 0.8:
   and in loadout files. A file that still sets `vars` or `vars_lenient` fails
   with exit code 3, and the message names the file and the key. Rename the key
   to `env_vars`.
+- `min init` writes the session entry as `[sessions.default]`, which holds the
+  session's packages, and writes no `[boxes]` or `[defaults]` table.
 
 #### Copy your box state before you upgrade
 
