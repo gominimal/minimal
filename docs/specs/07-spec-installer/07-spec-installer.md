@@ -148,12 +148,22 @@ manifest (R2.3), and exit non-zero. The state is from 0.8 or later when the
 `key` in an `install.toml` in the state directory names a version from 0.8
 on. It is also from 0.8 or
 later when `sessions/index.json` under the state directory carries a
-`format_version` above 0. The refusal says what it refused and why. It prints
-the `mv` command that moves the state directory aside, to a path that does
-not exist yet. When an R5.7 copy of
-0.7 state is beside the state directory, the refusal also names that copy and
-prints the command that puts it back in place. The installer installs a
-version before 0.8 over 0.7 state, and over a state that the user put back.
+`format_version` above 0. The refusal says what it refused and why. When a
+`min` is on disk, the first steps it prints stop every Minimal host before
+anything moves: `min host list`, then `min host stop <host>` for each host,
+with `min` named by its path when the bin directory is not on `PATH`. A
+running daemon keeps its sockets and locks under the state directory, and
+writes the box index into whatever is there after a move. Then the refusal
+prints the `mv` command that moves the state directory aside, to a path that
+does not exist yet. When an R5.7 copy of 0.7 state is beside the state
+directory, the refusal also names the newest copy by modification time and
+prints the command that puts it back in place. When there are more copies,
+one line says how many and where. The installer installs a version before
+0.8 over 0.7 state, and over a state that the user put back. A version that
+is not `X.Y` (a nightly named by its commit hash) is placed from the
+`min version` output of the `min` its manifest ships, after the manifest
+fetch and before any component is replaced. A version that cannot be placed
+is not refused.
 
 **Proof artifacts**:
 
@@ -173,7 +183,11 @@ version before 0.8 over 0.7 state, and over a state that the user put back.
   0.7.3 installs. When the first move target already exists, the printed
   `mv` names another path, and the state does not land inside the old one.
   With a relative `XDG_STATE_HOME`, the printed `mv` clears the refusal, and
-  then 0.7.3 installs.
+  then 0.7.3 installs. With a 0.8 host running, the printed steps list and
+  stop the hosts by the path of the `min` on disk before the `mv`. With two
+  copies, the refusal names the newest one and says where the other is. A
+  hash-named version whose `min` reports 0.7.3 is refused before any
+  component is replaced. A hash-named version that cannot be placed installs.
 
 ### Unit 3 - Manifest format and field extraction
 
@@ -416,7 +430,11 @@ both hash columns in place of digests.
 
 **R5.7**, When the run installs 0.8 or later and the `min` on disk reports a
 0.7 version (`<bin>/min version`), the installer shall copy the state directory
-to `<state directory>.<0.7 version>` beside it. An `install.toml` whose `key`
+to `<state directory>.<0.7 version>` beside it. A version that R2.6 cannot
+place counts as 0.8 or later here. When that path exists, the copy gets a
+`.<time>` suffix and the existing one is left alone. A symlinked state
+directory is resolved first: the copy is a real directory that holds the
+contents, and `du` measures the resolved directory. An `install.toml` whose `key`
 names 0.8 or later skips the question to `min`. The copy happens once, after
 the R5.5 pre-swap stop and before the first executable swap, so the daemon
 writes nothing during the copy. The installer first tries a copy-on-write
@@ -428,7 +446,8 @@ non-zero. The refusal says that the space is short, gives both sizes, and
 names `--skip-state-archive`. A refusal of the copy also says that the
 daemon the pre-swap stop ended stays stopped. With enough space, the copy keeps sparse files
 sparse (`cp --sparse=always` on GNU). A copy that fails is removed, and the
-run exits non-zero before any executable swap. The component table shows the
+run exits non-zero before any executable swap. That refusal prints the last
+line of the `cp` error after its first sentence. The component table shows the
 copy as a `box state` row. `--skip-state-archive`, or a non-empty
 `MINIMAL_INSTALL_SKIP_STATE_ARCHIVE`, upgrades without the copy. The copy is
 what R2.6 puts back for a return to 0.7.
@@ -510,12 +529,18 @@ what R2.6 puts back for a return to 0.7.
   that is byte-identical to the state before the run, and still swaps the
   binaries. A rerun within 0.8, and a `min` that reports 0.8.1, make no copy.
   `--skip-state-archive` and `MINIMAL_INSTALL_SKIP_STATE_ARCHIVE` upgrade
-  without the copy.
+  without the copy. A hash-named version whose `min` reports 0.8.0, and one
+  that cannot be placed, get the copy. A symlinked state directory gets a
+  real directory with the target's files. An earlier copy at the same path
+  is left untouched, and the new copy gets a suffix.
 - **Test** (R5.7, `case_state_archive_refuses_short_space`): with a `cp` that
   refuses a clone and a `df` that reports 1 KB free, the upgrade exits
   non-zero, prints the refusal and the line about the stopped daemon,
   replaces no executable, and leaves no copy and no temp file. `--skip-state-archive` then upgrades. With enough free
-  space the plain copy is made and is byte-identical.
+  space the plain copy is made and is byte-identical. With a `cp` that fails
+  every copy, the upgrade exits non-zero, prints the last `cp` error line and
+  the line about the stopped daemon, replaces no executable, and leaves no
+  partial copy.
 - **Test** (R5.6): a `symlink` component lands as a symlink at its `dest`
   pointing at the manifest target, with no download; a rerun skips it, and a
   retargeted link is repaired on the next run, still with no download.
