@@ -72,12 +72,11 @@ use switch::SwitchSubnet;
 use crate::bep_attach::BoxId;
 use crate::net::host_exposures::HostExposure;
 use crate::net::kernel_config::{
-    Diverged, KernelConfig, MemberFacts, Poisoned, RowFacts, RowShape, ZONE_APEX_WIRE, recordable,
-    unpoisoned,
+    Diverged, KernelConfig, MemberFacts, Poisoned, RowFacts, RowShape, recordable, unpoisoned,
 };
 use netcore::frame::Facts;
 use netcore::ingress::Heard;
-use netcore::split::{First, IngressFor};
+use netcore::split::IngressFor;
 
 /// The per-row cap on runtime-admitted ports (NET-138): the row's
 /// runtime-published set answers to this bound, so a report storm cannot
@@ -3590,6 +3589,11 @@ pub struct BoxRegistry {
     /// The instant the kernel's clock counts from: one clock for the gate
     /// this registry decides for, shared by every clone and table.
     kernel_epoch: Instant,
+    /// Test builds only: how many times the kernel's clock was read, shared
+    /// by every clone and table (for the check that a frame is decided at
+    /// one reading).
+    #[cfg(test)]
+    clock_reads: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Where the running egress gate leaves its ledger for the node mirror's
@@ -4034,6 +4038,8 @@ impl Clone for BoxRegistry {
             mirror_ledger: Arc::clone(&self.mirror_ledger),
             kernel: Arc::clone(&self.kernel),
             kernel_epoch: self.kernel_epoch,
+            #[cfg(test)]
+            clock_reads: Arc::clone(&self.clock_reads),
         }
     }
 }
@@ -4092,6 +4098,8 @@ impl BoxRegistry {
                     .expect("every switch subnet is a block the network kernel plans"),
             )),
             kernel_epoch: Instant::now(),
+            #[cfg(test)]
+            clock_reads: Arc::default(),
         }
     }
 
@@ -7604,6 +7612,8 @@ impl BoxRegistry {
             mirror_ledger: Arc::clone(&self.mirror_ledger),
             kernel: Arc::clone(&self.kernel),
             kernel_epoch: self.kernel_epoch,
+            #[cfg(test)]
+            clock_reads: Arc::clone(&self.clock_reads),
         }
     }
 
@@ -7877,6 +7887,13 @@ impl BoxRegistry {
         self.kernel
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Gives out every name number the network kernel's configuration holds
+    /// ([`KernelConfig::exhaust_names_for_tests`]).
+    #[cfg(test)]
+    pub(crate) fn kernel_exhaust_names_for_tests(&self) {
+        self.kernel_config().exhaust_names_for_tests();
     }
 
     /// Poisons the network kernel configuration's lock: a panic while its
@@ -9771,26 +9788,14 @@ pub struct BoxTable {
     kernel: Arc<RwLock<KernelConfig>>,
     /// The instant the kernel's clock counts from ([`Self::kernel_now`]).
     kernel_epoch: Instant,
+    /// Test builds only: the registry's count of the kernel's clock
+    /// readings ([`Self::clock_reads`]).
+    #[cfg(test)]
+    clock_reads: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-/// The kernel's answer for `frame` on `kernel`, as [`BoxTable::egress_first`]
-/// copies it out, under the read lock the caller holds.
-fn asked_of(kernel: &KernelConfig, frame: &[u8]) -> (First, usize, AskedFor) {
-    let config = kernel.config();
-    let first = config.egress_first(frame, ZONE_APEX_WIRE);
-    let row = match &first {
-        First::Frame { frame, .. } => kernel.generation_at(frame.sent.src.to_be_bytes()),
-        First::NotAFrame(_) | First::ShortHeader => None,
-    };
-    let asked = AskedFor {
-        row,
-        cohort: kernel.cohort_generation(),
-    };
-    (first, config.members.len(), asked)
-}
-
-/// The registry records a kernel answer for a guest's frame was made for
-/// ([`BoxTable::egress_first`]), by generation ([`BoxRecord::generation`]).
+/// The registry records a kernel decision for a guest's frame was made for
+/// ([`BoxTable::decide_egress`]), by generation ([`BoxRecord::generation`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AskedFor {
     /// The record of the row at the frame's source; `None` when no row
@@ -9838,6 +9843,13 @@ impl BoxTable {
         }
     }
 
+    /// How many times the kernel's clock was read for this registry's gates,
+    /// for the check that a frame is decided at one reading.
+    #[cfg(test)]
+    pub(crate) fn clock_reads(&self) -> usize {
+        self.clock_reads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// The network kernel's configuration, to read.
     #[cfg(test)]
     pub(crate) fn kernel_for_tests(&self) -> std::sync::RwLockReadGuard<'_, KernelConfig> {
@@ -9846,10 +9858,46 @@ impl BoxTable {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Retires the DNS entry alone, in the kernel's tables: the
+    /// row's DNS table replaced by an empty one, its reply records and notes
+    /// kept ([`KernelConfig::retire_row_pins`]). A relay's end empties all
+    /// three.
+    #[cfg(test)]
+    pub(crate) fn kernel_retire_dns_for_tests(&self, addr: Ipv4Addr) {
+        self.kernel
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retire_row_pins(addr);
+    }
+
+    /// Shrinks the kernel's reply table of the row at `addr` to `cap`
+    /// records ([`KernelConfig::shrink_reply_cap`]), for a test that reaches
+    /// the cap with few records.
+    #[cfg(test)]
+    pub(crate) fn kernel_shrink_reply_cap_for_tests(&self, addr: [u8; 4], cap: usize) {
+        self.kernel
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .shrink_reply_cap(addr, cap);
+    }
+
+    /// Shrinks the kernel's DNS flow table of the row at `addr` to `cap`
+    /// flows ([`KernelConfig::shrink_dns_flow_cap`]).
+    #[cfg(test)]
+    pub(crate) fn kernel_shrink_dns_flow_cap_for_tests(&self, addr: [u8; 4], cap: usize) {
+        self.kernel
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .shrink_dns_flow_cap(addr, cap);
+    }
+
     /// The kernel's clock: milliseconds since the registry was made, one
     /// clock for the gate. Read once for a frame, before any lock, and handed
     /// to every kernel call for that frame.
     pub(crate) fn kernel_now(&self) -> netcore::time::Instant {
+        #[cfg(test)]
+        self.clock_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         netcore::time::Instant {
             ms: u64::try_from(self.kernel_epoch.elapsed().as_millis()).unwrap_or(u64::MAX),
         }
@@ -9859,6 +9907,7 @@ impl BoxTable {
     /// is for, beside the daemon's own record, under the configuration's
     /// read lock with that box's tables locked inside it. Decides nothing,
     /// and records nothing past a poisoned lock ([`recordable`]).
+    #[cfg(test)]
     pub(crate) fn kernel_toward_guest(
         &self,
         bytes: &[u8],
@@ -9868,25 +9917,63 @@ impl BoxTable {
         recordable(self.kernel.read())?.record_toward_guest(bytes, published, now)
     }
 
+    /// [`Self::kernel_toward_guest`], with what the lines about the frame
+    /// read ([`crate::net::kernel_config::Recorded`]): what the relay acts
+    /// on, as the kernel's tables decide delivery toward a guest.
+    /// [`Poisoned`] when the configuration's lock or the box's tables' was
+    /// poisoned: nothing is recorded, and the frame is not delivered.
+    pub(crate) fn kernel_ingress(
+        &self,
+        bytes: &[u8],
+        published: bool,
+        now: netcore::time::Instant,
+    ) -> Result<Option<crate::net::kernel_config::Recorded>, Poisoned> {
+        unpoisoned(self.kernel.read())?.record_toward_guest_said(bytes, published, now)
+    }
+
     /// Records a DNS question a guest sent in the kernel's DNS table its
-    /// source is routed to, beside the daemon's own. Decides nothing, and
-    /// records nothing past a poisoned lock ([`recordable`]).
+    /// source is routed to, beside the daemon's own, when that table is the
+    /// one of the registry records the frame was decided for (`asked`,
+    /// [`KernelConfig::asks_for`]), under the same read lock: a question is
+    /// never recorded in the table of another row at the address. Decides
+    /// nothing. [`Poisoned`] when the configuration's lock or the table's
+    /// was poisoned: nothing is recorded, and the frame is dropped.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the source, its mark, where the question went, its name, id and port, and the \
-                  instant are each one of the question's facts"
+        reason = "the source, the records it was decided for, its mark, where the question went, \
+                  its name, id and port, and the instant are each one of the question's facts"
     )]
     pub(crate) fn kernel_question(
         &self,
         src: [u8; 4],
+        asked: AskedFor,
         marked: bool,
         dst: [u8; 4],
         name: &str,
         txid: u16,
         port: u16,
         now: netcore::time::Instant,
-    ) -> Option<netcore::pins::Asked> {
-        recordable(self.kernel.read())?.record_question(src, marked, dst, name, txid, port, now)
+    ) -> Result<Option<netcore::pins::Asked>, Poisoned> {
+        let kernel = unpoisoned(self.kernel.read())?;
+        if !kernel.asks_for(src, marked, asked) {
+            return Ok(None);
+        }
+        kernel.try_record_question(src, marked, dst, name, txid, port, now)
+    }
+
+    /// The registry records the kernel's configuration holds now for a frame
+    /// from `src` ([`AskedFor`]): for a test that records a question as the
+    /// relay does, outside a decision.
+    #[cfg(test)]
+    pub(crate) fn asked_now(&self, src: [u8; 4]) -> AskedFor {
+        let kernel = self
+            .kernel
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        AskedFor {
+            row: kernel.generation_at(src),
+            cohort: kernel.cohort_generation(),
+        }
     }
 
     /// Offers a DNS answer delivered toward `dst` to the kernel's DNS
@@ -9905,33 +9992,22 @@ impl BoxTable {
             .unwrap_or_default()
     }
 
-    /// The kernel's answer for the bytes of a frame a guest sent, with how
-    /// many resident `host_ip` boxes the configuration holds and the
-    /// registry records the answer was made for ([`AskedFor`]). The
-    /// configuration's read lock is held only around the
-    /// kernel's call; all three are copied out before it is released, so no
-    /// registry or table lock is ever taken under it. [`Poisoned`] when the
-    /// lock is poisoned: nothing is answered.
-    pub(crate) fn egress_first(&self, frame: &[u8]) -> Result<(First, usize, AskedFor), Poisoned> {
-        let kernel = unpoisoned(self.kernel.read())?;
-        Ok(asked_of(&kernel, frame))
-    }
-
-    /// [`Self::egress_first`], taken only on a configuration that holds the
-    /// exposure list `open` (the one this frame read from the exposure
-    /// table), under the same read lock that checks it: `None` when it holds
-    /// another, for the caller to hand `open` over and ask again; and
-    /// [`Poisoned`] when the lock is poisoned.
-    pub(crate) fn egress_first_holding(
+    /// The kernel's whole decision for a frame a guest sent
+    /// ([`KernelConfig::decide_egress`]), with the registry records it was
+    /// made for ([`AskedFor`]), under the configuration's read lock with the
+    /// box's tables locked inside it: `None` for a frame to the host alias
+    /// when the configuration does not hold the exposure list `open` the
+    /// frame read, for the caller to hand it over and ask again. Nothing is
+    /// copied out under the lock but the decision, so no registry lock is
+    /// ever taken under it. [`Poisoned`] when the configuration's lock or a
+    /// table lock the decision takes was poisoned: nothing is decided.
+    pub(crate) fn decide_egress(
         &self,
         frame: &[u8],
-        open: &Arc<[HostExposure]>,
-    ) -> Result<Option<(First, usize, AskedFor)>, Poisoned> {
-        let kernel = unpoisoned(self.kernel.read())?;
-        if !kernel.holds_exposures(open) {
-            return Ok(None);
-        }
-        Ok(Some(asked_of(&kernel, frame)))
+        open: Option<&Arc<[HostExposure]>>,
+        now: netcore::time::Instant,
+    ) -> Result<Option<crate::net::kernel_config::Decided>, Poisoned> {
+        unpoisoned(self.kernel.read())?.decide_egress(frame, open, now)
     }
 
     /// The kernel's answer for the bytes of a frame toward a guest: what it
@@ -9977,7 +10053,7 @@ impl BoxTable {
     /// alone, for reading to see whether `open` is the list already given,
     /// and for writing only when it is not. Whether the configuration
     /// changed. A poisoned lock is left as it is (`false`): the frame that
-    /// asks again meets it and is dropped ([`Self::egress_first_holding`]).
+    /// asks again meets it and is dropped ([`Self::decide_egress`]).
     pub(crate) fn push_exposures(&self, open: &Arc<[HostExposure]>) -> bool {
         let Ok(kernel) = unpoisoned(self.kernel.read()) else {
             return false;

@@ -2,8 +2,7 @@
 //! take.
 //!
 //! The gate reads no frame itself: `netcore` reads it once and these
-//! functions hand the reading on. They decide nothing. Each is `None`
-//! exactly where the reader it replaces was.
+//! functions hand the reading on. They decide nothing.
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 
@@ -62,12 +61,16 @@ pub(crate) fn l4_packet(facts: &Facts) -> Option<L4Packet> {
     }
 }
 
-/// The UDP payload `frame` carries, with its L4 addressing: what the DNS
-/// tables read a question or an answer from. For a first fragment with more
-/// to follow it is what this fragment carries, as the reader this replaces
-/// gave. `None` for anything else.
+/// The UDP payload of a whole datagram `frame` carries, with its L4
+/// addressing: what the DNS tables read a question or an answer from, on both
+/// legs. `None` for a first fragment with more to follow, whose payload is not
+/// the whole datagram, and for anything else: the gate reads DNS only from
+/// whole datagrams, and a fragment is decided and delivered as any frame is.
 pub(crate) fn udp_datagram<'a>(frame: &'a [u8], facts: &Facts) -> Option<(L4Packet, &'a [u8])> {
     let v = v4(facts)?;
+    if v.more_fragments {
+        return None;
+    }
     let L4::Udp {
         payload_at,
         payload_len,
@@ -176,17 +179,16 @@ mod tests {
     }
 
     #[test]
-    fn a_udp_datagram_gives_the_payload_this_frame_carries() {
+    fn a_whole_udp_datagram_gives_its_payload_and_a_first_fragment_gives_none() {
         let bytes = frame(IPPROTO_UDP, 0, &udp(b"query"));
         let facts = parse_frame(&bytes);
         let (l4, payload) = udp_datagram(&bytes, &facts).unwrap();
         assert_eq!(payload, b"query");
         assert_eq!((l4.proto, l4.dst.port(), l4.tcp_payload_len), (17, 53, 0));
-        // More fragments to follow: what this fragment carries.
+        // More fragments to follow: the payload is not the whole datagram.
         let first = frame(IPPROTO_UDP, 0x2000, &udp(b"query"));
         let facts = parse_frame(&first);
-        let (_, payload) = udp_datagram(&first, &facts).unwrap();
-        assert_eq!(payload, b"query");
+        assert!(udp_datagram(&first, &facts).is_none());
     }
 
     #[test]

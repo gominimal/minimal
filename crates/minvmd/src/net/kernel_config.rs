@@ -30,6 +30,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LockResult, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
@@ -44,21 +45,22 @@ use netcore::alias::{AliasState, Exposure, Holder, PortRange};
 use netcore::answer::{self, Answer};
 use netcore::cohort::Member;
 use netcore::dnsa;
-use netcore::finish::{TableLimits, tables_for};
-use netcore::flow::Windows;
+use netcore::finish::{Outcome, TableLimits, tables_for};
+use netcore::flow::{Inbound, Windows};
 use netcore::frame::Facts;
 use netcore::ingress::Seen;
-use netcore::judge::BoxTables;
+use netcore::judge::{BoxTables, SentKind};
 use netcore::origin::{CohortSpelling, Origin, Sources};
 use netcore::pins::{self, Asked, Pins};
 use netcore::plan::{Plan, PlanError};
 use netcore::policy::{self, Abilities, Declared, Effective, Enforced, Net, Section};
 use netcore::rebind;
 use netcore::row::Cidr;
-use netcore::split::{Config, IngressFor, RowDecl};
+use netcore::split::{Arm, Config, First, IngressFor, RowDecl};
 use netcore::time::{Instant as KernelInstant, Span};
 use switch::SwitchSubnet;
 
+use crate::box_registry::AskedFor;
 use crate::net::baseline::ALIAS_FETCH_PROTOCOL;
 use crate::net::dns_pins;
 use crate::net::egress_gate::{REFUSAL_NOTES_PER_SOURCE, REFUSAL_WINDOW};
@@ -222,6 +224,14 @@ struct Held<T> {
     names: Vec<String>,
     wire: Vec<Option<Vec<u8>>>,
     tables: Mutex<T>,
+    /// A box's reply table has opened its first record since these tables
+    /// were made: the once-per-box line is said.
+    first_flow: AtomicBool,
+    /// A box's reply table has reached its cap since these tables were made:
+    /// the once-per-box line is said.
+    filled: AtomicBool,
+    /// The frames toward the box its reply table refused at its cap.
+    refused_at_cap: AtomicU64,
 }
 
 impl<T> Held<T> {
@@ -231,6 +241,9 @@ impl<T> Held<T> {
             names,
             wire,
             tables: Mutex::new(tables),
+            first_flow: AtomicBool::new(false),
+            filled: AtomicBool::new(false),
+            refused_at_cap: AtomicU64::new(0),
         }
     }
 
@@ -288,6 +301,29 @@ fn row_held(addr: Ipv4Addr, names: Vec<String>) -> Result<Held<BoxTables>, Kerne
     match tables_for(u32::from(addr), table_limits(names.len())) {
         Some(tables) => Ok(Held::new(names, tables)),
         None => Err(KernelConfigError::TablesRefused { names: names.len() }),
+    }
+}
+
+/// What the lines about a frame toward a guest read, after the kernel's
+/// tables made `seen` of it: `before` is the reply table's fill before it.
+fn said_of(
+    held: &Held<BoxTables>,
+    flows: &netcore::flow::Flows,
+    seen: Seen,
+    before: usize,
+) -> Recorded {
+    let opened = matches!(seen, Seen::Flow(Inbound::Opened));
+    if matches!(seen, Seen::Flow(Inbound::TableFull)) {
+        held.refused_at_cap.fetch_add(1, Ordering::Relaxed);
+    }
+    Recorded {
+        seen,
+        first_flow: opened && !held.first_flow.swap(true, Ordering::Relaxed),
+        filled: opened && flows.is_full() && !held.filled.swap(true, Ordering::Relaxed),
+        ended: (before + usize::from(opened)).saturating_sub(flows.len()),
+        held: flows.len(),
+        cap: flows.capacity(),
+        generation: None,
     }
 }
 
@@ -431,6 +467,40 @@ struct AliasInputs {
     exposures: Vec<HostExposure>,
 }
 
+/// The kernel's whole decision for a frame a guest sent
+/// ([`KernelConfig::decide_egress`]): egress_first's answer, the finish
+/// step's outcome for a frame a judge decides, how many resident
+/// `host_ip` boxes the configuration holds, and the registry records the
+/// decision was made for ([`AskedFor`]), read under the same lock.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Decided {
+    pub(crate) first: First,
+    pub(crate) outcome: Option<Outcome>,
+    pub(crate) members: usize,
+    pub(crate) asked: AskedFor,
+}
+
+/// What the kernel's tables made of a frame toward a guest, with what the
+/// lines about it read from the box's reply table at that moment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Recorded {
+    /// What the frame did to the tables.
+    pub(crate) seen: Seen,
+    /// The frame opened the first record these tables have held.
+    pub(crate) first_flow: bool,
+    /// The frame's record took the reply table to its cap, the first time
+    /// for these tables.
+    pub(crate) filled: bool,
+    /// Records the frame ended: expired, or closed by the client.
+    pub(crate) ended: usize,
+    /// Records the reply table holds after the frame, and its cap.
+    pub(crate) held: usize,
+    pub(crate) cap: usize,
+    /// The generation of the registry record whose row's tables these are
+    /// ([`KernelConfig::generation_at`]); `None` for the node's own tables.
+    pub(crate) generation: Option<u64>,
+}
+
 /// The kernel's configuration, with what keeps it in step with the
 /// registry: the name numbers, the names and the policy of each row, each
 /// resident `host_ip` box's policy by session, what the alias is built
@@ -495,6 +565,10 @@ pub(crate) struct KernelConfig {
     /// resident members' allowed subnets of the members that name a DNS
     /// host, nothing denied.
     cohort_rules: netcore::policy::Rules,
+    /// How many frames the kernel's finish step answered `Misrouted`: a
+    /// frame handed to the wrong kind's call, or with tables not its box's.
+    /// Zero in every test.
+    misrouted: AtomicU64,
 }
 
 /// The rules made from a policy allowing `allow` and denying nothing, by the
@@ -592,6 +666,7 @@ impl KernelConfig {
             node_rules: rules_from(None),
             node_endpoints: Vec::new(),
             cohort_rules: rules_from(None),
+            misrouted: AtomicU64::new(0),
         })
     }
 
@@ -759,7 +834,22 @@ impl KernelConfig {
     pub(crate) fn drop_row(&mut self, addr: Ipv4Addr) -> Result<(), Diverged> {
         let key = u32::from(addr);
         self.row_policies.remove(&key);
-        self.row_tables.remove(&key);
+        if let Some(held) = self.row_tables.remove(&key) {
+            let ended = held
+                .tables
+                .into_inner()
+                .unwrap_or_else(PoisonError::into_inner)
+                .flows
+                .len();
+            if ended > 0 {
+                tracing::debug!(
+                    switch_addr = %addr,
+                    ended,
+                    why = "its row was withdrawn",
+                    "ended inbound-flow records"
+                );
+            }
+        }
         self.row_generations.remove(&key);
         if let Some(names) = self.row_names.remove(&key) {
             self.release_names(&names);
@@ -1195,6 +1285,117 @@ impl KernelConfig {
             .collect()
     }
 
+    /// The kernel's whole decision for a frame a guest sent: `egress_first`,
+    /// then for a frame it routes to a row, the node or the cohort, that
+    /// kind's `finish_*` on the box's tables, each locked inside the
+    /// configuration's read lock in this order: the cohort's DNS table, then
+    /// the node's tables, then a row's tables. A frame to the host alias is
+    /// decided only on a configuration that holds the exposure list `open`
+    /// the frame read, and `None` is returned before any table is touched
+    /// when it holds another or no list was read yet, for the caller to hand
+    /// the list over and ask again.
+    pub(crate) fn decide_egress(
+        &self,
+        bytes: &[u8],
+        open: Option<&Arc<[HostExposure]>>,
+        now: KernelInstant,
+    ) -> Result<Option<Decided>, Poisoned> {
+        let first = self.config.egress_first(bytes, ZONE_APEX_WIRE);
+        let alias = self.config.sources.plan().host_alias();
+        let to_alias = match first {
+            First::Frame { frame, .. } => {
+                matches!(frame.sent.kind, SentKind::V4 { dst, .. } if dst == alias)
+            }
+            First::NotAFrame(_) | First::ShortHeader => false,
+        };
+        if to_alias && !open.is_some_and(|open| self.holds_exposures(open)) {
+            return Ok(None);
+        }
+        self.decide_from(first, now).map(Some)
+    }
+
+    /// The finish step for `first`: `finish_*` on the routed box's tables. A
+    /// frame no judge decides (no frame, a short header, a stray source, the
+    /// DNS refusal of a row or of the cohort) carries no outcome; its drop is
+    /// egress_first's. A `Misrouted` outcome, or a row egress_first routes to
+    /// that holds no tables, is said and counted, and the frame is dropped.
+    /// [`Poisoned`] when a table lock the decision takes was poisoned: no
+    /// table is touched, and nothing is decided.
+    fn decide_from(&self, first: First, now: KernelInstant) -> Result<Decided, Poisoned> {
+        let members = self.config.members.len();
+        let asked = AskedFor {
+            row: match first {
+                First::Frame { frame, .. } => self.generation_at(frame.sent.src.to_be_bytes()),
+                First::NotAFrame(_) | First::ShortHeader => None,
+            },
+            cohort: self.cohort_generation(),
+        };
+        let First::Frame { frame, arm, .. } = first else {
+            return Ok(Decided {
+                first,
+                outcome: None,
+                members,
+                asked,
+            });
+        };
+        let outcome = match arm {
+            Arm::Row(_, _) => match self.row_tables.get(&frame.sent.src) {
+                Some(held) => {
+                    let mut tables = unpoisoned(held.tables.lock())?;
+                    self.config.finish_row(first, &mut tables, now)
+                }
+                // A routed row with no tables is a broken invariant, not a
+                // case: tables exist exactly while a row holds its address,
+                // and the in-step check (`assert_tables_held`) asserts every
+                // registered row has its tables and the misrouted count is 0,
+                // so in every test this arm is never taken.
+                None => Outcome::Misrouted,
+            },
+            Arm::Node(_) => {
+                let mut tables = unpoisoned(self.node_tables.tables.lock())?;
+                self.config.finish_node(first, &mut tables, now)
+            }
+            Arm::Cohort(_) => {
+                let mut cohort = unpoisoned(self.cohort_pins.tables.lock())?;
+                let mut node = unpoisoned(self.node_tables.tables.lock())?;
+                self.config
+                    .finish_cohort(first, &mut node, &mut cohort, now)
+            }
+            Arm::Refused(_) | Arm::RowDns(_) | Arm::CohortDns => {
+                return Ok(Decided {
+                    first,
+                    outcome: None,
+                    members,
+                    asked,
+                });
+            }
+        };
+        if outcome == Outcome::Misrouted {
+            let routes = format!("{arm:?}");
+            let count = self.misrouted.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::error!(
+                source = %Ipv4Addr::from(frame.sent.src),
+                arm = %routes,
+                misrouted = count,
+                "the network kernel's finish step was handed a frame egress_first routed \
+                 elsewhere, or tables that are not the box's; the frame is dropped"
+            );
+        }
+        Ok(Decided {
+            first,
+            outcome: Some(outcome),
+            members,
+            asked,
+        })
+    }
+
+    /// How many frames the kernel's finish step answered `Misrouted`. Read
+    /// by the in-step check alone.
+    #[cfg(test)]
+    pub(crate) fn misrouted(&self) -> u64 {
+        self.misrouted.load(Ordering::Relaxed)
+    }
+
     /// Ends the reply records of the box at `addr` whose box-side port is
     /// `port` over `proto`, when the publication they were opened under is
     /// retracted: in the row's tables, and at the node's address in the
@@ -1232,26 +1433,123 @@ impl KernelConfig {
     /// Records a frame toward a guest in the kernel's tables of the box it is
     /// for, as `finish_ingress` does, beside the daemon's own record: the
     /// tables chosen by the kernel's own reading (`ingress_first`). `None`
-    /// when no box's tables take it, or their lock was poisoned
-    /// ([`recordable`]). Decides nothing.
+    /// when no box's tables take it, or their lock was poisoned. Decides
+    /// nothing.
+    #[cfg(test)]
     pub(crate) fn record_toward_guest(
         &self,
         bytes: &[u8],
         published: bool,
         now: KernelInstant,
     ) -> Option<Seen> {
+        self.record_toward_guest_said(bytes, published, now)
+            .ok()
+            .flatten()
+            .map(|recorded| recorded.seen)
+    }
+
+    /// [`Self::record_toward_guest`], with what the lines about the frame
+    /// read: whether it opened the box's first record or filled its reply
+    /// table (each once for these tables), how many records it ended, and
+    /// the table's fill after it. A frame the table refuses at its cap is
+    /// counted for the box. [`Poisoned`] when the tables' lock was poisoned:
+    /// nothing is recorded, and the frame is not delivered.
+    pub(crate) fn record_toward_guest_said(
+        &self,
+        bytes: &[u8],
+        published: bool,
+        now: KernelInstant,
+    ) -> Result<Option<Recorded>, Poisoned> {
         let (heard, whose, facts) = self.config.ingress_first(bytes);
-        let held = match whose {
+        let (held, generation) = match whose {
             IngressFor::Row(_) => match facts {
-                Facts::V4(v) => self.row_tables.get(&v.dst)?,
-                Facts::Arp { .. } | Facts::Other(_) => return None,
+                Facts::V4(v) => match self.row_tables.get(&v.dst) {
+                    Some(held) => (held, self.row_generations.get(&v.dst).copied()),
+                    None => return Ok(None),
+                },
+                Facts::Arp { .. } | Facts::Other(_) => return Ok(None),
             },
-            IngressFor::Node => &self.node_tables,
-            IngressFor::Cohort | IngressFor::NotARow => return None,
+            IngressFor::Node => (&self.node_tables, None),
+            IngressFor::Cohort | IngressFor::NotARow => return Ok(None),
         };
-        let mut tables = recordable(held.tables.lock())?;
-        self.config
+        let mut tables = unpoisoned(held.tables.lock())?;
+        let before = tables.flows.len();
+        let Some(seen) = self
+            .config
             .finish_ingress(heard, &mut tables, published, now)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Recorded {
+            generation,
+            ..said_of(held, &tables.flows, seen, before)
+        }))
+    }
+
+    /// [`Self::record_toward_guest_said`] on the tables of the row at
+    /// `tables_at` rather than the ones the kernel's reading chooses: the one
+    /// way a frame meets another box's tables. For a test of what the relay
+    /// does then.
+    #[cfg(test)]
+    pub(crate) fn record_toward_guest_into(
+        &self,
+        bytes: &[u8],
+        published: bool,
+        now: KernelInstant,
+        tables_at: [u8; 4],
+    ) -> Option<Recorded> {
+        let (heard, _, _) = self.config.ingress_first(bytes);
+        let held = self.row_tables.get(&u32::from_be_bytes(tables_at))?;
+        let mut tables = held.tables.lock().unwrap_or_else(PoisonError::into_inner);
+        let before = tables.flows.len();
+        let seen = self
+            .config
+            .finish_ingress(heard, &mut tables, published, now)?;
+        Some(said_of(held, &tables.flows, seen, before))
+    }
+
+    /// The frames toward the box at `addr` its reply table refused at its
+    /// cap: the node's at the node's address, else the row's there.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "read by the tests alone: no surface outside them reads it; the counter is \
+                      kept at the refusal in every build"
+        )
+    )]
+    pub(crate) fn refused_at_cap_of(&self, addr: [u8; 4]) -> Option<u64> {
+        let at = u32::from_be_bytes(addr);
+        let held = if at == self.config.sources.plan().node() {
+            &self.node_tables
+        } else {
+            self.row_tables.get(&at)?
+        };
+        Some(held.refused_at_cap.load(Ordering::Relaxed))
+    }
+
+    /// Whether the DNS table a question from `src` is routed to (by its
+    /// source and `marked`, as [`Self::record_question`] routes it) is the
+    /// one of the registry record the frame's decision was made for
+    /// (`asked`): a row's table only while the row at `src` is that record's,
+    /// the cohort's only while the resident `host_ip` boxes' record is. The
+    /// node's own table belongs to no record.
+    pub(crate) fn asks_for(&self, src: [u8; 4], marked: bool, asked: AskedFor) -> bool {
+        let dscp = if marked {
+            boxes::core::egress::BOX_COHORT_DSCP
+        } else {
+            0
+        };
+        match self
+            .config
+            .sources
+            .origin(Some(u32::from_be_bytes(src)), true, dscp)
+        {
+            Origin::Row(_) => self.generation_at(src) == asked.row,
+            Origin::Cohort => self.cohort_generation() == asked.cohort,
+            Origin::Node => true,
+            Origin::NoSource | Origin::Unregistered | Origin::Unknown => false,
+        }
     }
 
     /// Records a DNS question a guest sent from `src` (the box's mark
@@ -1259,8 +1557,9 @@ impl KernelConfig {
     /// the node's, or the cohort's. `name` is the question's name as the
     /// rows' names are matched; it is asked under its position in that
     /// table's list, and not at all when the list does not hold it. Only a
-    /// question addressed to the plan's resolver (`dst`) is asked, and none
-    /// in a table whose lock was poisoned ([`recordable`]).
+    /// question addressed to the plan's resolver (`dst`) is asked. `None`
+    /// too when that table's lock was poisoned ([`Self::try_record_question`]).
+    #[cfg(test)]
     #[expect(
         clippy::too_many_arguments,
         reason = "the source, its mark, where the question went, its name, id and port, and the \
@@ -1276,8 +1575,30 @@ impl KernelConfig {
         port: u16,
         now: KernelInstant,
     ) -> Option<Asked> {
+        self.try_record_question(src, marked, dst, name, txid, port, now)
+            .ok()
+            .flatten()
+    }
+
+    /// [`Self::record_question`], as the relay records a question:
+    /// [`Poisoned`] when the table's lock was poisoned, and nothing is asked.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the source, its mark, where the question went, its name, id and port, and the \
+                  instant are each one of the question's facts"
+    )]
+    pub(crate) fn try_record_question(
+        &self,
+        src: [u8; 4],
+        marked: bool,
+        dst: [u8; 4],
+        name: &str,
+        txid: u16,
+        port: u16,
+        now: KernelInstant,
+    ) -> Result<Option<Asked>, Poisoned> {
         if Ipv4Addr::from(dst) != self.subnet.dns_server() {
-            return None;
+            return Ok(None);
         }
         let dscp = if marked {
             boxes::core::egress::BOX_COHORT_DSCP
@@ -1290,22 +1611,30 @@ impl KernelConfig {
             .origin(Some(u32::from_be_bytes(src)), true, dscp)
         {
             Origin::Row(_) => {
-                let held = self.row_tables.get(&u32::from_be_bytes(src))?;
-                let number = held.number_of(name)?;
-                let mut tables = recordable(held.tables.lock())?;
-                Some(tables.pins.ask(number, txid, port, now))
+                let Some(held) = self.row_tables.get(&u32::from_be_bytes(src)) else {
+                    return Ok(None);
+                };
+                let Some(number) = held.number_of(name) else {
+                    return Ok(None);
+                };
+                let mut tables = unpoisoned(held.tables.lock())?;
+                Ok(Some(tables.pins.ask(number, txid, port, now)))
             }
             Origin::Node => {
-                let number = self.node_tables.number_of(name)?;
-                let mut tables = recordable(self.node_tables.tables.lock())?;
-                Some(tables.pins.ask(number, txid, port, now))
+                let Some(number) = self.node_tables.number_of(name) else {
+                    return Ok(None);
+                };
+                let mut tables = unpoisoned(self.node_tables.tables.lock())?;
+                Ok(Some(tables.pins.ask(number, txid, port, now)))
             }
             Origin::Cohort => {
-                let number = self.cohort_pins.number_of(name)?;
-                let mut pins = recordable(self.cohort_pins.tables.lock())?;
-                Some(pins.ask(number, txid, port, now))
+                let Some(number) = self.cohort_pins.number_of(name) else {
+                    return Ok(None);
+                };
+                let mut pins = unpoisoned(self.cohort_pins.tables.lock())?;
+                Ok(Some(pins.ask(number, txid, port, now)))
             }
-            Origin::NoSource | Origin::Unregistered | Origin::Unknown => None,
+            Origin::NoSource | Origin::Unregistered | Origin::Unknown => Ok(None),
         }
     }
 
@@ -1589,6 +1918,7 @@ impl KernelConfig {
             "the node's notes are its own"
         );
         assert_eq!(tables.pins.owner(), node, "the node's DNS table is its own");
+        assert_eq!(self.misrouted(), 0, "no frame was misrouted");
         let cohort = self
             .cohort_pins
             .tables
@@ -1601,6 +1931,13 @@ impl KernelConfig {
         );
     }
 
+    /// Gives out every name number, so the next row naming a name not held
+    /// yet is refused: the one way a test makes the registry's restate of a
+    /// row refused.
+    pub(crate) fn exhaust_names_for_tests(&mut self) {
+        self.names.exhaust_for_tests();
+    }
+
     /// The DNS table of the row at `addr`, for a test to write to and read.
     pub(crate) fn with_row_pins<T>(
         &self,
@@ -1610,6 +1947,95 @@ impl KernelConfig {
         let held = self.row_tables.get(&u32::from(addr))?;
         let mut tables = held.tables.lock().unwrap_or_else(PoisonError::into_inner);
         Some(f(&mut tables.pins))
+    }
+
+    /// The tables a frame to or from `addr` is recorded in, for a test to
+    /// read: the node's at the node's address, else the row's there.
+    #[cfg(test)]
+    pub(crate) fn with_tables_at<T>(
+        &self,
+        addr: [u8; 4],
+        f: impl FnOnce(&BoxTables) -> T,
+    ) -> Option<T> {
+        let at = u32::from_be_bytes(addr);
+        let held = if at == self.config.sources.plan().node() {
+            &self.node_tables
+        } else {
+            self.row_tables.get(&at)?
+        };
+        let tables = held.tables.lock().unwrap_or_else(PoisonError::into_inner);
+        Some(f(&tables))
+    }
+
+    /// Replaces the tables of the row at `addr` with ones made by
+    /// [`tables_for`] at the row's own limits but a reply table of `cap`
+    /// records: the one way a kernel table gets a cap. For a test that
+    /// reaches the cap with few records, before anything is recorded in it.
+    #[cfg(test)]
+    pub(crate) fn shrink_reply_cap(&mut self, addr: [u8; 4], cap: usize) {
+        let key = u32::from_be_bytes(addr);
+        let Some(held) = self.row_tables.get(&key) else {
+            return;
+        };
+        let names = held.names.clone();
+        let mut limits = table_limits(names.len());
+        limits.flows_cap = cap;
+        let tables = tables_for(key, limits).expect("the kernel makes a table of that cap");
+        self.row_tables.insert(key, Held::new(names, tables));
+    }
+
+    /// Replaces the tables of the row at `addr` with ones made by
+    /// [`tables_for`] at the row's own limits but a refusal-note table of
+    /// `cap` notes, `per_client` of them from one client: the reply-cap
+    /// hook's twin, before anything is recorded.
+    #[cfg(test)]
+    pub(crate) fn shrink_notes_cap(&mut self, addr: [u8; 4], cap: usize, per_client: usize) {
+        let key = u32::from_be_bytes(addr);
+        let Some(held) = self.row_tables.get(&key) else {
+            return;
+        };
+        let names = held.names.clone();
+        let mut limits = table_limits(names.len());
+        limits.notes_cap = cap;
+        limits.notes_per_client = per_client;
+        let tables = tables_for(key, limits).expect("the kernel makes a table of that cap");
+        self.row_tables.insert(key, Held::new(names, tables));
+    }
+
+    /// Replaces the tables of the row at `addr` with ones made by
+    /// [`tables_for`] at the row's own limits but a DNS flow table of `cap`
+    /// flows, `cap` to one destination: the reply-cap hook's twin, before
+    /// anything is recorded.
+    #[cfg(test)]
+    pub(crate) fn shrink_dns_flow_cap(&mut self, addr: [u8; 4], cap: usize) {
+        let key = u32::from_be_bytes(addr);
+        let Some(held) = self.row_tables.get(&key) else {
+            return;
+        };
+        let names = held.names.clone();
+        let mut limits = table_limits(names.len());
+        limits.pins.flows_cap = cap;
+        limits.pins.flows_per_destination = cap;
+        let tables = tables_for(key, limits).expect("the kernel makes a table of that cap");
+        self.row_tables.insert(key, Held::new(names, tables));
+    }
+
+    /// Retires the DNS entry alone: the DNS table of the row at
+    /// `addr` replaced by an empty one of the same limits, its reply records
+    /// and notes kept, as the holder replaces the node's DNS table alone at
+    /// a baseline change. A relay's end empties all three.
+    #[cfg(test)]
+    pub(crate) fn retire_row_pins(&mut self, addr: Ipv4Addr) {
+        let key = u32::from(addr);
+        let Some(held) = self.row_tables.get(&key) else {
+            return;
+        };
+        let pins = Pins::new(key, pin_limits(held.names.len()))
+            .expect("the kernel made this row's DNS table at these limits before");
+        held.tables
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pins = pins;
     }
 
     /// The cohort's DNS table, for a test to read.
@@ -3598,6 +4024,497 @@ mod tests {
         assert!(
             tables.pins.admitted_live(u32::from(beyond), later),
             "the answer's address outside the block is admitted"
+        );
+    }
+
+    /// Time at the holder's explicit instant: an admission past its window
+    /// admits nothing, and a question past its expiry takes no answer.
+    #[test]
+    fn an_admission_past_its_window_and_a_question_past_its_expiry_admit_nothing() {
+        let window = ms(DNS_ADMISSION_WINDOW);
+        let expiry = ms(DNS_QUERY_EXPIRY);
+        let at = |ms| netcore::time::Instant { ms };
+        let mut config = KernelConfig::new(subnet()).unwrap();
+        config.adopt_baseline(true, std::iter::empty(), strings(&["cache.example"]), &[]);
+        let node = Ipv4Addr::from(config.config.sources.plan().node()).octets();
+        let resolver = subnet().dns_server();
+        let live = |config: &KernelConfig, addr: Ipv4Addr, now| {
+            config
+                .node_tables
+                .tables
+                .lock()
+                .unwrap()
+                .pins
+                .admitted_live(u32::from(addr), at(now))
+        };
+
+        let site = Ipv4Addr::new(203, 0, 113, 31);
+        let asked = config.record_question(
+            node,
+            false,
+            resolver.octets(),
+            "cache.example",
+            0x522a,
+            40000,
+            at(1),
+        );
+        assert!(asked.is_some(), "the node asks its own name");
+        let answer = crate::net::dns_pins::tests::dns_response("cache.example.", &[site]);
+        let answered =
+            config.record_answer(SocketAddrV4::new(resolver, 53), node, 40000, &answer, at(2));
+        assert!(
+            matches!(answered.as_slice(), [Answer::Fates(..)]),
+            "the answer is taken"
+        );
+        assert!(
+            live(&config, site, 2 + window - 1),
+            "the admission holds within its window"
+        );
+        assert!(
+            !live(&config, site, 2 + window + 1),
+            "an admission past its window admits nothing"
+        );
+
+        let later = 2 + window + expiry;
+        let other = Ipv4Addr::new(203, 0, 113, 32);
+        let asked = config.record_question(
+            node,
+            false,
+            resolver.octets(),
+            "cache.example",
+            0x522a,
+            40001,
+            at(later),
+        );
+        assert!(asked.is_some(), "the node asks again");
+        let answer = crate::net::dns_pins::tests::dns_response("cache.example.", &[other]);
+        let answered = config.record_answer(
+            SocketAddrV4::new(resolver, 53),
+            node,
+            40001,
+            &answer,
+            at(later + expiry + 1),
+        );
+        assert!(
+            matches!(answered.as_slice(), [Answer::NoQuestion]),
+            "a question past its expiry takes no answer"
+        );
+        assert!(
+            !live(&config, other, later + expiry + 1),
+            "and its answer admits nothing"
+        );
+    }
+
+    /// A DNS admission's flow is looked up and recorded in
+    /// one step. The decision that admits a box's frame on the window of an
+    /// address its answer named records the frame's flow in the same call,
+    /// so the flow's next frame is carried by that record.
+    #[test]
+    fn the_decision_that_admits_on_a_window_records_the_flow_in_the_same_call() {
+        use boxes::core::egress::{TCP_ACK, TCP_SYN};
+        use netcore::judge::Judged;
+        use netcore::pins::Egress;
+        let row = at(9);
+        let naming = EgressPolicy {
+            allow_subnets: Some(Vec::new()),
+            allow_dns_hosts: Some(strings(&["example.org"])),
+            allow_protocols: None,
+            deny_subnets: None,
+        };
+        let mut config = KernelConfig::new(subnet()).unwrap();
+        config.note_policy(row, Some(&naming));
+        config
+            .register_row(
+                row,
+                &RowFacts {
+                    name: "probe",
+                    policy: Some(&naming),
+                    laned: false,
+                    task_row: false,
+                    generation: 0,
+                },
+            )
+            .unwrap();
+        let instant = |ms| netcore::time::Instant { ms };
+        let resolver = subnet().dns_server();
+        let asked = config.record_question(
+            row.octets(),
+            false,
+            resolver.octets(),
+            "example.org",
+            0x522a,
+            40000,
+            instant(1),
+        );
+        assert!(asked.is_some(), "the box asks its name");
+        let site = Ipv4Addr::new(93, 184, 216, 34);
+        let answer = crate::net::dns_pins::tests::dns_response("example.org.", &[site]);
+        let answered = config.record_answer(
+            SocketAddrV4::new(resolver, 53),
+            row.octets(),
+            40000,
+            &answer,
+            instant(2),
+        );
+        assert_eq!(answered.len(), 1, "the row's table takes the answer");
+        let flows = |config: &KernelConfig| {
+            config
+                .with_tables_at(row.octets(), |t| t.pins.flow_count())
+                .expect("the row has tables")
+        };
+        assert_eq!(flows(&config), 0, "no flow before the box's frame");
+        let syn = crate::net::dns_pins::tests::tcp_frame(row, 50000, site, 443, TCP_SYN);
+        let decided = config
+            .decide_egress(&syn, None, instant(3))
+            .expect("no lock is poisoned")
+            .expect("a frame to no alias needs no exposure list");
+        assert!(
+            matches!(
+                decided.outcome,
+                Some(Outcome::Row(_, Judged::Pinned(Egress::Retained)))
+            ),
+            "the window admits the opening frame: {:?}",
+            decided.outcome
+        );
+        assert_eq!(flows(&config), 1, "the same call recorded its flow");
+        let ack = crate::net::dns_pins::tests::tcp_frame(row, 50000, site, 443, TCP_ACK);
+        let decided = config
+            .decide_egress(&ack, None, instant(4))
+            .expect("no lock is poisoned")
+            .expect("a frame to no alias needs no exposure list");
+        assert!(
+            matches!(
+                decided.outcome,
+                Some(Outcome::Row(_, Judged::Pinned(Egress::ByFlow)))
+            ),
+            "the flow's next frame is carried by its record: {:?}",
+            decided.outcome
+        );
+    }
+
+    /// A configuration with one row at `.9` declaring `names`, allowing no
+    /// subnet, for the holder-level row checks.
+    fn one_naming_row(names: &[&str]) -> (KernelConfig, Ipv4Addr) {
+        let row = at(9);
+        let naming = EgressPolicy {
+            allow_subnets: Some(Vec::new()),
+            allow_dns_hosts: Some(strings(names)),
+            allow_protocols: None,
+            deny_subnets: None,
+        };
+        let mut config = KernelConfig::new(subnet()).unwrap();
+        config.note_policy(row, Some(&naming));
+        config
+            .register_row(
+                row,
+                &RowFacts {
+                    name: "probe",
+                    policy: Some(&naming),
+                    laned: false,
+                    task_row: false,
+                    generation: 0,
+                },
+            )
+            .unwrap();
+        (config, row)
+    }
+
+    /// The part of a note's expiry that needs time, at the holder's explicit
+    /// instants, with a note table of one: a note past its window gives up
+    /// its place to another client's connect, and a repeated connect from
+    /// the same client keeps the later deadline.
+    #[test]
+    fn a_refusal_note_past_its_window_gives_its_place_and_a_repeat_keeps_the_later_deadline() {
+        use boxes::core::egress::TCP_SYN;
+        let window = ms(REFUSAL_WINDOW);
+        let instant = |ms| netcore::time::Instant { ms };
+        let (mut config, row) = one_naming_row(&[]);
+        config.shrink_notes_cap(row.octets(), 1, 1);
+        let first = Ipv4Addr::new(100, 64, 7, 20);
+        let second = Ipv4Addr::new(100, 64, 7, 21);
+        let connect = |client: Ipv4Addr| {
+            crate::net::dns_pins::tests::tcp_frame(client, 40000, row, 9000, TCP_SYN)
+        };
+        let noted = |config: &KernelConfig, client: Ipv4Addr, now| {
+            config
+                .with_tables_at(row.octets(), |t| {
+                    t.notes
+                        .has_live(u32::from(client), 40000, 9000, instant(now))
+                })
+                .expect("the row has tables")
+        };
+        assert!(matches!(
+            config.record_toward_guest(&connect(first), false, instant(1)),
+            Some(Seen::Noted(_))
+        ));
+        assert!(
+            noted(&config, first, 2),
+            "the first client's connect is noted"
+        );
+        let past = 1 + window + 1;
+        config.record_toward_guest(&connect(second), false, instant(past));
+        assert!(
+            noted(&config, second, past),
+            "the expired note gave its place to the other client's connect"
+        );
+        assert!(!noted(&config, first, past), "the expired note is gone");
+
+        let (mut config, row) = one_naming_row(&[]);
+        config.shrink_notes_cap(row.octets(), 1, 1);
+        config.record_toward_guest(&connect(first), false, instant(1));
+        let again = 1 + window / 2;
+        config.record_toward_guest(&connect(first), false, instant(again));
+        assert!(
+            noted(&config, first, 1 + window + 1),
+            "past the first connect's window, the repeat's later deadline holds the note"
+        );
+        assert!(
+            !noted(&config, first, again + window + 1),
+            "and ends at the repeat's deadline"
+        );
+    }
+
+    /// The DNS flow table's room, at the holder's explicit instants, with a
+    /// DNS flow table of one: at an insert, an expired flow gives up its place,
+    /// so a new flow to a freshly admitted address is recorded.
+    #[test]
+    fn an_expired_dns_flow_gives_its_place_at_an_insert() {
+        use boxes::core::egress::TCP_SYN;
+        use netcore::judge::Judged;
+        use netcore::pins::Egress;
+        let instant = |ms| netcore::time::Instant { ms };
+        let (mut config, row) = one_naming_row(&["example.org"]);
+        config.shrink_dns_flow_cap(row.octets(), 1);
+        let resolver = subnet().dns_server();
+        let site = Ipv4Addr::new(93, 184, 216, 34);
+        let resolve = |config: &KernelConfig, port: u16, now: u64| {
+            let asked = config.record_question(
+                row.octets(),
+                false,
+                resolver.octets(),
+                "example.org",
+                0x522a,
+                port,
+                instant(now),
+            );
+            assert!(asked.is_some(), "the box asks its name");
+            let answer = crate::net::dns_pins::tests::dns_response("example.org.", &[site]);
+            let answered = config.record_answer(
+                SocketAddrV4::new(resolver, 53),
+                row.octets(),
+                port,
+                &answer,
+                instant(now + 1),
+            );
+            assert_eq!(answered.len(), 1, "the row's table takes the answer");
+        };
+        let decide = |config: &KernelConfig, port: u16, now: u64| {
+            let syn = crate::net::dns_pins::tests::tcp_frame(row, port, site, 443, TCP_SYN);
+            config
+                .decide_egress(&syn, None, instant(now))
+                .expect("no lock is poisoned")
+                .expect("a frame to no alias needs no exposure list")
+                .outcome
+        };
+        resolve(&config, 40000, 1);
+        assert!(matches!(
+            decide(&config, 50000, 3),
+            Some(Outcome::Row(_, Judged::Pinned(Egress::Retained)))
+        ));
+        let later = 3 + ms(DNS_FLOW_IDLE_CAP) + 10;
+        resolve(&config, 40001, later);
+        let outcome = decide(&config, 50001, later + 2);
+        assert!(
+            matches!(
+                outcome,
+                Some(Outcome::Row(_, Judged::Pinned(Egress::Retained)))
+            ),
+            "the expired flow gave its place: the new flow is recorded, got {outcome:?}"
+        );
+        assert_eq!(
+            config
+                .with_tables_at(row.octets(), |t| t.pins.flow_count())
+                .expect("the row has tables"),
+            1
+        );
+    }
+
+    /// The kernel's DNS table of a box, as the daemon builds it for a row
+    /// that names two hosts, holds what the documented limits say, by what
+    /// it does. Questions: 16 outstanding in all, so the 17th, for a name
+    /// still under its own quota, is refused as `Asked::Full`. Addresses: 32
+    /// a name and names times 32 in all, 64 here; the 64th is held, and the
+    /// next, the name's 33rd, is `Fate::NoRoom` (for one name the quota and
+    /// the table's room are the same bound, so the fate names room).
+    /// Flows: the 4,096th is recorded, and the next frame to the admitted
+    /// address at that full table of live flows passes on the window with no
+    /// flow (`Egress::Window`). The windows are read from the documented
+    /// values (DNS_QUERY_EXPIRY, DNS_ADMISSION_WINDOW, DNS_FLOW_IDLE_CAP);
+    /// their use is G5's, through the contracts of `Pins::ask`,
+    /// `Pins::resolve` and `Pins::egress`.
+    #[test]
+    fn a_boxs_dns_table_holds_the_documented_limits() {
+        use boxes::core::egress::TCP_SYN;
+        use netcore::answer::Fate;
+        use netcore::judge::Judged;
+        use netcore::pins::Egress;
+        let instant = |ms| netcore::time::Instant { ms };
+        let (config, row) = one_naming_row(&["a.example", "b.example"]);
+        let resolver = subnet().dns_server();
+        let ask = |name: &str, port: u16| {
+            config.record_question(
+                row.octets(),
+                false,
+                resolver.octets(),
+                name,
+                0x522a,
+                port,
+                instant(1),
+            )
+        };
+
+        for port in 0..10 {
+            assert_eq!(ask("a.example", 30000 + port), Some(Asked::Recorded));
+        }
+        for port in 0..6 {
+            assert_eq!(ask("b.example", 31000 + port), Some(Asked::Recorded));
+        }
+        assert_eq!(
+            ask("b.example", 31006),
+            Some(Asked::Full),
+            "the 17th outstanding question is refused for the table's room"
+        );
+
+        let answer = |name: &str, port: u16, addrs: &[Ipv4Addr]| {
+            let datagram = crate::net::dns_pins::tests::dns_response(name, addrs);
+            let answered = config.record_answer(
+                SocketAddrV4::new(resolver, 53),
+                row.octets(),
+                port,
+                &datagram,
+                instant(2),
+            );
+            match answered.as_slice() {
+                [Answer::Fates(fates, _)] => fates.clone(),
+                _ => panic!("the answer is taken, as one result with fates"),
+            }
+        };
+        let address = |high: u8, low: u8| Ipv4Addr::new(93, 184, high, low);
+        let a: Vec<Ipv4Addr> = (1..=32).map(|low| address(1, low)).collect();
+        let b: Vec<Ipv4Addr> = (1..=32).map(|low| address(2, low)).collect();
+        let held = |fates: &[Fate]| fates.iter().all(|fate| matches!(fate, Fate::Held { .. }));
+        assert!(
+            held(&answer("a.example", 30000, &a)),
+            "one name's 32 are held"
+        );
+        assert!(
+            held(&answer("b.example", 31000, &b)),
+            "the second name's 32 are held: the 64th, names times 32, is not refused"
+        );
+        assert!(
+            matches!(
+                answer("a.example", 30001, &[address(1, 100)]).as_slice(),
+                [Fate::NoRoom]
+            ),
+            "the next address is refused for room"
+        );
+
+        let site = a[0];
+        let flows = || {
+            config
+                .with_tables_at(row.octets(), |t| t.pins.flow_count())
+                .expect("the row has tables")
+        };
+        let decide = |port: u16| {
+            let syn = crate::net::dns_pins::tests::tcp_frame(row, port, site, 443, TCP_SYN);
+            config
+                .decide_egress(&syn, None, instant(3))
+                .expect("no lock is poisoned")
+                .expect("a frame to no alias needs no exposure list")
+                .outcome
+        };
+        for port in 0..u16::try_from(DNS_MAX_FLOWS_PER_BOX).expect("the cap fits a port") {
+            assert!(
+                matches!(
+                    decide(10000 + port),
+                    Some(Outcome::Row(_, Judged::Pinned(Egress::Retained)))
+                ),
+                "flow {port} is recorded"
+            );
+        }
+        assert_eq!(flows(), 4096, "the 4,096th flow is recorded");
+        assert!(
+            matches!(
+                decide(20000),
+                Some(Outcome::Row(_, Judged::Pinned(Egress::Window)))
+            ),
+            "at a full table of live flows the frame passes on the window"
+        );
+        assert_eq!(flows(), 4096, "and no flow is recorded for it");
+    }
+
+    /// netcore's NC19: a baseline naming more names than a DNS table holds
+    /// room for gives the node the largest table the kernel makes, said in an
+    /// error line, and names past its room are refused for room. Here every
+    /// name the largest table has room for takes its quota of addresses, and
+    /// the one name past it is refused.
+    #[test]
+    fn more_names_than_a_dns_table_holds_get_the_largest_table_and_are_refused_for_room() {
+        use netcore::answer::Fate;
+        let most = most_declared_names();
+        let names: Vec<String> = (0..=most).map(|n| format!("n{n}.example")).collect();
+        let (log, _guard) = crate::net::egress_gate::test_support::capture_log();
+        let mut config = KernelConfig::new(subnet()).unwrap();
+        let endpoints: Vec<&str> = names
+            .iter()
+            .map(String::as_str)
+            .chain(["93.0.0.0/8"])
+            .collect();
+        config.adopt_baseline(true, endpoints, names.clone(), &[]);
+        assert!(
+            log.contents()
+                .contains("cannot make a DNS table with room for every name"),
+            "the error line is said: {}",
+            log.contents()
+        );
+        let node = Ipv4Addr::from(config.config.sources.plan().node()).octets();
+        let resolver = subnet().dns_server();
+        let at = netcore::time::Instant { ms: 1 };
+        let fates = |name: &str, port: u16, addrs: &[Ipv4Addr]| {
+            assert!(
+                config
+                    .record_question(node, false, resolver.octets(), name, 7, port, at)
+                    .is_some(),
+                "the node asks {name}"
+            );
+            let datagram = crate::net::dns_pins::tests::dns_response_with(7, name, addrs);
+            let answered =
+                config.record_answer(SocketAddrV4::new(resolver, 53), node, port, &datagram, at);
+            match answered.first() {
+                Some(Answer::Fates(fates, _)) => fates.clone(),
+                _ => panic!("the node's table takes the answer, as a result with fates"),
+            }
+        };
+        for (n, name) in names[..most].iter().enumerate() {
+            let high = u8::try_from(n / 256).expect("the names fit two octets");
+            let low = u8::try_from(n % 256).expect("a remainder of 256 fits an octet");
+            let addrs: Vec<Ipv4Addr> = (1..=32)
+                .map(|last| Ipv4Addr::new(93, high, low, last))
+                .collect();
+            let port = 10000 + u16::try_from(n).expect("the names fit a port");
+            assert!(
+                fates(name, port, &addrs)
+                    .iter()
+                    .all(|fate| matches!(fate, Fate::Held { .. })),
+                "{name}'s addresses are held"
+            );
+        }
+        assert!(
+            matches!(
+                fates(&names[most], 9000, &[Ipv4Addr::new(93, 250, 0, 1)]).as_slice(),
+                [Fate::NoRoom]
+            ),
+            "the name past the largest table's room is refused for room"
         );
     }
 }

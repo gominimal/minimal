@@ -72,6 +72,12 @@ impl NameIds {
     /// Takes one hold on `zone_name` and returns its number: the number it
     /// has while held, or a new one. `None`, and nothing changes, when
     /// every number has been given out.
+    /// Gives out every number, so a name not held yet is refused one.
+    #[cfg(test)]
+    pub(crate) fn exhaust_for_tests(&mut self) {
+        self.last = u32::MAX;
+    }
+
     pub(crate) fn hold(&mut self, zone_name: &str) -> Option<u32> {
         if let Some((id, holds)) = self.held.get_mut(zone_name) {
             *holds += 1;

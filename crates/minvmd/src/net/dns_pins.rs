@@ -1143,6 +1143,14 @@ impl DnsPins {
     /// holds it. The baseline is adopted first, so the gate's decision and
     /// the pins always read the same grant. A table with no node row pins
     /// nothing for the node, and the frame is refused.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the daemon's own table is asked by none of the gate's decisions, which \
+                      are the kernel's; it is deleted with its table"
+        )
+    )]
     pub(crate) fn admits_node_frame(
         &self,
         table: &BoxTable,
@@ -1326,6 +1334,14 @@ impl DnsPins {
     /// whether a live pin a resident `host_ip` box's declared name took
     /// names `dst`, or the flow such a pin established still holds it.
     /// Counted with every other pin decision.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the daemon's own table is asked by none of the gate's decisions, which \
+                      are the kernel's; it is deleted with its table"
+        )
+    )]
     pub(crate) fn admits_host_ip_frame(
         &self,
         cohort: Option<&Arc<BoxRecord>>,
@@ -1704,7 +1720,7 @@ pub(crate) mod tests {
     /// A DNS reply datagram like [`dns_response`], carrying `id` as the
     /// exchange's — the one field a reply that does not answer the box's own
     /// question gets wrong.
-    fn dns_response_with(id: u16, name: &str, answers: &[Ipv4Addr]) -> Vec<u8> {
+    pub(crate) fn dns_response_with(id: u16, name: &str, answers: &[Ipv4Addr]) -> Vec<u8> {
         let qname = Name::from_utf8(name).expect("the query name parses");
         let mut response = Message::response(id, OpCode::Query);
         response.metadata.message_type = MessageType::Response;
