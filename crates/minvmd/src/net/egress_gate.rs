@@ -7900,6 +7900,47 @@ pub(crate) mod test_support {
     use crate::box_registry::BoxRegistry;
     use crate::net::baseline::NodePlaneBaseline;
 
+    /// The relay's decision for one frame a box sent, on `registry`'s table,
+    /// in the relay's own order ([`super::relay_frames_to_switch`]): the
+    /// frame's summary and L4 read as the relay reads them,
+    /// [`super::gate_verdict`] called whole, and for an admit the deny-all
+    /// DNS check under the relay's own condition (a UDP frame whose L4
+    /// destination port is the resolver's, whose datagram can be taken).
+    /// The built-in baseline with no host exposure, an empty DNS admission
+    /// table and empty reply tables: no reply, refusal or pin admits
+    /// anything. `Ok` is an admit; a drop answers its rule.
+    pub(crate) fn gate_decides(registry: &BoxRegistry, frame: &[u8]) -> Result<(), &'static str> {
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(table.subnet());
+        let pins = crate::net::dns_pins::DnsPins::new(table.subnet());
+        let summary = boxes::core::egress::summarize(frame);
+        let l4 = crate::net::dns_pins::parse_ipv4_l4(frame);
+        super::gate_verdict(
+            &summary,
+            l4.as_ref(),
+            &table,
+            &baseline,
+            &pins,
+            &ReplyTables::new(),
+        )
+        .map_err(|drop| drop.rule())?;
+        let dns = if crate::net::dns_pins::is_ipv4_udp(frame)
+            && l4
+                .as_ref()
+                .is_some_and(|l4| l4.dst.port() == super::RESOLVER_PORT)
+        {
+            crate::net::dns_pins::udp_datagram(frame)
+        } else {
+            None
+        };
+        if let Some((query, datagram)) = &dns
+            && crate::net::dns_pins::deny_all_refusal(&table, query, datagram).is_some()
+        {
+            return Err(super::DENY_ALL_DNS_RULE);
+        }
+        Ok(())
+    }
+
     /// How long the harness waits for a frame or a log line before calling
     /// the test failed: far past any healthy gate decision on a local socket,
     /// short of nextest's slow-timeout.

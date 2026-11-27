@@ -3159,26 +3159,32 @@ pub(crate) mod tests {
     /// resolver the row names and the plan's own. Nothing can ever pin for
     /// it: without the guard the `src == row.resolver` check the reply's pin
     /// decides by would be a grant the row's own bytes make, and a forged
-    /// reply wearing the address the row named would pin through it.
+    /// reply wearing the address the row named would pin through it. A
+    /// registry no longer holds a row outside its own block (the registration
+    /// is refused: `a_registration_the_kernel_cannot_hold_changes_nothing`),
+    /// so the drift built here is one of plan against pin table, not of row
+    /// against registry.
     #[test]
     fn a_row_whose_resolver_is_not_the_plans_own_is_refused() {
         let (log, _guard) = crate::net::egress_gate::test_support::capture_log();
         // The registry a drifted row can only come from: built for another
-        // plan, it compiles this row's resolver from that plan's own
-        // address, while the box the row holds sits in the table's plan.
+        // plan, it holds the row at a lease of its own block and compiles
+        // its resolver from that plan's own address, while the pin table is
+        // built for this one.
         let foreign = SwitchSubnet::new(Ipv4Addr::new(100, 65, 0, 0), 24)
             .expect("the test's second plan is a valid prefix");
         let registry = BoxRegistry::new(foreign);
+        let drifted = [100, 65, 0, 9];
         dns_box(
             &registry,
             "weather",
-            LEASE,
+            drifted,
             vec!["example.com".to_string()],
             Vec::new(),
         );
         let table = registry.table();
         let record = table
-            .by_source(LEASE)
+            .by_source(drifted)
             .expect("the drifted row is held by the registry that built it");
         let pins = DnsPins::new(SUBNET);
         let limiter = DropLimiter::new();
@@ -3191,7 +3197,7 @@ pub(crate) mod tests {
         resolve(
             &pins,
             &table,
-            LEASE,
+            drifted,
             "example.com",
             &[answer],
             &limiter,
@@ -3206,7 +3212,7 @@ pub(crate) mod tests {
         let logged = log.contents();
         assert!(
             logged.contains(refused)
-                && logged.contains("source=100.64.0.9")
+                && logged.contains("source=100.65.0.9")
                 && logged.contains("namespace=weather")
                 && logged.contains("resolver=100.65.0.1")
                 && logged.contains("plan_resolver=100.64.0.1"),
@@ -3221,7 +3227,7 @@ pub(crate) mod tests {
         resolve(
             &pins,
             &table,
-            LEASE,
+            drifted,
             "example.com",
             &[answer],
             &limiter,

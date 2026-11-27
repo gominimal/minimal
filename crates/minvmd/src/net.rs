@@ -90,6 +90,8 @@ pub(crate) mod egress_gate;
 pub use egress_gate::EgressGate;
 pub mod answerer;
 mod forward_revoke;
+pub(crate) mod kernel_config;
+mod kernel_names;
 pub(crate) mod proxy_reclaim;
 mod shuttle;
 mod stale_gvproxy;
@@ -827,6 +829,9 @@ impl HostGvproxy {
         warn_retired_host_exposure_env(std::env::var_os(RETIRED_HOST_EXPOSURE_ENV));
         let baseline = NodePlaneBaseline::built_in(subnet)
             .with_host_exposures(host_exposures::HostExposures::client_config());
+        // The network kernel's configuration takes the baseline once, with no
+        // registry lock held.
+        registry.adopt_node_baseline(&baseline);
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<io::Result<u32>>();
 

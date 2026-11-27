@@ -802,147 +802,63 @@ mod tests {
         );
     }
 
-    /// NET-078/NET-133: a host-address box still delivers as the cohort. The
-    /// host's own address outside the box host — the cohort address
-    /// host-address boxes arrive from — is a row like a box's when the host
-    /// published one there: its registration issues the cohort's attachment,
-    /// the pool grows it a share like any box row's, and a delivered
-    /// connection from it carries the cohort's own id, which is the shape
-    /// the cross-check answers. The node namespace stays excluded beside it:
-    /// no share, no attachment, and nothing delivered from it.
-    #[tokio::test]
-    async fn host_address_box_still_delivers_as_cohort() {
+    /// NET-078/BEP-084: a host-address box delivers as the cohort. A
+    /// host-address box holds no row and no attachment: its connections
+    /// leave from the node's address, and the pool's id lookup answers that
+    /// address with the reserved cohort id while a resident host-address box
+    /// declares a credentialed lane, never a member's id. While no resident
+    /// box declares one, the node's address names nothing: the one source
+    /// the pool's no-attachment abort is for.
+    #[test]
+    fn the_node_address_is_the_cohort_only_while_a_laned_host_address_box_is_resident() {
         use switch::bep_host::BepBoxSource;
 
         let subnet = SwitchSubnet::default();
-        let proxy_ip = subnet.box_egress_proxy_address();
-        let cohort_ip = subnet.host_alias();
+        let node = subnet.daemon_ip();
         let attachments = Attachments::new();
         let registry = crate::box_registry::BoxRegistry::new(subnet)
             .feeding_proxy_attachments(attachments.clone());
-
-        // The node's own row, as run.rs publishes it at boot: not a box, so
-        // no share and no attachment — pinned by the pool's count below. The
-        // host's row at the cohort address is published the way the host
-        // publishes one: an explicit registration at its own address, a row
-        // like a box's, outside the run boxes are handed from.
         registry.register_node_namespace(7654);
-        let cohort = registry.register(crate::box_registry::BoxRegistration::new(
-            "host",
-            cohort_ip,
-            Ipv4Addr::LOCALHOST,
-        ));
+        let source =
+            crate::box_registry::RegisteredBoxes::new(registry.table(), attachments.clone());
 
-        // The cohort's attachment: issued by its registration, naming the
-        // cohort by the id its row holds — the id a delivery from the
-        // cohort address arrives as — while the node namespace's row
-        // bought none.
-        let attachment = attachments
-            .by_source(cohort_ip.octets())
-            .expect("the cohort row issued the cohort's attachment");
+        // No resident host-address box: the node's address names nothing.
+        assert_eq!(source.cohort_source(), None);
         assert_eq!(
-            attachment.box_id(),
-            cohort.box_id(),
-            "the cohort's attachment carries the id its row holds"
-        );
-        assert_ne!(
-            attachment.box_id(),
-            [0u8; 16],
-            "the cohort's id is a minted UUIDv7, never the all-zero non-id"
-        );
-        assert!(
-            attachments.by_source(subnet.daemon_ip().octets()).is_none(),
-            "the node namespace is not a box and no cohort either: its row buys \
-             no attachment"
-        );
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let proxy_sock = dir.path().join("bep-stub.sock");
-        let token = [0x5au8; TOKEN_LEN];
-        let (start_tx, start_rx) = std::sync::mpsc::channel();
-        let stub = spawn(proxy_sock.clone(), start_rx).expect("the stand-in binds its socket");
-        start_tx
-            .send(StubStart {
-                token,
-                daemon_pid: std::process::id(),
-                attachments: attachments.clone(),
-            })
-            .expect("the supervisor hands the start facts over the channel");
-
-        let wire = BepWire::new(proxy_sock, token);
-        let cap = wire.per_source_cap();
-        let boxes = Arc::new(crate::box_registry::RegisteredBoxes::new(
-            registry.table(),
-            attachments.clone(),
-        ));
-        let mut lane = TestLane::new(subnet, wire, boxes.clone());
-        drive(&mut lane, 2).await;
-        assert_eq!(
-            lane.pool_len(),
-            cap,
-            "the cohort row holds a share like a box's; the node's adds none"
-        );
-        assert_eq!(
-            boxes.box_id_for_source(cohort_ip),
-            Some(attachment.box_id()),
-            "the pool's id lookup resolves the cohort address to the cohort's \
-             attachment, never to a bare row"
-        );
-        assert_eq!(
-            boxes.box_id_for_source(subnet.daemon_ip()),
+            source.box_id_for_source(node),
             None,
-            "the node namespace resolves to nothing: the one shape the pool's \
-             no-attachment abort is for"
+            "with no resident box the node namespace resolves to nothing"
         );
 
-        // A connection rides the lane from the cohort address, the way the
-        // host's own traffic arrives — and it is delivered and answered,
-        // attributed to the cohort's id by the cross-check.
-        lane.add_box(cohort_ip);
-        drive(&mut lane, 1).await;
-        lane.boxes_mut()[0].arp_for(proxy_ip);
-        drive(&mut lane, 3).await;
-        let flow = lane.boxes_mut()[0].connect(proxy_ip, PROXY_PORT);
-        drive(&mut lane, 40).await;
-        let answer = read_flow(&mut lane, 0, flow, 8).await;
+        // A resident box that declares no lane opens nothing.
+        let laneless = boxes::SessionId::from_bytes([0x11; 16]);
+        assert!(registry.admit_host_ip_box(laneless, None));
+        assert_eq!(source.cohort_source(), None);
         assert_eq!(
-            String::from_utf8_lossy(&answer),
-            format!(
-                "source={}:{} destination={}:{}\n",
-                cohort_ip, FIRST_CLIENT_PORT, proxy_ip, PROXY_PORT
-            ),
-            "the cohort's connection was delivered and answered, arriving as \
-             the cohort from its own address"
+            source.box_id_for_source(node),
+            None,
+            "a resident box without a lane gives the node's address no id"
+        );
+
+        // A resident box that declares one: the node's address answers the
+        // reserved cohort id, and no attachment is held for it.
+        let laned = boxes::SessionId::from_bytes([0x22; 16]);
+        assert!(registry.admit_host_ip_box_with_lane(laned, None, true));
+        assert_eq!(source.cohort_source(), Some(node));
+        assert_eq!(
+            source.box_id_for_source(node),
+            Some(switch::bep_host::COHORT_BOX_ID),
+            "a connection from the node's address is the cohort's"
         );
         assert!(
-            stub.refusals().is_empty(),
-            "the cohort's delivery was refused for nothing"
-        );
-        assert_eq!(
-            stub.presented().len(),
-            1,
-            "one answer, attributed to the cohort's id"
+            attachments.by_source(node.octets()).is_none(),
+            "the cohort is found by its route, not by an attachment"
         );
 
-        // The node namespace stays excluded: its address holds no share, so
-        // the pool's screen refuses its connection before any listener
-        // answers — and nothing from it was presented as the cohort.
-        lane.add_box(subnet.daemon_ip());
-        drive(&mut lane, 1).await;
-        lane.boxes_mut()[1].arp_for(proxy_ip);
-        drive(&mut lane, 3).await;
-        let from_daemon = lane.boxes_mut()[1].connect(proxy_ip, PROXY_PORT);
-        drive(&mut lane, 40).await;
-        assert_eq!(
-            lane.boxes()[1].flow_state(from_daemon),
-            State::Closed,
-            "a connection from the node namespace's address was reset"
-        );
-        assert_eq!(
-            stub.presented().len(),
-            1,
-            "nothing from the node namespace was presented as the cohort"
-        );
+        // The lane closes with its box.
+        assert!(registry.retire_host_ip_box(laned, minimald_rpc::HostIpBoxEnd::Stopped));
+        assert_eq!(source.cohort_source(), None);
+        assert_eq!(source.box_id_for_source(node), None);
     }
 
     /// NET-133/T44: a box's attachment reaches the proxy before its first
