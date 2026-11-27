@@ -38,7 +38,7 @@ use boxes::core::egress::{
     DNS_ADMISSION_WINDOW, DNS_FLOW_IDLE_CAP, DNS_MAX_ADDRESSES_PER_NAME, DNS_MAX_FLOWS_PER_BOX,
     DNS_OUTSTANDING_QUERY_CAP, DNS_QUERY_EXPIRY, IPPROTO_TCP, IPPROTO_UDP,
     REPLY_FLOW_SWEEP_INTERVAL, REPLY_MAX_FLOWS_PER_BOX, REPLY_TCP_IDLE_CAP,
-    REPLY_UDP_REPLIED_WINDOW, REPLY_UDP_UNREPLIED_WINDOW,
+    REPLY_UDP_REPLIED_WINDOW, REPLY_UDP_UNREPLIED_WINDOW, TCP_FIN, TCP_RST,
 };
 use boxes::{EgressPolicy, IpProto, SessionId};
 use netcore::alias::{AliasState, Exposure, Holder, PortRange};
@@ -232,6 +232,19 @@ struct Held<T> {
     filled: AtomicBool,
     /// The frames toward the box its reply table refused at its cap.
     refused_at_cap: AtomicU64,
+    /// The DNS table has admitted its first address since it was made: the
+    /// once-per-box line is said.
+    first_pin: AtomicBool,
+    /// The addresses answers offered the DNS table that it refused for room.
+    refused_for_room: AtomicU64,
+    /// The DNS table's flow capacity, as it was made.
+    dns_flows_cap: usize,
+    /// The frames the DNS table admitted on a window alone because its flows
+    /// were at their capacity.
+    at_cap_admitted: AtomicU64,
+    /// When the at-capacity line was last said, in the kernel's clock;
+    /// `u64::MAX` before it ever was.
+    at_cap_said_ms: AtomicU64,
 }
 
 impl<T> Held<T> {
@@ -244,6 +257,11 @@ impl<T> Held<T> {
             first_flow: AtomicBool::new(false),
             filled: AtomicBool::new(false),
             refused_at_cap: AtomicU64::new(0),
+            first_pin: AtomicBool::new(false),
+            refused_for_room: AtomicU64::new(0),
+            dns_flows_cap: DNS_MAX_FLOWS_PER_BOX,
+            at_cap_admitted: AtomicU64::new(0),
+            at_cap_said_ms: AtomicU64::new(u64::MAX),
         }
     }
 
@@ -301,6 +319,83 @@ fn row_held(addr: Ipv4Addr, names: Vec<String>) -> Result<Held<BoxTables>, Kerne
     match tables_for(u32::from(addr), table_limits(names.len())) {
         Some(tables) => Ok(Held::new(names, tables)),
         None => Err(KernelConfigError::TablesRefused { names: names.len() }),
+    }
+}
+
+/// One answer's addresses as a DNS table is offered them: all it gave, the
+/// ones the floor kept, the switch's own addresses and the instant.
+struct Offered<'a> {
+    plan: &'a Plan,
+    given: &'a [u32],
+    kept: &'a [u32],
+    own: &'a [u32],
+    now: KernelInstant,
+}
+
+impl Offered<'_> {
+    /// For each kept address, whether `pins` admitted it before the answer.
+    fn held_before(&self, pins: &Pins) -> Vec<bool> {
+        self.kept
+            .iter()
+            .map(|addr| pins.admitted_live(*addr, self.now))
+            .collect()
+    }
+
+    /// What the lines about `answer` read, from the table `held` names by
+    /// `number`, checked by `rules`. The
+    /// addresses it refused for room are counted for the table.
+    fn taken<T>(
+        &self,
+        whose: Whose,
+        held: &Held<T>,
+        number: u32,
+        answer: Answer,
+        held_before: Vec<bool>,
+        rules: &netcore::policy::Rules,
+    ) -> Taken {
+        let checked = rules.get();
+        let floored = self
+            .given
+            .iter()
+            .filter(|addr| !rebind::passes_floor(self.plan, **addr))
+            .map(|&addr| {
+                let rule =
+                    rebind::rebind(addr, false, &checked.deny, &checked.allow_subnets, self.own);
+                (addr, rule)
+            })
+            .collect();
+        let mut first_pin = false;
+        if let Answer::Fates(fates, _) = &answer {
+            let no_room = fates
+                .iter()
+                .filter(|fate| matches!(fate, netcore::answer::Fate::NoRoom))
+                .count();
+            held.refused_for_room.fetch_add(
+                u64::try_from(no_room).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            if fates
+                .iter()
+                .any(|fate| matches!(fate, netcore::answer::Fate::Held { .. }))
+            {
+                first_pin = !held.first_pin.swap(true, Ordering::Relaxed);
+            }
+        }
+        let name = usize::try_from(number)
+            .ok()
+            .and_then(|at| held.names.get(at))
+            .cloned()
+            .unwrap_or_default();
+        Taken {
+            whose,
+            name,
+            answer,
+            offered: self.kept.to_vec(),
+            held_before,
+            floored,
+            first_pin,
+            entry: None,
+        }
     }
 }
 
@@ -478,6 +573,67 @@ pub(crate) struct Decided {
     pub(crate) outcome: Option<Outcome>,
     pub(crate) members: usize,
     pub(crate) asked: AskedFor,
+    /// The frame was admitted on a DNS window alone because the table's
+    /// flows were at their capacity; `None` otherwise.
+    pub(crate) at_cap: Option<AtCap>,
+}
+
+/// A frame a DNS table admitted on its window alone at its flow capacity:
+/// what the at-capacity line reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AtCap {
+    /// The table's flow capacity.
+    pub(crate) cap: usize,
+    /// How many frames the table has so admitted, this one included.
+    pub(crate) admitted_at_cap: u64,
+    /// The line is due: it was not said in the last minute.
+    pub(crate) say: bool,
+}
+
+/// How often the at-capacity line is said for one table at most: once a
+/// minute, the existing window.
+const AT_CAP_LINE_MS: u64 = 60_000;
+
+/// Whether a frame `sent` a DNS table admitted with `egress`, the table's
+/// `pins` after it, was admitted on the window alone because the table's
+/// flows were at their capacity: a frame with ports, not a closing segment,
+/// admitted on the window with no flow, at a full flow table. A frame with
+/// no ports and a closing segment ride the window by their own shape.
+fn at_cap_of(
+    held: &Held<impl Sized>,
+    pins: &Pins,
+    egress: netcore::pins::Egress,
+    sent: netcore::judge::Sent,
+    now: KernelInstant,
+) -> Option<AtCap> {
+    if egress != netcore::pins::Egress::Window {
+        return None;
+    }
+    let SentKind::V4 {
+        proto,
+        l4: Some(l4),
+        ..
+    } = sent.kind
+    else {
+        return None;
+    };
+    if proto == IPPROTO_TCP && l4.flags & (TCP_FIN | TCP_RST) != 0 {
+        return None;
+    }
+    if pins.flow_count() < held.dns_flows_cap {
+        return None;
+    }
+    let admitted_at_cap = held.at_cap_admitted.fetch_add(1, Ordering::Relaxed) + 1;
+    let last = held.at_cap_said_ms.load(Ordering::Relaxed);
+    let say = last == u64::MAX || now.ms.saturating_sub(last) >= AT_CAP_LINE_MS;
+    if say {
+        held.at_cap_said_ms.store(now.ms, Ordering::Relaxed);
+    }
+    Some(AtCap {
+        cap: held.dns_flows_cap,
+        admitted_at_cap,
+        say,
+    })
 }
 
 /// What the kernel's tables made of a frame toward a guest, with what the
@@ -499,6 +655,55 @@ pub(crate) struct Recorded {
     /// The generation of the registry record whose row's tables these are
     /// ([`KernelConfig::generation_at`]); `None` for the node's own tables.
     pub(crate) generation: Option<u64>,
+}
+
+/// Whose DNS table took an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Whose {
+    /// The row's at this address.
+    Row([u8; 4]),
+    /// The node's.
+    Node,
+    /// The cohort's: the resident host_ip boxes' together.
+    Cohort,
+}
+
+/// What one DNS table made of an answer, with what the lines about it read.
+pub(crate) struct Taken {
+    /// The table.
+    pub(crate) whose: Whose,
+    /// The asked name, as the table's list holds it.
+    pub(crate) name: String,
+    /// What the table did.
+    pub(crate) answer: Answer,
+    /// The answer's addresses the floor kept, in the answer's order: the
+    /// ones the fates are for, one each.
+    pub(crate) offered: Vec<u32>,
+    /// For each of `offered`, whether the table admitted it before.
+    pub(crate) held_before: Vec<bool>,
+    /// The answer's addresses the floor removed, each with the rule the
+    /// check gives it (the floor is below the check, so always a refusal).
+    pub(crate) floored: Vec<(u32, rebind::Rebind)>,
+    /// The answer gave the table its first admission since it was made.
+    pub(crate) first_pin: bool,
+    /// For the node's table, the baseline's categories naming the name.
+    pub(crate) entry: Option<String>,
+}
+
+/// What the kernel's DNS tables made of one answer toward a box.
+pub(crate) struct Answered {
+    /// A table at the answer's destination holds names an answer is matched
+    /// against, read or not.
+    pub(crate) tables: bool,
+    /// What each table offered the answer did, in the order offered.
+    pub(crate) taken: Vec<Taken>,
+    /// The generation of the registry record whose row's tables are at the
+    /// answer's destination ([`KernelConfig::generation_at`]), and of the
+    /// resident `host_ip` boxes' record, as the configuration held them when
+    /// the answer was taken: a line names a box only while the registry holds
+    /// that record.
+    pub(crate) row_generation: Option<u64>,
+    pub(crate) cohort_generation: Option<u64>,
 }
 
 /// The kernel's configuration, with what keeps it in step with the
@@ -561,6 +766,10 @@ pub(crate) struct KernelConfig {
     /// its names and its blocks, which `node_rules` and the node's DNS
     /// admissions were checked against.
     node_endpoints: Vec<String>,
+    /// For each name of the node's DNS table, the baseline's categories that
+    /// name it, as the node plane's pin line spells them (`registry,cache`):
+    /// labels for that line, deciding nothing.
+    node_labels: BTreeMap<String, String>,
     /// The rules a DNS answer to the cohort is checked by: the union of the
     /// resident members' allowed subnets of the members that name a DNS
     /// host, nothing denied.
@@ -665,6 +874,7 @@ impl KernelConfig {
             cohort_pins: Held::new(Vec::new(), cohort_pins),
             node_rules: rules_from(None),
             node_endpoints: Vec::new(),
+            node_labels: BTreeMap::new(),
             cohort_rules: rules_from(None),
             misrouted: AtomicU64::new(0),
         })
@@ -1052,6 +1262,13 @@ impl KernelConfig {
         self.refresh_alias();
     }
 
+    /// Gives the node's DNS table its names' labels: for each name, the
+    /// baseline's categories that name it, as the node plane's pin line
+    /// spells them. Labels only; they decide nothing.
+    pub(crate) fn set_node_labels(&mut self, labels: impl IntoIterator<Item = (String, String)>) {
+        self.node_labels = labels.into_iter().collect();
+    }
+
     /// Sets the ports the node's row admits, where the hostname proxy
     /// listens at the alias, and the alias's state from them.
     pub(crate) fn set_hostname_proxy(&mut self, ports: &[u16]) {
@@ -1184,7 +1401,8 @@ impl KernelConfig {
         }
         // The node's numbering comes from the baseline, which a rebuild
         // keeps, and so do its endpoints, which the next adoption of the
-        // same baseline compares with. The node's tables belong to the
+        // same baseline compares with, and its names' labels, which the
+        // node's DNS lines are said with. The node's tables belong to the
         // node's own address, fixed for the configuration's life; they are
         // kept unless their lock was poisoned.
         if self.node_tables.tables.is_poisoned() {
@@ -1209,6 +1427,7 @@ impl KernelConfig {
         }
         std::mem::swap(&mut fresh.node_rules, &mut self.node_rules);
         fresh.node_endpoints = std::mem::take(&mut self.node_endpoints);
+        fresh.node_labels = std::mem::take(&mut self.node_labels);
         fresh.row_policies = std::mem::take(&mut self.row_policies);
         fresh.members = std::mem::take(&mut self.members);
         fresh.cohort_rules = cohort_rules(&fresh.members);
@@ -1336,13 +1555,19 @@ impl KernelConfig {
                 outcome: None,
                 members,
                 asked,
+                at_cap: None,
             });
         };
+        let mut at_cap = None;
         let outcome = match arm {
             Arm::Row(_, _) => match self.row_tables.get(&frame.sent.src) {
                 Some(held) => {
                     let mut tables = unpoisoned(held.tables.lock())?;
-                    self.config.finish_row(first, &mut tables, now)
+                    let outcome = self.config.finish_row(first, &mut tables, now);
+                    if let Outcome::Row(_, netcore::judge::Judged::Pinned(egress)) = outcome {
+                        at_cap = at_cap_of(held, &tables.pins, egress, frame.sent, now);
+                    }
+                    outcome
                 }
                 // A routed row with no tables is a broken invariant, not a
                 // case: tables exist exactly while a row holds its address,
@@ -1353,13 +1578,22 @@ impl KernelConfig {
             },
             Arm::Node(_) => {
                 let mut tables = unpoisoned(self.node_tables.tables.lock())?;
-                self.config.finish_node(first, &mut tables, now)
+                let outcome = self.config.finish_node(first, &mut tables, now);
+                if let Outcome::Node(netcore::node::NodeJudged::Pinned(egress)) = outcome {
+                    at_cap = at_cap_of(&self.node_tables, &tables.pins, egress, frame.sent, now);
+                }
+                outcome
             }
             Arm::Cohort(_) => {
                 let mut cohort = unpoisoned(self.cohort_pins.tables.lock())?;
                 let mut node = unpoisoned(self.node_tables.tables.lock())?;
-                self.config
-                    .finish_cohort(first, &mut node, &mut cohort, now)
+                let outcome = self
+                    .config
+                    .finish_cohort(first, &mut node, &mut cohort, now);
+                if let Outcome::Cohort(netcore::cohort::CohortJudged::Pinned(egress)) = outcome {
+                    at_cap = at_cap_of(&self.cohort_pins, &cohort, egress, frame.sent, now);
+                }
+                outcome
             }
             Arm::Refused(_) | Arm::RowDns(_) | Arm::CohortDns => {
                 return Ok(Decided {
@@ -1367,6 +1601,7 @@ impl KernelConfig {
                     outcome: None,
                     members,
                     asked,
+                    at_cap: None,
                 });
             }
         };
@@ -1386,6 +1621,7 @@ impl KernelConfig {
             outcome: Some(outcome),
             members,
             asked,
+            at_cap,
         })
     }
 
@@ -1506,6 +1742,26 @@ impl KernelConfig {
             .config
             .finish_ingress(heard, &mut tables, published, now)?;
         Some(said_of(held, &tables.flows, seen, before))
+    }
+
+    /// The addresses answers offered the DNS table at `addr` that it refused
+    /// for room: the node's at the node's address, else the row's there.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "read by the tests alone: no surface outside them reads it; the counter is \
+                      kept at the refusal in every build"
+        )
+    )]
+    pub(crate) fn refused_for_room_of(&self, addr: [u8; 4]) -> Option<u64> {
+        let at = u32::from_be_bytes(addr);
+        let held = if at == self.config.sources.plan().node() {
+            &self.node_tables
+        } else {
+            self.row_tables.get(&at)?
+        };
+        Some(held.refused_for_room.load(Ordering::Relaxed))
     }
 
     /// The frames toward the box at `addr` its reply table refused at its
@@ -1638,15 +1894,39 @@ impl KernelConfig {
         }
     }
 
+    /// Whether a question from `src` (the box's mark `marked`) meets a DNS
+    /// table that holds names, by the routing [`Self::record_question`]
+    /// asks by: the lines about a question are said only for such a box.
+    pub(crate) fn asks_names(&self, src: [u8; 4], marked: bool) -> bool {
+        let dscp = if marked {
+            boxes::core::egress::BOX_COHORT_DSCP
+        } else {
+            0
+        };
+        match self
+            .config
+            .sources
+            .origin(Some(u32::from_be_bytes(src)), true, dscp)
+        {
+            Origin::Row(_) => self
+                .row_tables
+                .get(&u32::from_be_bytes(src))
+                .is_some_and(|held| !held.names.is_empty()),
+            Origin::Node => !self.node_tables.names.is_empty(),
+            Origin::Cohort => !self.cohort_pins.names.is_empty(),
+            Origin::NoSource | Origin::Unregistered | Origin::Unknown => false,
+        }
+    }
+
     /// Offers a DNS answer delivered toward `dst` at `port` to the kernel's
     /// DNS tables, as `answer::answer` takes it, beside the daemon's own: a
     /// row's table for a row's address; at the node's address while its
     /// baseline is in force, the node's table first and then the cohort's.
     /// Each table is offered the asked name under its position in its own
     /// list, compared in wire form, and is not offered when its list does
-    /// not hold it. What each table did, in the order offered; a table
-    /// whose lock was poisoned is offered nothing, and at the node's address
-    /// neither is when one is ([`recordable`]). Decides nothing.
+    /// not hold it. What each table did, in the order offered. Decides
+    /// nothing.
+    #[cfg(test)]
     pub(crate) fn record_answer(
         &self,
         from: SocketAddrV4,
@@ -1655,34 +1935,75 @@ impl KernelConfig {
         datagram: &[u8],
         now: KernelInstant,
     ) -> Vec<Answer> {
+        self.record_answer_said(from, dst, port, datagram, now)
+            .taken
+            .into_iter()
+            .map(|taken| taken.answer)
+            .collect()
+    }
+
+    /// [`Self::record_answer`], with what the lines about the answer read
+    /// ([`Answered`]). The addresses an answer offered a table and refused
+    /// for room are counted for the table. A table whose lock was poisoned
+    /// is offered nothing, and at the node's address neither is when one is
+    /// ([`recordable`]).
+    pub(crate) fn record_answer_said(
+        &self,
+        from: SocketAddrV4,
+        dst: [u8; 4],
+        port: u16,
+        datagram: &[u8],
+        now: KernelInstant,
+    ) -> Answered {
+        let mut said = Answered {
+            tables: false,
+            taken: Vec::new(),
+            row_generation: self.generation_at(dst),
+            cohort_generation: self.cohort_generation(),
+        };
         // Only an answer from the plan's resolver, at DNS's port, is taken:
         // the kernel's tables match an answer by name, id and the box's port,
         // and know nothing of where it came from.
         if *from.ip() != self.subnet.dns_server() || from.port() != 53 {
-            return Vec::new();
+            return said;
         }
-        let dnsa::Answer::Read(given) = dnsa::answer_addresses(datagram) else {
-            return Vec::new();
-        };
         let plan = self.config.sources.plan();
+        let at = u32::from_be_bytes(dst);
+        let at_node = at == plan.node() && self.config.sources.node_in_force();
+        said.tables = if at_node {
+            !self.node_tables.names.is_empty() || !self.cohort_pins.names.is_empty()
+        } else {
+            self.row_tables
+                .get(&at)
+                .is_some_and(|held| !held.names.is_empty())
+        };
+        let dnsa::Answer::Read(given) = dnsa::answer_addresses(datagram) else {
+            return said;
+        };
         // The floor first, as the kernel's own answer does (netcore, GD2): no
         // address of the plane or of the plan's own block reaches a box's DNS
         // table, wherever the plan lies. For a plan inside the plane it
         // removes nothing the check below would admit (FL1).
         let addrs = rebind::floor(&plan, &given.addrs);
         let own = [plan.gateway(), plan.host_alias()];
-        let at = u32::from_be_bytes(dst);
-        let mut answered = Vec::new();
-        if at == plan.node() && self.config.sources.node_in_force() {
+        let offered = Offered {
+            plan: &plan,
+            given: &given.addrs,
+            kept: &addrs,
+            own: &own,
+            now,
+        };
+        if at_node {
             // The lock order: the cohort's DNS table, then the node's.
             let Some(mut cohort) = recordable(self.cohort_pins.tables.lock()) else {
-                return answered;
+                return said;
             };
             let Some(mut node) = recordable(self.node_tables.tables.lock()) else {
-                return answered;
+                return said;
             };
             if let Some(number) = self.node_tables.number_of_wire(&given.asked) {
-                answered.push(answer::answer(
+                let before = offered.held_before(&node.pins);
+                let answer = answer::answer(
                     &mut node,
                     &self.node_rules,
                     &own,
@@ -1692,10 +2013,21 @@ impl KernelConfig {
                     port,
                     &addrs,
                     now,
-                ));
+                );
+                let mut taken = offered.taken(
+                    Whose::Node,
+                    &self.node_tables,
+                    number,
+                    answer,
+                    before,
+                    &self.node_rules,
+                );
+                taken.entry = self.node_labels.get(&taken.name).cloned();
+                said.taken.push(taken);
             }
-            if let Some(number) = self.cohort_pins.number_of_wire(&given.asked)
-                && let Some(answer) = self.answer_for_the_cohort(
+            if let Some(number) = self.cohort_pins.number_of_wire(&given.asked) {
+                let before = offered.held_before(&cohort);
+                if let Some(answer) = self.answer_for_the_cohort(
                     &mut node,
                     &mut cohort,
                     number,
@@ -1704,23 +2036,31 @@ impl KernelConfig {
                     port,
                     &addrs,
                     now,
-                )
-            {
-                answered.push(answer);
+                ) {
+                    said.taken.push(offered.taken(
+                        Whose::Cohort,
+                        &self.cohort_pins,
+                        number,
+                        answer,
+                        before,
+                        &self.cohort_rules,
+                    ));
+                }
             }
-            return answered;
+            return said;
         }
         let Some(index) = self.config.sources.index_of(at) else {
-            return answered;
+            return said;
         };
         let (Some(held), Some(decl)) = (self.row_tables.get(&at), self.config.decls.get(index))
         else {
-            return answered;
+            return said;
         };
         if let Some(number) = held.number_of_wire(&given.asked)
             && let Some(mut tables) = recordable(held.tables.lock())
         {
-            answered.push(answer::answer(
+            let before = offered.held_before(&tables.pins);
+            let answer = answer::answer(
                 &mut tables,
                 &decl.rules,
                 &own,
@@ -1730,9 +2070,17 @@ impl KernelConfig {
                 port,
                 &addrs,
                 now,
+            );
+            said.taken.push(offered.taken(
+                Whose::Row(dst),
+                held,
+                number,
+                answer,
+                before,
+                &decl.rules,
             ));
         }
-        answered
+        said
     }
 
     /// The cohort's answer through `answer::answer`, which takes a box's
@@ -2017,7 +2365,9 @@ impl KernelConfig {
         limits.pins.flows_cap = cap;
         limits.pins.flows_per_destination = cap;
         let tables = tables_for(key, limits).expect("the kernel makes a table of that cap");
-        self.row_tables.insert(key, Held::new(names, tables));
+        let mut held = Held::new(names, tables);
+        held.dns_flows_cap = cap;
+        self.row_tables.insert(key, held);
     }
 
     /// Retires the DNS entry alone: the DNS table of the row at
@@ -3212,6 +3562,53 @@ mod tests {
         assert!(
             !in_node("cache.example", 0x0a03, 40003) && !in_cohort(0x0a03, 40003),
             "a baseline name no member declares, asked under the mark, is recorded nowhere"
+        );
+    }
+
+    /// After a rebuild, the node's answer is said with the pin line: the
+    /// rebuild carries the labels the node's names are said with, so the
+    /// answer the node's DNS table takes names its baseline entry.
+    #[test]
+    fn after_a_rebuild_the_nodes_answer_is_said_with_the_pin_line() {
+        let mut config = KernelConfig::new(subnet()).unwrap();
+        config.adopt_baseline(
+            true,
+            ["cache.example", "203.0.113.0/24"],
+            strings(&["cache.example"]),
+            &[],
+        );
+        config.set_node_labels([("cache.example".to_string(), "fetch".to_string())]);
+        config.rebuild(
+            std::iter::empty::<(Ipv4Addr, RowShape<'static>)>(),
+            Diverged::missing("test", at(9)),
+        );
+        let node = Ipv4Addr::from(config.config.sources.plan().node()).octets();
+        let asked = config.record_question(
+            node,
+            false,
+            subnet().dns_server().octets(),
+            "cache.example",
+            0x522a,
+            40000,
+            netcore::time::Instant { ms: 1 },
+        );
+        assert!(asked.is_some(), "the node asks its own name");
+        let answer = crate::net::dns_pins::tests::dns_response(
+            "cache.example.",
+            &[Ipv4Addr::new(203, 0, 113, 31)],
+        );
+        let said = config.record_answer_said(
+            SocketAddrV4::new(subnet().dns_server(), 53),
+            node,
+            40000,
+            &answer,
+            netcore::time::Instant { ms: 2 },
+        );
+        assert_eq!(said.taken.len(), 1, "the node's table takes the answer");
+        assert_eq!(
+            said.taken[0].entry.as_deref(),
+            Some("fetch"),
+            "the answer names the baseline's entry, as the pin line says it"
         );
     }
 
@@ -4515,6 +4912,92 @@ mod tests {
                 [Fate::NoRoom]
             ),
             "the name past the largest table's room is refused for room"
+        );
+    }
+
+    /// The at-capacity line reads the window admissions the table's full flows caused,
+    /// and no other: with a DNS flow table of one, a first flow is recorded
+    /// and reads nothing; at the full table a second flow rides the window
+    /// and reads as at the capacity, the line due once; a closing segment and
+    /// a frame with no ports ride the window by their own shape and read
+    /// nothing; a further flow at the capacity is counted with the line not
+    /// due again inside the minute, and due after it.
+    #[test]
+    fn the_at_capacity_reading_is_the_full_tables_window_alone() {
+        use boxes::core::egress::{TCP_ACK, TCP_FIN, TCP_SYN};
+        let instant = |ms| netcore::time::Instant { ms };
+        let (mut config, row) = one_naming_row(&["example.org"]);
+        config.shrink_dns_flow_cap(row.octets(), 1);
+        let resolver = subnet().dns_server();
+        let site = Ipv4Addr::new(93, 184, 216, 34);
+        let asked = config.record_question(
+            row.octets(),
+            false,
+            resolver.octets(),
+            "example.org",
+            0x522a,
+            40000,
+            instant(1),
+        );
+        assert!(asked.is_some(), "the box asks its name");
+        let answer = crate::net::dns_pins::tests::dns_response("example.org.", &[site]);
+        let answered = config.record_answer(
+            SocketAddrV4::new(resolver, 53),
+            row.octets(),
+            40000,
+            &answer,
+            instant(2),
+        );
+        assert_eq!(answered.len(), 1, "the row's table takes the answer");
+        let decide = |bytes: &[u8], now: u64| {
+            config
+                .decide_egress(bytes, None, instant(now))
+                .expect("no lock is poisoned")
+                .expect("a frame to no alias needs no exposure list")
+                .at_cap
+        };
+        let tcp = |port: u16, flags: u8| {
+            crate::net::dns_pins::tests::tcp_frame(row, port, site, 443, flags)
+        };
+        assert_eq!(
+            decide(&tcp(50000, TCP_SYN), 3),
+            None,
+            "the first flow is recorded"
+        );
+        assert_eq!(
+            decide(&tcp(50001, TCP_SYN), 4),
+            Some(AtCap {
+                cap: 1,
+                admitted_at_cap: 1,
+                say: true,
+            }),
+            "at the full table a new flow rides the window, and the line is due"
+        );
+        assert_eq!(
+            decide(&tcp(50002, TCP_FIN | TCP_ACK), 5),
+            None,
+            "a closing segment rides the window by its own shape"
+        );
+        let portless =
+            crate::net::egress_gate::test_support::ipv4_frame(row.octets(), 1, site.octets(), 0);
+        assert_eq!(decide(&portless, 6), None, "so does a frame with no ports");
+        assert_eq!(
+            decide(&tcp(50003, TCP_SYN), 7),
+            Some(AtCap {
+                cap: 1,
+                admitted_at_cap: 2,
+                say: false,
+            }),
+            "inside the minute the frame is counted and the line is not due"
+        );
+        assert_eq!(
+            decide(&tcp(50004, TCP_SYN), 4 + AT_CAP_LINE_MS),
+            Some(AtCap {
+                cap: 1,
+                admitted_at_cap: 3,
+                say: true,
+            }),
+            "after the minute the line is due again"
         );
     }
 }

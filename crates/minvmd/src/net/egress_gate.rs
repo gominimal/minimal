@@ -182,8 +182,8 @@ use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::bep_attach::{BoxId, BoxIdText};
-use crate::box_registry::{AskedFor, BoxRecord, BoxTable, KernelPorts, RowWithdrawal};
-use crate::net::kernel_config::Recorded;
+use crate::box_registry::{AskedFor, BoxRecord, BoxTable, KernelPorts, NotRecorded, RowWithdrawal};
+use crate::net::kernel_config::{Answered, AtCap, Recorded, Whose};
 
 use super::baseline::{self, NodeBaselinePhase, NodePlaneBaseline};
 use super::dns_pins;
@@ -5025,16 +5025,20 @@ async fn relay_switch_frames_to_guest(
         // A DNS answer toward a box with tables, from the kernel's reading of
         // the datagram.
         if observed && let Some((pkt, datagram)) = kernel_facts::udp_datagram(&frame[..n], &facts) {
-            pins.observe_reply(&table, &pkt, datagram, &limiter, Instant::now());
-            // The kernel's DNS tables are offered the answer too, read by the
-            // kernel's own reader. Nothing it says changes the frame.
-            let _answered = table.kernel_answer(
+            // The daemon's own table keeps its records of the answer, and
+            // decides and says nothing.
+            pins.observe_reply(&table, &pkt, datagram, Instant::now());
+            // The kernel's DNS tables take the answer, read by the kernel's
+            // own reader, and the DNS lines are said from what they made of
+            // it. Nothing they say changes the frame.
+            let answered = table.kernel_answer_said(
                 pkt.src,
                 pkt.dst.ip().octets(),
                 pkt.dst.port(),
                 datagram,
                 now_k,
             );
+            say_answer(&answered, &table, pkt.dst.ip().octets(), datagram, &limiter);
         }
         // One combined write keeps the length prefix and the frame together
         // even if the guest closes between two writes; the permit taken
@@ -5118,6 +5122,9 @@ async fn relay_frames_to_switch(
         }
         if decided.marked {
             log_marked_decision(&decided, table, baseline);
+        }
+        if let Some(at_cap) = decided.at_cap {
+            say_at_cap(&decided, at_cap, table);
         }
         let admitted = match decided.verdict {
             Ok(admitted) => admitted,
@@ -5351,30 +5358,21 @@ async fn relay_frames_to_switch(
         // the resolver's port — and only for a frame the queue took, which
         // is why this sits after the enqueue.
         if let Some((query, datagram)) = dns {
-            let from_node = decided.src == Some(table.subnet().daemon_ip().octets());
-            let asker = decided.decided_for.asker(decided.marked && from_node);
-            pins.observe_query(table, asker, &query, datagram, Instant::now());
-            // The kernel's DNS table records the question too, when it is
-            // one the gate records ([`standard_query`]): its name as the
+            // A question is recorded only when it is one the gate records
+            // ([`standard_query`]). The daemon's own table keeps its record of
+            // it, and decides and says nothing.
+            let standard = standard_query(datagram);
+            if standard {
+                let from_node = decided.src == Some(table.subnet().daemon_ip().octets());
+                let asker = decided.decided_for.asker(decided.marked && from_node);
+                pins.observe_query(table, asker, &query, datagram, Instant::now());
+            }
+            // The kernel's DNS table records the question: its name as the
             // library reads it, its id from the header, its port from the
-            // kernel's reading. Nothing it says changes the frame, which the
-            // queue holds by now: a lock poisoned since the decision, which
-            // took the same table's, leaves the question unrecorded.
-            if standard_query(datagram)
-                && let (Some(src), Some((name, txid))) =
-                    (decided.src, dns_pins::question_of(datagram))
-                && let Err(Poisoned) = table.kernel_question(
-                    src,
-                    decided.decided_for.asked(),
-                    decided.marked,
-                    query.dst.ip().octets(),
-                    &name,
-                    txid,
-                    query.src.port(),
-                    now_k,
-                )
-            {
-                tracing::debug!("not recorded: a kernel table's lock was poisoned");
+            // kernel's reading, and the lines about it are said from what
+            // the table did. Nothing it says changes the frame.
+            if let Some(src) = decided.src {
+                say_question(table, &decided, src, &query, datagram, standard, now_k);
             }
         }
     }
@@ -6232,9 +6230,30 @@ struct GuestFrame {
     /// The registry records the frame was decided for; the relay records
     /// what it observes of the frame for them alone.
     decided_for: DecidedFor,
+    /// The frame was admitted on a DNS window alone because the table's
+    /// flows were at their capacity.
+    at_cap: Option<AtCap>,
 }
 
 impl GuestFrame {
+    /// The record a line about the frame names: the one it was decided for
+    /// (the resident `host_ip` boxes' for a marked frame from the node
+    /// address, the row at its source otherwise), while the registry holds it
+    /// there; none once it holds another.
+    fn named(&self, table: &BoxTable) -> Option<Arc<BoxRecord>> {
+        let from_node = self.src == Some(table.subnet().daemon_ip().octets());
+        let (decided, held) = if self.marked && from_node {
+            (self.decided_for.cohort.as_ref(), table.host_ip_cohort())
+        } else {
+            (
+                self.decided_for.row.as_ref(),
+                self.src.and_then(|src| table.by_source(src)),
+            )
+        };
+        let generation = decided?.generation();
+        held.filter(|record| record.generation() == generation)
+    }
+
     /// A drop decided before the frame was routed: nothing of it was read
     /// for the daemon's tables.
     fn unrouted(verdict: Result<GateAdmit, GateDrop>, src: Option<[u8; 4]>) -> Self {
@@ -6247,6 +6266,7 @@ impl GuestFrame {
             port: None,
             marked: false,
             decided_for: DecidedFor::default(),
+            at_cap: None,
         }
     }
 }
@@ -6399,6 +6419,7 @@ fn guest_frame(
         port,
         marked,
         decided_for,
+        at_cap: decided.at_cap,
     };
     let dst_port = port.unwrap_or(0);
     // A frame no judge decides is egress_first's drop, as the arm says;
@@ -6695,6 +6716,281 @@ fn standard_query(datagram: &[u8]) -> bool {
     datagram.len() <= dns_pins::MAX_DATAGRAM
         && datagram.get(2).is_some_and(|flags| flags & 0x80 == 0)
         && hickory_proto::op::Message::from_vec(datagram).is_ok()
+}
+
+/// Records a question the box at `src` sent in the kernel's DNS tables when
+/// it is a `standard` one ([`standard_query`]), and says the lines about it,
+/// with their existing text, for a box whose table holds names: a datagram too
+/// large or unreadable for the library, said only for a UDP datagram to the
+/// resolver's port at the switch's address, and a question the table did not
+/// record for want of room, or because the row it was decided for is no
+/// longer at its address (that line names no box). Each is a refusal, said
+/// whoever holds the
+/// address, naming the box only while the registry holds the record the
+/// frame was decided for ([`GuestFrame::named`]).
+fn say_question(
+    table: &BoxTable,
+    decided: &GuestFrame,
+    src: [u8; 4],
+    query: &dns_pins::L4Packet,
+    datagram: &[u8],
+    standard: bool,
+    now: netcore::time::Instant,
+) {
+    let named = decided.named(table);
+    let namespace = named.as_ref().map(|record| record.name());
+    let to_resolver = query.proto == egress::IPPROTO_UDP
+        && query.dst.port() == RESOLVER_PORT
+        && query.dst.ip().octets() == table.gateway();
+    let says = to_resolver && table.kernel_asks_names(src, decided.marked);
+    if says && datagram.len() > dns_pins::MAX_DATAGRAM {
+        tracing::debug!(
+            switch_addr = %Ipv4Addr::from(src),
+            namespace = namespace.as_deref().map(tracing::field::display),
+            n = datagram.len(),
+            "ignoring an oversized DNS query at the host-side admission table"
+        );
+    } else if says && let Err(error) = hickory_proto::op::Message::from_vec(datagram) {
+        tracing::debug!(
+            switch_addr = %Ipv4Addr::from(src),
+            namespace = namespace.as_deref().map(tracing::field::display),
+            %error,
+            "passing an unparseable DNS query through unrecorded on the host"
+        );
+    }
+    if !standard {
+        return;
+    }
+    let Some((name, txid)) = dns_pins::question_of(datagram) else {
+        return;
+    };
+    let asked = match table.kernel_question(
+        src,
+        decided.decided_for.asked(),
+        decided.marked,
+        query.dst.ip().octets(),
+        &name,
+        txid,
+        query.src.port(),
+        now,
+    ) {
+        Ok(asked) => asked,
+        Err(NotRecorded::NotDecidedFor) => {
+            tracing::debug!(
+                switch_addr = %Ipv4Addr::from(src),
+                name = %name,
+                "not recorded: the row the question was decided for is no longer at its address"
+            );
+            return;
+        }
+        // The frame is the queue's by now; a lock poisoned since its
+        // decision, which took the same table's, leaves the question
+        // unrecorded.
+        Err(NotRecorded::Poisoned) => {
+            tracing::debug!("not recorded: a kernel table's lock was poisoned");
+            return;
+        }
+    };
+    if matches!(
+        asked,
+        Some(netcore::pins::Asked::Full | netcore::pins::Asked::NameAtQuota)
+    ) {
+        tracing::debug!(
+            switch_addr = %Ipv4Addr::from(src),
+            namespace = namespace.as_deref().map(tracing::field::display),
+            name = %name,
+            cap = egress::DNS_OUTSTANDING_QUERY_CAP,
+            "not recording a question past the outstanding-query cap; its reply pins nothing"
+        );
+    }
+}
+
+/// Says that a DNS table's flows are at their capacity, once a minute for
+/// the table at most, with the existing line's fields: the box (the cohort's record
+/// for a marked frame from the node), the cap, and how many frames the
+/// table has admitted on the window alone so far.
+fn say_at_cap(decided: &GuestFrame, at_cap: AtCap, table: &BoxTable) {
+    if !at_cap.say {
+        return;
+    }
+    let Some(record) = decided.named(table) else {
+        return;
+    };
+    tracing::info!(
+        switch_addr = %record.switch_addr(),
+        namespace = %record.name(),
+        cap = at_cap.cap,
+        admitted_at_cap = at_cap.admitted_at_cap,
+        "the box's flow table is at its cap; its frames ride the admission window alone and no \
+         flow is retained for them"
+    );
+}
+
+/// The rule a DNS refusal is said under, by the check's reason.
+fn rebind_rule(rule: netcore::rebind::Rebind) -> &'static str {
+    match rule {
+        netcore::rebind::Rebind::DeniedSubnet => "dns-rebinding-denied-subnet",
+        netcore::rebind::Rebind::Infrastructure | netcore::rebind::Rebind::Admitted => {
+            "dns-rebinding-infrastructure"
+        }
+    }
+}
+
+/// Says the DNS lines for one answer toward the box at `dst`, from what the
+/// kernel's DNS tables made of it (`said`), with each line's existing text,
+/// level and rate window: an answer too large or unreadable for the
+/// library, at a destination whose tables hold names; each refused address
+/// under its rule, matched by address (the floor's, under the rule the
+/// check gives it; the rest by its fate); the addresses refused for want of
+/// room; and the admitted ones: for the node, the baseline entry's pin or
+/// re-pin line, and otherwise the box's first-fill line once and the
+/// window's debug line. The refusals are said whoever holds the address,
+/// naming the box only while the registry holds the record whose tables
+/// took the answer; the lines about the admitted ones report that box's
+/// own state and are said only then.
+fn say_answer(
+    said: &Answered,
+    table: &BoxTable,
+    dst: [u8; 4],
+    datagram: &[u8],
+    limiter: &DropLimiter,
+) {
+    if !said.tables {
+        return;
+    }
+    let node = table.subnet().daemon_ip().octets();
+    // A line names a box only while the registry holds the record whose
+    // tables took the answer. A refusal is said whoever holds the address,
+    // naming no box when the record there is another one; a line about the
+    // box's own state is said only for that record.
+    let same =
+        |record: &Arc<BoxRecord>, generation: Option<u64>| Some(record.generation()) == generation;
+    let row_at = |at: [u8; 4]| {
+        table
+            .by_source(at)
+            .filter(|record| same(record, said.row_generation))
+    };
+    let named = row_at(dst);
+    let namespace = named.as_ref().map(|record| record.name());
+    if datagram.len() > dns_pins::MAX_DATAGRAM {
+        tracing::debug!(
+            switch_addr = %Ipv4Addr::from(dst),
+            namespace = namespace.as_deref().map(tracing::field::display),
+            n = datagram.len(),
+            "ignoring an oversized DNS reply at the host-side admission table"
+        );
+    } else if let Err(error) = hickory_proto::op::Message::from_vec(datagram) {
+        tracing::debug!(
+            switch_addr = %Ipv4Addr::from(dst),
+            namespace = namespace.as_deref().map(tracing::field::display),
+            %error,
+            "passing an unparseable DNS reply through unpinned on the host"
+        );
+    }
+    for taken in &said.taken {
+        let (source, record) = match taken.whose {
+            Whose::Row(at) => (at, row_at(at)),
+            Whose::Node => (node, table.by_source(node)),
+            Whose::Cohort => (
+                node,
+                table
+                    .host_ip_cohort()
+                    .filter(|record| same(record, said.cohort_generation)),
+            ),
+        };
+        let namespace = record.as_ref().map(|record| record.name());
+        let name = taken.name.as_str();
+        // Only an answer to the box's own question is checked, so only its
+        // addresses are said as refused.
+        let netcore::answer::Answer::Fates(fates, _) = &taken.answer else {
+            continue;
+        };
+        for (addr, rule) in &taken.floored {
+            limiter.warn_dns_refusal(source, name, Ipv4Addr::from(*addr), rebind_rule(*rule));
+        }
+        let mut admitted = Vec::new();
+        let mut refreshed = 0usize;
+        let mut no_room = Vec::new();
+        for ((addr, fate), before) in taken.offered.iter().zip(fates).zip(&taken.held_before) {
+            let addr = Ipv4Addr::from(*addr);
+            match fate {
+                netcore::answer::Fate::Held { .. } => {
+                    admitted.push(addr);
+                    refreshed += usize::from(*before);
+                }
+                netcore::answer::Fate::NoRoom => no_room.push(addr),
+                netcore::answer::Fate::Refused(rule) => {
+                    limiter.warn_dns_refusal(source, name, addr, rebind_rule(*rule));
+                }
+            }
+        }
+        // The table's room is its names times the per-name quota, so a
+        // refusal for room is always one at the name's quota, said under the
+        // per-name cap's line.
+        if !no_room.is_empty() {
+            let over_cap = no_room;
+            tracing::debug!(
+                switch_addr = %Ipv4Addr::from(source),
+                namespace = namespace.as_deref().map(tracing::field::display),
+                name,
+                ?over_cap,
+                cap = egress::DNS_MAX_ADDRESSES_PER_NAME,
+                "refused a resolved name's answers past the per-name cap on the host"
+            );
+        }
+        // What follows reports the box's own state: said only for the
+        // record whose tables took the answer.
+        let Some(record) = record else {
+            continue;
+        };
+        if admitted.is_empty() {
+            continue;
+        }
+        let window_secs = egress::DNS_ADMISSION_WINDOW.as_secs();
+        if let (Whose::Node, Some(entry)) = (taken.whose, &taken.entry) {
+            let resolver = Ipv4Addr::from(record.egress().resolver());
+            if refreshed == admitted.len() {
+                tracing::info!(
+                    entry = %entry,
+                    name,
+                    addresses = ?admitted,
+                    lookup_source = %record.switch_addr(),
+                    resolver = %resolver,
+                    window_secs,
+                    "re-pinned a node-plane baseline entry's addresses from the node's own lookup"
+                );
+            } else {
+                tracing::info!(
+                    entry = %entry,
+                    name,
+                    addresses = ?admitted,
+                    lookup_source = %record.switch_addr(),
+                    resolver = %resolver,
+                    window_secs,
+                    "pinned a node-plane baseline entry's addresses from the node's own lookup"
+                );
+            }
+            continue;
+        }
+        if taken.first_pin {
+            tracing::info!(
+                switch_addr = %record.switch_addr(),
+                namespace = %record.name(),
+                name,
+                "filled the box's host-side DNS admission table; its undeclared \
+                 destinations are decided on the host, against the answers its own \
+                 lookups received"
+            );
+        }
+        tracing::debug!(
+            switch_addr = %record.switch_addr(),
+            namespace = %record.name(),
+            name,
+            addresses = ?admitted,
+            window_secs,
+            "admitted a resolved name's addresses for the window on the host"
+        );
+    }
 }
 
 /// Whether the relay delivers a frame toward a guest the kernel's tables
@@ -24931,8 +25227,7 @@ mod tests {
     /// put to the rebinding check, so an address in the row's denied range
     /// and a private address the row does not allow are admitted in no
     /// table of the kernel's, while the answer's public address is; each
-    /// refusal is said under its rule. The lines are the daemon's own table's; they
-    /// move to the kernel's fates in the next step.
+    /// refusal is said under its rule, from the kernel's fates.
     #[tokio::test]
     async fn a_rebinding_answers_refused_addresses_are_admitted_nowhere_and_said() {
         let registry = BoxRegistry::new(SUBNET);
@@ -24997,6 +25292,507 @@ mod tests {
             held.iter()
                 .all(|address| kernel_admits(&h, LEASE, address.octets())),
             "the addresses held keep their places"
+        );
+    }
+
+    /// The per-name cap's line and counter: an address an answer offers a full admission
+    /// table is said once, at debug, under the per-name cap's line naming the
+    /// box, the name, the addresses refused and the quota (a full table has
+    /// every name at its quota), and is counted for the box. Read here at
+    /// debug, which the relay harness's log does not keep.
+    #[test]
+    fn an_address_refused_for_room_is_said_and_counted() {
+        let log = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let registry = row_naming(&["example.com"]);
+        let table = registry.table();
+        let resolver = SUBNET.dns_server();
+        let exchange = |port: u16, addrs: &[Ipv4Addr]| {
+            let asked = table.kernel_question(
+                LEASE,
+                table.asked_now(LEASE),
+                false,
+                resolver.octets(),
+                "example.com",
+                0x522a,
+                port,
+                table.kernel_now(),
+            );
+            assert!(matches!(asked, Ok(Some(_))), "the box asks its name");
+            let datagram = dns_pins::tests::dns_response("example.com", addrs);
+            let said = table.kernel_answer_said(
+                std::net::SocketAddrV4::new(resolver, 53),
+                LEASE,
+                port,
+                &datagram,
+                table.kernel_now(),
+            );
+            super::say_answer(&said, &table, LEASE, &datagram, &DropLimiter::new());
+        };
+        let held: Vec<Ipv4Addr> = (1..=32)
+            .map(|last| Ipv4Addr::new(93, 184, 216, last))
+            .collect();
+        exchange(40000, &held);
+        exchange(40001, &[Ipv4Addr::new(93, 184, 216, 100)]);
+        let logged = log.contents();
+        let room = "refused a resolved name's answers past the per-name cap on the host";
+        assert_eq!(logged.matches(room).count(), 1, "said once: {logged}");
+        let line = logged
+            .lines()
+            .find(|line| line.contains(room))
+            .expect("the room line was written");
+        assert!(
+            line.contains("switch_addr=100.64.0.9")
+                && line.contains("name=\"example.com\"")
+                && line.contains("over_cap=[93.184.216.100]")
+                && line.contains("cap=32"),
+            "the line names the box, the name, the refused and the quota: {line}"
+        );
+        assert_eq!(
+            table.kernel_for_tests().refused_for_room_of(LEASE),
+            Some(1),
+            "the refusal is counted for the box"
+        );
+    }
+
+    /// The row at `LEASE` registered again, naming what `row_naming(names)`
+    /// names: a new record at the address, with new tables.
+    fn register_naming_again(registry: &BoxRegistry, names: &[&str]) {
+        registry.register(
+            BoxRegistration::new("probe", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: None,
+                    allow_subnets: Some(vec![]),
+                    allow_dns_hosts: Some(names.iter().map(ToString::to_string).collect()),
+                    deny_subnets: None,
+                }),
+        );
+    }
+
+    /// A refusal about a box's DNS question is said whoever holds the
+    /// address: decided for the row at `LEASE`, an unreadable query is said
+    /// naming the box; when the row there has been registered again by the
+    /// time the line is written, the same line is said naming no box. Read at
+    /// debug, which the relay harness's log does not keep, so the line
+    /// functions are called as the relay calls them.
+    #[test]
+    fn a_refusal_is_said_naming_no_box_once_the_row_at_the_address_is_another_one() {
+        let log = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let registry = row_naming(&["example.com"]);
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        table.adopt_node_baseline(&baseline);
+        let garbage = [0x12, 0x34, 0x01];
+        let frame = dns_pins::tests::udp_payload_frame(
+            Ipv4Addr::from(LEASE),
+            40000,
+            SUBNET.dns_server(),
+            53,
+            &garbage,
+        );
+        let facts = netcore::frame::parse_frame(&frame);
+        let (query, datagram) = super::kernel_facts::udp_datagram(&frame, &facts)
+            .expect("the query is a whole datagram");
+        let unreadable = "passing an unparseable DNS query through unrecorded on the host";
+        let lines = || {
+            log.contents()
+                .lines()
+                .filter(|line| line.contains(unreadable))
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        };
+
+        let decided = super::guest_frame(&frame, &table, &baseline, table.kernel_now());
+        super::say_question(
+            &table,
+            &decided,
+            LEASE,
+            &query,
+            datagram,
+            false,
+            table.kernel_now(),
+        );
+        assert!(
+            lines()
+                .last()
+                .is_some_and(|line| line.contains("namespace=probe")),
+            "while the row is the one decided for, the line names it: {:?}",
+            lines()
+        );
+
+        let decided = super::guest_frame(&frame, &table, &baseline, table.kernel_now());
+        register_naming_again(&registry, &["example.com"]);
+        super::say_question(
+            &table,
+            &decided,
+            LEASE,
+            &query,
+            datagram,
+            false,
+            table.kernel_now(),
+        );
+        let said = lines();
+        assert_eq!(said.len(), 2, "the refusal is said again: {said:?}");
+        assert!(
+            !said[1].contains("namespace="),
+            "with another row at the address, it names no box: {}",
+            said[1]
+        );
+
+        // A whole question decided for the row there, which is registered
+        // again before it is recorded: the kernel's table does not record it,
+        // and the line says so naming no box.
+        let question = dns_pins::tests::udp_payload_frame(
+            Ipv4Addr::from(LEASE),
+            40001,
+            SUBNET.dns_server(),
+            53,
+            &dns_pins::tests::dns_query("example.com"),
+        );
+        let facts = netcore::frame::parse_frame(&question);
+        let (query, datagram) = super::kernel_facts::udp_datagram(&question, &facts)
+            .expect("the question is a whole datagram");
+        let decided = super::guest_frame(&question, &table, &baseline, table.kernel_now());
+        register_naming_again(&registry, &["example.com"]);
+        super::say_question(
+            &table,
+            &decided,
+            LEASE,
+            &query,
+            datagram,
+            true,
+            table.kernel_now(),
+        );
+        let moved =
+            "not recorded: the row the question was decided for is no longer at its address";
+        let line = log
+            .contents()
+            .lines()
+            .find(|line| line.contains(moved))
+            .map(ToString::to_string)
+            .expect("the unrecorded question is said");
+        assert!(
+            line.contains("name=example.com") && !line.contains("namespace="),
+            "the line names the question and no box: {line}"
+        );
+    }
+
+    /// The oversized and unreadable query lines are said only for a datagram
+    /// to the resolver's port at the switch's address: the same two datagrams
+    /// a box sends to another host's port 53 say neither line, and sent to
+    /// the resolver each says its line once. Read at debug, which the relay
+    /// harness's log does not keep, so the line function is called as the
+    /// relay calls it.
+    #[test]
+    fn a_query_to_another_hosts_dns_port_says_no_oversized_or_unreadable_line() {
+        let log = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let registry = row_naming(&["example.com"]);
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        table.adopt_node_baseline(&baseline);
+        let garbage = [0x12, 0x34, 0x01];
+        let oversized = vec![0u8; dns_pins::MAX_DATAGRAM + 1];
+        let unreadable = "passing an unparseable DNS query through unrecorded on the host";
+        let too_large = "ignoring an oversized DNS query at the host-side admission table";
+        let count = |line: &str| log.contents().matches(line).count();
+        let say_to = |dst: Ipv4Addr| {
+            let frame =
+                dns_pins::tests::udp_payload_frame(Ipv4Addr::from(LEASE), 40000, dst, 53, &garbage);
+            let facts = netcore::frame::parse_frame(&frame);
+            let (query, datagram) = super::kernel_facts::udp_datagram(&frame, &facts)
+                .expect("the query is a whole datagram");
+            let decided = super::guest_frame(&frame, &table, &baseline, table.kernel_now());
+            for datagram in [datagram, &oversized[..]] {
+                super::say_question(
+                    &table,
+                    &decided,
+                    LEASE,
+                    &query,
+                    datagram,
+                    false,
+                    table.kernel_now(),
+                );
+            }
+        };
+
+        say_to(Ipv4Addr::new(93, 184, 216, 34));
+        assert_eq!(
+            (count(unreadable), count(too_large)),
+            (0, 0),
+            "a datagram to another host's port 53 says neither line: {}",
+            log.contents()
+        );
+
+        say_to(SUBNET.dns_server());
+        assert_eq!(
+            (count(unreadable), count(too_large)),
+            (1, 1),
+            "the same datagrams to the resolver each say their line: {}",
+            log.contents()
+        );
+    }
+
+    /// A line that reports a box's own state is said only for the record
+    /// the frame was decided for: at the box's DNS flow capacity, a frame
+    /// admitted on the window says the at-capacity line once a minute; when
+    /// the row at the address is registered again between the verdict and
+    /// the line, it is not said.
+    #[tokio::test]
+    async fn a_state_line_is_not_said_once_the_row_at_the_address_is_another_one() {
+        use boxes::core::egress::TCP_SYN;
+        let registry = Arc::new(row_naming(&["example.com"]));
+        let mut h = gate_over_kept(&registry).await;
+        h.table.kernel_shrink_dns_flow_cap_for_tests(LEASE, 1);
+        let site = Ipv4Addr::new(93, 184, 216, 34);
+        ask_through(&mut h, "example.com", 40000).await;
+        let answer = dns_pins::tests::dns_response("example.com", &[site]);
+        answer_through(&mut h, 40000, &answer).await;
+        let lease = Ipv4Addr::from(LEASE);
+        let first = dns_pins::tests::tcp_frame(lease, 50000, site, 443, TCP_SYN);
+        send_frame(&mut h.guest, &first).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            first,
+            "the first flow passes"
+        );
+
+        let again = Arc::clone(&registry);
+        let mut fired = false;
+        super::test_hooks::AFTER_DECIDED.set(Some(Box::new(move |_: &BoxTable, _: [u8; 4]| {
+            if !fired {
+                fired = true;
+                register_naming_again(&again, &["example.com"]);
+            }
+        })));
+        let second = dns_pins::tests::tcp_frame(lease, 50001, site, 443, TCP_SYN);
+        let marker = ipv4_frame(LEASE, 17, SUBNET.dns_server().octets(), 53);
+        send_frame(&mut h.guest, &second).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            second,
+            "at the capacity, the frame passes on the window"
+        );
+        super::test_hooks::AFTER_DECIDED.set(None);
+        send_frame(&mut h.guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            marker,
+            "the marker passes"
+        );
+        assert!(
+            !h.log
+                .contents()
+                .contains("the box's flow table is at its cap"),
+            "the at-capacity line is not said for the row registered again: {}",
+            h.log.contents()
+        );
+    }
+
+    /// The node plane's pin and re-pin lines, through the relay, from the
+    /// kernel's tables: the node's own lookup of a baseline entry's name pins
+    /// its answer and says so, naming the entry, the addresses, the lookup's
+    /// source and the resolver; the same answer again re-pins and says that.
+    #[tokio::test]
+    async fn the_node_planes_pin_and_re_pin_lines_come_from_the_kernel() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        let mut h = gate_over(registry).await;
+        let node = SUBNET.daemon_ip();
+        let resolver = SUBNET.dns_server();
+        let cache = Ipv4Addr::new(203, 0, 113, 10);
+        let name = crate::net::baseline::DAEMON_CACHE_ENDPOINT;
+        for port in [40000, 40001] {
+            let query = dns_pins::tests::udp_payload_frame(
+                node,
+                port,
+                resolver,
+                53,
+                &dns_pins::tests::dns_query(name),
+            );
+            send_frame(&mut h.guest, &query).await;
+            assert_eq!(
+                expect_frame(&mut h.switch).await,
+                query,
+                "the node's query reaches the switch"
+            );
+            let reply = dns_pins::tests::udp_payload_frame(
+                resolver,
+                53,
+                node,
+                port,
+                &dns_pins::tests::dns_response(name, &[cache]),
+            );
+            send_frame(&mut h.switch, &reply).await;
+            assert_eq!(
+                expect_frame(&mut h.guest).await,
+                reply,
+                "the answer reaches the node"
+            );
+        }
+        wait_for_log(&h.log, "re-pinned a node-plane baseline entry's addresses").await;
+        let logged = h.log.contents();
+        let pin = logged
+            .lines()
+            .find(|line| {
+                line.contains("pinned a node-plane baseline entry's addresses")
+                    && !line.contains("re-pinned")
+            })
+            .expect("the first answer pins and says so");
+        assert!(
+            pin.contains("entry=cache")
+                && pin.contains("addresses=[203.0.113.10]")
+                && pin.contains(&format!("lookup_source={node}"))
+                && pin.contains(&format!("resolver={resolver}")),
+            "the pin line names the entry, the addresses, the source and the resolver: {pin}"
+        );
+    }
+
+    /// The first-fill line, through the relay, from the kernel's tables: the
+    /// first answer each box's table admitted says so once, naming the box
+    /// and the name; a later answer adds no second line for the same box,
+    /// and another box has its own.
+    #[tokio::test]
+    async fn the_first_fill_line_is_said_once_per_box_from_the_kernel() {
+        let registry = row_naming(&["example.com"]);
+        let other = [100, 64, 0, 10];
+        registry.register(
+            BoxRegistration::new("other", Ipv4Addr::from(other), Ipv4Addr::LOCALHOST)
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: None,
+                    allow_subnets: Some(vec![]),
+                    allow_dns_hosts: Some(vec!["other.example".to_string()]),
+                    deny_subnets: None,
+                }),
+        );
+        let mut h = gate_over(registry).await;
+        let resolver = SUBNET.dns_server();
+        for (lease, name, port, last) in [
+            (LEASE, "example.com", 40000, 1),
+            (LEASE, "example.com", 40001, 2),
+            (other, "other.example", 40000, 3),
+        ] {
+            let query = dns_pins::tests::udp_payload_frame(
+                Ipv4Addr::from(lease),
+                port,
+                resolver,
+                53,
+                &dns_pins::tests::dns_query(name),
+            );
+            send_frame(&mut h.guest, &query).await;
+            assert_eq!(expect_frame(&mut h.switch).await, query, "the query passes");
+            let reply = dns_pins::tests::udp_payload_frame(
+                resolver,
+                53,
+                Ipv4Addr::from(lease),
+                port,
+                &dns_pins::tests::dns_response(name, &[Ipv4Addr::new(93, 184, 216, last)]),
+            );
+            send_frame(&mut h.switch, &reply).await;
+            assert_eq!(expect_frame(&mut h.guest).await, reply, "the answer passes");
+        }
+        wait_for_log(&h.log, "name=\"other.example\"").await;
+        let logged = h.log.contents();
+        let first = "filled the box's host-side DNS admission table";
+        assert_eq!(
+            logged.matches(first).count(),
+            2,
+            "one first-fill line per box: {logged}"
+        );
+        assert!(
+            logged.lines().any(|line| line.contains(first)
+                && line.contains("switch_addr=100.64.0.9")
+                && line.contains("namespace=probe")
+                && line.contains("name=\"example.com\"")),
+            "the first box's line names it and its name: {logged}"
+        );
+        assert!(
+            logged.lines().any(|line| line.contains(first)
+                && line.contains("switch_addr=100.64.0.10")
+                && line.contains("name=\"other.example\"")),
+            "the second box's line names it and its name: {logged}"
+        );
+    }
+
+    /// The refusal lines, through the relay, from the kernel's tables and
+    /// matched by address: in one answer, an address in the row's denied
+    /// range is said under the denied-subnet rule from its fate, and a
+    /// link-local address the floor removed is said under the
+    /// infrastructure rule the check gives it, while the answer's public
+    /// address is admitted; another name's multicast answer, which the floor
+    /// removes too, is said under its own name.
+    #[tokio::test]
+    async fn a_rebinding_answers_refusals_are_said_by_address_from_the_kernel() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(
+            BoxRegistration::new("probe", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: None,
+                    allow_subnets: Some(vec![]),
+                    allow_dns_hosts: Some(vec![
+                        "example.com".to_string(),
+                        "other.example".to_string(),
+                    ]),
+                    deny_subnets: Some(vec!["198.51.100.0/24".to_string()]),
+                }),
+        );
+        let mut h = gate_over(registry).await;
+        let denied = Ipv4Addr::new(198, 51, 100, 7);
+        let link_local = Ipv4Addr::new(169, 254, 169, 254);
+        let public = Ipv4Addr::new(93, 184, 216, 34);
+        ask_through(&mut h, "example.com", 40000).await;
+        let answer = dns_pins::tests::dns_response("example.com", &[denied, link_local, public]);
+        answer_through(&mut h, 40000, &answer).await;
+        let multicast = Ipv4Addr::new(224, 0, 0, 1);
+        let other_public = Ipv4Addr::new(93, 184, 216, 35);
+        ask_through(&mut h, "other.example", 40001).await;
+        let answer = dns_pins::tests::dns_response("other.example", &[multicast, other_public]);
+        answer_through(&mut h, 40001, &answer).await;
+        wait_for_log(&h.log, "answer=224.0.0.1").await;
+        let logged = h.log.contents();
+        let said = |answer: Ipv4Addr, name: &str, rule: &str| {
+            logged.lines().any(|line| {
+                line.contains("an allowed name resolved into a refused range")
+                    && line.contains(&format!("answer={answer}"))
+                    && line.contains(&format!("name=\"{name}\""))
+                    && line.contains(&format!("rule_matched=\"{rule}\""))
+            })
+        };
+        assert!(
+            said(denied, "example.com", "dns-rebinding-denied-subnet"),
+            "the denied address is said from its fate: {logged}"
+        );
+        assert!(
+            said(link_local, "example.com", "dns-rebinding-infrastructure"),
+            "the link-local address is said under the rule the check gives it: {logged}"
+        );
+        assert!(
+            said(multicast, "other.example", "dns-rebinding-infrastructure"),
+            "the other name's multicast address is said under its name: {logged}"
+        );
+        assert!(
+            kernel_admits(&h, LEASE, public.octets()),
+            "the public address is admitted"
+        );
+        assert!(
+            kernel_admits(&h, LEASE, other_public.octets()),
+            "the other name's public address is admitted"
         );
     }
 
@@ -25253,19 +26049,20 @@ mod tests {
         let resolver = SUBNET.dns_server();
         let site = Ipv4Addr::new(203, 0, 113, 60);
         let now = table.kernel_now();
-        let asked = table
-            .kernel_question(
-                node,
-                table.asked_now(node),
-                true,
-                resolver.octets(),
-                "b.example.com",
-                0x522a,
-                40000,
-                now,
-            )
-            .expect("no lock is poisoned");
-        assert!(asked.is_some(), "the cohort asks the second box's name");
+        let asked = table.kernel_question(
+            node,
+            table.asked_now(node),
+            true,
+            resolver.octets(),
+            "b.example.com",
+            0x522a,
+            40000,
+            now,
+        );
+        assert!(
+            matches!(asked, Ok(Some(_))),
+            "the cohort asks the second box's name"
+        );
         let answer = dns_pins::tests::dns_response("b.example.com", &[site]);
         let _answered = table.kernel_answer(
             std::net::SocketAddrV4::new(resolver, 53),
@@ -25468,19 +26265,20 @@ mod tests {
         let node = SUBNET.daemon_ip().octets();
         let resolver = SUBNET.dns_server();
         let ask = |port: u16| {
-            let asked = table
-                .kernel_question(
-                    node,
-                    table.asked_now(node),
-                    true,
-                    resolver.octets(),
-                    "b.example.com",
-                    0x522a,
-                    port,
-                    table.kernel_now(),
-                )
-                .expect("no lock is poisoned");
-            assert!(asked.is_some(), "the cohort asks the second box's name");
+            let asked = table.kernel_question(
+                node,
+                table.asked_now(node),
+                true,
+                resolver.octets(),
+                "b.example.com",
+                0x522a,
+                port,
+                table.kernel_now(),
+            );
+            assert!(
+                matches!(asked, Ok(Some(_))),
+                "the cohort asks the second box's name"
+            );
         };
         let answer = |port: u16, site: Ipv4Addr| {
             let datagram = dns_pins::tests::dns_response("b.example.com", &[site]);
@@ -25547,19 +26345,17 @@ mod tests {
             );
         };
         let ask = |src: [u8; 4], port: u16| {
-            let asked = table
-                .kernel_question(
-                    src,
-                    table.asked_now(src),
-                    false,
-                    resolver.octets(),
-                    name,
-                    0x522a,
-                    port,
-                    table.kernel_now(),
-                )
-                .expect("no lock is poisoned");
-            assert!(asked.is_some(), "the question is asked");
+            let asked = table.kernel_question(
+                src,
+                table.asked_now(src),
+                false,
+                resolver.octets(),
+                name,
+                0x522a,
+                port,
+                table.kernel_now(),
+            );
+            assert!(matches!(asked, Ok(Some(_))), "the question is asked");
         };
 
         let private = Ipv4Addr::new(10, 0, 0, 5);

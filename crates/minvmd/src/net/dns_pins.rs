@@ -128,7 +128,6 @@ use switch::SwitchSubnet;
 
 use crate::box_registry::{BoxRecord, BoxTable};
 use crate::net::baseline::{BaselineCategory, BaselineEntry, NodeBaselinePhase, NodePlaneBaseline};
-use crate::net::drop_limiter::DropLimiter;
 
 /// IPv4 protocol number for TCP.
 #[cfg(test)]
@@ -326,6 +325,11 @@ impl NodePlaneNames {
 
     /// The entries that name `name`, as the pin line spells them
     /// (`registry,cache`), or `None` for a name no entry names.
+    #[expect(
+        dead_code,
+        reason = "the line is said from the kernel's tables, which decide; this table is deleted \
+                  with its records in the next step"
+    )]
     fn entries_naming(&self, name: &str) -> Option<String> {
         self.names.get(name).map(|categories| {
             categories
@@ -412,6 +416,11 @@ struct BoxPins {
     /// `&self`, like every method on it, and the swap below is the write —
     /// returning whether this admission was the first, so two replies
     /// racing in the same window still write the line exactly once.
+    #[expect(
+        dead_code,
+        reason = "the line is said from the kernel's tables, which decide; this table is deleted \
+                  with its records in the next step"
+    )]
     logged_first_pin: AtomicBool,
 }
 
@@ -492,25 +501,10 @@ impl BoxPins {
     /// question, nothing to answer.
     fn record_query(&self, pkt: &L4Packet, datagram: &[u8], now: Instant) {
         if datagram.len() > MAX_DATAGRAM {
-            tracing::debug!(
-                switch_addr = %self.record.switch_addr(),
-                namespace = %self.record.name(),
-                n = datagram.len(),
-                "ignoring an oversized DNS query at the host-side admission table"
-            );
             return;
         }
-        let message = match Message::from_vec(datagram) {
-            Ok(message) => message,
-            Err(error) => {
-                tracing::debug!(
-                    switch_addr = %self.record.switch_addr(),
-                    namespace = %self.record.name(),
-                    %error,
-                    "passing an unparseable DNS query through unrecorded on the host"
-                );
-                return;
-            }
+        let Ok(message) = Message::from_vec(datagram) else {
+            return;
         };
         if message.metadata.message_type != MessageType::Query {
             return;
@@ -529,13 +523,6 @@ impl BoxPins {
             .expect("the outstanding-query table's lock is held only across this update");
         outstanding.retain(|_, at| now.duration_since(*at) < DNS_QUERY_EXPIRY);
         if outstanding.len() >= DNS_OUTSTANDING_QUERY_CAP && !outstanding.contains_key(&key) {
-            tracing::debug!(
-                switch_addr = %self.record.switch_addr(),
-                namespace = %self.record.name(),
-                name = %key.name,
-                cap = DNS_OUTSTANDING_QUERY_CAP,
-                "not recording a question past the outstanding-query cap; its reply pins nothing"
-            );
             return;
         }
         outstanding.insert(key, now);
@@ -566,30 +553,15 @@ impl BoxPins {
     /// pins nothing, and the reply itself is
     /// never kept from the box — resolution is honest; it is the *connection*
     /// to a refused address that is not admitted.
-    fn observe(&self, pkt: &L4Packet, datagram: &[u8], limiter: &DropLimiter, now: Instant) {
+    fn observe(&self, pkt: &L4Packet, datagram: &[u8], now: Instant) {
         if pkt.src.ip().octets() != self.record.egress().resolver() || pkt.src.port() != DNS_PORT {
             return;
         }
         if datagram.len() > MAX_DATAGRAM {
-            tracing::debug!(
-                switch_addr = %self.record.switch_addr(),
-                namespace = %self.record.name(),
-                n = datagram.len(),
-                "ignoring an oversized DNS reply at the host-side admission table"
-            );
             return;
         }
-        let message = match Message::from_vec(datagram) {
-            Ok(message) => message,
-            Err(error) => {
-                tracing::debug!(
-                    switch_addr = %self.record.switch_addr(),
-                    namespace = %self.record.name(),
-                    %error,
-                    "passing an unparseable DNS reply through unpinned on the host"
-                );
-                return;
-            }
+        let Ok(message) = Message::from_vec(datagram) else {
+            return;
         };
         if message.metadata.message_type != MessageType::Response {
             return;
@@ -676,20 +648,11 @@ impl BoxPins {
             &self.infrastructure,
         );
         self.admit(&asked, &split.admitted, now);
-        for (address, refusal) in split.refused {
-            limiter.warn_dns_refusal(
-                self.record.switch_addr().octets(),
-                &asked,
-                Ipv4Addr::from(address),
-                refusal.rule(),
-            );
-        }
     }
 
     /// Admits `addresses` — one name's surviving answers — until
-    /// `now` + the shared admission window, with the first-pin line at the
-    /// first answer that ever landed and the window's one debug line beside
-    /// it: the name, the addresses, and how long they hold.
+    /// `now` + the shared admission window. The lines about it are the
+    /// kernel's tables' to say, which decide.
     ///
     /// The shared per-name cap is enforced here: a name holds at most
     /// [`DNS_MAX_ADDRESSES_PER_NAME`] addresses at once, counted over the
@@ -723,20 +686,14 @@ impl BoxPins {
             .values()
             .filter(|admission| &*admission.name == name)
             .count();
-        let mut admitted_now = Vec::new();
-        let mut refreshed = 0usize;
-        let mut over_cap = Vec::new();
         for address in addresses {
             if let Some(existing) = admitted.get_mut(address) {
                 // The name answered again: refresh the window it holds for,
                 // under whichever owner first admitted the address.
                 existing.expires = expires;
-                admitted_now.push(*address);
-                refreshed += 1;
                 continue;
             }
             if held >= DNS_MAX_ADDRESSES_PER_NAME {
-                over_cap.push(Ipv4Addr::from(*address));
                 continue;
             }
             held += 1;
@@ -747,83 +704,10 @@ impl BoxPins {
                     expires,
                 },
             );
-            admitted_now.push(*address);
         }
         if admitted.len() > ADMISSION_SWEEP_AT {
             admitted.retain(|_, admission| now < admission.expires);
         }
-        if !over_cap.is_empty() {
-            tracing::debug!(
-                switch_addr = %self.record.switch_addr(),
-                namespace = %self.record.name(),
-                name,
-                ?over_cap,
-                cap = DNS_MAX_ADDRESSES_PER_NAME,
-                "refused a resolved name's answers past the per-name cap on the host"
-            );
-        }
-        // The one line per box the bundle's daemon log tail reads a DNS
-        // box's host-side decision by: at the first answer that landed, once
-        // per box per connection, naming the box and the name. Later
-        // admissions carry their own debug line below, so the table's every
-        // pin is legible in a bundle without a line per answer at `info`.
-        if admitted_now.is_empty() {
-            return;
-        }
-        let addresses: Vec<Ipv4Addr> = admitted_now.iter().copied().map(Ipv4Addr::from).collect();
-        // The node plane's own lookup for a baseline entry: one line per pin
-        // and per re-pin, naming the entry, the addresses, the lookup's
-        // source and the resolver that answered it — the line a bundle's
-        // daemon log reads the node plane's reach by.
-        if let Some(entry) = self
-            .node_plane
-            .as_ref()
-            .and_then(|grant| grant.entries_naming(name))
-        {
-            let source = self.record.switch_addr();
-            let resolver = Ipv4Addr::from(self.record.egress().resolver());
-            let window_secs = DNS_ADMISSION_WINDOW.as_secs();
-            if refreshed == admitted_now.len() {
-                tracing::info!(
-                    entry = %entry,
-                    name,
-                    ?addresses,
-                    lookup_source = %source,
-                    resolver = %resolver,
-                    window_secs,
-                    "re-pinned a node-plane baseline entry's addresses from the node's own lookup"
-                );
-            } else {
-                tracing::info!(
-                    entry = %entry,
-                    name,
-                    ?addresses,
-                    lookup_source = %source,
-                    resolver = %resolver,
-                    window_secs,
-                    "pinned a node-plane baseline entry's addresses from the node's own lookup"
-                );
-            }
-            return;
-        }
-        if !self.logged_first_pin.swap(true, Ordering::Relaxed) {
-            tracing::info!(
-                switch_addr = %self.record.switch_addr(),
-                namespace = %self.record.name(),
-                name,
-                "filled the box's host-side DNS admission table; its undeclared \
-                 destinations are decided on the host, against the answers its own \
-                 lookups received"
-            );
-        }
-        tracing::debug!(
-            switch_addr = %self.record.switch_addr(),
-            namespace = %self.record.name(),
-            name,
-            ?addresses,
-            window_secs = DNS_ADMISSION_WINDOW.as_secs(),
-            "admitted a resolved name's addresses for the window on the host"
-        );
     }
 
     /// Whether `dst` is an address this box's own lookups resolved to and
@@ -1217,7 +1101,6 @@ impl DnsPins {
         table: &BoxTable,
         pkt: &L4Packet,
         datagram: &[u8],
-        limiter: &DropLimiter,
         now: Instant,
     ) {
         if pkt.src.port() != DNS_PORT {
@@ -1226,7 +1109,7 @@ impl DnsPins {
         if *pkt.dst.ip() == table.subnet().daemon_ip()
             && let Some(entry) = self.host_ip_entry(table)
         {
-            entry.observe(pkt, datagram, limiter, now);
+            entry.observe(pkt, datagram, now);
         }
         let Some(record) = table.by_source(pkt.dst.ip().octets()) else {
             return;
@@ -1234,7 +1117,7 @@ impl DnsPins {
         let Some(entry) = self.entry(&record) else {
             return;
         };
-        entry.observe(pkt, datagram, limiter, now);
+        entry.observe(pkt, datagram, now);
     }
 
     /// The egress leg's half of the table: one DNS query a box sent its
@@ -1841,7 +1724,7 @@ pub(crate) mod tests {
         lease: [u8; 4],
         name: &str,
         answers: &[Ipv4Addr],
-        limiter: &DropLimiter,
+        _limiter: &DropLimiter,
         now: Instant,
     ) {
         let reply = udp_payload_frame(
@@ -1853,7 +1736,7 @@ pub(crate) mod tests {
         );
         let (pkt, datagram) = udp_datagram(&reply)
             .expect("the test's reply frame parses as the relay's ingress leg parses it");
-        pins.observe_reply(table, &pkt, datagram, limiter, now);
+        pins.observe_reply(table, &pkt, datagram, now);
     }
 
     /// Drives one full exchange — the box's own question recorded on the
@@ -1881,13 +1764,13 @@ pub(crate) mod tests {
         table: &BoxTable,
         lease: [u8; 4],
         reply: &[u8],
-        limiter: &DropLimiter,
+        _limiter: &DropLimiter,
         now: Instant,
     ) {
         let frame = udp_payload_frame(SUBNET.dns_server(), 53, Ipv4Addr::from(lease), 40000, reply);
         let (pkt, datagram) = udp_datagram(&frame)
             .expect("the test's reply frame parses as the relay's ingress leg parses it");
-        pins.observe_reply(table, &pkt, datagram, limiter, now);
+        pins.observe_reply(table, &pkt, datagram, now);
     }
 
     /// Drives one exchange whose reply the test built itself — the query
@@ -2094,7 +1977,7 @@ pub(crate) mod tests {
     /// the lookup's source.
     #[test]
     fn baseline_entry_pins_the_daemon_lookup_answers() {
-        let (log, _guard) = crate::net::egress_gate::test_support::capture_log();
+        let (_log, _guard) = crate::net::egress_gate::test_support::capture_log();
         let registry = BoxRegistry::new(SUBNET);
         registry.register_node_namespace(7654);
         // A box that declared the same name: its pins are its own.
@@ -2135,31 +2018,8 @@ pub(crate) mod tests {
             !node_admits(Ipv4Addr::new(203, 0, 113, 11), now),
             "an address the answer did not name is not pinned"
         );
-        wait_for_line(&log, "pinned a node-plane baseline entry's addresses");
-        let logged = log.contents();
-        assert!(
-            logged.contains("entry=cache")
-                && logged.contains("addresses=[203.0.113.10]")
-                && logged.contains("lookup_source=100.64.255.253")
-                && logged.contains(&format!("resolver={}", SUBNET.dns_server())),
-            "the pin line names the entry, the addresses and the lookup's source, got: {logged}"
-        );
-
-        // The same lookup again re-pins, and says so.
-        node_resolves(
-            &pins,
-            &table,
-            &baseline,
-            DAEMON_CACHE_ENDPOINT,
-            &[cache],
-            now,
-        );
-        assert!(
-            log.contents()
-                .contains("re-pinned a node-plane baseline entry's addresses"),
-            "a re-pin is logged, got: {}",
-            log.contents()
-        );
+        // The pin and re-pin lines are the kernel's tables' to say, which
+        // decide: the_node_planes_pin_and_re_pin_lines_come_from_the_kernel.
 
         // A name no entry names pins nothing for the node.
         let other = Ipv4Addr::new(198, 51, 100, 20);
@@ -2263,16 +2123,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// Panics unless `log` holds `needle`: the table logs synchronously, so
-    /// the line is there by the time the call that wrote it returns.
-    fn wait_for_line(log: &crate::net::egress_gate::test_support::CaptureWriter, needle: &str) {
-        let logged = log.contents();
-        assert!(
-            logged.contains(needle),
-            "expected `{needle}` in the log, got: {logged}"
-        );
-    }
-
     /// The table admits exactly the answers the box's own lookup received,
     /// and nothing else. Before any reply nothing admits; after one, the
     /// answers do — and only they: an address the answer did not name is
@@ -2283,7 +2133,7 @@ pub(crate) mod tests {
     /// received says so once at `info`, naming the box and the name.
     #[test]
     fn host_pins_are_the_answers_the_box_received() {
-        let (log, _guard) = crate::net::egress_gate::test_support::capture_log();
+        let (_log, _guard) = crate::net::egress_gate::test_support::capture_log();
         let registry = BoxRegistry::new(SUBNET);
         dns_box(
             &registry,
@@ -2386,7 +2236,7 @@ pub(crate) mod tests {
         );
         let (pkt, datagram) = udp_datagram(&off_resolver)
             .expect("the test's off-resolver reply parses as the ingress leg parses it");
-        pins.observe_reply(&table, &pkt, datagram, &limiter, now);
+        pins.observe_reply(&table, &pkt, datagram, now);
         assert!(
             !pins.admits_frame(&record, [198, 51, 100, 9], None, now),
             "a reply not from the resolver pins nothing"
@@ -2440,28 +2290,8 @@ pub(crate) mod tests {
             "the answer past the per-name cap is refused"
         );
 
-        // The one line per box the diagnostics read the host-side decision
-        // by: the first answer each box received said so once, naming the
-        // box's address, its namespace and the name; a later answer adds no
-        // second line for the same box, and the second box has its own.
-        let logged = log.contents();
-        let first_pin = "filled the box's host-side DNS admission table";
-        assert!(
-            logged.contains(first_pin)
-                && logged.contains("switch_addr=100.64.0.9")
-                && logged.contains("namespace=weather")
-                && logged.contains("name=\"example.com\""),
-            "the first pin says so at info, naming the box and the name, got: {logged}"
-        );
-        assert_eq!(
-            logged.matches(first_pin).count(),
-            2,
-            "one first-pin line per box, once per box — not one per answer or per name: {logged}"
-        );
-        assert!(
-            logged.contains("switch_addr=100.64.0.10") && logged.contains("name=\"other.example\""),
-            "the second box's first pin names it and its name, got: {logged}"
-        );
+        // The first-fill line, once per box, is the kernel's tables' to say,
+        // which decide: the_first_fill_line_is_said_once_per_box_from_the_kernel.
         assert!(
             pins.admitted_by_pin() > 0 && pins.refused_for_want_of_pin() > 1,
             "the counters read what the decisions did: admitted {}, refused {}",
@@ -2480,7 +2310,7 @@ pub(crate) mod tests {
     /// the flow ends, and a new flow to the same address does not.
     #[test]
     fn host_window_refuses_denied_and_infrastructure_ranges() {
-        let (log, _guard) = crate::net::egress_gate::test_support::capture_log();
+        let (_log, _guard) = crate::net::egress_gate::test_support::capture_log();
         let registry = BoxRegistry::new(SUBNET);
         // Two names, because the refusal line's key is the name: two names
         // refusing under one rule each say so. The denied range is the
@@ -2556,48 +2386,9 @@ pub(crate) mod tests {
             &limiter,
             now,
         );
-        let logged = log.contents();
-        // Each refusal names the name, the answer and the rule, in the shared
-        // format — one line each, per box per name per rule.
-        for expected in [
-            "an allowed name resolved into a refused range",
-            "source=100.64.0.9",
-            "name=\"example.com\"",
-            "answer=10.9.9.7",
-            "rule_matched=\"dns-rebinding-denied-subnet\"",
-            "answer=169.254.169.254",
-            "rule_matched=\"dns-rebinding-infrastructure\"",
-            "name=\"other.example\"",
-        ] {
-            assert!(
-                logged.contains(expected),
-                "the refusal line must carry {expected:?}: {logged}"
-            );
-        }
-        assert_eq!(
-            logged.matches("answer=127.0.0.1").count(),
-            0,
-            "the loopback refusal shares the metadata answer's key — one name, one rule, \
-             inside the interval — so it is silent, not a second line: {logged}"
-        );
-        assert_eq!(
-            logged.matches("answer=10.9.9.8").count(),
-            0,
-            "the repeated burst adds no line under the key the first refusal already \
-             spent: one rate-limited line per name per rule, not one per answer: {logged}"
-        );
-        assert_eq!(
-            logged
-                .matches("an allowed name resolved into a refused range")
-                .count(),
-            3,
-            "one line per name and rule — the denied range, the infrastructure range, \
-             and the second name's own — and no more: {logged}"
-        );
-        assert!(
-            logged.contains("answer=10.9.9.9"),
-            "the second name's refusal names its own answer: {logged}"
-        );
+        // The refusal lines, one per box per name per rule, are the kernel's
+        // tables' to say, which decide:
+        // a_rebinding_answers_refusals_are_said_by_address_from_the_kernel.
 
         // The window: the admitted answer holds for it, and no longer. A
         // frame with no L4 header to read is decided by the window alone.
@@ -3268,7 +3059,7 @@ pub(crate) mod tests {
         );
         let (pkt, datagram) = udp_datagram(&mismatched)
             .expect("the test's mismatched reply parses as the ingress leg parses it");
-        pins.observe_reply(&table, &pkt, datagram, &limiter, now);
+        pins.observe_reply(&table, &pkt, datagram, now);
         assert!(
             !pins.admits_frame(&record, answer.octets(), None, now),
             "a reply with a mismatched transaction id pins nothing"
@@ -3528,7 +3319,7 @@ pub(crate) mod tests {
     /// under its own key: the name, the answer and the rule.
     #[test]
     fn host_window_refuses_this_host_multicast_broadcast_and_reserved_answers() {
-        let (log, _guard) = crate::net::egress_gate::test_support::capture_log();
+        let (_log, _guard) = crate::net::egress_gate::test_support::capture_log();
         let registry = BoxRegistry::new(SUBNET);
         // Two names, because the refusal line's key is the name: this host's
         // own address and a multicast group, each refused under its own.
@@ -3574,20 +3365,8 @@ pub(crate) mod tests {
                  became a pin"
             );
         }
-        let logged = log.contents();
-        for expected in [
-            "an allowed name resolved into a refused range",
-            "name=\"example.com\"",
-            "answer=0.0.0.0",
-            "rule_matched=\"dns-rebinding-infrastructure\"",
-            "name=\"other.example\"",
-            "answer=224.0.0.1",
-        ] {
-            assert!(
-                logged.contains(expected),
-                "the refusal names {expected}, got: {logged}"
-            );
-        }
+        // Their refusal lines are the kernel's tables' to say, which decide:
+        // a_rebinding_answers_refusals_are_said_by_address_from_the_kernel.
 
         // The rest of the completed set — the reserved block and broadcast
         // itself — refuses as quietly, on the same leg.

@@ -9805,6 +9805,17 @@ pub(crate) struct AskedFor {
     pub(crate) cohort: Option<u64>,
 }
 
+/// Why [`BoxTable::kernel_question`] did not record a question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NotRecorded {
+    /// The DNS table the question is routed to is not the one of the
+    /// registry records the frame was decided for: the record there is
+    /// another one.
+    NotDecidedFor,
+    /// The configuration's lock or the table's was poisoned by a panic.
+    Poisoned,
+}
+
 /// The network kernel's reply tables, reached to end a port's records
 /// where a publication is retracted. It holds the configuration alone, so
 /// a holder the table itself keeps (the mirror ledger) makes no cycle.
@@ -9931,13 +9942,22 @@ impl BoxTable {
         unpoisoned(self.kernel.read())?.record_toward_guest_said(bytes, published, now)
     }
 
+    /// Whether a question from `src` meets a DNS table of the kernel's that
+    /// holds names ([`crate::net::kernel_config::KernelConfig::asks_names`]);
+    /// `false` when the configuration's lock was poisoned, so no line is said
+    /// of it.
+    pub(crate) fn kernel_asks_names(&self, src: [u8; 4], marked: bool) -> bool {
+        unpoisoned(self.kernel.read()).is_ok_and(|kernel| kernel.asks_names(src, marked))
+    }
+
     /// Records a DNS question a guest sent in the kernel's DNS table its
     /// source is routed to, beside the daemon's own, when that table is the
     /// one of the registry records the frame was decided for (`asked`,
     /// [`KernelConfig::asks_for`]), under the same read lock: a question is
-    /// never recorded in the table of another row at the address. Decides
-    /// nothing. [`Poisoned`] when the configuration's lock or the table's
-    /// was poisoned: nothing is recorded, and the frame is dropped.
+    /// never recorded in the table of another row at the address, and that
+    /// refusal is [`NotRecorded::NotDecidedFor`]. Decides nothing.
+    /// [`NotRecorded::Poisoned`] when the configuration's lock or the table's
+    /// was poisoned: nothing is recorded.
     #[expect(
         clippy::too_many_arguments,
         reason = "the source, the records it was decided for, its mark, where the question went, \
@@ -9953,12 +9973,14 @@ impl BoxTable {
         txid: u16,
         port: u16,
         now: netcore::time::Instant,
-    ) -> Result<Option<netcore::pins::Asked>, Poisoned> {
-        let kernel = unpoisoned(self.kernel.read())?;
+    ) -> Result<Option<netcore::pins::Asked>, NotRecorded> {
+        let kernel = unpoisoned(self.kernel.read()).map_err(|Poisoned| NotRecorded::Poisoned)?;
         if !kernel.asks_for(src, marked, asked) {
-            return Ok(None);
+            return Err(NotRecorded::NotDecidedFor);
         }
-        kernel.try_record_question(src, marked, dst, name, txid, port, now)
+        kernel
+            .try_record_question(src, marked, dst, name, txid, port, now)
+            .map_err(|Poisoned| NotRecorded::Poisoned)
     }
 
     /// The registry records the kernel's configuration holds now for a frame
@@ -9979,6 +10001,7 @@ impl BoxTable {
     /// Offers a DNS answer delivered toward `dst` to the kernel's DNS
     /// tables, beside the daemon's own. Decides nothing, and records nothing
     /// past a poisoned lock ([`recordable`]).
+    #[cfg(test)]
     pub(crate) fn kernel_answer(
         &self,
         from: std::net::SocketAddrV4,
@@ -9990,6 +10013,30 @@ impl BoxTable {
         recordable(self.kernel.read())
             .map(|kernel| kernel.record_answer(from, dst, port, datagram, now))
             .unwrap_or_default()
+    }
+
+    /// Offers a DNS answer delivered toward `dst` to the kernel's DNS tables,
+    /// with what the lines about it read
+    /// ([`crate::net::kernel_config::Answered`]): the gate says the DNS lines
+    /// from it. Decides nothing about the frame. Past a poisoned lock
+    /// ([`recordable`]) no table is offered the answer, and no line is said.
+    pub(crate) fn kernel_answer_said(
+        &self,
+        from: std::net::SocketAddrV4,
+        dst: [u8; 4],
+        port: u16,
+        datagram: &[u8],
+        now: netcore::time::Instant,
+    ) -> crate::net::kernel_config::Answered {
+        let Some(kernel) = recordable(self.kernel.read()) else {
+            return crate::net::kernel_config::Answered {
+                tables: false,
+                taken: Vec::new(),
+                row_generation: None,
+                cohort_generation: None,
+            };
+        };
+        kernel.record_answer_said(from, dst, port, datagram, now)
     }
 
     /// The kernel's whole decision for a frame a guest sent
@@ -10031,19 +10078,29 @@ impl BoxTable {
             .entries()
             .iter()
             .flat_map(|entry| entry.endpoints().iter().map(String::as_str));
-        self.kernel
+        let named = baseline.named_endpoints();
+        let labels: Vec<(String, String)> = named
+            .iter()
+            .map(|(name, categories)| {
+                let label = categories
+                    .iter()
+                    .map(|category| category.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                (name.clone(), label)
+            })
+            .collect();
+        let mut kernel = self
+            .kernel
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .adopt_baseline(
-                baseline.phase() == crate::net::NodeBaselinePhase::InForce,
-                endpoints,
-                baseline
-                    .named_endpoints()
-                    .into_iter()
-                    .map(|(name, _)| name)
-                    .collect(),
-                baseline.alias_ports(),
-            );
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        kernel.adopt_baseline(
+            baseline.phase() == crate::net::NodeBaselinePhase::InForce,
+            endpoints,
+            named.into_iter().map(|(name, _)| name).collect(),
+            baseline.alias_ports(),
+        );
+        kernel.set_node_labels(labels);
     }
 
     /// Gives the network kernel's configuration the host exposures the
