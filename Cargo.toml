@@ -26,6 +26,7 @@ members = [
     "crates/minvmd",
     "crates/minzoned",
     "crates/mlog",
+    "crates/netcore",
     "crates/remote-client",
     "crates/remote-proto",
     "crates/sandbox",
@@ -72,10 +73,12 @@ package.version = "0.8.0"
 # and should be promoted here as their counts reach zero. Test code is exempt
 # from the panic family in clippy.toml.
 [workspace.lints.rust]
-# The kani proof harnesses (boxes, rcache) are gated on `cfg(kani)`, a
-# custom cfg. Declaring it once here keeps rustc's unexpected_cfgs lint quiet
+# The kani proof harnesses (boxes, rcache, netcore) are gated on `cfg(kani)`,
+# a custom cfg. Declaring it once here keeps rustc's unexpected_cfgs lint quiet
 # on the normal (non-kani) builds without every crate repeating the check-cfg.
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+# `cfg(verus_keep_ghost)` is the one Verus sets: netcore's proofs sit in its
+# source behind it and compile away on a normal build.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)", "cfg(verus_keep_ghost)"] }
 
 [workspace.lints.clippy]
 # Panic / silent-failure tripwires.
@@ -278,6 +281,7 @@ mctx = { path = "crates/mctx" }
 minimal-client = { path = "crates/minimal-client" }
 minimald-rpc = { path = "crates/minimald-rpc" }
 mlog = { path = "crates/mlog" }
+netcore = { path = "crates/netcore" }
 mfile = { path = "crates/mfile" }
 op = { path = "crates/op" }
 ot = { path = "crates/ot" }

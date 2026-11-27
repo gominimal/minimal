@@ -207,7 +207,7 @@ execution:
 and inside the microVM:
 
 `async-dialog`, `bep`, `boxes`, `minimal`, `minimal-client`, `minimald`,
-`minimald-rpc`, `minvmd`, `minzoned`, `switch`
+`minimald-rpc`, `minvmd`, `minzoned`, `netcore`, `switch`
 
 **shared** covers the utilities the other planes draw on:
 
