@@ -387,21 +387,21 @@ and `min box rm <NAME>` removes it.
 
 A name from `--name` or the task's `[box] name` is a written name. When a box
 on the host has the written name, in any state, the command refuses with exit
-code 2 and creates nothing. The refusal says that the name is taken. When you
-can read the box that has the name, the refusal names that box and its state.
-Where one fits, it names the command that goes back into that box, as on
-[`box start`](#box-start). It also names `min box rm <name>`, or
+code 2 and creates nothing. The refusal says that another box has the name.
+When you can read the box that has the name, the refusal names that box and
+its state. Where one fits, it names the command that goes back into that box,
+as on [`box start`](#box-start). It also names `min box rm <name>`, or
 `min box rm --force <name>` for a running box, which removes that box and
-frees the name. Every refusal names `min task run <TASK> --name <name>`, which starts a box from the
-task under another name.
+frees the name. Every refusal names `min task run <TASK> --name <name>`, which
+starts a box from the task under another name.
 
 When the box takes a number, the command prints one line on stderr, also with
 `--detach`. The line names the name that the box took and the name that it did
 not get. When you can read the box that has that name, the line names that box
 and its state. It also names `min box attach`, `min box restart` or
-`min box logs` for that box. A reserved name, or a name in the form of a box id, is
-named as such. The line always names `min box prune`, which removes stopped
-boxes.
+`min box logs` for that box. When the name is reserved, or has the form of a
+box id, the line says so. The line always names `min box prune`, which removes
+stopped boxes.
 
 | Flag | Description |
 |------|-------------|
@@ -486,21 +486,21 @@ and adds `-<n>` when a box already holds that name.
 
 A name from `--name` or the entry's `[box] name` is a written name. When a box
 on the host has the written name, in any state, the command refuses with exit
-code 2 and creates nothing. The refusal says that the name is taken. When you
-can read the box that has the name, the refusal names that box and its state.
-Where one fits, it names the command that goes back into that box, as on
-[`box start`](#box-start). It also names `min box rm <name>`, or
+code 2 and creates nothing. The refusal says that another box has the name.
+When you can read the box that has the name, the refusal names that box and
+its state. Where one fits, it names the command that goes back into that box,
+as on [`box start`](#box-start). It also names `min box rm <name>`, or
 `min box rm --force <name>` for a running box, which removes that box and
-frees the name. Every refusal names `min box run <ENTRY> --name <name>`, which starts a box from the
-entry under another name.
+frees the name. Every refusal names `min box run <ENTRY> --name <name>`, which
+starts a box from the entry under another name.
 
 When the box takes a number, the command prints one line on stderr, also with
 `--detach`. The line names the name that the box took and the name that it did
 not get. When you can read the box that has that name, the line names that box
 and its state. It also names `min box attach`, `min box restart` or
-`min box logs` for that box. A reserved name, or a name in the form of a box id, is
-named as such. The line always names `min box prune`, which removes stopped
-boxes.
+`min box logs` for that box. When the name is reserved, or has the form of a
+box id, the line says so. The line always names `min box prune`, which removes
+stopped boxes.
 
 | Flag | Description |
 |------|-------------|
