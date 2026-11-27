@@ -64,13 +64,33 @@
 //! admits its UDP queries, and a forwarded query carries data out in the
 //! name it asks. So for an own-address deny-all row this module also holds
 //! the host-side decision of what that carve-out may carry
-//! ([`deny_all_refusal`]): a standard query whose every question is an A
+//! ([`dns_query_refusal`]): a standard query whose every question is an A
 //! lookup of a box-zone name, the one thing the switch's resolver answers
 //! without asking upstream. Anything else is dropped by the relay before it
 //! reaches the switch, silently toward the guest and with a rate-limited
 //! line naming the box and the name. The in-VM gate answers the same
-//! queries REFUSED first, as the precision copy honest clients meet; this
-//! is the deciding copy, outside the VM.
+//! queries NXDOMAIN or NODATA first, as the precision copy honest clients
+//! meet; this is the deciding copy, outside the VM.
+//!
+//! ## An allow-list box's unmatched names (NET-141)
+//!
+//! A row that declared `egress.allow_dns_hosts` has its queries to its own
+//! resolver decided here too ([`dns_query_refusal`]): a query passes only
+//! when every name it asks is one the row declared, matched as its answers
+//! are pinned, or an A lookup of a box-zone name the switch's resolver
+//! answers on its own, the deny-all row's zone rule. A query naming
+//! anything else is dropped before it reaches the switch, so the switch's
+//! resolver never forwards the name, silently toward the guest and with a
+//! rate-limited line naming the box and the name. The in-VM gate answers
+//! the same queries NXDOMAIN or NODATA first, as the precision copy. A
+//! query to another address the row's subnets admit is not this gate's, as
+//! it is not the in-VM gate's. A row with no `allow_dns_hosts`, the node
+//! row among them, is not decided here.
+//!
+//! Both rows' queries are decided over UDP. TCP to the resolver's port
+//! from either row is dropped whatever it carries ([`tcp_query_refusal`]).
+//! A box reaches its resolver over TCP only after a truncated UDP answer,
+//! and for these rows that lookup is not served.
 //!
 //! ## The node plane's own lookups (NET-130, NET-085)
 //!
@@ -1543,11 +1563,13 @@ impl DnsPins {
     }
 }
 
-/// One DNS datagram from a deny-all box that the host-side gate drops
-/// rather than write on to the switch ([`deny_all_refusal`]): the row it
-/// came from and what the warn line names.
-pub(crate) struct DenyAllRefusal {
-    /// The deny-all row the datagram's source resolved to.
+/// One DNS query from a row whose names the host-side gate decides
+/// that it drops rather than write on to the switch
+/// ([`dns_query_refusal`]): the row it came from and what the warn line
+/// names.
+pub(crate) struct DnsQueryRefusal {
+    /// The row the query's source resolved to: deny-all, or one that
+    /// declared `allow_dns_hosts`.
     pub(crate) record: Arc<BoxRecord>,
     /// The first question that failed the check, normalized the way names
     /// are matched here — or a placeholder in angle brackets when the
@@ -1577,51 +1599,159 @@ fn is_zone_name(name: &Name) -> bool {
         && labels.next_back().is_some()
 }
 
-/// The host-side deny-all DNS gate (NET-141's deny-all case, decided
-/// outside the VM for own-address rows): whether the UDP datagram one box
-/// sent to DNS's port must be dropped instead of written on to the switch.
-/// `Some` is the drop and what its warn line names; `None` is "not this
-/// gate's; forward as the verdict decided".
+/// Whether `declared` names `name`, a question's name already lowercased
+/// with its root dot stripped: each declared name compared as
+/// [`normalized`] spells it, without building it.
+fn declares(declared: &[String], name: &str) -> bool {
+    declared.iter().any(|host| {
+        host.strip_suffix('.')
+            .unwrap_or(host)
+            .eq_ignore_ascii_case(name)
+    })
+}
+
+/// The host-side DNS gate (NET-141, decided outside the VM for own-address
+/// rows): whether the UDP datagram one box sent to its own resolver
+/// ([`boxes::core::egress::EgressRules::resolver`], the address the in-VM
+/// gate intercepts at) must be dropped instead of written on to the
+/// switch. `Some` is the drop and what its warn line names; `None` is "not
+/// this gate's; forward as the verdict decided".
 ///
-/// Only a row the host registered as deny-all ([`BoxRecord::is_deny_all`])
-/// is decided here. For such a row the resolver carve-out (NET-079, UDP
-/// only) is the one thing the frame verdict admits, so the carve-out is
-/// narrowed to what the switch's resolver answers on its own: a standard
-/// query whose every question is an A lookup of a box-zone name strictly
-/// below the apex, the apex spelled in lowercase ([`is_zone_name`]).
-/// gvproxy's resolver answers those names locally for A alone and hands
-/// every other type, and every name outside the zone, to the host's
-/// upstream resolvers — a forwarded question carries data out in its name
-/// even when no connection follows. So the datagram is dropped when:
+/// Two kinds of row are decided here, both read off the host's own
+/// registration, never a guest report:
+///
+/// * A row the host registered as deny-all ([`BoxRecord::is_deny_all`]).
+///   Its resolver carve-out (NET-079, UDP only) is the one thing the frame
+///   verdict admits, so the carve-out is narrowed to what the switch's
+///   resolver answers on its own: every question an A lookup of a box-zone
+///   name strictly below the apex, the apex spelled in lowercase
+///   ([`is_zone_name`]). gvproxy's resolver answers those names locally for
+///   A alone and hands every other type, and every name outside the zone,
+///   to the host's upstream resolvers.
+/// * A row that declared `egress.allow_dns_hosts`
+///   ([`BoxRecord::allow_dns_hosts`]). Every question must name a name the
+///   row declared, normalized as its answers are pinned ([`declares`]), or
+///   be the deny-all row's zone A lookup: the in-VM gate answers every
+///   other zone question itself, so an honest box never sends one.
+///
+/// For either, a forwarded question carries data out in its name even when
+/// no connection follows, so the datagram is dropped when:
 ///
 /// * it does not parse as a DNS message, is not a query, is not a standard
-///   query, or carries no question (fail closed: nothing proves it names
-///   only the zone);
-/// * any question names a name outside the zone — every question is read,
-///   so a zone name in front cannot carry a second name past the check;
-/// * any question asks a zone name for a type other than A.
+///   query, or carries no question (fail closed: nothing proves what it
+///   names);
+/// * any question fails the row's check — every question is read, so a
+///   passing name in front cannot carry a second name past it.
 ///
 /// Silent toward the guest by construction: this only decides; the caller
 /// drops the frame by not writing it, and nothing is written back.
-/// Host-address boxes ride the node row, which is never deny-all, and an
-/// allow-list row is not decided here either.
-pub(crate) fn deny_all_refusal(
+/// Host-address boxes ride the node row, which declares no names and is
+/// never deny-all, and a row with no `allow_dns_hosts` is not decided here
+/// either, so a box with unrestricted egress resolves every name. A
+/// datagram to any other address is not decided here either: the frame
+/// verdict already admitted it, and the in-VM gate does not intercept it.
+/// TCP to that resolver is dropped whatever it carries
+/// ([`tcp_query_refusal`]).
+pub(crate) fn dns_query_refusal(
     table: &BoxTable,
     pkt: &L4Packet,
     datagram: &[u8],
-) -> Option<DenyAllRefusal> {
-    if pkt.proto != IPPROTO_UDP || pkt.dst.port() != DNS_PORT {
+) -> Option<DnsQueryRefusal> {
+    if pkt.proto != IPPROTO_UDP {
         return None;
     }
-    let record = table
-        .by_source(pkt.src.ip().octets())
-        .filter(|record| record.is_deny_all())?;
-    let refused = |name: &str, query_type: Option<RecordType>| DenyAllRefusal {
-        record: Arc::clone(&record),
+    message_refusal(&decided_row(table, pkt)?, datagram)
+}
+
+/// The host-side DNS gate's rule for a UDP frame to a decided row's
+/// resolver whose datagram cannot be read ([`udp_datagram`] yields `None`,
+/// whether or not the frame's UDP header is whole): nothing proves what it
+/// names, so `Some` is the drop, as for a datagram that does not parse as a
+/// DNS message. It reads the frame's summary (source, destination, protocol
+/// and destination port), so a UDP header too short for [`parse_ipv4_l4`]
+/// is decided too. `None` for every frame [`dns_query_refusal`] does not
+/// decide.
+pub(crate) fn unreadable_datagram_refusal(
+    table: &BoxTable,
+    src: [u8; 4],
+    dst: [u8; 4],
+    proto: u8,
+    dst_port: u16,
+) -> Option<DnsQueryRefusal> {
+    if proto != IPPROTO_UDP {
+        return None;
+    }
+    Some(DnsQueryRefusal {
+        record: decided_row_at(table, src, dst, dst_port)?,
+        name: "<unparseable>".to_string(),
+        query_type: None,
+    })
+}
+
+/// The host-side DNS gate's rule for TCP to a decided row's resolver port:
+/// every such segment is dropped, whatever it carries, so `Some` is the
+/// drop. The gate decides DNS over UDP only. A box reaches its resolver
+/// over TCP only after a truncated UDP answer, and for a decided row that
+/// lookup is not served. It reads the frame's summary (source, destination,
+/// protocol and destination port), so a first fragment, which carries the
+/// ports, is decided too, however short. `None` for every frame
+/// [`decided_row_at`] does not decide.
+pub(crate) fn tcp_query_refusal(
+    table: &BoxTable,
+    src: [u8; 4],
+    dst: [u8; 4],
+    proto: u8,
+    dst_port: u16,
+) -> Option<DnsQueryRefusal> {
+    if proto != IPPROTO_TCP {
+        return None;
+    }
+    Some(DnsQueryRefusal {
+        record: decided_row_at(table, src, dst, dst_port)?,
+        name: "<tcp dns>".to_string(),
+        query_type: None,
+    })
+}
+
+/// The row whose queries to `pkt`'s destination the host-side DNS gate
+/// decides ([`dns_query_refusal`]), whatever the transport: a deny-all row,
+/// or one that declared `allow_dns_hosts`, sending to its own resolver's
+/// port. `None` for every other frame.
+fn decided_row(table: &BoxTable, pkt: &L4Packet) -> Option<Arc<BoxRecord>> {
+    decided_row_at(
+        table,
+        pkt.src.ip().octets(),
+        pkt.dst.ip().octets(),
+        pkt.dst.port(),
+    )
+}
+
+/// [`decided_row`] from the frame's addresses and destination port.
+fn decided_row_at(
+    table: &BoxTable,
+    src: [u8; 4],
+    dst: [u8; 4],
+    dst_port: u16,
+) -> Option<Arc<BoxRecord>> {
+    if dst_port != DNS_PORT {
+        return None;
+    }
+    table
+        .by_source(src)
+        .filter(|record| record.is_deny_all() || !record.allow_dns_hosts().is_empty())
+        .filter(|record| dst == record.egress().resolver())
+}
+
+/// The host-side DNS gate's rule for one DNS message from `record`
+/// ([`dns_query_refusal`] says what it passes). `Some` is the drop and what
+/// its warn line names.
+fn message_refusal(record: &Arc<BoxRecord>, message: &[u8]) -> Option<DnsQueryRefusal> {
+    let refused = |name: &str, query_type: Option<RecordType>| DnsQueryRefusal {
+        record: Arc::clone(record),
         name: name.to_string(),
         query_type,
     };
-    let Ok(message) = Message::from_vec(datagram) else {
+    let Ok(message) = Message::from_vec(message) else {
         return Some(refused("<unparseable>", None));
     };
     if message.metadata.message_type != MessageType::Query
@@ -1632,16 +1762,21 @@ pub(crate) fn deny_all_refusal(
     if message.queries.is_empty() {
         return Some(refused("<no question>", None));
     }
+    let declared = record.allow_dns_hosts();
     message
         .queries
         .iter()
-        .find(|question| !(question.query_type() == RecordType::A && is_zone_name(question.name())))
         .map(|question| {
-            refused(
-                &normalized(&question.name().to_lowercase().to_string()),
-                Some(question.query_type()),
+            (
+                question,
+                normalized(&question.name().to_lowercase().to_string()),
             )
         })
+        .find(|(question, name)| {
+            let zone_a = question.query_type() == RecordType::A && is_zone_name(question.name());
+            !(zone_a || declares(declared, name))
+        })
+        .map(|(question, name)| refused(&name, Some(question.query_type())))
 }
 
 #[cfg(test)]
@@ -1667,7 +1802,7 @@ pub(crate) mod tests {
     use hickory_proto::rr::{Name, RData, Record, RecordType};
     use switch::SwitchSubnet;
 
-    use super::{DnsPins, IPPROTO_TCP, TCP_FIN, deny_all_refusal, udp_datagram};
+    use super::{DnsPins, IPPROTO_TCP, TCP_FIN, dns_query_refusal, udp_datagram};
     use crate::box_registry::{BoxRegistration, BoxRegistry, BoxTable};
     use crate::net::baseline::{DAEMON_CACHE_ENDPOINT, NodePlaneBaseline};
     use crate::net::drop_limiter::DropLimiter;
@@ -1730,7 +1865,21 @@ pub(crate) mod tests {
         dst_port: u16,
         flags: u8,
     ) -> Vec<u8> {
-        let total = 20 + 20;
+        tcp_segment_frame(src, src_port, dst, dst_port, flags, 0, &[])
+    }
+
+    /// An Ethernet II + IPv4 + TCP frame like [`tcp_frame`]'s, at sequence
+    /// number `seq` and carrying `payload`, with an honest total length.
+    pub(crate) fn tcp_segment_frame(
+        src: Ipv4Addr,
+        src_port: u16,
+        dst: Ipv4Addr,
+        dst_port: u16,
+        flags: u8,
+        seq: u32,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let total = 20 + 20 + payload.len();
         let mut f = Vec::with_capacity(ETH_FRAME_PREFIX.len() + total);
         f.extend_from_slice(ETH_FRAME_PREFIX);
         f.push(0x45); // IPv4, IHL 5
@@ -1745,14 +1894,22 @@ pub(crate) mod tests {
         f.extend_from_slice(&dst.octets());
         f.extend_from_slice(&src_port.to_be_bytes());
         f.extend_from_slice(&dst_port.to_be_bytes());
-        f.extend_from_slice(&0u32.to_be_bytes()); // sequence
+        f.extend_from_slice(&seq.to_be_bytes()); // sequence
         f.extend_from_slice(&0u32.to_be_bytes()); // acknowledgement
         f.push(0x50); // data offset: 5 words
-        f.push(flags); // flags — the byte the flow retention reads
+        f.push(flags);
         f.extend_from_slice(&0u16.to_be_bytes()); // window
         f.extend_from_slice(&0u16.to_be_bytes()); // checksum: none
         f.extend_from_slice(&0u16.to_be_bytes()); // urgent pointer
+        f.extend_from_slice(payload);
         f
+    }
+
+    /// `message` as DNS over TCP carries it: its 2-byte length, then itself.
+    pub(crate) fn tcp_dns_message(message: &[u8]) -> Vec<u8> {
+        let mut framed = (message.len() as u16).to_be_bytes().to_vec();
+        framed.extend_from_slice(message);
+        framed
     }
 
     /// A standard DNS query datagram for `name`, carrying the id of the
@@ -3665,14 +3822,14 @@ pub(crate) mod tests {
         );
     }
 
-    /// What the host-side deny-all gate decides for `payload` sent from
-    /// `lease` to the plan's resolver at DNS's port: `Some((name, type))`
-    /// for a drop, `None` for a pass.
+    /// What the host-side DNS gate decides for `payload` sent from `lease`
+    /// to the plan's resolver at DNS's port: `Some((name, type))` for a
+    /// drop, `None` for a pass.
     #[expect(
         clippy::unwrap_in_result,
         reason = "a test helper: a frame the test built that does not parse is the test's bug"
     )]
-    fn deny_all_decision(
+    fn gate_decision(
         table: &BoxTable,
         lease: [u8; 4],
         payload: &[u8],
@@ -3685,7 +3842,7 @@ pub(crate) mod tests {
             payload,
         );
         let (pkt, datagram) = udp_datagram(&frame).expect("the query frame parses");
-        deny_all_refusal(table, &pkt, datagram).map(|refusal| (refusal.name, refusal.query_type))
+        dns_query_refusal(table, &pkt, datagram).map(|refusal| (refusal.name, refusal.query_type))
     }
 
     /// NET-141's deny-all case, decided host-side for an own-address row: a
@@ -3701,7 +3858,7 @@ pub(crate) mod tests {
         let registry = BoxRegistry::new(SUBNET);
         deny_all_box(&registry, "sealed", LEASE);
         let table = registry.table();
-        let decide = |payload: &[u8]| deny_all_decision(&table, LEASE, payload);
+        let decide = |payload: &[u8]| gate_decision(&table, LEASE, payload);
 
         for rtype in [
             RecordType::A,
@@ -3838,20 +3995,162 @@ pub(crate) mod tests {
         );
     }
 
-    /// The deny-all gate decides deny-all rows and nothing else: an
-    /// allow-list row, a row with no egress declaration, a row whose names
-    /// are closed but whose subnets are not, the node namespace (which every
-    /// host-address box's frames ride) and an unregistered source are all
-    /// left to the verdict and the pins, whatever their queries name.
+    /// NET-141, decided host-side for an own-address allow-list row: a
+    /// query to its own resolver passes only when every question names a
+    /// name the row declared (in any case, the root dot notwithstanding) or
+    /// is the deny-all row's zone A lookup, and is dropped otherwise, naming
+    /// the first name that failed: so a name the list does not match never
+    /// reaches the switch, and no resolver beyond the box's own is asked it.
+    /// A query to another address the row's subnets admit is not decided.
     #[test]
-    fn non_deny_all_rows_are_not_decided() {
+    fn allow_list_row_drops_unmatched_names() {
         let registry = BoxRegistry::new(SUBNET);
         dns_box(
             &registry,
             "weather",
             LEASE,
-            vec!["example.com".to_string()],
+            vec!["example.com".to_string(), "API.GitHub.com".to_string()],
             Vec::new(),
+        );
+        let table = registry.table();
+        let decide = |payload: &[u8]| gate_decision(&table, LEASE, payload);
+        let cased = |name: &str| Name::from_ascii(name).expect("query name parses");
+
+        // Declared names pass, whatever their case or type.
+        for (name, rtype) in [
+            ("example.com.", RecordType::A),
+            ("EXAMPLE.com", RecordType::AAAA),
+            ("api.github.com.", RecordType::A),
+            ("Api.GitHub.Com.", RecordType::HTTPS),
+        ] {
+            assert_eq!(
+                decide(&dns_query_of(&[(cased(name), rtype)])),
+                None,
+                "a {rtype:?} lookup of the declared {name} passes"
+            );
+        }
+        // A box-zone A lookup the switch's resolver answers on its own
+        // passes, the host row included (NET-072), whatever the case below
+        // the apex.
+        for name in [
+            "web.min.internal.",
+            "host.min.internal.",
+            "Web.min.internal.",
+        ] {
+            assert_eq!(
+                decide(&dns_query_of(&[(cased(name), RecordType::A)])),
+                None,
+                "an A lookup of the zone name {name} passes"
+            );
+        }
+        // Every other zone question is one the switch's resolver forwards
+        // upstream, and one the in-VM gate answers itself: dropped, as for a
+        // deny-all row.
+        for (name, rtype) in [
+            ("X.MIN.INTERNAL.", RecordType::A),
+            ("min.internal.", RecordType::A),
+            ("min.internal.", RecordType::SOA),
+            ("db.min.internal.", RecordType::TXT),
+            ("host.min.internal.", RecordType::AAAA),
+        ] {
+            assert_eq!(
+                decide(&dns_query_of(&[(cased(name), rtype)])),
+                Some((
+                    name.to_ascii_lowercase().trim_end_matches('.').to_string(),
+                    Some(rtype)
+                )),
+                "a {rtype:?} lookup of the zone name {name} is dropped"
+            );
+        }
+
+        // A name the list does not match is dropped, in any type: a sibling
+        // or a parent of a declared name is not that name, and a lookalike
+        // of the zone, or a label holding an escaped dot, is outside it.
+        for name in [
+            "example.org.",
+            "www.example.com.",
+            "github.com.",
+            "data.example.net.",
+            "web.min.internal.example.com.",
+        ] {
+            for rtype in [RecordType::A, RecordType::TXT] {
+                assert_eq!(
+                    decide(&dns_query_of(&[(qname(name), rtype)])),
+                    Some((name.trim_end_matches('.').to_string(), Some(rtype))),
+                    "a {rtype:?} lookup of {name} is dropped, naming the name"
+                );
+            }
+        }
+        let escaped = Name::from_labels(vec![b"evil.min" as &[u8], b"internal"])
+            .expect("a label may carry a dot");
+        assert!(
+            decide(&dns_query_of(&[(escaped, RecordType::A)])).is_some(),
+            "a label holding an escaped dot is not a zone name"
+        );
+
+        // Every question is read: a declared name or a zone name in front
+        // carries no unmatched name past the check.
+        for front in ["example.com.", "web.min.internal."] {
+            assert_eq!(
+                decide(&dns_query_of(&[
+                    (qname(front), RecordType::A),
+                    (qname("leak.example.org."), RecordType::A),
+                ])),
+                Some(("leak.example.org".to_string(), Some(RecordType::A))),
+                "an unmatched name behind {front} is dropped"
+            );
+        }
+
+        // Nothing that is not a standard query with a question passes.
+        assert_eq!(
+            decide(&[0xde, 0xad, 0xbe, 0xef, 0x00]),
+            Some(("<unparseable>".to_string(), None)),
+            "an unparseable datagram is dropped"
+        );
+        assert_eq!(
+            decide(&dns_query_of(&[])),
+            Some(("<no question>".to_string(), None)),
+            "a query with no question is dropped"
+        );
+
+        // A query to another address at DNS's port is not this gate's: the
+        // frame verdict decided it, as the in-VM gate leaves it to.
+        let elsewhere = udp_payload_frame(
+            Ipv4Addr::from(LEASE),
+            40000,
+            Ipv4Addr::new(10, 0, 0, 53),
+            53,
+            &dns_query_of(&[(qname("example.org."), RecordType::A)]),
+        );
+        let (pkt, datagram) = udp_datagram(&elsewhere).expect("the query frame parses");
+        assert!(
+            dns_query_refusal(&table, &pkt, datagram).is_none(),
+            "a query to an address other than the box's resolver is not decided"
+        );
+    }
+
+    /// The gate decides deny-all rows and rows that declared
+    /// `allow_dns_hosts`, and nothing else: a row with no egress
+    /// declaration, a row with unrestricted egress, a row whose names are
+    /// closed but whose subnets are not, the node namespace (which every
+    /// host-address box's frames ride) and an unregistered source are all
+    /// left to the verdict and the pins, whatever their queries name.
+    #[test]
+    fn rows_without_declared_names_are_not_decided() {
+        let registry = BoxRegistry::new(SUBNET);
+        let unrestricted = [100, 64, 0, 13];
+        registry.register(
+            BoxRegistration::new(
+                "unrestricted",
+                Ipv4Addr::from(unrestricted),
+                Ipv4Addr::LOCALHOST,
+            )
+            .with_egress_policy(EgressPolicy {
+                allow_protocols: None,
+                allow_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+                allow_dns_hosts: None,
+                deny_subnets: None,
+            }),
         );
         let open = [100, 64, 0, 10];
         registry.register(BoxRegistration::new(
@@ -3877,7 +4176,7 @@ pub(crate) mod tests {
         let table = registry.table();
 
         for (lease, row) in [
-            (LEASE, "an allow-list row"),
+            (unrestricted, "a row with unrestricted egress"),
             (open, "a row with no egress declaration"),
             (closed_names, "a row with closed names but open subnets"),
             (node.switch_addr().octets(), "the node namespace"),
@@ -3889,9 +4188,9 @@ pub(crate) mod tests {
                 vec![0xde, 0xad],
             ] {
                 assert_eq!(
-                    deny_all_decision(&table, lease, &payload),
+                    gate_decision(&table, lease, &payload),
                     None,
-                    "{row} is not decided by the deny-all gate"
+                    "{row} is not decided by the host-side DNS gate"
                 );
             }
         }
