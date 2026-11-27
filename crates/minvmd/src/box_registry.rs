@@ -2137,6 +2137,17 @@ pub enum AllocationError {
         /// The address the kernel cannot hold.
         addr: Ipv4Addr,
     },
+    /// The box declares more DNS hosts than the network kernel's tables
+    /// hold room for. The registration is refused before any row changes.
+    #[error(
+        "the network gate cannot hold a box declaring {names} DNS hosts; it holds at most {most}"
+    )]
+    KernelRefusedNames {
+        /// How many DNS hosts the box declares.
+        names: usize,
+        /// The most a box may declare.
+        most: usize,
+    },
 }
 
 /// Follows the registry's removal of the row at `addr` in the network
@@ -5115,6 +5126,21 @@ impl BoxRegistry {
             );
             return Err(AllocationError::KernelRefusedAddress { addr });
         }
+        // The same for the box's tables: a declaration whose DNS table the
+        // kernel cannot make is refused before anything changes.
+        let names = crate::net::kernel_config::dns_names(registration.egress.as_ref()).len();
+        let most = crate::net::kernel_config::most_declared_names();
+        if names > most {
+            drop(rows);
+            tracing::warn!(
+                box = %record.name(),
+                names,
+                most,
+                "refused a box registration declaring more DNS hosts than the network kernel's \
+                 tables hold room for"
+            );
+            return Err(AllocationError::KernelRefusedNames { names, most });
+        }
         if let Some(attachments) = &self.attachments
             && record.switch_addr != self.subnet.daemon_ip()
         {
@@ -7909,6 +7935,7 @@ impl BoxRegistry {
         // and the exposures rest on the test that writes an exposure file
         // and reads the kernel's arm.
         live.assert_alias_built_from(&node_ports);
+        live.assert_tables_held();
     }
 
     /// A `host_ip` box's policy from its client's declared one, filled under
@@ -9821,6 +9848,11 @@ impl BoxTable {
             .adopt_baseline(
                 baseline.phase() == crate::net::NodeBaselinePhase::InForce,
                 endpoints,
+                baseline
+                    .named_endpoints()
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .collect(),
                 baseline.alias_ports(),
             );
     }
@@ -10145,6 +10177,34 @@ impl BoxTable {
         self.subnet
     }
 
+    /// Makes the kernel tables of each address the ending relay carried
+    /// empty again, when the row there is still the one it carried (the same
+    /// box id): the relay's end is the end of a box's records. A row
+    /// withdrawn since has no tables, and one registered since began empty.
+    /// Under the read of the row lock, the configuration's write taken alone
+    /// beneath it; no table is read.
+    fn empty_carried_tables(&self, sources: &WithdrawalReport) {
+        let rows = self
+            .rows
+            .read()
+            .expect("the row lock is never held across a panic, so it cannot be poisoned");
+        let carried: Vec<Ipv4Addr> = sources
+            .iter()
+            .filter(|(addr, box_id)| rows.get(addr).is_some_and(|row| row.box_id == *box_id))
+            .map(|(addr, _)| Ipv4Addr::from(*addr))
+            .collect();
+        if carried.is_empty() {
+            return;
+        }
+        let mut kernel = self
+            .kernel
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for addr in carried {
+            kernel.empty_tables_at(addr);
+        }
+    }
+
     /// Files a withdrawal report: `sources` are the switch addresses whose
     /// relayed traffic the calling connection carried, each with the box id
     /// [`Self::carry`] filed for it, and the connection is at
@@ -10162,6 +10222,7 @@ impl BoxTable {
         if sources.is_empty() {
             return;
         }
+        self.empty_carried_tables(&sources);
         if let Err(_disconnected) = self.withdrawal_reports.send(sources) {
             // Every receiver is gone: the drainer was never started or the
             // host is shutting down. Nothing to withdraw for, nowhere to
@@ -17388,6 +17449,129 @@ mod tests {
         );
     }
 
+    /// A question written into the DNS table of the row at `addr`, as the
+    /// gate will write one, and whether the table still holds it.
+    fn ask_at(registry: &BoxRegistry, addr: Ipv4Addr) {
+        let asked = registry.kernel_for_tests().with_row_pins(addr, |pins| {
+            pins.ask(7, 0x522a, 40000, netcore::time::Instant { ms: 1 })
+        });
+        assert!(asked.is_some(), "the row at {addr} has tables");
+    }
+
+    fn asked_at(registry: &BoxRegistry, addr: Ipv4Addr) -> bool {
+        registry
+            .kernel_for_tests()
+            .with_row_pins(addr, |pins| {
+                pins.asked_live(7, 0x522a, 40000, netcore::time::Instant { ms: 2 })
+            })
+            .unwrap_or(false)
+    }
+
+    /// A box's kernel tables exist exactly while a row holds its address:
+    /// made empty at its registration, made empty again when it is
+    /// registered again, and gone with its withdrawal; the node's and the
+    /// cohort's stand beside them, owned as the configuration's spelling
+    /// says.
+    #[test]
+    fn a_rows_tables_exist_exactly_while_a_row_holds_its_address() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        let web = Ipv4Addr::new(100, 64, 0, 9);
+        registry.register(BoxRegistration::new("web", web, Ipv4Addr::LOCALHOST));
+        assert!(registry.admit_host_ip_box(boxes::SessionId::from_bytes([0x61; 16]), None));
+        registry.assert_kernel_in_step();
+
+        ask_at(&registry, web);
+        assert!(asked_at(&registry, web), "the question is held");
+        registry.register(BoxRegistration::new("web", web, Ipv4Addr::LOCALHOST));
+        registry.assert_kernel_in_step();
+        assert!(
+            !asked_at(&registry, web),
+            "a row registered again starts empty"
+        );
+
+        ask_at(&registry, web);
+        assert!(registry.withdraw(web).is_some());
+        registry.assert_kernel_in_step();
+        assert!(
+            registry
+                .kernel_for_tests()
+                .with_row_pins(web, |_| ())
+                .is_none(),
+            "a withdrawn row has no tables"
+        );
+        registry.register(BoxRegistration::new("web", web, Ipv4Addr::LOCALHOST));
+        registry.assert_kernel_in_step();
+        assert!(
+            !asked_at(&registry, web),
+            "the next registration starts empty"
+        );
+    }
+
+    /// The end of a relay makes the tables of each row it carried empty
+    /// again, when the row there is still the one it carried; a row whose
+    /// box id differs keeps its tables.
+    #[test]
+    fn a_relays_end_empties_the_tables_of_the_rows_it_carried() {
+        let registry = BoxRegistry::new(SUBNET);
+        let web = Ipv4Addr::new(100, 64, 0, 9);
+        let db = Ipv4Addr::new(100, 64, 0, 10);
+        let carried = registry.register(BoxRegistration::new("web", web, Ipv4Addr::LOCALHOST));
+        registry.register(BoxRegistration::new("db", db, Ipv4Addr::LOCALHOST));
+        ask_at(&registry, web);
+        ask_at(&registry, db);
+        registry.table().report_withdrawals(vec![
+            (web.octets(), carried.box_id()),
+            (db.octets(), carried.box_id()),
+        ]);
+        assert!(
+            !asked_at(&registry, web),
+            "the carried row's tables are empty again"
+        );
+        assert!(
+            asked_at(&registry, db),
+            "a row of another box keeps its tables"
+        );
+        registry.assert_kernel_in_step();
+    }
+
+    /// A box may declare as many DNS hosts as its DNS table holds a name's
+    /// quota of admissions for, and no more: the table's own maximum
+    /// decides. The registration past it is refused with nothing changed.
+    #[test]
+    fn a_box_declares_at_most_the_dns_hosts_its_tables_hold() {
+        let most = crate::net::kernel_config::most_declared_names();
+        assert_eq!(most, 1023, "32,767 admissions at 32 a name");
+        let declaring = |name: &str, last: u8, count: usize| {
+            BoxRegistration::new(name, Ipv4Addr::new(100, 64, 0, last), Ipv4Addr::LOCALHOST)
+                .with_egress_policy(EgressPolicy {
+                    allow_subnets: Some(vec![]),
+                    allow_dns_hosts: Some(
+                        (0..count).map(|i| format!("h{i}.example.org")).collect(),
+                    ),
+                    allow_protocols: None,
+                    deny_subnets: None,
+                })
+        };
+        let registry = BoxRegistry::new(SUBNET);
+        assert!(registry.try_register(declaring("held", 9, most)).is_ok());
+        registry.assert_kernel_in_step();
+        assert_eq!(
+            registry
+                .try_register(declaring("refused", 10, most + 1))
+                .map(|record| record.switch_addr()),
+            Err(AllocationError::KernelRefusedNames {
+                names: most + 1,
+                most
+            })
+        );
+        assert!(
+            registry.table().by_source([100, 64, 0, 10]).is_none(),
+            "the refused registration changed nothing"
+        );
+        registry.assert_kernel_in_step();
+    }
+
     /// A registration at an address the kernel cannot hold, the box's own
     /// or a task row's, is refused before any row changes.
     #[test]
@@ -17649,7 +17833,7 @@ mod tests {
             registry.register_node_namespace(7654);
             registry
                 .kernel_config()
-                .adopt_baseline(true, std::iter::empty(), &[]);
+                .adopt_baseline(true, std::iter::empty(), Vec::new(), &[]);
             let (first, last) = hand_out_run(subnet);
             for addr in [last, first + (last - first) / 2] {
                 let addr = Ipv4Addr::from(addr);

@@ -418,7 +418,7 @@ struct BoxPins {
 /// A DNS wire name in the form the row's declared names are matched in:
 /// ASCII-lowercased, with the root dot stripped — `github.com` for
 /// `GitHub.com.`. The same normalization the in-VM gate matches by.
-fn normalized(name: &str) -> String {
+pub(crate) fn normalized(name: &str) -> String {
     let lowered = name.to_ascii_lowercase();
     lowered.strip_suffix('.').unwrap_or(&lowered).to_string()
 }

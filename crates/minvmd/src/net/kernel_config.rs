@@ -30,20 +30,33 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::{Arc, LockResult};
+use std::sync::{Arc, LockResult, Mutex, OnceLock, PoisonError};
+use std::time::Duration;
 
-use boxes::core::egress::{IPPROTO_TCP, IPPROTO_UDP};
+use boxes::core::egress::{
+    DNS_ADMISSION_WINDOW, DNS_FLOW_IDLE_CAP, DNS_MAX_ADDRESSES_PER_NAME, DNS_MAX_FLOWS_PER_BOX,
+    DNS_OUTSTANDING_QUERY_CAP, DNS_QUERY_EXPIRY, IPPROTO_TCP, IPPROTO_UDP,
+    REPLY_FLOW_SWEEP_INTERVAL, REPLY_MAX_FLOWS_PER_BOX, REPLY_TCP_IDLE_CAP,
+    REPLY_UDP_REPLIED_WINDOW, REPLY_UDP_UNREPLIED_WINDOW,
+};
 use boxes::{EgressPolicy, IpProto, SessionId};
 use netcore::alias::{AliasState, Exposure, Holder, PortRange};
 use netcore::cohort::Member;
+use netcore::finish::{TableLimits, tables_for};
+use netcore::flow::Windows;
+use netcore::judge::BoxTables;
 use netcore::origin::{CohortSpelling, Sources};
+use netcore::pins::{self, Pins};
 use netcore::plan::{Plan, PlanError};
 use netcore::policy::{self, Abilities, Declared, Effective, Enforced, Net, Section};
 use netcore::row::Cidr;
 use netcore::split::{Config, RowDecl};
+use netcore::time::Span;
 use switch::SwitchSubnet;
 
 use crate::net::baseline::ALIAS_FETCH_PROTOCOL;
+use crate::net::dns_pins;
+use crate::net::egress_gate::{REFUSAL_NOTES_PER_SOURCE, REFUSAL_WINDOW};
 use crate::net::host_exposures::{self, HostExposure};
 use crate::net::kernel_names::{NO_NAME, NameIds, listed_zone_names, names_host, zone_name};
 
@@ -98,6 +111,145 @@ pub(crate) enum KernelConfigError {
     /// The kernel refused the configuration's starting row list.
     #[error("the network kernel refused an empty row list")]
     Sources,
+    /// A box's kernel tables cannot be made for `names` declared names: its
+    /// DNS table would need room for more admissions than the table holds.
+    #[error("the network kernel cannot make tables for a box declaring {names} names")]
+    TablesRefused { names: usize },
+}
+
+/// How long a TCP reply record lives after the first FIN, and after every
+/// later segment while one side has sent FIN and the other has not.
+const TCP_CLOSING_WINDOW: Duration = Duration::from_secs(120);
+
+/// How long a TCP reply record lives after the second FIN, or a reset.
+const TCP_CLOSED_WINDOW: Duration = Duration::from_secs(10);
+
+/// `d` in whole milliseconds, as the kernel's clock counts.
+fn ms(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The limits of the DNS tables of a box whose declaration names `names`
+/// DNS hosts (the node: its baseline's endpoint names; the cohort: its
+/// members' names together): the gate's existing capacities and windows,
+/// with room for a name's full quota of admissions for each name, and for
+/// one name when none is declared.
+fn pin_limits(names: usize) -> pins::Limits {
+    pins::Limits {
+        asked_cap: DNS_OUTSTANDING_QUERY_CAP,
+        asked_per_name: DNS_OUTSTANDING_QUERY_CAP,
+        admitted_cap: names.max(1).saturating_mul(DNS_MAX_ADDRESSES_PER_NAME),
+        admitted_per_name: DNS_MAX_ADDRESSES_PER_NAME,
+        flows_cap: DNS_MAX_FLOWS_PER_BOX,
+        flows_per_destination: DNS_MAX_FLOWS_PER_BOX,
+        query_ms: ms(DNS_QUERY_EXPIRY),
+        window_ms: ms(DNS_ADMISSION_WINDOW),
+        idle_ms: ms(DNS_FLOW_IDLE_CAP),
+    }
+}
+
+/// The limits of one box's three kernel tables, for a box whose
+/// declaration names `names` DNS hosts: the reply table's capacity, sweep
+/// interval and windows, the refusal notes' and the DNS tables', each the
+/// gate's existing value, and the closing windows.
+fn table_limits(names: usize) -> TableLimits {
+    TableLimits {
+        windows: Windows {
+            tcp_idle_ms: ms(REPLY_TCP_IDLE_CAP),
+            tcp_closing_ms: ms(TCP_CLOSING_WINDOW),
+            tcp_closed_ms: ms(TCP_CLOSED_WINDOW),
+            udp_unreplied_ms: ms(REPLY_UDP_UNREPLIED_WINDOW),
+            udp_replied_ms: ms(REPLY_UDP_REPLIED_WINDOW),
+            evict_after_ms: None,
+        },
+        flows_cap: REPLY_MAX_FLOWS_PER_BOX,
+        sweep: Span {
+            ms: ms(REPLY_FLOW_SWEEP_INTERVAL),
+        },
+        notes_cap: REPLY_MAX_FLOWS_PER_BOX,
+        notes_per_client: REFUSAL_NOTES_PER_SOURCE,
+        note_window: Span {
+            ms: ms(REFUSAL_WINDOW),
+        },
+        pins: pin_limits(names),
+    }
+}
+
+/// The DNS hosts `policy` declares, as the box's DNS table numbers them:
+/// each normalized as a question is matched against it
+/// ([`dns_pins::normalized`]), the first occurrence kept. A name's number is
+/// its position here.
+pub(crate) fn dns_names(policy: Option<&EgressPolicy>) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for host in policy
+        .and_then(|policy| policy.allow_dns_hosts.as_ref())
+        .into_iter()
+        .flatten()
+    {
+        let name = dns_pins::normalized(host);
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// One box's tables, or the cohort's DNS table, with the names its DNS
+/// table numbers by position, each table under its own lock.
+struct Held<T> {
+    names: Vec<String>,
+    tables: Mutex<T>,
+}
+
+/// The three empty tables of the box at `addr` whose DNS table numbers
+/// `names`, made by the kernel's one constructor.
+fn row_held(addr: Ipv4Addr, names: Vec<String>) -> Result<Held<BoxTables>, KernelConfigError> {
+    match tables_for(u32::from(addr), table_limits(names.len())) {
+        Some(tables) => Ok(Held {
+            names,
+            tables: Mutex::new(tables),
+        }),
+        None => Err(KernelConfigError::TablesRefused { names: names.len() }),
+    }
+}
+
+/// A DNS table owned by `owner` with room for `names`; when the kernel
+/// cannot make one that large, an empty one at the largest size it makes,
+/// said in an error line: names past its room are refused for room.
+fn pins_or_largest(owner: u32, names: usize, whose: &'static str) -> Pins {
+    if let Some(pins) = Pins::new(owner, pin_limits(names)) {
+        return pins;
+    }
+    let most = most_declared_names();
+    tracing::error!(
+        whose,
+        names,
+        most,
+        "the network kernel cannot make a DNS table with room for every name; it holds an empty \
+         one at the largest size, and names past its room are refused for room"
+    );
+    Pins::new(owner, pin_limits(most))
+        .expect("a DNS table at the largest size the kernel makes is made")
+}
+
+/// The most distinct DNS hosts one box may declare: the most a DNS table
+/// holds room for, at a name's quota of admissions each. Derived once from
+/// the kernel's own refusal, so the number is written nowhere: the largest
+/// count whose DNS table the kernel makes.
+pub(crate) fn most_declared_names() -> usize {
+    static MOST: OnceLock<usize> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        let mut most = 0;
+        let mut step = 1 << 20;
+        while step > 0 {
+            let names = most + step;
+            if Pins::new(0, pin_limits(names)).is_some() {
+                most = names;
+            }
+            step >>= 1;
+        }
+        most
+    })
 }
 
 /// What a registration says of one row, as the registry holds it while the
@@ -182,10 +334,12 @@ struct RowNames {
     listed: Vec<String>,
 }
 
-/// One resident `host_ip` box's enforced policy.
+/// One resident `host_ip` box's enforced policy, and the DNS hosts it
+/// declares.
 struct MemberRules {
     effective: Effective,
     resolves_names: bool,
+    names: Vec<String>,
 }
 
 /// What the alias's state is built from: the node row's ports, where the
@@ -230,6 +384,50 @@ pub(crate) struct KernelConfig {
     /// How many times an operation found the configuration different from
     /// the registry and it was rebuilt.
     divergences: u64,
+    /// By row address: the row's kernel tables, with the names its DNS
+    /// table numbers. They exist exactly while a row holds the address: made
+    /// empty when the row is registered, made empty again when it is
+    /// registered again or at the end of a relay that carried it, and
+    /// dropped with the row. The node's own row has these too: they are the
+    /// ones its frames are decided by while the node's baseline is not in
+    /// force, when the node's address routes as its row both ways.
+    row_tables: BTreeMap<u32, Held<BoxTables>>,
+    /// The node's tables, owned by the node's address, with its baseline's
+    /// endpoint names in the baseline's order. Reached while the baseline is
+    /// in force: by the node's unmarked frames and by frames toward the
+    /// node's address, and, under the mark spelling, by the cohort for its
+    /// reply records and notes. Its DNS table is made empty again when the
+    /// baseline changes.
+    node_tables: Held<BoxTables>,
+    /// The cohort's DNS table, owned by the address the cohort sends from
+    /// under the configuration's spelling, with its members' names together,
+    /// normalized and sorted. Reached by the cohort's frames while the
+    /// baseline is in force. Made empty again when the members change.
+    cohort_pins: Held<Pins>,
+    /// The baseline's endpoints last adopted, as given and in their order:
+    /// its names and its blocks, which the node's DNS admissions are
+    /// checked against.
+    node_endpoints: Vec<String>,
+}
+
+/// The cohort's names: its members' DNS hosts together, normalized, each
+/// once, sorted (members come and go in no fixed order).
+fn cohort_names(members: &BTreeMap<SessionId, MemberRules>) -> Vec<String> {
+    let names: std::collections::BTreeSet<String> = members
+        .values()
+        .flat_map(|member| member.names.iter().map(|name| dns_pins::normalized(name)))
+        .collect();
+    names.into_iter().collect()
+}
+
+/// The address the cohort sends from under `sources`' spelling: the node's
+/// with the mark, or the plan's own cohort address.
+fn cohort_owner(sources: &Sources) -> u32 {
+    let plan = sources.plan();
+    match sources.spelling() {
+        CohortSpelling::NodeWithMark => plan.node(),
+        CohortSpelling::OwnAddress => plan.cohort(),
+    }
 }
 
 impl fmt::Debug for KernelConfig {
@@ -253,6 +451,10 @@ impl KernelConfig {
         let plan = plan_of(subnet).map_err(KernelConfigError::Plan)?;
         let sources = Sources::new(plan, Vec::new(), false, CohortSpelling::NodeWithMark)
             .ok_or(KernelConfigError::Sources)?;
+        let node_tables = tables_for(plan.node(), table_limits(0))
+            .ok_or(KernelConfigError::TablesRefused { names: 0 })?;
+        let cohort_pins = Pins::new(cohort_owner(&sources), pin_limits(0))
+            .ok_or(KernelConfigError::TablesRefused { names: 0 })?;
         Ok(Self {
             subnet,
             config: Config {
@@ -271,6 +473,16 @@ impl KernelConfig {
             alias_inputs: AliasInputs::default(),
             exposures_from: None,
             divergences: 0,
+            row_tables: BTreeMap::new(),
+            node_tables: Held {
+                names: Vec::new(),
+                tables: Mutex::new(node_tables),
+            },
+            cohort_pins: Held {
+                names: Vec::new(),
+                tables: Mutex::new(cohort_pins),
+            },
+            node_endpoints: Vec::new(),
         })
     }
 
@@ -321,9 +533,11 @@ impl KernelConfig {
         addr: Ipv4Addr,
         facts: &RowFacts<'_>,
     ) -> Result<(), KernelConfigError> {
+        let tables = row_held(addr, dns_names(facts.policy))?;
         let (decl, names) = self.row_decl(facts)?;
         if self.config.register(u32::from(addr), decl) {
             self.row_names.insert(u32::from(addr), names);
+            self.row_tables.insert(u32::from(addr), tables);
             self.row_generations
                 .insert(u32::from(addr), facts.generation);
             Ok(())
@@ -410,6 +624,8 @@ impl KernelConfig {
     /// new declaration holds are taken before the old ones are given back,
     /// so a name both hold keeps its number.
     fn restate_row(&mut self, addr: Ipv4Addr, facts: &RowFacts<'_>) -> Result<(), Diverged> {
+        let tables = row_held(addr, dns_names(facts.policy))
+            .map_err(|error| Diverged::refused("restate", addr, error))?;
         let (decl, names) = self
             .row_decl(facts)
             .map_err(|error| Diverged::refused("restate", addr, error))?;
@@ -421,6 +637,8 @@ impl KernelConfig {
         if let Some(before) = self.row_names.insert(key, names) {
             self.release_names(&before);
         }
+        // A row registered again starts with empty tables.
+        self.row_tables.insert(key, tables);
         self.row_generations.insert(key, facts.generation);
         Ok(())
     }
@@ -431,6 +649,7 @@ impl KernelConfig {
     pub(crate) fn drop_row(&mut self, addr: Ipv4Addr) -> Result<(), Diverged> {
         let key = u32::from(addr);
         self.row_policies.remove(&key);
+        self.row_tables.remove(&key);
         self.row_generations.remove(&key);
         if let Some(names) = self.row_names.remove(&key) {
             self.release_names(&names);
@@ -492,6 +711,7 @@ impl KernelConfig {
     ) {
         self.members.insert(session, member_rules(session, facts));
         self.sync_members();
+        self.renew_cohort_pins();
         self.cohort_generation = generation;
     }
 
@@ -501,8 +721,54 @@ impl KernelConfig {
     pub(crate) fn drop_member(&mut self, session: SessionId, generation: Option<u64>) {
         if self.members.remove(&session).is_some() {
             self.sync_members();
+            self.renew_cohort_pins();
         }
         self.cohort_generation = generation;
+    }
+
+    /// Makes the cohort's DNS table empty again, numbering its members'
+    /// names together.
+    fn renew_cohort_pins(&mut self) {
+        let names = cohort_names(&self.members);
+        let pins = pins_or_largest(
+            cohort_owner(&self.config.sources),
+            names.len(),
+            "the host_ip boxes together",
+        );
+        self.cohort_pins = Held {
+            names,
+            tables: Mutex::new(pins),
+        };
+    }
+
+    /// Makes the tables of the row at `addr` empty again, when a row holds
+    /// it: the end of a relay that carried it. Nothing else changes.
+    pub(crate) fn empty_tables_at(&mut self, addr: Ipv4Addr) {
+        let key = u32::from(addr);
+        if !self.row_tables.contains_key(&key) {
+            return;
+        }
+        let policy = self.row_policies.get(&key).cloned().flatten();
+        let names = dns_names(policy.as_ref());
+        let held = match row_held(addr, names.clone()) {
+            Ok(held) => held,
+            Err(error) => {
+                tracing::error!(
+                    address = %addr,
+                    %error,
+                    "the network kernel could not make a carried row's tables at their size; \
+                     they are made empty for no name, and its names are refused for room"
+                );
+                let Some(tables) = tables_for(key, table_limits(0)) else {
+                    return;
+                };
+                Held {
+                    names,
+                    tables: Mutex::new(tables),
+                }
+            }
+        };
+        self.row_tables.insert(key, held);
     }
 
     /// Adopts the node's baseline: whether it is in force, the blocks its
@@ -511,12 +777,52 @@ impl KernelConfig {
     /// a block is left out: a host name, which the node plane pins by its
     /// answers, or a bare address, silently; a term spelled as a block, with
     /// a warning.
+    /// `node_names` are the baseline's endpoint names in its order, each
+    /// once, as the node's DNS table numbers them. The node's DNS table is
+    /// kept when the baseline's in-force flag, its endpoints (names, and the
+    /// blocks the node's admissions were checked against) and its names are
+    /// unchanged; otherwise made empty, so no address admitted under an old
+    /// allow list outlives it. The node's address is the plan's, fixed for
+    /// the configuration's life, and an entry's category is not given: a
+    /// category is a label; it decides nothing the table holds. Node tables
+    /// whose lock was poisoned are never adopted: the node gets empty ones.
     pub(crate) fn adopt_baseline<'a>(
         &mut self,
         in_force: bool,
         endpoints: impl IntoIterator<Item = &'a str>,
+        node_names: Vec<String>,
         alias_ports: &[host_exposures::PortRange],
     ) {
+        let endpoints: Vec<&str> = endpoints.into_iter().collect();
+        let unchanged = self.config.sources.node_in_force() == in_force
+            && self.node_endpoints.len() == endpoints.len()
+            && self
+                .node_endpoints
+                .iter()
+                .zip(&endpoints)
+                .all(|(kept, given)| kept == given)
+            && self.node_tables.names == node_names;
+        let poisoned = self.node_tables.tables.is_poisoned();
+        if !unchanged || poisoned {
+            let node = self.config.sources.plan().node();
+            let pins = pins_or_largest(node, node_names.len(), "the node's baseline");
+            if poisoned && let Some(mut emptied) = tables_for(node, table_limits(0)) {
+                tracing::error!(
+                    "the node's kernel tables' lock was poisoned by a panic; the node's baseline \
+                     is adopted with empty tables"
+                );
+                emptied.pins = pins;
+                self.node_tables.tables = Mutex::new(emptied);
+            } else {
+                self.node_tables
+                    .tables
+                    .get_mut()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .pins = pins;
+            }
+        }
+        self.node_tables.names = node_names;
+        self.node_endpoints = endpoints.iter().map(ToString::to_string).collect();
         let baseline = endpoints
             .into_iter()
             .filter_map(|endpoint| match net_of(endpoint) {
@@ -578,7 +884,9 @@ impl KernelConfig {
     /// Rebuilds the configuration from the registry's `rows` after `cause`
     /// showed it different from them: counted, logged, and each row built
     /// again from its kept policy by the builders a registration uses. The
-    /// members, the baseline and the alias are kept.
+    /// members, the baseline and the alias are kept. Tables are kept only
+    /// for the registration they were made for, and never when their lock
+    /// was poisoned: such a row, the node or the cohort gets empty ones.
     pub(crate) fn rebuild<'a>(
         &mut self,
         rows: impl IntoIterator<Item = (Ipv4Addr, RowShape<'a>)>,
@@ -629,9 +937,94 @@ impl KernelConfig {
                 );
             }
         }
+        // The reply records and notes of every row the rebuilt configuration
+        // holds are the ones it held: a rebuild repairs the rules, and keeps
+        // a row's records only for the registration they were made for. A
+        // row whose registration differs from the one its tables were made
+        // for, or whose tables' lock was poisoned, keeps the rebuilt row's
+        // empty tables, as a new registration's are. A row's DNS table is kept
+        // only while its names are numbered as before; otherwise it is the
+        // rebuilt row's empty one, so no admission is ever read under
+        // another name.
+        for (key, held) in std::mem::take(&mut self.row_tables) {
+            let Some(kept) = fresh.row_tables.get_mut(&key) else {
+                continue;
+            };
+            if self.row_generations.get(&key) != fresh.row_generations.get(&key) {
+                tracing::debug!(
+                    address = %Ipv4Addr::from(key),
+                    "a rebuild finds the row registered again since its tables were made; its \
+                     tables start empty"
+                );
+                continue;
+            }
+            let Ok(mut tables) = held.tables.into_inner() else {
+                tracing::error!(
+                    address = %Ipv4Addr::from(key),
+                    "a row's kernel tables' lock was poisoned by a panic; the rebuilt row's \
+                     tables start empty"
+                );
+                continue;
+            };
+            let rebuilt = kept
+                .tables
+                .get_mut()
+                .unwrap_or_else(PoisonError::into_inner);
+            if held.names != kept.names {
+                std::mem::swap(&mut tables.pins, &mut rebuilt.pins);
+                tracing::debug!(
+                    address = %Ipv4Addr::from(key),
+                    "a rebuild numbers the row's DNS names differently; its DNS table starts empty"
+                );
+            }
+            *rebuilt = tables;
+        }
+        // The node's numbering comes from the baseline, which a rebuild
+        // keeps, and so do its endpoints, which the next adoption of the
+        // same baseline compares with. The node's tables belong to the
+        // node's own address, fixed for the configuration's life; they are
+        // kept unless their lock was poisoned.
+        if self.node_tables.tables.is_poisoned() {
+            tracing::error!(
+                "the node's kernel tables' lock was poisoned by a panic; the rebuilt node's \
+                 tables start empty"
+            );
+            let pins = pins_or_largest(
+                fresh.config.sources.plan().node(),
+                self.node_tables.names.len(),
+                "the node's baseline",
+            );
+            fresh
+                .node_tables
+                .tables
+                .get_mut()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pins = pins;
+            fresh.node_tables.names = std::mem::take(&mut self.node_tables.names);
+        } else {
+            std::mem::swap(&mut fresh.node_tables, &mut self.node_tables);
+        }
+        fresh.node_endpoints = std::mem::take(&mut self.node_endpoints);
         fresh.row_policies = std::mem::take(&mut self.row_policies);
         fresh.members = std::mem::take(&mut self.members);
+        // The cohort's tables were made for the resident boxes' record, which
+        // a rebuild keeps with its generation.
         fresh.cohort_generation = self.cohort_generation;
+        if self.cohort_pins.tables.is_poisoned() {
+            tracing::error!(
+                "the host_ip boxes' kernel DNS table's lock was poisoned by a panic; the rebuilt \
+                 one starts empty"
+            );
+            fresh.renew_cohort_pins();
+        } else if cohort_names(&fresh.members) == self.cohort_pins.names {
+            std::mem::swap(&mut fresh.cohort_pins, &mut self.cohort_pins);
+        } else {
+            tracing::debug!(
+                "a rebuild numbers the host_ip boxes' DNS names differently; their DNS table \
+                 starts empty"
+            );
+            fresh.renew_cohort_pins();
+        }
         fresh.sync_members();
         fresh.alias_inputs = std::mem::take(&mut self.alias_inputs);
         fresh.exposures_from = self.exposures_from.take();
@@ -749,6 +1142,83 @@ impl KernelConfig {
             assert!(same_rules(mine.rules.get(), theirs.rules.get()));
             assert_eq!(mine.resolves_names, theirs.resolves_names);
         }
+    }
+
+    /// Panics unless the tables are held as the rule says: exactly the
+    /// registered rows have tables, each owned by its row's address; the
+    /// node's are owned by the node's address; and the cohort's DNS table by
+    /// the address the cohort sends from under the configuration's spelling.
+    /// Presence and owners only: a rebuilt configuration's tables are new.
+    pub(crate) fn assert_tables_held(&self) {
+        let rows: Vec<u32> = self.row_names.keys().copied().collect();
+        assert_eq!(
+            rows.len(),
+            self.config.sources.len(),
+            "one name record for each row"
+        );
+        let held: Vec<u32> = self.row_tables.keys().copied().collect();
+        assert_eq!(held, rows, "exactly the registered rows have tables");
+        for (key, held) in &self.row_tables {
+            let policy = self.row_policies.get(key).cloned().flatten();
+            assert_eq!(
+                held.names,
+                dns_names(policy.as_ref()),
+                "a row's names are its policy's"
+            );
+            let tables = held.tables.lock().unwrap_or_else(PoisonError::into_inner);
+            assert_eq!(
+                tables.flows.box_addr(),
+                *key,
+                "a row's reply table is its own"
+            );
+            assert_eq!(tables.notes.box_addr(), *key, "a row's notes are its own");
+            assert_eq!(tables.pins.owner(), *key, "a row's DNS table is its own");
+        }
+        let node = self.config.sources.plan().node();
+        // The node's row declares no DNS host. While the baseline is in
+        // force the node's questions are recorded in the node's tables under
+        // the baseline's endpoint names; a DNS host declared on the node's
+        // row would have no number there.
+        if let Some(held) = self.row_tables.get(&node) {
+            assert!(held.names.is_empty(), "the node's row declares no DNS host");
+        }
+        let tables = self
+            .node_tables
+            .tables
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(
+            tables.flows.box_addr(),
+            node,
+            "the node's reply table is its own"
+        );
+        assert_eq!(
+            tables.notes.box_addr(),
+            node,
+            "the node's notes are its own"
+        );
+        assert_eq!(tables.pins.owner(), node, "the node's DNS table is its own");
+        let cohort = self
+            .cohort_pins
+            .tables
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(
+            cohort.owner(),
+            cohort_owner(&self.config.sources),
+            "the cohort's DNS table is owned by the address it sends from"
+        );
+    }
+
+    /// The DNS table of the row at `addr`, for a test to write to and read.
+    pub(crate) fn with_row_pins<T>(
+        &self,
+        addr: Ipv4Addr,
+        f: impl FnOnce(&mut Pins) -> T,
+    ) -> Option<T> {
+        let held = self.row_tables.get(&u32::from(addr))?;
+        let mut tables = held.tables.lock().unwrap_or_else(PoisonError::into_inner);
+        Some(f(&mut tables.pins))
     }
 
     /// Panics unless the alias's state is the one built from the node row's
@@ -945,9 +1415,15 @@ fn member_rules(session: SessionId, facts: &MemberFacts<'_>) -> MemberRules {
         &declared(facts.policy, facts.laned, true, &subject),
         &subject,
     );
+    let names = facts
+        .policy
+        .and_then(|policy| policy.allow_dns_hosts.as_ref())
+        .cloned()
+        .unwrap_or_default();
     MemberRules {
         effective,
         resolves_names,
+        names,
     }
 }
 
@@ -1382,6 +1858,260 @@ mod tests {
             twice.err(),
             Some(KernelConfigError::RowRefused { addr: at(4) })
         );
+    }
+
+    /// A rebuild keeps a row's reply records, and its DNS table only while
+    /// the row's DNS names are numbered as before: the same list keeps both;
+    /// a list in another order leaves the DNS table empty and the reply
+    /// records in place.
+    #[test]
+    fn a_rebuild_keeps_a_rows_dns_table_only_while_its_names_are_numbered_as_before() {
+        let row = at(9);
+        let declaring = |hosts: &[&str]| EgressPolicy {
+            allow_subnets: Some(Vec::new()),
+            allow_dns_hosts: Some(strings(hosts)),
+            allow_protocols: None,
+            deny_subnets: None,
+        };
+        let first = declaring(&["example.org", "example.net"]);
+        let mut config = KernelConfig::new(subnet()).unwrap();
+        config.note_policy(row, Some(&first));
+        config
+            .register_row(
+                row,
+                &RowFacts {
+                    name: "probe",
+                    policy: Some(&first),
+                    laned: false,
+                    task_row: false,
+                    generation: 0,
+                },
+            )
+            .unwrap();
+        let then = netcore::time::Instant { ms: 1 };
+        let later = netcore::time::Instant { ms: 2 };
+        {
+            let held = &config.row_tables[&u32::from(row)];
+            let mut tables = held.tables.lock().unwrap();
+            let _asked = tables.pins.ask(0, 0x522a, 40000, then);
+            let _opened = tables.flows.inbound(
+                netcore::flow::Conversation {
+                    proto: 17,
+                    client: u32::from(Ipv4Addr::new(203, 0, 113, 7)),
+                    client_port: 5353,
+                    box_addr: u32::from(row),
+                    box_port: 8080,
+                },
+                0,
+                then,
+            );
+        }
+        let read = |config: &KernelConfig| {
+            let held = &config.row_tables[&u32::from(row)];
+            let tables = held.tables.lock().unwrap();
+            (
+                tables.pins.asked_live(0, 0x522a, 40000, later),
+                tables.flows.len(),
+            )
+        };
+        let shape = || {
+            [(
+                row,
+                RowShape {
+                    name: "probe",
+                    laned: false,
+                    task_row: false,
+                    generation: 0,
+                },
+            )]
+        };
+        assert_eq!(read(&config), (true, 1));
+        config.rebuild(shape(), Diverged::missing("test", row));
+        assert_eq!(read(&config), (true, 1), "the same numbering keeps both");
+        config.note_policy(row, Some(&declaring(&["example.net", "example.org"])));
+        config.rebuild(shape(), Diverged::missing("test", row));
+        assert_eq!(
+            read(&config),
+            (false, 1),
+            "another numbering empties the DNS table and keeps the records"
+        );
+    }
+
+    /// Poisons `lock`: a panic while it is held, caught here.
+    fn poison<T>(lock: &Mutex<T>) {
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            panic!("a panic while a kernel table's lock is held");
+        }));
+        assert!(caught.is_err(), "the closure panicked");
+        assert!(lock.is_poisoned(), "the lock is poisoned");
+    }
+
+    /// A row at `addr` declaring `example.org` and `example.net`, made for
+    /// registration `generation`, with a question asked in its DNS table and
+    /// an inbound flow in its reply table at instant 1.
+    fn row_with_records(config: &mut KernelConfig, addr: Ipv4Addr, generation: u64) {
+        let policy = EgressPolicy {
+            allow_subnets: Some(Vec::new()),
+            allow_dns_hosts: Some(strings(&["example.org", "example.net"])),
+            allow_protocols: None,
+            deny_subnets: None,
+        };
+        config.note_policy(addr, Some(&policy));
+        config
+            .register_row(
+                addr,
+                &RowFacts {
+                    name: "probe",
+                    policy: Some(&policy),
+                    laned: false,
+                    task_row: false,
+                    generation,
+                },
+            )
+            .unwrap();
+        let held = &config.row_tables[&u32::from(addr)];
+        let mut tables = held.tables.lock().unwrap();
+        let then = netcore::time::Instant { ms: 1 };
+        let _asked = tables.pins.ask(0, 0x522a, 40000, then);
+        let _opened = tables.flows.inbound(
+            netcore::flow::Conversation {
+                proto: 17,
+                client: u32::from(Ipv4Addr::new(203, 0, 113, 7)),
+                client_port: 5353,
+                box_addr: u32::from(addr),
+                box_port: 8080,
+            },
+            0,
+            then,
+        );
+    }
+
+    /// The question and the inbound flow [`row_with_records`] put at `addr`,
+    /// read at instant 2: whether the question is live, and how many flows.
+    fn records_at(config: &KernelConfig, addr: Ipv4Addr) -> (bool, usize) {
+        let held = &config.row_tables[&u32::from(addr)];
+        assert!(
+            !held.tables.is_poisoned(),
+            "a rebuilt row's lock is not poisoned"
+        );
+        let tables = held.tables.lock().unwrap();
+        let later = netcore::time::Instant { ms: 2 };
+        (
+            tables.pins.asked_live(0, 0x522a, 40000, later),
+            tables.flows.len(),
+        )
+    }
+
+    /// The shape of the row at `addr` the registry holds, made for
+    /// registration `generation`.
+    fn probe_shape(addr: Ipv4Addr, generation: u64) -> (Ipv4Addr, RowShape<'static>) {
+        (
+            addr,
+            RowShape {
+                name: "probe",
+                laned: false,
+                task_row: false,
+                generation,
+            },
+        )
+    }
+
+    /// A rebuild keeps a row's records only for the registration they were
+    /// made for. Here the registry holds a newer registration at one address
+    /// than the one the configuration made its tables for, as when the
+    /// registration's restate was refused; no registry path refuses a
+    /// restate in a test, so the rebuild is driven directly. That row's
+    /// tables start empty, with the newer generation; the row registered
+    /// once keeps its question and its flow.
+    #[test]
+    fn a_rebuild_keeps_a_rows_records_only_for_the_registration_they_were_made_for() {
+        let (kept, again) = (at(9), at(10));
+        let mut config = KernelConfig::new(subnet()).unwrap();
+        row_with_records(&mut config, kept, 0);
+        row_with_records(&mut config, again, 0);
+        assert_eq!(records_at(&config, kept), (true, 1));
+        assert_eq!(records_at(&config, again), (true, 1));
+        config.rebuild(
+            [probe_shape(kept, 0), probe_shape(again, 1)],
+            Diverged::missing("test", again),
+        );
+        assert_eq!(
+            records_at(&config, kept),
+            (true, 1),
+            "the same registration keeps both"
+        );
+        assert_eq!(
+            records_at(&config, again),
+            (false, 0),
+            "a newer registration starts with empty tables"
+        );
+        assert_eq!(config.generation_at(again.octets()), Some(1));
+    }
+
+    /// A rebuild never carries tables whose lock was poisoned: the row's,
+    /// the node's and the host_ip boxes' are made empty, with locks that are
+    /// not poisoned, while a row whose lock holds keeps its records.
+    #[test]
+    fn a_rebuild_never_carries_tables_whose_lock_was_poisoned() {
+        let (kept, poisoned) = (at(9), at(10));
+        let mut config = KernelConfig::new(subnet()).unwrap();
+        row_with_records(&mut config, kept, 0);
+        row_with_records(&mut config, poisoned, 0);
+        poison(&config.row_tables[&u32::from(poisoned)].tables);
+        poison(&config.node_tables.tables);
+        poison(&config.cohort_pins.tables);
+        config.rebuild(
+            [probe_shape(kept, 0), probe_shape(poisoned, 0)],
+            Diverged::missing("test", poisoned),
+        );
+        assert_eq!(records_at(&config, kept), (true, 1));
+        assert_eq!(records_at(&config, poisoned), (false, 0));
+        assert!(!config.node_tables.tables.is_poisoned());
+        assert!(!config.cohort_pins.tables.is_poisoned());
+    }
+
+    /// After a rebuild, the node's baseline adopted again unchanged keeps
+    /// the node's DNS table, since the rebuild carries the baseline's
+    /// endpoints with its names. Node tables whose lock was poisoned are
+    /// never adopted: the same baseline then gives the node empty tables.
+    #[test]
+    fn an_unchanged_baseline_adopted_after_a_rebuild_keeps_the_nodes_dns_table() {
+        let mut config = KernelConfig::new(subnet()).unwrap();
+        let names = || strings(&["example.com"]);
+        config.adopt_baseline(true, ["example.com", "192.0.2.0/24"], names(), &[]);
+        let then = netcore::time::Instant { ms: 1 };
+        let later = netcore::time::Instant { ms: 2 };
+        let _asked = config
+            .node_tables
+            .tables
+            .lock()
+            .unwrap()
+            .pins
+            .ask(0, 0x522a, 40000, then);
+        let live = |config: &KernelConfig| {
+            config
+                .node_tables
+                .tables
+                .lock()
+                .unwrap()
+                .pins
+                .asked_live(0, 0x522a, 40000, later)
+        };
+        config.rebuild(
+            std::iter::empty::<(Ipv4Addr, RowShape<'static>)>(),
+            Diverged::missing("test", at(9)),
+        );
+        config.adopt_baseline(true, ["example.com", "192.0.2.0/24"], names(), &[]);
+        assert!(
+            live(&config),
+            "the unchanged baseline keeps the node's DNS table"
+        );
+
+        poison(&config.node_tables.tables);
+        config.adopt_baseline(true, ["example.com", "192.0.2.0/24"], names(), &[]);
+        assert!(!config.node_tables.tables.is_poisoned());
+        assert!(!live(&config), "the node's tables are empty");
     }
 
     #[test]

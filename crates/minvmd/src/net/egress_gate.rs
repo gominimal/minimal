@@ -5513,13 +5513,13 @@ impl FirstOpeningDrops {
 /// stays refusable ([`ReplyTables::observe_refusable`]): the refusal follows
 /// the SYN at once, and a retransmitted SYN notes the connect afresh, so the
 /// window only has to outlast one relay round trip.
-const REFUSAL_WINDOW: Duration = Duration::from_secs(5);
+pub(crate) const REFUSAL_WINDOW: Duration = Duration::from_secs(5);
 
 /// How many of one box's refusable connects one client source may hold
 /// noted at once ([`ReplyTables::observe_refusable`]): an eighth of the
 /// per-box cap, so a single client flooding SYNs at unpublished ports
 /// cannot take every note and leave another client's connect to time out.
-const REFUSAL_NOTES_PER_SOURCE: usize = egress::REPLY_MAX_FLOWS_PER_BOX / 8;
+pub(crate) const REFUSAL_NOTES_PER_SOURCE: usize = egress::REPLY_MAX_FLOWS_PER_BOX / 8;
 
 /// One box's refusal notes ([`BoxReplies`]'s `refusals`): each noted
 /// connect's tuple, with the acknowledgement its refusal carries, the
