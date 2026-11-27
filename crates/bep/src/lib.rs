@@ -40,6 +40,8 @@ pub mod seal;
 #[cfg(target_os = "linux")]
 pub mod secret_service;
 pub mod signin;
+#[cfg(target_os = "linux")]
+pub mod ss_dbus;
 pub mod store;
 pub mod supervisor;
 #[cfg(target_os = "linux")]

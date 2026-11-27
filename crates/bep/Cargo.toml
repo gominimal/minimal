@@ -38,6 +38,15 @@ tokio-util = { workspace = true, features = ["io-util"] }
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+# SPIKE (#3849): Secret Service over D-Bus in place of `secret-tool`.
+# rt-default: zbus on its own zruntime executor, which the crate's
+# `blocking` API drives with `zruntime::block_on` (no tokio involvement).
+# crypto-rust: the dh-ietf1024-sha256-aes128-cbc-pkcs7 session libsecret uses.
+[target.'cfg(target_os = "linux")'.dependencies]
+secret-service = { version = "6.0.0", default-features = false, features = ["rt-default", "crypto-rust"] }
+zbus = { version = "6", default-features = false, features = ["default-rt"] }
+zruntime = { version = "0.2", default-features = false, features = ["helper"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
 # OSX_10_15: the data-protection keychain, which holds a release build's
