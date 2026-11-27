@@ -119,7 +119,7 @@ pub fn sort(err: &Error) -> Cause {
 /// The sorted cause when no Secret Service answers.
 pub fn connect(timeout: Duration) -> Result<SecretService<'static>, Cause> {
     let conn = zruntime::block_on(async {
-        zbus::connection::Builder::session()?
+        zbus::connection::Builder::session()
             .method_timeout(timeout)
             .build()
             .await
