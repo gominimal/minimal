@@ -145,7 +145,8 @@ with an error. This installs a staged version that no channel points at.
 writes. When the resolved version is before 0.8 and the state on disk is from
 0.8 or later, the installer shall refuse the install before it fetches the
 manifest (R2.3), and exit non-zero. The state is from 0.8 or later when the
-`key` in `install.toml` names a version from 0.8 on. It is also from 0.8 or
+`key` in an `install.toml` in the state directory names a version from 0.8
+on. It is also from 0.8 or
 later when `sessions/index.json` under the state directory carries a
 `format_version` above 0. The refusal says what it refused and why. It prints
 the `mv` command that moves the state directory aside, to a path that does
@@ -171,6 +172,8 @@ version before 0.8 over 0.7 state, and over a state that the user put back.
   0.8.0, the refusal names the R5.7 copy. Its printed command runs, and then
   0.7.3 installs. When the first move target already exists, the printed
   `mv` names another path, and the state does not land inside the old one.
+  With a relative `XDG_STATE_HOME`, the printed `mv` clears the refusal, and
+  then 0.7.3 installs.
 
 ### Unit 3 - Manifest format and field extraction
 

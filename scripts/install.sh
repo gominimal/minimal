@@ -1244,16 +1244,20 @@ ver_from_0_8() {
     [ "${_vf% *}" -gt 0 ] || [ "${_vf#* }" -ge 8 ]
 }
 
-# The `key` the installer wrote into install.toml: the version it installed.
+# installed_key <dir> — the `key` the installer wrote into <dir>/install.toml:
+# the version it installed.
 installed_key() {
-    [ -f "$state_dir/install.toml" ] || return 0
-    sed -n 's/^key = "\(.*\)"$/\1/p' "$state_dir/install.toml" | head -n 1
+    [ -f "$1/install.toml" ] || return 0
+    sed -n 's/^key = "\(.*\)"$/\1/p' "$1/install.toml" | head -n 1
 }
 
-# Whether the state on disk is 0.8 state: install.toml names a version from
-# 0.8 on, or the box index carries a format_version above 0.
+# Whether the state on disk is 0.8 state: an install.toml in the box state
+# directory names a version from 0.8 on, or the box index carries a
+# format_version above 0. The key is read from $box_state, not $state_dir:
+# the two differ when XDG_STATE_HOME is relative, and the refusal's `mv`
+# moves $box_state. A key left in $state_dir would repeat the refusal.
 state_from_0_8() {
-    _sk="$(installed_key)"
+    _sk="$(installed_key "$box_state")"
     if [ -n "$_sk" ] && ver_from_0_8 "$_sk"; then
         return 0
     fi
@@ -1287,7 +1291,7 @@ fi
 # install.toml that already names 0.8 or later skips the question. The copy
 # (archive_from) also needs a state directory and no --skip-state-archive.
 upgrade_from_0_7=
-_ik="$(installed_key)"
+_ik="$(installed_key "$state_dir")"
 if [ -x "$bindir/min" ] && ver_from_0_8 "$VERSION" \
     && { [ -z "$_ik" ] || ! ver_from_0_8 "$_ik"; }; then
     _af="$("$bindir/min" version </dev/null 2>/dev/null \

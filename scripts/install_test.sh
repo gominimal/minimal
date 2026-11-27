@@ -682,7 +682,7 @@ run() {
         SHELL="${TEST_SHELL:-/bin/sh}" \
         MINIMAL_BIN="$hp/bin" \
         XDG_DATA_HOME="$hp/xdg-data" \
-        XDG_STATE_HOME="$hp/xdg-state" \
+        XDG_STATE_HOME="${STATE_HOME:-$hp/xdg-state}" \
         XDG_CACHE_HOME="${CACHE_HOME:-$hp/xdg-cache}" \
         XDG_CONFIG_HOME="$hp/xdg-config" \
         MINIMAL_OVERRIDE_INSTALLER_BUCKET="$BUCKET_HOST" \
@@ -4621,6 +4621,24 @@ case_refuses_0_7_over_0_8_state() {
         test -f "$HRD/xdg-state/minimal/sessions/abc/record.json"
     run rd4_restored "$HRD" --version 0.7.3
     check 0 "$rc" "0.7.3 over the restored 0.7 state installs (R2.6)"
+
+    # A relative XDG_STATE_HOME: install.toml goes to the relative directory,
+    # and the box state is ~/.local/state/minimal. The refusal's move clears
+    # the refusal, because the key outside the box state does not count.
+    HRE="$root/rd5"; mkdir -p "$HRE/cwd" "$HRE/.local/state/minimal/sessions"
+    printf '{"format_version": 1, "short_to_id": {}}\n' >"$HRE/.local/state/minimal/sessions/index.json"
+    _rd_cwd="$(pwd)"
+    cd "$HRE/cwd"
+    STATE_HOME=rel-state run rd5_seed "$HRE" --version 0.8.0
+    check 0 "$rc" "rd5: a 0.8.0 install with a relative XDG_STATE_HOME exits 0"
+    want_ok "rd5: install.toml is outside the box state" test -f "$HRE/cwd/rel-state/minimal/install.toml"
+    STATE_HOME=rel-state run rd5 "$HRE" --version 0.7.3
+    check 1 "$rc" "rd5: 0.7.3 over the 0.8 index is refused (R2.6)"
+    _rd_mv="$(awk '/^      mv / {sub(/^      /, ""); print; exit}' "$OUT")"
+    want_ok "rd5: the printed move runs (R2.6)" sh -c "$_rd_mv"
+    STATE_HOME=rel-state run rd5_moved "$HRE" --version 0.7.3
+    check 0 "$rc" "rd5: 0.7.3 installs after the printed move (R2.6)"
+    cd "$_rd_cwd"
 }
 
 # --- Case dispatch -----------------------------------------------------------
