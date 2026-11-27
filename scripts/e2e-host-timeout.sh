@@ -12,18 +12,37 @@
 # fallback runs CMD in the background, keeps its stdin, and sends it SIGTERM
 # after SECS. CMD's own exit code passes through when it ends in time.
 #
+# Set E2E_TIMEOUT_KILL_AFTER to a number of seconds to also send SIGKILL
+# when CMD is still running that long after the SIGTERM, on every path. The
+# result is still 124. Unset, only SIGTERM is sent, and a CMD that does not
+# exit on it keeps the call waiting.
+#
 # The function is safe under `set -e`: it returns the code and does not exit.
 
 e2e_timeout() {
-  local secs="$1"
+  local secs="$1" kill_after="${E2E_TIMEOUT_KILL_AFTER:-}"
   shift
+  local gnu=""
   if command -v timeout >/dev/null 2>&1; then
-    timeout "$secs" "$@"
-    return
+    gnu=timeout
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gnu=gtimeout
   fi
-  if command -v gtimeout >/dev/null 2>&1; then
-    gtimeout "$secs" "$@"
-    return
+  if [ -n "$gnu" ]; then
+    if [ -z "$kill_after" ]; then
+      "$gnu" "$secs" "$@"
+      return
+    fi
+    # With -k, GNU timeout exits 137 when it had to send the SIGKILL. That
+    # is still a timeout, so it is reported as one. A command that is killed
+    # some other way before the limit also ends with 137, so the elapsed
+    # time decides which it was.
+    local grc=0 started=$SECONDS
+    "$gnu" -k "$kill_after" "$secs" "$@" || grc=$?
+    if [ "$grc" -eq 137 ] && [ $((SECONDS - started)) -ge "$secs" ]; then
+      return 124
+    fi
+    return "$grc"
   fi
 
   # Without job control, bash gives a background command /dev/null as its
@@ -52,8 +71,19 @@ e2e_timeout() {
     esac
     # CMD can still end between the check and the kill. Then it ended at the
     # limit, and 124 is the GNU timeout answer for that case too.
-    if kill -TERM "$cmd_pid" 2>/dev/null; then exit 3; fi
-    exit 0
+    kill -TERM "$cmd_pid" 2>/dev/null || exit 0
+    # With E2E_TIMEOUT_KILL_AFTER set, give CMD that long to exit on the
+    # TERM, checking once a second so the call returns as soon as it does,
+    # then send SIGKILL.
+    if [ -n "$kill_after" ]; then
+      waited=0
+      while [ "$waited" -lt "$kill_after" ] && kill -0 "$cmd_pid" 2>/dev/null; do
+        sleep 1
+        waited=$((waited + 1))
+      done
+      kill -KILL "$cmd_pid" 2>/dev/null || true
+    fi
+    exit 3
   ) </dev/null &
   watch_pid=$!
 

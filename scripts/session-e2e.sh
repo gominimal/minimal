@@ -1290,8 +1290,8 @@ teardown() {
   # answerer; a run that died between that and its own revert must not leave
   # the change behind. `resolvectl revert` restores the link's DNS state and
   # `ip link del` removes the dedicated link the command created — the soak
-  # runs this script ten times on one runner, so the next iteration must
-  # find the host as this one did.
+  # runs this script many times on one runner, so the next run must find
+  # the host as this one did.
   if [ -n "$NATIVE_REVERT_LINK" ]; then
     sudo -n resolvectl revert "$NATIVE_REVERT_LINK" >/dev/null 2>&1 || true
     sudo -n ip link del "$NATIVE_REVERT_LINK" >/dev/null 2>&1 || true
@@ -1485,9 +1485,9 @@ teardown() {
   # allocation is everything the guest wrote into it: its package cache, the
   # session rootfs, the workspace. WORK is fresh per run, so nothing is shared
   # and every run pays that allocation again. Leaving one behind is survivable;
-  # scripts/soak-session-e2e.sh runs this script TEN times back-to-back, so ten
-  # accumulate on one runner — and the nightly soak now dies inside that step
-  # with the runner agent gone (job `failure`, step still `in_progress`, no
+  # scripts/soak-session-e2e.sh runs this script dozens of times back-to-back
+  # (once per case in every iteration), so they accumulate on one runner —
+  # and the nightly soak then dies inside that step with the runner agent gone (job `failure`, step still `in_progress`, no
   # retrievable log lines and no uploaded artifacts), which is the shape a
   # runner ENOSPC takes. The sibling harnesses (bulk-upload-e2e.sh,
   # stress-session-e2e.sh) already remove theirs; this one was the outlier.
@@ -9859,7 +9859,7 @@ proof_native_resolution_without_proxy_env() {
     if [ -n "$NATIVE_REVERT_LINK" ]; then
       # Undo the whole command: `resolvectl revert` restores the link's
       # DNS state, `ip link del` removes the dedicated link itself — the
-      # next iteration (the soak runs this script ten times) must find the
+      # next run (the soak runs this script many times) must find the
       # host as this run did. The record is kept when a deletion fails, so
       # the teardown retries it: this block must not clear the variable on
       # a link it could not remove.
