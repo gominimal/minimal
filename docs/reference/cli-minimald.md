@@ -69,9 +69,9 @@ the `listener` address and the `channel` path.
 
 `min ls` prints a `HOSTNAME PROXY` line with the proxy's port. It also
 prints a `DNS SERVICE` line, marked `(UDP)`, for the answerer that serves
-the box names of this daemon. That is the port of the `minzoned` service, or the
-interim's port. It is the port for the host's resolver, not a value for
-`HTTP(S)_PROXY`.
+the box names of this daemon. That is the port of the `minzoned` service,
+or the interim's port. It is the port for the host's resolver, not a value
+for `HTTP(S)_PROXY`.
 
 ### `completions`
 
