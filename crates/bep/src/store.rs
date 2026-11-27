@@ -1487,6 +1487,9 @@ mod host {
         program: PathBuf,
         leading: Vec<OsString>,
         timeout: Duration,
+        /// The longest that the proxy's read of a value waits, over every
+        /// `secret-tool` call it makes. [`READ_TIMEOUT`] outside tests.
+        read_timeout: Duration,
     }
 
     impl SecretItems {
@@ -1505,7 +1508,15 @@ mod host {
                 program: program.into(),
                 leading: leading.into_iter().map(Into::into).collect(),
                 timeout: ss::TIMEOUT,
+                read_timeout: READ_TIMEOUT,
             }
+        }
+
+        /// The same items, with `timeout` as the cap of the proxy's read.
+        #[cfg(test)]
+        pub(super) fn with_read_timeout(mut self, timeout: Duration) -> Self {
+            self.read_timeout = timeout;
+            self
         }
 
         /// The same items, with `timeout` for each `secret-tool` call.
@@ -1590,14 +1601,18 @@ mod host {
                 .contains(id))
         }
 
-        /// The value under `id`, read now. The read waits at most
-        /// [`READ_TIMEOUT`], so a locked keyring's unlock prompt holds a
-        /// request only that long.
+        /// The value under `id`, read now. The `lookup` and the `search`
+        /// that may follow it share one deadline, [`READ_TIMEOUT`] from the
+        /// start, so a locked keyring's unlock prompt or a stalled Secret
+        /// Service holds a request only that long, and each call's output
+        /// for at most its drain grace after it.
         pub(super) fn read(&self, id: &str) -> Result<Zeroizing<Vec<u8>>, ReadError> {
             check_id(id).map_err(ReadError::Store)?;
             let action = "read the secret";
+            let started = Instant::now();
+            let cap = self.timeout.min(self.read_timeout);
             let reader = Self {
-                timeout: self.timeout.min(READ_TIMEOUT),
+                timeout: cap,
                 ..self.clone()
             };
             let mut out = reader
@@ -1619,7 +1634,11 @@ mod host {
             // `lookup` exits 1 with no message when no item matches. A
             // dismissed unlock prompt gives the same result, so ask whether
             // the item is listed: `search` lists a locked item too.
-            let listed = self
+            let searcher = Self {
+                timeout: cap.saturating_sub(started.elapsed()),
+                ..self.clone()
+            };
+            let listed = searcher
                 .ids(action, &["search", "--all", "service", SERVICE, ID, id])
                 .map_err(ReadError::Store)?;
             if listed.contains(id) {
@@ -2882,5 +2901,23 @@ esac
             Err(ReadError::Store(StoreError::Refused { .. }))
         ));
         assert_eq!(host::READ_TIMEOUT, std::time::Duration::from_secs(10));
+
+        // The `search` after a silent `lookup` keeps the read's deadline,
+        // not the store's longer timeout, so a stalled search ends the
+        // request at the deadline.
+        let script = dir.path().join("stalled-search");
+        std::fs::write(&script, "[ \"$1\" = lookup ] && exit 1\nexec sleep 30\n").unwrap();
+        let stalled = host::SecretItems::with_program("/bin/sh", [script])
+            .with_read_timeout(std::time::Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            stalled.read("claude"),
+            Err(ReadError::Store(StoreError::Refused { .. }))
+        ));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the read waited {:?}",
+            started.elapsed()
+        );
     }
 }
