@@ -180,7 +180,7 @@ use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::bep_attach::{BoxId, BoxIdText};
-use crate::box_registry::{AskedFor, BoxRecord, BoxTable, RowWithdrawal};
+use crate::box_registry::{AskedFor, BoxRecord, BoxTable, KernelPorts, RowWithdrawal};
 
 use super::baseline::{self, NodeBaselinePhase, NodePlaneBaseline};
 use super::dns_pins;
@@ -1040,6 +1040,7 @@ impl EgressGate {
         table.attach_mirror_ledger(MirrorLedger {
             forwards: Arc::downgrade(&forwards),
             replies: replies.clone(),
+            kernel: table.kernel_ports(),
             switch_sock: switch_sock.clone(),
             runtime: tokio::runtime::Handle::current(),
         });
@@ -1055,6 +1056,7 @@ impl EgressGate {
                 switch_sock.clone(),
                 Arc::clone(&forwards),
                 replies.clone(),
+                table.kernel_ports(),
             )
             .instrument(crate::telemetry::vm_task("net.gate.revoke")),
         );
@@ -2203,7 +2205,7 @@ async fn relay_control(
         if let Some((addr, inside, proto)) = forwards.note_retracted(listener)
             && !forwards.still_published(addr, inside, proto)
         {
-            replies.end_port_at(addr, proto, inside);
+            end_reply_records(&replies, &table.kernel_ports(), addr, proto, inside);
         }
     }
     let answered = Arc::new(OnceLock::new());
@@ -2287,7 +2289,7 @@ async fn relay_control(
             "the switch refused a publish; the egress gate's ledger released its note"
         );
         if !forwards.still_published(addr, inside, proto) {
-            replies.end_port_at(addr, proto, inside);
+            end_reply_records(&replies, &table.kernel_ports(), addr, proto, inside);
         }
     }
     // A probe round's expose the switch refused bound nothing, and a release
@@ -3202,6 +3204,7 @@ async fn revoke_on_row_withdrawal(
     switch_sock: PathBuf,
     forwards: Arc<PublishedForwards>,
     replies: ReplyTables,
+    kernel: KernelPorts,
 ) {
     let mut revocations = JoinSet::new();
     let mut stranded: Vec<RowWithdrawal> = Vec::new();
@@ -3216,6 +3219,7 @@ async fn revoke_on_row_withdrawal(
                         switch_sock.clone(),
                         Arc::clone(&forwards),
                         replies.clone(),
+                        kernel.clone(),
                         withdrawal,
                         &UNBIND_RETRY_BACKOFF,
                     )
@@ -3277,6 +3281,7 @@ async fn revoke_box_forwards(
     switch_sock: PathBuf,
     forwards: Arc<PublishedForwards>,
     replies: ReplyTables,
+    kernel: KernelPorts,
     withdrawal: RowWithdrawal,
     backoff: &'static [Duration],
 ) -> Option<RowWithdrawal> {
@@ -3287,8 +3292,8 @@ async fn revoke_box_forwards(
     forwards.drop_waiting_at(addr);
     let mut owed = Vec::new();
     loop {
-        owed = hand_over_owed(&switch_sock, &forwards, &replies, owed).await;
-        owed.extend(unbind_pass(&switch_sock, &forwards, &replies, addr, attempt).await);
+        owed = hand_over_owed(&switch_sock, &forwards, &replies, &kernel, owed).await;
+        owed.extend(unbind_pass(&switch_sock, &forwards, &replies, &kernel, addr, attempt).await);
         let flows = forwards.flows.take_at(addr);
         let still_bound = forwards.published_at(addr);
         if still_bound.is_empty() {
@@ -3296,7 +3301,7 @@ async fn revoke_box_forwards(
             // before the resets go out, which reuse no longer depends on.
             drop(withdrawal);
             terminate_flows(&switch_sock, switch_addr, &flows).await;
-            retry_hand_overs(&switch_sock, &forwards, &replies, owed, backoff).await;
+            retry_hand_overs(&switch_sock, &forwards, &replies, &kernel, owed, backoff).await;
             return None;
         }
         terminate_flows(&switch_sock, switch_addr, &flows).await;
@@ -3310,12 +3315,27 @@ async fn revoke_box_forwards(
                      bound, and its addresses stay held against reuse"
                 );
             }
-            retry_hand_overs(&switch_sock, &forwards, &replies, owed, backoff).await;
+            retry_hand_overs(&switch_sock, &forwards, &replies, &kernel, owed, backoff).await;
             return Some(withdrawal);
         };
         tokio::time::sleep(*wait).await;
         attempt += 1;
     }
+}
+
+/// Ends the reply records a retracted publication's inside port earned, in
+/// the daemon's own tables and in the kernel's alike: the same box, protocol
+/// and port, under the caller's one condition (no other applied publish
+/// still dials the port).
+fn end_reply_records(
+    replies: &ReplyTables,
+    kernel: &KernelPorts,
+    addr: [u8; 4],
+    proto: u8,
+    inside: u16,
+) {
+    replies.end_port_at(addr, proto, inside);
+    kernel.end_port(addr, proto, inside);
 }
 
 /// One pass over the forwards the ledger still holds at `addr`: an unexpose
@@ -3331,6 +3351,7 @@ async fn unbind_pass(
     switch_sock: &std::path::Path,
     forwards: &PublishedForwards,
     replies: &ReplyTables,
+    kernel: &KernelPorts,
     addr: [u8; 4],
     attempt: usize,
 ) -> Vec<Listener> {
@@ -3361,7 +3382,7 @@ async fn unbind_pass(
             Ok(unexposed) => {
                 let (dropped, next) = forwards.hand_over_at(listener, addr);
                 if dropped && !forwards.still_published(addr, inside, proto) {
-                    replies.end_port_at(addr, proto, inside);
+                    end_reply_records(replies, kernel, addr, proto, inside);
                 }
                 tracing::info!(
                     %switch_addr,
@@ -3373,7 +3394,9 @@ async fn unbind_pass(
                     "unbound the box's forwarder at its row's withdrawal"
                 );
                 let bound = match next {
-                    Ok(Some(next)) => apply_waiting(switch_sock, forwards, replies, next).await,
+                    Ok(Some(next)) => {
+                        apply_waiting(switch_sock, forwards, replies, kernel, next).await
+                    }
                     Ok(None) => true,
                     Err(LedgerFull) => false,
                 };
@@ -3412,6 +3435,7 @@ async fn apply_waiting(
     switch_sock: &std::path::Path,
     forwards: &PublishedForwards,
     replies: &ReplyTables,
+    kernel: &KernelPorts,
     next: WaitingForward,
 ) -> bool {
     let switch_addr = Ipv4Addr::from(next.addr);
@@ -3463,7 +3487,7 @@ async fn apply_waiting(
             if forwards.release_claim(&next)
                 && !forwards.still_published(next.addr, next.inside, next.proto)
             {
-                replies.end_port_at(next.addr, next.proto, next.inside);
+                end_reply_records(replies, kernel, next.addr, next.proto, next.inside);
             }
             tracing::warn!(
                 %switch_addr,
@@ -3487,12 +3511,13 @@ async fn hand_over_owed(
     switch_sock: &std::path::Path,
     forwards: &PublishedForwards,
     replies: &ReplyTables,
+    kernel: &KernelPorts,
     owed: Vec<Listener>,
 ) -> Vec<Listener> {
     let mut still_owed = Vec::new();
     for listener in owed {
         let bound = match forwards.claim_waiting(listener) {
-            Ok(Some(next)) => apply_waiting(switch_sock, forwards, replies, next).await,
+            Ok(Some(next)) => apply_waiting(switch_sock, forwards, replies, kernel, next).await,
             Ok(None) => true,
             Err(LedgerFull) => false,
         };
@@ -3511,6 +3536,7 @@ async fn retry_hand_overs(
     switch_sock: &std::path::Path,
     forwards: &PublishedForwards,
     replies: &ReplyTables,
+    kernel: &KernelPorts,
     mut owed: Vec<Listener>,
     backoff: &'static [Duration],
 ) {
@@ -3519,7 +3545,7 @@ async fn retry_hand_overs(
             return;
         }
         tokio::time::sleep(*wait).await;
-        owed = hand_over_owed(switch_sock, forwards, replies, owed).await;
+        owed = hand_over_owed(switch_sock, forwards, replies, kernel, owed).await;
     }
     give_up_hand_overs(&owed);
 }
@@ -3587,6 +3613,7 @@ async fn terminate_flows(
 pub(crate) struct MirrorLedger {
     forwards: std::sync::Weak<PublishedForwards>,
     replies: ReplyTables,
+    kernel: KernelPorts,
     switch_sock: PathBuf,
     runtime: tokio::runtime::Handle,
 }
@@ -3690,7 +3717,7 @@ impl MirrorLedger {
             && let Some((addr, inside, proto)) = forwards.note_retracted(key)
             && !forwards.still_published(addr, inside, proto)
         {
-            self.replies.end_port_at(addr, proto, inside);
+            end_reply_records(&self.replies, &self.kernel, addr, proto, inside);
         }
     }
 
@@ -3729,6 +3756,7 @@ impl TestMirrorLedger {
         table.attach_mirror_ledger(MirrorLedger {
             forwards: Arc::downgrade(&forwards),
             replies: ReplyTables::new(),
+            kernel: KernelPorts::unattached(),
             switch_sock,
             runtime: tokio::runtime::Handle::current(),
         });
@@ -4841,6 +4869,8 @@ async fn relay_switch_frames_to_guest(
             ));
         }
         switch.read_exact(&mut frame[..n]).await?;
+        // The kernel's clock for this frame, read once, before any lock.
+        let now_k = table.kernel_now();
         // The queue's room is taken before anything below observes the
         // frame, because a frame the queue has no room for is never
         // delivered — and nothing that was not delivered may be observed as
@@ -4928,6 +4958,17 @@ async fn relay_switch_frames_to_guest(
         // The reply tables record a delivered frame only when both hold: the
         // kernel's configuration names its destination as a row's
         // (`observed`), and the registry holds a row there (`by_source`).
+        // The kernel's tables record the frame too, now that it has its slot
+        // in the queue: as the kernel reads it, beside the daemon's record
+        // below. Nothing it says changes what happens to the frame. It comes
+        // before the daemon's own two refusals below (the proxy's opening
+        // packet, a flow at the box's cap), and that order is safe: the
+        // kernel's observation refuses the same two by its own contract, so
+        // neither side records a frame the other refuses.
+        let published = l4
+            .as_ref()
+            .is_some_and(|pkt| forwards.inside_published(pkt.dst.ip().octets(), pkt.dst.port()));
+        let _recorded = table.kernel_toward_guest(&frame[..n], published, now_k);
         let delivered = l4.filter(|_| observed).and_then(|pkt| {
             let record = table.by_source(pkt.dst.ip().octets())?;
             let published =
@@ -4974,6 +5015,15 @@ async fn relay_switch_frames_to_guest(
         // the datagram.
         if observed && let Some((pkt, datagram)) = kernel_facts::udp_datagram(&frame[..n], &facts) {
             pins.observe_reply(&table, &pkt, datagram, &limiter, Instant::now());
+            // The kernel's DNS tables are offered the answer too, read by the
+            // kernel's own reader. Nothing it says changes the frame.
+            let _answered = table.kernel_answer(
+                pkt.src,
+                pkt.dst.ip().octets(),
+                pkt.dst.port(),
+                datagram,
+                now_k,
+            );
         }
         // One combined write keeps the length prefix and the frame together
         // even if the guest closes between two writes; the permit taken
@@ -5048,6 +5098,8 @@ async fn relay_frames_to_switch(
             ));
         }
         guest.read_exact(&mut frame[..n]).await?;
+        // The kernel's clock for this frame, read once, before any lock.
+        let now_k = table.kernel_now();
         // The kernel decides the frame; the daemon reads no byte of it.
         let decided = guest_frame(&frame[..n], table, baseline, pins, replies);
         if let Some(src) = decided.src {
@@ -5285,6 +5337,24 @@ async fn relay_frames_to_switch(
             let from_node = decided.src == Some(table.subnet().daemon_ip().octets());
             let asker = decided.decided_for.asker(decided.marked && from_node);
             pins.observe_query(table, asker, &query, datagram, Instant::now());
+            // The kernel's DNS table records the question too, when it is
+            // one the gate records ([`standard_query`]): its name as the
+            // library reads it, its id from the header, its port from the
+            // kernel's reading. Nothing it says changes the frame.
+            if standard_query(datagram)
+                && let (Some(src), Some((name, txid))) =
+                    (decided.src, dns_pins::question_of(datagram))
+            {
+                let _asked = table.kernel_question(
+                    src,
+                    decided.marked,
+                    query.dst.ip().octets(),
+                    &name,
+                    txid,
+                    query.src.port(),
+                    now_k,
+                );
+            }
         }
     }
 }
@@ -6668,6 +6738,19 @@ enum TowardGuest {
         l4: Option<dns_pins::L4Packet>,
         observed: bool,
     },
+}
+
+/// Whether `datagram` is a question the gate records: a question is recorded
+/// only when the datagram is within [`dns_pins::MAX_DATAGRAM`], reads whole,
+/// and has the response flag clear; the operation code is not read. A
+/// recorded question opens the box's table to an answer, so no other
+/// datagram is recorded. The daemon makes this check, reading the datagram
+/// with the resolver library; the kernel's DNS table is given only a question
+/// that passes it.
+fn standard_query(datagram: &[u8]) -> bool {
+    datagram.len() <= dns_pins::MAX_DATAGRAM
+        && datagram.get(2).is_some_and(|flags| flags & 0x80 == 0)
+        && hickory_proto::op::Message::from_vec(datagram).is_ok()
 }
 
 /// The gate's decision for one frame toward a guest (`bytes`): the kernel
@@ -11848,6 +11931,7 @@ mod tests {
             sock,
             Arc::clone(&forwards),
             ReplyTables::new(),
+            crate::box_registry::KernelPorts::unattached(),
             withdrawal,
             &TWO_QUICK_RETRIES,
         )
@@ -11881,6 +11965,7 @@ mod tests {
             sock,
             Arc::clone(&forwards),
             ReplyTables::new(),
+            crate::box_registry::KernelPorts::unattached(),
             withdrawal,
             &TWO_QUICK_RETRIES,
         )
@@ -11919,6 +12004,7 @@ mod tests {
             sock,
             Arc::clone(&forwards),
             ReplyTables::new(),
+            crate::box_registry::KernelPorts::unattached(),
             withdrawal,
             &TWO_QUICK_RETRIES,
         )
@@ -12008,6 +12094,7 @@ mod tests {
             sock.clone(),
             Arc::clone(&forwards),
             ReplyTables::new(),
+            crate::box_registry::KernelPorts::unattached(),
             withdrawal,
             &TWO_QUICK_RETRIES,
         )
@@ -12041,6 +12128,7 @@ mod tests {
             sock,
             Arc::clone(&forwards),
             ReplyTables::new(),
+            crate::box_registry::KernelPorts::unattached(),
             withdrawal,
             &TWO_QUICK_RETRIES,
         )
@@ -12129,6 +12217,7 @@ mod tests {
                 sock,
                 Arc::clone(&forwards),
                 ReplyTables::new(),
+                crate::box_registry::KernelPorts::unattached(),
                 withdrawal,
                 &TWO_QUICK_RETRIES,
             )
@@ -12186,6 +12275,7 @@ mod tests {
                 sock.clone(),
                 Arc::clone(&forwards),
                 ReplyTables::new(),
+                crate::box_registry::KernelPorts::unattached(),
                 withdrawal,
                 &TWO_QUICK_RETRIES,
             )
@@ -12227,7 +12317,15 @@ mod tests {
 
         // The waiting box's row is withdrawn with the expose unanswered.
         forwards.drop_waiting_at(WAITER);
-        let owed = super::unbind_pass(&sock, &forwards, &ReplyTables::new(), WAITER, 1).await;
+        let owed = super::unbind_pass(
+            &sock,
+            &forwards,
+            &ReplyTables::new(),
+            &crate::box_registry::KernelPorts::unattached(),
+            WAITER,
+            1,
+        )
+        .await;
         assert!(owed.is_empty());
         assert!(asked_so_far(&mut asked).is_empty(), "no unbind beside it");
         assert_eq!(
@@ -12237,7 +12335,15 @@ mod tests {
         );
 
         forwards.settle_claim(&next);
-        let _owed = super::unbind_pass(&sock, &forwards, &ReplyTables::new(), WAITER, 2).await;
+        let _owed = super::unbind_pass(
+            &sock,
+            &forwards,
+            &ReplyTables::new(),
+            &crate::box_registry::KernelPorts::unattached(),
+            WAITER,
+            2,
+        )
+        .await;
         server.abort();
         let requests = asked_so_far(&mut asked);
         assert_eq!(requests.len(), 1, "{requests:?}");
@@ -12340,6 +12446,7 @@ mod tests {
             sock,
             Arc::clone(&forwards),
             ReplyTables::new(),
+            crate::box_registry::KernelPorts::unattached(),
             withdrawal,
             &TWO_QUICK_RETRIES,
         )
@@ -12393,6 +12500,7 @@ mod tests {
                 sock,
                 Arc::clone(&forwards),
                 ReplyTables::new(),
+                crate::box_registry::KernelPorts::unattached(),
                 withdrawal,
                 &TWO_QUICK_RETRIES,
             )
@@ -12441,6 +12549,7 @@ mod tests {
             sock.clone(),
             Arc::clone(&forwards),
             ReplyTables::new(),
+            crate::box_registry::KernelPorts::unattached(),
             withdrawal,
             &TWO_QUICK_RETRIES,
         )
@@ -12481,6 +12590,7 @@ mod tests {
             sock,
             Arc::clone(&forwards),
             ReplyTables::new(),
+            crate::box_registry::KernelPorts::unattached(),
             withdrawal,
             &TWO_QUICK_RETRIES,
         )
@@ -12529,6 +12639,7 @@ mod tests {
                 sock,
                 Arc::clone(&forwards),
                 ReplyTables::new(),
+                crate::box_registry::KernelPorts::unattached(),
                 withdrawal,
                 &TWO_QUICK_RETRIES,
             )
@@ -12577,7 +12688,16 @@ mod tests {
 
         // The waiting box's row is withdrawn, then the expose goes unanswered.
         forwards.drop_waiting_at(WAITER);
-        assert!(!super::apply_waiting(&sock, &forwards, &ReplyTables::new(), next).await);
+        assert!(
+            !super::apply_waiting(
+                &sock,
+                &forwards,
+                &ReplyTables::new(),
+                &crate::box_registry::KernelPorts::unattached(),
+                next
+            )
+            .await
+        );
         assert_eq!(forwards.address_of(SHARED), Some(WAITER));
         assert_eq!(
             forwards.claim_waiting(SHARED),
@@ -12585,7 +12705,15 @@ mod tests {
             "nothing waits any more, so nothing is exposed again"
         );
 
-        let owed = super::unbind_pass(&sock, &forwards, &ReplyTables::new(), WAITER, 1).await;
+        let owed = super::unbind_pass(
+            &sock,
+            &forwards,
+            &ReplyTables::new(),
+            &crate::box_registry::KernelPorts::unattached(),
+            WAITER,
+            1,
+        )
+        .await;
         server.abort();
         assert!(owed.is_empty());
         let requests = asked_so_far(&mut asked);
@@ -12632,16 +12760,17 @@ mod tests {
         );
 
         let replies = ReplyTables::new();
-        let owed = super::unbind_pass(&sock, &forwards, &replies, LEASE, 1).await;
+        let kernel = crate::box_registry::KernelPorts::unattached();
+        let owed = super::unbind_pass(&sock, &forwards, &replies, &kernel, LEASE, 1).await;
         assert_eq!(owed, vec![SHARED], "the hand-over is owed");
         assert_eq!(forwards.address_of(SHARED), None);
         assert_eq!(forwards.lock_waiting().len(), 1, "the forward still waits");
-        let owed = super::hand_over_owed(&sock, &forwards, &replies, owed).await;
+        let owed = super::hand_over_owed(&sock, &forwards, &replies, &kernel, owed).await;
         assert_eq!(owed, vec![SHARED], "still owed while the ledger is full");
         assert_eq!(asked_so_far(&mut asked).len(), 1, "the unexpose alone");
 
         assert!(forwards.note_retracted(other(0)).is_some());
-        let owed = super::hand_over_owed(&sock, &forwards, &replies, owed).await;
+        let owed = super::hand_over_owed(&sock, &forwards, &replies, &kernel, owed).await;
         server.abort();
         assert!(owed.is_empty());
         assert_eq!(forwards.address_of(SHARED), Some(WAITER));
@@ -12799,6 +12928,7 @@ mod tests {
             sock,
             Arc::clone(&forwards),
             ReplyTables::new(),
+            crate::box_registry::KernelPorts::unattached(),
             withdrawal,
             &TWO_QUICK_RETRIES,
         )
@@ -22743,6 +22873,153 @@ mod tests {
         );
     }
 
+    /// A row that may reach every address and names `example.org`, for the
+    /// two checks below of what the kernel's DNS table takes at the relay.
+    fn naming_row(registry: &BoxRegistry) {
+        registry.register(
+            BoxRegistration::new("naming", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_egress_policy(EgressPolicy {
+                    allow_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+                    allow_dns_hosts: Some(vec!["example.org".to_string()]),
+                    allow_protocols: None,
+                    deny_subnets: None,
+                }),
+        );
+    }
+
+    /// Reads frames from `stream` until `wanted` arrives, at most `most`, so
+    /// a check does not depend on whether the frames sent before it were
+    /// passed on or dropped.
+    async fn read_until(stream: &mut UnixStream, wanted: &[u8], most: usize) {
+        for _ in 0..most {
+            if expect_frame(stream).await == wanted {
+                return;
+            }
+        }
+        panic!("the frame waited for did not arrive among {most}");
+    }
+
+    /// A question a row whose rules admit `8.8.8.8` sends to `8.8.8.8:53` is
+    /// one the kernel's DNS table does not hold as asked; the same question
+    /// sent to the resolver right after is.
+    #[tokio::test]
+    async fn a_question_to_another_hosts_port_53_is_not_asked_in_the_kernels_table() {
+        let registry = BoxRegistry::new(SUBNET);
+        naming_row(&registry);
+        let mut h = gate_over(registry.clone()).await;
+        let lease = Ipv4Addr::from(LEASE);
+        let query = dns_pins::tests::dns_query("example.org.");
+        let elsewhere =
+            dns_pins::tests::udp_payload_frame(lease, 40000, Ipv4Addr::new(8, 8, 8, 8), 53, &query);
+        let resolver =
+            dns_pins::tests::udp_payload_frame(lease, 40001, SUBNET.dns_server(), 53, &query);
+        send_frame(&mut h.guest, &elsewhere).await;
+        send_frame(&mut h.guest, &resolver).await;
+        read_until(&mut h.switch, &resolver, 2).await;
+
+        let now = h.table.kernel_now();
+        let asked = |port: u16| {
+            registry
+                .kernel_for_tests()
+                .with_row_pins(lease, |pins| pins.asked_live(0, 0x522a, port, now))
+                .expect("the kernel holds the row's tables")
+        };
+        assert!(
+            !asked(40000),
+            "the question to 8.8.8.8:53 is not outstanding in the kernel's table"
+        );
+        assert!(
+            asked(40001),
+            "the question to the resolver is outstanding in the kernel's table"
+        );
+    }
+
+    /// A well-formed answer with the right id for a live question, from
+    /// another address's port 53 toward the asking port, admits nothing in
+    /// the kernel's DNS table nor in the daemon's own; the resolver's answer to the
+    /// same question right after admits its address in both.
+    #[tokio::test]
+    async fn an_answer_from_another_hosts_port_53_admits_nothing_in_either_table() {
+        let registry = BoxRegistry::new(SUBNET);
+        naming_row(&registry);
+        let mut h = gate_over(registry.clone()).await;
+        let lease = Ipv4Addr::from(LEASE);
+        let question = dns_pins::tests::udp_payload_frame(
+            lease,
+            40001,
+            SUBNET.dns_server(),
+            53,
+            &dns_pins::tests::dns_query("example.org."),
+        );
+        send_frame(&mut h.guest, &question).await;
+        read_until(&mut h.switch, &question, 1).await;
+
+        let forged_at = Ipv4Addr::new(203, 0, 113, 30);
+        let answered_at = Ipv4Addr::new(203, 0, 113, 31);
+        let forged = dns_pins::tests::udp_payload_frame(
+            Ipv4Addr::new(8, 8, 8, 8),
+            53,
+            lease,
+            40001,
+            &dns_pins::tests::dns_response("example.org.", &[forged_at]),
+        );
+        let answer = dns_pins::tests::udp_payload_frame(
+            SUBNET.dns_server(),
+            53,
+            lease,
+            40001,
+            &dns_pins::tests::dns_response("example.org.", &[answered_at]),
+        );
+        send_frame(&mut h.switch, &forged).await;
+        send_frame(&mut h.switch, &answer).await;
+        read_until(&mut h.guest, &answer, 2).await;
+
+        let now = h.table.kernel_now();
+        let kernel_admits = |addr: Ipv4Addr| {
+            registry
+                .kernel_for_tests()
+                .with_row_pins(lease, |pins| pins.admitted_live(u32::from(addr), now))
+                .expect("the kernel holds the row's tables")
+        };
+        assert!(
+            !kernel_admits(forged_at),
+            "the answer from 8.8.8.8:53 admits nothing in the kernel's table"
+        );
+        assert_eq!(
+            h.pins.live_admission(LEASE, forged_at),
+            None,
+            "the answer from 8.8.8.8:53 admits nothing in the daemon's own table"
+        );
+        assert!(
+            kernel_admits(answered_at),
+            "the resolver's answer admits its address in the kernel's table"
+        );
+        assert_eq!(
+            h.pins.live_admission(LEASE, answered_at).as_deref(),
+            Some("example.org"),
+            "the resolver's answer admits its address in the daemon's own table"
+        );
+    }
+
+    /// A question past `MAX_DATAGRAM` is not recorded. The relay cannot carry
+    /// it to show this end to end: its frames end at the MTU (`max_frame`,
+    /// 1,518 bytes), below the bound of 4,096, so the check is read here
+    /// directly; the same datagram within the bound is recorded.
+    #[test]
+    fn a_question_past_max_datagram_is_not_recorded() {
+        let query = dns_pins::tests::dns_query("example.com");
+        assert!(
+            super::standard_query(&query),
+            "a standard query is recorded"
+        );
+        let mut oversized = query;
+        oversized.resize(dns_pins::MAX_DATAGRAM + 1, 0);
+        assert!(
+            !super::standard_query(&oversized),
+            "a question past the size bound is not"
+        );
+    }
+
     /// The switch-to-guest leg observes a DNS answer toward the node address
     /// for a resident `host_ip` box's question only when the kernel's
     /// configuration names the node address as a row's, as the registry
@@ -23795,6 +24072,137 @@ mod tests {
             );
         }
     }
+
+    /// A registry with the node namespace and two resident `host_ip` boxes,
+    /// each declaring one name and no subnet, and the first box's session
+    /// with the policy that admits it under `host`.
+    fn two_members() -> (BoxRegistry, boxes::SessionId, impl Fn(&str) -> EgressPolicy) {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        let policy = |host: &str| EgressPolicy {
+            allow_protocols: None,
+            allow_subnets: Some(Vec::new()),
+            allow_dns_hosts: Some(vec![host.to_string()]),
+            deny_subnets: None,
+        };
+        let box_a = boxes::SessionId::from_bytes([0x41; 16]);
+        let box_b = boxes::SessionId::from_bytes([0x42; 16]);
+        assert!(registry.admit_host_ip_box(box_a, Some(&policy("a.example.com"))));
+        assert!(registry.admit_host_ip_box(box_b, Some(&policy("b.example.com"))));
+        (registry, box_a, policy)
+    }
+
+    /// Whether the kernel's cohort DNS table admits `addr` now.
+    fn cohort_admits(table: &BoxTable, addr: Ipv4Addr) -> bool {
+        let now = table.kernel_now();
+        table
+            .kernel_for_tests()
+            .with_cohort_pins(|pins| pins.admitted_live(u32::from(addr), now))
+    }
+
+    /// NET-085 through the registry: an attach that re-admits a `host_ip`
+    /// box with the rules the set holds keeps the kernel's cohort DNS table,
+    /// so the admission another resident box's lookup took stays; a re-admit
+    /// with other rules renews the table.
+    #[test]
+    fn an_equal_readmit_keeps_the_kernels_cohort_table_and_a_changed_one_empties_it() {
+        let (registry, box_a, policy) = two_members();
+        let table = registry.table();
+        table.adopt_node_baseline(&NodePlaneBaseline::built_in(SUBNET));
+        let node = SUBNET.daemon_ip().octets();
+        let resolver = SUBNET.dns_server();
+        let site = Ipv4Addr::new(203, 0, 113, 60);
+        let now = table.kernel_now();
+        let asked = table.kernel_question(
+            node,
+            true,
+            resolver.octets(),
+            "b.example.com",
+            0x522a,
+            40000,
+            now,
+        );
+        assert!(asked.is_some(), "the cohort asks the second box's name");
+        let answer = dns_pins::tests::dns_response("b.example.com", &[site]);
+        let _answered = table.kernel_answer(
+            std::net::SocketAddrV4::new(resolver, 53),
+            node,
+            40000,
+            &answer,
+            now,
+        );
+        assert!(
+            cohort_admits(&table, site),
+            "the cohort holds the admission"
+        );
+        assert!(registry.admit_host_ip_box(box_a, Some(&policy("a.example.com"))));
+        assert!(
+            cohort_admits(&table, site),
+            "a re-admit with equal rules keeps the cohort's table"
+        );
+        assert!(registry.admit_host_ip_box(box_a, Some(&policy("c.example.com"))));
+        assert!(
+            !cohort_admits(&table, site),
+            "a re-admit with other rules empties the cohort's table"
+        );
+    }
+
+    /// NET-085 through the relay: after an attach re-admits a `host_ip` box
+    /// with equal rules, the cohort's frame to the address another box's
+    /// lookup admitted still passes; after a re-admit with other rules it is
+    /// refused under the host-address boxes' rule.
+    #[tokio::test]
+    async fn the_cohorts_admission_survives_an_equal_readmit_at_the_relay() {
+        let (registry, box_a, policy) = two_members();
+        let mut h = gate_over(registry.clone()).await;
+        let node = SUBNET.daemon_ip();
+        let resolver = SUBNET.dns_server();
+        let site = Ipv4Addr::new(203, 0, 113, 60);
+        let query = box_cohort_frame(dns_pins::tests::udp_payload_frame(
+            node,
+            40000,
+            resolver,
+            53,
+            &dns_pins::tests::dns_query("b.example.com"),
+        ));
+        send_frame(&mut h.guest, &query).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            query,
+            "the cohort's query reaches the switch"
+        );
+        let reply = dns_pins::tests::udp_payload_frame(
+            resolver,
+            53,
+            node,
+            40000,
+            &dns_pins::tests::dns_response("b.example.com", &[site]),
+        );
+        send_frame(&mut h.switch, &reply).await;
+        assert_eq!(
+            expect_frame(&mut h.guest).await,
+            reply,
+            "the answer reaches the node"
+        );
+        let frame = box_cohort_frame(ipv4_frame(node.octets(), 6, site.octets(), 443));
+        send_frame(&mut h.guest, &frame).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            frame,
+            "the cohort's frame to the admitted address passes"
+        );
+        assert!(registry.admit_host_ip_box(box_a, Some(&policy("a.example.com"))));
+        send_frame(&mut h.guest, &frame).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            frame,
+            "after a re-admit with equal rules it still passes"
+        );
+        assert!(registry.admit_host_ip_box(box_a, Some(&policy("c.example.com"))));
+        send_frame(&mut h.guest, &frame).await;
+        expect_silence(&mut h.switch).await;
+        wait_for_log(&h.log, HOST_IP_BOXES_RULE).await;
+    }
 }
 
 #[cfg(test)]
@@ -23834,6 +24242,7 @@ mod mirror_tests {
         let ledger = super::MirrorLedger {
             forwards: std::sync::Arc::downgrade(&forwards),
             replies: super::ReplyTables::new(),
+            kernel: crate::box_registry::KernelPorts::unattached(),
             switch_sock: dir.path().join("no-switch.sock"),
             runtime: tokio::runtime::Handle::current(),
         };

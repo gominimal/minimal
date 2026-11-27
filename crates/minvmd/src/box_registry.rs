@@ -72,7 +72,8 @@ use switch::SwitchSubnet;
 use crate::bep_attach::BoxId;
 use crate::net::host_exposures::HostExposure;
 use crate::net::kernel_config::{
-    Diverged, KernelConfig, MemberFacts, Poisoned, RowFacts, RowShape, ZONE_APEX_WIRE, unpoisoned,
+    Diverged, KernelConfig, MemberFacts, Poisoned, RowFacts, RowShape, ZONE_APEX_WIRE, recordable,
+    unpoisoned,
 };
 use netcore::frame::Facts;
 use netcore::ingress::Heard;
@@ -3586,6 +3587,9 @@ pub struct BoxRegistry {
     /// inside the row lock or the resident set's lock, never the other way
     /// round. Shared by every clone.
     kernel: Arc<RwLock<KernelConfig>>,
+    /// The instant the kernel's clock counts from: one clock for the gate
+    /// this registry decides for, shared by every clone and table.
+    kernel_epoch: Instant,
 }
 
 /// Where the running egress gate leaves its ledger for the node mirror's
@@ -4029,6 +4033,7 @@ impl Clone for BoxRegistry {
             node_mirror: Arc::clone(&self.node_mirror),
             mirror_ledger: Arc::clone(&self.mirror_ledger),
             kernel: Arc::clone(&self.kernel),
+            kernel_epoch: self.kernel_epoch,
         }
     }
 }
@@ -4086,6 +4091,7 @@ impl BoxRegistry {
                 KernelConfig::new(subnet)
                     .expect("every switch subnet is a block the network kernel plans"),
             )),
+            kernel_epoch: Instant::now(),
         }
     }
 
@@ -7597,6 +7603,7 @@ impl BoxRegistry {
             row_epoch: Arc::clone(&self.row_epoch),
             mirror_ledger: Arc::clone(&self.mirror_ledger),
             kernel: Arc::clone(&self.kernel),
+            kernel_epoch: self.kernel_epoch,
         }
     }
 
@@ -9762,6 +9769,8 @@ pub struct BoxTable {
     mirror_ledger: MirrorLedgerSlot,
     /// The network kernel's configuration the registry keeps, shared.
     kernel: Arc<RwLock<KernelConfig>>,
+    /// The instant the kernel's clock counts from ([`Self::kernel_now`]).
+    kernel_epoch: Instant,
 }
 
 /// The kernel's answer for `frame` on `kernel`, as [`BoxTable::egress_first`]
@@ -9791,7 +9800,111 @@ pub(crate) struct AskedFor {
     pub(crate) cohort: Option<u64>,
 }
 
+/// The network kernel's reply tables, reached to end a port's records
+/// where a publication is retracted. It holds the configuration alone, so
+/// a holder the table itself keeps (the mirror ledger) makes no cycle.
+#[derive(Clone)]
+pub(crate) struct KernelPorts {
+    kernel: Arc<RwLock<KernelConfig>>,
+}
+
+impl KernelPorts {
+    /// Ends the kernel's reply records of the box at `addr` at its port
+    /// `port` over `proto` ([`KernelConfig::end_port_at`]), under the
+    /// configuration's read lock with the box's tables locked inside it.
+    pub(crate) fn end_port(&self, addr: [u8; 4], proto: u8, port: u16) {
+        self.kernel
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .end_port_at(addr, proto, port);
+    }
+
+    /// A configuration of its own, for a test that drives the retraction
+    /// paths with tables of their own.
+    #[cfg(test)]
+    pub(crate) fn unattached() -> Self {
+        BoxRegistry::new(switch::DEFAULT_SUBNET)
+            .table()
+            .kernel_ports()
+    }
+}
+
 impl BoxTable {
+    /// The kernel's reply tables, for ending a port's records where a
+    /// publication is retracted.
+    pub(crate) fn kernel_ports(&self) -> KernelPorts {
+        KernelPorts {
+            kernel: Arc::clone(&self.kernel),
+        }
+    }
+
+    /// The network kernel's configuration, to read.
+    #[cfg(test)]
+    pub(crate) fn kernel_for_tests(&self) -> std::sync::RwLockReadGuard<'_, KernelConfig> {
+        self.kernel
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The kernel's clock: milliseconds since the registry was made, one
+    /// clock for the gate. Read once for a frame, before any lock, and handed
+    /// to every kernel call for that frame.
+    pub(crate) fn kernel_now(&self) -> netcore::time::Instant {
+        netcore::time::Instant {
+            ms: u64::try_from(self.kernel_epoch.elapsed().as_millis()).unwrap_or(u64::MAX),
+        }
+    }
+
+    /// Records a frame toward a guest in the kernel's tables of the box it
+    /// is for, beside the daemon's own record, under the configuration's
+    /// read lock with that box's tables locked inside it. Decides nothing,
+    /// and records nothing past a poisoned lock ([`recordable`]).
+    pub(crate) fn kernel_toward_guest(
+        &self,
+        bytes: &[u8],
+        published: bool,
+        now: netcore::time::Instant,
+    ) -> Option<netcore::ingress::Seen> {
+        recordable(self.kernel.read())?.record_toward_guest(bytes, published, now)
+    }
+
+    /// Records a DNS question a guest sent in the kernel's DNS table its
+    /// source is routed to, beside the daemon's own. Decides nothing, and
+    /// records nothing past a poisoned lock ([`recordable`]).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the source, its mark, where the question went, its name, id and port, and the \
+                  instant are each one of the question's facts"
+    )]
+    pub(crate) fn kernel_question(
+        &self,
+        src: [u8; 4],
+        marked: bool,
+        dst: [u8; 4],
+        name: &str,
+        txid: u16,
+        port: u16,
+        now: netcore::time::Instant,
+    ) -> Option<netcore::pins::Asked> {
+        recordable(self.kernel.read())?.record_question(src, marked, dst, name, txid, port, now)
+    }
+
+    /// Offers a DNS answer delivered toward `dst` to the kernel's DNS
+    /// tables, beside the daemon's own. Decides nothing, and records nothing
+    /// past a poisoned lock ([`recordable`]).
+    pub(crate) fn kernel_answer(
+        &self,
+        from: std::net::SocketAddrV4,
+        dst: [u8; 4],
+        port: u16,
+        datagram: &[u8],
+        now: netcore::time::Instant,
+    ) -> Vec<netcore::answer::Answer> {
+        recordable(self.kernel.read())
+            .map(|kernel| kernel.record_answer(from, dst, port, datagram, now))
+            .unwrap_or_default()
+    }
+
     /// The kernel's answer for the bytes of a frame a guest sent, with how
     /// many resident `host_ip` boxes the configuration holds and the
     /// registry records the answer was made for ([`AskedFor`]). The

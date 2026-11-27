@@ -144,7 +144,7 @@ const TCP_RST: u8 = 0x04;
 /// Largest DNS datagram the table reads — the answerer's bound: a DNS
 /// message fits far below it, and a larger datagram is ignored rather than
 /// buffered unbounded.
-const MAX_DATAGRAM: usize = 4096;
+pub(crate) const MAX_DATAGRAM: usize = 4096;
 /// Sweep expired admissions once the table crosses this many entries —
 /// this table's own memory bound behind the shared per-name cap, the same
 /// bound the in-VM gate keeps (the conntrack's pattern, bounding memory
@@ -413,6 +413,17 @@ struct BoxPins {
     /// returning whether this admission was the first, so two replies
     /// racing in the same window still write the line exactly once.
     logged_first_pin: AtomicBool,
+}
+
+/// The first question's name of a DNS query `datagram`, read by the
+/// resolver library and normalized as the rows' names are matched, with the
+/// query's id from the header's first two bytes; `None` when the library
+/// reads no question.
+pub(crate) fn question_of(datagram: &[u8]) -> Option<(String, u16)> {
+    let id = u16::from_be_bytes([*datagram.first()?, *datagram.get(1)?]);
+    let message = Message::from_vec(datagram).ok()?;
+    let question = message.queries.first()?;
+    Some((normalized(&question.name().to_lowercase().to_string()), id))
 }
 
 /// A DNS wire name in the form the row's declared names are matched in:
@@ -1440,6 +1451,33 @@ impl DnsPins {
     pub(crate) fn sweeps_of(&self, record: &Arc<BoxRecord>) -> u64 {
         self.entry(record)
             .map_or(0, |box_pins| box_pins.sweeps.load(Ordering::Relaxed))
+    }
+
+    /// The name a live admission of `addr` in the entry held for the box at
+    /// `source` was taken under, or `None` when the table holds no entry
+    /// for that box or no admission of `addr` whose window is still open.
+    ///
+    /// Test-facing, and a reader only: it looks the entry up in the table as
+    /// it stands and builds none, unlike [`Self::entry`], so reading it
+    /// never changes what the table holds.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn live_admission(&self, source: [u8; 4], addr: Ipv4Addr) -> Option<String> {
+        let box_pins = self
+            .inner
+            .boxes
+            .lock()
+            .expect("the admission table's lock is held only across this lookup")
+            .get(&source)
+            .map(Arc::clone)?;
+        let admitted = box_pins
+            .admitted
+            .lock()
+            .expect("the admissions' lock is held only across this lookup");
+        admitted
+            .get(&addr.octets())
+            .filter(|admission| admission.expires > Instant::now())
+            .map(|admission| admission.name.to_string())
     }
 }
 
