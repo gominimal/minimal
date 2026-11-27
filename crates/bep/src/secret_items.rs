@@ -46,6 +46,10 @@ pub enum Cause {
     /// Secret Service can still act on a request it was already sent: the
     /// item is in an unknown state.
     NoAnswer(Duration),
+    /// A change was sent, and how much of it Secret Service made is not
+    /// known: the answer to it did not arrive, or a later step of the
+    /// change failed after an earlier one was made.
+    Unsettled(String),
     /// Anything else.
     Other(String),
 }
@@ -56,6 +60,7 @@ impl std::fmt::Display for Cause {
             Self::Locked(detail)
             | Self::Unreachable(detail)
             | Self::NoProvider(detail)
+            | Self::Unsettled(detail)
             | Self::Other(detail) => f.write_str(detail),
             Self::NoAnswer(timeout) => {
                 write!(
@@ -86,7 +91,8 @@ pub trait Items {
     /// # Errors
     ///
     /// [`Cause::Locked`] when the default collection is locked. After
-    /// [`Cause::NoAnswer`] the item holds the old secret or the new one.
+    /// [`Cause::NoAnswer`] or [`Cause::Unsettled`] the item holds the old
+    /// secret or the new one.
     fn store(&self, label: &str, attributes: &[(&str, &str)], secret: &[u8]) -> Result<(), Cause>;
 
     /// Removes every item under `attributes`, and gives the count.
@@ -94,7 +100,8 @@ pub trait Items {
     /// # Errors
     ///
     /// [`Cause::Locked`] when a matching item is locked. Nothing is removed
-    /// then. After [`Cause::NoAnswer`] any of the items can be gone.
+    /// then. After [`Cause::NoAnswer`] or [`Cause::Unsettled`] any of the
+    /// items can be gone.
     fn clear(&self, attributes: &[(&str, &str)]) -> Result<usize, Cause>;
 
     /// The value of attribute `key` on each item under `attributes`,
@@ -228,7 +235,7 @@ impl Items for SessionItems {
                 .create_item(label, borrowed(&attributes), secret, true, CONTENT_TYPE)
                 .await
                 .map(|_| ())
-                .map_err(sort)
+                .map_err(sort_sent)
         })
     }
 
@@ -240,10 +247,21 @@ impl Items for SessionItems {
             if !found.locked.is_empty() {
                 return Err(Cause::Locked("a matching item is locked".into()));
             }
-            for item in &found.unlocked {
-                item.delete().await.map_err(sort)?;
+            let matching = found.unlocked.len();
+            for (removed, item) in found.unlocked.iter().enumerate() {
+                if let Err(err) = item.delete().await {
+                    let cause = sort_sent(err);
+                    // A refusal of the first delete removed nothing.
+                    return Err(if removed == 0 {
+                        cause
+                    } else {
+                        Cause::Unsettled(format!(
+                            "Secret Service removed {removed} of {matching} matching items, and then: {cause}"
+                        ))
+                    });
+                }
             }
-            Ok(found.unlocked.len())
+            Ok(matching)
         })
     }
 
@@ -313,6 +331,62 @@ fn sort(err: Error) -> Cause {
         Error::ZbusFdo(fdo) => Cause::Other(fdo.to_string()),
         err => Cause::Other(err.to_string()),
     })
+}
+
+/// Sorts the error of a method that changes an item. An answer that
+/// refuses the change is sorted as [`sort`] sorts it. An answer that did
+/// not arrive leaves the change [`Cause::Unsettled`], because Secret
+/// Service had the request.
+fn sort_sent(err: Error) -> Cause {
+    let lost = answer_lost(&err);
+    match sort(err) {
+        // The deadline of the call says the same, with its time.
+        cause @ Cause::NoAnswer(_) => cause,
+        cause if lost => Cause::Unsettled(format!(
+            "the answer from Secret Service did not arrive: {cause}"
+        )),
+        cause => cause,
+    }
+}
+
+/// The D-Bus error names that the bus gives for a method whose answer did
+/// not arrive.
+const LOST: [&str; 4] = [
+    "org.freedesktop.DBus.Error.NoReply",
+    "org.freedesktop.DBus.Error.Disconnected",
+    "org.freedesktop.DBus.Error.Timeout",
+    "org.freedesktop.DBus.Error.TimedOut",
+];
+
+/// Whether `err` says that the answer to a method did not arrive, and not
+/// what the answer was.
+fn answer_lost(err: &Error) -> bool {
+    use zbus::fdo::Error as Fdo;
+    fn bus(err: &zbus::Error) -> bool {
+        match err {
+            zbus::Error::InputOutput(_) => true,
+            zbus::Error::MethodError(name, _, _) => LOST.contains(&name.as_str()),
+            zbus::Error::FDO(fdo) => fdo_lost(fdo),
+            _ => false,
+        }
+    }
+    fn fdo_lost(err: &Fdo) -> bool {
+        match err {
+            Fdo::NoReply(_)
+            | Fdo::Disconnected(_)
+            | Fdo::Timeout(_)
+            | Fdo::TimedOut(_)
+            | Fdo::IOError(_) => true,
+            Fdo::ZBus(err) => bus(err),
+            _ => false,
+        }
+    }
+    match err {
+        Error::PromptDisconnected => true,
+        Error::Zbus(err) => bus(err),
+        Error::ZbusFdo(fdo) => fdo_lost(fdo),
+        _ => false,
+    }
 }
 
 /// The D-Bus error names that say the bus has no Secret Service.
@@ -603,6 +677,34 @@ mod tests {
             sort(io(std::io::ErrorKind::TimedOut)),
             Cause::NoAnswer(_)
         ));
+
+        // For a method that changes an item, an answer that did not arrive
+        // leaves the change unsettled, and an answer that refuses does not.
+        for lost in [
+            io(std::io::ErrorKind::BrokenPipe),
+            io(std::io::ErrorKind::ConnectionRefused),
+            method("org.freedesktop.DBus.Error.NoReply"),
+            method("org.freedesktop.DBus.Error.Disconnected"),
+            Error::ZbusFdo(zbus::fdo::Error::NoReply("x".into())),
+            Error::PromptDisconnected,
+        ] {
+            let cause = sort_sent(lost);
+            assert!(matches!(cause, Cause::Unsettled(_)), "{cause:?}");
+        }
+        assert!(matches!(
+            sort_sent(io(std::io::ErrorKind::TimedOut)),
+            Cause::NoAnswer(_)
+        ));
+        assert!(matches!(sort_sent(Error::Locked), Cause::Locked(_)));
+        assert!(matches!(
+            sort_sent(method("org.freedesktop.Secret.Error.IsLocked")),
+            Cause::Locked(_)
+        ));
+        assert!(matches!(
+            sort_sent(method("org.freedesktop.DBus.Error.Failed")),
+            Cause::Other(_)
+        ));
+        assert!(matches!(sort_sent(Error::Prompt), Cause::Other(_)));
     }
 
     // The fake answers as Secret Service does, so a test of a caller pins

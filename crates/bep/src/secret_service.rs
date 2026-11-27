@@ -86,7 +86,7 @@ impl<I: Items> SecretService<I> {
         self.items
             .store(&label, &[(ATTRIBUTE, &label)], encoded.as_bytes())
             .map_err(|cause| match cause {
-                Cause::NoAnswer(_) => KeyError::Store {
+                Cause::NoAnswer(_) | Cause::Unsettled(_) => KeyError::Store {
                     role,
                     detail: format!("{cause}, and it can still store the key"),
                 },

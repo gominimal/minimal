@@ -343,14 +343,14 @@ pub enum StoreError {
         /// What is locked.
         detail: String,
     },
-    /// Secret Service did not answer a request to change an item. The
-    /// request was sent, so the change can still be made.
+    /// A request to change an item did not end with an answer that settles
+    /// it. The change can be made, not made, or made in part.
     #[error(
-        "Secret Service did not answer in {secs} s, and it can still make the change. Run the command again."
+        "{detail}. Secret Service can still make the change, or it made a part of it. Run the command again."
     )]
-    ChangeUnanswered {
-        /// How long the request waited, in seconds.
-        secs: u64,
+    ChangeUnsettled {
+        /// What happened to the request.
+        detail: String,
     },
     /// A user other than the current one or root can change the proxy
     /// program, so the item's access control cannot trust it.
@@ -1636,11 +1636,12 @@ mod host {
     }
 
     /// [`failure`] for a call that changes an item. With no answer, the
-    /// request was sent, and nothing says whether the change was made.
+    /// request may have been sent, and nothing says whether the change
+    /// was made.
     fn change_failure(action: &'static str, cause: Cause) -> StoreError {
         match cause {
-            Cause::NoAnswer(timeout) => StoreError::ChangeUnanswered {
-                secs: timeout.as_secs(),
+            Cause::NoAnswer(_) | Cause::Unsettled(_) => StoreError::ChangeUnsettled {
+                detail: cause.to_string(),
             },
             cause => failure(action, cause),
         }
@@ -2753,11 +2754,18 @@ access: 1 entries
         let err = store.set(SERVICE, "claude", b"new").expect_err("no answer");
         assert_eq!(
             err.to_string(),
-            "Secret Service did not answer in 60 s, and it can still make the change. Run the command again."
+            "Secret Service did not answer in 60 s. Secret Service can still make the change, or it made a part of it. Run the command again."
         );
-        assert!(matches!(
-            store.remove("claude"),
-            Err(StoreError::ChangeUnanswered { secs: 60 })
-        ));
+        // So does a removal that stopped part of the way.
+        items.set_failure(Some(Cause::Unsettled(
+            "Secret Service removed 1 of 2 matching items, and then: a matching item is locked"
+                .into(),
+        )));
+        let err = store.remove("claude").expect_err("in part");
+        assert!(matches!(err, StoreError::ChangeUnsettled { .. }), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "Secret Service removed 1 of 2 matching items, and then: a matching item is locked. Secret Service can still make the change, or it made a part of it. Run the command again."
+        );
     }
 }

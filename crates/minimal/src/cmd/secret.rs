@@ -763,7 +763,7 @@ pub(crate) fn run_set_with_rule(
         }
         // With no answer to the request, the store can still make the
         // change, so "did not store" is not known.
-        let mut message = if matches!(e, StoreError::ChangeUnanswered { .. }) {
+        let mut message = if matches!(e, StoreError::ChangeUnsettled { .. }) {
             format!("min secret set cannot tell whether it stored {}", args.id)
         } else {
             format!("min secret set did not store {}", args.id)
@@ -950,7 +950,7 @@ pub(crate) fn run_rm(
     check_id(RM, &args.id)?;
     check_store(RM, args.store.as_deref())?;
     let removed = store.remove(&args.id).map_err(|e| {
-        let message = if matches!(e, StoreError::ChangeUnanswered { .. }) {
+        let message = if matches!(e, StoreError::ChangeUnsettled { .. }) {
             format!("min secret rm cannot tell whether it removed {}", args.id)
         } else {
             format!("min secret rm did not remove {}", args.id)
@@ -2507,13 +2507,20 @@ attributes:
             NATIVE_STORE
         }
         fn set(&self, _: &str, _: &[u8], _: &Path) -> Result<(), StoreError> {
-            Err(StoreError::ChangeUnanswered { secs: 60 })
+            Err(Self::unsettled())
         }
         fn list(&self, _: &Path) -> Result<Vec<bep::store::ItemInfo>, StoreError> {
             Ok(Vec::new())
         }
         fn remove(&self, _: &str) -> Result<bool, StoreError> {
-            Err(StoreError::ChangeUnanswered { secs: 60 })
+            Err(Self::unsettled())
+        }
+    }
+    impl UnansweredStore {
+        fn unsettled() -> StoreError {
+            StoreError::ChangeUnsettled {
+                detail: "Secret Service did not answer in 60 s".into(),
+            }
         }
     }
 
@@ -2537,8 +2544,8 @@ attributes:
             format!("{:#}", result.expect_err("no answer")),
             format!(
                 "min secret set cannot tell whether it stored claude. The rule for claude in {} \
-                 is back as it was: Secret Service did not answer in 60 s, and it can still make \
-                 the change. Run the command again.",
+                 is back as it was: Secret Service did not answer in 60 s. Secret Service can \
+                 still make the change, or it made a part of it. Run the command again.",
                 path.display()
             )
         );
@@ -2555,7 +2562,8 @@ attributes:
                 run_rm(&UnansweredStore, &args, &mut out).unwrap_err()
             ),
             "min secret rm cannot tell whether it removed claude: Secret Service did not answer \
-             in 60 s, and it can still make the change. Run the command again."
+             in 60 s. Secret Service can still make the change, or it made a part of it. Run \
+             the command again."
         );
     }
 
