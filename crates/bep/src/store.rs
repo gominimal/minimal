@@ -278,6 +278,30 @@ pub fn check_proxy_binary(_path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// The longest value that `secret-tool store` keeps whole. It reads at most
+/// this many bytes of its input, and stores a longer value cut short while it
+/// exits 0.
+pub const SECRET_TOOL_MAX_VALUE: usize = 8192;
+
+/// Whether Secret Service can keep `value` through `secret-tool`: UTF-8 text
+/// of at most [`SECRET_TOOL_MAX_VALUE`] bytes. `secret-tool store` refuses a
+/// value that is not UTF-8 and cuts a longer one short, so the Linux store
+/// refuses both before it runs. The limit holds until the store stops using
+/// `secret-tool`.
+///
+/// # Errors
+///
+/// [`StoreError::ValueTooLong`] or [`StoreError::ValueNotText`].
+pub fn check_secret_tool_value(value: &[u8]) -> Result<(), StoreError> {
+    if value.len() > SECRET_TOOL_MAX_VALUE {
+        return Err(StoreError::ValueTooLong { len: value.len() });
+    }
+    if std::str::from_utf8(value).is_err() {
+        return Err(StoreError::ValueNotText);
+    }
+    Ok(())
+}
+
 /// Whether `id` is an identifier a secret can have: 1 to [`MAX_ID_LEN`]
 /// ASCII letters, digits, `.`, `_` and `-`, not starting with `-`.
 #[must_use]
@@ -350,6 +374,19 @@ pub enum StoreError {
         /// The check that failed.
         reason: String,
     },
+    /// The value is longer than Secret Service keeps through `secret-tool`.
+    #[error(
+        "On Linux, `min secret` stores a value in Secret Service through `secret-tool`, which keeps at most {SECRET_TOOL_MAX_VALUE} bytes, and this value is {len} bytes. Give a value of {SECRET_TOOL_MAX_VALUE} bytes or fewer."
+    )]
+    ValueTooLong {
+        /// The value's length in bytes.
+        len: usize,
+    },
+    /// The value is not UTF-8, which `secret-tool` refuses.
+    #[error(
+        "On Linux, `min secret` stores a value in Secret Service through `secret-tool`, which keeps only UTF-8 text, and this value is not valid UTF-8. Give the value as UTF-8 text."
+    )]
+    ValueNotText,
     /// The identifier is not one that [`valid_id`] admits.
     #[error(
         "`{0}` is not a name a secret can have. Use 1 to {MAX_ID_LEN} letters, digits, `.`, `_` and `-`, not starting with `-`."
@@ -415,6 +452,17 @@ pub trait SecretStore {
     /// When the store cannot tell without a prompt, or refuses the lookup.
     fn holds(&self, id: &str) -> Result<bool, StoreError> {
         Ok(self.list(Path::new(""))?.iter().any(|item| item.id == id))
+    }
+
+    /// Whether the store can keep `value` whole. `set` asks before it writes
+    /// anything, so a value the store would refuse or cut short changes
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// When the store cannot keep the value as given.
+    fn check_value(&self, _value: &[u8]) -> Result<(), StoreError> {
+        Ok(())
     }
 
     /// The store as a message names it, such as "the keychain store".
@@ -990,6 +1038,14 @@ impl SecretStore for HostStore {
         host::holds(id)
     }
 
+    fn check_value(&self, value: &[u8]) -> Result<(), StoreError> {
+        if cfg!(target_os = "linux") {
+            check_secret_tool_value(value)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Secret Service on Linux, where a store reference still names the
     /// store `keychain`. The keychain store elsewhere.
     fn place(&self) -> String {
@@ -1546,6 +1602,7 @@ mod host {
         /// in place, and a failed store leaves it as it was.
         pub(super) fn set(&self, service: &str, id: &str, value: &[u8]) -> Result<(), StoreError> {
             check_id(id)?;
+            super::check_secret_tool_value(value)?;
             let action = "store the secret";
             let label = format!("--label=Minimal secret {id}");
             let out = self.run(
@@ -2711,6 +2768,27 @@ access: 1 entries
         assert!(!store.holds(&id).expect("lookup"), "no item after remove");
     }
 
+    // Secret Service through `secret-tool` keeps UTF-8 text of at most 8192
+    // bytes. Each refusal says why and gives the limit.
+    #[test]
+    fn secret_tool_value_limits_refuse_with_the_limit() {
+        assert_eq!(SECRET_TOOL_MAX_VALUE, 8192);
+        check_secret_tool_value(&vec![b'a'; 8192]).expect("the longest value");
+        check_secret_tool_value("sk-ant-\u{e9}".as_bytes()).expect("UTF-8 text");
+        let err = check_secret_tool_value(&vec![b'a'; 8193]).expect_err("too long");
+        assert_eq!(
+            err.to_string(),
+            "On Linux, `min secret` stores a value in Secret Service through `secret-tool`, which keeps at most 8192 bytes, and this value is 8193 bytes. Give a value of 8192 bytes or fewer."
+        );
+        let err = check_secret_tool_value(b"\xff\x00\xfe").expect_err("not text");
+        assert_eq!(
+            err.to_string(),
+            "On Linux, `min secret` stores a value in Secret Service through `secret-tool`, which keeps only UTF-8 text, and this value is not valid UTF-8. Give the value as UTF-8 text."
+        );
+        let host = HostStore.check_value(b"\xff");
+        assert_eq!(host.is_err(), cfg!(target_os = "linux"), "{host:?}");
+    }
+
     // A creation asks whether an item is stored, by identifier, and a
     // message names the store where it lives: Secret Service on Linux, and
     // the keychain store on macOS and in a store held in memory.
@@ -2821,6 +2899,22 @@ esac
         assert!(matches!(store.read("claude"), Err(ReadError::Deleted(_))));
         assert!(!store.holds("claude").unwrap(), "no item after remove");
         assert_eq!(store.list().unwrap().len(), 1);
+
+        // A value that `secret-tool` would refuse or cut short is refused
+        // before it runs, and the held value stays.
+        let long = vec![b'a'; SECRET_TOOL_MAX_VALUE + 1];
+        assert!(matches!(
+            store.set(SERVICE, "linear", &long),
+            Err(StoreError::ValueTooLong { len }) if len == SECRET_TOOL_MAX_VALUE + 1
+        ));
+        assert!(matches!(
+            store.set(SERVICE, "linear", b"\xff\x00\xfe"),
+            Err(StoreError::ValueNotText)
+        ));
+        assert_eq!(store.read("linear").unwrap().as_slice(), b"lin-two");
+        let longest = vec![b'a'; SECRET_TOOL_MAX_VALUE];
+        store.set(SERVICE, "linear", &longest).unwrap();
+        assert_eq!(store.read("linear").unwrap().as_slice(), &longest[..]);
 
         // An identifier that `secret-tool` could read as an option is
         // refused before it runs.

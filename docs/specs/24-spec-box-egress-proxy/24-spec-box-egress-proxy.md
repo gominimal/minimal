@@ -914,6 +914,10 @@ Setting secrets
     tier:   T0
     verify: cargo nextest run -p bep linux_native_store_refusals_name_what_to_install
     <!-- unwanted; a Linux-only test, which a fake `secret-tool` drives -->
+  - IF the value given to `min secret set` is not UTF-8 text or is longer than 8192 bytes THEN THE SYSTEM SHALL refuse it before it writes the rule or the item, and report the limit.
+    tier:   T0
+    verify: cargo nextest run -p minimal secret_set_refuses_a_value_secret_tool_cannot_keep
+    <!-- unwanted; `secret-tool store` refuses a value that is not UTF-8, and keeps only the first 8192 bytes of a longer one while it reports success; the limit holds until the store reads and writes Secret Service without `secret-tool` -->
   - IF the keyring is locked THEN THE SYSTEM SHALL refuse `min secret set` and report that the keyring is locked.
     tier:   T0
     verify: cargo nextest run -p bep linux_native_store_refusals_name_what_to_install
