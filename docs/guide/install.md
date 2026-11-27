@@ -67,6 +67,87 @@ For a scripted upgrade that must not stop to ask, set
 curl --proto "=https" --tlsv1.2 -fsSL https://go.minimal.dev/stable | sh -s -- --force-stop
 ```
 
+### Upgrade from 0.7 to 0.8
+
+0.8 changes how Minimal stores your boxes. 0.7 cannot read the box state that
+0.8 writes, so after the upgrade you cannot go back to 0.7 with your boxes
+unless you made a copy of the state first. Make that copy before you run the
+install command.
+
+What changes in 0.8:
+
+- Every session and task is a box. A box stays after it stops or ends, until
+  `min box rm` removes it.
+- The old session verbs, bare `min stop` and `min task run --path` are gone.
+  Use the `min box` verbs, `min host stop <HOST>` and `-C <DIR>`. Run
+  `min box --help` to see the verbs.
+- A box without a name that you chose takes `<project>` for the default entry,
+  or `<project>-<entry>` for another entry. When a box already has that name,
+  the new box takes the name with `-<n>` added.
+- A name that you choose with `--name` or with an entry's `[box] name` is kept
+  exactly. When any box on the host has that name, in any state, the command
+  refuses and creates nothing.
+- Environment variables are set in one table, `env_vars`, in `minimal.toml`
+  and in loadout files. A file that still sets `vars` or `vars_lenient` fails
+  with exit code 3, and the message names the file and the key. Rename the key
+  to `env_vars`.
+
+#### Copy your box state before you upgrade
+
+Minimal keeps its box state in `${XDG_STATE_HOME:-$HOME/.local/state}/minimal`.
+On macOS, that directory holds the virtual machine's data volume, a large
+sparse file. The copy commands below keep it sparse.
+
+1. Stop the 0.7 daemon, so that nothing writes to the state while you copy
+   it. When sessions are active, `min stop` refuses, and `min stop --force`
+   stops the daemon anyway:
+
+   ```shell
+   min stop
+   ```
+
+2. Copy the state directory.
+
+   On macOS:
+
+   ```shell
+   cp -Rc "${XDG_STATE_HOME:-$HOME/.local/state}/minimal" "$HOME/minimal-state-0.7"
+   ```
+
+   On Linux:
+
+   ```shell
+   cp -a --sparse=always "${XDG_STATE_HOME:-$HOME/.local/state}/minimal" "$HOME/minimal-state-0.7"
+   ```
+
+3. Run the install command for your platform.
+
+#### Go back to 0.7
+
+A 0.7 daemon that meets 0.8 state can fail to start, or start without the boxes
+that 0.8 changed. To go back, put your copy back in place first. The boxes that
+you made on 0.8 are lost.
+
+1. Stop the 0.8 hosts. Run `min host list` to see their names, then stop each
+   one, for example:
+
+   ```shell
+   min host stop local-minvmd0
+   ```
+
+2. Move the 0.8 state aside, and put the copy back:
+
+   ```shell
+   mv "${XDG_STATE_HOME:-$HOME/.local/state}/minimal" "$HOME/minimal-state-0.8"
+   mv "$HOME/minimal-state-0.7" "${XDG_STATE_HOME:-$HOME/.local/state}/minimal"
+   ```
+
+3. Install the 0.7 release that you had, for example 0.7.3:
+
+   ```shell
+   curl --proto "=https" --tlsv1.2 -fsSL https://go.minimal.dev/stable | sh -s -- --version 0.7.3
+   ```
+
 ## Uninstall
 
 ```shell
