@@ -1,0 +1,80 @@
+{
+  "types": {
+    "AllocateRequest": {
+      "full": {
+        "allocate": "web",
+        "keep": "127.0.64.9"
+      },
+      "minimal": {
+        "allocate": "web"
+      }
+    },
+    "Hello": {
+      "full": {
+        "node": "/var/lib/minimal#default",
+        "version": 4
+      }
+    },
+    "PublishRequest": {
+      "full": {
+        "rows": [
+          {
+            "address": "127.0.64.9",
+            "address_only": true,
+            "live": true,
+            "name": "web.min.internal",
+            "node_address": true
+          },
+          {
+            "address": null,
+            "live": false,
+            "name": "web.min.internal"
+          }
+        ]
+      }
+    },
+    "RefusedRow": {
+      "full": {
+        "name": "web.min.internal",
+        "reason": "another node holds the name"
+      }
+    },
+    "RegisteredRow": {
+      "full": {
+        "address": "127.0.64.9",
+        "address_only": true,
+        "live": true,
+        "name": "web.min.internal",
+        "node_address": true
+      },
+      "minimal": {
+        "address": null,
+        "live": false,
+        "name": "web.min.internal"
+      }
+    },
+    "RegistrationReply": {
+      "full": {
+        "address": "127.0.64.9",
+        "error": "the answerer refused the line",
+        "holder": "service",
+        "ok": true,
+        "refused": [
+          {
+            "name": "web.min.internal",
+            "reason": "another node holds the name"
+          }
+        ]
+      },
+      "minimal": {
+        "ok": true
+      }
+    },
+    "ReleaseAddressRequest": {
+      "full": {
+        "release": "web"
+      }
+    }
+  },
+  "version": 4
+}

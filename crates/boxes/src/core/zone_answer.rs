@@ -65,6 +65,19 @@ pub const ANSWER_TTL_SECS: u32 = 15;
 /// past NET-126's bound fails the build rather than a test run.
 const _: () = assert!(ANSWER_TTL_SECS <= 15);
 
+/// The answerer channel's protocol version. A node daemon's hello carries
+/// this number, and the installed answerer refuses a node whose number
+/// differs from its own. Both daemons read it here, so the VM host daemon,
+/// the installed answerer built from it and the native daemon speak the
+/// same version within one release.
+///
+/// Bump it whenever a line on the channel changes shape. That includes an
+/// added optional field, because an installed answerer from an earlier
+/// release ignores a field it does not know and misreads the line. The
+/// wire snapshot test beside the VM host daemon's channel types fails when
+/// they change while this number stays the same.
+pub const CHANNEL_PROTOCOL_VERSION: u32 = 4;
+
 /// The label of the host's node row (NET-003): the row the switch and
 /// the DNS gate resolve for the host itself, whose zone name is
 /// [`HOST_ROW_NAME`]. The store's reserved session names include this
