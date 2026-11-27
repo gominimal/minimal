@@ -16,11 +16,10 @@
 //! and in any encoding.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use secret_service::blocking::SecretService;
-use secret_service::{EncryptionType, Error};
+use secret_service::{EncryptionType, Error, SecretService};
 use zeroize::Zeroizing;
 
 /// The content type of each item's secret, the one `secret-tool store`
@@ -37,10 +36,15 @@ pub const TIMEOUT: Duration = Duration::from_secs(60);
 pub enum Cause {
     /// The item or its collection is locked. Nothing was unlocked.
     Locked(String),
-    /// This session has no session bus, or no Secret Service on it.
+    /// This process reached no session bus.
     Unreachable(String),
+    /// The session bus answers, and no Secret Service is on it.
+    NoProvider(String),
     /// Secret Service did not answer in this time. No prompt is ever
-    /// waiting, so the provider is stuck.
+    /// waiting, so the provider is stuck. A [`store`](Items::store) or a
+    /// [`clear`](Items::clear) that ends this way sends nothing more, but
+    /// Secret Service can still act on a request it was already sent: the
+    /// item is in an unknown state.
     NoAnswer(Duration),
     /// Anything else.
     Other(String),
@@ -49,9 +53,10 @@ pub enum Cause {
 impl std::fmt::Display for Cause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Locked(detail) | Self::Unreachable(detail) | Self::Other(detail) => {
-                f.write_str(detail)
-            }
+            Self::Locked(detail)
+            | Self::Unreachable(detail)
+            | Self::NoProvider(detail)
+            | Self::Other(detail) => f.write_str(detail),
             Self::NoAnswer(timeout) => {
                 write!(
                     f,
@@ -80,7 +85,8 @@ pub trait Items {
     ///
     /// # Errors
     ///
-    /// [`Cause::Locked`] when the default collection is locked.
+    /// [`Cause::Locked`] when the default collection is locked. After
+    /// [`Cause::NoAnswer`] the item holds the old secret or the new one.
     fn store(&self, label: &str, attributes: &[(&str, &str)], secret: &[u8]) -> Result<(), Cause>;
 
     /// Removes every item under `attributes`, and gives the count.
@@ -88,7 +94,7 @@ pub trait Items {
     /// # Errors
     ///
     /// [`Cause::Locked`] when a matching item is locked. Nothing is removed
-    /// then.
+    /// then. After [`Cause::NoAnswer`] any of the items can be gone.
     fn clear(&self, attributes: &[(&str, &str)]) -> Result<usize, Cause>;
 
     /// The value of attribute `key` on each item under `attributes`,
@@ -142,40 +148,32 @@ impl SessionItems {
         self
     }
 
-    /// Runs `call` against a new connection, on a thread of its own, and
-    /// waits for it no longer than the timeout. The timeout of each D-Bus
-    /// method ends the thread of a call that was given up on. A provider
-    /// that answers nothing, a bus that never finishes its handshake and a
-    /// call that takes several slow methods all end here at the one time.
+    /// Runs `call` against a new connection, and gives it no longer than
+    /// the timeout. The one time covers the bus handshake and every D-Bus
+    /// method of the call. When it ends, the call is dropped where it
+    /// stands and its connection closes: no thread and no socket outlive
+    /// it, and it sends nothing more.
     fn run<T, F>(&self, call: F) -> Result<T, Cause>
     where
-        T: Send + 'static,
-        F: FnOnce(&SecretService<'_>) -> Result<T, Cause> + Send + 'static,
+        F: AsyncFnOnce(&SecretService<'static>) -> Result<T, Cause>,
     {
         let timeout = self.timeout;
-        let address = self.address.clone();
-        let (answer, waiting) = mpsc::channel();
-        std::thread::Builder::new()
-            .name("secret-service".into())
-            .spawn(move || {
-                let result = connect(timeout, address.as_deref()).and_then(|ss| call(&ss));
-                // A caller that gave up dropped the receiver. The value
-                // that comes back with the error is dropped here, and a
-                // secret in it is zeroed.
-                drop(answer.send(result));
-            })
-            .map_err(|err| Cause::Other(format!("the Secret Service call did not start: {err}")))?;
-        match waiting.recv_timeout(timeout) {
-            // The time of one D-Bus method ran out just before the time of
-            // the call did. It is the same time, and the same cause.
-            Ok(Err(Cause::NoAnswer(_))) | Err(mpsc::RecvTimeoutError::Timeout) => {
-                Err(Cause::NoAnswer(timeout))
+        let address = self.address.as_deref();
+        zruntime::block_on(async {
+            let runtime = zruntime::SharedRuntime::current().map_err(|err| {
+                Cause::Other(format!("the Secret Service call did not start: {err}"))
+            })?;
+            let work = async {
+                let ss = connect(timeout, address).await?;
+                call(&ss).await
+            };
+            match runtime.timeout(timeout, work).await {
+                // The time of one D-Bus method ran out just before the time
+                // of the call did. It is the same time, and the same cause.
+                Ok(Err(Cause::NoAnswer(_))) | Err(_) => Err(Cause::NoAnswer(timeout)),
+                Ok(result) => result,
             }
-            Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(Cause::Other(
-                "the Secret Service call stopped before it answered".into(),
-            )),
-        }
+        })
     }
 }
 
@@ -198,11 +196,12 @@ fn borrowed(attributes: &Attributes) -> HashMap<&str, &str> {
 impl Items for SessionItems {
     fn lookup(&self, attributes: &[(&str, &str)]) -> Result<Option<Zeroizing<Vec<u8>>>, Cause> {
         let attributes = owned(attributes);
-        self.run(move |ss| {
-            let found = ss.search_items(borrowed(&attributes)).map_err(sort)?;
+        self.run(async |ss| {
+            let found = ss.search_items(borrowed(&attributes)).await.map_err(sort)?;
             match found.unlocked.first() {
                 Some(item) => item
                     .get_secret()
+                    .await
                     .map(|secret| Some(Zeroizing::new(secret)))
                     .map_err(sort),
                 None if found.locked.is_empty() => Ok(None),
@@ -214,21 +213,20 @@ impl Items for SessionItems {
     }
 
     fn store(&self, label: &str, attributes: &[(&str, &str)], secret: &[u8]) -> Result<(), Cause> {
-        let label = label.to_owned();
         let attributes = owned(attributes);
-        let secret = Zeroizing::new(secret.to_vec());
-        self.run(move |ss| {
-            let collection = ss.get_default_collection().map_err(|err| match err {
+        self.run(async |ss| {
+            let collection = ss.get_default_collection().await.map_err(|err| match err {
                 Error::NoResult => Cause::Other("Secret Service has no default collection".into()),
                 err => sort(err),
             })?;
             // `CreateItem` on a locked collection answers with a prompt to
             // unlock it, so the write asks first and never shows one.
-            if collection.is_locked().map_err(sort)? {
+            if collection.is_locked().await.map_err(sort)? {
                 return Err(Cause::Locked("the default collection is locked".into()));
             }
             collection
-                .create_item(&label, borrowed(&attributes), &secret, true, CONTENT_TYPE)
+                .create_item(label, borrowed(&attributes), secret, true, CONTENT_TYPE)
+                .await
                 .map(|_| ())
                 .map_err(sort)
         })
@@ -236,16 +234,15 @@ impl Items for SessionItems {
 
     fn clear(&self, attributes: &[(&str, &str)]) -> Result<usize, Cause> {
         let attributes = owned(attributes);
-        self.run(move |ss| {
-            let found = ss.search_items(borrowed(&attributes)).map_err(sort)?;
+        self.run(async |ss| {
+            let found = ss.search_items(borrowed(&attributes)).await.map_err(sort)?;
             // A delete of a locked item answers with a prompt to unlock it.
             if !found.locked.is_empty() {
                 return Err(Cause::Locked("a matching item is locked".into()));
             }
-            found
-                .unlocked
-                .iter()
-                .try_for_each(|item| item.delete().map_err(sort))?;
+            for item in &found.unlocked {
+                item.delete().await.map_err(sort)?;
+            }
             Ok(found.unlocked.len())
         })
     }
@@ -256,17 +253,13 @@ impl Items for SessionItems {
         key: &str,
     ) -> Result<Vec<String>, Cause> {
         let attributes = owned(attributes);
-        let key = key.to_owned();
-        self.run(move |ss| {
-            let found = ss.search_items(borrowed(&attributes)).map_err(sort)?;
-            let mut values = found
-                .unlocked
-                .iter()
-                .chain(&found.locked)
-                .map(|item| item.get_attributes().map(|mut held| held.remove(&key)))
-                .filter_map(Result::transpose)
-                .collect::<Result<Vec<String>, Error>>()
-                .map_err(sort)?;
+        self.run(async |ss| {
+            let found = ss.search_items(borrowed(&attributes)).await.map_err(sort)?;
+            let mut values = Vec::new();
+            for item in found.unlocked.iter().chain(&found.locked) {
+                let mut held = item.get_attributes().await.map_err(sort)?;
+                values.extend(held.remove(key));
+            }
             values.sort();
             Ok(values)
         })
@@ -275,24 +268,30 @@ impl Items for SessionItems {
 
 /// A connection to Secret Service. Each method call on it gives up after
 /// `timeout`.
-fn connect(timeout: Duration, address: Option<&str>) -> Result<SecretService<'static>, Cause> {
-    let bus = zruntime::block_on(async {
-        let builder = match address {
-            Some(address) => zbus::connection::Builder::address(address),
-            None => zbus::connection::Builder::session(),
-        };
-        builder.method_timeout(timeout).build().await
-    })
-    .map_err(|err| match sort_bus(&err) {
-        Some(Cause::Unreachable(_)) => {
-            Cause::Unreachable(format!("no session bus answered: {err}"))
-        }
-        Some(cause) => cause,
-        // A bus that is there and refuses the connection is not a session
-        // with no bus.
-        None => Cause::Other(format!("the session bus refused the connection: {err}")),
-    })?;
-    SecretService::connect_with_existing(EncryptionType::Dh, bus).map_err(sort)
+async fn connect(
+    timeout: Duration,
+    address: Option<&str>,
+) -> Result<SecretService<'static>, Cause> {
+    let builder = match address {
+        Some(address) => zbus::connection::Builder::address(address),
+        None => zbus::connection::Builder::session(),
+    };
+    let bus = builder
+        .method_timeout(timeout)
+        .build()
+        .await
+        .map_err(|err| match sort_bus(&err) {
+            Some(Cause::Unreachable(_)) => {
+                Cause::Unreachable(format!("no session bus answered: {err}"))
+            }
+            Some(cause) => cause,
+            // A bus that is there and refuses the connection is not a
+            // session with no bus.
+            None => Cause::Other(format!("the session bus refused the connection: {err}")),
+        })?;
+    SecretService::connect_with_existing(EncryptionType::Dh, bus)
+        .await
+        .map_err(sort)
 }
 
 /// Sorts an error of the client by cause, from its variant and the D-Bus
@@ -300,8 +299,10 @@ fn connect(timeout: Duration, address: Option<&str>) -> Result<SecretService<'st
 fn sort(err: Error) -> Cause {
     let sorted = match &err {
         Error::Locked => Some(Cause::Locked("Secret Service says it is locked".into())),
-        Error::Unavailable => Some(Cause::Unreachable(
-            "no session bus or no Secret Service was found".into(),
+        // The connection is made before the client has it, so what is
+        // not there is Secret Service.
+        Error::Unavailable => Some(Cause::NoProvider(
+            "the session bus has no Secret Service".into(),
         )),
         Error::Zbus(bus) => sort_bus(bus),
         Error::ZbusFdo(fdo) => sort_fdo(fdo),
@@ -314,10 +315,14 @@ fn sort(err: Error) -> Cause {
     })
 }
 
-/// The D-Bus error names that say no Secret Service answers on this bus.
-const UNREACHABLE: [&str; 4] = [
+/// The D-Bus error names that say the bus has no Secret Service.
+const NO_PROVIDER: [&str; 2] = [
     "org.freedesktop.DBus.Error.ServiceUnknown",
     "org.freedesktop.DBus.Error.NameHasNoOwner",
+];
+
+/// The D-Bus error names that say no bus answers.
+const UNREACHABLE: [&str; 2] = [
     "org.freedesktop.DBus.Error.NoServer",
     "org.freedesktop.DBus.Error.Disconnected",
 ];
@@ -328,6 +333,9 @@ const IS_LOCKED: &str = "org.freedesktop.Secret.Error.IsLocked";
 fn sort_bus(err: &zbus::Error) -> Option<Cause> {
     use std::io::ErrorKind;
     match err {
+        zbus::Error::MethodError(name, _, _) if NO_PROVIDER.contains(&name.as_str()) => {
+            Some(Cause::NoProvider(err.to_string()))
+        }
         zbus::Error::MethodError(name, _, _) if UNREACHABLE.contains(&name.as_str()) => {
             Some(Cause::Unreachable(err.to_string()))
         }
@@ -354,10 +362,8 @@ fn sort_bus(err: &zbus::Error) -> Option<Cause> {
 fn sort_fdo(err: &zbus::fdo::Error) -> Option<Cause> {
     use zbus::fdo::Error as Fdo;
     match err {
-        Fdo::ServiceUnknown(_)
-        | Fdo::NameHasNoOwner(_)
-        | Fdo::NoServer(_)
-        | Fdo::Disconnected(_) => Some(Cause::Unreachable(err.to_string())),
+        Fdo::ServiceUnknown(_) | Fdo::NameHasNoOwner(_) => Some(Cause::NoProvider(err.to_string())),
+        Fdo::NoServer(_) | Fdo::Disconnected(_) => Some(Cause::Unreachable(err.to_string())),
         Fdo::ZBus(bus) => sort_bus(bus),
         _ => None,
     }
@@ -513,13 +519,25 @@ mod tests {
     fn a_bus_that_says_nothing_ends_at_the_timeout() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bus");
-        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         let timeout = Duration::from_millis(300);
         let items = SessionItems::within(timeout).at(&format!("unix:path={}", path.display()));
         let started = Instant::now();
         let err = items.lookup(ONE).unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(10));
         assert_eq!(err, Cause::NoAnswer(timeout));
+        // Nothing of the call outlives it: its end of the connection is
+        // closed, so the bus reads to the end.
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        std::io::Read::read_to_end(&mut peer, &mut Vec::new())
+            .expect("the call closed its connection");
+        // A write ends the same way.
+        assert_eq!(
+            items.store("label", ONE, b"v"),
+            Err(Cause::NoAnswer(timeout))
+        );
         assert_eq!(err.to_string(), "Secret Service did not answer in 0 s");
         assert_eq!(
             Cause::NoAnswer(Duration::from_secs(10)).to_string(),
@@ -541,7 +559,11 @@ mod tests {
             ))
         };
         assert!(matches!(sort(Error::Locked), Cause::Locked(_)));
-        assert!(matches!(sort(Error::Unavailable), Cause::Unreachable(_)));
+        // A bus with no Secret Service is not a session with no bus.
+        assert!(matches!(sort(Error::Unavailable), Cause::NoProvider(_)));
+        for name in NO_PROVIDER {
+            assert!(matches!(sort(method(name)), Cause::NoProvider(_)), "{name}");
+        }
         assert!(matches!(
             sort(method("org.freedesktop.Secret.Error.IsLocked")),
             Cause::Locked(_)
@@ -554,7 +576,7 @@ mod tests {
         }
         assert!(matches!(
             sort(Error::ZbusFdo(zbus::fdo::Error::ServiceUnknown("x".into()))),
-            Cause::Unreachable(_)
+            Cause::NoProvider(_)
         ));
         let io = |kind| {
             Error::Zbus(zbus::Error::InputOutput(Arc::new(std::io::Error::from(

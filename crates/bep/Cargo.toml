@@ -61,8 +61,8 @@ tokio-util = { workspace = true, features = ["io-util"] }
 libc.workspace = true
 
 # Secret Service over D-Bus (`secret_items`).
-# rt-default: zbus runs on its own executor, which the crate's blocking
-# interface drives, so no tokio runtime is involved.
+# rt-default: zbus runs on its own executor, which each call drives on the
+# calling thread until the call ends, so no tokio runtime is involved.
 # crypto-rust: the encrypted session that Secret Service providers offer
 # (dh-ietf1024-sha256-aes128-cbc-pkcs7), with no OpenSSL.
 [target.'cfg(target_os = "linux")'.dependencies]

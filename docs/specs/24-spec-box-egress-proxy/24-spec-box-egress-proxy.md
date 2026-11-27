@@ -913,11 +913,11 @@ Setting secrets
 - **BEP-091** WHERE the host is Linux THE SYSTEM SHALL keep each item of the host's native store in the user's Secret Service, under its identifier, for `min secret set`, `min secret list` and `min secret rm` and for the proxy's read of a store reference.
   tier:     T0
   verify:   cargo nextest run -p bep linux_native_store_is_secret_service
-  <!-- the store that the GitHub sign-in uses on Linux; a store reference names it `keychain`, as on macOS, so one project file names the native store on both hosts; a listing reads identifiers only, never a value; a value is bytes of any kind, kept whole -->
-  - IF no Secret Service answers in the session THEN THE SYSTEM SHALL refuse `min secret set`, `min secret list` and `min secret rm`, before reading a value, and report that none answered and what to install or set up.
+  <!-- the store that the GitHub sign-in uses on Linux; a store reference names it `keychain`, as on macOS, so one project file names the native store on both hosts; a listing reads identifiers only, never a value; the store keeps the bytes that `min secret set` hands it, of any length and in any encoding -->
+  - IF the process reaches no session bus, or the session bus has no Secret Service, THEN THE SYSTEM SHALL refuse `min secret set`, `min secret list` and `min secret rm`, before reading a value, and report which of the two it is and the next step for it.
     tier:   T0
     verify: cargo nextest run -p bep linux_native_store_refusals_name_what_to_install
-    <!-- unwanted; a Linux-only test, which items held in memory drive -->
+    <!-- unwanted; a session with no bus can still have a provider installed, so the two get different next steps; a Linux-only test, which items held in memory drive -->
   - IF the keyring is locked THEN THE SYSTEM SHALL refuse `min secret set` and report that the keyring is locked.
     tier:   T0
     verify: cargo nextest run -p bep linux_native_store_refusals_name_what_to_install
@@ -928,8 +928,8 @@ Setting secrets
     <!-- unwanted; no call to Secret Service unlocks a keyring or shows a prompt, as on macOS the read shows none; a locked item is never read as a deleted one -->
   - IF Secret Service does not answer the proxy's read of a value within 10 seconds THEN THE SYSTEM SHALL refuse that request.
     tier:   T0
-    verify: cargo nextest run -p bep a_bus_that_says_nothing_ends_at_the_timeout
-    <!-- unwanted; no prompt is ever waiting, so a call that gets no answer is a stuck provider, and the request does not wait on it -->
+    verify: cargo nextest run -p bep serve_refuses_a_store_member_that_secret_service_does_not_answer
+    <!-- unwanted; no prompt is ever waiting, so a call that gets no answer is a stuck provider, and the request does not wait on it; the one time covers the bus handshake and every method of the read (`a_bus_that_says_nothing_ends_at_the_timeout`) -->
 
 
 - **BEP-092** IF a box spec declares a store reference to the host's native store and this host cannot use that store THEN THE SYSTEM SHALL refuse the creation with exit 3 before it seals a value, and report the store's reason and next step.

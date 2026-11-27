@@ -761,7 +761,13 @@ pub(crate) fn run_set_with_rule(
         if matches!(e, StoreError::StagingLeft { .. }) {
             return Err(anyhow::Error::new(e));
         }
-        let mut message = format!("min secret set did not store {}", args.id);
+        // With no answer to the request, the store can still make the
+        // change, so "did not store" is not known.
+        let mut message = if matches!(e, StoreError::ChangeUnanswered { .. }) {
+            format!("min secret set cannot tell whether it stored {}", args.id)
+        } else {
+            format!("min secret set did not store {}", args.id)
+        };
         if let Some((path, snapshot)) = &snapshot {
             match crate::config::restore_config(snapshot) {
                 Ok(()) => {
@@ -943,9 +949,14 @@ pub(crate) fn run_rm(
 ) -> anyhow::Result<()> {
     check_id(RM, &args.id)?;
     check_store(RM, args.store.as_deref())?;
-    let removed = store
-        .remove(&args.id)
-        .with_context(|| format!("min secret rm did not remove {}", args.id))?;
+    let removed = store.remove(&args.id).map_err(|e| {
+        let message = if matches!(e, StoreError::ChangeUnanswered { .. }) {
+            format!("min secret rm cannot tell whether it removed {}", args.id)
+        } else {
+            format!("min secret rm did not remove {}", args.id)
+        };
+        anyhow::Error::new(e).context(message)
+    })?;
     if !removed {
         bail!(
             "There is no secret named {} in {}. Run `min secret list` to see the stored names.",
@@ -2487,6 +2498,65 @@ attributes:
         fn remove(&self, _: &str) -> Result<bool, StoreError> {
             Ok(false)
         }
+    }
+
+    /// A store that gets no answer to a change.
+    struct UnansweredStore;
+    impl SecretStore for UnansweredStore {
+        fn name(&self) -> &'static str {
+            NATIVE_STORE
+        }
+        fn set(&self, _: &str, _: &[u8], _: &Path) -> Result<(), StoreError> {
+            Err(StoreError::ChangeUnanswered { secs: 60 })
+        }
+        fn list(&self, _: &Path) -> Result<Vec<bep::store::ItemInfo>, StoreError> {
+            Ok(Vec::new())
+        }
+        fn remove(&self, _: &str) -> Result<bool, StoreError> {
+            Err(StoreError::ChangeUnanswered { secs: 60 })
+        }
+    }
+
+    // A change that got no answer can still be made, so neither command
+    // says that it changed nothing.
+    #[test]
+    fn secret_change_with_no_answer_says_the_outcome_is_unknown() {
+        let (_dir, proxy) = proxy();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, EXISTING).unwrap();
+        let (result, out) = set_with_rule(
+            &UnansweredStore,
+            &["claude", "--preset", "anthropic", "--yes"],
+            &proxy,
+            ValueSource::Stdin,
+            &path,
+            &mut no_confirm,
+        );
+        assert_eq!(
+            format!("{:#}", result.expect_err("no answer")),
+            format!(
+                "min secret set cannot tell whether it stored claude. The rule for claude in {} \
+                 is back as it was: Secret Service did not answer in 60 s, and it can still make \
+                 the change. Run the command again.",
+                path.display()
+            )
+        );
+        assert!(out.is_empty());
+
+        let args = SecretRmArgs {
+            id: "claude".into(),
+            store: None,
+        };
+        let mut out = Vec::new();
+        assert_eq!(
+            format!(
+                "{:#}",
+                run_rm(&UnansweredStore, &args, &mut out).unwrap_err()
+            ),
+            "min secret rm cannot tell whether it removed claude: Secret Service did not answer \
+             in 60 s, and it can still make the change. Run the command again."
+        );
     }
 
     #[test]

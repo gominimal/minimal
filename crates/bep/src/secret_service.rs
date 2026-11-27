@@ -100,7 +100,7 @@ fn failure(role: Role, cause: &Cause) -> KeyError {
     let detail = cause.to_string();
     match cause {
         Cause::Locked(_) => KeyError::Locked { role, detail },
-        Cause::Unreachable(_) => KeyError::Unreachable { role, detail },
+        Cause::Unreachable(_) | Cause::NoProvider(_) => KeyError::Unreachable { role, detail },
         // A provider that does not answer in time can hold the key, so it
         // is not the headless host that has no Secret Service.
         _ => KeyError::Store { role, detail },
@@ -388,6 +388,10 @@ mod tests {
                 role: Role::Root,
                 ..
             }
+        ));
+        assert!(matches!(
+            failure(Role::Root, &Cause::NoProvider("no Secret Service".into())),
+            KeyError::Unreachable { .. }
         ));
         assert!(matches!(
             failure(Role::Root, &Cause::Unreachable("no bus".into())),

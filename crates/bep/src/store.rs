@@ -318,12 +318,21 @@ pub enum StoreError {
         "This host has no secret store that `min secret` can use. `min secret` stores secrets in the macOS Keychain on macOS and in Secret Service on Linux."
     )]
     Unsupported,
-    /// No Secret Service answered in this login session.
+    /// This process reached no D-Bus session bus, so it cannot tell whether
+    /// the host has a Secret Service.
     #[error(
-        "`min secret` keeps secrets in Secret Service on Linux, and no Secret Service answered in this login session: {detail}. Install a Secret Service provider such as GNOME Keyring (the `gnome-keyring` package), and run the command again in a login session that starts it."
+        "`min secret` keeps secrets in Secret Service on Linux, and this process reached no D-Bus session bus: {detail}. Run the command again in a login session where DBUS_SESSION_BUS_ADDRESS names a running session bus."
+    )]
+    NoSessionBus {
+        /// Why no bus answered.
+        detail: String,
+    },
+    /// The session bus answers, and no Secret Service is on it.
+    #[error(
+        "`min secret` keeps secrets in Secret Service on Linux, and the D-Bus session bus has no Secret Service: {detail}. Install a Secret Service provider such as GNOME Keyring (the `gnome-keyring` package), and run the command again in a login session that starts it."
     )]
     NoSecretService {
-        /// Why no Secret Service answered.
+        /// What the bus said.
         detail: String,
     },
     /// The Secret Service keyring is locked.
@@ -333,6 +342,15 @@ pub enum StoreError {
     KeyringLocked {
         /// What is locked.
         detail: String,
+    },
+    /// Secret Service did not answer a request to change an item. The
+    /// request was sent, so the change can still be made.
+    #[error(
+        "Secret Service did not answer in {secs} s, and it can still make the change. Run the command again."
+    )]
+    ChangeUnanswered {
+        /// How long the request waited, in seconds.
+        secs: u64,
     },
     /// A user other than the current one or root can change the proxy
     /// program, so the item's access control cannot trust it.
@@ -1455,6 +1473,22 @@ impl ValueReader for UnreachableHostStore {
     }
 }
 
+/// The host's native store on a Secret Service that answers no read in the
+/// time the proxy gives it.
+#[cfg(all(test, target_os = "linux", feature = "secret-service"))]
+pub(crate) struct UnansweredHostStore;
+
+#[cfg(all(test, target_os = "linux", feature = "secret-service"))]
+impl ValueReader for UnansweredHostStore {
+    fn name(&self) -> &'static str {
+        NATIVE_STORE
+    }
+
+    fn read(&self, id: &str) -> Result<Zeroizing<Vec<u8>>, ReadError> {
+        host::read_unanswered(id)
+    }
+}
+
 #[cfg(all(target_os = "linux", feature = "secret-service"))]
 mod host {
     use super::{ItemInfo, ReadError, SERVICE, StoreError, valid_id};
@@ -1510,7 +1544,7 @@ mod host {
                     &[("service", service), (ID, id)],
                     value,
                 )
-                .map_err(|cause| failure("store the secret", cause))
+                .map_err(|cause| change_failure("store the secret", cause))
         }
 
         /// Every stored identifier. Every program of the user reads an
@@ -1532,7 +1566,7 @@ mod host {
             self.items
                 .clear(&[("service", SERVICE), (ID, id)])
                 .map(|removed| removed > 0)
-                .map_err(|cause| failure("remove the secret", cause))
+                .map_err(|cause| change_failure("remove the secret", cause))
         }
 
         /// Whether an item is stored under `id`, locked or not. Reads no
@@ -1595,8 +1629,20 @@ mod host {
     fn failure(action: &'static str, cause: Cause) -> StoreError {
         match cause {
             Cause::Locked(detail) => StoreError::KeyringLocked { detail },
-            Cause::Unreachable(detail) => StoreError::NoSecretService { detail },
+            Cause::Unreachable(detail) => StoreError::NoSessionBus { detail },
+            Cause::NoProvider(detail) => StoreError::NoSecretService { detail },
             cause => refused(action, cause.to_string()),
+        }
+    }
+
+    /// [`failure`] for a call that changes an item. With no answer, the
+    /// request was sent, and nothing says whether the change was made.
+    fn change_failure(action: &'static str, cause: Cause) -> StoreError {
+        match cause {
+            Cause::NoAnswer(timeout) => StoreError::ChangeUnanswered {
+                secs: timeout.as_secs(),
+            },
+            cause => failure(action, cause),
         }
     }
 
@@ -1613,6 +1659,14 @@ mod host {
     pub(super) fn read_unreachable(id: &str) -> Result<Zeroizing<Vec<u8>>, ReadError> {
         SecretItems::new(SessionItems::within(READ_TIMEOUT).at("unix:path=/nonexistent/bus"))
             .read(id)
+    }
+
+    /// [`read`] when Secret Service gives no answer in [`READ_TIMEOUT`].
+    #[cfg(test)]
+    pub(super) fn read_unanswered(id: &str) -> Result<Zeroizing<Vec<u8>>, ReadError> {
+        let items = crate::secret_items::MemoryItems::default();
+        items.set_failure(Some(Cause::NoAnswer(READ_TIMEOUT)));
+        SecretItems::new(items).read(id)
     }
 
     pub(super) fn set(id: &str, value: &[u8], _proxy: &Path) -> Result<(), StoreError> {
@@ -2624,11 +2678,26 @@ access: 1 entries
         let items = MemoryItems::default();
         let store = host::SecretItems::new(items.clone());
 
-        items.set_failure(Some(Cause::Unreachable("no session bus".into())));
+        // No bus and no provider are two situations with two next steps.
+        items.set_failure(Some(Cause::Unreachable(
+            "no session bus answered: no such file".into(),
+        )));
         let err = store.check_available().expect_err("unreachable");
         assert_eq!(
             err.to_string(),
-            "`min secret` keeps secrets in Secret Service on Linux, and no Secret Service answered in this login session: no session bus. Install a Secret Service provider such as GNOME Keyring (the `gnome-keyring` package), and run the command again in a login session that starts it."
+            "`min secret` keeps secrets in Secret Service on Linux, and this process reached no D-Bus session bus: no session bus answered: no such file. Run the command again in a login session where DBUS_SESSION_BUS_ADDRESS names a running session bus."
+        );
+        assert!(matches!(store.list(), Err(StoreError::NoSessionBus { .. })));
+        assert!(matches!(
+            store.read("claude"),
+            Err(ReadError::Store(StoreError::NoSessionBus { .. }))
+        ));
+
+        items.set_failure(Some(Cause::NoProvider("ServiceUnknown".into())));
+        let err = store.check_available().expect_err("no provider");
+        assert_eq!(
+            err.to_string(),
+            "`min secret` keeps secrets in Secret Service on Linux, and the D-Bus session bus has no Secret Service: ServiceUnknown. Install a Secret Service provider such as GNOME Keyring (the `gnome-keyring` package), and run the command again in a login session that starts it."
         );
         assert!(matches!(
             store.list(),
@@ -2677,6 +2746,18 @@ access: 1 entries
         assert!(matches!(
             store.read("claude"),
             Err(ReadError::Store(StoreError::Refused { .. }))
+        ));
+
+        // A change with no answer may still be made, and the error says so.
+        items.set_failure(Some(Cause::NoAnswer(std::time::Duration::from_secs(60))));
+        let err = store.set(SERVICE, "claude", b"new").expect_err("no answer");
+        assert_eq!(
+            err.to_string(),
+            "Secret Service did not answer in 60 s, and it can still make the change. Run the command again."
+        );
+        assert!(matches!(
+            store.remove("claude"),
+            Err(StoreError::ChangeUnanswered { secs: 60 })
         ));
     }
 }
