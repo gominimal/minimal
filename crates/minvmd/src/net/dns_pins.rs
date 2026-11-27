@@ -59,16 +59,15 @@
 //!
 //! ## A deny-all box's queries (NET-141)
 //!
-//! A row the host registered as deny-all ([`BoxRecord::is_deny_all`]) pins
-//! nothing — it declared no names — but the resolver carve-out still
-//! admits its UDP queries, and a forwarded query carries data out in the
-//! name it asks. So for an own-address deny-all row this module also holds
-//! the host-side decision of what that carve-out may carry
-//! ([`deny_all_refusal`]): a standard query whose every question is an A
-//! lookup of a box-zone name, the one thing the switch's resolver answers
-//! without asking upstream. Anything else is dropped by the relay before it
-//! reaches the switch, silently toward the guest and with a rate-limited
-//! line naming the box and the name. The in-VM gate answers the same
+//! A row that declares no subnet and no DNS host pins nothing, but the
+//! resolver's port still takes its UDP queries, and a forwarded query
+//! carries data out in the name it asks. The network kernel decides what
+//! such a row may send the resolver: a whole standard query whose every
+//! question is for a name below the box zone's apex, which the switch's
+//! resolver answers without asking upstream. Anything else is dropped by the
+//! relay before it reaches the switch, silently toward the guest and with a
+//! rate-limited line naming the box and the name, which this module reads
+//! for the line alone ([`deny_all_line`]). The in-VM gate answers the same
 //! queries REFUSED first, as the precision copy honest clients meet; this
 //! is the deciding copy, outside the VM.
 //!
@@ -131,12 +130,8 @@ use crate::box_registry::{BoxRecord, BoxTable};
 use crate::net::baseline::{BaselineCategory, BaselineEntry, NodeBaselinePhase, NodePlaneBaseline};
 use crate::net::drop_limiter::DropLimiter;
 
-/// Ethernet II header length: destination MAC (6) + source MAC (6) +
-/// `EtherType` (2).
-const ETH_HDR: usize = 14;
-/// `EtherType` for IPv4.
-const ETHERTYPE_IPV4: u16 = 0x0800;
 /// IPv4 protocol number for TCP.
+#[cfg(test)]
 const IPPROTO_TCP: u8 = 6;
 /// IPv4 protocol number for UDP.
 const IPPROTO_UDP: u8 = 17;
@@ -171,13 +166,10 @@ const FLOW_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 /// tail without a line per frame spending the log on one hostile box.
 const AT_CAP_LINE_INTERVAL: Duration = Duration::from_secs(60);
 
-/// The L4 addressing of a TCP/UDP-over-IPv4 frame, as extracted by
-/// [`parse_ipv4_l4`] — the one read the shared frame summary does not carry
-/// (it holds the destination and its port, not the source port or the TCP
-/// flags the flow retention reads), so the table parses its own, in the same
-/// shape and with the same bounds checks as the in-VM relay's
-/// (`minimald::net::switch::parse_ipv4_l4`): one parse per frame,
-/// allocation-free, everything length-checked before it happens.
+/// The L4 addressing of a TCP/UDP-over-IPv4 frame, built from the network
+/// kernel's reading of it ([`crate::net::kernel_facts::l4_packet`]): the
+/// source port, the TCP flags and the sequence numbers the flow retention
+/// reads, in the shape the daemon's own tables take.
 pub(crate) struct L4Packet {
     /// Source `ip:port` — the box's own lease and its ephemeral port.
     pub(crate) src: SocketAddrV4,
@@ -195,128 +187,6 @@ pub(crate) struct L4Packet {
     /// headers, bounded by the bytes the frame carries; `0` for UDP and for
     /// a TCP header too short to say.
     pub(crate) tcp_payload_len: u16,
-}
-
-/// Parses an Ethernet II + IPv4 + TCP/UDP frame into its L4 addressing, or
-/// `None` for non-IPv4 (ARP/IPv6/VLAN), non-TCP/UDP, IP fragments, and
-/// short/malformed frames — a truncated or hostile frame yields `None`, never
-/// an out-of-bounds read.
-pub(crate) fn parse_ipv4_l4(frame: &[u8]) -> Option<L4Packet> {
-    // Ethernet header + minimum (20-byte) IPv4 header.
-    if frame.len() < ETH_HDR + 20 {
-        return None;
-    }
-    if u16::from_be_bytes([frame[12], frame[13]]) != ETHERTYPE_IPV4 {
-        return None;
-    }
-    let ip = &frame[ETH_HDR..];
-    // IHL (low nibble of byte 0) is the header length in 32-bit words.
-    let ihl = ((ip[0] & 0x0f) as usize) * 4;
-    if ihl < 20 || ip.len() < ihl {
-        return None;
-    }
-    let proto = ip[9];
-    if proto != IPPROTO_TCP && proto != IPPROTO_UDP {
-        return None;
-    }
-    // A non-zero fragment offset (low 13 bits of bytes 6–7) is a later
-    // fragment with no L4 header at `ihl`; pass rather than misparse.
-    if u16::from_be_bytes([ip[6], ip[7]]) & 0x1fff != 0 {
-        return None;
-    }
-    let l4 = &ip[ihl..];
-    // TCP needs through the flags byte (offset 13); UDP only its 8-byte
-    // header. Both carry src/dst ports in the first four bytes.
-    let need = if proto == IPPROTO_TCP { 14 } else { 8 };
-    if l4.len() < need {
-        return None;
-    }
-    let tcp_word = |at: usize| -> u32 {
-        l4.get(at..at + 4)
-            .and_then(|word| word.try_into().ok())
-            .map_or(0, u32::from_be_bytes)
-    };
-    let (tcp_seq, tcp_ack, tcp_payload_len) = if proto == IPPROTO_TCP {
-        let total = usize::from(u16::from_be_bytes([ip[2], ip[3]]));
-        let data_offset = usize::from(l4[12] >> 4) * 4;
-        let carried = l4.len().min(total.saturating_sub(ihl));
-        let payload = u16::try_from(carried.saturating_sub(data_offset)).unwrap_or(u16::MAX);
-        (tcp_word(4), tcp_word(8), payload)
-    } else {
-        (0, 0, 0)
-    };
-    Some(L4Packet {
-        src: SocketAddrV4::new(
-            Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]),
-            u16::from_be_bytes([l4[0], l4[1]]),
-        ),
-        dst: SocketAddrV4::new(
-            Ipv4Addr::new(ip[16], ip[17], ip[18], ip[19]),
-            u16::from_be_bytes([l4[2], l4[3]]),
-        ),
-        proto,
-        tcp_flags: if proto == IPPROTO_TCP { l4[13] } else { 0 },
-        tcp_seq,
-        tcp_ack,
-        tcp_payload_len,
-    })
-}
-
-/// Whether an Ethernet frame's IPv4 protocol byte says UDP — a pre-check,
-/// not a parse: the EtherType and the one protocol byte, nothing else, so
-/// the relay's ingress hot path — mostly a peer's TCP frames, which this
-/// table can never observe — spends three comparisons per frame instead of
-/// the full [`udp_datagram`] parse. A frame that says UDP here is still
-/// parsed and length-checked before the table reads a word of it.
-pub(crate) fn is_ipv4_udp(frame: &[u8]) -> bool {
-    frame
-        .get(12..14)
-        .is_some_and(|ether| *ether == ETHERTYPE_IPV4.to_be_bytes())
-        && frame
-            .get(ETH_HDR + 9)
-            .is_some_and(|proto| *proto == IPPROTO_UDP)
-}
-
-/// The UDP datagram one Ethernet frame carries — its L4 addressing plus the
-/// datagram's payload — or `None` for anything that is not an IPv4+UDP
-/// frame, or whose claimed lengths do not bound its own payload. The IPv4
-/// total length bounds the datagram and the UDP length bounds the header it
-/// names, so a hostile frame yields `None` — never an out-of-bounds slice,
-/// and never a slice padded out to the Ethernet frame's end: the datagram
-/// is `total` bytes, whatever the frame around it claims to be.
-pub(crate) fn udp_datagram(frame: &[u8]) -> Option<(L4Packet, &[u8])> {
-    let pkt = parse_ipv4_l4(frame).filter(|pkt| pkt.proto == IPPROTO_UDP)?;
-    let payload = udp_payload(frame, &pkt)?;
-    Some((pkt, payload))
-}
-
-/// The payload of the UDP datagram one frame carries, for a caller already
-/// holding that frame's own [`parse_ipv4_l4`] result. The length contract is
-/// [`udp_datagram`]'s: a claimed length that does not bound a payload yields
-/// `None`, so a mismatched `pkt` can only cost a parse, never panic.
-fn udp_payload<'a>(frame: &'a [u8], pkt: &L4Packet) -> Option<&'a [u8]> {
-    if pkt.proto != IPPROTO_UDP {
-        return None;
-    }
-    let ip = frame.get(ETH_HDR..)?;
-    let ihl = ((ip.first()? & 0x0f) as usize) * 4;
-    // The IPv4 total length bounds the datagram; a total shorter than its
-    // own headers (including the `0` an offload'd frame carries) is not a
-    // datagram this table reads.
-    let total = u16::from_be_bytes([*ip.get(2)?, *ip.get(3)?]) as usize;
-    if total < ihl + 8 {
-        return None;
-    }
-    let udp = ip.get(ihl..)?;
-    // A UDP length shorter than its own header is malformed; a longer one is
-    // trimmed to the IP total, which is the datagram's real bound.
-    let udp_len = u16::from_be_bytes([*udp.get(4)?, *udp.get(5)?]) as usize;
-    if udp_len < 8 {
-        return None;
-    }
-    let end = total.min(ip.len());
-    let payload_end = (ihl + udp_len).min(end);
-    udp.get(8..payload_end - ihl)
 }
 
 /// One admitted address: the name whose resolution admitted it — the
@@ -998,7 +868,7 @@ impl BoxPins {
             dst,
             dst_port: pkt.dst.port(),
         };
-        // The flags byte is TCP's only (`parse_ipv4_l4` zeroes it for every
+        // The flags byte is TCP's only (`kernel_facts` zeroes it for every
         // other transport), so a FIN or RST is a close exactly where one can
         // be signalled.
         let ends = pkt.tcp_flags & (TCP_FIN | TCP_RST) != 0;
@@ -1134,6 +1004,18 @@ struct Inner {
     refused_for_want_of_pin: AtomicU64,
 }
 
+/// Whose question a DNS query is, as the gate decided its frame for
+/// ([`DnsPins::observe_query`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Asker<'a> {
+    /// A row's: the record the frame was decided for, `None` when no row
+    /// held its source.
+    Row(Option<&'a Arc<BoxRecord>>),
+    /// The resident `host_ip` boxes': their record as the gate read it for
+    /// the frame, `None` while none declares a DNS host.
+    Cohort(Option<&'a Arc<BoxRecord>>),
+}
+
 impl DnsPins {
     /// An empty table for a switch serving `subnet`: the plan each entry's
     /// infrastructure deny set and host-alias address are built from, the
@@ -1196,6 +1078,9 @@ impl DnsPins {
             Some(entry) if Arc::ptr_eq(&entry.record, record) && same_grant(entry) => {
                 Some(Arc::clone(entry))
             }
+            // An entry built for a newer record at the address is never
+            // replaced by an older one's: the older record gets none.
+            Some(entry) if entry.record.generation() > record.generation() => None,
             _ => {
                 let entry = Arc::new(BoxPins::built(record, self.inner.subnet, node_plane));
                 boxes.insert(key, Arc::clone(&entry));
@@ -1345,17 +1230,19 @@ impl DnsPins {
     /// the one DNS path v1 carries and the one a reply can pin by — and a
     /// query from a source no row holds records nothing either.
     ///
-    /// `box_cohort_marked` is the query frame's own mark. A query from the
-    /// node address records into exactly one entry, so the name split
-    /// matches the address split (NET-085): a marked query into the
-    /// resident `host_ip` boxes' entry, and an unmarked one into the node
-    /// row's entry. A reply pins only in the entry that recorded its query.
+    /// `asker` is whose question it is, as the gate decided the frame for:
+    /// the row's record, or the resident `host_ip` boxes' record for a
+    /// marked query from the node address. A query from the node address
+    /// records into exactly one entry, so the name split matches the address
+    /// split (NET-085): a marked query into the resident `host_ip` boxes'
+    /// entry, and an unmarked one into the node row's entry. A reply pins
+    /// only in the entry that recorded its query.
     pub(crate) fn observe_query(
         &self,
         table: &BoxTable,
+        asker: Asker<'_>,
         pkt: &L4Packet,
         datagram: &[u8],
-        box_cohort_marked: bool,
         now: Instant,
     ) {
         if pkt.proto != IPPROTO_UDP
@@ -1364,19 +1251,14 @@ impl DnsPins {
         {
             return;
         }
-        if *pkt.src.ip() == table.subnet().daemon_ip() && box_cohort_marked {
-            if let Some(entry) = self.host_ip_entry(table) {
-                entry.record_query(pkt, datagram, now);
-            }
-            return;
+        let entry = match asker {
+            Asker::Cohort(cohort) => self.host_ip_entry_of(cohort.cloned()),
+            Asker::Row(Some(record)) => self.entry(record),
+            Asker::Row(None) => None,
+        };
+        if let Some(entry) = entry {
+            entry.record_query(pkt, datagram, now);
         }
-        let Some(record) = table.by_source(pkt.src.ip().octets()) else {
-            return;
-        };
-        let Some(entry) = self.entry(&record) else {
-            return;
-        };
-        entry.record_query(pkt, datagram, now);
     }
 
     /// The resident `host_ip` boxes' entry, built from the registry's
@@ -1385,15 +1267,33 @@ impl DnsPins {
     /// `None` when no resident box declared a DNS host, or when the
     /// record's resolver is not the plan's own.
     fn host_ip_entry(&self, table: &BoxTable) -> Option<Arc<BoxPins>> {
+        let Some(record) = table.host_ip_cohort() else {
+            *self
+                .inner
+                .host_ip
+                .lock()
+                .expect("the host_ip entry's lock is held only across this lookup") = None;
+            return None;
+        };
+        self.host_ip_entry_of(Some(record))
+    }
+
+    /// [`Self::host_ip_entry`] for the resident `host_ip` boxes' record
+    /// `cohort` as the gate read it. An entry built for a newer record is
+    /// never replaced by an older one's: the older record gets none.
+    fn host_ip_entry_of(&self, cohort: Option<Arc<BoxRecord>>) -> Option<Arc<BoxPins>> {
         let mut held = self
             .inner
             .host_ip
             .lock()
             .expect("the host_ip entry's lock is held only across this lookup");
-        let Some(record) = table.host_ip_cohort() else {
-            *held = None;
+        let record = cohort?;
+        if held
+            .as_ref()
+            .is_some_and(|entry| entry.record.generation() > record.generation())
+        {
             return None;
-        };
+        }
         let plan_resolver = self.inner.subnet.dns_server().octets();
         if record.egress().resolver() != plan_resolver {
             *held = None;
@@ -1417,13 +1317,13 @@ impl DnsPins {
     /// Counted with every other pin decision.
     pub(crate) fn admits_host_ip_frame(
         &self,
-        table: &BoxTable,
+        cohort: Option<&Arc<BoxRecord>>,
         dst: [u8; 4],
         pkt: Option<&L4Packet>,
         now: Instant,
     ) -> bool {
         let admitted = self
-            .host_ip_entry(table)
+            .host_ip_entry_of(cohort.cloned())
             .is_some_and(|entry| entry.admits(dst, pkt, now));
         if admitted {
             self.inner.admitted_by_pin.fetch_add(1, Ordering::Relaxed);
@@ -1543,33 +1443,10 @@ impl DnsPins {
     }
 }
 
-/// One DNS datagram from a deny-all box that the host-side gate drops
-/// rather than write on to the switch ([`deny_all_refusal`]): the row it
-/// came from and what the warn line names.
-pub(crate) struct DenyAllRefusal {
-    /// The deny-all row the datagram's source resolved to.
-    pub(crate) record: Arc<BoxRecord>,
-    /// The first question that failed the check, normalized the way names
-    /// are matched here — or a placeholder in angle brackets when the
-    /// datagram carried no question to name (unparseable, not a standard
-    /// query, or no question at all).
-    pub(crate) name: String,
-    /// That question's record type, when it had one.
-    pub(crate) query_type: Option<RecordType>,
-}
-
-/// Whether `name` is a zone name the switch's resolver answers locally for
-/// a deny-all row: at least one label strictly below the apex, whose last
-/// two wire labels are exactly the lowercase bytes of `min.internal`.
-///
-/// This is gvproxy's own test, not the zone's: it treats a name as local
-/// only on a case-sensitive `.min.internal.` suffix, so a name that spells
-/// the apex in any other case (`x.MIN.INTERNAL`), and the apex itself, are
-/// forwarded to the host's upstream resolvers and must be dropped here.
-/// The labels below the apex may carry any case. Comparing raw label bytes
-/// also keeps a label that carries an escaped dot (`evil\.min` under
-/// `internal`) from passing the way a string-suffix match would.
-fn is_zone_name(name: &Name) -> bool {
+/// Whether `name` is a name the drop line counts as inside the box zone: at
+/// least one label below the apex, whose last two labels are exactly the
+/// lowercase bytes of `min.internal`. For the line alone: it decides nothing.
+fn names_in_zone(name: &Name) -> bool {
     let mut labels = name.iter();
     boxes::core::zone_answer::ZONE_APEX
         .rsplit('.')
@@ -1577,71 +1454,68 @@ fn is_zone_name(name: &Name) -> bool {
         && labels.next_back().is_some()
 }
 
-/// The host-side deny-all DNS gate (NET-141's deny-all case, decided
-/// outside the VM for own-address rows): whether the UDP datagram one box
-/// sent to DNS's port must be dropped instead of written on to the switch.
-/// `Some` is the drop and what its warn line names; `None` is "not this
-/// gate's; forward as the verdict decided".
-///
-/// Only a row the host registered as deny-all ([`BoxRecord::is_deny_all`])
-/// is decided here. For such a row the resolver carve-out (NET-079, UDP
-/// only) is the one thing the frame verdict admits, so the carve-out is
-/// narrowed to what the switch's resolver answers on its own: a standard
-/// query whose every question is an A lookup of a box-zone name strictly
-/// below the apex, the apex spelled in lowercase ([`is_zone_name`]).
-/// gvproxy's resolver answers those names locally for A alone and hands
-/// every other type, and every name outside the zone, to the host's
-/// upstream resolvers — a forwarded question carries data out in its name
-/// even when no connection follows. So the datagram is dropped when:
-///
-/// * it does not parse as a DNS message, is not a query, is not a standard
-///   query, or carries no question (fail closed: nothing proves it names
-///   only the zone);
-/// * any question names a name outside the zone — every question is read,
-///   so a zone name in front cannot carry a second name past the check;
-/// * any question asks a zone name for a type other than A.
-///
-/// Silent toward the guest by construction: this only decides; the caller
-/// drops the frame by not writing it, and nothing is written back.
-/// Host-address boxes ride the node row, which is never deny-all, and an
-/// allow-list row is not decided here either.
-pub(crate) fn deny_all_refusal(
-    table: &BoxTable,
-    pkt: &L4Packet,
-    datagram: &[u8],
-) -> Option<DenyAllRefusal> {
-    if pkt.proto != IPPROTO_UDP || pkt.dst.port() != DNS_PORT {
-        return None;
-    }
-    let record = table
-        .by_source(pkt.src.ip().octets())
-        .filter(|record| record.is_deny_all())?;
-    let refused = |name: &str, query_type: Option<RecordType>| DenyAllRefusal {
-        record: Arc::clone(&record),
-        name: name.to_string(),
+/// What the drop line names for one DNS datagram the network kernel refused
+/// from a row, or the cohort, that names nothing ([`deny_all_line`]).
+pub(crate) struct DenyAllRefusal {
+    /// The row the datagram's source resolved to.
+    pub(crate) record: Arc<BoxRecord>,
+    /// The datagram's first question, normalized the way names are matched
+    /// here, or a placeholder in angle brackets when the datagram carried no
+    /// question to name (unparseable, not a standard query, or no question
+    /// at all).
+    pub(crate) name: String,
+    /// That question's record type, when it had one.
+    pub(crate) query_type: Option<RecordType>,
+    /// Whether the question named is for a name outside the box zone. When
+    /// it is not, the datagram was refused for another reason (its class, a
+    /// pointer, a fragment, a part that cannot be read), and the line says so.
+    pub(crate) outside_zone: bool,
+}
+
+/// What the drop line names for a DNS datagram the network kernel already
+/// refused: the first question for a name outside the box zone, or the
+/// first question when every one is inside it, and its type, read for the
+/// line alone. This decides nothing and is never asked before the kernel's
+/// arm: whatever it reads, the datagram stays refused. `payload` is the UDP
+/// payload the kernel's reading gave, `None` when there was none to take.
+pub(crate) fn deny_all_line(record: Arc<BoxRecord>, payload: Option<&[u8]>) -> DenyAllRefusal {
+    let (name, query_type, outside_zone) = deny_all_question(payload);
+    DenyAllRefusal {
+        record,
+        name,
         query_type,
-    };
-    let Ok(message) = Message::from_vec(datagram) else {
-        return Some(refused("<unparseable>", None));
+        outside_zone,
+    }
+}
+
+/// The name and type a deny-all drop line names for a refused datagram's
+/// `payload`, read for the line alone, with no row: the first question for
+/// a name outside the box zone, else the first question, else a
+/// placeholder in angle brackets; and whether the question named is for a
+/// name outside the zone. [`deny_all_line`] for a row's refusal; the
+/// cohort's line takes it bare, naming no box.
+pub(crate) fn deny_all_question(payload: Option<&[u8]>) -> (String, Option<RecordType>, bool) {
+    let placeholder = |name: &str| (name.to_string(), None, false);
+    let Some(Ok(message)) = payload.map(Message::from_vec) else {
+        return placeholder("<unparseable>");
     };
     if message.metadata.message_type != MessageType::Query
         || message.metadata.op_code != OpCode::Query
     {
-        return Some(refused("<not a standard query>", None));
+        return placeholder("<not a standard query>");
     }
-    if message.queries.is_empty() {
-        return Some(refused("<no question>", None));
-    }
-    message
+    let outside = message
         .queries
         .iter()
-        .find(|question| !(question.query_type() == RecordType::A && is_zone_name(question.name())))
-        .map(|question| {
-            refused(
-                &normalized(&question.name().to_lowercase().to_string()),
-                Some(question.query_type()),
-            )
-        })
+        .find(|question| !names_in_zone(question.name()));
+    match outside.or_else(|| message.queries.first()) {
+        Some(question) => (
+            normalized(&question.name().to_lowercase().to_string()),
+            Some(question.query_type()),
+            outside.is_some(),
+        ),
+        None => placeholder("<no question>"),
+    }
 }
 
 #[cfg(test)]
@@ -1667,7 +1541,7 @@ pub(crate) mod tests {
     use hickory_proto::rr::{Name, RData, Record, RecordType};
     use switch::SwitchSubnet;
 
-    use super::{DnsPins, IPPROTO_TCP, TCP_FIN, deny_all_refusal, udp_datagram};
+    use super::{Asker, DnsPins, IPPROTO_TCP, L4Packet, TCP_FIN, deny_all_line};
     use crate::box_registry::{BoxRegistration, BoxRegistry, BoxTable};
     use crate::net::baseline::{DAEMON_CACHE_ENDPOINT, NodePlaneBaseline};
     use crate::net::drop_limiter::DropLimiter;
@@ -1891,7 +1765,16 @@ pub(crate) mod tests {
         );
         let (pkt, datagram) = udp_datagram(&query)
             .expect("the test's query frame parses as the egress leg parses it");
-        pins.observe_query(table, &pkt, datagram, marked, now);
+        // The asker the gate would check for the frame: the resident
+        // `host_ip` boxes' record for a marked query from the node address,
+        // the row at the source otherwise.
+        let (row, cohort) = (table.by_source(lease), table.host_ip_cohort());
+        let asker = if marked && Ipv4Addr::from(lease) == table.subnet().daemon_ip() {
+            Asker::Cohort(cohort.as_ref())
+        } else {
+            Asker::Row(row.as_ref())
+        };
+        pins.observe_query(table, asker, &pkt, datagram, now);
     }
 
     /// Observes one reply the switch returned toward `lease`, answering
@@ -2027,12 +1910,12 @@ pub(crate) mod tests {
         ));
         let site = Ipv4Addr::new(203, 0, 113, 50);
         assert!(
-            !pins.admits_host_ip_frame(&table, site.octets(), None, now),
+            !pins.admits_host_ip_frame(table.host_ip_cohort().as_ref(), site.octets(), None, now),
             "nothing is pinned before a lookup"
         );
         host_ip_resolves(&pins, &table, "example.com", &[site], now);
         assert!(
-            pins.admits_host_ip_frame(&table, site.octets(), None, now),
+            pins.admits_host_ip_frame(table.host_ip_cohort().as_ref(), site.octets(), None, now),
             "the box's declared name pins its answer for a box-marked frame"
         );
         assert!(
@@ -2050,12 +1933,12 @@ pub(crate) mod tests {
         );
         assert!(pins.admits_node_frame(&table, &baseline, cache.octets(), None, now));
         assert!(
-            !pins.admits_host_ip_frame(&table, cache.octets(), None, now),
+            !pins.admits_host_ip_frame(table.host_ip_cohort().as_ref(), cache.octets(), None, now),
             "a baseline pin never admits a box-marked frame"
         );
         assert!(registry.retire_host_ip_box(session, minimald_rpc::HostIpBoxEnd::Destroyed));
         assert!(
-            !pins.admits_host_ip_frame(&table, site.octets(), None, now),
+            !pins.admits_host_ip_frame(table.host_ip_cohort().as_ref(), site.octets(), None, now),
             "a retired box's pins go with it"
         );
     }
@@ -2082,7 +1965,12 @@ pub(crate) mod tests {
         assert!(registry.admit_host_ip_box(box_b, Some(&policy("b.example.com"))));
         let site = Ipv4Addr::new(203, 0, 113, 60);
         host_ip_resolves(&pins, &table, "b.example.com", &[site], now);
-        assert!(pins.admits_host_ip_frame(&table, site.octets(), None, now));
+        assert!(pins.admits_host_ip_frame(
+            table.host_ip_cohort().as_ref(),
+            site.octets(),
+            None,
+            now
+        ));
         let before = table.host_ip_cohort().expect("both boxes declare a name");
 
         assert!(registry.admit_host_ip_box(box_a, Some(&policy("a.example.com"))));
@@ -2092,7 +1980,7 @@ pub(crate) mod tests {
             "a re-admit with equal rules keeps the cohort record"
         );
         assert!(
-            pins.admits_host_ip_frame(&table, site.octets(), None, now),
+            pins.admits_host_ip_frame(table.host_ip_cohort().as_ref(), site.octets(), None, now),
             "a re-admit with equal rules keeps the other box's pin"
         );
 
@@ -2135,7 +2023,7 @@ pub(crate) mod tests {
         let site = Ipv4Addr::new(203, 0, 113, 50);
         node_resolves(&pins, &table, &baseline, "example.com", &[site], now);
         assert!(
-            !pins.admits_host_ip_frame(&table, site.octets(), None, now),
+            !pins.admits_host_ip_frame(table.host_ip_cohort().as_ref(), site.octets(), None, now),
             "an unmarked query for a host_ip box's name never pins for that box"
         );
     }
@@ -3671,15 +3559,16 @@ pub(crate) mod tests {
         );
     }
 
-    /// What the host-side deny-all gate decides for `payload` sent from
-    /// `lease` to the plan's resolver at DNS's port: `Some((name, type))`
-    /// for a drop, `None` for a pass.
+    /// What the network kernel decides for `payload` sent from `lease` to the
+    /// plan's resolver at DNS's port, by the configuration `registry` keeps:
+    /// `Some((name, type))`, what the drop line names, when its arm refuses
+    /// the query as from a row that names nothing; `None` otherwise.
     #[expect(
         clippy::unwrap_in_result,
-        reason = "a test helper: a frame the test built that does not parse is the test's bug"
+        reason = "a test helper: a refused row the registry does not hold is the test's bug"
     )]
     fn deny_all_decision(
-        table: &BoxTable,
+        registry: &BoxRegistry,
         lease: [u8; 4],
         payload: &[u8],
     ) -> Option<(String, Option<RecordType>)> {
@@ -3690,24 +3579,40 @@ pub(crate) mod tests {
             53,
             payload,
         );
-        let (pkt, datagram) = udp_datagram(&frame).expect("the query frame parses");
-        deny_all_refusal(table, &pkt, datagram).map(|refusal| (refusal.name, refusal.query_type))
+        let first = registry
+            .kernel_for_tests()
+            .config()
+            .egress_first(&frame, crate::net::kernel_config::ZONE_APEX_WIRE);
+        let netcore::split::First::Frame {
+            arm: netcore::split::Arm::RowDns(_),
+            facts,
+            ..
+        } = first
+        else {
+            return None;
+        };
+        let record = registry
+            .table()
+            .by_source(lease)
+            .expect("a refused row is registered");
+        let payload = crate::net::kernel_facts::udp_datagram(&frame, &facts).map(|(_, p)| p);
+        let line = deny_all_line(record, payload);
+        Some((line.name, line.query_type))
     }
 
-    /// NET-141's deny-all case, decided host-side for an own-address row: a
-    /// deny-all box's query passes only when every question is an A lookup
-    /// of a box-zone name — the one thing the switch's resolver answers on
-    /// its own — and is dropped otherwise: a name outside the zone in any
-    /// record type, a zone name asked for any type but A (which the switch's
-    /// resolver forwards upstream), a datagram that is not a standard
-    /// query, and a multi-question query hiding either behind a zone A in
-    /// front.
+    /// NET-141's deny-all case, decided host-side by the network kernel for
+    /// an own-address row that names nothing: a query passes only when every
+    /// question is for a box-zone name below the apex, of any type (the
+    /// resolver answers the zone itself), and is dropped otherwise: a name
+    /// outside the zone in any record type, a datagram that is not a
+    /// standard query, and a multi-question query hiding an outside name
+    /// behind a zone name in front. The drop line names the first outside
+    /// name, or the placeholder for what carries none.
     #[test]
-    fn deny_all_row_passes_only_zone_a_lookups() {
+    fn deny_all_row_passes_only_zone_lookups() {
         let registry = BoxRegistry::new(SUBNET);
         deny_all_box(&registry, "sealed", LEASE);
-        let table = registry.table();
-        let decide = |payload: &[u8]| deny_all_decision(&table, LEASE, payload);
+        let decide = |payload: &[u8]| deny_all_decision(&registry, LEASE, payload);
 
         for rtype in [
             RecordType::A,
@@ -3775,19 +3680,53 @@ pub(crate) mod tests {
                 "an A lookup of {name} is dropped"
             );
         }
-        // Two zone A questions pass together.
+        // Questions written out by hand, plain labels, class IN: the
+        // header of a standard query with `questions.len()` questions, then
+        // each name on the wire with its type.
+        let by_hand = |questions: &[(&[u8], u16)]| {
+            let count = u16::try_from(questions.len()).expect("a few questions");
+            let mut payload = vec![0x52, 0x2a, 0x01, 0x00];
+            payload.extend_from_slice(&count.to_be_bytes());
+            payload.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+            for (name, rtype) in questions {
+                payload.extend_from_slice(name);
+                payload.extend_from_slice(&rtype.to_be_bytes());
+                payload.extend_from_slice(&[0, 1]);
+            }
+            payload
+        };
+        const WEB: &[u8] = b"\x03web\x03min\x08internal\x00";
+        const DB: &[u8] = b"\x02db\x03min\x08internal\x00";
+        const X: &[u8] = b"\x01x\x03min\x08internal\x00";
+
+        // Two zone A questions written out with no pointer pass together:
+        // every counted question is read, and each is a zone name.
         assert_eq!(
-            decide(&dns_query_of(&[
-                (qname("web.min.internal."), RecordType::A),
-                (qname("db.min.internal."), RecordType::A),
-            ])),
+            decide(&by_hand(&[(WEB, 1), (DB, 1)])),
             None,
-            "every question a zone A lookup passes"
+            "every question a plain zone A lookup passes"
+        );
+        // A multi-question zone query written by a
+        // standard encoder carries a compression pointer, and is refused.
+        // The switch's resolver rejects any query whose question count is
+        // not one in any case, so no answer is lost.
+        let encoded = dns_query_of(&[
+            (qname("web.min.internal."), RecordType::A),
+            (qname("db.min.internal."), RecordType::A),
+        ]);
+        let second = 12 + WEB.len() + 4;
+        assert!(
+            encoded[second..].contains(&0xc0),
+            "the encoder writes the second question's suffix as a pointer"
+        );
+        assert_eq!(
+            decide(&encoded),
+            Some(("web.min.internal".to_string(), Some(RecordType::A))),
+            "the encoded pair is refused for its pointer"
         );
 
-        // A zone name asked for any type but A is dropped: the switch's
-        // resolver answers the zone locally for A alone and forwards the rest
-        // upstream.
+        // A zone name asked for any type passes: the type is not read
+        // (the resolver answers the zone itself).
         for name in ["x.min.internal.", "host.min.internal."] {
             for rtype in [
                 RecordType::TXT,
@@ -3795,15 +3734,16 @@ pub(crate) mod tests {
                 RecordType::SRV,
                 RecordType::AAAA,
             ] {
-                assert!(
-                    decide(&dns_query_of(&[(qname(name), rtype)])).is_some(),
-                    "{rtype:?} for {name} is dropped"
+                assert_eq!(
+                    decide(&dns_query_of(&[(qname(name), rtype)])),
+                    None,
+                    "{rtype:?} for {name} passes"
                 );
             }
         }
 
-        // Every question is read: a zone A in front carries neither an
-        // outside name nor a zone name of another type past the check.
+        // Every question is read: a zone name in front carries no outside
+        // name past the check.
         assert_eq!(
             decide(&dns_query_of(&[
                 (qname("web.min.internal."), RecordType::A),
@@ -3812,14 +3752,23 @@ pub(crate) mod tests {
             Some(("leak.example.com".to_string(), Some(RecordType::A))),
             "an outside name behind a zone A is dropped"
         );
+        // Written out with no pointer, every question is a
+        // plain zone question in class IN, and the type is not read.
         assert_eq!(
-            decide(&dns_query_of(&[
-                (qname("x.min.internal."), RecordType::A),
-                (qname("x.min.internal."), RecordType::TXT),
-            ])),
-            Some(("x.min.internal".to_string(), Some(RecordType::TXT))),
-            "a zone TXT behind a zone A is dropped"
+            decide(&by_hand(&[(X, 1), (X, 16)])),
+            None,
+            "a zone TXT behind a zone A passes"
         );
+        // The same pair as a standard encoder writes it
+        // carries a compression pointer (the second name is all pointer), and
+        // is refused. The switch's resolver rejects any query whose question
+        // count is not one in any case, so no answer is lost.
+        let encoded = dns_query_of(&[
+            (qname("x.min.internal."), RecordType::A),
+            (qname("x.min.internal."), RecordType::TXT),
+        ]);
+        assert_eq!(encoded[12 + X.len() + 4], 0xc0);
+        assert!(decide(&encoded).is_some(), "the encoded pair is refused");
 
         // Nothing that is not a standard query with a question passes: an
         // unparseable datagram, a reply-shaped one, and a query with no
@@ -3841,6 +3790,43 @@ pub(crate) mod tests {
             decide(&dns_query_of(&[])),
             Some(("<no question>".to_string(), None)),
             "a query with no question is dropped"
+        );
+    }
+
+    /// A record that was registered over at its address gets no entry once
+    /// the newer record's entry stands, and asking for it leaves the newer
+    /// record's pins where they are.
+    #[test]
+    fn an_older_record_never_replaces_a_newer_records_entry() {
+        let registry = BoxRegistry::new(SUBNET);
+        let names = vec!["example.com".to_string()];
+        dns_box(&registry, "weather", LEASE, names.clone(), Vec::new());
+        let table = registry.table();
+        let older = table.by_source(LEASE).expect("the first row is held");
+        dns_box(&registry, "weather", LEASE, names, Vec::new());
+        let newer = table.by_source(LEASE).expect("the second row is held");
+        assert!(newer.generation() > older.generation());
+        let pins = DnsPins::new(SUBNET);
+        let limiter = DropLimiter::new();
+        let now = Instant::now();
+        let answer = Ipv4Addr::new(93, 184, 216, 34);
+        resolve(
+            &pins,
+            &table,
+            LEASE,
+            "example.com",
+            &[answer],
+            &limiter,
+            now,
+        );
+        assert!(pins.admits_frame(&newer, answer.octets(), None, now));
+        assert!(
+            !pins.admits_frame(&older, answer.octets(), None, now),
+            "the older record gets no entry"
+        );
+        assert!(
+            pins.admits_frame(&newer, answer.octets(), None, now),
+            "the newer record's pin stands"
         );
     }
 
@@ -3880,7 +3866,6 @@ pub(crate) mod tests {
             }),
         );
         let node = registry.register_node_namespace(7655);
-        let table = registry.table();
 
         for (lease, row) in [
             (LEASE, "an allow-list row"),
@@ -3895,7 +3880,7 @@ pub(crate) mod tests {
                 vec![0xde, 0xad],
             ] {
                 assert_eq!(
-                    deny_all_decision(&table, lease, &payload),
+                    deny_all_decision(&registry, lease, &payload),
                     None,
                     "{row} is not decided by the deny-all gate"
                 );
@@ -3903,9 +3888,17 @@ pub(crate) mod tests {
         }
     }
 
-    /// The L4 addressing of one of the frames above, as the gate's egress leg
-    /// would parse it — the identity the flow retention reads.
-    fn l4_of(frame: &[u8]) -> super::L4Packet {
-        super::parse_ipv4_l4(frame).expect("the test's frame parses as the relay parses it")
+    /// The L4 addressing of one of the frames above, from the kernel's
+    /// reading of it, as the gate's legs take it: the identity the flow
+    /// retention reads.
+    fn l4_of(frame: &[u8]) -> L4Packet {
+        crate::net::kernel_facts::l4_packet(&netcore::frame::parse_frame(frame))
+            .expect("the test's frame is one the kernel reads")
+    }
+
+    /// The UDP datagram one frame carries, with its L4 addressing, from the
+    /// kernel's reading: what the gate's legs hand the table.
+    fn udp_datagram(frame: &[u8]) -> Option<(L4Packet, &[u8])> {
+        crate::net::kernel_facts::udp_datagram(frame, &netcore::frame::parse_frame(frame))
     }
 }

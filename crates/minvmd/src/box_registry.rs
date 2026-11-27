@@ -71,7 +71,12 @@ use switch::SwitchSubnet;
 
 use crate::bep_attach::BoxId;
 use crate::net::host_exposures::HostExposure;
-use crate::net::kernel_config::{Diverged, KernelConfig, MemberFacts, RowFacts, RowShape};
+use crate::net::kernel_config::{
+    Diverged, KernelConfig, MemberFacts, Poisoned, RowFacts, RowShape, ZONE_APEX_WIRE, unpoisoned,
+};
+use netcore::frame::Facts;
+use netcore::ingress::Heard;
+use netcore::split::{First, IngressFor};
 
 /// The per-row cap on runtime-admitted ports (NET-138): the row's
 /// runtime-published set answers to this bound, so a report storm cannot
@@ -517,6 +522,19 @@ pub struct BoxRecord {
     /// The task addresses filed with this box ([`Self::task_row_of`]):
     /// empty for a task row, and for a box that registered none.
     task_addrs: Vec<Ipv4Addr>,
+    /// This record's own number ([`record_generation`]): no other record
+    /// built in this process has it. The network kernel's configuration
+    /// keeps it for the row it holds at the address, so the gate can tell
+    /// whether the row it reads is the one the kernel decided for.
+    /// Bookkeeping: not compared.
+    generation: u64,
+}
+
+/// A number no record built before it in this process has, for
+/// [`BoxRecord::generation`].
+fn record_generation() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// A row's liveness as the host reads it at its end of the box's
@@ -647,6 +665,13 @@ impl BoxRecord {
             .name
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::from(name);
+    }
+
+    /// This record's own number: equal for two reads exactly when both read
+    /// this record.
+    #[must_use]
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Whether a frame of the box ever crossed the gate under this row
@@ -845,8 +870,8 @@ impl BoxRecord {
     /// guest's reports fill ([`RowRuntime`]) is not read. A row with no
     /// egress declaration (the node namespace's among them, which carries
     /// every host-address box's frames) is never deny-all. The host-side
-    /// gate reads this to drop a deny-all box's DNS queries for names
-    /// outside the box zone ([`crate::net::dns_pins::deny_all_refusal`]).
+    /// gate's DNS refusal for a row that names nothing is the network
+    /// kernel's (`Arm::RowDns`), which reads the row's declaration itself.
     #[must_use]
     pub fn is_deny_all(&self) -> bool {
         self.deny_all
@@ -2128,31 +2153,53 @@ fn drop_kernel_row(kernel: &mut KernelConfig, addr: Ipv4Addr, diverged: &mut Opt
 /// and denied subnets it leaves out (an IPv6 block, a prefix past 32, an
 /// entry that cannot be read), naming the box by `name`, or by `session`
 /// for a `host_ip` box. Nothing is refused and nothing enforced changes: the
-/// rest of the policy is enforced as declared.
+/// rest of the policy is enforced as declared. When what is left names
+/// nothing the gate enforces, read as the kernel reads the row
+/// ([`crate::net::kernel_config::names_nothing`]), the line says the box
+/// reaches only the box zone's names, and only then.
 fn warn_unenforced_subnets(
     policy: Option<&EgressPolicy>,
     name: Option<&str>,
     session: Option<boxes::SessionId>,
+    laned: bool,
 ) {
     let (allowed, denied) = crate::net::kernel_config::unenforced_subnets(policy);
     if allowed.is_empty() && denied.is_empty() {
         return;
     }
-    tracing::warn!(
-        namespace = name,
-        session = session.map(tracing::field::display),
-        unenforced_allowed = ?allowed,
-        unenforced_denied = ?denied,
-        "the host-side egress gate does not enforce these declared subnets: it enforces IPv4 \
-         blocks of prefix at most 32; the rest of the egress policy is enforced as declared",
+    let subject = name.map_or_else(
+        || session.map(|id| id.to_string()).unwrap_or_default(),
+        str::to_string,
     );
+    let host_address = session.is_some();
+    if crate::net::kernel_config::names_nothing(policy, laned, host_address, &subject) {
+        tracing::warn!(
+            namespace = name,
+            session = session.map(tracing::field::display),
+            unenforced_allowed = ?allowed,
+            unenforced_denied = ?denied,
+            "the host-side egress gate does not enforce these declared subnets: it enforces IPv4 \
+             blocks of prefix at most 32; the rest of the egress policy is enforced as declared; \
+             with no other subnet and no DNS host declared, the box reaches only names in the box \
+             zone through the resolver",
+        );
+    } else {
+        tracing::warn!(
+            namespace = name,
+            session = session.map(tracing::field::display),
+            unenforced_allowed = ?allowed,
+            unenforced_denied = ?denied,
+            "the host-side egress gate does not enforce these declared subnets: it enforces IPv4 \
+             blocks of prefix at most 32; the rest of the egress policy is enforced as declared",
+        );
+    }
 }
 
 /// Rebuilds the network kernel's configuration from `rows`, inside the write
 /// section that found it different from them (`cause`), so no frame is
 /// decided by a configuration the registry does not hold.
 fn rebuild_kernel(kernel: &mut KernelConfig, rows: &Rows, cause: Diverged) {
-    let shapes: Vec<(Ipv4Addr, Arc<str>, bool, bool)> = rows
+    let shapes: Vec<(Ipv4Addr, Arc<str>, bool, bool, u64)> = rows
         .values()
         .map(|row| {
             (
@@ -2160,20 +2207,24 @@ fn rebuild_kernel(kernel: &mut KernelConfig, rows: &Rows, cause: Diverged) {
                 row.name(),
                 row.credentialed_upstream,
                 row.is_task_row(),
+                row.generation,
             )
         })
         .collect();
     kernel.rebuild(
-        shapes.iter().map(|(addr, name, laned, task_row)| {
-            (
-                *addr,
-                RowShape {
-                    name,
-                    laned: *laned,
-                    task_row: *task_row,
-                },
-            )
-        }),
+        shapes
+            .iter()
+            .map(|(addr, name, laned, task_row, generation)| {
+                (
+                    *addr,
+                    RowShape {
+                        name,
+                        laned: *laned,
+                        task_row: *task_row,
+                        generation: *generation,
+                    },
+                )
+            }),
         cause,
     );
 }
@@ -4947,6 +4998,7 @@ impl BoxRegistry {
                     runtime_ports: Mutex::new(RowRuntime::default()),
                     egress_allow_list: egress_allow_list.clone(),
                     attributed: AtomicBool::new(false),
+                    generation: record_generation(),
                     liveness: Mutex::new(RowLiveness::default()),
                     task_row_of: Some(registration.switch_addr),
                     task_addrs: Vec::new(),
@@ -4983,6 +5035,7 @@ impl BoxRegistry {
             runtime_ports: Mutex::new(RowRuntime::default()),
             egress_allow_list,
             attributed: AtomicBool::new(false),
+            generation: record_generation(),
             // Awaiting its box's first frame: no grace runs until a relay
             // that carried the row has ended, or the row was reloaded
             // rather than registered ([`Self::persisting_to`]).
@@ -5161,7 +5214,7 @@ impl BoxRegistry {
         // Said once for each policy a box's address takes: at its
         // registration, and again only when a re-registration changes it.
         if kernel.row_policy(record.switch_addr).as_ref() != Some(&policy.cloned()) {
-            warn_unenforced_subnets(policy, Some(&name), None);
+            warn_unenforced_subnets(policy, Some(&name), None, record.credentialed_upstream);
         }
         for row in std::iter::once(record).chain(task_rows.iter().map(Arc::as_ref)) {
             kernel.note_policy(row.switch_addr, policy);
@@ -5171,6 +5224,7 @@ impl BoxRegistry {
             policy,
             laned: record.credentialed_upstream,
             task_row: false,
+            generation: record.generation,
         };
         let task = RowFacts {
             laned: false,
@@ -5182,8 +5236,12 @@ impl BoxRegistry {
             .chain(task_rows.iter().map(Arc::as_ref))
             .zip(held)
         {
-            let facts = if row.is_task_row() { &task } else { &own };
-            kept = kernel.keep_row(row.switch_addr, facts, occupied);
+            let shape = if row.is_task_row() { task } else { own };
+            let facts = RowFacts {
+                generation: row.generation,
+                ..shape
+            };
+            kept = kernel.keep_row(row.switch_addr, &facts, occupied);
             if kept.is_err() {
                 break;
             }
@@ -7618,15 +7676,23 @@ impl BoxRegistry {
         // set in order. An admit that repeats the rules held returned above,
         // so the warning is said once for each policy a box is admitted with.
         let policy = self.host_ip_policy(declared);
-        warn_unenforced_subnets(policy.as_ref(), None, Some(session_id));
+        warn_unenforced_subnets(
+            policy.as_ref(),
+            None,
+            Some(session_id),
+            credentialed_upstream,
+        );
+        // The members and the record's generation change in one write of
+        // the configuration ([`KernelConfig::keep_member`]).
+        resident.cohort = HostIpBoxes::cohort_record(&resident.boxes, self.subnet);
         self.kernel_config().keep_member(
             session_id,
             &MemberFacts {
                 policy: policy.as_ref(),
                 laned: credentialed_upstream,
             },
+            resident.cohort.as_ref().map(|cohort| cohort.generation),
         );
-        resident.cohort = HostIpBoxes::cohort_record(&resident.boxes, self.subnet);
         let count = resident.boxes.len();
         // Under the resident set's lock, so the mirror's flag follows the
         // set in order (NET-138).
@@ -7693,22 +7759,6 @@ impl BoxRegistry {
         }
     }
 
-    /// Gives the network kernel's configuration the node-plane baseline:
-    /// whether it is in force, the blocks its endpoints name and its ports at
-    /// the alias. Called once, when the switch's baseline is built; nothing
-    /// changes the baseline after.
-    pub(crate) fn adopt_node_baseline(&self, baseline: &crate::net::NodePlaneBaseline) {
-        let endpoints = baseline
-            .entries()
-            .iter()
-            .flat_map(|entry| entry.endpoints().iter().map(String::as_str));
-        self.kernel_config().adopt_baseline(
-            baseline.phase() == crate::net::NodeBaselinePhase::InForce,
-            endpoints,
-            baseline.alias_ports(),
-        );
-    }
-
     /// The network kernel's configuration built from scratch from this
     /// registry's rows and resident `host_ip` boxes, by the builders a
     /// registration uses, each row with the policy the live configuration
@@ -7718,7 +7768,7 @@ impl BoxRegistry {
     /// it, deciding frames against the registry's own compiled rules.
     #[cfg(test)]
     pub(crate) fn kernel_from_registry(&self) -> KernelConfig {
-        let rows: Vec<(Ipv4Addr, Arc<str>, bool, bool)> = self
+        let rows: Vec<(Ipv4Addr, Arc<str>, bool, bool, u64)> = self
             .rows
             .read()
             .expect("the row lock is never held across a panic")
@@ -7729,6 +7779,7 @@ impl BoxRegistry {
                     row.name(),
                     row.credentialed_upstream,
                     row.is_task_row(),
+                    row.generation,
                 )
             })
             .collect();
@@ -7760,9 +7811,8 @@ impl BoxRegistry {
         };
         KernelConfig::from_parts(
             self.subnet,
-            rows.iter()
-                .zip(&policies)
-                .map(|((addr, name, laned, task_row), policy)| {
+            rows.iter().zip(&policies).map(
+                |((addr, name, laned, task_row, generation), policy)| {
                     (
                         *addr,
                         RowFacts {
@@ -7770,9 +7820,11 @@ impl BoxRegistry {
                             policy: policy.as_ref(),
                             laned: *laned,
                             task_row: *task_row,
+                            generation: *generation,
                         },
                     )
-                }),
+                },
+            ),
             members.iter().map(|(session, policy, laned)| {
                 (
                     *session,
@@ -7794,6 +7846,24 @@ impl BoxRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Poisons the network kernel configuration's lock: a panic while its
+    /// write guard is held, caught here.
+    #[cfg(test)]
+    pub(crate) fn poison_kernel_for_tests(&self) {
+        let kernel = Arc::clone(&self.kernel);
+        let caught = std::panic::catch_unwind(move || {
+            let _held = kernel
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            panic!("a panic while the configuration's write lock is held");
+        });
+        assert!(caught.is_err(), "the closure panicked");
+        assert!(
+            self.kernel.is_poisoned(),
+            "the configuration's lock is poisoned"
+        );
+    }
+
     /// Panics unless the network kernel's configuration never differed from
     /// the registry and holds what a configuration built from scratch from
     /// the registry holds.
@@ -7809,6 +7879,15 @@ impl BoxRegistry {
             .get(&self.subnet.daemon_ip().octets())
             .map(|node| node.admitted_ports().to_vec())
             .unwrap_or_default();
+        // The resident host_ip boxes' record's generation, read under their
+        // own lock before the configuration's lock is taken.
+        let cohort = self
+            .host_ip_boxes
+            .read()
+            .expect("the resident host_ip boxes' lock is never held across a panic")
+            .cohort
+            .as_ref()
+            .map(|cohort| cohort.generation);
         let live = self
             .kernel
             .read()
@@ -7819,6 +7898,11 @@ impl BoxRegistry {
             "the kernel's configuration never differed from the registry"
         );
         live.assert_in_step_with(&rebuilt);
+        assert_eq!(
+            live.cohort_generation(),
+            cohort,
+            "the kernel keeps the generation of the resident host_ip boxes' record"
+        );
         // The alias's exposures and baseline ports are compared with the
         // holder's own inputs, which no registry holds: this checks the
         // hostname-proxy part, taken from the node row the registry holds,
@@ -7910,7 +7994,10 @@ impl BoxRegistry {
             .is_some_and(HostIpBoxRules::declares_credentialed_upstream);
         if removed {
             resident.cohort = HostIpBoxes::cohort_record(&resident.boxes, self.subnet);
-            self.kernel_config().drop_member(session_id);
+            self.kernel_config().drop_member(
+                session_id,
+                resident.cohort.as_ref().map(|cohort| cohort.generation),
+            );
         }
         let count = resident.boxes.len();
         if removed {
@@ -8048,7 +8135,13 @@ impl BoxRegistry {
             .collect();
         for session in gone {
             if let Some(rules) = resident.boxes.remove(&session) {
-                self.kernel_config().drop_member(session);
+                // Each step's members and the record after it change in one
+                // write of the configuration ([`KernelConfig::drop_member`]).
+                resident.cohort = HostIpBoxes::cohort_record(&resident.boxes, self.subnet);
+                self.kernel_config().drop_member(
+                    session,
+                    resident.cohort.as_ref().map(|cohort| cohort.generation),
+                );
                 // A box the guest no longer lists is destroyed there: no
                 // resume can bring it back, so nothing is set aside.
                 if guest.contains_key(&session) {
@@ -8068,14 +8161,17 @@ impl BoxRegistry {
         for session in back {
             if let Some(rules) = resident.dormant.remove(&session) {
                 let policy = self.host_ip_policy(rules.declared.as_ref());
+                let laned = rules.credentialed_upstream;
+                resident.boxes.insert(session, rules);
+                resident.cohort = HostIpBoxes::cohort_record(&resident.boxes, self.subnet);
                 self.kernel_config().keep_member(
                     session,
                     &MemberFacts {
                         policy: policy.as_ref(),
-                        laned: rules.credentialed_upstream,
+                        laned,
                     },
+                    resident.cohort.as_ref().map(|cohort| cohort.generation),
                 );
-                resident.boxes.insert(session, rules);
                 outcome.admitted.push(session);
             }
         }
@@ -8171,7 +8267,8 @@ impl BoxRegistry {
             }
             return outcome;
         }
-        resident.cohort = HostIpBoxes::cohort_record(&resident.boxes, self.subnet);
+        // The record is the one the last step above made: every dropped or
+        // readmitted box changed it, with the members, in one write.
         let count = resident.boxes.len();
         // Under the resident set's lock, so the mirror's flag follows the
         // set in order (NET-138).
@@ -9510,6 +9607,7 @@ impl HostIpBoxes {
             runtime_ports: Mutex::new(RowRuntime::default()),
             egress_allow_list: allow_subnets,
             attributed: AtomicBool::new(false),
+            generation: record_generation(),
             liveness: Mutex::new(RowLiveness::default()),
             task_row_of: None,
             task_addrs: Vec::new(),
@@ -9639,27 +9737,111 @@ pub struct BoxTable {
     kernel: Arc<RwLock<KernelConfig>>,
 }
 
+/// The kernel's answer for `frame` on `kernel`, as [`BoxTable::egress_first`]
+/// copies it out, under the read lock the caller holds.
+fn asked_of(kernel: &KernelConfig, frame: &[u8]) -> (First, usize, AskedFor) {
+    let config = kernel.config();
+    let first = config.egress_first(frame, ZONE_APEX_WIRE);
+    let row = match &first {
+        First::Frame { frame, .. } => kernel.generation_at(frame.sent.src.to_be_bytes()),
+        First::NotAFrame(_) | First::ShortHeader => None,
+    };
+    let asked = AskedFor {
+        row,
+        cohort: kernel.cohort_generation(),
+    };
+    (first, config.members.len(), asked)
+}
+
+/// The registry records a kernel answer for a guest's frame was made for
+/// ([`BoxTable::egress_first`]), by generation ([`BoxRecord::generation`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AskedFor {
+    /// The record of the row at the frame's source; `None` when no row
+    /// holds it, or the bytes are no frame.
+    pub(crate) row: Option<u64>,
+    /// The resident `host_ip` boxes' record; `None` while there is none.
+    pub(crate) cohort: Option<u64>,
+}
+
 impl BoxTable {
+    /// The kernel's answer for the bytes of a frame a guest sent, with how
+    /// many resident `host_ip` boxes the configuration holds and the
+    /// registry records the answer was made for ([`AskedFor`]). The
+    /// configuration's read lock is held only around the
+    /// kernel's call; all three are copied out before it is released, so no
+    /// registry or table lock is ever taken under it. [`Poisoned`] when the
+    /// lock is poisoned: nothing is answered.
+    pub(crate) fn egress_first(&self, frame: &[u8]) -> Result<(First, usize, AskedFor), Poisoned> {
+        let kernel = unpoisoned(self.kernel.read())?;
+        Ok(asked_of(&kernel, frame))
+    }
+
+    /// [`Self::egress_first`], taken only on a configuration that holds the
+    /// exposure list `open` (the one this frame read from the exposure
+    /// table), under the same read lock that checks it: `None` when it holds
+    /// another, for the caller to hand `open` over and ask again; and
+    /// [`Poisoned`] when the lock is poisoned.
+    pub(crate) fn egress_first_holding(
+        &self,
+        frame: &[u8],
+        open: &Arc<[HostExposure]>,
+    ) -> Result<Option<(First, usize, AskedFor)>, Poisoned> {
+        let kernel = unpoisoned(self.kernel.read())?;
+        if !kernel.holds_exposures(open) {
+            return Ok(None);
+        }
+        Ok(Some(asked_of(&kernel, frame)))
+    }
+
+    /// The kernel's answer for the bytes of a frame toward a guest: what it
+    /// heard, whose tables the frame belongs to, and the facts it read. The
+    /// configuration's read lock is held only around the kernel's call.
+    /// [`Poisoned`] when the lock is poisoned: nothing is answered.
+    pub(crate) fn ingress_first(
+        &self,
+        frame: &[u8],
+    ) -> Result<(Heard, IngressFor, Facts), Poisoned> {
+        Ok(unpoisoned(self.kernel.read())?
+            .config()
+            .ingress_first(frame))
+    }
+
+    /// Gives the network kernel's configuration the node-plane baseline:
+    /// whether it is in force, the blocks its endpoints name and its ports at
+    /// the alias, taking the configuration's lock alone.
+    pub(crate) fn adopt_node_baseline(&self, baseline: &crate::net::NodePlaneBaseline) {
+        let endpoints = baseline
+            .entries()
+            .iter()
+            .flat_map(|entry| entry.endpoints().iter().map(String::as_str));
+        self.kernel
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .adopt_baseline(
+                baseline.phase() == crate::net::NodeBaselinePhase::InForce,
+                endpoints,
+                baseline.alias_ports(),
+            );
+    }
+
     /// Gives the network kernel's configuration the host exposures the
     /// frame path read from the exposure table (`open`, with Minimal's own
     /// listeners' ports left out). Called where the frame path reads the
     /// table, with no registry lock held: the configuration's lock is taken
     /// alone, for reading to see whether `open` is the list already given,
     /// and for writing only when it is not. Whether the configuration
-    /// changed.
+    /// changed. A poisoned lock is left as it is (`false`): the frame that
+    /// asks again meets it and is dropped ([`Self::egress_first_holding`]).
     pub(crate) fn push_exposures(&self, open: &Arc<[HostExposure]>) -> bool {
-        let given = self
-            .kernel
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .holds_exposures(open);
-        if given {
+        let Ok(kernel) = unpoisoned(self.kernel.read()) else {
+            return false;
+        };
+        if kernel.holds_exposures(open) {
             return false;
         }
-        self.kernel
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .set_exposures(open)
+        drop(kernel);
+        unpoisoned(self.kernel.write()).is_ok_and(|mut kernel| kernel.set_exposures(open))
     }
 
     /// Leaves the egress gate's publish ledger for the node mirror's binder
@@ -9747,11 +9929,23 @@ impl BoxTable {
     /// landed where none stood when the relay first attributed the source
     /// — so a live relay always counts as one carrier of the row its box's
     /// frames are decided by. A frame of a source the relay marked, while
-    /// no row has landed since, costs one atomic read.
-    pub fn carry(&self, src: [u8; 4], relay: &mut RelayCarry) {
+    /// no row has landed since, costs one atomic read. `generation` is the
+    /// record the frame was decided for ([`BoxRecord::generation`]): when
+    /// the row at `src` is another, nothing is marked.
+    pub fn carry(&self, src: [u8; 4], generation: u64, relay: &mut RelayCarry) {
         let epoch = self.row_epoch.load(Ordering::Acquire);
         let seen = relay.marked.iter().any(|(addr, _)| *addr == src);
         if seen && epoch == relay.epoch {
+            return;
+        }
+        let rows = self
+            .rows
+            .read()
+            .expect("the row lock is never held across a panic, so it cannot be poisoned");
+        if rows
+            .get(&src)
+            .is_none_or(|record| record.generation != generation)
+        {
             return;
         }
         let stale = epoch != relay.epoch;
@@ -9759,10 +9953,6 @@ impl BoxTable {
         if !seen {
             relay.marked.push((src, std::sync::Weak::new()));
         }
-        let rows = self
-            .rows
-            .read()
-            .expect("the row lock is never held across a panic, so it cannot be poisoned");
         for (addr, marked) in &mut relay.marked {
             if !stale && *addr != src {
                 continue;
@@ -12586,7 +12776,7 @@ mod tests {
         // A task row is carried without its box's own row being marked:
         // the carrier count on the box row stays zero.
         let mut relay = RelayCarry::default();
-        table.carry(task.switch_addr().octets(), &mut relay);
+        table.carry(task.switch_addr().octets(), task.generation(), &mut relay);
         registry.advance_clock(RESUME_ATTACH_BOUND * 2);
         let_the_drainer_sweep();
         assert!(
@@ -12612,7 +12802,7 @@ mod tests {
         let table = registry.table();
         let src = web.switch_addr().octets();
         let mut relay = RelayCarry::default();
-        table.carry(src, &mut relay);
+        table.carry(src, web.generation(), &mut relay);
         // The row goes from under the live relay.
         assert!(registry.withdraw(web.switch_addr()).is_some());
 
@@ -12630,7 +12820,7 @@ mod tests {
         assert!(!Arc::ptr_eq(&resumed, &web), "a new row at the address");
         assert!(!resumed.was_attributed(), "not yet carried");
 
-        table.carry(src, &mut relay);
+        table.carry(src, resumed.generation(), &mut relay);
         assert!(
             resumed.was_attributed(),
             "the relay's next frame attributes the reinstated row"
@@ -12646,6 +12836,27 @@ mod tests {
             || resumed.is_detached(),
             "the relay's end detaches the reinstated row",
         );
+    }
+
+    /// A frame decided for a row that was registered again at its address
+    /// before the relay marks it marks nothing: the row there is another
+    /// record. The frame decided for the row there marks it.
+    #[test]
+    fn carry_marks_only_the_row_the_frame_was_decided_for() {
+        let registry = BoxRegistry::new(SUBNET);
+        let at = Ipv4Addr::new(100, 64, 0, 9);
+        let first = registry.register(BoxRegistration::new("web", at, Ipv4Addr::LOCALHOST));
+        let again = registry.register(BoxRegistration::new("web", at, Ipv4Addr::LOCALHOST));
+        assert!(!Arc::ptr_eq(&first, &again), "a new record at the address");
+        let table = registry.table();
+        let mut relay = RelayCarry::default();
+        table.carry(at.octets(), first.generation(), &mut relay);
+        assert!(
+            !again.was_attributed(),
+            "a frame decided for the first record does not mark the second"
+        );
+        table.carry(at.octets(), again.generation(), &mut relay);
+        assert!(again.was_attributed(), "the frame decided for it marks it");
     }
 
     /// The task rows filed with `web`, as the gate resolves them by source.
@@ -16983,40 +17194,196 @@ mod tests {
         assert!(!alias.contains(&held(7654)));
     }
 
+    /// `kernel_config::names_nothing`, which decides the warning's clause,
+    /// says what the kernel's own arm says. Over a table of policies, for a
+    /// row and for a resident `host_ip` box, it is true exactly when the
+    /// kernel refuses an off-zone A query from that row (`RowDns`), or from
+    /// the cohort (`CohortDns`), to the resolver, asked through the
+    /// configuration the registry keeps. Each entry also states the value
+    /// expected by reading, so a failure says which side moved. A row's
+    /// policy reaches the kernel as declared; a member's as the egress
+    /// default fills it, where an absent list becomes an empty one.
+    #[test]
+    fn names_nothing_is_true_exactly_when_the_kernel_refuses_an_off_zone_query() {
+        use crate::net::kernel_config::{ZONE_APEX_WIRE, names_nothing};
+        use netcore::split::{Arm, First};
+
+        let strings = |list: &[&str]| list.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let policy = |subnets: Option<&[&str]>, hosts: Option<&[&str]>| EgressPolicy {
+            allow_subnets: subnets.map(strings),
+            allow_dns_hosts: hosts.map(strings),
+            allow_protocols: None,
+            deny_subnets: None,
+        };
+        // (what, declared policy, laned, expected for a row, for a member)
+        let table: Vec<(&str, Option<EgressPolicy>, bool, bool, bool)> = vec![
+            ("no policy", None, false, false, false),
+            (
+                "every list absent",
+                Some(EgressPolicy::default()),
+                false,
+                false,
+                true,
+            ),
+            (
+                "both lists empty",
+                Some(EgressPolicy::deny_all()),
+                false,
+                true,
+                true,
+            ),
+            (
+                "no subnet, the DNS-host list absent",
+                Some(policy(Some(&[]), None)),
+                false,
+                true,
+                true,
+            ),
+            (
+                "::/0 alone",
+                Some(policy(Some(&["::/0"]), None)),
+                false,
+                true,
+                true,
+            ),
+            (
+                "::/0 beside an IPv4 block",
+                Some(policy(Some(&["::/0", "10.0.0.0/8"]), None)),
+                false,
+                false,
+                false,
+            ),
+            (
+                "a DNS host named",
+                Some(policy(Some(&[]), Some(&["example.org"]))),
+                false,
+                false,
+                false,
+            ),
+            (
+                "a lane, naming nothing",
+                Some(EgressPolicy::deny_all()),
+                true,
+                true,
+                true,
+            ),
+            (
+                "a lane, naming a DNS host",
+                Some(policy(Some(&[]), Some(&["example.org"]))),
+                true,
+                false,
+                false,
+            ),
+        ];
+        let query_from = |src: Ipv4Addr| {
+            crate::net::dns_pins::tests::udp_payload_frame(
+                src,
+                40000,
+                SUBNET.dns_server(),
+                53,
+                &crate::net::dns_pins::tests::dns_query("example.org."),
+            )
+        };
+        let arm_of = |registry: &BoxRegistry, frame: &[u8]| match registry
+            .kernel_for_tests()
+            .config()
+            .egress_first(frame, ZONE_APEX_WIRE)
+        {
+            First::Frame { arm, .. } => arm,
+            other => panic!("the query is a whole frame: {other:?}"),
+        };
+        for (what, declared, laned, row_expected, member_expected) in table {
+            // A row at a lease.
+            let registry = BoxRegistry::new(SUBNET);
+            let lease = Ipv4Addr::new(100, 64, 0, 9);
+            let mut registration = BoxRegistration::new("probe", lease, Ipv4Addr::LOCALHOST);
+            if let Some(declared) = declared.clone() {
+                registration = registration.with_egress_policy(declared);
+            }
+            if laned {
+                registration =
+                    registration.with_credentialed_upstream(boxes::CredentialedUpstream::default());
+            }
+            registry.register(registration);
+            let held = registry.kernel_for_tests().row_policy(lease).flatten();
+            let said = names_nothing(held.as_ref(), laned, false, "probe");
+            let refused = matches!(arm_of(&registry, &query_from(lease)), Arm::RowDns(_));
+            assert_eq!(said, row_expected, "{what}, a row: names_nothing");
+            assert_eq!(refused, row_expected, "{what}, a row: the kernel's arm");
+
+            // A resident host_ip box, its frames the node address's, marked.
+            let registry = BoxRegistry::new(SUBNET);
+            registry.register_node_namespace(7654);
+            registry
+                .table()
+                .adopt_node_baseline(&crate::net::NodePlaneBaseline::built_in(SUBNET));
+            let member = boxes::SessionId::from_bytes([0x51; 16]);
+            assert!(registry.admit_host_ip_box_with_lane(member, declared.as_ref(), laned));
+            let filled = registry.host_ip_policy(declared.as_ref());
+            let said = names_nothing(filled.as_ref(), laned, true, &member.to_string());
+            let marked = crate::net::egress_gate::test_support::box_cohort_frame(query_from(
+                SUBNET.daemon_ip(),
+            ));
+            let refused = matches!(arm_of(&registry, &marked), Arm::CohortDns);
+            assert_eq!(said, member_expected, "{what}, a member: names_nothing");
+            assert_eq!(
+                refused, member_expected,
+                "{what}, a member: the kernel's arm"
+            );
+        }
+    }
+
     /// A registration whose allowed subnets hold an entry the gate does not
     /// enforce (`::/0`) writes one warn line naming the box and the entry;
     /// re-registering the row with the same policy does not write it again,
-    /// and nothing is refused.
+    /// and nothing is refused. Beside an enforced IPv4 block the line says
+    /// nothing more; with `::/0` alone and no DNS host, it also says the box
+    /// reaches only names in the box zone.
     #[test]
     fn an_unenforced_subnet_is_said_once_at_registration() {
+        const ONLY_ZONE: &str = "the box reaches only names in the box zone through the resolver";
         let (log, _guard) = crate::net::egress_gate::test_support::capture_log();
         let registry = BoxRegistry::new(SUBNET);
-        let registration = || {
-            BoxRegistration::new("sixes", Ipv4Addr::new(100, 64, 0, 9), Ipv4Addr::LOCALHOST)
+        let registration = |name: &str, last: u8, subnets: &[&str]| {
+            BoxRegistration::new(name, Ipv4Addr::new(100, 64, 0, last), Ipv4Addr::LOCALHOST)
                 .with_egress_policy(EgressPolicy {
-                    allow_subnets: Some(vec!["::/0".to_string(), "10.0.0.0/8".to_string()]),
+                    allow_subnets: Some(subnets.iter().map(ToString::to_string).collect()),
                     allow_dns_hosts: None,
                     allow_protocols: None,
                     deny_subnets: None,
                 })
         };
-        registry.register(registration());
-        registry.register(registration());
+        registry.register(registration("sixes", 9, &["::/0", "10.0.0.0/8"]));
+        registry.register(registration("sixes", 9, &["::/0", "10.0.0.0/8"]));
+        registry.register(registration("only-six", 10, &["::/0"]));
         let logged = log.contents();
         let lines: Vec<&str> = logged
             .lines()
             .filter(|line| line.contains("does not enforce these declared subnets"))
             .collect();
-        assert_eq!(lines.len(), 1, "one line for the one policy: {logged}");
+        assert_eq!(lines.len(), 2, "one line for each policy: {logged}");
+        let beside = lines
+            .iter()
+            .find(|line| line.contains("namespace=\"sixes\""))
+            .expect("the line for the box beside an IPv4 block");
         assert!(
-            lines[0].contains("namespace=\"sixes\"")
-                && lines[0].contains("::/0")
-                && !lines[0].contains("10.0.0.0/8"),
-            "the line names the box and the unenforced entry alone: {}",
-            lines[0]
+            beside.contains("::/0")
+                && !beside.contains("10.0.0.0/8")
+                && !beside.contains(ONLY_ZONE),
+            "the line names the unenforced entry alone, and nothing more: {beside}"
         );
+        let alone = lines
+            .iter()
+            .find(|line| line.contains("namespace=\"only-six\""))
+            .expect("the line for the box with ::/0 alone");
         assert!(
-            registry.table().by_source([100, 64, 0, 9]).is_some(),
+            alone.contains("::/0") && alone.contains(ONLY_ZONE),
+            "the line says what the box reaches: {alone}"
+        );
+        let table = registry.table();
+        assert!(
+            table.by_source([100, 64, 0, 9]).is_some()
+                && table.by_source([100, 64, 0, 10]).is_some(),
             "nothing is refused"
         );
     }
@@ -17145,6 +17512,79 @@ mod tests {
         assert!(kernel.config().members[0].resolves_names);
     }
 
+    /// After every change of the resident `host_ip` boxes (an admit, a
+    /// reconcile's drop and its readmit, a retire), the configuration holds
+    /// the generation of the record the registry holds for them, set in the
+    /// write that changed the members: a new record each time the set
+    /// changes, and none once no resident box declares a DNS host. The
+    /// moment between the two changes cannot be observed, because no call
+    /// runs between them: the test reads the state after each operation.
+    #[test]
+    fn the_kernels_cohort_generation_is_the_registrys_record_after_each_member_change() {
+        let registry = BoxRegistry::new(SUBNET);
+        let first = boxes::SessionId::from_bytes([1; 16]);
+        let second = boxes::SessionId::from_bytes([2; 16]);
+        let names = EgressPolicy {
+            allow_dns_hosts: Some(vec!["github.com".to_string()]),
+            ..EgressPolicy::deny_all()
+        };
+        let held = |registry: &BoxRegistry| {
+            let record = registry
+                .table()
+                .host_ip_cohort()
+                .map(|cohort| cohort.generation());
+            assert_eq!(
+                kernel_of(registry).cohort_generation(),
+                record,
+                "the configuration holds the generation of the registry's record"
+            );
+            record
+        };
+        let mut seen = Vec::new();
+
+        assert!(registry.admit_host_ip_box(second, Some(&names)));
+        seen.push(held(&registry).expect("a box that declares a DNS host makes a record"));
+        assert!(registry.admit_host_ip_box_with_lane(first, None, true));
+        seen.push(held(&registry).expect("the record is made again for the new set"));
+
+        let stopped = BTreeMap::from([
+            (first, boxes::BoxState::Active),
+            (second, boxes::BoxState::Stopped),
+        ]);
+        let outcome = registry.reconcile_host_ip_boxes(
+            &stopped,
+            registry.host_ip_admit_mark(),
+            HostIpReconcileTrigger::BoxEvent,
+        );
+        assert_eq!(outcome.dropped, vec![second]);
+        assert_eq!(held(&registry), None, "no resident box declares a DNS host");
+
+        let running = BTreeMap::from([
+            (first, boxes::BoxState::Active),
+            (second, boxes::BoxState::Active),
+        ]);
+        let outcome = registry.reconcile_host_ip_boxes(
+            &running,
+            registry.host_ip_admit_mark(),
+            HostIpReconcileTrigger::BoxEvent,
+        );
+        assert_eq!(outcome.admitted, vec![second]);
+        seen.push(held(&registry).expect("the readmitted box declares a DNS host"));
+
+        assert!(registry.retire_host_ip_box(first, HostIpBoxEnd::Stopped));
+        seen.push(held(&registry).expect("the box left declares a DNS host"));
+        assert!(registry.retire_host_ip_box(second, HostIpBoxEnd::Stopped));
+        assert_eq!(held(&registry), None, "no box is resident");
+
+        let distinct: std::collections::BTreeSet<u64> = seen.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            seen.len(),
+            "each change made a new record: {seen:?}"
+        );
+        registry.assert_kernel_in_step();
+    }
+
     /// Every address the switch-address book can hand out, for every prefix
     /// a switch subnet accepts at a few bases, is one the network kernel may
     /// hold, and so is the node's: a row the registry registers at a drawn
@@ -17255,7 +17695,7 @@ mod tests {
             baseline.rules().allow_subnets().map_or(0, <[_]>::len)
         };
         let baseline = crate::net::NodePlaneBaseline::built_in(SUBNET);
-        registry.adopt_node_baseline(&baseline);
+        registry.table().adopt_node_baseline(&baseline);
         registry.assert_kernel_in_step();
         {
             let kernel = kernel_of(&registry);
@@ -17282,7 +17722,7 @@ mod tests {
             "10.9.8.7".to_string(),
             "192.168.1.0/24".to_string(),
         ]);
-        registry.adopt_node_baseline(&mixed);
+        registry.table().adopt_node_baseline(&mixed);
         assert_eq!(blocks(&mixed), 2);
         assert_eq!(kernel_of(&registry).config().baseline.len(), blocks(&mixed));
     }

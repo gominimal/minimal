@@ -73,12 +73,6 @@ impl HostExposure {
             port,
         }
     }
-
-    /// Whether a frame with this IP protocol and destination port matches.
-    #[must_use]
-    pub(crate) fn admits(self, protocol: u8, port: u16) -> bool {
-        self.protocol == protocol && self.port == port
-    }
 }
 
 /// One table entry: the name the user gave it and the exposure it opens.

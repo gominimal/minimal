@@ -24,12 +24,13 @@
 //! changes a row or a resident `host_ip` box makes the matching change here,
 //! under its own lock, and a change the configuration cannot follow is
 //! counted, logged and repaired by rebuilding it from the registry in the
-//! same section. The egress gate does not read it; the tests do.
+//! same section. The egress gate decides every frame it relays, in both
+//! directions, by this configuration.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::Arc;
+use std::sync::{Arc, LockResult};
 
 use boxes::core::egress::{IPPROTO_TCP, IPPROTO_UDP};
 use boxes::{EgressPolicy, IpProto, SessionId};
@@ -46,6 +47,22 @@ use crate::net::baseline::ALIAS_FETCH_PROTOCOL;
 use crate::net::host_exposures::{self, HostExposure};
 use crate::net::kernel_names::{NO_NAME, NameIds, listed_zone_names, names_host, zone_name};
 
+/// A lock a frame is decided under was poisoned: a panic happened while it
+/// was held, so what it guards may be half changed, and no frame is decided
+/// on it ([`unpoisoned`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Poisoned;
+
+/// The guard `taken` holds, or [`Poisoned`] when its lock was poisoned: the
+/// one way the frame path takes the configuration's lock and a box's
+/// tables' locks. A poisoned lock is never decided on, and the frame it
+/// meets is dropped. The registry's write sections take the configuration's
+/// lock another way ([`crate::box_registry`]): they decide nothing, and go
+/// on keeping the configuration in step with the registry.
+pub(crate) fn unpoisoned<G>(taken: LockResult<G>) -> Result<G, Poisoned> {
+    taken.map_err(|_| Poisoned)
+}
+
 /// What this host can enforce, as the kernel's policy reads it. The flag
 /// changes only what is reported as unenforced for a box at the host's
 /// address, and no rule: the kernel hands over the same policy either way.
@@ -58,6 +75,10 @@ const HOST: Abilities = Abilities {
 /// it absent (the allow-all reading before the deny-all default is in force,
 /// or behind the daemon's opt-out).
 const EVERY_SUBNET: Net = Net::V4(Cidr { addr: 0, prefix: 0 });
+
+/// The box zone's apex on the wire, `min.internal`: the name the kernel
+/// narrows a DNS query from a row that names nothing to.
+pub(crate) const ZONE_APEX_WIRE: &[u8] = b"\x03min\x08internal\x00";
 
 /// The ICMP protocol number, as the product's compiled rules write it.
 const IPPROTO_ICMP: u8 = 1;
@@ -92,6 +113,8 @@ pub(crate) struct RowFacts<'a> {
     pub(crate) laned: bool,
     /// The row is a task row of a box: it has no name and no lane.
     pub(crate) task_row: bool,
+    /// The registry record's generation (`BoxRecord::generation`).
+    pub(crate) generation: u64,
 }
 
 /// What the registry says of one row when its configuration is rebuilt:
@@ -104,6 +127,8 @@ pub(crate) struct RowShape<'a> {
     pub(crate) laned: bool,
     /// The row is a task row of a box.
     pub(crate) task_row: bool,
+    /// The registry record's generation (`BoxRecord::generation`).
+    pub(crate) generation: u64,
 }
 
 /// A change the configuration could not follow: the registry changed the
@@ -188,6 +213,13 @@ pub(crate) struct KernelConfig {
     /// after `boxes::effective_egress`. Kept for every row the registry
     /// holds, so a rebuild reads each row's policy here.
     row_policies: BTreeMap<u32, Option<EgressPolicy>>,
+    /// By row address: the generation of the registry record the row was
+    /// made or last restated from ([`Self::generation_at`]).
+    row_generations: BTreeMap<u32, u64>,
+    /// The generation of the resident `host_ip` boxes' record the members
+    /// were last given with (`BoxRegistry::host_ip_cohort`), `None` while
+    /// there is none.
+    cohort_generation: Option<u64>,
     /// By session: the resident `host_ip` boxes' policies, in session order.
     members: BTreeMap<SessionId, MemberRules>,
     alias_inputs: AliasInputs,
@@ -233,6 +265,8 @@ impl KernelConfig {
             names: NameIds::new(),
             row_names: BTreeMap::new(),
             row_policies: BTreeMap::new(),
+            row_generations: BTreeMap::new(),
+            cohort_generation: None,
             members: BTreeMap::new(),
             alias_inputs: AliasInputs::default(),
             exposures_from: None,
@@ -263,16 +297,20 @@ impl KernelConfig {
     }
 
     /// The kernel's configuration, to decide by.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "only the tests read the kernel's configuration; the egress gate does not \
-                      decide by it in this commit"
-        )
-    )]
     pub(crate) fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// The generation of the registry record the row at `addr` was made or
+    /// last restated from, when a row holds `addr`.
+    pub(crate) fn generation_at(&self, addr: [u8; 4]) -> Option<u64> {
+        self.row_generations.get(&u32::from_be_bytes(addr)).copied()
+    }
+
+    /// The generation of the resident `host_ip` boxes' record, as the last
+    /// change of the members set it.
+    pub(crate) fn cohort_generation(&self) -> Option<u64> {
+        self.cohort_generation
     }
 
     /// Adds a row at `addr`, after every row there is. Refused, with nothing
@@ -286,6 +324,8 @@ impl KernelConfig {
         let (decl, names) = self.row_decl(facts)?;
         if self.config.register(u32::from(addr), decl) {
             self.row_names.insert(u32::from(addr), names);
+            self.row_generations
+                .insert(u32::from(addr), facts.generation);
             Ok(())
         } else {
             self.release_names(&names);
@@ -381,6 +421,7 @@ impl KernelConfig {
         if let Some(before) = self.row_names.insert(key, names) {
             self.release_names(&before);
         }
+        self.row_generations.insert(key, facts.generation);
         Ok(())
     }
 
@@ -390,6 +431,7 @@ impl KernelConfig {
     pub(crate) fn drop_row(&mut self, addr: Ipv4Addr) -> Result<(), Diverged> {
         let key = u32::from(addr);
         self.row_policies.remove(&key);
+        self.row_generations.remove(&key);
         if let Some(names) = self.row_names.remove(&key) {
             self.release_names(&names);
         }
@@ -438,17 +480,29 @@ impl KernelConfig {
     }
 
     /// Follows the admit of a resident `host_ip` box, or of new rules for
-    /// one: the members go to the kernel again, in session order.
-    pub(crate) fn keep_member(&mut self, session: SessionId, facts: &MemberFacts<'_>) {
+    /// one: the members go to the kernel again, in session order, and
+    /// `generation` is the generation of the resident boxes' record after
+    /// the admit. Both change in this one call, so no frame is decided on
+    /// the new members under the old record's generation, or the reverse.
+    pub(crate) fn keep_member(
+        &mut self,
+        session: SessionId,
+        facts: &MemberFacts<'_>,
+        generation: Option<u64>,
+    ) {
         self.members.insert(session, member_rules(session, facts));
         self.sync_members();
+        self.cohort_generation = generation;
     }
 
-    /// Follows a resident `host_ip` box's leaving the union.
-    pub(crate) fn drop_member(&mut self, session: SessionId) {
+    /// Follows a resident `host_ip` box's leaving the union, with
+    /// `generation` the generation of the resident boxes' record after it,
+    /// as [`Self::keep_member`] takes it.
+    pub(crate) fn drop_member(&mut self, session: SessionId, generation: Option<u64>) {
         if self.members.remove(&session).is_some() {
             self.sync_members();
         }
+        self.cohort_generation = generation;
     }
 
     /// Adopts the node's baseline: whether it is in force, the blocks its
@@ -564,6 +618,7 @@ impl KernelConfig {
                 policy: policy.as_ref(),
                 laned: shape.laned,
                 task_row: shape.task_row,
+                generation: shape.generation,
             };
             if let Err(error) = fresh.register_row(addr, &facts) {
                 tracing::error!(
@@ -576,6 +631,7 @@ impl KernelConfig {
         }
         fresh.row_policies = std::mem::take(&mut self.row_policies);
         fresh.members = std::mem::take(&mut self.members);
+        fresh.cohort_generation = self.cohort_generation;
         fresh.sync_members();
         fresh.alias_inputs = std::mem::take(&mut self.alias_inputs);
         fresh.exposures_from = self.exposures_from.take();
@@ -642,8 +698,8 @@ impl KernelConfig {
 #[cfg(test)]
 impl KernelConfig {
     /// Panics, naming what differs, unless `self` and `other` hold the same
-    /// rows by address, each with the same rules, flags, names and kept
-    /// policy, and the same members in session order with the same rules;
+    /// rows by address, each with the same rules, flags, names, kept policy
+    /// and record generation, and the same members in session order with the same rules;
     /// and unless each gives one number to each name.
     pub(crate) fn assert_in_step_with(&self, other: &KernelConfig) {
         assert_eq!(
@@ -667,6 +723,11 @@ impl KernelConfig {
                 self.row_policies.get(key),
                 other.row_policies.get(key),
                 "the policy kept for the row at {addr}"
+            );
+            assert_eq!(
+                self.row_generations.get(key),
+                other.row_generations.get(key),
+                "the record generation kept for the row at {addr}"
             );
             let mine = self.decl_at(*key);
             let theirs = other.decl_at(*key);
@@ -909,6 +970,30 @@ pub(crate) fn unenforced_subnets(policy: Option<&EgressPolicy>) -> (Vec<String>,
     )
 }
 
+/// Whether a box with `policy` names nothing the gate enforces, read as the
+/// kernel reads its row: the rules [`declared`] and [`effective_of`] make
+/// (the ones [`KernelConfig::register_row`] gives the kernel) allow no
+/// subnet, present and empty, and the box names no DNS host, an absent list
+/// and an empty one alike. The condition is the one the kernel decides a
+/// row's DNS refusal by. For the warning a registration writes; it decides
+/// nothing.
+pub(crate) fn names_nothing(
+    policy: Option<&EgressPolicy>,
+    laned: bool,
+    host_address: bool,
+    subject: &str,
+) -> bool {
+    let effective = effective_of(&declared(policy, laned, host_address, subject), subject);
+    let rules = effective.rules();
+    let resolves_names = policy
+        .and_then(|policy| policy.allow_dns_hosts.as_ref())
+        .is_some_and(|hosts| !hosts.is_empty());
+    match &rules.get().allow_subnets {
+        Some(v) => v.as_slice().is_empty() && !resolves_names,
+        None => false,
+    }
+}
+
 /// One `allow_subnets` or `deny_subnets` entry as the kernel reads it. An
 /// IPv4 block with a prefix of at most 32 is the set of entries the
 /// product's compiled rules keep; every other entry is named and not
@@ -979,6 +1064,7 @@ mod tests {
             policy,
             laned: false,
             task_row: false,
+            generation: 0,
         }
     }
 
@@ -1372,6 +1458,17 @@ mod tests {
     }
 
     #[test]
+    fn the_zone_apex_on_the_wire_is_the_box_zones() {
+        let mut wire = Vec::new();
+        for label in boxes::core::zone_answer::ZONE_APEX.split('.') {
+            wire.push(u8::try_from(label.len()).unwrap());
+            wire.extend_from_slice(label.as_bytes());
+        }
+        wire.push(0);
+        assert_eq!(ZONE_APEX_WIRE, wire.as_slice());
+    }
+
+    #[test]
     fn a_protocol_is_read_by_its_wire_number() {
         assert_eq!(wire_number(IpProto::Tcp), Some(6));
         assert_eq!(wire_number(IpProto::Udp), Some(17));
@@ -1631,11 +1728,13 @@ mod tests {
         }
     }
 
-    /// The differences between the relay and the kernel that the slice's
-    /// acceptance set names, each asserted as a difference: the test fails
-    /// when one goes away as when a new one appears. Each entry: the
-    /// acceptance row, the row's policy, the frame, what the relay says and
-    /// what the kernel says.
+    /// The frames on which the relay, as it decided before the kernel did,
+    /// and the kernel decide differently. Each entry: what kind of
+    /// difference it is, the row's policy, the frame, what that relay said
+    /// and what the kernel says. The relay's column is literal: what the
+    /// relay decided before the kernel did (the gate called whole, then its
+    /// deny-all DNS check). The test checks that the kernel and the gate
+    /// both say the kernel's side and that it is not the relay's.
     fn nc7_differences() -> Vec<(&'static str, Option<EgressPolicy>, Probe, Said, Said)> {
         vec![
             (
@@ -1652,8 +1751,8 @@ mod tests {
                 DENY_ALL_DNS,
                 ADMIT,
             ),
-            // The test asserts that the relay admits this frame and the
-            // kernel drops it as no frame. The relay's summary does not read
+            // The test asserts that the kernel and the gate drop this frame
+            // as no frame, where the relay admitted it. The relay's summary does not read
             // the total length, so the gate admits the query by the
             // resolver's carve-out, and the deny-all check is skipped because
             // the datagram's payload cannot be taken; the kernel's reader
@@ -1758,9 +1857,11 @@ mod tests {
         0xde, 0xad, 0xbe, 0xef,
     ];
 
-    /// Frames of a strictly read question on which the relay and the kernel agree,
-    /// written for the deny-all row only. Each entry: the acceptance row,
-    /// the row's policy, the frame, and what both sides say.
+    /// Frames of a strictly read question on which the relay, as it decided before
+    /// the kernel did, and the kernel agree, written for the deny-all row
+    /// only. Each entry: what kind of question it is, the row's policy, the
+    /// frame, and what both said; the test checks that the kernel and the
+    /// gate both say it.
     fn nc7_row12_agreeing() -> Vec<(&'static str, Option<EgressPolicy>, Probe, Said)> {
         vec![
             // A label of 64 bytes: its length byte 0x40, then 64 bytes of
@@ -1878,7 +1979,7 @@ mod tests {
         (rule != netcore::report::NONE).then_some(netcore::report::NAMES[usize::from(rule)])
     }
 
-    /// What the relay and the kernel each say of `probe` from a row
+    /// What the gate and the kernel each say of `probe` from a row
     /// registered with `policy`, the kernel deciding by the configuration
     /// the registry keeps, and the kernel's outcome as it named it (its arm,
     /// or why the bytes are no frame).
@@ -1897,7 +1998,7 @@ mod tests {
             .push_exposures(&Arc::from(vec![NC7_EXPOSURE]));
         registry.assert_kernel_in_step();
         let frame = frame_of(row, probe);
-        let relay = gate_decides(&registry, &frame).err();
+        let gate = gate_decides(&registry, &frame).err();
         let first = registry
             .kernel_for_tests()
             .config()
@@ -1906,7 +2007,7 @@ mod tests {
             First::Frame { arm, .. } => format!("{arm:?}"),
             other => format!("{other:?}"),
         };
-        (relay, kernel_rule(first), outcome)
+        (gate, kernel_rule(first), outcome)
     }
 
     /// A side's answer in the gate's drop-line shape.
@@ -1919,48 +2020,50 @@ mod tests {
 
     /// NC7's test: for every policy of the table and every frame, the
     /// kernel, deciding by the configuration the registry keeps for a row
-    /// registered with the policy, says what the relay says (the gate called
-    /// whole, then the relay's deny-all DNS check), admit or drop and the
-    /// rule a drop is reported under, with no reply, refusal, pin or
-    /// exposure; and each of the differences the acceptance set names is
-    /// still there, as named, with one line printed for each saying what
-    /// both sides returned.
+    /// registered with the policy, says what the table says, admit or drop
+    /// and the rule a drop is reported under, and so does the gate called
+    /// whole, with no reply, refusal or pin; and for each frame of
+    /// `nc7_differences` the kernel and the gate say the kernel's side,
+    /// which is not the relay's, with one line printed for each saying what
+    /// both returned.
     #[test]
     fn nc7_a_rows_frame_is_decided_by_the_kernel_as_by_the_relay() {
         for (probe, wants) in nc7_table() {
             for ((policy_name, policy), want) in nc7_policies().into_iter().zip(wants) {
                 let case = format!("{policy_name}, {}", probe.what);
-                let (relay, kernel, _) = both_say(policy, &probe);
-                assert_eq!(relay, want, "{case}: the relay");
+                let (gate, kernel, _) = both_say(policy, &probe);
                 assert_eq!(kernel, want, "{case}: the kernel");
+                assert_eq!(gate, want, "{case}: the gate");
             }
         }
-        for (row, policy, probe, relay_want, kernel_want) in nc7_differences() {
+        for (row, policy, probe, relay_was, kernel_want) in nc7_differences() {
             let case = format!("{row}, {}", probe.what);
-            let (relay, kernel, outcome) = both_say(policy, &probe);
+            let (gate, kernel, outcome) = both_say(policy, &probe);
             // The record of each named difference, as the run computed it:
             // `cargo nextest run --no-capture` prints it.
             println!(
-                "{case}: relay {} | kernel {outcome} {}",
-                action(relay),
-                action(kernel)
+                "{case}: relay before the kernel {} | kernel {outcome} {} | gate {}",
+                action(relay_was),
+                action(kernel),
+                action(gate)
             );
-            assert_eq!(relay, relay_want, "{case}: the relay");
             assert_eq!(kernel, kernel_want, "{case}: the kernel");
-            assert_ne!(relay, kernel, "{case}: a named difference");
+            assert_eq!(gate, kernel_want, "{case}: the gate");
+            assert_ne!(relay_was, kernel_want, "{case}: a named difference");
         }
-        // The frames of a strictly read question that both sides decide alike,
+        // The frames of a strictly read question that both sides decided alike,
         // printed as the differences are.
-        for (row, policy, probe, want) in nc7_row12_agreeing() {
+        for (row, policy, probe, both_said) in nc7_row12_agreeing() {
             let case = format!("{row}, {}", probe.what);
-            let (relay, kernel, outcome) = both_say(policy, &probe);
+            let (gate, kernel, outcome) = both_say(policy, &probe);
             println!(
-                "{case}: relay {} | kernel {outcome} {}",
-                action(relay),
-                action(kernel)
+                "{case}: relay before the kernel {} | kernel {outcome} {} | gate {}",
+                action(both_said),
+                action(kernel),
+                action(gate)
             );
-            assert_eq!(relay, want, "{case}: the relay");
-            assert_eq!(kernel, want, "{case}: the kernel");
+            assert_eq!(kernel, both_said, "{case}: the kernel");
+            assert_eq!(gate, both_said, "{case}: the gate");
         }
     }
 }

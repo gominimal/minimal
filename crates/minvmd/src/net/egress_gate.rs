@@ -154,17 +154,24 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tracing::Instrument as _;
 
 use boxes::EgressDefaultPhase;
-use boxes::core::egress::{self, DropReason, FrameFamily, FrameSummary, FrameVerdict, Ipv4Cidr};
+use boxes::core::egress::{self, DropReason};
 use boxes::core::switch_request::{
     self, Applied, MAX_REQUEST_RECORDS, Record, Refusal, SwitchRequest, SwitchRow, SwitchTable,
     SwitchVerb,
 };
+use netcore::cohort::CohortArm;
+use netcore::frame::Facts;
+use netcore::gate::Stray;
+use netcore::judge::{BoxNameRule, SentKind};
+use netcore::node::NodeArm;
+use netcore::row::RowArm;
+use netcore::split::{Arm, First, IngressFor};
 use switch::{DEFAULT_MTU, RESERVED_LOCAL_RANGE, SwitchSubnet};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -173,13 +180,15 @@ use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::bep_attach::{BoxId, BoxIdText};
-use crate::box_registry::{BoxRecord, BoxTable, RowWithdrawal};
+use crate::box_registry::{AskedFor, BoxRecord, BoxTable, RowWithdrawal};
 
 use super::baseline::{self, NodeBaselinePhase, NodePlaneBaseline};
 use super::dns_pins;
 use super::drop_limiter::{DropLimiter, WarnDecision};
 use super::forward_revoke::{self, ForwardedFlows};
 use super::host_exposures;
+use super::kernel_config::Poisoned;
+use super::kernel_facts;
 
 /// The HTTP request that upgrades a control-socket connection into a raw
 /// frame stream. The guest shuttle writes this head before its first frame;
@@ -425,29 +434,12 @@ const UNKNOWN_SOURCE_RULE: &str = "egress-unknown-source";
 /// leases, and nothing else.
 const NODE_PLANE_UNPINNED_RULE: &str = "egress-node-plane-unpinned";
 
-/// The IP protocol a pinned baseline address is reached over: TCP alone,
-/// because the registry and the cache the daemon fetches from serve HTTPS
-/// (`https://github.com/gominimal/pkgs`, `https://cache.minimal.dev/`). A
-/// pin names an address, and a registry or cache name often resolves to a
-/// shared CDN address, so without this bound the pin would open that address
-/// at every protocol and port. QUIC is not admitted: carrying it would be a
-/// stated choice that adds UDP here. An endpoint spelled as a subnet is the
-/// deployment's own allowance and is decided by the set's compiled rules,
-/// without this bound.
-const NODE_PLANE_FETCH_PROTOCOL: u8 = egress::IPPROTO_TCP;
-
-/// The ports a pinned baseline address is reached at, over
-/// [`NODE_PLANE_FETCH_PROTOCOL`]: the HTTPS port the daemon's registry and
-/// cache fetches use. Any other port to a pinned address is
-/// [`NODE_PLANE_UNPINNED_RULE`]'s drop, the same as an address no pin names.
-const NODE_PLANE_FETCH_PORTS: [u16; 1] = [443];
-
-// The baseline set opens the host alias at the node plane's fetch ports, over
-// its fetch protocol, and at nothing else.
+// The baseline set opens the host alias at the port the kernel lifts the node
+// plane's pinned fetches at, over TCP, and at nothing else.
 const _: () = assert!(
-    NODE_PLANE_FETCH_PORTS.len() == baseline::ALIAS_FETCH_PORTS.len()
-        && NODE_PLANE_FETCH_PORTS[0] == baseline::ALIAS_FETCH_PORTS[0]
-        && NODE_PLANE_FETCH_PROTOCOL == baseline::ALIAS_FETCH_PROTOCOL
+    baseline::ALIAS_FETCH_PORTS.len() == 1
+        && baseline::ALIAS_FETCH_PORTS[0] == netcore::node::NODE_FETCH_PORT
+        && baseline::ALIAS_FETCH_PROTOCOL == egress::IPPROTO_TCP
 );
 
 /// The rule name for a frame headed to the switch's own address — the plan's
@@ -472,13 +464,11 @@ const SWITCH_CONTROL_RULE: &str = "egress-switch-control-surface";
 /// records for, not a destination any rules decided.
 const INBOUND_FLOW_CAP_RULE: &str = "egress-inbound-flow-cap";
 
-/// The rule name for a deny-all box's DNS datagram the host drops rather
-/// than write on to the switch (NET-141's deny-all case, decided host-side
-/// for own-address rows): anything but a standard query whose every
-/// question is an A lookup of a box-zone name
-/// ([`dns_pins::deny_all_refusal`]). Its own rule, not the row verdict's:
-/// the verdict admitted the frame under the resolver carve-out, and what
-/// this names is the name the carve-out may not carry out.
+/// The rule name for a DNS datagram to the resolver the host drops rather
+/// than write on to the switch (NET-141's deny-all case): from a row, or the
+/// cohort, that declares no subnet and no DNS host, anything but a whole
+/// standard query for names below the box zone's apex, as the network
+/// kernel decides it.
 const DENY_ALL_DNS_RULE: &str = "egress-deny-all-dns-query";
 
 /// The port the resolver carve-out is keyed to at the gateway (NET-079):
@@ -491,70 +481,24 @@ const DENY_ALL_DNS_RULE: &str = "egress-deny-all-dns-query";
 /// anywhere else.
 const RESOLVER_PORT: u16 = 53;
 
-/// The two IPv4 protocols a resolver query travels over: UDP, and TCP when
-/// the answer is truncated. A frame to the gateway in any other protocol has
-/// no resolver to be headed for, whatever its L4 bytes say.
-const RESOLVER_PROTOCOLS: [u8; 2] = [6, 17];
-
 /// The rule name for a frame headed into the infrastructure deny set (design
 /// §5.3, NET-067) as a host frame rule: the set applies to every box-plane
 /// packet, CIDR-admitted direct-IP flows included, so it is decided for every
 /// row, before the row's own rules and before the pin arm a name-declaring
 /// row earns — no row, no `allow_subnets` entry, and no DNS pin ever admits
-/// a frame here. The ranges are [`INFRASTRUCTURE_RANGES`]'; the one
-/// exemption is RFC 1918 under the row's `allow_subnets`, and the one
-/// carve-out is the node's own switch block ([`infrastructure_destination`]).
+/// a frame here. The ranges are link-local, loopback, the plane outside the
+/// switch's own block, and RFC 1918 space the row's `allow_subnets` does not
+/// cover, as the network kernel's arms decide them.
 const INFRASTRUCTURE_RULE: &str = "egress-infrastructure-destination";
-
-/// The ranges the host-side infrastructure rule refuses — the host frame
-/// rule's own copy of the §5.3 set, built beside the `boxes` crate's
-/// [`egress::InfrastructureDenySet`] rather than from it, because the two
-/// decide different things and the rebinding intersection relies on its own
-/// shape: that set names the gateway's two addresses as `/32`s (here the
-/// gateway is the control-surface rule's, [`SWITCH_CONTROL_RULE`], and the
-/// host alias is default-deny under this rule for a box row), refuses or admits
-/// the whole fabric plane by whether the name is a box-zone name (a frame has
-/// no name, and the plane's one admitted slice is the node's own block), and
-/// keeps its ranges private. The constants overlap without coinciding: the
-/// answer side's set carries the four ranges that complete it — this-host
-/// space, multicast, broadcast, and the reserved block the broadcast address
-/// ends in — for answers alone, where the frame rule refuses a frame by its
-/// own facts (a multicast or this-host destination is already outside the
-/// row's declared reach, and the plane and RFC 1918 arms decide the rest).
-struct InfrastructureRanges {
-    /// Refused under every row: link-local and the metadata services living
-    /// in it, and loopback space.
-    fixed: [Ipv4Cidr; 2],
-    /// The plane the switch fabric draws its subnets from: refused outside
-    /// the node's own block, where another node's boxes, gateway, and daemon
-    /// live.
-    plane: Ipv4Cidr,
-    /// RFC 1918 space, refused unless the row's `allow_subnets` covers the
-    /// destination.
-    rfc1918: [Ipv4Cidr; 3],
-}
-
-/// The host-side infrastructure ranges, parsed once: the rule is on the
-/// per-frame path, and the ranges are constants.
-static INFRASTRUCTURE_RANGES: LazyLock<InfrastructureRanges> = LazyLock::new(|| {
-    // Every constant parses; the parses exist so the set's contents are
-    // spelled as ranges, not as byte arrays.
-    let cidr = |s: &'static str| Ipv4Cidr::parse(s).expect("a constant CIDR parses");
-    InfrastructureRanges {
-        fixed: [cidr("169.254.0.0/16"), cidr("127.0.0.0/8")],
-        plane: cidr("100.64.0.0/10"),
-        rfc1918: [
-            cidr("10.0.0.0/8"),
-            cidr("172.16.0.0/12"),
-            cidr("192.168.0.0/16"),
-        ],
-    }
-});
 
 /// The rule name for a frame to the host alias, `host.min.internal`, at a
 /// port no opening the source's row has covers (NET-156, design §7.1). The
 /// drop line names the row ([`AliasRow`]) and the port beside it.
 const HOST_ALIAS_RULE: &str = "host-alias";
+
+/// The rule name for a frame the gate could not decide on the
+/// configuration it asked ([`InternalCause`]).
+const INTERNAL_RULE: &str = "internal";
 
 /// The row a frame to the host alias is decided for: the in-VM daemon's own
 /// traffic (`node`), the host-address boxes that share the guest's root
@@ -578,247 +522,11 @@ impl AliasRow {
     }
 }
 
-/// The openings the host alias has for one row. The alias is default-deny
-/// (design §7.1, NET-156, NET-158): every row reaches it at the configured
-/// host exposures, the current `[host-exposures]` table (NET-161), and the
-/// row's own rules decide the flow from there. A box row reaches an
-/// exposure only when the box names the host, by `host.min.internal` in
-/// `egress.allow_dns_hosts` or by an `allow_subnets` that covers the alias
-/// (NET-160). The node-plane identity alone also reaches the alias at the
-/// ports the baseline set's own endpoints open there
-/// ([`NodePlaneBaseline::alias_ports`]). An exposure opens its port for its
-/// own protocol alone.
-///
-/// Minimal's own listeners and sockets are refused ahead of the exposure
-/// openings, at each flow (NET-162): the hostname proxy at the node row's
-/// assigned port, the box-name answerer, the Box Egress Proxy's listener,
-/// and the baseline endpoints at the alias for every row but the node's.
-/// So a listener that binds an exposed port later shadows the entry from
-/// the next flow on ([`host_exposures::HostExposures::current`]).
-///
-/// The design's two other host-side openings are not at the alias: the
-/// resolver's port is on the gateway address ([`SWITCH_CONTROL_RULE`]'s
-/// arm), and a credentialed lane's steered flow goes to the Box Egress
-/// Proxy's own address ([`PROXY_LANE_RULE`]'s arm). So a frame to the alias
-/// at the resolver's port or the proxy's port is refused here like any other.
-#[derive(Clone, Copy)]
-struct AliasOpenings<'a> {
-    row: AliasRow,
-    baseline: &'a NodePlaneBaseline,
-    table: &'a BoxTable,
-    /// Whether the row names the host, the box's half of an exposure
-    /// (NET-160). Always `true` for the node and the cohort rows.
-    names_host: bool,
-}
-
-impl<'a> AliasOpenings<'a> {
-    fn new(row: AliasRow, baseline: &'a NodePlaneBaseline, table: &'a BoxTable) -> Self {
-        Self {
-            row,
-            baseline,
-            table,
-            names_host: true,
-        }
-    }
-
-    /// The openings for one box row, whose exposures need the box to name
-    /// the host (NET-160).
-    fn for_box(baseline: &'a NodePlaneBaseline, table: &'a BoxTable, record: &BoxRecord) -> Self {
-        let alias = table.subnet().host_alias().octets();
-        Self {
-            names_host: names_host_by_name(record.allow_dns_hosts())
-                || record
-                    .egress()
-                    .allow_subnets()
-                    .is_none_or(|list| list.iter().any(|cidr| cidr.contains(alias))),
-            ..Self::new(AliasRow::Box, baseline, table)
-        }
-    }
-
-    /// Minimal's own listeners and sockets at the alias as of this flow
-    /// (NET-162), the hostname proxy's port read from the node row the
-    /// host registered before boot.
-    fn listeners(&self) -> Vec<host_exposures::Holder> {
-        let node = self
-            .table
-            .by_source(self.table.subnet().daemon_ip().octets());
-        host_exposures::minimal_listeners(
-            node.as_deref().map_or(&[][..], BoxRecord::admitted_ports),
-            self.baseline.alias_ports(),
-            baseline::ALIAS_FETCH_PROTOCOL,
-        )
-    }
-
-    /// Whether the row reaches the alias with this transport, the frame's
-    /// IP protocol and destination port when it is TCP or UDP. A frame with
-    /// no transport port (ICMP, a later fragment) fails every opening closed.
-    /// The table is read here, so only a frame to the alias pays for it.
-    fn admit(&self, transport: Option<(u8, u16)>) -> bool {
-        let Some((protocol, port)) = transport else {
-            return false;
-        };
-        let within =
-            |ranges: &[(u16, u16)]| ranges.iter().any(|&(lo, hi)| lo <= port && port <= hi);
-        if self.row == AliasRow::Node
-            && protocol == baseline::ALIAS_FETCH_PROTOCOL
-            && within(self.baseline.alias_ports())
-        {
-            // The baseline set's ports at the alias are the node plane's
-            // alone (NET-158). Another protocol at the same port is not a
-            // baseline fetch, so the table decides it.
-            return true;
-        }
-        let held = self.listeners();
-        // The table holds its entries against the listeners as of this
-        // flow, so it records a listener that shadows an entry even when
-        // the check below refuses the frame.
-        let exposures = self.baseline.host_exposure_ports(&held);
-        // The network kernel's configuration takes the exposures where the
-        // frame path reads them, with no registry lock held. The two answers
-        // above are given without the table and do not depend on it.
-        self.table.push_exposures(&exposures);
-        if held.iter().any(|holder| holder.holds_port(protocol, port)) {
-            // Minimal's own listener, refused ahead of the exposures at
-            // each flow (NET-162), even when a table entry names the port.
-            return false;
-        }
-        self.names_host
-            && exposures
-                .iter()
-                .any(|exposure| exposure.admits(protocol, port))
-    }
-}
-
-/// Whether `allow_dns_hosts` names the host alias, `host.min.internal`,
-/// as the box's half of a host exposure (NET-160).
-fn names_host_by_name(allow_dns_hosts: &[String]) -> bool {
-    allow_dns_hosts.iter().any(|host| {
-        host.trim_end_matches('.')
-            .eq_ignore_ascii_case(baseline::HOST_ALIAS_NAME)
-    })
-}
-
 /// The rule name for a frame to another box's lease that the source's
 /// `allow_subnets` leaves undeclared, from a box whose
 /// `egress.allow_dns_hosts` names boxes but not that one (NET-163). The
 /// drop line names the source box and the target box beside it.
 const BOX_NAME_RULE: &str = "box-name";
-
-/// The box-zone names `allow_dns_hosts` lists, ASCII lower-case and with no
-/// trailing dot: the names under the box zone that are neither its apex
-/// nor the host alias's (NET-163).
-fn box_zone_entries(allow_dns_hosts: &[String]) -> Vec<String> {
-    let suffix = format!(".{}", boxes::core::zone_answer::ZONE_APEX);
-    allow_dns_hosts
-        .iter()
-        .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
-        .filter(|host| {
-            host.len() > suffix.len()
-                && host.ends_with(&suffix)
-                && !host.eq_ignore_ascii_case(baseline::HOST_ALIAS_NAME)
-        })
-        .collect()
-}
-
-/// How the source's name rules decide a frame to `dst` that its declared
-/// subnets left undeclared (NET-163). `None` when the source names no box,
-/// or when `dst` is no other box's lease, so the row's rules decide alone.
-/// `Some(true)` when an entry is the zone name of the box whose row holds
-/// `dst`: the name admits the source's half, and the target's ingress, in
-/// the guest, decides the rest. `Some(false)` refuses it under
-/// [`BOX_NAME_RULE`]. The match is exact, so an entry for `web` never
-/// covers a parallel instance `web-2`.
-fn box_name_verdict(table: &BoxTable, record: &BoxRecord, dst: [u8; 4]) -> Option<bool> {
-    let entries = box_zone_entries(record.allow_dns_hosts());
-    if entries.is_empty() || dst == table.subnet().daemon_ip().octets() {
-        return None;
-    }
-    let target = table.by_source(dst)?;
-    if target.switch_addr() == record.switch_addr() {
-        return None;
-    }
-    if target.is_task_row() {
-        // A task sandbox's address is not the box's lease, so no name
-        // covers it.
-        return Some(false);
-    }
-    let name = format!(
-        "{}.{}",
-        crate::box_registry::canonical_box_name(&target.name()),
-        boxes::core::zone_answer::ZONE_APEX
-    );
-    Some(entries.contains(&name))
-}
-
-/// Which infrastructure rule refuses a destination.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InfrastructureHit {
-    /// The infrastructure deny set ([`INFRASTRUCTURE_RULE`]).
-    Set,
-    /// The host alias outside the row's openings ([`HOST_ALIAS_RULE`]).
-    HostAlias,
-}
-
-/// The frame's IP protocol and destination port when it is TCP or UDP, the
-/// transport the alias's openings are matched against.
-fn alias_transport(summary: &FrameSummary) -> Option<(u8, u16)> {
-    summary
-        .protocol()
-        .filter(|&protocol| matches!(protocol, egress::IPPROTO_TCP | egress::IPPROTO_UDP))
-        .map(|protocol| (protocol, summary.destination_port()))
-}
-
-/// Which rule, if any, refuses `dst` as infrastructure, as the host frame
-/// rule holds it ([`INFRASTRUCTURE_RULE`], [`HOST_ALIAS_RULE`]): a fixed
-/// range; the host alias outside the openings `alias` grants the row; the
-/// fabric plane outside `own_block`, the subnet the gate's rows live in — a
-/// frame to a sibling or to the daemon inside the node's own block is local
-/// reach, decided by the row's CIDR rules and the target's ingress, never by
-/// this rule, and the gateway inside it is the control-surface rule's; or
-/// RFC 1918 space the row's `allow_subnets` does not cover.
-///
-/// `transport` is the frame's protocol and port when it is TCP or UDP
-/// ([`alias_transport`]), `None` for any other frame. A non-first IPv4
-/// fragment carries no readable port and reads as port 0, so it fails every
-/// alias opening: the stateless verdict fails such a frame closed.
-///
-/// `allow` is the row's compiled `allow_subnets`, `None` when the dimension
-/// is undeclared — allow-all, the shipped default (03-spec R2.1) — which
-/// counts as covering the destination, as the rebinding intersection's
-/// exemption holds it ([`egress::rebinding_admits`]): the two allow-all
-/// spellings, an undeclared dimension and `0.0.0.0/0`, compile to the same
-/// reach everywhere else in the verdict, and the host's rule must not split
-/// them, or veto a private address the host's own admission table pins for
-/// the same declaration. A declared list that does not cover the destination
-/// is the refusal: a developer who wants a box to reach the LAN says so by
-/// allowing the range, so neither a name rule nor a pin can become a way
-/// around leaving it undeclared.
-///
-fn infrastructure_destination(
-    dst: [u8; 4],
-    transport: Option<(u8, u16)>,
-    own_block: SwitchSubnet,
-    allow: Option<&[Ipv4Cidr]>,
-    alias: AliasOpenings<'_>,
-) -> Option<InfrastructureHit> {
-    let ranges = &*INFRASTRUCTURE_RANGES;
-    if ranges.fixed.iter().any(|cidr| cidr.contains(dst)) {
-        return Some(InfrastructureHit::Set);
-    }
-    // The host alias is default-deny (design §7.1, NET-156): it opens only
-    // at the row's openings, whatever the row's rules say about it.
-    if dst == own_block.host_alias().octets() {
-        return (!alias.admit(transport)).then_some(InfrastructureHit::HostAlias);
-    }
-    let in_own_block = (u32::from_be_bytes(dst) & u32::from(own_block.netmask()))
-        == u32::from(own_block.network());
-    if ranges.plane.contains(dst) && !in_own_block {
-        return Some(InfrastructureHit::Set);
-    }
-    (ranges.rfc1918.iter().any(|cidr| cidr.contains(dst))
-        && !allow.is_none_or(|list| list.iter().any(|cidr| cidr.contains(dst))))
-    .then_some(InfrastructureHit::Set)
-}
 
 /// The rule name for a frame headed to the Box Egress Proxy's address that
 /// the lane does not admit (NET-134): the proxy's listener is a credentialed
@@ -1257,7 +965,7 @@ impl EgressGate {
     /// default bound) and pin the publish decision's announced arm at relay
     /// level beside the in-force one this build ships. The frame half needs
     /// no phase from here: the drop of an
-    /// unregistered source is unconditional ([`gate_verdict`] reads no phase),
+    /// unregistered source is unconditional ([`guest_frame`] reads no phase),
     /// and the start-up line logs the phase the gate was actually built with.
     ///
     /// `replies` is the gate's own reply-flow table (NET-040's answer half)
@@ -1307,6 +1015,11 @@ impl EgressGate {
         // The pins the node plane's own lookups take are adopted here, from
         // the same baseline the gate decides by, so the two never disagree.
         pins.adopt_baseline(&baseline);
+        // So does the network kernel's configuration, which decides the
+        // frames: it takes this baseline once, before the gate accepts a
+        // connection, with no registry lock held. A gate is decided by the
+        // baseline it was spawned with, and by no other.
+        table.adopt_node_baseline(&baseline);
         tracing::info!(
             baseline = %baseline.render(),
             node_addr = %Ipv4Addr::from(baseline.node_addr()),
@@ -5141,9 +4854,22 @@ async fn relay_switch_frames_to_guest(
         // identity this direction has; a frame with no IPv4 header (an ARP)
         // names none rather than a made-up address. A refusal below (the
         // proxy's opening packet, a flow at the box's cap) drops the permit
-        // unused, which hands its room back. The frame's L4 addressing is
-        // parsed once, here, for both the line and the observations below.
-        let l4 = dns_pins::parse_ipv4_l4(&frame[..n]);
+        // unused, which hands its room back. The kernel reads the frame
+        // once, here, for both the line and the observations below: a TCP or
+        // UDP first fragment without a whole header is dropped and recorded
+        // nowhere, and a frame whose destination has no tables is delivered
+        // and recorded nowhere.
+        let (facts, l4, observed) = match toward_guest(&frame[..n], &table) {
+            TowardGuest::Drop { dst, rule, cause } => {
+                limiter.warn_toward_guest(dst, Who::of(&table, dst), rule, cause);
+                continue;
+            }
+            TowardGuest::Deliver {
+                facts,
+                l4,
+                observed,
+            } => (facts, l4, observed),
+        };
         let permit = match guest.try_reserve() {
             Ok(permit) => permit,
             Err(mpsc::error::TrySendError::Full(())) => {
@@ -5199,7 +4925,10 @@ async fn relay_switch_frames_to_guest(
         // as refusable, so the reset that decision answers it with reaches
         // the client whatever the box's egress rules say (NET-014,
         // [`ReplyTables::observe_refusable`]).
-        let delivered = l4.and_then(|pkt| {
+        // The reply tables record a delivered frame only when both hold: the
+        // kernel's configuration names its destination as a row's
+        // (`observed`), and the registry holds a row there (`by_source`).
+        let delivered = l4.filter(|_| observed).and_then(|pkt| {
             let record = table.by_source(pkt.dst.ip().octets())?;
             let published =
                 forwards.inside_published(record.switch_addr().octets(), pkt.dst.port());
@@ -5237,15 +4966,13 @@ async fn relay_switch_frames_to_guest(
             ) {
                 continue;
             }
-            if let Some(segment) = forward_revoke::parse_tcp_segment(&frame[..n]) {
+            if let Some(segment) = kernel_facts::tcp_segment(&facts) {
                 forwards.flows.observe_toward_box(&segment, now);
             }
         }
-        // The pre-check is three comparisons; the parse it guards is the one
-        // that bounds-checks the datagram before the table reads a word of it.
-        if dns_pins::is_ipv4_udp(&frame[..n])
-            && let Some((pkt, datagram)) = dns_pins::udp_datagram(&frame[..n])
-        {
+        // A DNS answer toward a box with tables, from the kernel's reading of
+        // the datagram.
+        if observed && let Some((pkt, datagram)) = kernel_facts::udp_datagram(&frame[..n], &facts) {
             pins.observe_reply(&table, &pkt, datagram, &limiter, Instant::now());
         }
         // One combined write keeps the length prefix and the frame together
@@ -5261,7 +4988,7 @@ async fn relay_switch_frames_to_guest(
 /// guest → switch: the frame relay's loop, fed by the relay's attribution,
 /// which its caller ([`relay_frames`]) files after whichever relay leg ends
 /// first: read one length-framed Ethernet frame, decide it against the
-/// host-side table ([`gate_verdict`]), and hand the frame to the relay's
+/// host-side table ([`guest_frame`]), and hand the frame to the relay's
 /// switch-bound writer only when it is admitted. A dropped frame is simply
 /// not written on — nothing is sent back
 /// toward the guest either; a drop is not a reset (NET-062) — and its class
@@ -5321,40 +5048,38 @@ async fn relay_frames_to_switch(
             ));
         }
         guest.read_exact(&mut frame[..n]).await?;
-        let summary = egress::summarize(&frame[..n]);
-        // The frame's own L4 addressing, for the pin arm's flow retention: the
-        // shared summary carries the destination and its port, not the source
-        // port or the TCP flags a flow's identity and end are read from, so
-        // the table's parse supplies them — the same allocation-free,
-        // bounds-checked read the in-VM relay's is.
-        let l4 = dns_pins::parse_ipv4_l4(&frame[..n]);
-        let decided = gate_verdict(&summary, l4.as_ref(), table, baseline, pins, replies);
-        if summary.box_cohort_marked() {
-            log_marked_decision(&summary, l4.as_ref(), table, baseline, &decided);
+        // The kernel decides the frame; the daemon reads no byte of it.
+        let decided = guest_frame(&frame[..n], table, baseline, pins, replies);
+        if let Some(src) = decided.src {
+            test_hooks::after_decided(table, src);
         }
-        let admitted = match decided {
+        if decided.marked {
+            log_marked_decision(&decided, table, baseline);
+        }
+        let admitted = match decided.verdict {
             Ok(admitted) => admitted,
             // Every line below whose source a row can hold names the box that
             // row holds (as it is now, a rename moves it), beside the address
             // the line already carried: the address alone means nothing once
-            // the box is gone (gominimal/inbox#1228). All of them resolve
+            // the box is gone. All of them resolve
             // through [`Who`], which reads the row only for a line the
             // limiter lets through and names no box for the node address.
             // The unregistered-source line has no row to name, and the node
-            // plane's two lines come from the node address.
-            Err(GateDrop::SwitchControlSurface { src, dst_port }) => {
-                limiter.warn_switch_surface(src, Who::of(table, Some(src)), dst_port);
+            // plane's two lines come from the node address. A frame with no
+            // port names none.
+            Err(GateDrop::SwitchControlSurface { src, .. }) => {
+                limiter.warn_switch_surface(src, Who::of(table, Some(src)), decided.port);
                 continue;
             }
-            Err(GateDrop::Infrastructure { src, dst, dst_port }) => {
-                limiter.warn_infrastructure(src, Who::of(table, Some(src)), dst, dst_port);
+            Err(GateDrop::Infrastructure { src, dst, .. }) => {
+                limiter.warn_infrastructure(src, Who::of(table, Some(src)), dst, decided.port);
                 continue;
             }
-            Err(GateDrop::HostAlias { src, dst_port, row }) => {
-                limiter.warn_host_alias(src, Who::of(table, Some(src)), dst_port, row);
+            Err(GateDrop::HostAlias { src, row, .. }) => {
+                limiter.warn_host_alias(src, Who::of(table, Some(src)), decided.port, row);
                 continue;
             }
-            Err(GateDrop::BoxName { src, dst, dst_port }) => {
+            Err(GateDrop::BoxName { src, dst, .. }) => {
                 // The line names both boxes by the rows that hold their
                 // addresses, so a host reads who reached for whom.
                 limiter.warn_box_name(
@@ -5362,16 +5087,16 @@ async fn relay_frames_to_switch(
                     Who::of(table, Some(src)),
                     dst,
                     Who::of(table, Some(dst)),
-                    dst_port,
+                    decided.port,
                 );
                 continue;
             }
-            Err(GateDrop::ProxyLane { src, dst, dst_port }) => {
+            Err(GateDrop::ProxyLane { src, dst, .. }) => {
                 // The plan's diagnostics line wants the refusal to name the
                 // box, not only its address (#1116). The node plane and the
                 // `host_ip` cohort raise this drop from the node address,
                 // which names no one box, so that line names none.
-                limiter.warn_proxy_lane(src, Who::of(table, Some(src)), dst, dst_port);
+                limiter.warn_proxy_lane(src, Who::of(table, Some(src)), dst, decided.port);
                 continue;
             }
             Err(GateDrop::UnregisteredSource { src }) => {
@@ -5392,44 +5117,74 @@ async fn relay_frames_to_switch(
                 }
                 continue;
             }
-            Err(GateDrop::NodePlaneUnpinned { src, dst, dst_port }) => {
-                let opening = FirstOpeningDrops::is_opening(l4.as_ref());
-                first_openings.note(NODE_PLANE_UNPINNED_RULE, src, dst, dst_port, opening);
-                limiter.warn_node_plane_unpinned(src, dst, dst_port);
+            Err(GateDrop::NodePlaneUnpinned { src, dst, .. }) => {
+                let opening = FirstOpeningDrops::is_opening(decided.l4.as_ref());
+                first_openings.note(NODE_PLANE_UNPINNED_RULE, src, dst, decided.port, opening);
+                limiter.warn_node_plane_unpinned(src, dst, decided.port);
                 continue;
             }
             Err(GateDrop::HostIpUnbounded {
-                src,
-                dst,
-                dst_port,
-                resident,
+                src, dst, resident, ..
             }) => {
-                let opening = FirstOpeningDrops::is_opening(l4.as_ref());
-                first_openings.note(HOST_IP_BOXES_RULE, src, dst, dst_port, opening);
-                limiter.warn_host_ip_unbounded(src, dst, dst_port, resident);
+                let opening = FirstOpeningDrops::is_opening(decided.l4.as_ref());
+                first_openings.note(HOST_IP_BOXES_RULE, src, dst, decided.port, opening);
+                limiter.warn_host_ip_unbounded(src, dst, decided.port, resident);
                 continue;
             }
             Err(GateDrop::Verdict(reason @ DropReason::UndeclaredSubnet { dst, .. })) => {
                 // The row's own rules refused the destination, and the line
                 // names it beside the source and the rule: the destination
-                // address and the port the frame gave it, read off the frame
-                // the reason's own shape refuses — so a bundle's reader learns
-                // which reach was refused without cross-reading the rows.
+                // address and the port the frame gave it — so a bundle's
+                // reader learns which reach was refused without cross-reading
+                // the rows.
                 limiter.warn_undeclared_subnet(
-                    summary.source(),
-                    Who::of(table, summary.source()),
+                    decided.src,
+                    Who::of(table, decided.src),
                     dst,
-                    summary.destination_port(),
+                    decided.port,
                     reason.rule(),
                 );
                 continue;
             }
+            Err(GateDrop::DenyAllDns { src }) => {
+                // NET-141's deny-all case: the query is dropped by not being
+                // written on, silently toward the guest, before any resolver
+                // beyond the box sees the name. The line names the question,
+                // read for the line alone after the kernel decided, and says
+                // it once per box per name per interval.
+                let payload = decided
+                    .facts
+                    .as_ref()
+                    .and_then(|facts| kernel_facts::udp_datagram(&frame[..n], facts))
+                    .map(|(_, payload)| payload);
+                match table.by_source(src) {
+                    Some(record) => {
+                        limiter.warn_deny_all_query(&dns_pins::deny_all_line(record, payload));
+                    }
+                    None => {
+                        limiter.emit(Some(src), Who::of(table, Some(src)), DENY_ALL_DNS_RULE);
+                    }
+                }
+                continue;
+            }
+            Err(GateDrop::Internal { src, dst, cause }) => {
+                limiter.warn_internal(src, Who::of(table, src), dst, cause);
+                continue;
+            }
+            Err(GateDrop::CohortDenyAllDns { src }) => {
+                // The cohort's refusal: the same line without a box, since
+                // the node address names none of the members.
+                let payload = decided
+                    .facts
+                    .as_ref()
+                    .and_then(|facts| kernel_facts::udp_datagram(&frame[..n], facts))
+                    .map(|(_, payload)| payload);
+                let (name, query_type, outside_zone) = dns_pins::deny_all_question(payload);
+                limiter.warn_cohort_deny_all_query(src, &name, query_type, outside_zone);
+                continue;
+            }
             Err(dropped) => {
-                limiter.emit(
-                    summary.source(),
-                    Who::of(table, summary.source()),
-                    dropped.rule(),
-                );
+                limiter.emit(decided.src, Who::of(table, decided.src), dropped.rule());
                 continue;
             }
         };
@@ -5448,7 +5203,7 @@ async fn relay_frames_to_switch(
         // shuttle close its control path rode out.
         let src = match admitted {
             GateAdmit::Baseline | GateAdmit::Row | GateAdmit::ProxyLane | GateAdmit::HostIpBox => {
-                summary.source()
+                decided.src
             }
         };
         if let Some(src) = src
@@ -5458,34 +5213,26 @@ async fn relay_frames_to_switch(
             // from here on: this connection may now key state by it. The
             // mark is once per row, not per source: a row reinstated while
             // this relay carries its box is marked again (NET-138).
-            table.carry(src, carried);
+            // Only the row the frame was decided for is marked.
+            if let Some(row) = &decided.decided_for.row {
+                table.carry(src, row.generation(), carried);
+            }
             if !attributed.contains(&src) {
                 attributed.push(src);
             }
         }
-        // The box's DNS datagram, read once for both checks below: only for
-        // a UDP frame headed to DNS's port — UDP is most of a box's traffic
-        // and DNS a sliver of it — and only for a frame the gate admitted.
-        let dns = if dns_pins::is_ipv4_udp(&frame[..n])
-            && l4.as_ref().is_some_and(|l4| l4.dst.port() == RESOLVER_PORT)
-        {
-            dns_pins::udp_datagram(&frame[..n])
-        } else {
-            None
-        };
-        // NET-141's deny-all case, decided here for own-address rows: a
-        // deny-all box's query that names anything outside the box zone (or
-        // asks a zone name for anything but A, or does not parse as a
-        // standard query) is dropped by not being written on — silently
-        // toward the guest, like every drop here — and said once per box per
-        // name per interval. Before the write, so no resolver beyond the box
-        // ever sees the name.
-        if let Some((query, datagram)) = &dns
-            && let Some(refusal) = dns_pins::deny_all_refusal(table, query, datagram)
-        {
-            limiter.warn_deny_all_query(&refusal);
-            continue;
-        }
+        // The box's DNS datagram, from the kernel's reading: only for a UDP
+        // frame headed to DNS's port — UDP is most of a box's traffic and DNS
+        // a sliver of it — and only for a frame the gate admitted.
+        let dns = decided
+            .facts
+            .as_ref()
+            .filter(|_| {
+                decided.l4.as_ref().is_some_and(|l4| {
+                    l4.proto == egress::IPPROTO_UDP && l4.dst.port() == RESOLVER_PORT
+                })
+            })
+            .and_then(|facts| kernel_facts::udp_datagram(&frame[..n], facts));
         // One combined write keeps the length prefix and the frame together
         // even if the switch closes between two writes — and the queue keeps
         // this leg reading when the switch stops reading: a frame the queue
@@ -5506,8 +5253,8 @@ async fn relay_frames_to_switch(
             Err(mpsc::error::TrySendError::Full(_)) => {
                 limiter.warn_backpressure(
                     QueueDirection::TowardSwitch,
-                    summary.source(),
-                    Who::of(table, summary.source()),
+                    decided.src,
+                    Who::of(table, decided.src),
                 );
                 continue;
             }
@@ -5522,11 +5269,7 @@ async fn relay_frames_to_switch(
         // the sequence number a reset at its end is built at. The table
         // updates only a connection the switch's side opened, so any other
         // TCP frame costs one lookup and records nothing.
-        if l4
-            .as_ref()
-            .is_some_and(|l4| l4.proto == egress::IPPROTO_TCP)
-            && let Some(segment) = forward_revoke::parse_tcp_segment(&frame[..n])
-        {
+        if let Some(segment) = decided.facts.as_ref().and_then(kernel_facts::tcp_segment) {
             forwards.flows.observe_from_box(&segment, Instant::now());
         }
         // The reply matching's other half: the box's own DNS query, one the
@@ -5539,13 +5282,9 @@ async fn relay_frames_to_switch(
         // the resolver's port — and only for a frame the queue took, which
         // is why this sits after the enqueue.
         if let Some((query, datagram)) = dns {
-            pins.observe_query(
-                table,
-                &query,
-                datagram,
-                summary.box_cohort_marked(),
-                Instant::now(),
-            );
+            let from_node = decided.src == Some(table.subnet().daemon_ip().octets());
+            let asker = decided.decided_for.asker(decided.marked && from_node);
+            pins.observe_query(table, asker, &query, datagram, Instant::now());
         }
     }
 }
@@ -5558,7 +5297,7 @@ async fn relay_frames_to_switch(
 /// Two postures this module carries, one unconditional and one phased, and
 /// the phase governs only the second: the frame-level drop of a source no row
 /// holds is unconditional (NET-085, T89 #1925) — no phase reaches
-/// [`gate_verdict`], so a source the table does not publish never leaves the
+/// [`guest_frame`], so a source the table does not publish never leaves the
 /// VM whatever this constant says — while a box's *declared* egress is the
 /// phased thing: an undeclared own-address box's default, the gate's handling
 /// of a row with no egress section (an absent section still allows all while
@@ -5748,7 +5487,7 @@ impl FirstOpeningDrops {
         rule: &'static str,
         src: [u8; 4],
         dst: [u8; 4],
-        dst_port: u16,
+        dst_port: Option<u16>,
         opening: bool,
     ) -> bool {
         if !opening
@@ -5760,7 +5499,7 @@ impl FirstOpeningDrops {
         tracing::warn!(
             source = %Ipv4Addr::from(src),
             destination = %Ipv4Addr::from(dst),
-            port = %if dst_port == 0 { "none".to_string() } else { dst_port.to_string() },
+            port = dst_port.map(port_text).map(tracing::field::display),
             rule_matched = rule,
             "dropped the first opening packet leaving the VM under this rule from this source \
              address; later drops under this rule from this source are only in the \
@@ -5964,8 +5703,8 @@ impl ReplyTables {
     /// toward a box, so a proxy-sourced opening packet at a box's published
     /// port has no legitimate origin, and the stream it
     /// would open must never become a reply flow the box could reverse-answer
-    /// ([`gate_verdict`]'s reply-flow admit). Defense in depth — the
-    /// reply-flow admit in [`gate_verdict`] itself never admits a frame to
+    /// ([`guest_frame`]'s reply-flow admit). Defense in depth — the
+    /// reply-flow admit in [`guest_frame`] itself never admits a frame to
     /// the proxy's address, whatever record exists, and leaves it to the
     /// lane arm; this decline keeps such a record from being minted at all.
     pub(crate) fn observe_delivered(
@@ -6326,264 +6065,650 @@ fn reply_tuple_of(pkt: &dns_pins::L4Packet) -> egress::FlowTuple {
     )
 }
 
-/// The in-force node-plane decision for a frame from the in-VM daemon's own
-/// address (NET-085, NET-130). The frame is admitted to:
-///
-/// - an address the node plane's own lookups pinned for a baseline entry's
-///   name, or a flow such a pin established ([`dns_pins::DnsPins::admits_node_frame`]),
-///   at [`NODE_PLANE_FETCH_PROTOCOL`] and [`NODE_PLANE_FETCH_PORTS`] only;
-/// - a subnet a baseline entry names, and the resolver carve-out, both by the
-///   set's compiled rules;
-/// - the host alias at the configured host exposures, over TCP or UDP, and
-///   at the ports the set's own endpoints open there;
-/// - a box's lease the registry holds, which the target box's ingress
-///   decides on the switch's side, the reach the node's hostname proxy and
-///   its answers to the boxes ride.
-///
-/// Everything else is refused. The infrastructure deny set is decided first,
-/// the Box Egress Proxy's address is refused because no category names it,
-/// and a destination no rule admits and no pin names is
-/// [`NODE_PLANE_UNPINNED_RULE`]'s drop.
-fn node_plane_verdict(
-    summary: &FrameSummary,
-    l4: Option<&dns_pins::L4Packet>,
-    table: &BoxTable,
-    baseline: &NodePlaneBaseline,
-    pins: &dns_pins::DnsPins,
-) -> Result<GateAdmit, GateDrop> {
-    let Some(src) = summary.source() else {
-        return Err(GateDrop::Verdict(family_drop(summary.family())));
-    };
-    // ARP and every frame with no destination address: the set's verdict
-    // decides them, the way a row's decides a box's.
-    let Some(dst) = summary.destination() else {
-        return match egress::verdict(summary, baseline.rules()) {
-            FrameVerdict::Admit => Ok(GateAdmit::Baseline),
-            FrameVerdict::Drop(reason) => Err(GateDrop::Verdict(reason)),
-        };
-    };
-    let dst_port = summary.destination_port();
-    let subnet = table.subnet();
-    if dst == subnet.box_egress_proxy_address().octets() {
-        return Err(GateDrop::ProxyLane { src, dst, dst_port });
+/// How many times a frame to the host alias reads the exposure list, hands
+/// it over and asks the kernel, when another frame handed over a different
+/// list in between. When every round finds the configuration holding
+/// another list, the frame is dropped under [`INTERNAL_RULE`].
+const ALIAS_ASKS: usize = 3;
+
+/// How many times a frame a guest sent is asked of the kernel when a
+/// record the registry holds (the row at its source, and for a marked frame
+/// from the node address the resident `host_ip` boxes' record) is not the
+/// one the kernel's answer was made for. When the second answer is not for
+/// the records held either, the frame is dropped under [`INTERNAL_RULE`].
+const ROW_ASKS: usize = 2;
+
+/// Seams between the gate's reads of one frame a guest sent, where a test
+/// changes the configuration the way a concurrent write section would. Each
+/// does nothing outside tests.
+mod test_hooks {
+    use crate::box_registry::BoxTable;
+
+    /// A test's hook given the table and the frame's source address.
+    #[cfg(test)]
+    pub(super) type SourceHook = Box<dyn FnMut(&BoxTable, [u8; 4])>;
+
+    /// A test's hook given the table.
+    #[cfg(test)]
+    pub(super) type TableHook = Box<dyn FnMut(&BoxTable)>;
+
+    #[cfg(test)]
+    thread_local! {
+        /// Run after the kernel's answer for a frame is copied out and before
+        /// the registry's row at its source is read.
+        pub(super) static BETWEEN_READS: std::cell::RefCell<Option<SourceHook>> =
+            const { std::cell::RefCell::new(None) };
+        /// Run after a frame to the host alias hands over the exposure list
+        /// it read, before it asks the kernel again.
+        pub(super) static AFTER_EXPOSURES_PUSHED: std::cell::RefCell<Option<TableHook>> =
+            const { std::cell::RefCell::new(None) };
+        /// Run on the relay after a frame a guest sent is decided, before
+        /// anything is recorded for it.
+        pub(super) static AFTER_DECIDED: std::cell::RefCell<Option<SourceHook>> =
+            const { std::cell::RefCell::new(None) };
     }
-    match infrastructure_destination(
-        dst,
-        alias_transport(summary),
-        subnet,
-        baseline.rules().allow_subnets(),
-        AliasOpenings::new(AliasRow::Node, baseline, table),
-    ) {
-        Some(InfrastructureHit::Set) => {
-            return Err(GateDrop::Infrastructure { src, dst, dst_port });
-        }
-        Some(InfrastructureHit::HostAlias) => {
-            return Err(GateDrop::HostAlias {
-                src,
-                dst_port,
-                row: AliasRow::Node,
-            });
-        }
-        None => {}
+
+    /// Runs the test's `BETWEEN_READS` hook, when one is set.
+    pub(super) fn between_reads(table: &BoxTable, src: [u8; 4]) {
+        #[cfg(test)]
+        BETWEEN_READS.with_borrow_mut(|hook| {
+            if let Some(hook) = hook {
+                hook(table, src);
+            }
+        });
+        #[cfg(not(test))]
+        let _ = (table, src);
     }
-    // Past the infrastructure check, the alias is at one of the node's
-    // openings there: a host exposure or the baseline set's own port.
-    if dst == subnet.host_alias().octets() {
-        return Ok(GateAdmit::Baseline);
+
+    /// Runs the test's `AFTER_EXPOSURES_PUSHED` hook, when one is set.
+    pub(super) fn after_exposures_pushed(table: &BoxTable) {
+        #[cfg(test)]
+        AFTER_EXPOSURES_PUSHED.with_borrow_mut(|hook| {
+            if let Some(hook) = hook {
+                hook(table);
+            }
+        });
+        #[cfg(not(test))]
+        let _ = table;
     }
-    // A box's lease: the target's ingress decides it on the switch's side.
-    if dst != src
-        && table
-            .by_source(dst)
-            .is_some_and(|record| record.switch_addr().octets() == dst)
-    {
-        return Ok(GateAdmit::Baseline);
-    }
-    match egress::verdict(summary, baseline.rules()) {
-        FrameVerdict::Admit => Ok(GateAdmit::Baseline),
-        FrameVerdict::Drop(DropReason::UndeclaredSubnet { .. })
-            if summary.protocol() == Some(NODE_PLANE_FETCH_PROTOCOL)
-                && NODE_PLANE_FETCH_PORTS.contains(&dst_port)
-                && pins.admits_node_frame(table, baseline, dst, l4, Instant::now()) =>
-        {
-            Ok(GateAdmit::Baseline)
-        }
-        FrameVerdict::Drop(DropReason::UndeclaredSubnet { .. }) => {
-            Err(GateDrop::NodePlaneUnpinned { src, dst, dst_port })
-        }
-        FrameVerdict::Drop(reason) => Err(GateDrop::Verdict(reason)),
+
+    /// Runs the test's `AFTER_DECIDED` hook, when one is set.
+    pub(super) fn after_decided(table: &BoxTable, src: [u8; 4]) {
+        #[cfg(test)]
+        AFTER_DECIDED.with_borrow_mut(|hook| {
+            if let Some(hook) = hook {
+                hook(table, src);
+            }
+        });
+        #[cfg(not(test))]
+        let _ = (table, src);
     }
 }
 
-/// The gate's admit-or-drop decision for one frame summary against the
-/// host-side table (NET-081): pure — a function of the summary, the table,
-/// the baseline set, the phase, the DNS admission table and the reply-flow
-/// tables, nothing else — and deliberately separate from the relay loop that
-/// applies it, the same discipline the shared verdict keeps.
+/// A rule the kernel reports by number, by its name.
+fn rule_name(rule: u8) -> &'static str {
+    netcore::report::NAMES
+        .get(usize::from(rule))
+        .copied()
+        .unwrap_or("internal")
+}
+
+/// The gate's decision for one frame a guest sent ([`guest_frame`]), with
+/// what the relay acts on beside it and what the drop lines name.
+struct GuestFrame {
+    /// Admitted, and how; or dropped, and why.
+    verdict: Result<GateAdmit, GateDrop>,
+    /// What the kernel read of the frame; `None` for bytes that are no
+    /// frame or carry a short transport header.
+    facts: Option<Facts>,
+    /// The frame's TCP or UDP addressing on a first fragment with a whole
+    /// header, built from the kernel's reading, for the daemon's own tables.
+    l4: Option<dns_pins::L4Packet>,
+    /// The source address the frame carries, when it carries one.
+    src: Option<[u8; 4]>,
+    /// The destination address, when the frame is IPv4.
+    dst: Option<[u8; 4]>,
+    /// The destination port, when the frame is TCP or UDP with a whole
+    /// header on a first fragment; `None` for a frame that has no port.
+    port: Option<u16>,
+    /// The frame wears the host-address boxes' mark.
+    marked: bool,
+    /// The registry records the frame was decided for; the relay records
+    /// what it observes of the frame for them alone.
+    decided_for: DecidedFor,
+}
+
+impl GuestFrame {
+    /// A drop decided before the frame was routed: nothing of it was read
+    /// for the daemon's tables.
+    fn unrouted(verdict: Result<GateAdmit, GateDrop>, src: Option<[u8; 4]>) -> Self {
+        Self {
+            verdict,
+            facts: None,
+            l4: None,
+            src,
+            dst: None,
+            port: None,
+            marked: false,
+            decided_for: DecidedFor::default(),
+        }
+    }
+}
+
+/// The registry records a frame a guest sent was decided for, each the one
+/// the kernel's answer was made for ([`guest_frame`]).
+#[derive(Default)]
+struct DecidedFor {
+    /// The row at the frame's source; `None` when no row holds it.
+    row: Option<Arc<BoxRecord>>,
+    /// The resident `host_ip` boxes' record, for a marked frame from the
+    /// node address; `None` for every other frame, and while no resident
+    /// box declares a DNS host.
+    cohort: Option<Arc<BoxRecord>>,
+}
+
+impl DecidedFor {
+    /// Whose question a DNS query in the frame is ([`dns_pins::Asker`]).
+    fn asker(&self, marked_from_node: bool) -> dns_pins::Asker<'_> {
+        if marked_from_node {
+            dns_pins::Asker::Cohort(self.cohort.as_ref())
+        } else {
+            dns_pins::Asker::Row(self.row.as_ref())
+        }
+    }
+}
+
+/// What a frame a guest sent says, as the arms' drops name it.
+#[derive(Clone, Copy)]
+struct Seen<'a> {
+    src: [u8; 4],
+    dst: [u8; 4],
+    /// The destination port, 0 for a frame that has no port.
+    dst_port: u16,
+    proto: u8,
+    l4: Option<&'a dns_pins::L4Packet>,
+    sent: netcore::judge::Sent,
+}
+
+/// The gate's decision for one frame a guest sent (`bytes`), in one order.
+/// The kernel reads and routes the frame and gives its arm; bytes that are
+/// no frame, or carry a short transport header, drop under the kernel's
+/// rule. A query to the resolver from a row, or the cohort, that names
+/// nothing drops under [`DENY_ALL_DNS_RULE`] before any table is asked.
+/// Then the source's reply tables admit a frame that exactly reverses a live
+/// inbound flow or answers a noted connect, keyed by the source address, as
+/// before the routing; never a frame to the Box Egress Proxy's address.
+/// Then the arm: an admitting arm admits; an arm a lift may turn asks the
+/// daemon's own tables in the kernel's order (a DNS admission, then the
+/// alias by name, then the box name; the node's admission only for a
+/// fetch-shaped frame); every other arm drops under the rule the kernel
+/// reports for it. The daemon reads no byte of the frame to decide.
+fn guest_frame(
+    bytes: &[u8],
+    table: &BoxTable,
+    baseline: &NodePlaneBaseline,
+    pins: &dns_pins::DnsPins,
+    replies: &ReplyTables,
+) -> GuestFrame {
+    let mut asks = 0;
+    let (frame, facts, with, arm, members, decided_for) = loop {
+        let (first, members, asked) = match ask_kernel(bytes, table, baseline) {
+            Ok(answer) => answer,
+            Err(dropped) => {
+                let src = match dropped {
+                    GateDrop::Internal { src, .. } => src,
+                    _ => None,
+                };
+                return GuestFrame::unrouted(Err(dropped), src);
+            }
+        };
+        let (frame, facts, with, arm) = match first {
+            First::NotAFrame(why) => {
+                let rule = rule_name(netcore::report::not_a_frame(why));
+                return GuestFrame::unrouted(Err(GateDrop::NotAFrame { rule }), None);
+            }
+            First::ShortHeader => {
+                // The source, for the line alone, from the kernel's own reading.
+                let src = match netcore::frame::parse_frame(bytes) {
+                    Facts::V4(v) => Some(v.src.to_be_bytes()),
+                    Facts::Arp { .. } | Facts::Other(_) => None,
+                };
+                return GuestFrame::unrouted(Err(GateDrop::ShortHeader { src }), src);
+            }
+            First::Frame {
+                frame,
+                facts,
+                with,
+                arm,
+            } => (frame, facts, with, arm),
+        };
+        let src = frame.sent.src.to_be_bytes();
+        test_hooks::between_reads(table, src);
+        // The records the kernel's answer was made for must be the ones the
+        // registry holds when they are read here: their tables are the ones
+        // asked below and the ones the relay records in. The resident
+        // `host_ip` boxes' record is read for a marked frame from the node
+        // address alone.
+        let row = table.by_source(src);
+        let cohort_frame = marked_from_node(&facts, frame.dscp, src, table);
+        let cohort = if cohort_frame {
+            table.host_ip_cohort()
+        } else {
+            None
+        };
+        let generation = |record: &Option<Arc<BoxRecord>>| record.as_ref().map(|r| r.generation());
+        if generation(&row) == asked.row && (!cohort_frame || generation(&cohort) == asked.cohort) {
+            break (frame, facts, with, arm, members, DecidedFor { row, cohort });
+        }
+        asks += 1;
+        if asks == ROW_ASKS {
+            let dst = match frame.sent.kind {
+                SentKind::V4 { dst, .. } => Some(dst.to_be_bytes()),
+                SentKind::Arp => None,
+            };
+            let dropped = GateDrop::Internal {
+                src: Some(src),
+                dst,
+                cause: InternalCause::RowChanged,
+            };
+            return GuestFrame::unrouted(Err(dropped), Some(src));
+        }
+    };
+    let src = frame.sent.src.to_be_bytes();
+    let (dst, proto, port) = match frame.sent.kind {
+        SentKind::V4 { dst, proto, l4 } => {
+            (Some(dst.to_be_bytes()), proto, l4.map(|ports| ports.dport))
+        }
+        SentKind::Arp => (None, 0, None),
+    };
+    let marked = matches!(facts, Facts::V4(_)) && frame.dscp == egress::BOX_COHORT_DSCP;
+    let l4 = kernel_facts::l4_packet(&facts);
+    let seen = Seen {
+        src,
+        dst: dst.unwrap_or_default(),
+        dst_port: port.unwrap_or(0),
+        proto,
+        l4: l4.as_ref(),
+        sent: frame.sent,
+    };
+    let verdict = decide_arm(
+        arm,
+        with.lifts,
+        members,
+        &seen,
+        &decided_for,
+        table,
+        baseline,
+        pins,
+        replies,
+    );
+    GuestFrame {
+        verdict,
+        facts: Some(facts),
+        l4,
+        src: Some(src),
+        dst,
+        port,
+        marked,
+        decided_for,
+    }
+}
+
+/// Whether a frame a guest sent wears the host-address boxes' mark and the
+/// node's address: the resident `host_ip` boxes' frame, whose DNS question
+/// and pins are theirs.
+fn marked_from_node(facts: &Facts, dscp: u8, src: [u8; 4], table: &BoxTable) -> bool {
+    matches!(facts, Facts::V4(_))
+        && dscp == egress::BOX_COHORT_DSCP
+        && src == table.subnet().daemon_ip().octets()
+}
+
+/// The kernel's answer for a frame a guest sent, with the number of
+/// resident `host_ip` boxes and the registry records the answer was made
+/// for ([`AskedFor`]). A frame to the host alias is decided on a
+/// configuration that holds the exposure list this frame read from the
+/// exposure table, under the read lock it is decided under: when the
+/// configuration holds another list, the lock is released, the list is
+/// handed over, and the frame is asked again. When [`ALIAS_ASKS`] rounds
+/// all find another list, the frame is dropped under [`INTERNAL_RULE`]. A
+/// frame to any other address is answered once: no arm reads the list for
+/// it.
 ///
-/// The frame's source address is the routing, with one split at the node
-/// address: the node plane's own frames there are decided by the baseline
-/// set ([`NodePlaneBaseline`], the helper's enumeration of the categories
-/// the in-VM daemon's traffic may reach, NET-130), and a frame the guest's
-/// classifier marked as a box's (`BOX_COHORT_DSCP`, written from the
-/// sender's cgroup) is decided by the union of the resident `host_ip`
-/// boxes' rules ([`host_ip_verdict`]), never by the node row. The
-/// published namespace that holds any other source
-/// supplies the rules its frames are decided by, and an address neither
-/// covers is the phase's to decide — [`UnregisteredSourcePhase`] carries what
-/// that means and why. The node plane is decided before the table because the
-/// run path's row for the daemon's address is the allow-all interim the
-/// enumeration replaces: consulted first, it would make the enumeration
-/// decorative. Families that carry no readable source address (IPv6,
-/// undeclared ethertypes, truncated frames) never reach the table: the shared
-/// verdict's own family drops decide them, under any rules, fail-closed.
+/// Every frame to the alias reads the exposure table, those whose arm reads
+/// no list included: a frame without ports, and the node's at a fetch port
+/// its baseline opens there (the kernel's `alias_open` answers both before
+/// the list). Such a frame pays for the read and may hand over a new list,
+/// though its own answer does not depend on one.
 ///
-/// Two destinations no row decides either, in every phase. The switch's own
-/// address ([`SWITCH_CONTROL_RULE`]) is refused for everything but TCP or UDP
-/// to the resolver's port, before the row's decision and the interim. And the
-/// §5.3 infrastructure deny set ([`INFRASTRUCTURE_RULE`]) is refused for
-/// every row, between the source's routing and the row's own rules: the set
-/// applies to every box-plane packet, CIDR-admitted direct-IP flows included,
-/// so a row's `allow_subnets` admits nothing in it — RFC 1918 under an
-/// explicit allowance excepted — and the pin arm a name-declaring row earns
-/// for its undeclared destinations never reaches it. The order is the
-/// contract: the reply-flow record, then the control surface, then the
-/// source's attribution (a baseline-decided node frame, a row, or the phase's
-/// unknown-source decision), then the infrastructure set, then the proxy
-/// lane, then the row's rules, then the pin arm.
-/// The reply-flow record never admits a frame to the proxy's address: such
-/// a frame skips it and goes on down the order to the proxy lane arm, which
-/// decides it by the row's lane declaration (NET-134).
-///
-/// The reply-flow record goes ahead of the control-surface check because the
-/// answer to a host-published port's connection is a frame *to the gateway*:
-/// the forwarder dials the box from the switch's own address, so the box's
-/// answer names the switch as its destination — the very address the
-/// control-surface rule refuses. The record is the one thing that tells the
-/// two apart: it exists only for a flow this gate itself delivered toward a
-/// port one of the box's applied publishes dials, and it admits only its
-/// exact reverse, so a box reaching for the switch's API ports still finds
-/// them refused, whatever it dials. Nothing else moves — the lease check the
-/// shared verdict carries still governs every frame, and a destination no
-/// record names keeps every drop it ever took.
-///
-/// One destination is decided beside the rules instead of refused outright:
-/// the Box Egress Proxy's listener (NET-134), the third thing the frame's
-/// destination is checked against after the source's routing. The proxy's
-/// listener is a credentialed lane's infrastructure — a box reaches it by
-/// declaring the upstream, not by allowing its address — so the listener,
-/// TCP to `bep_host::PROXY_PORT`, is admitted for the one row that declared
-/// the lane, whatever its compiled rules say about the frame
-/// ([`GateAdmit::ProxyLane`]), and every other frame to the proxy's address
-/// is refused under [`PROXY_LANE_RULE`], whatever the source: a row that
-/// declared no upstream, a row that declared the lane but sent another
-/// port or another protocol, neither of which the declaration ever opened,
-/// and the node plane's baseline set, which holds the address for no
-/// category. The lane arm sits after the attribution on purpose: it reads
-/// the row the frame's source resolved to, so a frame wearing a source the
-/// table does not hold is one of the two source refusals', and a frame to
-/// the listener from an address no row owns never rides a lane it never
-/// declared.
-fn gate_verdict(
-    summary: &FrameSummary,
-    l4: Option<&dns_pins::L4Packet>,
+/// A frame that meets the configuration's lock poisoned is answered
+/// nothing and dropped under [`INTERNAL_RULE`] ([`InternalCause::Poisoned`]).
+fn ask_kernel(
+    bytes: &[u8],
+    table: &BoxTable,
+    baseline: &NodePlaneBaseline,
+) -> Result<(First, usize, AskedFor), GateDrop> {
+    let answer = table
+        .egress_first(bytes)
+        .map_err(|Poisoned| poisoned_drop(bytes))?;
+    let alias = u32::from(table.subnet().host_alias());
+    let src = match answer.0 {
+        First::Frame { frame, .. } => match frame.sent.kind {
+            SentKind::V4 { dst, .. } if dst == alias => frame.sent.src.to_be_bytes(),
+            SentKind::V4 { .. } | SentKind::Arp => return Ok(answer),
+        },
+        First::NotAFrame(_) | First::ShortHeader => return Ok(answer),
+    };
+    for _ in 0..ALIAS_ASKS {
+        let open = alias_exposures(table, baseline);
+        let holding = table
+            .egress_first_holding(bytes, &open)
+            .map_err(|Poisoned| poisoned_drop(bytes))?;
+        if let Some(answer) = holding {
+            return Ok(answer);
+        }
+        table.push_exposures(&open);
+        test_hooks::after_exposures_pushed(table);
+    }
+    Err(GateDrop::Internal {
+        src: Some(src),
+        dst: Some(alias.to_be_bytes()),
+        cause: InternalCause::ExposuresChanged,
+    })
+}
+
+/// The drop of a frame a guest sent that met a lock it is decided under
+/// poisoned: its source and destination are the kernel's own reading of it,
+/// taken without the lock, and `None` for bytes that carry no IPv4 header.
+fn poisoned_drop(bytes: &[u8]) -> GateDrop {
+    let (src, dst) = match netcore::frame::parse_frame(bytes) {
+        Facts::V4(v) => (Some(v.src.to_be_bytes()), Some(v.dst.to_be_bytes())),
+        Facts::Arp { .. } | Facts::Other(_) => (None, None),
+    };
+    GateDrop::Internal {
+        src,
+        dst,
+        cause: InternalCause::Poisoned,
+    }
+}
+
+/// The host exposures the exposure table opens at the alias while
+/// Minimal's own listeners hold their ports (NET-162), read where the frame
+/// path reads them: the hostname proxy at the node row's ports, the
+/// box-name answerer, the Box Egress Proxy and the baseline's endpoints at
+/// the alias. The table stats its file at most once a second, and says once
+/// each entry a listener shadows.
+fn alias_exposures(
+    table: &BoxTable,
+    baseline: &NodePlaneBaseline,
+) -> Arc<[host_exposures::HostExposure]> {
+    let node = table.by_source(table.subnet().daemon_ip().octets());
+    let held = host_exposures::minimal_listeners(
+        node.as_deref().map_or(&[][..], BoxRecord::admitted_ports),
+        baseline.alias_ports(),
+        baseline::ALIAS_FETCH_PROTOCOL,
+    );
+    baseline.host_exposure_ports(&held)
+}
+
+/// What the gate does with the kernel's arm for a routed frame, after the
+/// deny-all DNS check and the reply tables ([`guest_frame`]). `decided_for`
+/// holds the records the arm was made for: the reply tables and the DNS
+/// lifts are asked for those records.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the arm, its lifts, the resident count, the frame, the row it was decided \
+              for and the four tables the arm may ask are each a distinct input; grouping \
+              them would name the bundle without naming the members"
+)]
+fn decide_arm(
+    arm: Arm,
+    lifts: netcore::judge::Lifts,
+    members: usize,
+    seen: &Seen<'_>,
+    decided_for: &DecidedFor,
     table: &BoxTable,
     baseline: &NodePlaneBaseline,
     pins: &dns_pins::DnsPins,
     replies: &ReplyTables,
 ) -> Result<GateAdmit, GateDrop> {
-    let Some(src) = summary.source() else {
-        return Err(GateDrop::Verdict(family_drop(summary.family())));
-    };
-    // NET-040's answer half: a frame whose five-tuple exactly reverses a live
-    // inbound flow this gate's ingress leg recorded — the connection a
-    // published port received, delivered by this gate itself — passes
-    // without a single rule being consulted, the row's `deny_subnets` and
-    // the infrastructure set included, because a destination the box's rules
-    // refuse is what a reply to a published port *is*. The record admits its
-    // exact reverse and nothing else: the box's next connection finds no
-    // record, and no frame the box sends can open one, so a box cannot mint
-    // this admission — it can only answer a flow a client's packet earned.
-    // A frame no record admits stays exactly where it was, with every check
-    // below deciding it as it always has.
-    // NET-014 rides the same arm: the refusal of a bare SYN the ingress leg
-    // delivered at a port no publish dials — the reset the in-VM relay's
-    // gate (or the box's kernel) answers it with, in a kernel refusal's
-    // exact shape and numbers — passes once, whatever the row's rules say,
-    // so a connect to a deny-all box's unpublished port is refused rather
-    // than timed out ([`ReplyTables::refusal_admits`]). It too is only ever
-    // an answer: nothing the box sends notes a connect.
-    // A frame to the Box Egress Proxy's address is never a record's to
-    // admit: the proxy only answers a lane's dial and never opens a flow
-    // toward a box (NET-134), so no record can legitimately reverse to it,
-    // and the frame goes on down the order to the lane arm below, which
-    // decides it by the row's lane declaration.
-    if let Some(pkt) = l4
-        && summary.destination() != Some(table.subnet().box_egress_proxy_address().octets())
-        && let Some(record) = table.by_source(src)
-        && (replies.reply_admits(&record, pkt, Instant::now())
-            || replies.refusal_admits(&record, pkt, Instant::now()))
+    let src = seen.src;
+    if let Arm::RowDns(_) = arm {
+        return Err(GateDrop::DenyAllDns { src });
+    }
+    if matches!(arm, Arm::CohortDns) {
+        return Err(GateDrop::CohortDenyAllDns { src });
+    }
+    let now = Instant::now();
+    if let Some(pkt) = seen.l4
+        && seen.dst != table.subnet().box_egress_proxy_address().octets()
+        && let Some(record) = decided_for.row.as_ref()
+        && (replies.reply_admits(record, pkt, now) || replies.refusal_admits(record, pkt, now))
     {
         return Ok(GateAdmit::Row);
     }
-    // The switch's own address is a control surface, not a destination a
-    // box's egress rules decide (design §4.1, §7.1). Every frame from a box
-    // to the gateway — the address the resolver answers at, and the one
-    // gvproxy's API listens on — is refused unless it is TCP or UDP to the
-    // resolver's port, whatever the rows would say about the rest of the
-    // frame: any other port, and any other protocol (ICMP has no
-    // port to carve out by), points at the switch itself. A row's admitted
-    // ports are no exception — they are the box's own ingress, what others
-    // reach on the box's address through the switch's forwarders, and no
-    // box-to-gateway flow at them exists. The check sits before the row's
-    // decision, so no allow-all row can admit a frame at the switch's own
-    // address, and it reads no phase at all, so it binds unchanged whatever
-    // the egress default's rollout does.
-    // The one frame this check never sees is the reply the record above
-    // admitted: a forwarder's dial arrives at the box from the switch's own
-    // address, so the box's answer to it names the gateway — and that
-    // answer, the exact reverse of a flow this gate delivered toward the
-    // box's published port, is not a reach for the control surface but the
-    // half of a connection the host itself opened. The resolver carve-out
-    // falls through to the decision behind this check — the row's own
-    // rules — which still decides it, so the carve-out admits
-    // exactly what it admitted before, and the refusal adds a ceiling
-    // without moving any floor.
-    if summary.destination() == Some(table.gateway()) {
-        let dst_port = summary.destination_port();
-        let resolver_query = summary
-            .protocol()
-            .is_some_and(|proto| RESOLVER_PROTOCOLS.contains(&proto))
-            && dst_port == RESOLVER_PORT;
-        if !resolver_query {
-            return Err(GateDrop::SwitchControlSurface { src, dst_port });
+    match arm {
+        Arm::Refused(Stray::ControlSurface) => Err(GateDrop::SwitchControlSurface {
+            src,
+            dst_port: seen.dst_port,
+        }),
+        Arm::Refused(Stray::Unregistered) => Err(GateDrop::UnregisteredSource { src }),
+        Arm::Refused(Stray::Unknown) => Err(GateDrop::UnknownSource { src }),
+        Arm::Row(_, arm) => row_arm(arm, lifts, seen, decided_for.row.as_ref(), table, pins),
+        Arm::Node(arm) => node_arm(arm, seen, table, baseline, pins),
+        Arm::Cohort(arm) => cohort_arm(arm, members, seen, decided_for.cohort.as_ref(), pins),
+        Arm::RowDns(_) => Err(GateDrop::DenyAllDns { src }),
+        Arm::CohortDns => Err(GateDrop::CohortDenyAllDns { src }),
+    }
+}
+
+/// A registered row's arm. The node namespace's own row, which the node
+/// plane rides while its baseline is not in force, names the cohort in the
+/// host-alias line.
+fn row_arm(
+    arm: RowArm,
+    lifts: netcore::judge::Lifts,
+    seen: &Seen<'_>,
+    record: Option<&Arc<BoxRecord>>,
+    table: &BoxTable,
+    pins: &dns_pins::DnsPins,
+) -> Result<GateAdmit, GateDrop> {
+    let Seen {
+        src,
+        dst,
+        dst_port,
+        proto,
+        ..
+    } = *seen;
+    match arm {
+        RowArm::Arp | RowArm::Resolver | RowArm::Rules => Ok(GateAdmit::Row),
+        RowArm::LaneAdmit => Ok(GateAdmit::ProxyLane),
+        RowArm::ControlSurface => Err(GateDrop::SwitchControlSurface { src, dst_port }),
+        RowArm::InfraFixed | RowArm::InfraPlane | RowArm::InfraPrivate => {
+            Err(GateDrop::Infrastructure { src, dst, dst_port })
+        }
+        RowArm::AliasClosed => {
+            let row = if src == table.subnet().daemon_ip().octets() {
+                AliasRow::Cohort
+            } else {
+                AliasRow::Box
+            };
+            Err(GateDrop::HostAlias { src, dst_port, row })
+        }
+        RowArm::LaneRefuse => Err(GateDrop::ProxyLane { src, dst, dst_port }),
+        RowArm::UndeclaredProtocol => {
+            Err(GateDrop::Verdict(DropReason::UndeclaredProtocol { proto }))
+        }
+        RowArm::DeniedSubnet => Err(GateDrop::Verdict(DropReason::DeniedSubnet { dst, proto })),
+        RowArm::UndeclaredSubnet => {
+            // The lifts, in the kernel's order: a DNS admission the row's own
+            // lookups earned, then the alias by name, then the box name.
+            if lifts.resolves_names
+                && record
+                    .is_some_and(|record| pins.admits_frame(record, dst, seen.l4, Instant::now()))
+            {
+                return Ok(GateAdmit::Row);
+            }
+            if lifts.alias_by_name && dst == table.subnet().host_alias().octets() {
+                return Ok(GateAdmit::Row);
+            }
+            if lifts.box_name_dst == u32::from_be_bytes(dst) {
+                match lifts.box_name {
+                    BoxNameRule::Allowed => return Ok(GateAdmit::Row),
+                    BoxNameRule::Refused => {
+                        return Err(GateDrop::BoxName { src, dst, dst_port });
+                    }
+                    BoxNameRule::Silent => {}
+                }
+            }
+            Err(GateDrop::Verdict(DropReason::UndeclaredSubnet {
+                dst,
+                proto,
+            }))
         }
     }
-    // The node plane's own frames, when the baseline is in force (NET-085,
-    // NET-130): decided by the baseline set, never by the interim node row.
-    // The arm sits after the reply record, so the answers to connections the
-    // node's published ports received still pass, and after the
-    // control-surface check, so the switch's own ports stay refused.
-    // The node address is not the node plane's alone: a host-address box,
-    // the default network mode, leaves from it too. What tells them apart
-    // is the sender's cgroup, which the guest's classifier writes into the
-    // frame as `BOX_COHORT_DSCP` for a connection a box opened and clears
-    // on every other packet. An unmarked frame is the daemon's own, and the
-    // baseline set decides it, so a guest whose classifier never loaded
-    // fails closed to the baseline.
-    // The mark is no proof of a box: root in the guest can write it on any
-    // frame (NET-085). So a marked frame is decided by the union of the
-    // resident `host_ip` boxes' rules, which the host-side client
-    // registered, and dropped when no `host_ip` box is resident (design
-    // §4.3 rule 2). The node row never decides it. A process that writes
-    // the mark reaches only what a resident box's own rules admit.
-    if baseline.phase() == NodeBaselinePhase::InForce && src == baseline.node_addr() {
-        if summary.box_cohort_marked() {
-            return host_ip_verdict(summary, l4, table, baseline, pins, src);
+}
+
+/// The node plane's arm, under its baseline in force. Its DNS admission is
+/// asked only for a frame the kernel calls fetch-shaped.
+fn node_arm(
+    arm: NodeArm,
+    seen: &Seen<'_>,
+    table: &BoxTable,
+    baseline: &NodePlaneBaseline,
+    pins: &dns_pins::DnsPins,
+) -> Result<GateAdmit, GateDrop> {
+    let Seen {
+        src, dst, dst_port, ..
+    } = *seen;
+    match arm {
+        NodeArm::Arp
+        | NodeArm::AliasOpen
+        | NodeArm::Sibling
+        | NodeArm::Resolver
+        | NodeArm::Baseline => Ok(GateAdmit::Baseline),
+        NodeArm::ControlSurface => Err(GateDrop::SwitchControlSurface { src, dst_port }),
+        NodeArm::ProxyRefuse => Err(GateDrop::ProxyLane { src, dst, dst_port }),
+        NodeArm::InfraFixed | NodeArm::InfraPlane | NodeArm::InfraPrivate => {
+            Err(GateDrop::Infrastructure { src, dst, dst_port })
         }
-        return node_plane_verdict(summary, l4, table, baseline, pins);
+        NodeArm::AliasClosed => Err(GateDrop::HostAlias {
+            src,
+            dst_port,
+            row: AliasRow::Node,
+        }),
+        NodeArm::Unpinned => {
+            if netcore::node::is_fetch_shaped(&seen.sent)
+                && pins.admits_node_frame(table, baseline, dst, seen.l4, Instant::now())
+            {
+                Ok(GateAdmit::Baseline)
+            } else {
+                Err(GateDrop::NodePlaneUnpinned { src, dst, dst_port })
+            }
+        }
     }
-    row_verdict(summary, l4, table, baseline, pins, src)
+}
+
+/// The resident `host_ip` boxes' arm, for a frame from the node address
+/// that wears their mark. `members` is how many the configuration holds.
+fn cohort_arm(
+    arm: CohortArm,
+    members: usize,
+    seen: &Seen<'_>,
+    cohort: Option<&Arc<BoxRecord>>,
+    pins: &dns_pins::DnsPins,
+) -> Result<GateAdmit, GateDrop> {
+    let Seen {
+        src, dst, dst_port, ..
+    } = *seen;
+    let unbounded = |resident: usize| GateDrop::HostIpUnbounded {
+        src,
+        dst,
+        dst_port,
+        resident,
+    };
+    match arm {
+        CohortArm::Arp | CohortArm::Member => Ok(GateAdmit::HostIpBox),
+        CohortArm::LaneAdmit => Ok(GateAdmit::ProxyLane),
+        CohortArm::ControlSurface => Err(GateDrop::SwitchControlSurface { src, dst_port }),
+        CohortArm::NoMember => Err(unbounded(0)),
+        CohortArm::LaneRefuse => Err(GateDrop::ProxyLane { src, dst, dst_port }),
+        CohortArm::AliasClosed => Err(GateDrop::HostAlias {
+            src,
+            dst_port,
+            row: AliasRow::Cohort,
+        }),
+        CohortArm::Infrastructure => Err(GateDrop::Infrastructure { src, dst, dst_port }),
+        CohortArm::Unbounded => Err(unbounded(members)),
+        CohortArm::NeedsPin => {
+            if pins.admits_host_ip_frame(cohort, dst, seen.l4, Instant::now()) {
+                Ok(GateAdmit::HostIpBox)
+            } else {
+                Err(unbounded(members))
+            }
+        }
+    }
+}
+
+/// What the gate does with one frame the switch sent toward a guest, by the
+/// kernel's reading ([`toward_guest`]).
+enum TowardGuest {
+    /// Dropped, and recorded nowhere: a TCP or UDP first fragment without a
+    /// whole header, or a frame that met the configuration's lock poisoned.
+    /// `dst` is the address the line keys by; `cause` is said for a drop
+    /// under [`INTERNAL_RULE`], and is `None` for every other.
+    Drop {
+        dst: Option<[u8; 4]>,
+        rule: &'static str,
+        cause: Option<InternalCause>,
+    },
+    /// Delivered. `observed` says whether the frame's destination has
+    /// tables the daemon keeps, found by its address.
+    Deliver {
+        facts: Facts,
+        l4: Option<dns_pins::L4Packet>,
+        observed: bool,
+    },
+}
+
+/// The gate's decision for one frame toward a guest (`bytes`): the kernel
+/// reads it and names whose tables it belongs to. Bytes that are not a frame
+/// (too short for their header, an ARP packet of another shape, or an IPv4
+/// header with a bad version, header length or total length) are dropped
+/// and recorded nowhere, under the rule for bytes that are no frame; a TCP
+/// or UDP first fragment without a whole header is dropped and recorded
+/// nowhere; a frame whose destination no table holds is delivered and
+/// recorded nowhere; anything else (an IPv6 frame, a VLAN tag and another
+/// EtherType among them) is delivered and observed in the daemon's own
+/// tables. A frame that meets the configuration's lock poisoned is dropped
+/// under [`INTERNAL_RULE`] and recorded nowhere.
+fn toward_guest(bytes: &[u8], table: &BoxTable) -> TowardGuest {
+    let Ok((heard, whose, facts)) = table.ingress_first(bytes) else {
+        let dst = match netcore::frame::parse_frame(bytes) {
+            Facts::V4(v) => Some(v.dst.to_be_bytes()),
+            Facts::Arp { .. } | Facts::Other(_) => None,
+        };
+        return TowardGuest::Drop {
+            dst,
+            rule: INTERNAL_RULE,
+            cause: Some(InternalCause::Poisoned),
+        };
+    };
+    if let Some(rule) = netcore::report::heard(heard) {
+        let dst = match facts {
+            Facts::V4(v) => Some(v.dst.to_be_bytes()),
+            Facts::Arp { .. } | Facts::Other(_) => None,
+        };
+        return TowardGuest::Drop {
+            dst,
+            rule: rule_name(rule),
+            cause: None,
+        };
+    }
+    TowardGuest::Deliver {
+        l4: kernel_facts::l4_packet(&facts),
+        observed: !matches!(whose, IngressFor::NotARow),
+        facts,
+    }
 }
 
 /// The tracing target of [`log_marked_decision`]'s line, so a harness can
@@ -6595,25 +6720,19 @@ pub(crate) const MARKED_DECISION_TARGET: &str = "minvmd::egress_gate::marked";
 /// and cohort record the decision read. Only a flow's opening frame (a TCP
 /// SYN, or any frame that is not TCP) writes a line, so a long connection
 /// writes one, not one per segment.
-fn log_marked_decision(
-    summary: &FrameSummary,
-    l4: Option<&dns_pins::L4Packet>,
-    table: &BoxTable,
-    baseline: &NodePlaneBaseline,
-    decided: &Result<GateAdmit, GateDrop>,
-) {
+fn log_marked_decision(decided: &GuestFrame, table: &BoxTable, baseline: &NodePlaneBaseline) {
     const TCP_SYN: u8 = 0x02;
     const TCP_ACK: u8 = 0x10;
     if !tracing::enabled!(target: MARKED_DECISION_TARGET, tracing::Level::DEBUG) {
         return;
     }
-    if let Some(l4) = l4
+    if let Some(l4) = &decided.l4
         && l4.proto == egress::IPPROTO_TCP
         && (l4.tcp_flags & (TCP_SYN | TCP_ACK)) != TCP_SYN
     {
         return;
     }
-    let src = summary.source();
+    let src = decided.src;
     let phase = baseline.phase();
     let node = baseline.node_addr();
     let arm = if phase != NodeBaselinePhase::InForce {
@@ -6631,18 +6750,18 @@ fn log_marked_decision(
     let cohort = table
         .host_ip_cohort()
         .map_or_else(|| "none".to_string(), |record| record.name().to_string());
-    let (verdict, rule) = match decided {
+    let (verdict, rule) = match &decided.verdict {
         Ok(admit) => ("admitted", format!("{admit:?}")),
         Err(drop) => ("dropped", drop.rule().to_string()),
     };
     tracing::debug!(
         target: MARKED_DECISION_TARGET,
         source = %src.map_or_else(|| "none".to_string(), |s| Ipv4Addr::from(s).to_string()),
-        destination = %summary
-            .destination()
+        destination = %decided
+            .dst
             .map_or_else(|| "none".to_string(), |d| Ipv4Addr::from(d).to_string()),
-        port = summary.destination_port(),
-        source_port = l4.map_or(0, |l4| l4.src.port()),
+        port = decided.port,
+        source_port = decided.l4.as_ref().map_or(0, |l4| l4.src.port()),
         verdict,
         rule,
         arm,
@@ -6653,348 +6772,6 @@ fn log_marked_decision(
         cohort = %cohort,
         "decided a box-marked frame",
     );
-}
-
-/// The decision for a box-marked frame from the node address under the
-/// in-force baseline (NET-085, design §4.3 rule 2): admitted when one
-/// resident `host_ip` box's rules admit it, and dropped under
-/// [`HOST_IP_BOXES_RULE`] otherwise, and always when no `host_ip` box is
-/// resident.
-///
-/// Each resident box decides the frame the way a row decides its own: the
-/// infrastructure deny set first, with the box's own `allow_subnets` as the
-/// RFC 1918 allowance and the node's own block reach a `host_ip` box keeps,
-/// then the box's compiled rules, then the DNS admission table's pins for
-/// the names the resident boxes declared. The Box Egress Proxy's listener is
-/// decided by the cohort's lane (BEP-083): the union of the resident
-/// members' declarations. While one member declares a credentialed
-/// upstream, two ports at the proxy's address are admitted
-/// ([`GateAdmit::ProxyLane`]): the proxy's listener port, and TCP 443
-/// ([`egress::PROXY_DIRECT_TLS_PORT`]). UDP 443 and every other port at that
-/// address still drop. While no member declares one, every frame to the
-/// proxy's address drops under [`PROXY_LANE_RULE`].
-///
-/// The gate cannot tell the members apart: every member leaves from the
-/// node address with the same cohort mark. The in-VM classifier, which
-/// knows the sender's cgroup, refuses a connection to the proxy's address
-/// from a member that declares no lane. This gate is the lane's host half.
-fn host_ip_verdict(
-    summary: &FrameSummary,
-    l4: Option<&dns_pins::L4Packet>,
-    table: &BoxTable,
-    baseline: &NodePlaneBaseline,
-    pins: &dns_pins::DnsPins,
-    src: [u8; 4],
-) -> Result<GateAdmit, GateDrop> {
-    let dst = summary.destination();
-    let dst_port = summary.destination_port();
-    let unbounded = |resident: usize| GateDrop::HostIpUnbounded {
-        src,
-        dst: dst.unwrap_or_default(),
-        dst_port,
-        resident,
-    };
-    let resident = table.host_ip_boxes();
-    if resident.is_empty() {
-        return Err(unbounded(0));
-    }
-    if let Some(dst) = dst
-        && dst == table.subnet().box_egress_proxy_address().octets()
-    {
-        let declaring = resident
-            .iter()
-            .filter(|rules| rules.declares_credentialed_upstream())
-            .count();
-        let listener = egress::ProxyListener::at(dst);
-        // BEP-083: the cohort lane opens the listener and TCP 443 at the
-        // proxy's address, through the one lane predicate every leg shares.
-        let admitted = egress::proxy_lane_admits(declaring > 0, listener, summary);
-        tracing::debug!(
-            source = %Ipv4Addr::from(src),
-            destination = %Ipv4Addr::from(dst),
-            port = dst_port,
-            cohort_lane = if declaring > 0 { "open" } else { "closed" },
-            declaring_members = declaring,
-            resident_members = resident.len(),
-            admitted,
-            "decided a host_ip cohort frame to the box egress proxy's address"
-        );
-        if admitted {
-            return Ok(GateAdmit::ProxyLane);
-        }
-        return Err(GateDrop::ProxyLane { src, dst, dst_port });
-    }
-    let transport = alias_transport(summary);
-    let openings = AliasOpenings::new(AliasRow::Cohort, baseline, table);
-    // The alias's openings are the cohort's, the same for every resident
-    // box, so the alias is decided once, before the boxes' rules.
-    if let Some(dst) = dst
-        && dst == table.subnet().host_alias().octets()
-        && !openings.admit(transport)
-    {
-        return Err(GateDrop::HostAlias {
-            src,
-            dst_port,
-            row: AliasRow::Cohort,
-        });
-    }
-    let mut infrastructure = false;
-    // Whether a name-resolving box left the frame to the pins. The pins are
-    // one shared cohort entry, so the gate asks them once, after the loop,
-    // and the frame counts once.
-    let mut ask_pins = false;
-    for rules in &resident {
-        if let Some(dst) = dst
-            && infrastructure_destination(
-                dst,
-                transport,
-                table.subnet(),
-                rules.egress().allow_subnets(),
-                openings,
-            )
-            .is_some()
-        {
-            infrastructure = true;
-            continue;
-        }
-        match egress::verdict(summary, rules.egress()) {
-            FrameVerdict::Admit => return Ok(GateAdmit::HostIpBox),
-            FrameVerdict::Drop(DropReason::UndeclaredSubnet { .. }) if rules.resolves_names() => {
-                ask_pins = true;
-            }
-            FrameVerdict::Drop(_) => {}
-        }
-    }
-    if ask_pins && pins.admits_host_ip_frame(table, dst.unwrap_or_default(), l4, Instant::now()) {
-        return Ok(GateAdmit::HostIpBox);
-    }
-    // Every resident box refused the frame. A destination every box's
-    // check put in the infrastructure set keeps that drop's own rule, so
-    // the line a host reads names the set rather than the boxes' rules.
-    if infrastructure
-        && let Some(dst) = dst
-        && resident.iter().all(|rules| {
-            infrastructure_destination(
-                dst,
-                transport,
-                table.subnet(),
-                rules.egress().allow_subnets(),
-                openings,
-            )
-            .is_some()
-        })
-    {
-        return Err(GateDrop::Infrastructure { src, dst, dst_port });
-    }
-    Err(unbounded(resident.len()))
-}
-
-/// The rest of [`gate_verdict`]'s order for a frame the node-plane arm did
-/// not decide: the source's row, then the infrastructure set, then the proxy
-/// lane, then the row's rules, then the pin arm.
-fn row_verdict(
-    summary: &FrameSummary,
-    l4: Option<&dns_pins::L4Packet>,
-    table: &BoxTable,
-    baseline: &NodePlaneBaseline,
-    pins: &dns_pins::DnsPins,
-    src: [u8; 4],
-) -> Result<GateAdmit, GateDrop> {
-    // No namespace holds the source — NET-081's failure case, held
-    // unconditionally, under no phase (NET-085, T89 #1925): an address no
-    // namespace holds never leaves the VM, toward every destination alike,
-    // the baseline set included, because nothing on the host bounds the
-    // reach a frame from it would carry. Two classes, two rules, so a host
-    // reading its log can tell them apart: an address outside the plan's
-    // lease block is nobody's to wear — the plan never hands one out, so no
-    // row will ever hold it — and stays rule 0's
-    // ([`UNKNOWN_SOURCE_RULE`]); an address inside the run the plan hands
-    // leases from is a lease the guest daemon's own allocator could have
-    // minted — an own-address box's, whose row the creator-side registration
-    // (T66, #1711) is the only thing that ever publishes, or a task
-    // sandbox's, or an escapee's made-up one — and drops under its own rule
-    // ([`UNREGISTERED_SOURCE_RULE`]), whose line can even name the remedy
-    // when an applied switch request named the address as a box's own
-    // ([`PublishedForwards::lease_live_at`], a live lease whose box
-    // predates host registration). The relay picks the line; the drop is
-    // the same either way, and no phase the gate was built under reaches it.
-    let record = match table.by_source(src) {
-        Some(record) => record,
-        None if table.is_allocatable(src) => {
-            return Err(GateDrop::UnregisteredSource { src });
-        }
-        None => return Err(GateDrop::UnknownSource { src }),
-    };
-    // The infrastructure deny set, decided for every row before the row's
-    // own rules (design §5.3, NET-067): the host and the fabric, not
-    // destinations — link-local and the metadata services in it, loopback,
-    // the plane outside the node's own block, and RFC 1918 space the row's
-    // `allow_subnets` does not cover. Decided here, between the source's
-    // routing and the row's rules, so that no row admits it — an allow-all
-    // row's `0.0.0.0/0` included, the CIDR-admitted direct-IP flow the set
-    // names — and so that the pin arm below never sees it: an undeclared
-    // destination inside the set is this drop, and no answer resolving into
-    // it ever becomes a pin. Only a row the registry holds reaches this arm
-    // now — the source check above returns before any other source — so the
-    // set applies to every box-plane packet, and no row's rules concede the
-    // fabric.
-    // The host alias opens at the configured host exposures for every row,
-    // and the row's own rules decide the flow from there (design §7.1). The
-    // node namespace's row, keyed to the daemon's own address, carries the
-    // host-address boxes' frames under the announced baseline, so it is the
-    // cohort here and never gets the baseline set's own openings. A
-    // non-first IPv4 fragment reads as port 0 and fails the openings
-    // closed: the verdict path is stateless, and a drop is the safe
-    // direction.
-    let row = if src == table.subnet().daemon_ip().octets() {
-        AliasRow::Cohort
-    } else {
-        AliasRow::Box
-    };
-    // A box row reaches an exposure only when it names the host (NET-160).
-    let openings = match row {
-        AliasRow::Box => AliasOpenings::for_box(baseline, table, &record),
-        _ => AliasOpenings::new(row, baseline, table),
-    };
-    if let Some(dst) = summary.destination() {
-        match infrastructure_destination(
-            dst,
-            alias_transport(summary),
-            table.subnet(),
-            record.egress().allow_subnets(),
-            openings,
-        ) {
-            Some(InfrastructureHit::Set) => {
-                return Err(GateDrop::Infrastructure {
-                    src,
-                    dst,
-                    dst_port: summary.destination_port(),
-                });
-            }
-            Some(InfrastructureHit::HostAlias) => {
-                return Err(GateDrop::HostAlias {
-                    src,
-                    dst_port: summary.destination_port(),
-                    row,
-                });
-            }
-            None => {}
-        }
-    }
-    // The Box Egress Proxy's listener, decided beside every rule (NET-134):
-    // the proxy is a credentialed lane's infrastructure — the one host-side
-    // listener a box reaches by declaring the upstream, never by allowing
-    // its address — so this is the one destination whose admission the
-    // frame rules cannot carry, decided from the row's own declaration the
-    // way the DNS name dimension is. What the declaration opens is the
-    // listener, one of §5.3's port-scoped openings: TCP to
-    // `bep_host::PROXY_PORT`, the port the proxy's acceptor listens at read
-    // from the stack that runs it, so the gate cannot drift from the
-    // listener it guards, over the protocol of the acceptor the relay leg
-    // pins too (`egress::PROXY_LISTENER_PROTOCOL`) — and the predicate
-    // itself is the one function the relay leg decides the same
-    // destination by (`egress::proxy_lane_admits`, handed the listener as
-    // `egress::ProxyListener::at` builds it), so the two legs admit the
-    // same frame or refuse it together by construction rather than by
-    // parallel spellings of one triple. A row that declared the lane
-    // is admitted here, whatever its rules would say about the address: a
-    // deny-all row included, because the credentials the proxy redeems are
-    // the lane's own and no egress rule of the box's says anything about
-    // them. Everything else at the address is refused under the
-    // box-to-host default-deny — a row that declared nothing (whatever its
-    // rules would have allowed at the address: a declared allowance is not
-    // a lane, the same way a `0.0.0.0/0` row admits no metadata service),
-    // a row that declared the lane but sent another port or another
-    // protocol, neither of which the declaration ever opened, and the node
-    // row under the announced baseline, which is the allow-all the in-force
-    // enumeration replaces.
-    // Under the in-force baseline the node plane never reaches this arm:
-    // its own arm above refuses the address under the same rule.
-    if let Some(dst) = summary.destination()
-        && dst == table.subnet().box_egress_proxy_address().octets()
-    {
-        // minvmd is the one crate that sees both spellings of the listener's
-        // port and of the direct TLS port.
-        const _: () = assert!(egress::PROXY_LISTENER_PORT == switch::bep_host::PROXY_PORT);
-        const _: () = assert!(egress::PROXY_DIRECT_TLS_PORT == switch::bep_host::PROXY_TLS_PORT);
-        let listener = egress::ProxyListener::at(dst);
-        if egress::proxy_lane_admits(record.declares_credentialed_upstream(), listener, summary) {
-            return Ok(GateAdmit::ProxyLane);
-        }
-        return Err(GateDrop::ProxyLane {
-            src,
-            dst,
-            dst_port: summary.destination_port(),
-        });
-    }
-    // The namespace that holds the source decides its frames by its own
-    // compiled rules — the shared verdict, unchanged, now made outside where
-    // nothing inside can change it. One drop class the address rules cannot
-    // carry is decided beside them, by the host-side DNS admission table
-    // ([`crate::net::dns_pins`], the deciding copy NET-081 names): a row that
-    // declared DNS hosts has a name-based admission no set of subnets
-    // expresses, so the undeclared-destination drop such a row takes is
-    // decided on the host against the answers the box's own lookups received
-    // — admitted when a live pin names the frame's destination, or the flow
-    // a pin established still holds it, and dropped when nothing does, under
-    // the same window, cap and retention the in-VM precision copy applies
-    // (both read them from one place). Deciding it here is the point of the
-    // gate: the in-VM relay is whatever runs inside the VM, and the box still
-    // reaches only the addresses its own answers named. Everything else
-    // stays host-made, and a pin governs none of it: a denied destination,
-    // an infrastructure destination (decided above, before this arm can see
-    // it), an undeclared protocol, a foreign source, a family the verdict
-    // reads no source from — the guest lifts none of those either, so the
-    // host refusing them is parity, not pre-emption.
-    match egress::verdict(summary, record.egress()) {
-        FrameVerdict::Admit => Ok(GateAdmit::Row),
-        FrameVerdict::Drop(reason)
-            if matches!(reason, DropReason::UndeclaredSubnet { .. })
-                && record.resolves_names()
-                && pins.admits_frame(
-                    &record,
-                    summary.destination().unwrap_or_default(),
-                    l4,
-                    Instant::now(),
-                ) =>
-        {
-            Ok(GateAdmit::Row)
-        }
-        // The alias passed its openings above, so the frame is at a host
-        // exposure. A box that names `host.min.internal` reaches it by the
-        // name, as a pin admits an answer to a declared name, while its
-        // deny rules and protocols still decide first (NET-160).
-        FrameVerdict::Drop(reason)
-            if matches!(reason, DropReason::UndeclaredSubnet { .. })
-                && row == AliasRow::Box
-                && summary.destination() == Some(table.subnet().host_alias().octets())
-                && names_host_by_name(record.allow_dns_hosts()) =>
-        {
-            Ok(GateAdmit::Row)
-        }
-        FrameVerdict::Drop(reason) => {
-            // NET-163: a box that names another box's zone name reaches that
-            // box's lease, while its deny rules and protocols still decide
-            // first. The target's ingress decides the rest in the guest.
-            // A box that names boxes reaches no other box by a name.
-            if matches!(reason, DropReason::UndeclaredSubnet { .. })
-                && row == AliasRow::Box
-                && let Some(dst) = summary.destination()
-                && let Some(named) = box_name_verdict(table, &record, dst)
-            {
-                return if named {
-                    Ok(GateAdmit::Row)
-                } else {
-                    Err(GateDrop::BoxName {
-                        src,
-                        dst,
-                        dst_port: summary.destination_port(),
-                    })
-                };
-            }
-            Err(GateDrop::Verdict(reason))
-        }
-    }
 }
 
 /// Why the gate dropped a frame: the shared verdict's reason, or one of the
@@ -7113,6 +6890,69 @@ enum GateDrop {
         /// How many `host_ip` boxes were resident: `0` when none was.
         resident: usize,
     },
+    /// The kernel read no IPv4 datagram and no ARP packet in the bytes.
+    NotAFrame {
+        /// The rule the kernel reports for why.
+        rule: &'static str,
+    },
+    /// TCP or UDP on a first fragment without a whole header: dropped before
+    /// any decision.
+    ShortHeader {
+        /// The source address the frame wore, when it wore one.
+        src: Option<[u8; 4]>,
+    },
+    /// A query to the resolver from a row, or from the cohort, that declares
+    /// no subnet and no DNS host, other than a whole query for names in the
+    /// box zone ([`DENY_ALL_DNS_RULE`]).
+    DenyAllDns {
+        /// The source address the frame wore.
+        src: [u8; 4],
+    },
+    /// The same refusal for the cohort's frame (the kernel's `CohortDns`):
+    /// its line names no box, since the node address it wears is shared by
+    /// every member and by the VM's own namespace.
+    CohortDenyAllDns {
+        /// The node address the frame wore.
+        src: [u8; 4],
+    },
+    /// The gate could not decide the frame on the configuration it asked
+    /// ([`INTERNAL_RULE`]), for the cause named. Recorded nowhere.
+    Internal {
+        /// The source address the frame wore, when its bytes carry one.
+        src: Option<[u8; 4]>,
+        /// The frame's destination, when it is IPv4.
+        dst: Option<[u8; 4]>,
+        /// Why the frame was not decided.
+        cause: InternalCause,
+    },
+}
+
+/// Why a frame [`GateDrop::Internal`] drops was not decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InternalCause {
+    /// A frame to the host alias: every one of [`ALIAS_ASKS`] rounds found
+    /// the configuration holding an exposure list other than the one the
+    /// frame read.
+    ExposuresChanged,
+    /// Both of [`ROW_ASKS`] answers were made for a record other than the
+    /// one the registry held when the answer was read: the row at the
+    /// frame's source, or, for a marked frame from the node address, the
+    /// resident `host_ip` boxes' record.
+    RowChanged,
+    /// A lock the frame is decided under was poisoned by a panic while it was
+    /// held; nothing is decided under it.
+    Poisoned,
+}
+
+impl InternalCause {
+    /// The cause as the drop line names it.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ExposuresChanged => "the host exposure list changed in every round",
+            Self::RowChanged => "the records the frame was decided for changed after each answer",
+            Self::Poisoned => "a lock the frame is decided under was poisoned by a panic",
+        }
+    }
 }
 
 impl GateDrop {
@@ -7130,19 +6970,21 @@ impl GateDrop {
             Self::ProxyLane { .. } => PROXY_LANE_RULE,
             Self::NodePlaneUnpinned { .. } => NODE_PLANE_UNPINNED_RULE,
             Self::HostIpUnbounded { .. } => HOST_IP_BOXES_RULE,
+            Self::NotAFrame { rule } => rule,
+            Self::ShortHeader { .. } => rule_name(netcore::report::SHORT_HEADER_OUT),
+            Self::DenyAllDns { .. } | Self::CohortDenyAllDns { .. } => DENY_ALL_DNS_RULE,
+            Self::Internal { .. } => INTERNAL_RULE,
         }
     }
 }
 
-/// The shared verdict's family drop for a frame that carries no readable
-/// source: the families decided without rules, and the fail-closed answer for
-/// an arm the summarizer's contract makes unreachable (an ARP or IPv4 frame
-/// always carries a source, so one without is truncated).
-fn family_drop(family: FrameFamily) -> DropReason {
-    match family {
-        FrameFamily::Ipv6 => DropReason::Ipv6,
-        FrameFamily::UndeclaredFamily(ethertype) => DropReason::UndeclaredFamily(ethertype),
-        FrameFamily::Truncated | FrameFamily::Arp | FrameFamily::Ipv4 => DropReason::Truncated,
+/// A destination port as a drop line prints it: `none` for port 0, which
+/// names no listener.
+fn port_text(port: u16) -> String {
+    if port == 0 {
+        "none".to_string()
+    } else {
+        port.to_string()
     }
 }
 
@@ -7193,6 +7035,57 @@ impl Named {
 }
 
 impl DropLimiter {
+    /// Emits the drop warning for one frame headed toward a guest that the
+    /// gate dropped, if the rate limit allows: the destination address the
+    /// frame carried (`none` when it carried none to read) and the box it
+    /// names, and the ingress rule that dropped it, with a window per
+    /// destination and rule. A drop under [`INTERNAL_RULE`] also says its
+    /// `cause`, as the internal drop of a frame leaving the VM does; every
+    /// other drop has none. Returns whether a line was written.
+    fn warn_toward_guest(
+        &self,
+        dst: Option<[u8; 4]>,
+        who: Who<'_>,
+        rule: &'static str,
+        cause: Option<InternalCause>,
+    ) -> bool {
+        match self.should_warn_at(dst, rule, Instant::now()) {
+            WarnDecision::Silent => false,
+            WarnDecision::Named => {
+                let who = who.resolve();
+                let destination =
+                    dst.map_or_else(|| "none".to_string(), |dst| Ipv4Addr::from(dst).to_string());
+                if let Some(cause) = cause {
+                    tracing::warn!(
+                        destination = %destination,
+                        box = who.name().as_deref(),
+                        box_id = who.id(),
+                        cause = cause.as_str(),
+                        rule_matched = rule,
+                        "dropped a frame headed toward a guest at the host-side egress gate",
+                    );
+                    return true;
+                }
+                tracing::warn!(
+                    destination = %destination,
+                    box = who.name().as_deref(),
+                    box_id = who.id(),
+                    rule_matched = rule,
+                    "dropped a frame headed toward a guest at the host-side egress gate",
+                );
+                true
+            }
+            WarnDecision::Overflow => {
+                tracing::warn!(
+                    rule_matched = rule,
+                    "dropped frames toward more distinct destination addresses than the gate \
+                     keeps a window per address for; one line per rule covers the rest",
+                );
+                true
+            }
+        }
+    }
+
     /// Emits the drop warning for one dropped frame if the rate limit allows:
     /// the source address the frame carried — `none` when the frame carried
     /// none to read, as for an IPv6 or truncated drop — and the rule that
@@ -7232,7 +7125,7 @@ impl DropLimiter {
     /// source and the rule, and naming the port the frame gave the gateway —
     /// the line a host reads to learn which port of the switch's control
     /// surface a box was reaching for. Returns whether a line was written.
-    fn warn_switch_surface(&self, src: [u8; 4], who: Who<'_>, dst_port: u16) -> bool {
+    fn warn_switch_surface(&self, src: [u8; 4], who: Who<'_>, dst_port: Option<u16>) -> bool {
         match self.should_warn_at(Some(src), SWITCH_CONTROL_RULE, Instant::now()) {
             WarnDecision::Silent => false,
             WarnDecision::Named => {
@@ -7330,7 +7223,13 @@ impl DropLimiter {
     /// and the rule, and naming the destination and the port the frame gave
     /// it — the line a host reads to learn which piece of the host or the
     /// fabric a box was reaching for. Returns whether a line was written.
-    fn warn_infrastructure(&self, src: [u8; 4], who: Who<'_>, dst: [u8; 4], dst_port: u16) -> bool {
+    fn warn_infrastructure(
+        &self,
+        src: [u8; 4],
+        who: Who<'_>,
+        dst: [u8; 4],
+        dst_port: Option<u16>,
+    ) -> bool {
         match self.should_warn_at(Some(src), INFRASTRUCTURE_RULE, Instant::now()) {
             WarnDecision::Silent => false,
             WarnDecision::Named => {
@@ -7359,11 +7258,71 @@ impl DropLimiter {
         }
     }
 
+    /// Emits the warning for one frame the gate could not decide on the
+    /// configuration it asked ([`GateDrop::Internal`]): the same
+    /// rate limit a drop's line answers to, keyed by the source and the
+    /// rule. The line names the source box, the frame's destination and
+    /// the cause; a frame whose bytes carry no source has no source field.
+    /// Returns whether a line was written.
+    fn warn_internal(
+        &self,
+        src: Option<[u8; 4]>,
+        who: Who<'_>,
+        dst: Option<[u8; 4]>,
+        cause: InternalCause,
+    ) -> bool {
+        match self.should_warn_at(src, INTERNAL_RULE, Instant::now()) {
+            WarnDecision::Silent => false,
+            WarnDecision::Named => {
+                let who = who.resolve();
+                let destination =
+                    dst.map_or_else(|| "none".to_string(), |dst| Ipv4Addr::from(dst).to_string());
+                let Some(src) = src else {
+                    tracing::warn!(
+                        box = who.name().as_deref(),
+                        box_id = who.id(),
+                        destination = %destination,
+                        cause = cause.as_str(),
+                        rule_matched = INTERNAL_RULE,
+                        "dropped a frame leaving the VM at the host-side egress gate: it could not \
+                         be decided on the configuration it was asked of",
+                    );
+                    return true;
+                };
+                tracing::warn!(
+                    source = %Ipv4Addr::from(src),
+                    box = who.name().as_deref(),
+                    box_id = who.id(),
+                    destination = %destination,
+                    cause = cause.as_str(),
+                    rule_matched = INTERNAL_RULE,
+                    "dropped a frame leaving the VM at the host-side egress gate: it could not \
+                     be decided on the configuration it was asked of",
+                );
+                true
+            }
+            WarnDecision::Overflow => {
+                tracing::warn!(
+                    rule_matched = INTERNAL_RULE,
+                    "dropped frames from more distinct source addresses than the gate \
+                     keeps a window per source for; one line per rule covers the rest",
+                );
+                true
+            }
+        }
+    }
+
     /// Emits the warning for one frame to the host alias outside its row's
     /// openings (NET-156): the same rate limit a drop's line answers to,
     /// keyed by the source and the rule, and naming the row and the port.
     /// Returns whether a line was written.
-    fn warn_host_alias(&self, src: [u8; 4], who: Who<'_>, dst_port: u16, row: AliasRow) -> bool {
+    fn warn_host_alias(
+        &self,
+        src: [u8; 4],
+        who: Who<'_>,
+        dst_port: Option<u16>,
+        row: AliasRow,
+    ) -> bool {
         match self.should_warn_at(Some(src), HOST_ALIAS_RULE, Instant::now()) {
             WarnDecision::Silent => false,
             WarnDecision::Named => {
@@ -7404,7 +7363,7 @@ impl DropLimiter {
         who: Who<'_>,
         dst: [u8; 4],
         target: Who<'_>,
-        dst_port: u16,
+        dst_port: Option<u16>,
     ) -> bool {
         match self.should_warn_at(Some(src), BOX_NAME_RULE, Instant::now()) {
             WarnDecision::Silent => false,
@@ -7446,7 +7405,13 @@ impl DropLimiter {
     /// its source names them when one does (read only for a line the
     /// limiter lets through), and the reason by the rule. Returns whether a
     /// line was written.
-    fn warn_proxy_lane(&self, src: [u8; 4], who: Who<'_>, dst: [u8; 4], dst_port: u16) -> bool {
+    fn warn_proxy_lane(
+        &self,
+        src: [u8; 4],
+        who: Who<'_>,
+        dst: [u8; 4],
+        dst_port: Option<u16>,
+    ) -> bool {
         match self.should_warn_at(Some(src), PROXY_LANE_RULE, Instant::now()) {
             WarnDecision::Silent => false,
             WarnDecision::Named => {
@@ -7555,7 +7520,7 @@ impl DropLimiter {
         &self,
         src: [u8; 4],
         dst: [u8; 4],
-        dst_port: u16,
+        dst_port: Option<u16>,
         resident: usize,
     ) -> bool {
         match self.should_warn_at(Some(src), HOST_IP_BOXES_RULE, Instant::now()) {
@@ -7564,7 +7529,7 @@ impl DropLimiter {
                 tracing::warn!(
                     source = %Ipv4Addr::from(src),
                     destination = %Ipv4Addr::from(dst),
-                    port = %if dst_port == 0 { "none".to_string() } else { dst_port.to_string() },
+                    port = dst_port.map(port_text).map(tracing::field::display),
                     resident_host_ip_boxes = resident,
                     rule_matched = HOST_IP_BOXES_RULE,
                     "dropped a box-marked frame from the node address: no host_ip box is \
@@ -7576,7 +7541,7 @@ impl DropLimiter {
                 tracing::warn!(
                     source = %Ipv4Addr::from(src),
                     destination = %Ipv4Addr::from(dst),
-                    port = %if dst_port == 0 { "none".to_string() } else { dst_port.to_string() },
+                    port = dst_port.map(port_text).map(tracing::field::display),
                     resident_host_ip_boxes = resident,
                     rule_matched = HOST_IP_BOXES_RULE,
                     "dropped a box-marked frame from the node address toward a destination \
@@ -7601,14 +7566,14 @@ impl DropLimiter {
     /// port, so a bundle's reader learns which reach the node plane was
     /// refused and that no baseline entry's lookup had pinned it. Returns
     /// whether a line was written.
-    fn warn_node_plane_unpinned(&self, src: [u8; 4], dst: [u8; 4], dst_port: u16) -> bool {
+    fn warn_node_plane_unpinned(&self, src: [u8; 4], dst: [u8; 4], dst_port: Option<u16>) -> bool {
         match self.should_warn_at(Some(src), NODE_PLANE_UNPINNED_RULE, Instant::now()) {
             WarnDecision::Silent => false,
             WarnDecision::Named => {
                 tracing::warn!(
                     source = %Ipv4Addr::from(src),
                     destination = %Ipv4Addr::from(dst),
-                    port = %if dst_port == 0 { "none".to_string() } else { dst_port.to_string() },
+                    port = dst_port.map(port_text).map(tracing::field::display),
                     rule_matched = NODE_PLANE_UNPINNED_RULE,
                     "dropped a node-plane frame leaving the VM toward an address no baseline \
                      entry pinned, or toward a pinned address at a port other than TCP 443; \
@@ -7641,7 +7606,7 @@ impl DropLimiter {
         src: Option<[u8; 4]>,
         who: Who<'_>,
         dst: [u8; 4],
-        dst_port: u16,
+        dst_port: Option<u16>,
         rule: &'static str,
     ) -> bool {
         match self.should_warn_at(src, rule, Instant::now()) {
@@ -7657,7 +7622,7 @@ impl DropLimiter {
                     destination = %Ipv4Addr::from(dst),
                     // The frame summary reads 0 when the protocol carries no
                     // L4 port (ICMP, say): name that rather than a port 0.
-                    port = %if dst_port == 0 { "none".to_string() } else { dst_port.to_string() },
+                    port = dst_port.map(port_text).map(tracing::field::display),
                     rule_matched = rule,
                     "dropped a frame leaving the VM toward a subnet its rules do not \
                      declare",
@@ -7676,8 +7641,58 @@ impl DropLimiter {
         }
     }
 
+    /// [`Self::warn_deny_all_query`] for the cohort's refusal: the same
+    /// name, type and rule, and no namespace, as a line from the node
+    /// address names no box. The window is keyed by the node address and
+    /// the name, so it is shared by the cohort's members.
+    pub(crate) fn warn_cohort_deny_all_query(
+        &self,
+        src: [u8; 4],
+        name: &str,
+        query_type: Option<hickory_proto::rr::RecordType>,
+        outside_zone: bool,
+    ) -> bool {
+        match self.should_warn_refusal_at(src, name, DENY_ALL_DNS_RULE, Instant::now()) {
+            WarnDecision::Silent => false,
+            WarnDecision::Named => {
+                let query_type =
+                    query_type.map_or_else(|| "none".to_string(), |rtype| rtype.to_string());
+                if outside_zone {
+                    tracing::warn!(
+                        source = %Ipv4Addr::from(src),
+                        name,
+                        query_type,
+                        rule_matched = DENY_ALL_DNS_RULE,
+                        "dropped a DNS query from the host_ip boxes, none of which names \
+                         anything, for something outside the box zone at the host-side egress \
+                         gate",
+                    );
+                } else {
+                    tracing::warn!(
+                        source = %Ipv4Addr::from(src),
+                        name,
+                        query_type,
+                        rule_matched = DENY_ALL_DNS_RULE,
+                        "dropped a DNS query from the host_ip boxes, none of which names \
+                         anything, that is not a plain question for a box-zone name at the \
+                         host-side egress gate",
+                    );
+                }
+                true
+            }
+            WarnDecision::Overflow => {
+                tracing::warn!(
+                    rule_matched = DENY_ALL_DNS_RULE,
+                    "dropped deny-all boxes' DNS queries for more distinct boxes and names \
+                     than the gate keeps a window for; one line per rule covers the rest",
+                );
+                true
+            }
+        }
+    }
+
     /// Emits the warning for one deny-all box's DNS datagram the gate
-    /// dropped ([`dns_pins::deny_all_refusal`]): the same rate limit a DNS
+    /// dropped ([`DENY_ALL_DNS_RULE`]): the same rate limit a DNS
     /// refusal's line answers to, keyed by the box, the rule and the name,
     /// so one name's burst says so once per interval while two names each
     /// get their line — and a flood of distinct names folds into the rule's
@@ -7692,15 +7707,27 @@ impl DropLimiter {
                 let query_type = refusal
                     .query_type
                     .map_or_else(|| "none".to_string(), |rtype| rtype.to_string());
-                tracing::warn!(
-                    source = %Ipv4Addr::from(src),
-                    namespace = ?refusal.record.name(),
-                    name = refusal.name.as_str(),
-                    query_type,
-                    rule_matched = DENY_ALL_DNS_RULE,
-                    "dropped a deny-all box's DNS query naming something outside the box \
-                     zone at the host-side egress gate",
-                );
+                if refusal.outside_zone {
+                    tracing::warn!(
+                        source = %Ipv4Addr::from(src),
+                        namespace = ?refusal.record.name(),
+                        name = refusal.name.as_str(),
+                        query_type,
+                        rule_matched = DENY_ALL_DNS_RULE,
+                        "dropped a deny-all box's DNS query naming something outside the box \
+                         zone at the host-side egress gate",
+                    );
+                } else {
+                    tracing::warn!(
+                        source = %Ipv4Addr::from(src),
+                        namespace = ?refusal.record.name(),
+                        name = refusal.name.as_str(),
+                        query_type,
+                        rule_matched = DENY_ALL_DNS_RULE,
+                        "dropped a deny-all box's DNS query that is not a plain question for a \
+                         box-zone name at the host-side egress gate",
+                    );
+                }
                 true
             }
             WarnDecision::Overflow => {
@@ -7908,46 +7935,21 @@ pub(crate) mod test_support {
     pub(crate) const NC7_EXPOSURE: crate::net::host_exposures::HostExposure =
         crate::net::host_exposures::HostExposure::tcp(8080);
 
-    /// The relay's decision for one frame a box sent, on `registry`'s table,
-    /// in the relay's own order ([`super::relay_frames_to_switch`]): the
-    /// frame's summary and L4 read as the relay reads them,
-    /// [`super::gate_verdict`] called whole, and for an admit the deny-all
-    /// DNS check under the relay's own condition (a UDP frame whose L4
-    /// destination port is the resolver's, whose datagram can be taken).
-    /// The built-in baseline with one host exposure, [`NC7_EXPOSURE`], an
-    /// empty DNS admission table and empty reply tables: no reply, refusal
-    /// or pin admits anything. `Ok` is an admit; a drop answers its rule.
+    /// The gate's decision for one frame a box sent, on `registry`'s table:
+    /// [`super::guest_frame`] called whole, as the relay calls it, with the
+    /// built-in baseline and one host exposure, [`NC7_EXPOSURE`], an empty
+    /// DNS admission table and empty reply tables, so no reply, refusal or
+    /// pin admits anything. `Ok` is an admit; a drop answers its rule.
     pub(crate) fn gate_decides(registry: &BoxRegistry, frame: &[u8]) -> Result<(), &'static str> {
         let table = registry.table();
         let baseline =
             NodePlaneBaseline::built_in(table.subnet()).with_host_exposure(vec![NC7_EXPOSURE]);
         let pins = crate::net::dns_pins::DnsPins::new(table.subnet());
-        let summary = boxes::core::egress::summarize(frame);
-        let l4 = crate::net::dns_pins::parse_ipv4_l4(frame);
-        super::gate_verdict(
-            &summary,
-            l4.as_ref(),
-            &table,
-            &baseline,
-            &pins,
-            &ReplyTables::new(),
-        )
-        .map_err(|drop| drop.rule())?;
-        let dns = if crate::net::dns_pins::is_ipv4_udp(frame)
-            && l4
-                .as_ref()
-                .is_some_and(|l4| l4.dst.port() == super::RESOLVER_PORT)
-        {
-            crate::net::dns_pins::udp_datagram(frame)
-        } else {
-            None
-        };
-        if let Some((query, datagram)) = &dns
-            && crate::net::dns_pins::deny_all_refusal(&table, query, datagram).is_some()
-        {
-            return Err(super::DENY_ALL_DNS_RULE);
-        }
-        Ok(())
+        table.adopt_node_baseline(&baseline);
+        super::guest_frame(frame, &table, &baseline, &pins, &ReplyTables::new())
+            .verdict
+            .map(|_| ())
+            .map_err(|drop| drop.rule())
     }
 
     /// How long the harness waits for a frame or a log line before calling
@@ -8096,6 +8098,25 @@ pub(crate) mod test_support {
         phase: UnregisteredSourcePhase,
         baseline: NodePlaneBaseline,
     ) -> GateHarness {
+        gate_connected_on(&registry, phase, baseline).await
+    }
+
+    /// [`gate_over`] on a registry the test keeps, so it can change the
+    /// registry while the gate runs.
+    pub(crate) async fn gate_over_kept(registry: &BoxRegistry) -> GateHarness {
+        let baseline = crate::net::baseline::NodePlaneBaseline::built_in(registry.subnet());
+        forward_upgrade_head(
+            gate_connected_on(registry, super::UNREGISTERED_SOURCE_PHASE, baseline).await,
+        )
+        .await
+    }
+
+    /// [`gate_connected_with_node_baseline`] on a registry the caller keeps.
+    async fn gate_connected_on(
+        registry: &BoxRegistry,
+        phase: UnregisteredSourcePhase,
+        baseline: NodePlaneBaseline,
+    ) -> GateHarness {
         let dir = TempDir::new().expect("a tempdir is creatable");
         let switch_sock = dir.path().join("gvproxy-switch.sock");
         let gate_sock = dir.path().join("gvproxy-gate.sock");
@@ -8182,13 +8203,14 @@ pub(crate) mod test_support {
         // registry's rows were compiled against — the same construction the
         // production gate is handed in [`crate::net`].
         let pins = crate::net::dns_pins::DnsPins::new(registry.subnet());
+        let baseline = crate::net::baseline::NodePlaneBaseline::built_in(registry.subnet());
 
         let gate = EgressGate::spawn(
             gate_sock.clone(),
             switch_sock.clone(),
             registry.table(),
             pins.clone(),
-            crate::net::baseline::NodePlaneBaseline::built_in(registry.subnet()),
+            baseline,
         )
         .expect("spawning the egress gate");
 
@@ -8504,25 +8526,38 @@ pub(crate) mod test_support {
         }
     }
 
-    /// An Ethernet II frame carrying an IPv4 `proto` packet from `src` to
-    /// `dst`:`port` — the shape the shared verdict reads: a 14-byte Ethernet
-    /// header, the fixed 20-byte IPv4 header (TTL 64, the protocol byte, a
-    /// zeroed checksum — neither is read), and 4 bytes of L4 ports. `6` is
-    /// TCP, `17` UDP.
+    /// An Ethernet II frame carrying a whole IPv4 `proto` packet from `src`
+    /// to `dst`:`port`: a 14-byte Ethernet header, the fixed 20-byte IPv4
+    /// header with its total length (TTL 64, the protocol byte, a zeroed
+    /// checksum, which is not read), and a whole transport header. `6` is TCP,
+    /// a 20-byte header from port 40000 with ACK set and no payload, so it
+    /// opens no flow and notes no connect; `17` is UDP, an 8-byte header from
+    /// port 40000 with no payload; any other protocol carries 8 bytes, the
+    /// first four spelling ports 40000 and `port` as before.
     pub(crate) fn ipv4_frame(src: [u8; 4], proto: u8, dst: [u8; 4], port: u16) -> Vec<u8> {
-        let mut frame = Vec::with_capacity(14 + 24);
+        let mut transport = Vec::with_capacity(20);
+        transport.extend_from_slice(&40000u16.to_be_bytes()); // source port
+        transport.extend_from_slice(&port.to_be_bytes()); // destination port
+        match proto {
+            6 => transport
+                .extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0, 0x50, 0x10, 0xff, 0xff, 0, 0, 0, 0]),
+            17 => transport.extend_from_slice(&[0, 8, 0, 0]),
+            _ => transport.extend_from_slice(&[0; 4]),
+        }
+        let total = u16::try_from(20 + transport.len()).expect("a test frame is short");
+        let mut frame = Vec::with_capacity(14 + 20 + transport.len());
         frame.extend_from_slice(&[0x52, 0x54, 0x00, 0x00, 0x00, 0x01]); // dst MAC
         frame.extend_from_slice(&[0x52, 0x54, 0x00, 0x00, 0x00, 0x02]); // src MAC
         frame.extend_from_slice(&0x0800u16.to_be_bytes()); // EtherType: IPv4
-        frame.extend_from_slice(&[0x45, 0, 0, 0]); // version 4, IHL 5, TOS, length (unchecked)
+        frame.extend_from_slice(&[0x45, 0]); // version 4, IHL 5, TOS
+        frame.extend_from_slice(&total.to_be_bytes()); // total length
         frame.extend_from_slice(&[0; 4]); // id, flags+offset: 0
         frame.push(64); // TTL
         frame.push(proto); // protocol
         frame.extend_from_slice(&[0; 2]); // checksum (unchecked)
         frame.extend_from_slice(&src);
         frame.extend_from_slice(&dst);
-        frame.extend_from_slice(&40000u16.to_be_bytes()); // source port
-        frame.extend_from_slice(&port.to_be_bytes()); // destination port
+        frame.extend_from_slice(&transport);
         frame
     }
 
@@ -8574,7 +8609,7 @@ mod tests {
     use tracing::Instrument as _;
 
     use boxes::EgressPolicy;
-    use boxes::core::egress::{DropReason, FrameFamily, FrameVerdict, InboundFlow, Ipv4Cidr};
+    use boxes::core::egress::{DropReason, FrameVerdict, InboundFlow, Ipv4Cidr};
     use switch::SwitchSubnet;
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -8585,17 +8620,17 @@ mod tests {
         CaptureWriter, DEADLINE, arp_frame, box_cohort_frame, capture_log, connect_control,
         connect_over, daemon_request, expect_frame, expect_silence, expect_teardown,
         expose_request, gate_connected, gate_connected_with_phase, gate_over, gate_over_control,
-        gate_over_shipped, gate_over_with, gate_over_with_node_baseline, ipv4_frame, ipv6_frame,
-        read_within, send_frame, unexpose_request, wait_for_log,
+        gate_over_kept, gate_over_shipped, gate_over_with, gate_over_with_node_baseline,
+        ipv4_frame, ipv6_frame, read_within, send_frame, unexpose_request, wait_for_log,
     };
     use super::{
         AcceptFailure, AliasRow, CONNECT_REQUEST, CONTROL_VERBS, ControlVerb, DropLimiter,
-        EgressGate, FrameSummary, GateAdmit, GateDrop, GuestSource, GuestSpeak, HANDSHAKE_TIMEOUT,
-        HOST_IP_BOXES_RULE, MALFORMED_PUBLISH_RULE, MAX_HEAD, MAX_LIVE_RELAYS, MAX_NAMED_TARGET,
-        PublishedForwards, Record, ReplyTables, UNDECLARED_PUBLISH_RECORD_RULE,
+        EgressGate, GateAdmit, GateDrop, GuestSource, GuestSpeak, HANDSHAKE_TIMEOUT,
+        HOST_IP_BOXES_RULE, InternalCause, MALFORMED_PUBLISH_RULE, MAX_HEAD, MAX_LIVE_RELAYS,
+        MAX_NAMED_TARGET, PublishedForwards, Record, ReplyTables, UNDECLARED_PUBLISH_RECORD_RULE,
         UNDECLARED_RETRACT_RULE, UNKNOWN_PUBLISH_ADDRESS_RULE, UNREGISTERED_LIVE_LEASE_RULE,
         UNREGISTERED_PUBLISH_RULE, UNREGISTERED_SOURCE_PHASE, UNREGISTERED_SOURCE_RULE,
-        UnregisteredSourcePhase, WarnDecision, Who, accept_loop, dns_pins, gate_verdict, max_frame,
+        UnregisteredSourcePhase, WarnDecision, Who, accept_loop, dns_pins, max_frame,
         render_record, serve_connection,
     };
     use crate::box_registry::{BoxRegistration, BoxRegistry, BoxTable};
@@ -8604,6 +8639,35 @@ mod tests {
 
     /// The default switch subnet, the plan every registry below is built for.
     const SUBNET: SwitchSubnet = switch::DEFAULT_SUBNET;
+
+    /// A frame's bytes as the relay hands them to the gate.
+    fn sent(frame: &[u8]) -> Vec<u8> {
+        frame.to_vec()
+    }
+
+    /// The frame's TCP or UDP addressing, from the kernel's reading of it: the
+    /// shape the daemon's own tables take.
+    fn parse_l4(frame: &[u8]) -> Option<dns_pins::L4Packet> {
+        crate::net::kernel_facts::l4_packet(&netcore::frame::parse_frame(frame))
+    }
+
+    /// The gate's decision for `frame`'s bytes, [`super::guest_frame`] called
+    /// whole as the relay calls it. `_l4`, the frame's addressing, is not
+    /// read: the gate takes the addressing from the kernel's reading of the
+    /// frame.
+    fn guest_verdict(
+        frame: &[u8],
+        _l4: Option<&dns_pins::L4Packet>,
+        table: &BoxTable,
+        baseline: &NodePlaneBaseline,
+        pins: &dns_pins::DnsPins,
+        replies: &ReplyTables,
+    ) -> Result<GateAdmit, GateDrop> {
+        // The kernel's configuration decides by the baseline this call names,
+        // as a gate's start gives it the one that gate decides by.
+        table.adopt_node_baseline(baseline);
+        super::guest_frame(frame, table, baseline, pins, replies).verdict
+    }
 
     /// D3574: the first dropped opening packet is logged once per rule and
     /// source address, with the source, the destination and the port, for a
@@ -8619,12 +8683,12 @@ mod tests {
         let google = [142, 250, 80, 4];
         let cloudflare = [1, 1, 1, 1];
 
-        assert!(!drops.note(NODE_PLANE_UNPINNED_RULE, node, google, 443, false));
-        assert!(drops.note(NODE_PLANE_UNPINNED_RULE, node, google, 443, true));
-        assert!(!drops.note(NODE_PLANE_UNPINNED_RULE, node, cloudflare, 443, true));
-        assert!(drops.note(HOST_IP_BOXES_RULE, node, cloudflare, 443, true));
+        assert!(!drops.note(NODE_PLANE_UNPINNED_RULE, node, google, Some(443), false));
+        assert!(drops.note(NODE_PLANE_UNPINNED_RULE, node, google, Some(443), true));
+        assert!(!drops.note(NODE_PLANE_UNPINNED_RULE, node, cloudflare, Some(443), true));
+        assert!(drops.note(HOST_IP_BOXES_RULE, node, cloudflare, Some(443), true));
         // A second `host_ip` box sends from the same node address: no line.
-        assert!(!drops.note(HOST_IP_BOXES_RULE, node, google, 443, true));
+        assert!(!drops.note(HOST_IP_BOXES_RULE, node, google, Some(443), true));
 
         let lines: Vec<String> = log
             .contents()
@@ -10154,7 +10218,7 @@ mod tests {
     /// mapping's *external* end, both fall to the control-surface refusal
     /// the row's rules never reach.
     #[test]
-    fn gate_verdict_admits_forwarder_reply_from_admitted_port() {
+    fn a_reply_to_the_gateway_is_admitted_before_the_control_surface_refuses() {
         let registry = BoxRegistry::new(SUBNET);
         // Deny-all by destination, every protocol allowed as a dimension:
         // no rule of this row's can admit the answer below, so the admit
@@ -10198,10 +10262,8 @@ mod tests {
         // table the attempt names — the one the dial filled, or the empty
         // one a box's ingress never reached.
         let decide = |replies: &ReplyTables, frame: &[u8]| {
-            let l4 = dns_pins::parse_ipv4_l4(frame)
-                .expect("the frame builder's IPv4 header always parses");
-            let summary = boxes::core::egress::summarize(frame);
-            gate_verdict(&summary, Some(&l4), &table, &baseline, &pins, replies)
+            let l4 = parse_l4(frame).expect("the frame builder's IPv4 header always parses");
+            guest_verdict(frame, Some(&l4), &table, &baseline, &pins, replies)
         };
 
         // The forwarder's dial: a bare SYN from the gateway — the source
@@ -10217,8 +10279,7 @@ mod tests {
             18080,
             boxes::core::egress::TCP_SYN,
         );
-        let dial_l4 =
-            dns_pins::parse_ipv4_l4(&dial).expect("the frame builder's IPv4 header always parses");
+        let dial_l4 = parse_l4(&dial).expect("the frame builder's IPv4 header always parses");
         assert!(
             matches!(
                 replies.observe_delivered(&record, &dial_l4, &limiter, SUBNET, Instant::now()),
@@ -10351,14 +10412,11 @@ mod tests {
         let pins = dns_pins::DnsPins::new(SUBNET);
         let replies = ReplyTables::new();
         let decide = |frame: &[u8]| {
-            let l4 = dns_pins::parse_ipv4_l4(frame)
-                .expect("the frame builder's IPv4 header always parses");
-            let summary = boxes::core::egress::summarize(frame);
-            gate_verdict(&summary, Some(&l4), &table, &baseline, &pins, &replies)
+            let l4 = parse_l4(frame).expect("the frame builder's IPv4 header always parses");
+            guest_verdict(frame, Some(&l4), &table, &baseline, &pins, &replies)
         };
         let note = |frame: &[u8], now: Instant| {
-            let l4 = dns_pins::parse_ipv4_l4(frame)
-                .expect("the frame builder's IPv4 header always parses");
+            let l4 = parse_l4(frame).expect("the frame builder's IPv4 header always parses");
             replies.observe_refusable(&record, &l4, SUBNET, now);
         };
 
@@ -10435,14 +10493,11 @@ mod tests {
         let pins = dns_pins::DnsPins::new(SUBNET);
         let replies = ReplyTables::new();
         let decide = |frame: &[u8]| {
-            let l4 = dns_pins::parse_ipv4_l4(frame)
-                .expect("the frame builder's IPv4 header always parses");
-            let summary = boxes::core::egress::summarize(frame);
-            gate_verdict(&summary, Some(&l4), &table, &baseline, &pins, &replies)
+            let l4 = parse_l4(frame).expect("the frame builder's IPv4 header always parses");
+            guest_verdict(frame, Some(&l4), &table, &baseline, &pins, &replies)
         };
         let note = |frame: &[u8]| {
-            let l4 = dns_pins::parse_ipv4_l4(frame)
-                .expect("the frame builder's IPv4 header always parses");
+            let l4 = parse_l4(frame).expect("the frame builder's IPv4 header always parses");
             replies.observe_refusable(&record, &l4, SUBNET, Instant::now());
         };
 
@@ -10560,10 +10615,8 @@ mod tests {
         let replies = ReplyTables::new();
         let limiter = Arc::new(DropLimiter::new());
         let decide = |replies: &ReplyTables, frame: &[u8]| {
-            let l4 = dns_pins::parse_ipv4_l4(frame)
-                .expect("the frame builder's IPv4 header always parses");
-            let summary = boxes::core::egress::summarize(frame);
-            gate_verdict(&summary, Some(&l4), &table, &baseline, &pins, replies)
+            let l4 = parse_l4(frame).expect("the frame builder's IPv4 header always parses");
+            guest_verdict(frame, Some(&l4), &table, &baseline, &pins, replies)
         };
 
         // The proxy-sourced dial: a bare SYN from the proxy's address at the
@@ -10577,8 +10630,7 @@ mod tests {
             18080,
             boxes::core::egress::TCP_SYN,
         );
-        let dial_l4 =
-            dns_pins::parse_ipv4_l4(&dial).expect("the frame builder's IPv4 header always parses");
+        let dial_l4 = parse_l4(&dial).expect("the frame builder's IPv4 header always parses");
         assert!(
             replies
                 .observe_delivered(&record, &dial_l4, &limiter, SUBNET, Instant::now())
@@ -10646,8 +10698,7 @@ mod tests {
             18080,
             boxes::core::egress::TCP_SYN,
         );
-        let dial_l4 =
-            dns_pins::parse_ipv4_l4(&dial).expect("the frame builder's IPv4 header always parses");
+        let dial_l4 = parse_l4(&dial).expect("the frame builder's IPv4 header always parses");
         let outcome = replies
             .entry(&record)
             .flows
@@ -10670,11 +10721,10 @@ mod tests {
             40000,
             boxes::core::egress::TCP_SYN | boxes::core::egress::TCP_ACK,
         );
-        let answer_l4 = dns_pins::parse_ipv4_l4(&answer)
-            .expect("the frame builder's IPv4 header always parses");
-        let summary = boxes::core::egress::summarize(&answer);
+        let answer_l4 = parse_l4(&answer).expect("the frame builder's IPv4 header always parses");
+        let summary = sent(&answer);
         assert_eq!(
-            gate_verdict(
+            guest_verdict(
                 &summary,
                 Some(&answer_l4),
                 &table,
@@ -10733,10 +10783,8 @@ mod tests {
         let replies = ReplyTables::new();
         let limiter = Arc::new(DropLimiter::new());
         let decide = |replies: &ReplyTables, frame: &[u8]| {
-            let l4 = dns_pins::parse_ipv4_l4(frame)
-                .expect("the frame builder's IPv4 header always parses");
-            let summary = boxes::core::egress::summarize(frame);
-            gate_verdict(&summary, Some(&l4), &table, &baseline, &pins, replies)
+            let l4 = parse_l4(frame).expect("the frame builder's IPv4 header always parses");
+            guest_verdict(frame, Some(&l4), &table, &baseline, &pins, replies)
         };
 
         // The node's own connect toward the gateway, from the proxy port
@@ -10774,8 +10822,7 @@ mod tests {
             7654,
             boxes::core::egress::TCP_SYN,
         );
-        let dial_l4 =
-            dns_pins::parse_ipv4_l4(&dial).expect("the frame builder's IPv4 header always parses");
+        let dial_l4 = parse_l4(&dial).expect("the frame builder's IPv4 header always parses");
         assert!(
             matches!(
                 replies.observe_delivered(&node, &dial_l4, &limiter, SUBNET, Instant::now()),
@@ -10895,10 +10942,8 @@ mod tests {
         let replies = ReplyTables::new();
         let limiter = Arc::new(DropLimiter::new());
         let decide = |replies: &ReplyTables, frame: &[u8]| {
-            let l4 = dns_pins::parse_ipv4_l4(frame)
-                .expect("the frame builder's IPv4 header always parses");
-            let summary = boxes::core::egress::summarize(frame);
-            gate_verdict(&summary, Some(&l4), &table, &baseline, &pins, replies)
+            let l4 = parse_l4(frame).expect("the frame builder's IPv4 header always parses");
+            guest_verdict(frame, Some(&l4), &table, &baseline, &pins, replies)
         };
 
         // The whole proof runs on one hand-held clock — the same decision,
@@ -10914,8 +10959,7 @@ mod tests {
             18080,
             boxes::core::egress::TCP_SYN,
         );
-        let dial_l4 =
-            dns_pins::parse_ipv4_l4(&dial).expect("the frame builder's IPv4 header always parses");
+        let dial_l4 = parse_l4(&dial).expect("the frame builder's IPv4 header always parses");
         assert!(
             matches!(
                 replies.observe_delivered(&record, &dial_l4, &limiter, SUBNET, t0),
@@ -10931,8 +10975,7 @@ mod tests {
             40000,
             boxes::core::egress::TCP_SYN | boxes::core::egress::TCP_ACK,
         );
-        let answer_l4 = dns_pins::parse_ipv4_l4(&answer)
-            .expect("the frame builder's IPv4 header always parses");
+        let answer_l4 = parse_l4(&answer).expect("the frame builder's IPv4 header always parses");
         // The conversation's first answer is admitted, and refreshes the
         // record: TCP's window runs from the last frame either way.
         let t1 = t0 + Duration::from_secs(1);
@@ -10978,8 +11021,8 @@ mod tests {
             18080,
             boxes::core::egress::TCP_SYN,
         );
-        let second_dial_l4 = dns_pins::parse_ipv4_l4(&second_dial)
-            .expect("the frame builder's IPv4 header always parses");
+        let second_dial_l4 =
+            parse_l4(&second_dial).expect("the frame builder's IPv4 header always parses");
         assert!(
             matches!(
                 replies.observe_delivered(
@@ -13469,6 +13512,126 @@ mod tests {
         );
     }
 
+    /// A box that declared a credentialed upstream reaches the Box Egress
+    /// Proxy's listener from its own address, and its task row does not: the
+    /// lane is the box's row's, and the task row the registration files
+    /// beside it is kept in the kernel's configuration unlaned. The in-step
+    /// helper could not notice a task row that took the box's lane, since
+    /// it builds its expectation through the same function that keeps the
+    /// rows; this check decides the two rows' frames instead.
+    #[test]
+    fn a_task_row_does_not_inherit_its_boxs_credentialed_lane() {
+        let registry = BoxRegistry::new(SUBNET);
+        let task = [100, 64, 0, 20];
+        registry.register(
+            BoxRegistration::new("laned", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_task_addresses([Ipv4Addr::from(task)])
+                .with_credentialed_upstream(boxes::CredentialedUpstream::default())
+                .with_egress_policy(EgressPolicy::deny_all()),
+        );
+        registry.assert_kernel_in_step();
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        let pins = dns_pins::DnsPins::new(SUBNET);
+        let proxy = SUBNET.box_egress_proxy_address().octets();
+        let port = switch::bep_host::PROXY_PORT;
+        let decide = |src: [u8; 4]| {
+            guest_verdict(
+                &sent(&ipv4_frame(src, 6, proxy, port)),
+                None,
+                &table,
+                &baseline,
+                &pins,
+                &ReplyTables::new(),
+            )
+        };
+        assert_eq!(
+            decide(LEASE),
+            Ok(GateAdmit::ProxyLane),
+            "the box's own row reaches the proxy's listener on its lane"
+        );
+        assert_eq!(
+            decide(task),
+            Err(GateDrop::ProxyLane {
+                src: task,
+                dst: proxy,
+                dst_port: port,
+            }),
+            "the task row is refused at the proxy's listener under the proxy-lane rule"
+        );
+    }
+
+    /// The alias-by-name lift admits a frame to the host alias and nothing
+    /// else. A row whose DNS hosts name `host.min.internal` and whose rules
+    /// cover no subnet:
+    /// - its frame to an undeclared public address is dropped under the
+    ///   undeclared-subnet rule: the lift is not a way past the row's rules
+    ///   to any other destination;
+    /// - its frame to the alias at an exposed port is admitted: the row
+    ///   names the host, so the kernel opens the alias to it there, and the
+    ///   frame, which the row's rules do not cover, reaches the lift as an
+    ///   undeclared subnet.
+    ///
+    /// A row that does not name the host, by name or by a subnet covering the
+    /// alias, sends to the same exposed port and is dropped under the
+    /// host-alias rule: the kernel opens the alias at an exposure only to a
+    /// box that names the host (`alias_open`'s `names && any_exposure`, with
+    /// `names_host` the row's alias-by-name flag or its allowed subnets
+    /// covering the alias), so its arm is the closed alias and the lift is
+    /// never asked with the alias as destination from such a row.
+    #[test]
+    fn the_alias_by_name_lift_admits_the_alias_alone() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(
+            BoxRegistration::new("names-host", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: None,
+                    allow_subnets: Some(vec![]),
+                    allow_dns_hosts: Some(vec!["host.min.internal".to_string()]),
+                    deny_subnets: None,
+                }),
+        );
+        let silent = [100, 64, 0, 11];
+        registry.register(
+            BoxRegistration::new("silent", Ipv4Addr::from(silent), Ipv4Addr::LOCALHOST)
+                .with_egress_policy(EgressPolicy::deny_all()),
+        );
+        registry.assert_kernel_in_step();
+        let table = registry.table();
+        let exposed = NodePlaneBaseline::built_in(SUBNET)
+            .with_host_exposure(vec![crate::net::host_exposures::HostExposure::tcp(8080)]);
+        let public = [203, 0, 113, 10];
+        assert_eq!(
+            guest_verdict(
+                &sent(&ipv4_frame(LEASE, 6, public, 443)),
+                None,
+                &table,
+                &exposed,
+                &dns_pins::DnsPins::new(SUBNET),
+                &ReplyTables::new(),
+            ),
+            Err(GateDrop::Verdict(DropReason::UndeclaredSubnet {
+                dst: public,
+                proto: 6,
+            })),
+            "the row that names the host is held to its rules at a public address"
+        );
+        assert_eq!(
+            alias_verdict(&table, &exposed, LEASE, false, 6, 8080),
+            Ok(GateAdmit::Row),
+            "the row that names the host reaches the alias at the exposed port"
+        );
+        assert_eq!(
+            alias_verdict(&table, &exposed, silent, false, 6, 8080),
+            Err(GateDrop::HostAlias {
+                src: silent,
+                dst_port: 8080,
+                row: AliasRow::Box,
+            }),
+            "a row that does not name the host finds the alias closed at the exposed port"
+        );
+    }
+
     /// NET-134: the Box Egress Proxy's listener is a credentialed lane's
     /// infrastructure — the one host-side destination a box reaches by
     /// declaring the upstream, never by allowing its address. A box whose
@@ -13851,10 +14014,10 @@ mod tests {
         // refused under the proxy rule, at the proxy's port and over UDP too.
         assert_eq!(baseline.phase(), NodeBaselinePhase::InForce);
         for (proto, port) in [(6, 8118), (17, 8118)] {
-            let frame = boxes::core::egress::summarize(&ipv4_frame(node, proto, proxy, port));
+            let frame = sent(&ipv4_frame(node, proto, proxy, port));
             assert!(
                 matches!(
-                    gate_verdict(&frame, None, &table, &baseline, &pins, &ReplyTables::new()),
+                    guest_verdict(&frame, None, &table, &baseline, &pins, &ReplyTables::new()),
                     Err(GateDrop::ProxyLane { .. })
                 ),
                 "the in-force set refuses the proxy's address at proto {proto} port {port}"
@@ -13864,10 +14027,10 @@ mod tests {
         // Announced: the node row — allow-all — declares no lane, so the
         // proxy rule drops the same frame. Either posture, no reach.
         let announced = baseline.clone().announced();
-        let frame = boxes::core::egress::summarize(&ipv4_frame(node, 6, proxy, 8118));
+        let frame = sent(&ipv4_frame(node, 6, proxy, 8118));
         assert!(
             matches!(
-                gate_verdict(&frame, None, &table, &announced, &pins, &ReplyTables::new()),
+                guest_verdict(&frame, None, &table, &announced, &pins, &ReplyTables::new()),
                 Err(GateDrop::ProxyLane { .. })
             ),
             "the interim node row carries no lane, so its frame to the proxy is the proxy \
@@ -16246,13 +16409,13 @@ mod tests {
         // against: empty, because the row declared no names and no reply has
         // been observed — the arm below stays unreachable for it.
         let pins = dns_pins::DnsPins::new(SUBNET);
-        let summarize = boxes::core::egress::summarize;
+        let summarize = sent;
 
         // A held source is decided by its rules: the same frame that the
         // relay test watches pass and drop, decided here with no sockets.
         let declared = summarize(&ipv4_frame(LEASE, 6, [10, 1, 2, 3], 80));
         assert!(matches!(
-            gate_verdict(
+            guest_verdict(
                 &declared,
                 None,
                 &table,
@@ -16269,14 +16432,14 @@ mod tests {
             .clone();
         assert!(
             matches!(
-                boxes::core::egress::verdict(&declared, &rules),
+                boxes::core::egress::verdict(&boxes::core::egress::summarize(&declared), &rules),
                 FrameVerdict::Admit
             ),
             "the shared verdict admits what the gate admits"
         );
         let undeclared = summarize(&ipv4_frame(LEASE, 6, [203, 0, 113, 7], 443));
         assert_eq!(
-            gate_verdict(
+            guest_verdict(
                 &undeclared,
                 None,
                 &table,
@@ -16296,7 +16459,7 @@ mod tests {
         // of the row's decision, so no rules are ever read for it.
         let surface = summarize(&ipv4_frame(LEASE, 6, SUBNET.gateway().octets(), 443));
         assert_eq!(
-            gate_verdict(
+            guest_verdict(
                 &surface,
                 None,
                 &table,
@@ -16321,7 +16484,7 @@ mod tests {
             443,
         ));
         assert_eq!(
-            gate_verdict(
+            guest_verdict(
                 &unregistered_surface,
                 None,
                 &table,
@@ -16339,7 +16502,7 @@ mod tests {
         // whatever the row's protocols allow.
         let resolver = summarize(&ipv4_frame(LEASE, 17, SUBNET.gateway().octets(), 53));
         assert!(matches!(
-            gate_verdict(
+            guest_verdict(
                 &resolver,
                 None,
                 &table,
@@ -16355,7 +16518,7 @@ mod tests {
         // there — the row is never consulted.
         let ingress_port = summarize(&ipv4_frame(LEASE, 6, SUBNET.gateway().octets(), 8080));
         assert_eq!(
-            gate_verdict(
+            guest_verdict(
                 &ingress_port,
                 None,
                 &table,
@@ -16377,7 +16540,7 @@ mod tests {
         // half.
         let unknown = summarize(&ipv4_frame([100, 64, 0, 99], 6, [10, 1, 2, 3], 80));
         assert_eq!(
-            gate_verdict(
+            guest_verdict(
                 &unknown,
                 None,
                 &table,
@@ -16404,7 +16567,7 @@ mod tests {
             80,
         ));
         assert_eq!(
-            gate_verdict(
+            guest_verdict(
                 &gateway,
                 None,
                 &table,
@@ -16418,7 +16581,7 @@ mod tests {
         );
         let foreign_arp = summarize(&arp_frame([203, 0, 113, 7]));
         assert_eq!(
-            gate_verdict(
+            guest_verdict(
                 &foreign_arp,
                 None,
                 &table,
@@ -16437,12 +16600,14 @@ mod tests {
         assert!(empty.is_empty());
         let v6 = summarize(&ipv6_frame());
         assert_eq!(
-            gate_verdict(&v6, None, &empty, &baseline, &pins, &ReplyTables::new()),
-            Err(GateDrop::Verdict(DropReason::Ipv6))
+            guest_verdict(&v6, None, &empty, &baseline, &pins, &ReplyTables::new()),
+            Err(GateDrop::NotAFrame {
+                rule: "egress-ipv6"
+            })
         );
         let truncated = summarize(&[0u8; 13]);
         assert_eq!(
-            gate_verdict(
+            guest_verdict(
                 &truncated,
                 None,
                 &table,
@@ -16450,11 +16615,10 @@ mod tests {
                 &pins,
                 &ReplyTables::new()
             ),
-            Err(GateDrop::Verdict(DropReason::Truncated))
+            Err(GateDrop::NotAFrame {
+                rule: "egress-truncated-ipv4"
+            })
         );
-        // The summaries agree with the families the frames were built as.
-        assert_eq!(v6.family(), FrameFamily::Ipv6);
-        assert_eq!(truncated.family(), FrameFamily::Truncated);
     }
 
     /// NET-085's bound at the decision that makes it: a root process inside
@@ -16538,7 +16702,7 @@ mod tests {
         }
 
         /// One spoofed attempt: summarizes the frame exactly as the gate's
-        /// relay would hand it over, decides it with [`gate_verdict`], and
+        /// relay would hand it over, decides it with [`guest_frame`], and
         /// records the verdict under the decision's own name, tagged by the
         /// baseline posture it ran under.
         fn decide(
@@ -16550,13 +16714,13 @@ mod tests {
             dst: [u8; 4],
             port: u16,
         ) -> Attempt {
-            let frame = boxes::core::egress::summarize(&ipv4_frame(src, proto, dst, port));
+            let frame = sent(&ipv4_frame(src, proto, dst, port));
             // No reply-flow records exist for any of these attempts — nothing
             // was ever delivered toward a box's published port — so the empty
             // table is the one the pure decision reads, and the frame's verdict
             // is the row's and the baseline's alone.
             let verdict =
-                match gate_verdict(&frame, None, table, baseline, pins, &ReplyTables::new()) {
+                match guest_verdict(&frame, None, table, baseline, pins, &ReplyTables::new()) {
                     Ok(GateAdmit::Baseline) => Verdict::AdmittedByBaseline,
                     Ok(GateAdmit::Row) if src == baseline.node_addr() => Verdict::AdmittedByNodeRow,
                     Ok(GateAdmit::Row) => Verdict::AdmittedByRow,
@@ -16630,7 +16794,7 @@ mod tests {
 
         // Every spoofed attempt, decided and recorded: the tuples are
         // (baseline posture, source, protocol, destination, port), and each
-        // is summarized, decided by [`gate_verdict`], and recorded exactly
+        // is summarized, decided by [`guest_frame`], and recorded exactly
         // as the gate's relay would hand the frame over. The announced world
         // is the one the flip closed — the allow-all node row — kept so the
         // gap stays pinned beside its replacement.
@@ -16794,10 +16958,9 @@ mod tests {
         // box resident, every marked frame drops, the pinned baseline
         // endpoint included.
         let marked = |dst: [u8; 4], port: u16| {
-            let frame =
-                boxes::core::egress::summarize(&box_cohort_frame(ipv4_frame(node, 6, dst, port)));
-            assert!(frame.box_cohort_marked());
-            gate_verdict(&frame, None, &table, &baseline, &pins, &ReplyTables::new())
+            let frame = sent(&box_cohort_frame(ipv4_frame(node, 6, dst, port)));
+            assert!(boxes::core::egress::summarize(&frame).box_cohort_marked());
+            guest_verdict(&frame, None, &table, &baseline, &pins, &ReplyTables::new())
         };
         let unbounded = |dst: [u8; 4], resident: usize| GateDrop::HostIpUnbounded {
             src: node,
@@ -16883,7 +17046,7 @@ mod tests {
                         Ipv4Addr::from(attempt.src),
                     )
                 });
-                let summary = boxes::core::egress::summarize(&ipv4_frame(
+                let summary = sent(&ipv4_frame(
                     attempt.src,
                     attempt.proto,
                     attempt.dst,
@@ -16891,7 +17054,10 @@ mod tests {
                 ));
                 assert!(
                     matches!(
-                        boxes::core::egress::verdict(&summary, record.egress()),
+                        boxes::core::egress::verdict(
+                            &boxes::core::egress::summarize(&summary),
+                            record.egress()
+                        ),
                         FrameVerdict::Admit
                     ),
                     "the admit of {}:{} from {} is not the source's own row's \
@@ -16971,9 +17137,36 @@ mod tests {
             verdict_of(shipped, [100, 64, 0, 11], 6, web_only, 80),
             Verdict::Dropped("egress-infrastructure-destination"),
         );
+        // This row's DNS-host list is absent and it allows no subnet, so it
+        // names nothing and is narrowed: a row that names nothing reaches the
+        // resolver only with a zone question, and the gate's verdict is that
+        // one decision. A second kind: the datagram carries no question.
         assert_eq!(
             verdict_of(shipped, [100, 64, 0, 11], 17, resolver, 53),
-            Verdict::AdmittedByRow,
+            Verdict::Dropped("egress-deny-all-dns-query"),
+        );
+        // The resolver's arm stays open to it for a zone question.
+        let zone_query = dns_pins::tests::udp_payload_frame(
+            Ipv4Addr::new(100, 64, 0, 11),
+            40000,
+            SUBNET.dns_server(),
+            53,
+            &dns_pins::tests::dns_query_of(&[(
+                dns_pins::tests::qname("web.min.internal."),
+                hickory_proto::rr::RecordType::A,
+            )]),
+        );
+        assert_eq!(
+            guest_verdict(
+                &zone_query,
+                None,
+                &table,
+                &baseline,
+                &pins,
+                &ReplyTables::new()
+            ),
+            Ok(GateAdmit::Row),
+            "a zone A query from the row that names nothing is admitted by its row"
         );
         assert_eq!(
             verdict_of(shipped, [100, 64, 0, 11], 6, resolver, 53),
@@ -17043,9 +17236,9 @@ mod tests {
         // is admitted by web's row the same as any resolution web's own
         // traffic would carry. It buys no reach — the flow frames behind it
         // are what the rows bound, each on its own.
-        let spoofed_arp = boxes::core::egress::summarize(&arp_frame(LEASE));
+        let spoofed_arp = sent(&arp_frame(LEASE));
         assert!(matches!(
-            gate_verdict(
+            guest_verdict(
                 &spoofed_arp,
                 None,
                 &table,
@@ -17055,6 +17248,1445 @@ mod tests {
             ),
             Ok(GateAdmit::Row)
         ));
+    }
+
+    /// A whole IPv4 frame from `src` to `dst` carrying `transport` as
+    /// protocol `proto`, with the flags and fragment field `fragment` and its
+    /// true total length: what the behaviour rows below send.
+    fn whole_frame(
+        src: [u8; 4],
+        dst: [u8; 4],
+        proto: u8,
+        transport: &[u8],
+        fragment: u16,
+    ) -> Vec<u8> {
+        let total = u16::try_from(20 + transport.len()).unwrap();
+        let mut frame = vec![0x52, 0x54, 0, 0, 0, 1, 0x52, 0x54, 0, 0, 0, 2, 0x08, 0x00];
+        frame.extend_from_slice(&[0x45, 0]);
+        frame.extend_from_slice(&total.to_be_bytes());
+        frame.extend_from_slice(&[0, 0]);
+        frame.extend_from_slice(&fragment.to_be_bytes());
+        frame.extend_from_slice(&[64, proto, 0, 0]);
+        frame.extend_from_slice(&src);
+        frame.extend_from_slice(&dst);
+        frame.extend_from_slice(transport);
+        frame
+    }
+
+    /// A UDP header and `payload` from port 40000 to `port`.
+    fn udp_transport(port: u16, payload: &[u8]) -> Vec<u8> {
+        let mut udp = 40000u16.to_be_bytes().to_vec();
+        udp.extend_from_slice(&port.to_be_bytes());
+        udp.extend_from_slice(&u16::try_from(8 + payload.len()).unwrap().to_be_bytes());
+        udp.extend_from_slice(&[0, 0]);
+        udp.extend_from_slice(payload);
+        udp
+    }
+
+    /// A query for `name` of type `kind`, class IN.
+    fn zone_query(name: &str, kind: hickory_proto::rr::RecordType) -> Vec<u8> {
+        dns_pins::tests::dns_query_of(&[(dns_pins::tests::qname(name), kind)])
+    }
+
+    /// A registry holding one row at `LEASE` with `policy`, its table, and
+    /// the shipped baseline.
+    fn one_row(policy: Option<EgressPolicy>) -> (BoxRegistry, BoxTable, NodePlaneBaseline) {
+        let registry = BoxRegistry::new(SUBNET);
+        let mut registration =
+            BoxRegistration::new("probe", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST);
+        if let Some(policy) = policy {
+            registration = registration.with_egress_policy(policy);
+        }
+        registry.register(registration);
+        let table = registry.table();
+        (registry, table, NodePlaneBaseline::built_in(SUBNET))
+    }
+
+    /// The gate's decision for a frame `bytes` from a guest, by the
+    /// configuration `table` keeps, with no reply, refusal or pin.
+    fn guest(table: &BoxTable, baseline: &NodePlaneBaseline, bytes: &[u8]) -> super::GuestFrame {
+        table.adopt_node_baseline(baseline);
+        super::guest_frame(
+            bytes,
+            table,
+            baseline,
+            &dns_pins::DnsPins::new(SUBNET),
+            &ReplyTables::new(),
+        )
+    }
+
+    /// TCP or UDP from a guest on a first fragment without
+    /// a whole transport header is dropped before any decision, under the
+    /// truncated-transport rule.
+    #[test]
+    fn a_guest_first_fragment_without_a_whole_transport_header_is_dropped_as_truncated_transport() {
+        let (_registry, table, baseline) = one_row(None);
+        // Ten bytes of a TCP header: ports, sequence number, half the rest.
+        let short = whole_frame(
+            LEASE,
+            [203, 0, 113, 7],
+            6,
+            &[0x9c, 0x40, 1, 187, 0, 0, 0, 1, 0, 0],
+            0,
+        );
+        let decided = guest(&table, &baseline, &short);
+        assert_eq!(
+            decided.verdict,
+            Err(GateDrop::ShortHeader { src: Some(LEASE) })
+        );
+        assert_eq!(
+            decided.verdict.map_err(|drop| drop.rule()),
+            Err("egress-truncated-transport")
+        );
+    }
+
+    /// The same toward a guest is dropped, and recorded
+    /// nowhere, under the ingress truncated-transport rule.
+    #[test]
+    fn a_short_first_fragment_toward_a_guest_is_dropped_and_recorded_nowhere() {
+        let (_registry, table, _baseline) = one_row(None);
+        let short = whole_frame([203, 0, 113, 7], LEASE, 17, &[0, 53, 0x9c, 0x40], 0);
+        assert!(matches!(
+            super::toward_guest(&short, &table),
+            super::TowardGuest::Drop {
+                dst: Some(LEASE),
+                rule: "ingress-truncated-transport",
+                cause: None,
+            }
+        ));
+    }
+
+    /// A configuration whose lock was poisoned by a panic is decided on by no
+    /// frame: a frame a guest sent is dropped under the internal rule with
+    /// the poisoned cause, and a frame toward a guest under the internal
+    /// rule, each with no table touched. The registry's write sections go on:
+    /// a withdrawal completes, and the configuration no longer holds the row.
+    #[test]
+    fn a_poisoned_configuration_decides_no_frame_and_a_withdrawal_still_completes() {
+        let (registry, table, baseline) = one_row(None);
+        let leaving = ipv4_frame(LEASE, 6, [203, 0, 113, 7], 443);
+        let toward = ipv4_frame([203, 0, 113, 7], 6, LEASE, 40000);
+        let poisoned = Err(GateDrop::Internal {
+            src: Some(LEASE),
+            dst: Some([203, 0, 113, 7]),
+            cause: InternalCause::Poisoned,
+        });
+        assert_ne!(guest(&table, &baseline, &leaving).verdict, poisoned);
+        assert!(matches!(
+            super::toward_guest(&toward, &table),
+            super::TowardGuest::Deliver { .. }
+        ));
+
+        registry.poison_kernel_for_tests();
+        assert_eq!(guest(&table, &baseline, &leaving).verdict, poisoned);
+        assert!(matches!(
+            super::toward_guest(&toward, &table),
+            super::TowardGuest::Drop {
+                dst: Some(LEASE),
+                rule: super::INTERNAL_RULE,
+                cause: Some(InternalCause::Poisoned),
+            }
+        ));
+
+        assert!(registry.withdraw(Ipv4Addr::from(LEASE)).is_some());
+        assert!(table.by_source(LEASE).is_none(), "the row is withdrawn");
+        assert_eq!(
+            registry.kernel_for_tests().generation_at(LEASE),
+            None,
+            "the configuration followed the withdrawal"
+        );
+    }
+
+    /// The same drop on the relay: the line it writes names the frame's
+    /// destination as the destination, says the frame was headed toward a
+    /// guest, and carries the ingress rule; the whole frame behind it is
+    /// delivered.
+    #[tokio::test]
+    async fn a_short_first_fragment_toward_a_guest_is_said_as_an_ingress_drop() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        let mut h = gate_over(registry).await;
+        let short = whole_frame([203, 0, 113, 7], LEASE, 17, &[0, 53, 0x9c, 0x40], 0);
+        let whole = ipv4_frame([203, 0, 113, 7], 17, LEASE, 40000);
+        send_frame(&mut h.switch, &short).await;
+        send_frame(&mut h.switch, &whole).await;
+        assert_eq!(
+            expect_frame(&mut h.guest).await,
+            whole,
+            "the short frame never reached the guest; the whole one did"
+        );
+        wait_for_log(&h.log, "ingress-truncated-transport").await;
+        let logged = h.log.contents();
+        let line = logged
+            .lines()
+            .find(|line| line.contains("ingress-truncated-transport"))
+            .expect("the drop's line was written");
+        assert!(
+            line.contains("destination=100.64.0.9")
+                && line.contains("toward a guest")
+                && !line.contains("source=")
+                && !line.contains("leaving the VM"),
+            "the line is an ingress drop's: {line}"
+        );
+    }
+
+    /// Bytes that claim a header and do not carry one, toward a guest.
+    fn malformed_toward_a_guest() -> Vec<(&'static str, Vec<u8>)> {
+        let mut arp = arp_frame([100, 64, 0, 1]);
+        arp[18] = 5;
+        let ipv4 = ipv4_frame([203, 0, 113, 7], 6, LEASE, 8080);
+        let mut version = ipv4.clone();
+        version[14] = 0x65;
+        let mut header_length = ipv4.clone();
+        header_length[14] = 0x44;
+        let mut total_length = ipv4;
+        total_length[16..18].copy_from_slice(&0xffffu16.to_be_bytes());
+        vec![
+            ("bytes too short for a header", vec![0u8; 10]),
+            ("an ARP packet of another shape", arp),
+            ("an IPv4 header with another version", version),
+            ("an IPv4 header too short for itself", header_length),
+            ("an IPv4 total length past the bytes", total_length),
+        ]
+    }
+
+    /// An Ethernet frame of `ethertype` carrying 46 zero bytes.
+    fn ethertype_frame(ethertype: u16) -> Vec<u8> {
+        let mut frame = vec![0x52, 0x54, 0, 0, 0, 1, 0x52, 0x54, 0, 0, 0, 2];
+        frame.extend_from_slice(&ethertype.to_be_bytes());
+        frame.extend_from_slice(&[0u8; 46]);
+        frame
+    }
+
+    /// Toward a guest, bytes that are not a frame are dropped as no frame,
+    /// with no destination and recorded nowhere; another kind of frame (IPv6,
+    /// a VLAN tag, another EtherType) is delivered.
+    #[test]
+    fn a_malformed_frame_toward_a_guest_is_dropped_as_no_frame_and_another_kind_is_delivered() {
+        let (_registry, table, _baseline) = one_row(None);
+        for (what, bytes) in malformed_toward_a_guest() {
+            assert!(
+                matches!(
+                    super::toward_guest(&bytes, &table),
+                    super::TowardGuest::Drop {
+                        dst: None,
+                        rule: "ingress-truncated-ipv4",
+                        cause: None,
+                    }
+                ),
+                "{what} is dropped as no frame"
+            );
+        }
+        for (what, bytes) in [
+            ("an IPv6 frame", ipv6_frame()),
+            ("a VLAN-tagged frame", ethertype_frame(0x8100)),
+            ("another EtherType", ethertype_frame(0x88cc)),
+        ] {
+            assert!(
+                matches!(
+                    super::toward_guest(&bytes, &table),
+                    super::TowardGuest::Deliver { .. }
+                ),
+                "{what} is delivered"
+            );
+        }
+    }
+
+    /// The same at the relay: a malformed frame from the switch is not
+    /// delivered and its line names no destination, says the frame was
+    /// headed toward a guest and carries the rule for bytes that are no
+    /// frame; the whole frame behind it is delivered.
+    #[tokio::test]
+    async fn a_malformed_frame_toward_a_guest_is_dropped_as_no_frame_and_the_next_is_delivered() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        let mut h = gate_over(registry).await;
+        let mut malformed = ipv4_frame([203, 0, 113, 7], 17, LEASE, 40000);
+        malformed[14] = 0x65;
+        let whole = ipv4_frame([203, 0, 113, 7], 17, LEASE, 40000);
+        send_frame(&mut h.switch, &malformed).await;
+        send_frame(&mut h.switch, &whole).await;
+        assert_eq!(
+            expect_frame(&mut h.guest).await,
+            whole,
+            "the malformed frame never reached the guest; the whole one did"
+        );
+        wait_for_log(&h.log, "ingress-truncated-ipv4").await;
+        let logged = h.log.contents();
+        let line = logged
+            .lines()
+            .find(|line| line.contains("ingress-truncated-ipv4"))
+            .expect("the drop's line was written");
+        assert!(
+            line.contains("destination=none") && line.contains("toward a guest"),
+            "the line is an ingress drop's with no destination: {line}"
+        );
+    }
+
+    /// The box the recording checks below send toward, at `LEASE`: it
+    /// declares a DNS host, so the resolver's answer to its own question
+    /// pins, and its rules pass TCP to 203.0.113.0/24.
+    fn recording_box() -> BoxRegistry {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(
+            BoxRegistration::new("weather", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: Some(vec![boxes::IpProto::Tcp]),
+                    allow_subnets: Some(vec!["203.0.113.0/24".to_string()]),
+                    allow_dns_hosts: Some(vec!["example.com".to_string()]),
+                    deny_subnets: None,
+                }),
+        );
+        registry
+    }
+
+    /// Sends toward the box at `LEASE`, each with `spoil` applied, a bare SYN
+    /// at a port no publish dials and the resolver's answer to the box's own
+    /// question, and asserts each is dropped under `rule` and recorded
+    /// nowhere: the reply tables hold no entry for the box, and the address
+    /// the answer names is not admitted by a pin. Then the same two frames,
+    /// whole, are delivered and recorded, so the checks read tables that do
+    /// record.
+    async fn assert_spoiled_frames_toward_a_guest_record_nothing(spoil: fn(&mut [u8]), rule: &str) {
+        let mut h = gate_over(recording_box()).await;
+        let client = Ipv4Addr::new(203, 0, 113, 7);
+        // A datagram toward the box that no table records: not TCP, from no
+        // resolver, at a port no publish dials.
+        let toward_marker = ipv4_frame(client.octets(), 17, LEASE, 40001);
+
+        // A bare SYN, whole, is noted as refusable, which makes the box's
+        // entry in the reply tables.
+        let syn = dns_pins::tests::tcp_frame(client, 40000, Ipv4Addr::from(LEASE), 8080, 0x02);
+        let mut spoiled_syn = syn.clone();
+        spoil(&mut spoiled_syn);
+        send_frame(&mut h.switch, &spoiled_syn).await;
+        send_frame(&mut h.switch, &toward_marker).await;
+        assert_eq!(
+            expect_frame(&mut h.guest).await,
+            toward_marker,
+            "the spoiled SYN never reached the guest; the marker did"
+        );
+        wait_for_log(&h.log, rule).await;
+        assert_eq!(
+            h.replies.record_count_of(LEASE),
+            None,
+            "the spoiled SYN made no entry in the reply tables"
+        );
+
+        // The box's own question, then the resolver's answer to it, spoiled.
+        let query = dns_pins::tests::udp_payload_frame(
+            Ipv4Addr::from(LEASE),
+            40000,
+            SUBNET.dns_server(),
+            53,
+            &dns_pins::tests::dns_query("example.com"),
+        );
+        send_frame(&mut h.guest, &query).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            query,
+            "the box's own query reaches the switch"
+        );
+        let answer = Ipv4Addr::new(93, 184, 216, 34);
+        let reply = dns_pins::tests::udp_payload_frame(
+            SUBNET.dns_server(),
+            53,
+            Ipv4Addr::from(LEASE),
+            40000,
+            &dns_pins::tests::dns_response("example.com", &[answer]),
+        );
+        let mut spoiled_reply = reply.clone();
+        spoil(&mut spoiled_reply);
+        send_frame(&mut h.switch, &spoiled_reply).await;
+        send_frame(&mut h.switch, &toward_marker).await;
+        assert_eq!(
+            expect_frame(&mut h.guest).await,
+            toward_marker,
+            "the spoiled answer never reached the guest; the marker did"
+        );
+        let to_answer = ipv4_frame(LEASE, 6, answer.octets(), 443);
+        let marker = ipv4_frame(LEASE, 6, client.octets(), 443);
+        send_frame(&mut h.guest, &to_answer).await;
+        send_frame(&mut h.guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            marker,
+            "the spoiled answer pinned nothing: the frame to its address was refused; the \
+             marker passed"
+        );
+        assert_eq!(
+            h.pins.admitted_by_pin(),
+            0,
+            "no frame was admitted by a pin"
+        );
+        assert!(
+            !h.log
+                .contents()
+                .contains("filled the box's host-side DNS admission table"),
+            "the spoiled answer filled no pin"
+        );
+
+        // Whole, the same answer pins its address, and the same SYN makes the
+        // box's entry.
+        send_frame(&mut h.switch, &reply).await;
+        assert_eq!(
+            expect_frame(&mut h.guest).await,
+            reply,
+            "the whole answer reaches the guest"
+        );
+        wait_for_log(&h.log, "filled the box's host-side DNS admission table").await;
+        send_frame(&mut h.guest, &to_answer).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            to_answer,
+            "the whole answer's address is admitted by its pin"
+        );
+        send_frame(&mut h.switch, &syn).await;
+        assert_eq!(
+            expect_frame(&mut h.guest).await,
+            syn,
+            "the whole SYN reaches the guest"
+        );
+        assert!(
+            h.replies.record_count_of(LEASE).is_some(),
+            "the whole SYN made the box's entry in the reply tables"
+        );
+    }
+
+    /// Toward a guest, a TCP or UDP first fragment whose transport header
+    /// does not agree with its datagram (a TCP data offset past it, a UDP
+    /// length past it) is dropped under the ingress truncated-transport rule
+    /// and records nothing: no reply-table entry, no pin.
+    #[tokio::test]
+    async fn a_short_first_fragment_toward_a_guest_records_nothing() {
+        assert_spoiled_frames_toward_a_guest_record_nothing(
+            |frame| {
+                if frame[23] == 6 {
+                    // The TCP data offset: fifteen words, past the datagram.
+                    frame[46] = 0xf0;
+                } else {
+                    // The UDP length: one byte past the datagram, with no
+                    // more fragments to follow.
+                    let length = u16::from_be_bytes([frame[38], frame[39]]) + 1;
+                    frame[38..40].copy_from_slice(&length.to_be_bytes());
+                }
+            },
+            "ingress-truncated-transport",
+        )
+        .await;
+    }
+
+    /// Toward a guest, bytes whose IPv4 total length runs past them are no
+    /// frame: dropped under the ingress rule for bytes that are no frame, and
+    /// they record nothing: no reply-table entry, no pin.
+    #[tokio::test]
+    async fn a_malformed_frame_toward_a_guest_records_nothing() {
+        assert_spoiled_frames_toward_a_guest_record_nothing(
+            |frame| frame[16..18].copy_from_slice(&0xffffu16.to_be_bytes()),
+            "ingress-truncated-ipv4",
+        )
+        .await;
+    }
+
+    /// A deny-all line for a query refused though the question it names is
+    /// in the box zone (here for its class) says the query is not a plain
+    /// question for a box-zone name; a query naming an outside name keeps
+    /// the outside-the-zone sentence.
+    #[test]
+    fn a_refused_zone_question_is_said_as_not_a_plain_zone_question() {
+        let (_registry, table, _baseline) = one_row(Some(EgressPolicy::deny_all()));
+        let record = table.by_source(LEASE).expect("the row is held");
+        let (log, _guard) = capture_log();
+        let limiter = DropLimiter::new();
+        let class_ch = raw_query(b"\x03web\x03min\x08internal\x00\x00\x01\x00\x03");
+        assert!(limiter.warn_deny_all_query(&dns_pins::deny_all_line(
+            Arc::clone(&record),
+            Some(&class_ch)
+        )));
+        let outside = zone_query("example.org.", hickory_proto::rr::RecordType::A);
+        assert!(limiter.warn_deny_all_query(&dns_pins::deny_all_line(record, Some(&outside))));
+        let logged = log.contents();
+        let line_of = |name: &str| {
+            logged
+                .lines()
+                .find(|line| line.contains(name))
+                .unwrap_or_else(|| panic!("a line names {name}: {logged}"))
+                .to_string()
+        };
+        let in_zone = line_of("name=\"web.min.internal\"");
+        assert!(
+            in_zone.contains("not a plain question for a box-zone name")
+                && !in_zone.contains("outside the box zone"),
+            "{in_zone}"
+        );
+        let off_zone = line_of("name=\"example.org\"");
+        assert!(
+            off_zone.contains("naming something outside the box zone at the host-side egress gate"),
+            "{off_zone}"
+        );
+    }
+
+    /// The protocol-without-ports row, the same outcome for a different
+    /// reason: an ICMP first fragment to the alias whose bytes after the
+    /// header spell an exposed port is refused, and the kernel's frame has
+    /// no port, so its drop line names none.
+    #[test]
+    fn a_protocol_without_ports_is_decided_with_no_port() {
+        let (_registry, table, baseline) = one_row(None);
+        let exposed =
+            baseline.with_host_exposure(vec![crate::net::host_exposures::HostExposure::tcp(8080)]);
+        let alias = SUBNET.host_alias().octets();
+        let icmp = whole_frame(LEASE, alias, 1, &[0x1f, 0x90, 0x1f, 0x90, 0, 0, 0, 0], 0);
+        let decided = guest(&table, &exposed, &icmp);
+        assert_eq!(decided.port, None, "the kernel's frame has no port");
+        assert_eq!(
+            guest(&table, &exposed, &ipv4_frame(LEASE, 6, alias, 8080)).verdict,
+            Ok(GateAdmit::Row),
+            "the exposure is in force for the port the ICMP bytes spell"
+        );
+        assert_eq!(
+            decided.verdict,
+            Err(GateDrop::HostAlias {
+                src: LEASE,
+                dst_port: 0,
+                row: AliasRow::Box
+            })
+        );
+    }
+
+    /// A TCP header from port 40000 to 8080 with ACK set: the bytes a first
+    /// fragment would carry its ports in, which a later fragment carries as
+    /// data.
+    const PORTS_8080: [u8; 20] = [
+        0x9c, 0x40, 0x1f, 0x90, 0, 0, 0, 1, 0, 0, 0, 0, 0x50, 0x10, 0xff, 0xff, 0, 0, 0, 0,
+    ];
+
+    /// A fragment that is not the first has no port either: TCP to the
+    /// alias at a fragment offset past zero, whose bytes spell the exposed
+    /// port where a first fragment's header would, is refused with no port,
+    /// while the same bytes as a first fragment reach the exposure.
+    #[test]
+    fn a_fragment_that_is_not_the_first_is_decided_with_no_port() {
+        let (_registry, table, baseline) = one_row(None);
+        let exposed =
+            baseline.with_host_exposure(vec![crate::net::host_exposures::HostExposure::tcp(8080)]);
+        let alias = SUBNET.host_alias().octets();
+        let first = whole_frame(LEASE, alias, 6, &PORTS_8080, 0);
+        assert_eq!(
+            guest(&table, &exposed, &first).verdict,
+            Ok(GateAdmit::Row),
+            "the exposure is in force for the port the fragment's bytes spell"
+        );
+        // A fragment offset of one unit of eight bytes, no more to follow.
+        let later = whole_frame(LEASE, alias, 6, &PORTS_8080, 1);
+        let decided = guest(&table, &exposed, &later);
+        assert_eq!(decided.port, None, "the kernel's frame has no port");
+        assert_eq!(
+            decided.verdict,
+            Err(GateDrop::HostAlias {
+                src: LEASE,
+                dst_port: 0,
+                row: AliasRow::Box
+            })
+        );
+    }
+
+    /// The same on the relay, for both kinds of frame without a port: the
+    /// host-alias line for an ICMP frame and for a TCP fragment that is not
+    /// the first, each to the alias where an exposure is open, names its
+    /// source and prints no port field, while a whole TCP frame to the
+    /// exposure is delivered.
+    #[tokio::test]
+    async fn a_frame_without_a_port_is_said_with_no_port() {
+        let registry = BoxRegistry::new(SUBNET);
+        let other = [100, 64, 0, 10];
+        for (name, lease) in [("probe", LEASE), ("other", other)] {
+            registry.register(BoxRegistration::new(
+                name,
+                Ipv4Addr::from(lease),
+                Ipv4Addr::LOCALHOST,
+            ));
+        }
+        let exposed = NodePlaneBaseline::built_in(SUBNET)
+            .with_host_exposure(vec![crate::net::host_exposures::HostExposure::tcp(8080)]);
+        let mut h =
+            gate_over_with_node_baseline(registry, UNREGISTERED_SOURCE_PHASE, exposed).await;
+        let alias = SUBNET.host_alias().octets();
+        let icmp = whole_frame(LEASE, alias, 1, &[0x1f, 0x90, 0x1f, 0x90, 0, 0, 0, 0], 0);
+        let later = whole_frame(other, alias, 6, &PORTS_8080, 1);
+        let marker = whole_frame(LEASE, alias, 6, &PORTS_8080, 0);
+        send_frame(&mut h.guest, &icmp).await;
+        send_frame(&mut h.guest, &later).await;
+        send_frame(&mut h.guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            marker,
+            "neither frame without a port reached the switch; the whole frame to the exposure did"
+        );
+        expect_silence(&mut h.switch).await;
+        let rule = format!("rule_matched=\"{}\"", super::HOST_ALIAS_RULE);
+        for lease in [LEASE, other] {
+            let source = format!("source={}", Ipv4Addr::from(lease));
+            wait_for_log(&h.log, &source).await;
+            let logged = h.log.contents();
+            let line = logged
+                .lines()
+                .find(|line| line.contains(&rule) && line.contains(&source))
+                .unwrap_or_else(|| panic!("a host-alias line names {source}: {logged}"));
+            assert!(!line.contains("port="), "the line prints no port: {line}");
+        }
+    }
+
+    /// An ARP packet that is not Ethernet/IPv4 with six-
+    /// and four-byte addresses is no frame, under the truncated-IPv4 rule.
+    #[test]
+    fn an_arp_of_another_shape_is_no_frame() {
+        let (_registry, table, baseline) = one_row(None);
+        let mut arp = arp_frame(LEASE);
+        arp[18] = 8; // a hardware address length that is not six
+        assert_eq!(
+            guest(&table, &baseline, &arp).verdict,
+            Err(GateDrop::NotAFrame {
+                rule: "egress-truncated-ipv4"
+            })
+        );
+    }
+
+    /// An IPv4 header with a bad version, a bad header
+    /// length or a bad total length is no frame, under the truncated-IPv4
+    /// rule, whatever its protocol.
+    #[test]
+    fn an_ipv4_header_with_a_bad_version_length_or_total_is_no_frame() {
+        let (_registry, table, baseline) = one_row(None);
+        let good = ipv4_frame(LEASE, 6, [203, 0, 113, 7], 443);
+        let mut version = good.clone();
+        version[14] = 0x65;
+        let mut header_length = good.clone();
+        header_length[14] = 0x44;
+        let mut total = good.clone();
+        total[16] = 0;
+        total[17] = 0;
+        for bad in [version, header_length, total] {
+            assert_eq!(
+                guest(&table, &baseline, &bad).verdict,
+                Err(GateDrop::NotAFrame {
+                    rule: "egress-truncated-ipv4"
+                })
+            );
+        }
+    }
+
+    /// A row that names nothing reaches the resolver with a
+    /// query for a name below the box zone of any type, not only A.
+    #[test]
+    fn a_narrowed_rows_zone_query_of_any_type_is_admitted() {
+        let (_registry, table, baseline) = one_row(Some(EgressPolicy::deny_all()));
+        let resolver = SUBNET.dns_server().octets();
+        for kind in [
+            hickory_proto::rr::RecordType::A,
+            hickory_proto::rr::RecordType::AAAA,
+            hickory_proto::rr::RecordType::HTTPS,
+        ] {
+            let query = udp_transport(53, &zone_query("web.min.internal.", kind));
+            let frame = whole_frame(LEASE, resolver, 17, &query, 0);
+            assert_eq!(guest(&table, &baseline, &frame).verdict, Ok(GateAdmit::Row));
+        }
+    }
+
+    /// The zone's apex is not a name below the zone: from a row that names
+    /// nothing, a query for `min.internal` itself is refused for every type,
+    /// as is one for a name outside the zone.
+    #[test]
+    fn a_narrowed_rows_query_for_the_zone_apex_is_refused() {
+        let (_registry, table, baseline) = one_row(Some(EgressPolicy::deny_all()));
+        let resolver = SUBNET.dns_server().octets();
+        for name in ["min.internal.", "example.org."] {
+            for kind in [
+                hickory_proto::rr::RecordType::A,
+                hickory_proto::rr::RecordType::AAAA,
+                hickory_proto::rr::RecordType::HTTPS,
+            ] {
+                let query = udp_transport(53, &zone_query(name, kind));
+                let frame = whole_frame(LEASE, resolver, 17, &query, 0);
+                assert_eq!(
+                    guest(&table, &baseline, &frame).verdict,
+                    Err(GateDrop::DenyAllDns { src: LEASE }),
+                    "{kind:?} for {name} is refused"
+                );
+            }
+        }
+    }
+
+    /// A row that declares no subnet and no DNS host is
+    /// narrowed whether its DNS-host list is empty or absent.
+    #[test]
+    fn a_row_that_declares_no_subnet_and_no_dns_host_is_narrowed() {
+        let absent = EgressPolicy {
+            allow_dns_hosts: None,
+            ..EgressPolicy::deny_all()
+        };
+        let (_registry, table, baseline) = one_row(Some(absent));
+        let query = udp_transport(
+            53,
+            &zone_query("example.org.", hickory_proto::rr::RecordType::A),
+        );
+        let frame = whole_frame(LEASE, SUBNET.dns_server().octets(), 17, &query, 0);
+        assert_eq!(
+            guest(&table, &baseline, &frame).verdict,
+            Err(GateDrop::DenyAllDns { src: LEASE })
+        );
+    }
+
+    /// Only the resolver's arm is narrowed, and a datagram
+    /// to it whose payload cannot be read as a query is refused; a datagram
+    /// to DNS's port anywhere else is decided by the row's rules.
+    #[test]
+    fn only_the_resolvers_arm_is_narrowed_and_a_query_that_cannot_be_read_is_refused() {
+        let (_registry, table, baseline) = one_row(Some(EgressPolicy::deny_all()));
+        let unreadable = udp_transport(53, &[0x12, 0x34, 0x01]);
+        let to_resolver = whole_frame(LEASE, SUBNET.dns_server().octets(), 17, &unreadable, 0);
+        assert_eq!(
+            guest(&table, &baseline, &to_resolver).verdict,
+            Err(GateDrop::DenyAllDns { src: LEASE })
+        );
+        let elsewhere = whole_frame(LEASE, [8, 8, 8, 8], 17, &unreadable, 0);
+        let decided = guest(&table, &baseline, &elsewhere).verdict;
+        assert!(
+            matches!(&decided, Err(drop) if drop.rule() != "egress-deny-all-dns-query"),
+            "port 53 off the resolver is the row's rules' to decide: {decided:?}"
+        );
+    }
+
+    /// A cohort none of whose members names anything is
+    /// narrowed as a row is.
+    #[test]
+    fn a_cohort_whose_members_name_nothing_is_narrowed() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        let member = boxes::SessionId::from_bytes([0x31; 16]);
+        assert!(registry.admit_host_ip_box(member, Some(&EgressPolicy::deny_all())));
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        let node = SUBNET.daemon_ip().octets();
+        let query = udp_transport(
+            53,
+            &zone_query("example.org.", hickory_proto::rr::RecordType::A),
+        );
+        let marked = box_cohort_frame(whole_frame(
+            node,
+            SUBNET.dns_server().octets(),
+            17,
+            &query,
+            0,
+        ));
+        assert_eq!(
+            guest(&table, &baseline, &marked).verdict,
+            Err(GateDrop::CohortDenyAllDns { src: node })
+        );
+    }
+
+    /// A DNS query from a narrowed row that is a first
+    /// fragment with more to follow is refused, though what it carries asks
+    /// for a name in the zone.
+    #[test]
+    fn a_fragmented_dns_query_from_a_narrowed_row_is_refused() {
+        let (_registry, table, baseline) = one_row(Some(EgressPolicy::deny_all()));
+        let query = udp_transport(
+            53,
+            &zone_query("web.min.internal.", hickory_proto::rr::RecordType::A),
+        );
+        let more_to_follow = 0x2000;
+        let frame = whole_frame(
+            LEASE,
+            SUBNET.dns_server().octets(),
+            17,
+            &query,
+            more_to_follow,
+        );
+        assert_eq!(
+            guest(&table, &baseline, &frame).verdict,
+            Err(GateDrop::DenyAllDns { src: LEASE })
+        );
+    }
+
+    /// A cohort frame its members' DNS admissions could
+    /// lift, which no admission lifts, is refused under the host-address
+    /// boxes' rule.
+    #[test]
+    fn a_cohorts_unlifted_dns_admission_is_reported_under_the_host_ip_boxes_rule() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        let member = boxes::SessionId::from_bytes([0x32; 16]);
+        let names = EgressPolicy {
+            allow_subnets: Some(vec![]),
+            allow_dns_hosts: Some(vec!["example.org".to_string()]),
+            allow_protocols: None,
+            deny_subnets: None,
+        };
+        assert!(registry.admit_host_ip_box(member, Some(&names)));
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        let node = SUBNET.daemon_ip().octets();
+        let syn = box_cohort_frame(ipv4_frame(node, 6, [203, 0, 113, 7], 443));
+        let decided = guest(&table, &baseline, &syn);
+        assert_eq!(
+            decided.verdict.map_err(|drop| drop.rule()),
+            Err(HOST_IP_BOXES_RULE)
+        );
+    }
+
+    /// The order on the guest-to-switch leg: a query a row that names
+    /// nothing may not send is refused under the deny-all DNS rule before
+    /// any table is asked, a live reply record that the same frame would
+    /// answer included.
+    #[test]
+    fn a_row_dns_frame_reaches_no_table() {
+        let (_registry, table, baseline) = one_row(Some(EgressPolicy::deny_all()));
+        let record = table.by_source(LEASE).expect("the row is held");
+        let resolver = SUBNET.dns_server();
+        let limiter = DropLimiter::new();
+        let replies = ReplyTables::new();
+        // A client's datagram from the resolver's address and port, delivered
+        // to the box: the box's answer to it would be the record's reverse.
+        let dial =
+            dns_pins::tests::udp_payload_frame(resolver, 53, Ipv4Addr::from(LEASE), 40000, b"");
+        let dial_l4 = parse_l4(&dial).expect("the dial is a whole datagram");
+        let _flow = replies.observe_delivered(&record, &dial_l4, &limiter, SUBNET, Instant::now());
+        let off_zone = udp_transport(
+            53,
+            &zone_query("example.org.", hickory_proto::rr::RecordType::A),
+        );
+        let frame = whole_frame(LEASE, resolver.octets(), 17, &off_zone, 0);
+        let sent_l4 = parse_l4(&frame).expect("the query is a whole datagram");
+        assert!(
+            replies.reply_admits(&record, &sent_l4, Instant::now()),
+            "the reply record is live and would admit the query"
+        );
+        table.adopt_node_baseline(&baseline);
+        assert_eq!(
+            super::guest_frame(
+                &frame,
+                &table,
+                &baseline,
+                &dns_pins::DnsPins::new(SUBNET),
+                &replies
+            )
+            .verdict,
+            Err(GateDrop::DenyAllDns { src: LEASE })
+        );
+    }
+
+    /// A standard query, one question, whose question is `question` as
+    /// written: the name's wire form, the type and the class.
+    fn raw_query(question: &[u8]) -> Vec<u8> {
+        let mut query = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        query.extend_from_slice(question);
+        query
+    }
+
+    /// From a row that names nothing, a question counts
+    /// as one for a zone name only if its class is IN and its name is plain
+    /// labels with no compression pointer; any other is refused.
+    #[test]
+    fn a_narrowed_rows_zone_question_must_be_class_in_and_plain_labels() {
+        let (_registry, table, baseline) = one_row(Some(EgressPolicy::deny_all()));
+        let resolver = SUBNET.dns_server().octets();
+        let decide = |question: &[u8]| {
+            let datagram = udp_transport(53, &raw_query(question));
+            guest(
+                &table,
+                &baseline,
+                &whole_frame(LEASE, resolver, 17, &datagram, 0),
+            )
+            .verdict
+        };
+        assert_eq!(
+            decide(b"\x03web\x03min\x08internal\x00\x00\x01\x00\x01"),
+            Ok(GateAdmit::Row),
+            "class IN, plain labels: a zone question"
+        );
+        assert_eq!(
+            decide(b"\x03web\x03min\x08internal\x00\x00\x01\x00\x03"),
+            Err(GateDrop::DenyAllDns { src: LEASE }),
+            "class CH is not a zone question"
+        );
+        assert_eq!(
+            decide(b"\x03web\xc0\x0c\x00\x01\x00\x01"),
+            Err(GateDrop::DenyAllDns { src: LEASE }),
+            "a name with a compression pointer is not a zone question"
+        );
+    }
+
+    /// From a row that names nothing, the header and every question it
+    /// counts are read, and nothing after them: two zone questions in plain
+    /// labels pass together; a second question named by a pointer, a name
+    /// outside the zone behind a zone name, a counted question that is not
+    /// there, and the zone's apex are refused; and after the question, an
+    /// additional record that is counted and absent, one cut short and a
+    /// whole one are not read, so the query passes.
+    #[test]
+    fn a_narrowed_rows_query_is_read_to_the_end_of_its_questions_and_no_further() {
+        const WEB: &[u8] = b"\x03web\x03min\x08internal\x00";
+        const DB: &[u8] = b"\x02db\x03min\x08internal\x00";
+        const APEX: &[u8] = b"\x03min\x08internal\x00";
+        const OUTSIDE: &[u8] = b"\x07example\x03org\x00";
+        const POINTER_TO_THE_FIRST: &[u8] = b"\xc0\x0c";
+        const A_IN: &[u8] = &[0, 1, 0, 1];
+        // An OPT record cut short after its root name and its type.
+        const OPT_CUT: &[u8] = b"\x00\x00\x29";
+        // An OPT record: the root name, type 41, a UDP size of 1232, a TTL of
+        // 0, and eight bytes of data holding one option of a local code.
+        const OPT: &[u8] = &[
+            0x00, 0x00, 0x29, 0x04, 0xd0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0xfd, 0xe9, 0x00,
+            0x04, 0xde, 0xad, 0xbe, 0xef,
+        ];
+        let (_registry, table, baseline) = one_row(Some(EgressPolicy::deny_all()));
+        let resolver = SUBNET.dns_server().octets();
+        // A standard query whose header counts `questions` questions and
+        // `additional` additional records, then `body` as written.
+        let counted = |questions: u16, additional: u16, body: &[&[u8]]| {
+            let mut payload = vec![0x12, 0x34, 0x01, 0x00];
+            payload.extend_from_slice(&questions.to_be_bytes());
+            payload.extend_from_slice(&[0, 0, 0, 0]);
+            payload.extend_from_slice(&additional.to_be_bytes());
+            payload.extend_from_slice(&body.concat());
+            payload
+        };
+        let decide = |payload: &[u8]| {
+            let datagram = udp_transport(53, payload);
+            guest(
+                &table,
+                &baseline,
+                &whole_frame(LEASE, resolver, 17, &datagram, 0),
+            )
+            .verdict
+        };
+        for (what, payload, want) in [
+            (
+                "two zone questions in plain labels",
+                counted(2, 0, &[WEB, A_IN, DB, A_IN]),
+                Ok(GateAdmit::Row),
+            ),
+            (
+                "a second question named by a pointer to the first",
+                counted(2, 0, &[WEB, A_IN, POINTER_TO_THE_FIRST, A_IN]),
+                Err(GateDrop::DenyAllDns { src: LEASE }),
+            ),
+            (
+                "a name outside the zone behind a zone name",
+                counted(2, 0, &[WEB, A_IN, OUTSIDE, A_IN]),
+                Err(GateDrop::DenyAllDns { src: LEASE }),
+            ),
+            (
+                "two questions counted and one there",
+                counted(2, 0, &[WEB, A_IN]),
+                Err(GateDrop::DenyAllDns { src: LEASE }),
+            ),
+            (
+                "the zone's apex",
+                counted(1, 0, &[APEX, A_IN]),
+                Err(GateDrop::DenyAllDns { src: LEASE }),
+            ),
+            (
+                "an additional record counted and absent",
+                counted(1, 1, &[WEB, A_IN]),
+                Ok(GateAdmit::Row),
+            ),
+            (
+                "an additional record cut short",
+                counted(1, 1, &[WEB, A_IN, OPT_CUT]),
+                Ok(GateAdmit::Row),
+            ),
+            (
+                "a whole additional record",
+                counted(1, 1, &[WEB, A_IN, OPT]),
+                Ok(GateAdmit::Row),
+            ),
+        ] {
+            assert_eq!(decide(&payload), want, "{what}");
+        }
+    }
+
+    /// The order on the guest-to-switch leg for the cohort: a query a cohort
+    /// whose members name nothing may not send is refused under the deny-all
+    /// DNS rule, though the node's reply record would admit it.
+    #[test]
+    fn a_cohort_dns_frame_reaches_no_table() {
+        let registry = BoxRegistry::new(SUBNET);
+        let node_record = registry.register_node_namespace(7654);
+        let member = boxes::SessionId::from_bytes([0x33; 16]);
+        assert!(registry.admit_host_ip_box(member, Some(&EgressPolicy::deny_all())));
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        let node = SUBNET.daemon_ip();
+        let resolver = SUBNET.dns_server();
+        let limiter = DropLimiter::new();
+        let replies = ReplyTables::new();
+        let dial = dns_pins::tests::udp_payload_frame(resolver, 53, node, 40000, b"");
+        let dial_l4 = parse_l4(&dial).expect("the dial is a whole datagram");
+        let _flow =
+            replies.observe_delivered(&node_record, &dial_l4, &limiter, SUBNET, Instant::now());
+        let off_zone = udp_transport(
+            53,
+            &zone_query("example.org.", hickory_proto::rr::RecordType::A),
+        );
+        let frame = box_cohort_frame(whole_frame(
+            node.octets(),
+            resolver.octets(),
+            17,
+            &off_zone,
+            0,
+        ));
+        let sent_l4 = parse_l4(&frame).expect("the query is a whole datagram");
+        assert!(
+            replies.reply_admits(&node_record, &sent_l4, Instant::now()),
+            "the node's reply record is live and would admit the query"
+        );
+        table.adopt_node_baseline(&baseline);
+        assert_eq!(
+            super::guest_frame(
+                &frame,
+                &table,
+                &baseline,
+                &dns_pins::DnsPins::new(SUBNET),
+                &replies
+            )
+            .verdict,
+            Err(GateDrop::CohortDenyAllDns { src: node.octets() })
+        );
+    }
+
+    /// The arm the kernel gives `bytes` by the configuration `table` holds
+    /// when it is called, the alias's exposures not refreshed first.
+    fn kernel_arm(table: &BoxTable, bytes: &[u8]) -> netcore::split::Arm {
+        match table
+            .egress_first(bytes)
+            .expect("the configuration's lock is not poisoned")
+            .0
+        {
+            netcore::split::First::Frame { arm, .. } => arm,
+            netcore::split::First::NotAFrame(_) | netcore::split::First::ShortHeader => {
+                panic!("the probe is a whole frame")
+            }
+        }
+    }
+
+    /// An early alias path: a frame without ports to the alias is closed
+    /// whatever exposures list the kernel holds, a stale one included, so
+    /// deciding it reads no list. A frame with a port does read it.
+    #[test]
+    fn a_portless_frame_to_the_alias_is_closed_whatever_list_the_kernel_holds() {
+        use crate::net::host_exposures::HostExposure;
+        use netcore::row::RowArm;
+        use netcore::split::Arm;
+        let (_registry, table, baseline) = one_row(None);
+        table.adopt_node_baseline(&baseline);
+        let alias = SUBNET.host_alias().octets();
+        let icmp = whole_frame(LEASE, alias, 1, &[0x1f, 0x90, 0x1f, 0x90, 0, 0, 0, 0], 0);
+        let to_8080 = ipv4_frame(LEASE, 6, alias, 8080);
+        let none: Arc<[HostExposure]> = Arc::from(Vec::<HostExposure>::new());
+        let stale: Arc<[HostExposure]> = Arc::from(vec![HostExposure::tcp(8080)]);
+        for list in [&none, &stale] {
+            table.push_exposures(list);
+            assert!(matches!(
+                kernel_arm(&table, &icmp),
+                Arm::Row(_, RowArm::AliasClosed)
+            ));
+        }
+        table.push_exposures(&none);
+        assert!(matches!(
+            kernel_arm(&table, &to_8080),
+            Arm::Row(_, RowArm::AliasClosed)
+        ));
+        table.push_exposures(&stale);
+        assert!(!matches!(
+            kernel_arm(&table, &to_8080),
+            Arm::Row(_, RowArm::AliasClosed)
+        ));
+    }
+
+    /// Sets the seam run after each exposure list a frame to the alias hands
+    /// over: it hands over another list, as another frame would, so every
+    /// round finds the configuration holding a list the frame did not read.
+    fn every_alias_round_loses() {
+        use crate::net::host_exposures::HostExposure;
+        super::test_hooks::AFTER_EXPOSURES_PUSHED.set(Some(Box::new(|table: &BoxTable| {
+            let another: Arc<[HostExposure]> = Arc::from(vec![HostExposure::tcp(8080)]);
+            table.push_exposures(&another);
+        })));
+    }
+
+    /// A frame to the host alias whose every round finds another exposure
+    /// list is dropped under the internal rule; a frame from the same box to
+    /// another address reads no list and is decided as usual; and without
+    /// the seam the same frame to the alias reaches its exposure.
+    #[test]
+    fn a_frame_to_the_alias_is_dropped_when_every_round_finds_another_list() {
+        let (_registry, table, baseline) = one_row(None);
+        let exposed =
+            baseline.with_host_exposure(vec![crate::net::host_exposures::HostExposure::tcp(8080)]);
+        let alias = SUBNET.host_alias().octets();
+        let to_alias = ipv4_frame(LEASE, 6, alias, 8080);
+        let elsewhere = ipv4_frame(LEASE, 6, [203, 0, 113, 7], 443);
+        every_alias_round_loses();
+        let to_alias_decided = guest(&table, &exposed, &to_alias).verdict;
+        let elsewhere_decided = guest(&table, &exposed, &elsewhere).verdict;
+        super::test_hooks::AFTER_EXPOSURES_PUSHED.set(None);
+        assert_eq!(
+            to_alias_decided,
+            Err(GateDrop::Internal {
+                src: Some(LEASE),
+                dst: Some(alias),
+                cause: InternalCause::ExposuresChanged,
+            })
+        );
+        assert_eq!(
+            to_alias_decided.map_err(|drop| drop.rule()),
+            Err("internal")
+        );
+        assert_eq!(elsewhere_decided, Ok(GateAdmit::Row));
+        assert_eq!(
+            guest(&table, &exposed, &to_alias).verdict,
+            Ok(GateAdmit::Row),
+            "with a round that holds its own list, the frame reaches the exposure"
+        );
+    }
+
+    /// The same on the relay: the frame to the alias is not written on and
+    /// its line names the box, the alias as the destination, the cause and
+    /// the internal rule; the frame behind it to another address is.
+    #[tokio::test]
+    async fn a_frame_to_the_alias_dropped_for_its_rounds_is_said_and_not_written_on() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(BoxRegistration::new(
+            "probe",
+            Ipv4Addr::from(LEASE),
+            Ipv4Addr::LOCALHOST,
+        ));
+        let exposed = NodePlaneBaseline::built_in(SUBNET)
+            .with_host_exposure(vec![crate::net::host_exposures::HostExposure::tcp(8080)]);
+        let mut h =
+            gate_over_with_node_baseline(registry, UNREGISTERED_SOURCE_PHASE, exposed).await;
+        every_alias_round_loses();
+        let alias = SUBNET.host_alias().octets();
+        let to_alias = ipv4_frame(LEASE, 6, alias, 8080);
+        let marker = ipv4_frame(LEASE, 6, [203, 0, 113, 7], 443);
+        send_frame(&mut h.guest, &to_alias).await;
+        send_frame(&mut h.guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            marker,
+            "the frame to the alias never reached the switch; the marker did"
+        );
+        expect_silence(&mut h.switch).await;
+        super::test_hooks::AFTER_EXPOSURES_PUSHED.set(None);
+        wait_for_log(&h.log, "rule_matched=\"internal\"").await;
+        let logged = h.log.contents();
+        let line = logged
+            .lines()
+            .find(|line| line.contains("rule_matched=\"internal\""))
+            .expect("the drop's line was written");
+        let source = format!("source={}", Ipv4Addr::from(LEASE));
+        let destination = format!("destination={}", Ipv4Addr::from(alias));
+        assert!(
+            line.contains(&source)
+                && line.contains("box=\"probe\"")
+                && line.contains(&destination)
+                && line.contains("host exposure list changed"),
+            "the line names the box, the alias and the cause: {line}"
+        );
+    }
+
+    /// Fills `pins` with `answer` for `name`, the box at `LEASE` asking and
+    /// the resolver answering, as the relay's two legs would.
+    fn pin_answer(pins: &dns_pins::DnsPins, table: &BoxTable, name: &str, answer: Ipv4Addr) {
+        let now = Instant::now();
+        let query = dns_pins::tests::udp_payload_frame(
+            Ipv4Addr::from(LEASE),
+            40000,
+            SUBNET.dns_server(),
+            53,
+            &dns_pins::tests::dns_query(name),
+        );
+        let (pkt, datagram) =
+            super::kernel_facts::udp_datagram(&query, &netcore::frame::parse_frame(&query))
+                .expect("the query is a whole datagram");
+        let row = table.by_source(LEASE);
+        pins.observe_query(
+            table,
+            dns_pins::Asker::Row(row.as_ref()),
+            &pkt,
+            datagram,
+            now,
+        );
+        let reply = dns_pins::tests::udp_payload_frame(
+            SUBNET.dns_server(),
+            53,
+            Ipv4Addr::from(LEASE),
+            40000,
+            &dns_pins::tests::dns_response(name, &[answer]),
+        );
+        let (pkt, datagram) =
+            super::kernel_facts::udp_datagram(&reply, &netcore::frame::parse_frame(&reply))
+                .expect("the reply is a whole datagram");
+        pins.observe_reply(table, &pkt, datagram, &DropLimiter::new(), now);
+    }
+
+    /// A row at `LEASE` that allows no subnet, and names `example.com` when
+    /// `names` is set: the row without the name has no DNS lift, so a frame
+    /// to an answer's address drops by its arm whatever pin its tables hold.
+    fn register_at_lease(registry: &BoxRegistry, names: bool) {
+        registry.register(
+            BoxRegistration::new("probe", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: None,
+                    allow_subnets: Some(Vec::new()),
+                    allow_dns_hosts: names.then(|| vec!["example.com".to_string()]),
+                    deny_subnets: None,
+                }),
+        );
+    }
+
+    /// A frame is decided for the row the registry holds at its source when
+    /// it is read: when the row is registered again between the kernel's
+    /// answer and that read, the frame is asked again and decided by the new
+    /// row's arm and the new row's tables. Here the first row has no DNS
+    /// lift and the new one has the lift and a pin for the frame's
+    /// destination, so only the new row's arm with the new row's pins admits
+    /// it. When the row changes again after the second answer, the frame is
+    /// dropped under the internal rule.
+    #[test]
+    fn a_frame_is_decided_by_the_row_registered_again_at_its_source_and_its_tables() {
+        let registry = Arc::new(BoxRegistry::new(SUBNET));
+        register_at_lease(&registry, false);
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        table.adopt_node_baseline(&baseline);
+        let pins = dns_pins::DnsPins::new(SUBNET);
+        let answer = Ipv4Addr::new(93, 184, 216, 34);
+        let to_answer = ipv4_frame(LEASE, 6, answer.octets(), 443);
+        let decide =
+            || super::guest_frame(&to_answer, &table, &baseline, &pins, &ReplyTables::new());
+        assert!(
+            matches!(
+                decide().verdict,
+                Err(GateDrop::Verdict(DropReason::UndeclaredSubnet { .. }))
+            ),
+            "the first row has no DNS lift"
+        );
+
+        // Once, between the first answer and the read: the row that names
+        // the host is registered at the address, and its own lookup pins the
+        // frame's destination.
+        let (again, filled) = (Arc::clone(&registry), pins.clone());
+        let mut fired = false;
+        super::test_hooks::BETWEEN_READS.set(Some(Box::new(
+            move |table: &BoxTable, _: [u8; 4]| {
+                if !fired {
+                    fired = true;
+                    register_at_lease(&again, true);
+                    pin_answer(&filled, table, "example.com", answer);
+                }
+            },
+        )));
+        let decided = decide().verdict;
+        super::test_hooks::BETWEEN_READS.set(None);
+        assert_eq!(
+            decided,
+            Ok(GateAdmit::Row),
+            "decided by the new row's arm, with its lift, and by its pin"
+        );
+
+        // After every answer: the row changes each time, so the frame drops.
+        let again = Arc::clone(&registry);
+        super::test_hooks::BETWEEN_READS.set(Some(Box::new(move |_: &BoxTable, _: [u8; 4]| {
+            register_at_lease(&again, true);
+        })));
+        let decided = decide().verdict;
+        super::test_hooks::BETWEEN_READS.set(None);
+        assert_eq!(
+            decided,
+            Err(GateDrop::Internal {
+                src: Some(LEASE),
+                dst: Some(answer.octets()),
+                cause: InternalCause::RowChanged,
+            })
+        );
+        registry.assert_kernel_in_step();
+    }
+
+    /// The same for the resident `host_ip` boxes: a marked frame from the
+    /// node address is decided for the boxes' record the registry holds when
+    /// it is read, and when that record changes after both answers the frame
+    /// is dropped under the internal rule. Each admit of another box with a
+    /// DNS host makes a new record.
+    #[test]
+    fn a_marked_frame_from_the_node_is_dropped_when_the_boxes_record_changes_after_each_answer() {
+        let registry = Arc::new(BoxRegistry::new(SUBNET));
+        registry.register_node_namespace(7654);
+        let policy = EgressPolicy {
+            allow_protocols: None,
+            allow_subnets: Some(vec!["203.0.113.0/24".to_string()]),
+            allow_dns_hosts: Some(vec!["example.com".to_string()]),
+            deny_subnets: None,
+        };
+        assert!(
+            registry.admit_host_ip_box(boxes::SessionId::from_bytes([0x41; 16]), Some(&policy))
+        );
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        let node = SUBNET.daemon_ip().octets();
+        let marked = box_cohort_frame(ipv4_frame(node, 6, [203, 0, 113, 7], 443));
+        assert_eq!(
+            guest(&table, &baseline, &marked).verdict,
+            Ok(GateAdmit::HostIpBox),
+            "the members' rules admit the frame"
+        );
+        let (again, rules) = (Arc::clone(&registry), policy.clone());
+        let mut next = 0x50_u8;
+        super::test_hooks::BETWEEN_READS.set(Some(Box::new(move |_: &BoxTable, _: [u8; 4]| {
+            next += 1;
+            again.admit_host_ip_box(boxes::SessionId::from_bytes([next; 16]), Some(&rules));
+        })));
+        let decided = guest(&table, &baseline, &marked).verdict;
+        super::test_hooks::BETWEEN_READS.set(None);
+        assert_eq!(
+            decided,
+            Err(GateDrop::Internal {
+                src: Some(node),
+                dst: Some([203, 0, 113, 7]),
+                cause: InternalCause::RowChanged,
+            })
+        );
+        assert_eq!(
+            guest(&table, &baseline, &marked).verdict,
+            Ok(GateAdmit::HostIpBox),
+            "with the record unchanged between the reads, the frame is decided as before"
+        );
+        registry.assert_kernel_in_step();
+    }
+
+    /// On the relay, what is recorded for a frame after its verdict is
+    /// recorded for the row the frame was decided for. Here the row at the
+    /// box's address is registered again between the verdict on the box's
+    /// DNS question and what the relay records for it: the new row is not
+    /// marked carried, and the question is not recorded as the new row's, so
+    /// the resolver's answer, which reaches the new row, pins nothing and the
+    /// frame to the answer's address is refused.
+    #[tokio::test]
+    async fn after_its_verdict_a_frame_is_recorded_for_the_row_it_was_decided_for() {
+        let registry = Arc::new(recording_box());
+        let mut h = gate_over_kept(&registry).await;
+        let first = h.table.by_source(LEASE).expect("the box's row is held");
+
+        // Once, right after the verdict: the box's row is registered again.
+        let again = Arc::clone(&registry);
+        let mut fired = false;
+        super::test_hooks::AFTER_DECIDED.set(Some(Box::new(move |_: &BoxTable, _: [u8; 4]| {
+            if !fired {
+                fired = true;
+                again.register(
+                    BoxRegistration::new("weather", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                        .with_egress_policy(EgressPolicy {
+                            allow_protocols: Some(vec![boxes::IpProto::Tcp]),
+                            allow_subnets: Some(vec!["203.0.113.0/24".to_string()]),
+                            allow_dns_hosts: Some(vec!["example.com".to_string()]),
+                            deny_subnets: None,
+                        }),
+                );
+            }
+        })));
+        let query = dns_pins::tests::udp_payload_frame(
+            Ipv4Addr::from(LEASE),
+            40000,
+            SUBNET.dns_server(),
+            53,
+            &dns_pins::tests::dns_query("example.com"),
+        );
+        send_frame(&mut h.guest, &query).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            query,
+            "the box's query is decided for its row and reaches the switch"
+        );
+        super::test_hooks::AFTER_DECIDED.set(None);
+        let second = h.table.by_source(LEASE).expect("the new row is held");
+        assert!(!Arc::ptr_eq(&first, &second), "a new row at the address");
+        assert!(
+            !second.was_attributed(),
+            "the relay marks no row for a frame decided for another"
+        );
+
+        let answer = Ipv4Addr::new(93, 184, 216, 34);
+        let reply = dns_pins::tests::udp_payload_frame(
+            SUBNET.dns_server(),
+            53,
+            Ipv4Addr::from(LEASE),
+            40000,
+            &dns_pins::tests::dns_response("example.com", &[answer]),
+        );
+        send_frame(&mut h.switch, &reply).await;
+        assert_eq!(
+            expect_frame(&mut h.guest).await,
+            reply,
+            "the reply reaches the box"
+        );
+        let to_answer = ipv4_frame(LEASE, 6, answer.octets(), 443);
+        let marker = ipv4_frame(LEASE, 6, [203, 0, 113, 7], 443);
+        send_frame(&mut h.guest, &to_answer).await;
+        send_frame(&mut h.guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            marker,
+            "the answer pinned nothing for the new row: the frame to it was refused"
+        );
+        assert_eq!(
+            h.pins.admitted_by_pin(),
+            0,
+            "no frame was admitted by a pin"
+        );
+        assert!(
+            !h.log
+                .contents()
+                .contains("filled the box's host-side DNS admission table"),
+            "the answer filled no pin"
+        );
+    }
+
+    /// The other early alias path: the node at a fetch port its baseline
+    /// opens at the alias is admitted whatever exposures list the kernel
+    /// holds, a stale one included, so deciding it reads no list. The node
+    /// at another port does read it.
+    #[test]
+    fn the_node_at_its_baseline_fetch_port_of_the_alias_is_open_whatever_list_the_kernel_holds() {
+        use crate::net::host_exposures::HostExposure;
+        use netcore::node::NodeArm;
+        use netcore::split::Arm;
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET)
+            .with_registry(vec!["host.min.internal".to_string()]);
+        assert_eq!(baseline.alias_ports(), &[(443, 443)]);
+        table.adopt_node_baseline(&baseline);
+        let node = SUBNET.daemon_ip().octets();
+        let alias = SUBNET.host_alias().octets();
+        let fetch = ipv4_frame(node, 6, alias, netcore::node::NODE_FETCH_PORT);
+        let to_8080 = ipv4_frame(node, 6, alias, 8080);
+        let none: Arc<[HostExposure]> = Arc::from(Vec::<HostExposure>::new());
+        let stale: Arc<[HostExposure]> =
+            Arc::from(vec![HostExposure::tcp(8080), HostExposure::udp(443)]);
+        for list in [&none, &stale] {
+            table.push_exposures(list);
+            assert_eq!(kernel_arm(&table, &fetch), Arm::Node(NodeArm::AliasOpen));
+        }
+        table.push_exposures(&none);
+        assert_eq!(
+            kernel_arm(&table, &to_8080),
+            Arm::Node(NodeArm::AliasClosed)
+        );
+        table.push_exposures(&stale);
+        assert_eq!(kernel_arm(&table, &to_8080), Arm::Node(NodeArm::AliasOpen));
     }
 
     /// NET-085 and NET-130, the shipped arm of the node-plane decision: the
@@ -17089,8 +18721,8 @@ mod tests {
         let pins = dns_pins::DnsPins::new(SUBNET);
         let node = SUBNET.daemon_ip().octets();
         let decide = |proto: u8, dst: [u8; 4], port: u16| {
-            gate_verdict(
-                &boxes::core::egress::summarize(&ipv4_frame(node, proto, dst, port)),
+            guest_verdict(
+                &sent(&ipv4_frame(node, proto, dst, port)),
                 None,
                 &table,
                 &baseline,
@@ -17227,10 +18859,9 @@ mod tests {
     ) -> Result<GateAdmit, GateDrop> {
         let node = SUBNET.daemon_ip().octets();
         let proxy = SUBNET.box_egress_proxy_address().octets();
-        let frame =
-            boxes::core::egress::summarize(&box_cohort_frame(ipv4_frame(node, proto, proxy, port)));
-        assert!(frame.box_cohort_marked());
-        gate_verdict(&frame, None, table, baseline, pins, &ReplyTables::new())
+        let frame = sent(&box_cohort_frame(ipv4_frame(node, proto, proxy, port)));
+        assert!(boxes::core::egress::summarize(&frame).box_cohort_marked());
+        guest_verdict(&frame, None, table, baseline, pins, &ReplyTables::new())
     }
 
     /// BEP-083: the `host_ip` cohort's lane to the proxy's listener is the
@@ -17356,10 +18987,10 @@ mod tests {
         let node = SUBNET.daemon_ip().octets();
         let outside = [8, 8, 8, 8];
         let frame = box_cohort_frame(ipv4_frame(node, 6, outside, 443));
-        let summary = boxes::core::egress::summarize(&frame);
-        assert!(summary.box_cohort_marked());
-        let decide = |summary: &FrameSummary| {
-            gate_verdict(summary, None, &table, &baseline, &pins, &ReplyTables::new())
+        let summary = sent(&frame);
+        assert!(boxes::core::egress::summarize(&summary).box_cohort_marked());
+        let decide = |summary: &[u8]| {
+            guest_verdict(summary, None, &table, &baseline, &pins, &ReplyTables::new())
         };
         assert_eq!(
             decide(&summary),
@@ -17386,8 +19017,8 @@ mod tests {
         // refused.
         let metadata = box_cohort_frame(ipv4_frame(node, 6, [169, 254, 169, 254], 80));
         assert!(matches!(
-            gate_verdict(
-                &boxes::core::egress::summarize(&metadata),
+            guest_verdict(
+                &sent(&metadata),
                 None,
                 &table,
                 &baseline,
@@ -17398,8 +19029,8 @@ mod tests {
         ));
         let control = box_cohort_frame(ipv4_frame(node, 6, SUBNET.dns_server().octets(), 80));
         assert!(matches!(
-            gate_verdict(
-                &boxes::core::egress::summarize(&control),
+            guest_verdict(
+                &sent(&control),
                 None,
                 &table,
                 &baseline,
@@ -17426,10 +19057,10 @@ mod tests {
         let mut other_dscp = ipv4_frame(node, 6, outside, 443);
         other_dscp[15] = 0b10_1110 << 2;
         for frame in [ipv4_frame(node, 6, outside, 443), other_dscp] {
-            let summary = boxes::core::egress::summarize(&frame);
-            assert!(!summary.box_cohort_marked());
+            let summary = sent(&frame);
+            assert!(!boxes::core::egress::summarize(&summary).box_cohort_marked());
             assert_eq!(
-                gate_verdict(
+                guest_verdict(
                     &summary,
                     None,
                     &table,
@@ -17464,8 +19095,8 @@ mod tests {
         } else {
             frame
         };
-        gate_verdict(
-            &boxes::core::egress::summarize(&frame),
+        guest_verdict(
+            &sent(&frame),
             None,
             table,
             baseline,
@@ -17502,7 +19133,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
         ));
         let table = registry.table();
-        let record = table.by_source(LEASE).expect("the row is held");
+        let pins = dns_pins::DnsPins::new(SUBNET);
         let dir = TempDir::new().expect("temp dir");
         let config = dir.path().join("config.toml");
         std::fs::write(
@@ -17514,7 +19145,7 @@ mod tests {
             crate::net::host_exposures::HostExposures::at(config.clone(), Duration::ZERO),
         );
         let gate_opens =
-            || super::AliasOpenings::for_box(&baseline, &table, &record).admit(Some((6, 8080)));
+            || guest_verdict(&frame, None, &table, &baseline, &pins, &ReplyTables::new()).is_ok();
         let kernel_arm = || match registry
             .kernel_for_tests()
             .config()
@@ -17724,9 +19355,9 @@ mod tests {
         let resolver = ipv4_frame(LEASE, 17, SUBNET.dns_server().octets(), 53);
         let pins = dns_pins::DnsPins::new(SUBNET);
         for (frame, what) in [(to_proxy, "the lane's proxy"), (resolver, "the resolver")] {
-            let summary = boxes::core::egress::summarize(&frame);
+            let summary = sent(&frame);
             assert!(
-                gate_verdict(&summary, None, &table, &exposed, &pins, &ReplyTables::new()).is_ok(),
+                guest_verdict(&summary, None, &table, &exposed, &pins, &ReplyTables::new()).is_ok(),
                 "{what} stays open at its own address"
             );
         }
@@ -18118,8 +19749,8 @@ mod tests {
         let table = registry.table();
         let baseline = NodePlaneBaseline::built_in(SUBNET);
         let decide = |src: [u8; 4], dst: [u8; 4], proto: u8, port: u16| {
-            gate_verdict(
-                &boxes::core::egress::summarize(&ipv4_frame(src, proto, dst, port)),
+            guest_verdict(
+                &sent(&ipv4_frame(src, proto, dst, port)),
                 None,
                 &table,
                 &baseline,
@@ -18180,7 +19811,7 @@ mod tests {
             Who::of(&table, Some(app)),
             instance,
             Who::of(&table, Some(instance)),
-            8080,
+            Some(8080),
         ));
         let logged = log.contents();
         for expected in [
@@ -18418,7 +20049,18 @@ mod tests {
         // frame a deny-all row admits — the resolver carve-out — so the
         // arrival of the marker is the proof the drop happened.
         let undeclared = ipv4_frame(LEASE, 6, [1, 2, 3, 4], 80);
-        let marker = ipv4_frame(LEASE, 17, SUBNET.dns_server().octets(), 53);
+        // A row that declares no subnet and no DNS host reaches the
+        // resolver with a whole query for a name in the box zone.
+        let marker = dns_pins::tests::udp_payload_frame(
+            Ipv4Addr::from(LEASE),
+            40000,
+            SUBNET.dns_server(),
+            53,
+            &dns_pins::tests::dns_query_of(&[(
+                dns_pins::tests::qname("web.min.internal."),
+                hickory_proto::rr::RecordType::A,
+            )]),
+        );
         send_frame(&mut h.guest, &undeclared).await;
         send_frame(&mut h.guest, &marker).await;
         let seen = expect_frame(&mut h.switch).await;
@@ -21040,15 +22682,215 @@ mod tests {
         );
     }
 
+    /// A query a row that names nothing may not send is dropped before its
+    /// source is attributed or carried: a connection whose only frame from
+    /// that row is the refused query names the row in no withdrawal report
+    /// at its end, while the row whose frame it admitted is named.
+    #[tokio::test]
+    async fn a_refused_query_neither_attributes_nor_carries_its_source() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(
+            BoxRegistration::new("sealed", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_egress_policy(EgressPolicy::deny_all()),
+        );
+        let carrier = [100, 64, 0, 10];
+        tcp_lan_box(&registry, carrier);
+        let reports = registry
+            .take_withdrawal_reports()
+            .expect("the withdrawal reports' receiver is taken once");
+        let mut h = gate_over(registry).await;
+
+        // The sealed row's one frame: a query for a name outside the zone,
+        // refused. The carrier's frame behind it is admitted, and its arrival
+        // is the proof the refused query was decided first.
+        let refused = dns_pins::tests::udp_payload_frame(
+            Ipv4Addr::from(LEASE),
+            40000,
+            SUBNET.dns_server(),
+            53,
+            &dns_pins::tests::dns_query("example.com."),
+        );
+        send_frame(&mut h.guest, &refused).await;
+        let admitted = ipv4_frame(carrier, 6, [10, 1, 2, 3], 80);
+        send_frame(&mut h.guest, &admitted).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            admitted,
+            "the refused query never reached the switch; the carrier's frame did"
+        );
+
+        h.guest.shutdown().await.expect("closing the guest's side");
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        let report = loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the withdrawal report is not filed within {DEADLINE:?}"
+            );
+            match reports.try_recv() {
+                Ok(report) => break report,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    panic!("the withdrawal channel is down; nothing will file a report")
+                }
+            }
+        };
+        assert_eq!(
+            report.iter().map(|&(addr, _)| addr).collect::<Vec<_>>(),
+            vec![carrier],
+            "the report names the carrier alone: the refused query attributed nothing"
+        );
+    }
+
+    /// The switch-to-guest leg observes a DNS answer toward the node address
+    /// for a resident `host_ip` box's question only when the kernel's
+    /// configuration names the node address as a row's, as the registry
+    /// does: the answer fills the cohort's pin, and the box-marked frame to
+    /// the answered address, refused before it, is admitted after.
+    #[tokio::test]
+    async fn an_answer_toward_the_node_for_a_cohort_members_question_pins_for_the_cohort() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        let member = boxes::SessionId::from_bytes([0x34; 16]);
+        let names = EgressPolicy {
+            allow_subnets: Some(vec![]),
+            allow_dns_hosts: Some(vec!["example.org".to_string()]),
+            allow_protocols: None,
+            deny_subnets: None,
+        };
+        assert!(registry.admit_host_ip_box(member, Some(&names)));
+        let mut h = gate_over(registry).await;
+        let node = SUBNET.daemon_ip();
+        let answer = Ipv4Addr::new(203, 0, 113, 30);
+        let fetch = box_cohort_frame(ipv4_frame(node.octets(), 6, answer.octets(), 443));
+
+        // Before the answer: the fetch is refused, and the member's question
+        // behind it, box-marked from the node address, reaches the switch.
+        let question = box_cohort_frame(dns_pins::tests::udp_payload_frame(
+            node,
+            40000,
+            SUBNET.dns_server(),
+            53,
+            &dns_pins::tests::dns_query("example.org."),
+        ));
+        send_frame(&mut h.guest, &fetch).await;
+        send_frame(&mut h.guest, &question).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            question,
+            "the unpinned fetch never reached the switch; the member's question did"
+        );
+
+        // The resolver's answer toward the node address reaches the guest,
+        // and is observed on its way.
+        let reply = dns_pins::tests::udp_payload_frame(
+            SUBNET.dns_server(),
+            53,
+            node,
+            40000,
+            &dns_pins::tests::dns_response("example.org.", &[answer]),
+        );
+        send_frame(&mut h.switch, &reply).await;
+        assert_eq!(
+            expect_frame(&mut h.guest).await,
+            reply,
+            "the answer reaches the node address in full"
+        );
+
+        send_frame(&mut h.guest, &fetch).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            fetch,
+            "the box-marked fetch to the answered address is admitted by the cohort's pin"
+        );
+    }
+
+    /// A gate is decided by the baseline it was spawned with: over a registry
+    /// on which nothing adopted a baseline, a gate spawned with the shipped
+    /// in-force baseline refuses the node address's frame to an address no
+    /// lookup pinned under the node-plane rule, where the node row's
+    /// allow-all would have admitted it.
+    #[tokio::test]
+    async fn a_gate_decides_the_nodes_frames_by_the_baseline_it_was_spawned_with() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        let mut h = gate_over(registry).await;
+        let node = SUBNET.daemon_ip();
+        let unpinned = ipv4_frame(node.octets(), 6, [203, 0, 113, 10], 443);
+        let marker = dns_pins::tests::udp_payload_frame(
+            node,
+            40000,
+            SUBNET.dns_server(),
+            53,
+            &dns_pins::tests::dns_query("example.org."),
+        );
+        send_frame(&mut h.guest, &unpinned).await;
+        send_frame(&mut h.guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            marker,
+            "the unpinned frame never reached the switch; the node's own query did"
+        );
+        wait_for_log(&h.log, "egress-node-plane-unpinned").await;
+    }
+
+    /// A cohort's refused query is said in the deny-all line with the name
+    /// and type it asked and no namespace: the node address the cohort's
+    /// frames wear names none of the members, as no drop line from that
+    /// address names a box.
+    #[tokio::test]
+    async fn a_cohorts_refused_query_is_said_with_its_name_and_no_box() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        let member = boxes::SessionId::from_bytes([0x35; 16]);
+        assert!(registry.admit_host_ip_box(member, Some(&EgressPolicy::deny_all())));
+        let mut h = gate_over(registry).await;
+        let node = SUBNET.daemon_ip();
+        let marked_query = |port: u16, name: &str| {
+            box_cohort_frame(dns_pins::tests::udp_payload_frame(
+                node,
+                port,
+                SUBNET.dns_server(),
+                53,
+                &dns_pins::tests::dns_query(name),
+            ))
+        };
+        let refused = marked_query(40000, "example.org.");
+        let marker = marked_query(40001, "web.min.internal.");
+        send_frame(&mut h.guest, &refused).await;
+        send_frame(&mut h.guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            marker,
+            "the refused query never reached the switch; the zone query did"
+        );
+        wait_for_log(&h.log, "egress-deny-all-dns-query").await;
+        let logged = h.log.contents();
+        let line = logged
+            .lines()
+            .find(|line| line.contains("egress-deny-all-dns-query"))
+            .expect("the refusal's line was written");
+        assert!(
+            line.contains("source=100.64.255.253")
+                && line.contains("name=\"example.org\"")
+                && line.contains("query_type=\"A\""),
+            "the line names the cohort's question: {line}"
+        );
+        assert!(
+            !line.contains("namespace="),
+            "the line names no box for the node address: {line}"
+        );
+    }
+
     /// NET-141's deny-all case, decided host-side for an own-address row: a
     /// deny-all box's query for a name outside the box zone is dropped at the
     /// relay — never written on to the switch, nothing written back toward
     /// the guest — with one rate-limited warn line naming the box and the
-    /// name; zone A lookups (`host.min.internal` among them) pass byte for
-    /// byte; a zone name asked for any other type, a multi-question query
-    /// with a zone A in front, an unparseable datagram, and TCP to the
-    /// resolver are all dropped; and an allow-list row's queries are left
-    /// as they were.
+    /// name; zone lookups of any type (`host.min.internal` among them) pass
+    /// byte for byte; a multi-question query with a zone A in front, an
+    /// unparseable datagram, and TCP to the resolver are all dropped; and an
+    /// allow-list row's queries are left as they were.
     #[tokio::test]
     async fn deny_all_row_query_outside_zone_dropped_host_side() {
         use hickory_proto::rr::RecordType;
@@ -21081,8 +22923,8 @@ mod tests {
                 payload,
             )
         };
-        // The marker every drop below is proved against: a zone A lookup,
-        // the one query shape a deny-all box's resolver traffic may carry.
+        // The marker every drop below is proved against: a zone lookup, the
+        // one query shape a deny-all box's resolver traffic may carry.
         let marker = query_from(
             LEASE,
             40100,
@@ -21122,26 +22964,26 @@ mod tests {
         // Nothing was written back toward the guest: the drop is silent.
         expect_silence(&mut h.guest).await;
 
-        // Zone A lookups pass byte for byte, the host row's included.
-        for (port, name) in [(40001, "host.min.internal."), (40002, "db.min.internal.")] {
-            let zone = query_from(LEASE, port, &dns_query_of(&[(qname(name), RecordType::A)]));
+        // Zone lookups of any type pass byte for byte, the host row's
+        // included.
+        for (port, name, kind) in [
+            (40001, "host.min.internal.", RecordType::A),
+            (40002, "db.min.internal.", RecordType::A),
+            (40003, "host.min.internal.", RecordType::TXT),
+        ] {
+            let zone = query_from(LEASE, port, &dns_query_of(&[(qname(name), kind)]));
             send_frame(&mut h.guest, &zone).await;
             assert_eq!(
                 expect_frame(&mut h.switch).await,
                 zone,
-                "an A lookup of {name} reaches the switch"
+                "a {kind} lookup of {name} reaches the switch"
             );
         }
 
         // Everything else a deny-all box might send its resolver is dropped:
-        // a zone name asked for another type, an outside name behind a zone A,
-        // an unparseable datagram, and TCP to the resolver's port.
+        // an outside name behind a zone A, an unparseable datagram, and TCP
+        // to the resolver's port.
         let dropped = [
-            query_from(
-                LEASE,
-                40003,
-                &dns_query_of(&[(qname("host.min.internal."), RecordType::TXT)]),
-            ),
             query_from(
                 LEASE,
                 40004,
@@ -21166,10 +23008,8 @@ mod tests {
         wait_for_log(&h.log, "name=\"<unparseable>\"").await;
         let logged = h.log.contents();
         assert!(
-            logged.contains("name=\"host.min.internal\"")
-                && logged.contains("query_type=\"TXT\"")
-                && logged.contains("name=\"leak.example.com\""),
-            "each dropped name says so: {logged}"
+            logged.contains("name=\"leak.example.com\""),
+            "the dropped name says so: {logged}"
         );
 
         // A row that is not deny-all is untouched: the allow-list box's
