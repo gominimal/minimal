@@ -148,7 +148,8 @@ manifest (R2.3), and exit non-zero. The state is from 0.8 or later when the
 `key` in `install.toml` names a version from 0.8 on. It is also from 0.8 or
 later when `sessions/index.json` under the state directory carries a
 `format_version` above 0. The refusal says what it refused and why. It prints
-the `mv` command that moves the state directory aside. When an R5.7 copy of
+the `mv` command that moves the state directory aside, to a path that does
+not exist yet. When an R5.7 copy of
 0.7 state is beside the state directory, the refusal also names that copy and
 prints the command that puts it back in place. The installer installs a
 version before 0.8 over 0.7 state, and over a state that the user put back.
@@ -168,7 +169,8 @@ version before 0.8 over 0.7 state, and over a state that the user put back.
   `format_version` 1 and no `install.toml` gets the same refusal. An index
   with no `format_version` installs 0.7.3. After an upgrade from 0.7.3 to
   0.8.0, the refusal names the R5.7 copy. Its printed command runs, and then
-  0.7.3 installs.
+  0.7.3 installs. When the first move target already exists, the printed
+  `mv` names another path, and the state does not land inside the old one.
 
 ### Unit 3 - Manifest format and field extraction
 
@@ -420,7 +422,8 @@ the installer compares the allocated size of the state (`du -sk`) with the
 free space beside it (`df -Pk`). When the free space is not more than the
 size, the installer shall refuse the upgrade, replace no executable, and exit
 non-zero. The refusal says that the space is short, gives both sizes, and
-names `--skip-state-archive`. With enough space, the copy keeps sparse files
+names `--skip-state-archive`. A refusal of the copy also says that the
+daemon the pre-swap stop ended stays stopped. With enough space, the copy keeps sparse files
 sparse (`cp --sparse=always` on GNU). A copy that fails is removed, and the
 run exits non-zero before any executable swap. The component table shows the
 copy as a `box state` row. `--skip-state-archive`, or a non-empty
@@ -507,8 +510,8 @@ what R2.6 puts back for a return to 0.7.
   without the copy.
 - **Test** (R5.7, `case_state_archive_refuses_short_space`): with a `cp` that
   refuses a clone and a `df` that reports 1 KB free, the upgrade exits
-  non-zero, prints the refusal, replaces no executable, and leaves no copy
-  and no temp file. `--skip-state-archive` then upgrades. With enough free
+  non-zero, prints the refusal and the line about the stopped daemon,
+  replaces no executable, and leaves no copy and no temp file. `--skip-state-archive` then upgrades. With enough free
   space the plain copy is made and is byte-identical.
 - **Test** (R5.6): a `symlink` component lands as a symlink at its `dest`
   pointing at the manifest target, with no download; a rerun skips it, and a

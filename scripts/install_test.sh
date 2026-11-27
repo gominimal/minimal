@@ -4529,6 +4529,8 @@ case_state_archive_refuses_short_space() {
         grep -qF "No executables were replaced. Free some space, then run this installer again." "$OUT"
     want_ok "the refusal names --skip-state-archive (R5.7)" \
         grep -qF "To upgrade without the copy, run this installer with --skip-state-archive." "$OUT"
+    want_ok "the refusal says the daemon stays stopped (R5.7)" \
+        grep -qxF "This run stopped the daemon, if one was running. It did not start it again." "$OUT"
     check stale "$(cat "$HSS/bin/minimald")" "short space replaces no executable (R5.7)"
     want_err "short space leaves no partial copy (R5.7)" test -e "$HSS/xdg-state/minimal.0.7.3"
     check 0 "$(find "$HSS/bin" -name '*.tmp.*' | wc -l | tr -d ' ')" \
@@ -4575,6 +4577,18 @@ case_refuses_0_7_over_0_8_state() {
         grep -qxF "      mv '$HRA/xdg-state/minimal' '$HRA/xdg-state/minimal.0.8'" "$OUT"
     want_err "with no saved copy the refusal names none (R2.6)" grep -q "saved the earlier state" "$OUT"
     check "$h_before" "$(hash_file "$HRA/bin/min")" "the refusal replaces nothing (R2.6)"
+
+    # A move target an earlier refusal left is never reused: `mv` would nest
+    # the state inside it.
+    mkdir -p "$HRA/xdg-state/minimal.0.8"
+    run rd1_taken "$HRA" --version 0.7.3
+    check 1 "$rc" "0.7.3 is refused with the move target taken (R2.6)"
+    _rd_mv="$(awk '/^      mv / {sub(/^      /, ""); print; exit}' "$OUT")"
+    want_err "the printed move skips the taken target (R2.6)" \
+        test "$_rd_mv" = "mv '$HRA/xdg-state/minimal' '$HRA/xdg-state/minimal.0.8'"
+    want_ok "the printed move runs (R2.6)" sh -c "$_rd_mv"
+    want_ok "the moved state is not nested in the taken target (R2.6)" \
+        test ! -e "$HRA/xdg-state/minimal.0.8/minimal"
 
     # The box index alone is enough: no install.toml, format_version 1.
     HRB="$root/rd2"; mkdir -p "$HRB/xdg-state/minimal/sessions"

@@ -1264,13 +1264,18 @@ state_from_0_8() {
 if ver_before_0_8 "$VERSION" && state_from_0_8; then
     say "install: refused to install Minimal $VERSION over the box state in $(tilde "$box_state")."
     say "Minimal 0.8 or later wrote that state, and $VERSION cannot read it."
+    # The move target must not exist: `mv` into an existing directory nests
+    # the state inside it. A target an earlier refusal left gets a suffix.
+    _b08="$box_state.0.8"
+    [ ! -e "$_b08" ] || _b08="$box_state.0.8.$t0"
+    [ ! -e "$_b08" ] || _b08="$box_state.0.8.$t0.$$"
     say "Move the state aside, then run this installer again:"
-    say "      mv $(shq "$box_state") $(shq "$box_state.0.8")"
+    say "      mv $(shq "$box_state") $(shq "$_b08")"
     for _ba in "$box_state".0.7.*; do
         [ -d "$_ba" ] || continue
         say "An upgrade to 0.8 saved the earlier state in $(tilde "$_ba")."
         say "To use it again, run this before the installer:"
-        say "      mv $(shq "$box_state") $(shq "$box_state.0.8") && mv $(shq "$_ba") $(shq "$box_state")"
+        say "      mv $(shq "$box_state") $(shq "$_b08") && mv $(shq "$_ba") $(shq "$box_state")"
         break
     done
     exit 1
@@ -1603,7 +1608,13 @@ while read -r comp _ _ _ want kind dest src; do
                 rm -f "$tmp"
                 die "aborted: no executables were replaced, the daemon is still running"
             }
-            archive_box_state || { rm -f "$tmp"; exit 1; }
+            # A failed copy aborts after the stop above. The trap only stops
+            # daemons, so a daemon the stop ended stays down: say so.
+            archive_box_state || {
+                rm -f "$tmp"
+                say "This run stopped the daemon, if one was running. It did not start it again."
+                exit 1
+            }
             daemon_stop_ran=1
             ;;
     esac
