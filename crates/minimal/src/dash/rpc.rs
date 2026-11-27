@@ -2144,7 +2144,7 @@ mod tests {
             options.quic443,
             flags,
             crate::ProjectPrompts::Terminal,
-            &bep::store::MemorySecretStore::default(),
+            &crate::EveryItemStore,
         )
         .expect("min box start dev passes its project checks");
         let mut started = fresh(args.network_mode().into(), checks.policy);
@@ -2175,7 +2175,7 @@ mod tests {
                 global: Some(global.clone()),
                 ..PickedEntry::default()
             },
-            &bep::store::MemorySecretStore::default(),
+            &crate::EveryItemStore,
         )
         .expect("the dashboard creates a box from an entry with network and secret settings");
 
@@ -2262,7 +2262,7 @@ mod tests {
             &mut contribution,
             &root,
             &picked,
-            &bep::store::MemorySecretStore::default(),
+            &crate::EveryItemStore,
         );
         (result, request, contribution)
     }

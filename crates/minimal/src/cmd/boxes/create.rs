@@ -1307,6 +1307,8 @@ pub enum GrantNotDelivered {
         grant: String,
         /// The reference, `<store>:<id>` or `<id>`.
         item: String,
+        /// The minimal.toml table that declares the grant.
+        table: String,
     },
     /// The reference reads the host's native store, and that store cannot
     /// be used on this host, so the proxy could read no value for it.
@@ -1317,6 +1319,20 @@ pub enum GrantNotDelivered {
         item: String,
         /// Why the store cannot be used, and what to do, as the store says.
         reason: String,
+        /// The minimal.toml table that declares the grant.
+        table: String,
+    },
+    /// The reference reads the host's native store, and that store holds
+    /// no item under its identifier, so the proxy could read no value.
+    ItemNotStored {
+        /// The grant's name.
+        grant: String,
+        /// The item's identifier in the native store.
+        item: String,
+        /// The store as a message names it, such as "Secret Service".
+        place: String,
+        /// The minimal.toml table that declares the grant.
+        table: String,
     },
     /// The item's rule sets `action = "deny"`.
     StoreReferenceDenied {
@@ -1324,6 +1340,8 @@ pub enum GrantNotDelivered {
         grant: String,
         /// The reference, `<store>:<id>` or `<id>`.
         item: String,
+        /// The minimal.toml table that declares the grant.
+        table: String,
     },
     /// The item's rule sets `action = "ask"`, and the command cannot ask
     /// (BEP-035).
@@ -1358,10 +1376,9 @@ impl std::fmt::Display for GrantNotDelivered {
                 "Cannot create the box: no sealed value was made for the secret \
                  {grant}, so {grant} would be empty in the box. No box was created."
             ),
-            Self::NoStoreRule { grant, item } => write!(
+            Self::NoStoreRule { grant, item, table } => write!(
                 f,
-                "Cannot create the box: the secret {grant} in [defaults.session.secrets] \
-                 in {name} \
+                "Cannot create the box: the secret {grant} in {table} in {name} \
                  reads the item {item} from the host's secret store, and no rule in \
                  [secret-store-rules] in your config.toml names that item. Add a rule for \
                  it, or remove the secret from {name}. Run `min dirs` to find config.toml.",
@@ -1371,17 +1388,30 @@ impl std::fmt::Display for GrantNotDelivered {
                 grant,
                 item,
                 reason,
+                table,
             } => write!(
                 f,
-                "Cannot create the box: the secret {grant} in [defaults.session.secrets] \
-                 in {name} reads the item {item} from the host's secret store, and this \
-                 host cannot use that store. {reason}",
+                "Cannot create the box: the secret {grant} in {table} in {name} reads the \
+                 item {item} from the host's secret store, and this host cannot use that \
+                 store. {reason}",
                 name = mfile::MFILE_NAME,
             ),
-            Self::StoreReferenceDenied { grant, item } => write!(
+            Self::ItemNotStored {
+                grant,
+                item,
+                place,
+                table,
+            } => write!(
                 f,
-                "Cannot create the box: the secret {grant} in [defaults.session.secrets] \
-                 in {name} \
+                "Cannot create the box: the secret {grant} in {table} in {name} reads the \
+                 item {item} from the host's secret store, and no secret named {item} is \
+                 stored in {place}. Store it with `min secret set {item}`, then create the \
+                 box again.",
+                name = mfile::MFILE_NAME,
+            ),
+            Self::StoreReferenceDenied { grant, item, table } => write!(
+                f,
+                "Cannot create the box: the secret {grant} in {table} in {name} \
                  reads the item {item} from the host's secret store, and the rule for that \
                  item in [secret-store-rules] denies it. Remove the secret from {name}.",
                 name = mfile::MFILE_NAME,
@@ -1405,6 +1435,41 @@ impl std::fmt::Display for GrantNotDelivered {
 }
 
 impl std::error::Error for GrantNotDelivered {}
+
+/// The table that holds the project's session grants, as a refusal names
+/// it: [`LEGACY_SESSION_SECRETS_TABLE`] when minimal.toml declares them in
+/// the legacy `[session]` table, which loads as `[defaults.session]`
+/// (BOX-050), and [`boxes::core::bep::SESSION_SECRETS_TABLE`] otherwise.
+/// A `[defaults.session.secrets]` beside the legacy table replaces it, so
+/// that table is named then.
+fn project_secrets_table(project: &camino::Utf8Path) -> &'static str {
+    let doc = project_file_read(project)
+        .ok()
+        .and_then(|(bytes, _)| bytes)
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| text.parse::<toml::Table>().ok());
+    let secrets_in = |table: Option<&toml::Value>| {
+        table
+            .and_then(toml::Value::as_table)
+            .is_some_and(|table| table.contains_key("secrets"))
+    };
+    match doc {
+        Some(doc)
+            if secrets_in(doc.get("session"))
+                && !secrets_in(
+                    doc.get("defaults")
+                        .and_then(toml::Value::as_table)
+                        .and_then(|defaults| defaults.get("session")),
+                ) =>
+        {
+            LEGACY_SESSION_SECRETS_TABLE
+        }
+        _ => boxes::core::bep::SESSION_SECRETS_TABLE,
+    }
+}
+
+/// The legacy spelling of [`boxes::core::bep::SESSION_SECRETS_TABLE`].
+const LEGACY_SESSION_SECRETS_TABLE: &str = "[session.secrets]";
 
 /// The session entry's Box Egress Proxy settings (`network.bep`), its
 /// secret grants (`secrets`), the names of the variables its own spec sets
@@ -2813,8 +2878,9 @@ pub(crate) fn creation_host(
 /// [`boxes::core::bep::ActivationRefused`] for a reference to the GitHub
 /// sign-in item or a rule upstream outside the egress (BEP-034, BEP-036),
 /// and [`GrantNotDelivered`] for a reference to a host store this host
-/// cannot use, a reference with no rule, or one its rule denies (BEP-035).
-/// Each ends the run with exit 3.
+/// cannot use, a reference with no rule, one its rule denies (BEP-035), or
+/// one to an item the host store does not hold (BEP-092). Each ends the run
+/// with exit 3. `table` is the minimal.toml table a refusal names.
 fn check_store_grants(
     global: &GlobalArgs,
     secrets: &boxes::core::bep::SecretGrants,
@@ -2822,6 +2888,7 @@ fn check_store_grants(
     egress: Option<&boxes::EgressPolicy>,
     can_ask: bool,
     store: &dyn bep::store::SecretStore,
+    table: &str,
 ) -> Result<boxes::core::bep::StoreRules, anyhow::Error> {
     if boxes::core::bep::store_references(secrets).next().is_none() {
         return Ok(boxes::core::bep::StoreRules::new());
@@ -2835,11 +2902,39 @@ fn check_store_grants(
         can_ask,
         &mut |question| crate::cmd::confirm(question, false),
         store,
+        table,
     )
 }
 
+/// A native store that this host can use and that holds every item, for
+/// the tests of the checks that come before or after the store's.
+#[cfg(test)]
+pub(crate) struct EveryItemStore;
+
+#[cfg(test)]
+impl bep::store::SecretStore for EveryItemStore {
+    fn name(&self) -> &'static str {
+        bep::store::NATIVE_STORE
+    }
+    fn set(&self, _: &str, _: &[u8], _: &std::path::Path) -> Result<(), bep::store::StoreError> {
+        panic!("set was called")
+    }
+    fn list(
+        &self,
+        _: &std::path::Path,
+    ) -> Result<Vec<bep::store::ItemInfo>, bep::store::StoreError> {
+        panic!("list was called")
+    }
+    fn remove(&self, _: &str) -> Result<bool, bep::store::StoreError> {
+        panic!("remove was called")
+    }
+    fn holds(&self, _: &str) -> Result<bool, bep::store::StoreError> {
+        Ok(true)
+    }
+}
+
 /// [`accept_store_references_in`] with a native store that this host can
-/// use.
+/// use and that holds every item.
 #[cfg(test)]
 fn accept_store_references(
     secrets: &boxes::core::bep::SecretGrants,
@@ -2856,7 +2951,8 @@ fn accept_store_references(
         rules,
         can_ask,
         ask,
-        &bep::store::MemorySecretStore::default(),
+        &EveryItemStore,
+        boxes::core::bep::SESSION_SECRETS_TABLE,
     )
 }
 
@@ -2866,13 +2962,16 @@ fn accept_store_references(
 /// reference to the native store is refused when `store`, that store, says
 /// this host cannot use it, so no rule is asked for that could not help.
 /// Then a reference with no rule, a `deny` rule, or an `ask` rule without
-/// `can_ask` is refused (BEP-035). Only when no reference is refused does
-/// it call `ask`, once per distinct item that an `ask` rule names. Logs one
-/// info line naming each reference checked and its outcome.
+/// `can_ask` is refused (BEP-035). Then a reference to a native-store item
+/// that `store` says it does not hold is refused (BEP-092). Only when no
+/// reference is refused does it call `ask`, once per distinct item that an
+/// `ask` rule names. `table` is the minimal.toml table a refusal names.
+/// Logs one info line naming each reference checked and its outcome.
 ///
 /// # Errors
 ///
 /// As [`check_store_grants`] says. `ask`'s own error ends the check.
+#[allow(clippy::too_many_arguments)]
 fn accept_store_references_in(
     secrets: &boxes::core::bep::SecretGrants,
     network: boxes::NetworkMode,
@@ -2881,6 +2980,7 @@ fn accept_store_references_in(
     can_ask: bool,
     ask: &mut dyn FnMut(&str) -> Result<bool, anyhow::Error>,
     store: &dyn bep::store::SecretStore,
+    table: &str,
 ) -> Result<boxes::core::bep::StoreRules, anyhow::Error> {
     use boxes::core::bep::{StoreConsent, check_store_references, store_consent, store_references};
     let module_hosts = crate::config::store_module_hosts();
@@ -2909,6 +3009,7 @@ fn accept_store_references_in(
                 grant: reference.grant.to_owned(),
                 item,
                 reason: error.to_string(),
+                table: table.to_owned(),
             }
             .into());
         }
@@ -2921,7 +3022,12 @@ fn accept_store_references_in(
             let grant = reference.grant.to_owned();
             let Some(rule) = reference.rule(rules) else {
                 checked.push(format!("{item}: no rule"));
-                return Err(GrantNotDelivered::NoStoreRule { grant, item }.into());
+                return Err(GrantNotDelivered::NoStoreRule {
+                    grant,
+                    item,
+                    table: table.to_owned(),
+                }
+                .into());
             };
             match store_consent(rule, can_ask) {
                 StoreConsent::Allow => {}
@@ -2931,7 +3037,12 @@ fn accept_store_references_in(
                 }
                 StoreConsent::Deny => {
                     checked.push(format!("{item}: denied by its rule"));
-                    return Err(GrantNotDelivered::StoreReferenceDenied { grant, item }.into());
+                    return Err(GrantNotDelivered::StoreReferenceDenied {
+                        grant,
+                        item,
+                        table: table.to_owned(),
+                    }
+                    .into());
                 }
                 // One question per distinct item, naming every grant that reads it.
                 StoreConsent::Ask => match to_ask.iter_mut().find(|(seen, ..)| *seen == item) {
@@ -2940,6 +3051,33 @@ fn accept_store_references_in(
                 },
             }
             allowed.push((item, reference.id, rule));
+        }
+        // The proxy reads a native-store item at each request, so an item
+        // the store does not hold refuses the box now, not its first
+        // request. The lookup reads no value and shows no prompt. A store
+        // that cannot tell refuses nothing here: the request still refuses.
+        for reference in store_references(secrets)
+            .filter(|reference| reference.store == boxes::core::bep::NATIVE_STORE)
+        {
+            match store.holds(reference.id) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let item = reference.item();
+                    checked.push(format!("{item}: not stored"));
+                    return Err(GrantNotDelivered::ItemNotStored {
+                        grant: reference.grant.to_owned(),
+                        item,
+                        place: store.place(),
+                        table: table.to_owned(),
+                    }
+                    .into());
+                }
+                Err(error) => tracing::debug!(
+                    item = %reference.item(),
+                    error = %error,
+                    "the host store did not say whether it holds the item"
+                ),
+            }
         }
         for (item, grants, rule) in &to_ask {
             let upstream: Vec<String> = rule.upstream.iter().map(|host| printable(host)).collect();
@@ -4780,6 +4918,7 @@ pub(crate) fn check_project(
         policy.egress.as_ref(),
         can_ask,
         store,
+        project_secrets_table(project),
     )?;
     let store_grants = store_grants(&project_secrets, &accepted_store_rules)?;
     // BEP-062: a `dns` or `both` box resolves each accepted rule's
@@ -7466,6 +7605,7 @@ mod tests {
             grant: "OPENAI_KEY".into(),
             item: "openai-key".into(),
             reason: NoAnswerStore.check_available().unwrap_err().to_string(),
+            table: boxes::core::bep::SESSION_SECRETS_TABLE.into(),
         };
         for rules in [boxes::core::bep::StoreRules::new(), store_rule(None)] {
             let err = accept_store_references_in(
@@ -7476,6 +7616,7 @@ mod tests {
                 true,
                 &mut never_ask,
                 &NoAnswerStore,
+                boxes::core::bep::SESSION_SECRETS_TABLE,
             )
             .expect_err("the host store cannot be used");
             assert_eq!(err.downcast_ref::<GrantNotDelivered>(), Some(&expected));
@@ -7507,12 +7648,163 @@ mod tests {
             true,
             &mut never_ask,
             &NoAnswerStore,
+            boxes::core::bep::SESSION_SECRETS_TABLE,
         )
         .expect_err("no rule");
         assert!(matches!(
             err.downcast_ref::<GrantNotDelivered>(),
             Some(GrantNotDelivered::NoStoreRule { .. })
         ));
+    }
+
+    // BEP-092: a store reference to an item the host store does not hold
+    // is refused at creation, after its rule is found and before anyone is
+    // asked, with the command that stores it. An item the store holds
+    // passes. The lookup reads no value.
+    #[test]
+    fn store_reference_refused_when_the_host_store_holds_no_item() {
+        use bep::store::SecretStore as _;
+        let egress = egress_of(&["api.openai.com"]);
+        let accept = |store: &dyn bep::store::SecretStore, rules: &boxes::core::bep::StoreRules| {
+            accept_store_references_in(
+                &store_grant(),
+                boxes::NetworkMode::OwnIp,
+                Some(&egress),
+                rules,
+                true,
+                &mut never_ask,
+                store,
+                boxes::core::bep::SESSION_SECRETS_TABLE,
+            )
+        };
+        let store = bep::store::MemorySecretStore::default();
+        for action in [None, Some(boxes::core::bep::StoreAction::Ask)] {
+            let err = accept(&store, &store_rule(action)).expect_err("no item is stored");
+            let refused = err
+                .downcast_ref::<GrantNotDelivered>()
+                .expect("a refusal main.rs ends with exit 3");
+            assert_eq!(
+                refused,
+                &GrantNotDelivered::ItemNotStored {
+                    grant: "OPENAI_KEY".into(),
+                    item: "openai-key".into(),
+                    place: "the keychain store".into(),
+                    table: boxes::core::bep::SESSION_SECRETS_TABLE.into(),
+                }
+            );
+            assert_eq!(
+                refused.to_string(),
+                "Cannot create the box: the secret OPENAI_KEY in [defaults.session.secrets] \
+                 in minimal.toml reads the item openai-key from the host's secret store, and \
+                 no secret named openai-key is stored in the keychain store. Store it with \
+                 `min secret set openai-key`, then create the box again."
+            );
+        }
+        // A reference with no rule is refused for the rule first: the rule
+        // is what `min secret set` with `--upstream` writes beside the item.
+        let err = accept(&store, &boxes::core::bep::StoreRules::new()).expect_err("no rule");
+        assert!(matches!(
+            err.downcast_ref::<GrantNotDelivered>(),
+            Some(GrantNotDelivered::NoStoreRule { .. })
+        ));
+
+        store
+            .set("openai-key", b"sk-test", std::path::Path::new("/bep"))
+            .expect("stored");
+        let accepted = accept(&store, &store_rule(None)).expect("the stored item passes");
+        assert_eq!(accepted, store_rule(None));
+        assert_eq!(store.reads(), 0, "the check read no value");
+
+        // On Linux the refusal names Secret Service, where the item lives.
+        let linux = GrantNotDelivered::ItemNotStored {
+            grant: "OPENAI_KEY".into(),
+            item: "openai-key".into(),
+            place: "Secret Service".into(),
+            table: LEGACY_SESSION_SECRETS_TABLE.into(),
+        };
+        assert_eq!(
+            linux.to_string(),
+            "Cannot create the box: the secret OPENAI_KEY in [session.secrets] in \
+             minimal.toml reads the item openai-key from the host's secret store, and no \
+             secret named openai-key is stored in Secret Service. Store it with \
+             `min secret set openai-key`, then create the box again."
+        );
+    }
+
+    // The store refusals name the table the project's minimal.toml writes
+    // its secrets in: the legacy `[session.secrets]` when only that table
+    // declares them, else `[defaults.session.secrets]`.
+    #[test]
+    fn store_refusals_name_the_secrets_table_the_project_uses() {
+        let grant = "source = \"store\"\nstore = \"keychain\"\nid = \"openai-key\"\n";
+        for (body, table) in [
+            (
+                format!("[session.secrets.OPENAI_KEY]\n{grant}"),
+                "[session.secrets]",
+            ),
+            (
+                format!("[defaults.session.secrets.OPENAI_KEY]\n{grant}"),
+                "[defaults.session.secrets]",
+            ),
+            (
+                format!(
+                    "[session]\npackages = [\"git\"]\n\
+                     [defaults.session.secrets.OPENAI_KEY]\n{grant}"
+                ),
+                "[defaults.session.secrets]",
+            ),
+            (
+                format!(
+                    "[session.secrets.OLD]\n{grant}\
+                     [defaults.session.secrets.OPENAI_KEY]\n{grant}"
+                ),
+                "[defaults.session.secrets]",
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("project dir");
+            std::fs::write(dir.path().join("minimal.toml"), &body).expect("minimal.toml");
+            let path = camino::Utf8Path::from_path(dir.path()).expect("utf-8 path");
+            assert_eq!(project_secrets_table(path), table, "{body}");
+        }
+        let none = tempfile::tempdir().expect("empty dir");
+        let path = camino::Utf8Path::from_path(none.path()).expect("utf-8 path");
+        assert_eq!(
+            project_secrets_table(path),
+            boxes::core::bep::SESSION_SECRETS_TABLE
+        );
+
+        let no_rule = GrantNotDelivered::NoStoreRule {
+            grant: "OPENAI_KEY".into(),
+            item: "openai-key".into(),
+            table: LEGACY_SESSION_SECRETS_TABLE.into(),
+        };
+        assert_eq!(
+            no_rule.to_string(),
+            "Cannot create the box: the secret OPENAI_KEY in [session.secrets] in \
+             minimal.toml reads the item openai-key from the host's secret store, and no \
+             rule in [secret-store-rules] in your config.toml names that item. Add a rule \
+             for it, or remove the secret from minimal.toml. Run `min dirs` to find \
+             config.toml."
+        );
+        let err = accept_store_references_in(
+            &store_grant(),
+            boxes::NetworkMode::OwnIp,
+            Some(&egress_of(&["api.openai.com"])),
+            &boxes::core::bep::StoreRules::new(),
+            true,
+            &mut never_ask,
+            &NoAnswerStore,
+            LEGACY_SESSION_SECRETS_TABLE,
+        )
+        .expect_err("the host store cannot be used");
+        assert!(
+            err.to_string().starts_with(
+                "Cannot create the box: the secret OPENAI_KEY in [session.secrets] in \
+                 minimal.toml reads the item openai-key from the host's secret store, and \
+                 this host cannot use that store. "
+            ),
+            "{err}"
+        );
     }
 
     // BEP-062: the upstream of each store rule the creation accepts rides
@@ -7750,7 +8042,8 @@ mod tests {
             boxes::NetworkMode::OwnIp,
             Some(&egress),
             false,
-            &bep::store::MemorySecretStore::default(),
+            &EveryItemStore,
+            boxes::core::bep::SESSION_SECRETS_TABLE,
         )
         .expect_err("a reference with no rule is refused");
         let refused = err
@@ -7761,6 +8054,7 @@ mod tests {
             &GrantNotDelivered::NoStoreRule {
                 grant: "OPENAI_KEY".into(),
                 item: "openai-key".into(),
+                table: boxes::core::bep::SESSION_SECRETS_TABLE.into(),
             }
         );
         let text = refused.to_string();
@@ -7776,7 +8070,8 @@ mod tests {
             boxes::NetworkMode::OwnIp,
             None,
             false,
-            &bep::store::MemorySecretStore::default(),
+            &EveryItemStore,
+            boxes::core::bep::SESSION_SECRETS_TABLE,
         )
         .expect("no store reference, nothing to refuse");
         assert!(none.is_empty());
@@ -8340,7 +8635,8 @@ mod tests {
                 network,
                 policy.egress.as_ref(),
                 false,
-                &bep::store::MemorySecretStore::default(),
+                &EveryItemStore,
+                boxes::core::bep::SESSION_SECRETS_TABLE,
             )
         })
         .expect_err("the start refuses");

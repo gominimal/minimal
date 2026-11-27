@@ -928,6 +928,10 @@ Setting secrets
   tier:     T0
   verify:   cargo nextest run -p minimal store_reference_refused_when_the_host_store_does_not_answer
   <!-- unwanted; without it the box starts and every credentialed request fails; the check runs after the deny-set and egress checks (BEP-034, BEP-036) and before the rule check (BEP-035), because a rule cannot make an unusable store readable -->
+  - IF a box spec declares a store reference to an item that the host's native store does not hold THEN THE SYSTEM SHALL refuse the creation with exit 3 before it seals a value, and name the `min secret set` command that stores the item.
+    tier:   T0
+    verify: cargo nextest run -p minimal store_reference_refused_when_the_host_store_holds_no_item
+    <!-- unwanted; without it the box starts and its first request to the upstream is refused as a deleted item (BEP-045); the lookup reads no value and shows no prompt, and a store that cannot tell without one refuses nothing at creation; the check runs after the rule check (BEP-035), so a reference with no rule is told to add the rule first -->
 
 - **BEP-054** WHEN `min secret set <id>` replaces an existing item THE SYSTEM SHALL inject the new value in the next request that redeems a reference to `<id>`, with no restart of the proxy or the box.
   tier:     T0
@@ -1277,7 +1281,8 @@ store. The cost is the one that "Process identity on Linux is the user"
 records. Every program of the user reads an unlocked item, so BEP-051's
 control per program does not hold on Linux. A host with no Secret Service in
 its session has no native store, and creation refuses a box that references
-one (BEP-092).
+one (BEP-092). Creation also refuses a reference to an item that the store does
+not hold. Without that check, the box starts and its first request fails.
 
 **Generality.** The requirements hold on any LocalVM host OS and for any
 upstream module declaring a host set. GitHub and the host's native store are

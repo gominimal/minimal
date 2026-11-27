@@ -407,6 +407,21 @@ pub trait SecretStore {
         Ok(())
     }
 
+    /// Whether an item is stored under `id`. Reads no value and shows no
+    /// prompt, so a creation can ask it before the proxy reads the value.
+    ///
+    /// # Errors
+    ///
+    /// When the store cannot tell without a prompt, or refuses the lookup.
+    fn holds(&self, id: &str) -> Result<bool, StoreError> {
+        Ok(self.list(Path::new(""))?.iter().any(|item| item.id == id))
+    }
+
+    /// The store as a message names it, such as "the keychain store".
+    fn place(&self) -> String {
+        format!("the {} store", self.name())
+    }
+
     /// Whether an item's access control names one program, the proxy, as
     /// a Keychain item's does. `false` for a store where every program of
     /// the user reads every item, as in Secret Service. Then no proxy path
@@ -968,6 +983,23 @@ impl SecretStore for HostStore {
         host::check_available()
     }
 
+    fn holds(&self, id: &str) -> Result<bool, StoreError> {
+        if !valid_id(id) {
+            return Err(StoreError::InvalidId(id.to_owned()));
+        }
+        host::holds(id)
+    }
+
+    /// Secret Service on Linux, where a store reference still names the
+    /// store `keychain`. The keychain store elsewhere.
+    fn place(&self) -> String {
+        if cfg!(target_os = "linux") {
+            "Secret Service".to_owned()
+        } else {
+            format!("the {NATIVE_STORE} store")
+        }
+    }
+
     fn binds_program(&self) -> bool {
         cfg!(target_os = "macos")
     }
@@ -1311,6 +1343,35 @@ mod host {
         delete(SERVICE, id)
     }
 
+    /// Whether an item is stored under `id`. The search asks for a
+    /// reference, not the value, and runs with prompts off, so a locked
+    /// keychain answers `errSecInteractionNotAllowed` and shows no dialog.
+    pub(super) fn holds(id: &str) -> Result<bool, StoreError> {
+        let refused = |detail: String| StoreError::Refused {
+            store: NATIVE_STORE,
+            action: "find the secret",
+            detail,
+        };
+        let _serial = NO_PROMPT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _no_prompt =
+            security_framework::os::macos::keychain::SecKeychain::disable_user_interaction()
+                .map_err(|e| refused(e.to_string()))?;
+        let mut search = ItemSearchOptions::new();
+        search
+            .class(ItemClass::generic_password())
+            .service(SERVICE)
+            .account(id)
+            .load_refs(true)
+            .limit(Limit::Max(1));
+        match search.search() {
+            Ok(found) => Ok(!found.is_empty()),
+            Err(e) if e.code() == ITEM_NOT_FOUND => Ok(false),
+            Err(e) => Err(refused(e.to_string())),
+        }
+    }
+
     /// The codes that mean the item does not let this program read it:
     /// `errSecAuthFailed`, `errSecNoAccessForItem` and `errSecUserCanceled`.
     const DENIED: [i32; 3] = [-25293, -25243, -128];
@@ -1513,6 +1574,20 @@ mod host {
                 return Ok(false);
             }
             Err(failure(action, &out))
+        }
+
+        /// Whether an item is stored under `id`. `search` without
+        /// `--unlock` lists a locked item too and shows no unlock prompt.
+        /// Its standard output, which holds the values, goes to
+        /// `/dev/null`.
+        pub(super) fn holds(&self, id: &str) -> Result<bool, StoreError> {
+            check_id(id)?;
+            Ok(self
+                .ids(
+                    "find the secret",
+                    &["search", "--all", "service", SERVICE, ID, id],
+                )?
+                .contains(id))
         }
 
         /// The value under `id`, read now. The read waits at most
@@ -1743,6 +1818,10 @@ mod host {
     pub(super) fn check_available() -> Result<(), StoreError> {
         SecretItems::new().check_available()
     }
+
+    pub(super) fn holds(id: &str) -> Result<bool, StoreError> {
+        SecretItems::new().holds(id)
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -1772,6 +1851,10 @@ mod host {
     }
 
     pub(super) fn check_available() -> Result<(), StoreError> {
+        Err(StoreError::Unsupported)
+    }
+
+    pub(super) fn holds(_: &str) -> Result<bool, StoreError> {
         Err(StoreError::Unsupported)
     }
 }
@@ -2599,10 +2682,37 @@ access: 1 entries
     fn host_store_reads_an_item_this_program_added() {
         let store = HostStore;
         let id = format!("minimal-own-item-{}", std::process::id());
+        assert!(!store.holds(&id).expect("lookup"), "no item before the add");
         add_as_this_program(SERVICE, &id, b"value").expect("add");
+        let held = store.holds(&id);
         let read = store.read(&id);
         assert!(store.remove(&id).expect("remove"), "the item was held");
+        assert!(held.expect("lookup"), "the lookup finds the added item");
         assert_eq!(read.expect("read").as_slice(), b"value");
+        assert!(!store.holds(&id).expect("lookup"), "no item after remove");
+    }
+
+    // A creation asks whether an item is stored, by identifier, and a
+    // message names the store where it lives: Secret Service on Linux, and
+    // the keychain store on macOS and in a store held in memory.
+    #[test]
+    fn store_holds_by_identifier_and_names_its_place() {
+        let store = MemorySecretStore::default();
+        assert!(!store.holds("claude").unwrap());
+        store.set("claude", b"v", Path::new("/bep")).unwrap();
+        assert!(store.holds("claude").unwrap());
+        assert!(!store.holds("linear").unwrap());
+        assert_eq!(store.place(), "the keychain store");
+        assert!(matches!(
+            HostStore.holds("-x"),
+            Err(StoreError::InvalidId(_))
+        ));
+        let host = if cfg!(target_os = "linux") {
+            "Secret Service"
+        } else {
+            "the keychain store"
+        };
+        assert_eq!(HostStore.place(), host);
     }
 
     /// A fake `secret-tool` that keeps each item in a file under `dir`, and
@@ -2680,6 +2790,8 @@ esac
             ]
         );
         assert_eq!(store.read("claude").unwrap().as_slice(), b"sk-ant-one\n");
+        assert!(store.holds("claude").unwrap());
+        assert!(!store.holds("absent").unwrap());
 
         // A replaced value is the one the next read returns (BEP-054).
         store.set(SERVICE, "claude", b"sk-ant-new").unwrap();
@@ -2688,6 +2800,7 @@ esac
         assert!(store.remove("claude").unwrap());
         assert!(!store.remove("claude").unwrap(), "no item the second time");
         assert!(matches!(store.read("claude"), Err(ReadError::Deleted(_))));
+        assert!(!store.holds("claude").unwrap(), "no item after remove");
         assert_eq!(store.list().unwrap().len(), 1);
 
         // An identifier that `secret-tool` could read as an option is

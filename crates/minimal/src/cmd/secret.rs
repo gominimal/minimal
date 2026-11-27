@@ -873,7 +873,7 @@ pub(crate) fn run_list(
         .list(proxy.unwrap_or(Path::new("")))
         .context("min secret list did not read the store")?;
     if items.is_empty() {
-        writeln!(out, "No secrets in the {} store.", store.name())?;
+        writeln!(out, "No secrets in {}.", store.place())?;
         return Ok(());
     }
     for (n, item) in items.iter().enumerate() {
@@ -948,13 +948,13 @@ pub(crate) fn run_rm(
         .with_context(|| format!("min secret rm did not remove {}", args.id))?;
     if !removed {
         bail!(
-            "There is no secret named {} in the {} store. Run `min secret list` to see the stored names.",
+            "There is no secret named {} in {}. Run `min secret list` to see the stored names.",
             args.id,
-            store.name()
+            store.place()
         );
     }
     tracing::info!(store = store.name(), id = %args.id, "secret removed");
-    writeln!(out, "Removed {} from the {} store.", args.id, store.name())?;
+    writeln!(out, "Removed {} from {}.", args.id, store.place())?;
     Ok(())
 }
 
@@ -1379,6 +1379,9 @@ mod tests {
         fn remove(&self, id: &str) -> Result<bool, StoreError> {
             self.0.remove(id)
         }
+        fn place(&self) -> String {
+            "Secret Service".to_owned()
+        }
         fn binds_program(&self) -> bool {
             false
         }
@@ -1424,6 +1427,25 @@ mod tests {
 "
             );
         }
+
+        // `rm` and an empty listing name Secret Service, where the item
+        // lives on Linux, not the store name a reference uses.
+        let args = SecretRmArgs {
+            id: "claude".into(),
+            store: None,
+        };
+        let mut out = Vec::new();
+        run_rm(&store, &args, &mut out).unwrap();
+        assert_eq!(out, b"Removed claude from Secret Service.\n");
+        let err = run_rm(&store, &args, &mut Vec::new()).expect_err("absent");
+        assert_eq!(
+            err.to_string(),
+            "There is no secret named claude in Secret Service. \
+             Run `min secret list` to see the stored names."
+        );
+        let mut out = Vec::new();
+        run_list(&store, &StoreRules::new(), Err(&missing), &mut out).unwrap();
+        assert_eq!(out, b"No secrets in Secret Service.\n");
     }
 
     #[test]
@@ -1571,7 +1593,11 @@ sentry
         assert!(store.list(&proxy).unwrap().is_empty());
         // A second remove finds nothing, and says so.
         let err = run_rm(&store, &args, &mut Vec::new()).expect_err("absent");
-        assert!(err.to_string().contains("no secret named claude"), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "There is no secret named claude in the keychain store. \
+             Run `min secret list` to see the stored names."
+        );
     }
 
     #[test]
