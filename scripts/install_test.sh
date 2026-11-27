@@ -182,7 +182,12 @@ case "${1:-}" in
         # when a daemon answers. $HOME/minver.client / minver.server override
         # the reported versions (default: matching, so ordinary scenarios
         # stop nothing); an empty minver.server means "no daemon answered".
-        if [ -s "$HOME/minver.client" ]; then
+        # $HOME/minver.download overrides it for a `min` that runs from
+        # anywhere but $HOME/bin: the copy the installer downloads to place
+        # a version named by a commit hash.
+        if [ -f "$HOME/minver.download" ] && [ "$0" != "$HOME/bin/min" ]; then
+            _vc="$(cat "$HOME/minver.download")"
+        elif [ -s "$HOME/minver.client" ]; then
             _vc="$(cat "$HOME/minver.client")"
         else
             _vc=v1
@@ -658,6 +663,12 @@ FORCE_STOP=
 # already reached.
 BIN_ON_PATH=
 
+# A directory put first on the installer's PATH, for stubs one scenario needs
+# (the state-archive cases stub cp and df). SKIP_ARCHIVE fills
+# MINIMAL_INSTALL_SKIP_STATE_ARCHIVE.
+EXTRA_BIN=
+SKIP_ARCHIVE=
+
 # XDG_CACHE_HOME the installer sees. Empty means $hp/xdg-cache; a scenario sets
 # a relative value (from inside its own home, so nothing resolves outside it)
 # to drive the purge's absolute-path rule.
@@ -670,13 +681,13 @@ run() {
     OUT="$root/out.$label"
     set +e
     env -i \
-        PATH="${BIN_ON_PATH:+$hp/bin:}$stubbin:/usr/bin:/bin" \
+        PATH="${EXTRA_BIN:+$EXTRA_BIN:}${BIN_ON_PATH:+$hp/bin:}$stubbin:/usr/bin:/bin" \
         TERM=xterm-256color \
         HOME="$hp" \
         SHELL="${TEST_SHELL:-/bin/sh}" \
         MINIMAL_BIN="$hp/bin" \
         XDG_DATA_HOME="$hp/xdg-data" \
-        XDG_STATE_HOME="$hp/xdg-state" \
+        XDG_STATE_HOME="${STATE_HOME:-$hp/xdg-state}" \
         XDG_CACHE_HOME="${CACHE_HOME:-$hp/xdg-cache}" \
         XDG_CONFIG_HOME="$hp/xdg-config" \
         MINIMAL_OVERRIDE_INSTALLER_BUCKET="$BUCKET_HOST" \
@@ -686,6 +697,7 @@ run() {
         MINIMAL_OVERRIDE_FINALIZE_INSTALL_ROOT="${FINALIZE_INSTALL_ROOT:-$root/no-such-finalize-install-root}" \
         MINIMAL_OVERRIDE_TTY="${TTY_FILE:-$root/no-such-tty}" \
         MINIMAL_INSTALL_FORCE_STOP="${FORCE_STOP:-}" \
+        MINIMAL_INSTALL_SKIP_STATE_ARCHIVE="${SKIP_ARCHIVE:-}" \
         "$SH" "$installer" "$@" </dev/null >"$OUT" 2>&1
     rc=$?
     set -e
@@ -4392,6 +4404,410 @@ case_apparmor_profile_installer() {
     want_ok "--check reports the parse" grep -q "profile parses" "$OUT"
 }
 
+# --- Box state across the 0.8 line (R5.7, R2.6, R10.5) ----------------------
+
+# The mock bucket serves 0.7.3, 0.8.0 and 9b763dd5 (a nightly named by its
+# commit hash) as copies of the v1 manifest. The installer reads a semver
+# version only from the pointer or --version, so the component rows can stay
+# the v1 ones. It places 9b763dd5 from the downloaded `min version`, which
+# reports $HOME/minver.download.
+seed_0_8_versions() {
+    for _sv in 0.7.3 0.8.0 9b763dd5; do
+        mkdir -p "$mock/versions/$_sv"
+        cp "$mock/versions/v1/components" "$mock/versions/$_sv/components"
+    done
+}
+
+# stage_0_7_upgrade <home> <label> — a completed install whose on-disk `min`
+# reports 0.7.3, one stale executable so the next run swaps, and box state
+# in the state directory: an index without format_version and a record.
+stage_0_7_upgrade() {
+    run "$2_seed" "$1"
+    check 0 "$rc" "$2: seed install exits 0"
+    printf 'stale\n' >"$1/bin/minimald"
+    write_min_stub "$1/bin/min"
+    printf '0.7.3\n' >"$1/minver.client"
+    mkdir -p "$1/xdg-state/minimal/sessions/abc"
+    printf '{"short_to_id":{},"name_to_id":{}}\n' >"$1/xdg-state/minimal/sessions/index.json"
+    printf '{"id":"abc"}\n' >"$1/xdg-state/minimal/sessions/abc/record.json"
+}
+
+# Space stubs. `cp` refuses a copy-on-write clone (as on ext4 or tmpfs) and
+# runs the real cp otherwise. `df` reports $STUB_DF_FREE KB free.
+space_bin="$root/space-bin"
+mkdir -p "$space_bin"
+real_cp="$(command -v cp)"
+cat >"$space_bin/cp" <<STUB
+#!/bin/sh
+for _a in "\$@"; do
+    case "\$_a" in --reflink*|-c) exit 1 ;; esac
+done
+exec "$real_cp" "\$@"
+STUB
+cat >"$space_bin/df" <<'STUB'
+#!/bin/sh
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+printf 'stubfs 999999999 0 %s 1%% /\n' "$(cat "$HOME/df.free")"
+STUB
+chmod +x "$space_bin/cp" "$space_bin/df"
+# A `cp` that fails every copy into a state copy, after it leaves a partial
+# file behind. Other copies (the mock download) run the real cp.
+cpfail_bin="$root/cpfail-bin"
+mkdir -p "$cpfail_bin"
+cat >"$cpfail_bin/cp" <<STUB
+#!/bin/sh
+for _a in "\$@"; do _last="\$_a"; done
+case "\$_last" in
+    */minimal.0.7.*) ;;
+    *) exec "$real_cp" "\$@" ;;
+esac
+[ -d "\$_last" ] && : >"\$_last/partial"
+echo "cp: some earlier line" >&2
+echo "cp: cannot create regular file: Permission denied" >&2
+exit 1
+STUB
+chmod +x "$cpfail_bin/cp"
+
+case_state_archive_on_upgrade_from_0_7() {
+    seed_0_8_versions
+
+    # 0.7.3 -> 0.8.0: the state is copied beside itself, byte for byte, and
+    # the card names the box commands and the copy.
+    HSA="$root/sa1"; mkdir -p "$HSA"
+    stage_0_7_upgrade "$HSA" sa1
+    cp -Rp "$HSA/xdg-state/minimal" "$root/sa1.before"
+    run sa1 "$HSA" --version 0.8.0
+    check 0 "$rc" "an upgrade from 0.7.3 to 0.8.0 exits 0 (R5.7)"
+    want_ok "the upgrade leaves a state copy beside the state directory (R5.7)" \
+        test -d "$HSA/xdg-state/minimal.0.7.3"
+    want_ok "the state copy is byte-identical to the state before the upgrade (R5.7)" \
+        diff -r "$root/sa1.before" "$HSA/xdg-state/minimal.0.7.3"
+    want_ok "the table shows the saved copy (R5.7)" \
+        grep -q "box state  *saved  *~/xdg-state/minimal.0.7.3" "$OUT"
+    want_ok "the card names min box list --all (R10.5)" grep -q "> min box list --all  *list your boxes in every project" "$OUT"
+    want_ok "the card names min box attach (R10.5)" \
+        grep -q "> min box attach <box>  *open a shell in a box, and start it again if it stopped" "$OUT"
+    want_ok "the card names min box rm (R10.5)" grep -q "> min box rm <box>  *remove a box" "$OUT"
+    want_ok "the card says where the copy is (R10.5)" \
+        grep -qF "A copy of the box state from Minimal 0.7.3 is in ~/xdg-state/minimal.0.7.3." "$OUT"
+    check "$h_minimald" "$(hash_file "$HSA/bin/minimald")" "the upgrade still swaps the binaries (R5.7)"
+    want_card_last "the card is still the last block (R10.4)"
+
+    # 0.8.0 -> 0.8.0 with a stale binary: install.toml and the on-disk `min`
+    # both say 0.8, so nothing is copied and the card has no box rows.
+    printf 'stale\n' >"$HSA/bin/minimald"
+    write_min_stub "$HSA/bin/min"
+    printf '0.8.0\n' >"$HSA/minver.client"
+    run sa1_noop "$HSA" --version 0.8.0
+    check 0 "$rc" "an upgrade within 0.8 exits 0 (R5.7)"
+    check 1 "$(find "$HSA/xdg-state" -maxdepth 1 -name 'minimal.0.7.3*' | wc -l | tr -d ' ')" \
+        "an upgrade within 0.8 makes no second copy (R5.7)"
+    want_err "an upgrade within 0.8 prints no box rows (R10.5)" grep -q "min box list" "$OUT"
+
+    # The on-disk `min` alone decides when install.toml names no 0.8 version.
+    HSB="$root/sa2"; mkdir -p "$HSB"
+    stage_0_7_upgrade "$HSB" sa2
+    printf '0.8.1\n' >"$HSB/minver.client"
+    run sa2 "$HSB" --version 0.8.0
+    check 0 "$rc" "an upgrade from a min that reports 0.8.1 exits 0 (R5.7)"
+    want_err "a min that reports 0.8.1 gets no state copy (R5.7)" \
+        test -e "$HSB/xdg-state/minimal.0.8.1"
+    want_err "a min that reports 0.8.1 gets no box rows (R10.5)" grep -q "min box list" "$OUT"
+
+    # --skip-state-archive, and its environment form, upgrade without the copy.
+    HSC="$root/sa3"; mkdir -p "$HSC"
+    stage_0_7_upgrade "$HSC" sa3
+    run sa3 "$HSC" --version 0.8.0 --skip-state-archive
+    check 0 "$rc" "--skip-state-archive upgrades from 0.7.3 (R5.7)"
+    want_err "--skip-state-archive makes no copy (R5.7)" test -e "$HSC/xdg-state/minimal.0.7.3"
+    want_ok "--skip-state-archive still names min box list (R10.5)" grep -q "min box list" "$OUT"
+    want_err "--skip-state-archive names no copy (R10.5)" grep -q "A copy of the box state" "$OUT"
+    check "$h_minimald" "$(hash_file "$HSC/bin/minimald")" "--skip-state-archive swaps the binaries"
+
+    HSD="$root/sa4"; mkdir -p "$HSD"
+    stage_0_7_upgrade "$HSD" sa4
+    SKIP_ARCHIVE=1
+    run sa4 "$HSD" --version 0.8.0
+    SKIP_ARCHIVE=
+    check 0 "$rc" "MINIMAL_INSTALL_SKIP_STATE_ARCHIVE upgrades from 0.7.3 (R5.7)"
+    want_err "MINIMAL_INSTALL_SKIP_STATE_ARCHIVE makes no copy (R5.7)" \
+        test -e "$HSD/xdg-state/minimal.0.7.3"
+
+    # A version named by a commit hash is placed from the downloaded `min`:
+    # one that reports 0.8.0 gets the copy and the box rows.
+    HSE="$root/sa5"; mkdir -p "$HSE"
+    stage_0_7_upgrade "$HSE" sa5
+    printf '0.8.0\n' >"$HSE/minver.download"
+    run sa5 "$HSE" --version 9b763dd5
+    check 0 "$rc" "an upgrade from 0.7.3 to a hash-named 0.8.0 exits 0 (R5.7)"
+    want_ok "a hash-named 0.8 version gets the state copy (R5.7)" \
+        test -d "$HSE/xdg-state/minimal.0.7.3"
+    want_ok "a hash-named 0.8 version gets the box rows (R10.5)" grep -q "min box list --all" "$OUT"
+
+    # A hash-named version that the downloaded `min` cannot place counts as
+    # 0.8 or later: an extra copy is safe.
+    HSF="$root/sa6"; mkdir -p "$HSF"
+    stage_0_7_upgrade "$HSF" sa6
+    : >"$HSF/minver.download"
+    cp -Rp "$HSF/xdg-state/minimal" "$root/sa6.before"
+    run sa6 "$HSF" --version 9b763dd5
+    check 0 "$rc" "an upgrade to a version that cannot be placed exits 0 (R5.7)"
+    want_ok "a version that cannot be placed gets the state copy (R5.7)" \
+        diff -r "$root/sa6.before" "$HSF/xdg-state/minimal.0.7.3"
+
+    # A symlinked state directory: the copy is a real directory that holds
+    # the data, not another link to it.
+    HSG="$root/sa7"; mkdir -p "$HSG"
+    stage_0_7_upgrade "$HSG" sa7
+    mv "$HSG/xdg-state/minimal" "$HSG/real-state"
+    ln -s ../real-state "$HSG/xdg-state/minimal"
+    cp -Rp "$HSG/real-state" "$root/sa7.before"
+    run sa7 "$HSG" --version 0.8.0
+    check 0 "$rc" "an upgrade with a symlinked state directory exits 0 (R5.7)"
+    want_err "the copy of a symlinked state is not a link (R5.7)" test -L "$HSG/xdg-state/minimal.0.7.3"
+    want_ok "the copy of a symlinked state is a directory (R5.7)" test -d "$HSG/xdg-state/minimal.0.7.3"
+    want_ok "the copy of a symlinked state holds the target's files (R5.7)" \
+        diff -r "$root/sa7.before" "$HSG/xdg-state/minimal.0.7.3"
+
+    # A copy from an earlier run is left alone: the new copy gets a suffix.
+    HSH="$root/sa8"; mkdir -p "$HSH"
+    stage_0_7_upgrade "$HSH" sa8
+    mkdir -p "$HSH/xdg-state/minimal.0.7.3"
+    printf 'earlier\n' >"$HSH/xdg-state/minimal.0.7.3/marker"
+    cp -Rp "$HSH/xdg-state/minimal" "$root/sa8.before"
+    cp -Rp "$HSH/xdg-state/minimal.0.7.3" "$root/sa8.earlier"
+    run sa8 "$HSH" --version 0.8.0
+    check 0 "$rc" "an upgrade beside an earlier copy exits 0 (R5.7)"
+    want_ok "the earlier copy is left untouched (R5.7)" \
+        diff -r "$root/sa8.earlier" "$HSH/xdg-state/minimal.0.7.3"
+    _sa8_new="$(find "$HSH/xdg-state" -maxdepth 1 -name 'minimal.0.7.3.*' | head -n 1)"
+    want_ok "the new copy gets a suffix (R5.7)" test -n "$_sa8_new"
+    want_ok "the suffixed copy is byte-identical (R5.7)" diff -r "$root/sa8.before" "$_sa8_new"
+}
+
+case_state_archive_refuses_short_space() {
+    seed_0_8_versions
+
+    # No clone, and less free space than the state uses: the run stops
+    # before the first executable swap and names the skip flag.
+    HSS="$root/ss1"; mkdir -p "$HSS"
+    stage_0_7_upgrade "$HSS" ss1
+    printf '1\n' >"$HSS/df.free"
+    EXTRA_BIN="$space_bin"
+    run ss1 "$HSS" --version 0.8.0
+    check 1 "$rc" "short space refuses the upgrade (R5.7)"
+    want_ok "the refusal says the space is short (R5.7)" \
+        grep -qF "install: not enough free space to save a copy of the box state before the upgrade." "$OUT"
+    want_ok "the refusal says what the state uses and what is free (R5.7)" \
+        grep -q "^~/xdg-state/minimal uses .*, and 1 KB is free beside it\.$" "$OUT"
+    want_ok "the refusal says no executable was replaced (R5.7)" \
+        grep -qF "No executables were replaced. Free some space, then run this installer again." "$OUT"
+    want_ok "the refusal names --skip-state-archive (R5.7)" \
+        grep -qF "To upgrade without the copy, run this installer with --skip-state-archive." "$OUT"
+    want_ok "the refusal says the daemon stays stopped (R5.7)" \
+        grep -qxF "This run stopped the daemon, if one was running. It did not start it again." "$OUT"
+    check stale "$(cat "$HSS/bin/minimald")" "short space replaces no executable (R5.7)"
+    want_err "short space leaves no partial copy (R5.7)" test -e "$HSS/xdg-state/minimal.0.7.3"
+    check 0 "$(find "$HSS/bin" -name '*.tmp.*' | wc -l | tr -d ' ')" \
+        "short space leaves no temp file (R5.7)"
+
+    # The flag gets past the refusal.
+    run ss1_skip "$HSS" --version 0.8.0 --skip-state-archive
+    check 0 "$rc" "--skip-state-archive upgrades past short space (R5.7)"
+    check "$h_minimald" "$(hash_file "$HSS/bin/minimald")" "--skip-state-archive swaps the binaries"
+    want_err "--skip-state-archive makes no copy on short space (R5.7)" \
+        test -e "$HSS/xdg-state/minimal.0.7.3"
+
+    # No clone and enough space: the plain copy is made and is identical.
+    HST="$root/ss2"; mkdir -p "$HST"
+    stage_0_7_upgrade "$HST" ss2
+    printf '99999999\n' >"$HST/df.free"
+    cp -Rp "$HST/xdg-state/minimal" "$root/ss2.before"
+    run ss2 "$HST" --version 0.8.0
+    EXTRA_BIN=
+    check 0 "$rc" "enough space upgrades without a clone (R5.7)"
+    want_ok "the plain copy is byte-identical (R5.7)" \
+        diff -r "$root/ss2.before" "$HST/xdg-state/minimal.0.7.3"
+
+    # Every copy fails: the partial copy is removed, nothing is replaced,
+    # and the refusal says what cp said.
+    HSU="$root/ss3"; mkdir -p "$HSU"
+    stage_0_7_upgrade "$HSU" ss3
+    EXTRA_BIN="$cpfail_bin"
+    run ss3 "$HSU" --version 0.8.0
+    EXTRA_BIN=
+    check 1 "$rc" "a failed copy refuses the upgrade (R5.7)"
+    want_ok "the refusal says the copy failed (R5.7)" \
+        grep -qxF "install: could not save a copy of ~/xdg-state/minimal before the upgrade." "$OUT"
+    check "cp said: cp: cannot create regular file: Permission denied" \
+        "$(awk '/^install: could not save a copy/ {getline; print; exit}' "$OUT")" \
+        "the refusal prints the last line of cp's error after its first sentence (R5.7)"
+    want_ok "the refusal says no executable was replaced (R5.7)" \
+        grep -qxF "No executables were replaced." "$OUT"
+    want_ok "a failed copy says the daemon stays stopped (R5.7)" \
+        grep -qxF "This run stopped the daemon, if one was running. It did not start it again." "$OUT"
+    check stale "$(cat "$HSU/bin/minimald")" "a failed copy replaces no executable (R5.7)"
+    want_err "a failed copy leaves no partial copy (R5.7)" test -e "$HSU/xdg-state/minimal.0.7.3"
+}
+
+case_refuses_0_7_over_0_8_state() {
+    seed_0_8_versions
+
+    # install.toml names 0.8.0: --version 0.7.3 is refused before a download.
+    HRA="$root/rd1"; mkdir -p "$HRA"
+    run rd1_seed "$HRA" --version 0.8.0
+    check 0 "$rc" "a 0.8.0 install exits 0"
+    h_before="$(hash_file "$HRA/bin/min")"
+    reset_dl
+    run rd1 "$HRA" --version 0.7.3
+    check 1 "$rc" "0.7.3 over install.toml from 0.8.0 is refused (R2.6)"
+    check 0 "$(downloads)" "the refusal downloads nothing (R2.6)"
+    check "install: refused to install Minimal 0.7.3 over the box state in ~/xdg-state/minimal." \
+        "$(grep '^install: refused' "$OUT")" "the refusal says what was refused (R2.6)"
+    want_ok "the refusal says why (R2.6)" \
+        grep -qxF "Minimal 0.8 or later wrote that state, and 0.7.3 cannot read it." "$OUT"
+    want_ok "the refusal says to stop the hosts first (R2.6)" \
+        grep -qxF "Stop every Minimal host first, so that no daemon writes to the state while it moves." "$OUT"
+    want_ok "the refusal names the stop by the min on disk (R2.6)" \
+        grep -qxF "      '$HRA/bin/min' stop" "$OUT"
+    want_ok "the refusal says the next step (R2.6)" \
+        grep -qxF "Then move the state aside, and run this installer again:" "$OUT"
+    want_ok "the refusal prints the move (R2.6)" \
+        grep -qxF "      mv '$HRA/xdg-state/minimal' '$HRA/xdg-state/minimal.0.8'" "$OUT"
+    want_err "with no saved copy the refusal names none (R2.6)" grep -q "saved the earlier state" "$OUT"
+    check "$h_before" "$(hash_file "$HRA/bin/min")" "the refusal replaces nothing (R2.6)"
+
+    # A move target an earlier refusal left is never reused: `mv` would nest
+    # the state inside it.
+    mkdir -p "$HRA/xdg-state/minimal.0.8"
+    run rd1_taken "$HRA" --version 0.7.3
+    check 1 "$rc" "0.7.3 is refused with the move target taken (R2.6)"
+    _rd_mv="$(awk '/^      mv / {sub(/^      /, ""); print; exit}' "$OUT")"
+    want_err "the printed move skips the taken target (R2.6)" \
+        test "$_rd_mv" = "mv '$HRA/xdg-state/minimal' '$HRA/xdg-state/minimal.0.8'"
+    want_ok "the printed move runs (R2.6)" sh -c "$_rd_mv"
+    want_ok "the moved state is not nested in the taken target (R2.6)" \
+        test ! -e "$HRA/xdg-state/minimal.0.8/minimal"
+
+    # The box index alone is enough: no install.toml, format_version 1.
+    HRB="$root/rd2"; mkdir -p "$HRB/xdg-state/minimal/sessions"
+    printf '{"format_version": 1, "short_to_id": {}}\n' >"$HRB/xdg-state/minimal/sessions/index.json"
+    reset_dl
+    run rd2 "$HRB" --version 0.7.3
+    check 1 "$rc" "0.7.3 over an index from 0.8 is refused (R2.6)"
+    check 0 "$(downloads)" "the index-only refusal downloads nothing (R2.6)"
+    want_err "the index-only refusal installs nothing (R2.6)" test -e "$HRB/bin/min"
+    want_ok "with no min on disk the refusal starts at the move (R2.6)" \
+        grep -qxF "Move the state aside, then run this installer again:" "$OUT"
+    want_err "with no min on disk the refusal names no stop (R2.6)" grep -q "Stop every Minimal host" "$OUT"
+
+    # An index with no format_version is 0.7 state: 0.7.3 installs.
+    HRC="$root/rd3"; mkdir -p "$HRC/xdg-state/minimal/sessions"
+    printf '{"short_to_id": {}}\n' >"$HRC/xdg-state/minimal/sessions/index.json"
+    run rd3 "$HRC" --version 0.7.3
+    check 0 "$rc" "0.7.3 over 0.7 state installs (R2.6)"
+
+    # 0.7.3 -> 0.8.0 saves a copy. Back to 0.7.3 is refused and names the
+    # copy. The printed restore runs, and then 0.7.3 installs.
+    HRD="$root/rd4"; mkdir -p "$HRD"
+    stage_0_7_upgrade "$HRD" rd4
+    run rd4_up "$HRD" --version 0.8.0
+    check 0 "$rc" "rd4: the upgrade to 0.8.0 exits 0"
+    run rd4 "$HRD" --version 0.7.3
+    check 1 "$rc" "0.7.3 after the 0.8.0 upgrade is refused (R2.6)"
+    want_ok "the refusal names the saved copy (R2.6)" \
+        grep -qxF "An upgrade to 0.8 saved the earlier state in ~/xdg-state/minimal.0.7.3." "$OUT"
+    _rd_restore="$(awk '/^      mv .*&&/ {sub(/^      /, ""); l=$0} END {print l}' "$OUT")"
+    want_ok "the printed restore runs (R2.6)" sh -c "$_rd_restore"
+    want_ok "the restore puts the 0.7 state back (R2.6)" \
+        test -f "$HRD/xdg-state/minimal/sessions/abc/record.json"
+    run rd4_restored "$HRD" --version 0.7.3
+    check 0 "$rc" "0.7.3 over the restored 0.7 state installs (R2.6)"
+
+    # A relative XDG_STATE_HOME: install.toml goes to the relative directory,
+    # and the box state is ~/.local/state/minimal. The refusal's move clears
+    # the refusal, because the key outside the box state does not count.
+    HRE="$root/rd5"; mkdir -p "$HRE/cwd" "$HRE/.local/state/minimal/sessions"
+    printf '{"format_version": 1, "short_to_id": {}}\n' >"$HRE/.local/state/minimal/sessions/index.json"
+    _rd_cwd="$(pwd)"
+    cd "$HRE/cwd"
+    STATE_HOME=rel-state run rd5_seed "$HRE" --version 0.8.0
+    check 0 "$rc" "rd5: a 0.8.0 install with a relative XDG_STATE_HOME exits 0"
+    want_ok "rd5: install.toml is outside the box state" test -f "$HRE/cwd/rel-state/minimal/install.toml"
+    STATE_HOME=rel-state run rd5 "$HRE" --version 0.7.3
+    check 1 "$rc" "rd5: 0.7.3 over the 0.8 index is refused (R2.6)"
+    _rd_mv="$(awk '/^      mv / {sub(/^      /, ""); print; exit}' "$OUT")"
+    want_ok "rd5: the printed move runs (R2.6)" sh -c "$_rd_mv"
+    STATE_HOME=rel-state run rd5_moved "$HRE" --version 0.7.3
+    check 0 "$rc" "rd5: 0.7.3 installs after the printed move (R2.6)"
+    cd "$_rd_cwd"
+
+    # A 0.8 daemon runs at refusal time: the printed steps stop its host
+    # before any move, with the min on disk named by its path.
+    HRF="$root/rd6"; mkdir -p "$HRF"
+    run rd6_seed "$HRF" --version 0.8.0
+    check 0 "$rc" "rd6: a 0.8.0 install exits 0"
+    write_min_stub "$HRF/bin/min" host-stop
+    : >"$HRF/host.running"
+    run rd6 "$HRF" --version 0.7.3
+    check 1 "$rc" "rd6: 0.7.3 with a 0.8 daemon running is refused (R2.6)"
+    awk '/^      / {sub(/^      /, ""); print}' "$OUT" >"$root/rd6.steps"
+    check "'$HRF/bin/min' host list" "$(sed -n 1p "$root/rd6.steps")" \
+        "rd6: the first step lists the hosts (R2.6)"
+    check "'$HRF/bin/min' host stop <host>" "$(sed -n 2p "$root/rd6.steps")" \
+        "rd6: the second step stops each host (R2.6)"
+    check "mv '$HRF/xdg-state/minimal' '$HRF/xdg-state/minimal.0.8'" "$(sed -n 3p "$root/rd6.steps")" \
+        "rd6: the move comes after the stop (R2.6)"
+    want_err "rd6: the refusal itself stops nothing (R2.6)" test -e "$HRF/stop.calls"
+    BIN_ON_PATH=1
+    run rd6_path "$HRF" --version 0.7.3
+    BIN_ON_PATH=
+    want_ok "rd6: with the bin dir on PATH the step names min (R2.6)" \
+        grep -qxF "      min host list" "$OUT"
+
+    # Two saved copies: the newest by modification time is named, not the
+    # first in glob order, and one line says where the other one is.
+    HRG="$root/rd7"; mkdir -p "$HRG"
+    run rd7_seed "$HRG" --version 0.8.0
+    check 0 "$rc" "rd7: a 0.8.0 install exits 0"
+    mkdir -p "$HRG/xdg-state/minimal.0.7.2" "$HRG/xdg-state/minimal.0.7.3"
+    touch -t 202001010000 "$HRG/xdg-state/minimal.0.7.2"
+    run rd7 "$HRG" --version 0.7.3
+    check 1 "$rc" "rd7: 0.7.3 beside two copies is refused (R2.6)"
+    want_ok "rd7: the refusal names the newest copy (R2.6)" \
+        grep -qxF "An upgrade to 0.8 saved the earlier state in ~/xdg-state/minimal.0.7.3." "$OUT"
+    want_ok "rd7: one line says where the other copy is (R2.6)" \
+        grep -qxF "1 older copy is beside it, in ~/xdg-state/minimal.0.7.*." "$OUT"
+    want_ok "rd7: the restore puts back the newest copy (R2.6)" \
+        grep -qF "mv '$HRG/xdg-state/minimal.0.7.3' '$HRG/xdg-state/minimal'" "$OUT"
+
+    # A version named by a commit hash is placed from the downloaded `min`.
+    # One that reports 0.7.3 is refused before any component is replaced.
+    HRH="$root/rd8"; mkdir -p "$HRH"
+    run rd8_seed "$HRH" --version 0.8.0
+    check 0 "$rc" "rd8: a 0.8.0 install exits 0"
+    # The min on disk is another build, so the shipped one is downloaded.
+    write_min_stub "$HRH/bin/min"
+    printf '0.8.0\n' >"$HRH/minver.client"
+    h_before="$(hash_file "$HRH/bin/min")"
+    printf '0.7.3\n' >"$HRH/minver.download"
+    reset_dl
+    run rd8 "$HRH" --version 9b763dd5
+    check 1 "$rc" "rd8: a hash-named 0.7.3 over 0.8 state is refused (R2.6)"
+    check "install: refused to install Minimal 9b763dd5 over the box state in ~/xdg-state/minimal." \
+        "$(grep '^install: refused' "$OUT")" "rd8: the refusal names the version as given (R2.6)"
+    check 1 "$(downloads)" "rd8: only the version probe is downloaded (R2.6)"
+    check "$h_before" "$(hash_file "$HRH/bin/min")" "rd8: the refusal replaces nothing (R2.6)"
+
+    # A hash-named version that cannot be placed is not refused on that
+    # version alone.
+    HRI="$root/rd9"; mkdir -p "$HRI/xdg-state/minimal/sessions"
+    printf '{"format_version": 1, "short_to_id": {}}\n' >"$HRI/xdg-state/minimal/sessions/index.json"
+    : >"$HRI/minver.download"
+    run rd9 "$HRI" --version 9b763dd5
+    check 0 "$rc" "rd9: a version that cannot be placed is not refused (R2.6)"
+}
+
 # --- Case dispatch -----------------------------------------------------------
 # Every scenario group above is one named case. No argument runs them all, in
 # the order the linear script used to have; one argument runs exactly that
@@ -4426,6 +4842,9 @@ case_for() {
         linux_amd64_manifest_ships_vm_stack) case_linux_amd64_manifest_ships_vm_stack ;;
         linux_arm64_manifest_ships_vm_stack) case_linux_arm64_manifest_ships_vm_stack ;;
         bep_installs_beside_minvmd)         case_bep_installs_beside_minvmd ;;
+        state_archive_on_upgrade_from_0_7)  case_state_archive_on_upgrade_from_0_7 ;;
+        state_archive_refuses_short_space)  case_state_archive_refuses_short_space ;;
+        refuses_0_7_over_0_8_state)         case_refuses_0_7_over_0_8_state ;;
         *)
             echo "install_test: unknown case '$1' (known cases listed in the dispatch)" >&2
             exit 2
@@ -4445,11 +4864,13 @@ case "${1:-}" in
             gvproxy_rename_migration installer_switch_binary_executable \
             host_classifier_tree_installed answerer_source_installed \
             linux_amd64_manifest_ships_vm_stack linux_arm64_manifest_ships_vm_stack \
-            bep_installs_beside_minvmd; do
+            bep_installs_beside_minvmd state_archive_on_upgrade_from_0_7 \
+            state_archive_refuses_short_space refuses_0_7_over_0_8_state; do
             case_for "$_c"
         done
         ;;
-    *)  case_for "$1" ;;
+    # A case can be named with its function's case_ prefix too.
+    *)  case_for "${1#case_}" ;;
 esac
 
 # ===========================================================================

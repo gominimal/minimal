@@ -357,6 +357,15 @@ loud rather than silently degraded.
   This makes sure that a corrupt or unmountable volume does not produce a ghost
   READY that appears to the host as a healthy VM.
 
+  A second sentinel sits beside `MOUNT_FAILED`. When the volume mounts but a
+  newer build wrote the box state on it (`sessions/index.json` carries a newer
+  `format_version`), the guest emits `STATE_REFUSED\n<one-line reason>\n` in
+  place of `READY` and parks. It writes nothing to the volume first. The reason
+  has the same 512-byte cap and one-line flattening as the `MOUNT_FAILED`
+  reason. `minvmd run` fails the boot with that reason and the host path of the
+  data volume. It keeps the volume, whether or not the volume existed before
+  this boot.
+
 **Proof Artifacts:**
 
 1. **Test:** A test sends `minvmd stop` to a running VM, then confirms the volume

@@ -211,6 +211,13 @@ fn run_boot(foreground: bool) -> Result<()> {
                 volume_preexisted,
             ));
         }
+        Ok(Ok(crate::cmd::BootBeacon::StateRefused { reason })) => {
+            // A newer build's state is on the volume: keep it as it is.
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&marker_sock_path);
+            return Err(crate::cmd::state_refused_error(&reason, &volume_path));
+        }
         Ok(Err(e)) => {
             let _ = child.kill();
             let _ = child.wait();
