@@ -74,7 +74,10 @@ impl<I: Items> SecretService<I> {
             .map_err(|_| unreadable(role))
     }
 
-    /// Holds `secret` for `role` in `slot`, in place of any key there.
+    /// Holds `secret` for `role` in `slot`, in place of any key there. With
+    /// no answer from Secret Service, a request it already has can still
+    /// put the key there, and the error says so. The next generation in
+    /// the slot replaces that key.
     fn store(&self, role: Role, slot: Slot, secret: &SecretKey) -> Result<(), KeyError> {
         let label = role.slot_label(slot);
         let bytes = Zeroizing::new(secret.to_bytes().to_vec());
@@ -82,7 +85,13 @@ impl<I: Items> SecretService<I> {
             Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(bytes.as_slice()));
         self.items
             .store(&label, &[(ATTRIBUTE, &label)], encoded.as_bytes())
-            .map_err(|cause| failure(role, &cause))
+            .map_err(|cause| match cause {
+                Cause::NoAnswer(_) => KeyError::Store {
+                    role,
+                    detail: format!("{cause}, and it can still store the key"),
+                },
+                cause => failure(role, &cause),
+            })
     }
 
     /// Removes the item for `role` in `slot`. An empty slot is not an error.
@@ -377,6 +386,17 @@ mod tests {
             },
             &StartError::Store(stuck),
             "The proxy did not start: the key store failed for the sealing key: Secret Service did not answer in 60 s.",
+        );
+    }
+
+    #[test]
+    fn a_generation_with_no_answer_says_the_key_can_still_be_stored() {
+        let (items, store) = fake();
+        items.set_failure(Some(Cause::NoAnswer(Duration::from_secs(60))));
+        let err = store.generate(Role::Root).map(|_| ()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "the key store failed for the root key: Secret Service did not answer in 60 s, and it can still store the key"
         );
     }
 
