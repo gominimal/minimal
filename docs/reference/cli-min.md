@@ -270,7 +270,7 @@ The command refuses these starts before it creates a box:
 | No terminal, and no `--detach` | 2 |
 | `--no-loadouts` and `--loadout` together | 2 |
 | A box on the host already has the name from `--name` or `[box] name`, in any state. Pass another `--name` to create the box | 2 |
-| The name from `--name` or `[box] name` is not one DNS label, is reserved, or has the form of a box id | 3 |
+| The name from `--name` or `[box] name` breaks a box-name rule. A box name is one DNS label. It must not be a label that the box zone reserves, and it must not have the form of a box id | 3 |
 
 An invalid `minimal.toml` ends the command with exit code 3.
 
@@ -702,8 +702,9 @@ min box rename <BOX> <NEW_NAME>
 
 Gives a box a new name. The box keeps its id, its state and its files. The
 command refuses a name that another box on the host has, in any state, with
-exit code 2. It refuses a name that is not one DNS label, is reserved, or has
-the form of a box id, with exit code 3.
+exit code 2. It refuses a name that breaks a box-name rule with exit code 3.
+A box name is one DNS label. It must not be a label that the box zone
+reserves, and it must not have the form of a box id.
 
 ### `box show`
 
