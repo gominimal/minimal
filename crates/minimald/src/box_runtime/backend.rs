@@ -99,18 +99,22 @@ pub(crate) trait ProcessBackend: Send + 'static {
 
 /// The level a box's exit is logged at.
 ///
-/// A clean exit is info. A non-zero one is a warning unless the daemon ended
-/// the box itself: a destroy, a forced stop or a daemon shutdown kills the
-/// process, which then reaps as `container received signal SIGKILL` with
-/// code 125, the same account an out-of-memory kill or any other outside
-/// SIGKILL gives. So the reason cannot tell them apart, and the decision rests
-/// on `killed`, which is set only when [`BoxProcess::kill`] sent the kill. An
-/// exit the process made on its own (`exit_code` is `Some`) stays a warning
-/// even then: it ended before the kill could reach it.
+/// An exit the process made on its own (`exit_code` is `Some`) is info,
+/// whatever its code: a command or a task that exits non-zero has given its
+/// result, and the daemon has nothing to warn about. That holds even when a
+/// kill was sent: the process ended before the kill could reach it.
+///
+/// An abnormal end (`exit_code` is `None`: a signal, or the container
+/// failing) is a warning unless the daemon ended the box itself: a destroy, a
+/// forced stop or a daemon shutdown kills the process, which then reaps as
+/// `container received signal SIGKILL` with code 125, the same account an
+/// out-of-memory kill or any other outside SIGKILL gives. So the reason
+/// cannot tell them apart, and the decision rests on `killed`, which is set
+/// only when [`BoxProcess::kill`] sent the kill. That end is debug.
 pub(super) fn exit_log_level(reason: &ExitReason, killed: bool) -> tracing::Level {
-    if reason.code == 0 {
+    if !reason.is_abnormal() {
         tracing::Level::INFO
-    } else if killed && reason.is_abnormal() {
+    } else if killed {
         tracing::Level::DEBUG
     } else {
         tracing::Level::WARN
@@ -256,7 +260,16 @@ impl ProcessBackend for SandboxBackend {
     /// otherwise log the same death twice.
     fn log_exit(reason: &ExitReason, killed: bool) {
         let level = exit_log_level(reason, killed);
-        if level == tracing::Level::INFO {
+        // A non-zero exit keeps its line's text at info, so a search for it
+        // still finds every one; only the level says it is the command's own.
+        if level == tracing::Level::INFO && reason.code != 0 {
+            tracing::info!(
+                code = reason.code,
+                exit_code = ?reason.exit_code,
+                reason = %reason.reason,
+                "box process exited non-zero"
+            );
+        } else if level == tracing::Level::INFO {
             tracing::info!(
                 code = reason.code,
                 exit_code = ?reason.exit_code,

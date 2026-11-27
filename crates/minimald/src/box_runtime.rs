@@ -107,8 +107,9 @@ pub(crate) struct Host<P: BoxProcess, G: BoxGuard> {
     /// the error says how the host noticed, the reap says what became of the
     /// shell — and the reap is the slower of the two. Set only by a pty
     /// failure, never by a deliberate kill, which is what keeps a destroy from
-    /// raising a shell-exit prompt.
-    pending_pty_err: Option<std::io::Error>,
+    /// raising a shell-exit prompt. Held with the operation that failed: only
+    /// a read's `EIO` makes the reap an ordinary end ([`pty_reap_log_level`]).
+    pending_pty_err: Option<(PtyOp, std::io::Error)>,
     /// Set when [`Host::step`] takes a `Message::Kill`. The step-error branch
     /// of [`Host::mainloop`] reads it to tell a requested end from a pty
     /// failure. A pty error stashed before the kill does not hide the kill.
@@ -1605,7 +1606,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                 // deliberate kill stays silent: `Message::Kill` also returns
                 // `Err` from `step`, but a destroy or a daemon shutdown either
                 // wants no farewell at all or has already sent its own teardown.
-                let mut pending = self.pending_pty_err.take();
+                let (pending_op, mut pending) = self.pending_pty_err.take().unzip();
                 // Read from the kill itself, not from `pending`: a kill can
                 // arrive after a pty error was stashed, and that end is still
                 // the daemon's, not the entrypoint's own return (BOX-038).
@@ -1636,6 +1637,12 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                 // A requested teardown is logged at info: its SIGKILL reaps
                 // with the same abnormal reason an OOM kill does, and a warn
                 // for every destroy would bury the deaths nobody asked for.
+                //
+                // So is the ordinary end of a session: a master read's `EIO`
+                // (still in `pending`, which only a non-`EIO` error left
+                // empty above) and an exit the process made on its own
+                // (`pty_reap_log_level`). Everything else stays a warning,
+                // a write's `EIO` included.
                 if requested {
                     tracing::info!(
                         session_id = %self.session_id,
@@ -1644,6 +1651,17 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                         abnormal = exit.as_ref().is_some_and(ExitReason::is_abnormal),
                         exit_reason = exit.as_ref().map_or("", |r| r.reason.as_str()),
                         "session process reaped after requested teardown",
+                    );
+                } else if pty_reap_log_level(pending_op.zip(pending.as_ref()), exit.as_ref())
+                    == tracing::Level::INFO
+                {
+                    tracing::info!(
+                        session_id = %self.session_id,
+                        session = %self.session_name,
+                        ?code,
+                        abnormal = exit.as_ref().is_some_and(ExitReason::is_abnormal),
+                        exit_reason = exit.as_ref().map_or("", |r| r.reason.as_str()),
+                        "session process reaped after pty/step error",
                     );
                 } else {
                     tracing::warn!(
@@ -1806,18 +1824,32 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         // rendered message: this is the one line that says whether a session
         // died of the expected EIO-on-exit (5), of an `EINTR` (4) that the read
         // loop treated as fatal rather than retrying, or of something else
-        // entirely.
-        tracing::warn!(
-            session_id = %self.session_id,
-            session = %self.session_name,
-            op = op.as_str(),
-            errno = ?e.raw_os_error(),
-            kind = ?e.kind(),
-            error = %e,
-            attached = self.remote.is_some(),
-            "pty master error; tearing down host",
-        );
-        self.pending_pty_err = Some(e);
+        // entirely. The expected one is debug (`pty_err_log_level`): the reap
+        // line that follows says how the session ended.
+        if pty_err_log_level(op, &e) == tracing::Level::DEBUG {
+            tracing::debug!(
+                session_id = %self.session_id,
+                session = %self.session_name,
+                op = op.as_str(),
+                errno = ?e.raw_os_error(),
+                kind = ?e.kind(),
+                error = %e,
+                attached = self.remote.is_some(),
+                "pty master error; tearing down host",
+            );
+        } else {
+            tracing::warn!(
+                session_id = %self.session_id,
+                session = %self.session_name,
+                op = op.as_str(),
+                errno = ?e.raw_os_error(),
+                kind = ?e.kind(),
+                error = %e,
+                attached = self.remote.is_some(),
+                "pty master error; tearing down host",
+            );
+        }
+        self.pending_pty_err = Some((op, e));
     }
 
     /// Notifies the attached binding that the session is going away, so it

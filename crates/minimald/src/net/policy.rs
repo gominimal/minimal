@@ -1847,9 +1847,10 @@ async fn post_json_reply_within<T: Serialize>(
     // closing the connection. On the KVM libkrun `add_vsock_port2(listen=false)`
     // shuttle, a server-initiated close drops the still-buffered response bytes as
     // it propagates to the guest (the guest reads an immediate EOF → 0 bytes →
-    // `malformed gvproxy status line: ""`, even though the forward *was* applied —
-    // G-N8). Keeping the connection open lets the response drain to the guest,
-    // which then reads exactly `Content-Length` bytes and closes from its side.
+    // "the control connection closed before any answer came back", even though
+    // the forward *was* applied — G-N8). Keeping the connection open lets the
+    // response drain to the guest, which then reads exactly `Content-Length`
+    // bytes and closes from its side.
     request.extend_from_slice(format!("POST {path} HTTP/1.1\r\n").as_bytes());
     request.extend_from_slice(b"Host: localhost\r\n");
     request.extend_from_slice(b"Content-Type: application/json\r\n");
@@ -1967,8 +1968,16 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
         }
         let n = stream.read(&mut buf).await?;
         if n == 0 {
-            // EOF before headers completed — the empty-reply symptom the
-            // keep-alive framing is meant to avoid; surface it as-is.
+            // EOF before any byte of an answer: the far end closed without
+            // answering. On a VM host that is also how the host's egress
+            // gate refuses a request it does not admit.
+            if response.is_empty() {
+                return Err(io::Error::other(
+                    "the control connection closed before any answer came back",
+                ));
+            }
+            // EOF after part of the head: the caller reads what came and
+            // names the malformed status line or headers.
             return Ok(response);
         }
         response.extend_from_slice(&buf[..n]);
@@ -2871,6 +2880,36 @@ mod tests {
         assert_eq!(parse_status_code(&resp).unwrap(), 200);
         assert_eq!(body_after_headers(&resp), b"WEB_OK");
         drop(server.await.unwrap());
+    }
+
+    /// A peer that takes the request and closes without a byte of answer, as
+    /// the VM host's egress gate does for a request it refuses, is said as
+    /// that: not as a malformed empty status line.
+    #[tokio::test]
+    async fn exchange_says_the_connection_closed_before_an_answer() {
+        let (client, mut server) = tokio::io::duplex(1024);
+        let server = crate::traced::spawn(async move {
+            let mut buf = [0u8; 256];
+            let _ = server.read(&mut buf).await.unwrap();
+            drop(server);
+        });
+
+        let err = exchange(
+            client,
+            b"POST /services/dns/add HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await
+        .expect_err("a close with no answer is an error");
+        server.await.unwrap();
+
+        assert_eq!(
+            err.to_string(),
+            "the control connection closed before any answer came back"
+        );
+        assert!(
+            !err.to_string().contains("malformed"),
+            "no longer read as a malformed status line: {err}"
+        );
     }
 
     // ---- NET-123's forwarder-conducted range probe -----------------------

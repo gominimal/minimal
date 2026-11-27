@@ -2038,7 +2038,7 @@ async fn pump_signals_client_loss_after_stdin_eof() {
         .await
         .expect("a close after EOF must still signal client loss")
         .unwrap();
-    assert_eq!(*end_rx.borrow(), Some(super::ExecEnd::ClientLost));
+    assert_eq!(*end_rx.borrow(), Some(super::ExecEnd::ClientClosed));
 }
 
 /// The deadlock's shape (gominimal/inbox#1089): the command reads
@@ -2839,7 +2839,7 @@ async fn client_loss_releases_the_held_input_at_once() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(*end_rx.borrow(), Some(super::ExecEnd::ClientLost));
+    assert_eq!(*end_rx.borrow(), Some(super::ExecEnd::ClientClosed));
     assert_eq!(
         held.held_bytes(),
         0,
@@ -2937,6 +2937,26 @@ async fn pump_signals_client_loss_when_channel_sender_drops() {
         .unwrap();
     assert_eq!(*lost_rx.borrow(), Some(super::ExecEnd::ClientLost));
     pump.await.unwrap();
+}
+
+/// A client that closed its channel left on purpose, and the command
+/// ending with it is the contract: info. A connection that ended with no
+/// close, and an input bound that ran out, stay warnings.
+#[test]
+fn a_closed_channel_ends_the_exec_at_info_and_a_lost_one_warns() {
+    use super::{ExecEnd, HeldBound};
+    assert_eq!(ExecEnd::ClientClosed.log_level(), tracing::Level::INFO);
+    assert_eq!(ExecEnd::ClientLost.log_level(), tracing::Level::WARN);
+    for bound in [HeldBound::Exec, HeldBound::Daemon] {
+        assert_eq!(
+            ExecEnd::InputHeldOver(bound).log_level(),
+            tracing::Level::WARN
+        );
+        assert_eq!(
+            ExecEnd::InputHeldUnstarted(bound).log_level(),
+            tracing::Level::WARN
+        );
+    }
 }
 
 /// A grandchild that inherited the child's stdout keeps the pipe

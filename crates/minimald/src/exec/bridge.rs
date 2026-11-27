@@ -81,7 +81,7 @@ impl<S: Exec> ExecTask<S> {
         let notice = match *end_rx.borrow() {
             Some(ExecEnd::InputHeldOver(bound)) => Some(held_input_notice(bound)),
             Some(ExecEnd::InputHeldUnstarted(bound)) => Some(unstarted_input_notice(bound)),
-            Some(ExecEnd::ClientLost) | None => None,
+            Some(ExecEnd::ClientClosed | ExecEnd::ClientLost) | None => None,
         };
         if let Some(notice) = notice
             && e.write_all(notice.as_bytes()).await.is_err()
@@ -387,14 +387,72 @@ pub(crate) enum HeldBound {
 /// Why the bridge ends an exec before its command is done.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExecEnd {
-    /// The SSH client is gone (channel close, or the sender dropped with
-    /// the connection).
+    /// The SSH client closed the channel (an SSH channel close) while the
+    /// command still ran: the client chose to leave.
+    ClientClosed,
+    /// The SSH client's connection ended with no channel close: the channel's
+    /// sender dropped with the connection, as it does when the client is
+    /// killed or the transport fails.
     ClientLost,
     /// Input held for a command that was not reading it crossed a bound.
     InputHeldOver(HeldBound),
     /// Input reached a bound before the command started, and the command
     /// had still not started when [`EXEC_INPUT_UNSTARTED`] ran out.
     InputHeldUnstarted(HeldBound),
+}
+
+impl ExecEnd {
+    /// The level the bridge logs this end at ([`log_exec_end`], and the end
+    /// of an exec whose command is still starting, [`bridge_until_end`]).
+    ///
+    /// A client that closed its channel left on purpose, and its command
+    /// ending with it is the contract (gominimal/inbox#813), so that is info.
+    /// A connection that ended with no close, and an input bound that ran
+    /// out, are warnings.
+    pub(super) fn log_level(self) -> tracing::Level {
+        match self {
+            Self::ClientClosed => tracing::Level::INFO,
+            Self::ClientLost | Self::InputHeldOver(_) | Self::InputHeldUnstarted(_) => {
+                tracing::Level::WARN
+            }
+        }
+    }
+}
+
+/// One log line at `$level`, which is info or a warning: `tracing`'s macros
+/// take their level as a constant, so the two are spelled out here once.
+macro_rules! info_or_warn {
+    ($level:expr, $($line:tt)*) => {
+        if $level == tracing::Level::INFO {
+            tracing::info!($($line)*)
+        } else {
+            tracing::warn!($($line)*)
+        }
+    };
+}
+
+/// Logs why the bridge is ending the exec on `channel_id`, at the level
+/// [`ExecEnd::log_level`] gives.
+pub(super) fn log_exec_end(channel_id: &impl Display, end: ExecEnd) {
+    let level = end.log_level();
+    match end {
+        ExecEnd::ClientClosed | ExecEnd::ClientLost => info_or_warn!(
+            level,
+            %channel_id,
+            channel_closed = matches!(end, ExecEnd::ClientClosed),
+            "exec: ssh client disconnected; killing child",
+        ),
+        ExecEnd::InputHeldOver(bound) => info_or_warn!(
+            level,
+            %channel_id, ?bound,
+            "exec: the command's unread input crossed a bound; ending the exec",
+        ),
+        ExecEnd::InputHeldUnstarted(bound) => info_or_warn!(
+            level,
+            %channel_id, ?bound,
+            "exec: the command started after its wait at an input bound ran out; ending the exec",
+        ),
+    }
 }
 
 /// What the bridge does with input that arrives while the current command
@@ -763,9 +821,10 @@ impl Drop for HeldInputReader {
 /// `Eof` closes the held input (the command sees EOF once it has read what
 /// is queued) but keeps watching the channel: `min task run` from a
 /// terminal half-closes stdin straight away, so a disconnect almost always
-/// arrives *after* EOF and must still be seen. `Close`, or the end of `msgs`
-/// (the channel's sender dropped with the connection), sends
-/// [`ExecEnd::ClientLost`] and returns.
+/// arrives *after* EOF and must still be seen. `Close` (the client closed
+/// its channel) sends [`ExecEnd::ClientClosed`]; the end of `msgs` with no
+/// `Close` (the channel's sender dropped with the connection) sends
+/// [`ExecEnd::ClientLost`]. Either returns.
 pub(super) async fn pump_channel_input<M>(
     mut msgs: M,
     held: Arc<HeldInput>,
@@ -921,12 +980,19 @@ pub(super) async fn pump_channel_input<M>(
                 open = false;
                 held.close();
             }
-            Some(russh::ChannelMsg::Close) | None => {
+            msg @ (Some(russh::ChannelMsg::Close) | None) => {
                 // Released at once, as the bound-over path does: nothing of
                 // a gone client's is held against the daemon's budget while
-                // its command is still being ended.
+                // its command is still being ended. russh hands the channel
+                // a `Close` when the client sent one, before the stream
+                // ends; a stream that ends with none is a connection lost.
                 held.clear();
-                end.send_replace(Some(ExecEnd::ClientLost));
+                let gone = if msg.is_some() {
+                    ExecEnd::ClientClosed
+                } else {
+                    ExecEnd::ClientLost
+                };
+                end.send_replace(Some(gone));
                 return;
             }
             Some(_) => {}
@@ -1155,9 +1221,13 @@ where
             biased;
             next = stream.next() => next,
             () = until_ended(&mut client_lost) => {
-                tracing::warn!(
+                // The level is the end's own: a client that closed its
+                // channel while its command was starting left on purpose.
+                let end = *client_lost.borrow();
+                info_or_warn!(
+                    end.map_or(tracing::Level::WARN, ExecEnd::log_level),
                     %channel_id,
-                    end = ?*client_lost.borrow(),
+                    ?end,
                     "exec: ended while its command was starting; the start is ended when it returns",
                 );
                 return (1, Some(stream));
@@ -1439,20 +1509,7 @@ where
                 if res.is_err() {
                     client_watch_open = false;
                 } else if let Some(end) = *client_lost.borrow() {
-                    match end {
-                        ExecEnd::ClientLost => tracing::warn!(
-                            %channel_id,
-                            "exec: ssh client disconnected; killing child",
-                        ),
-                        ExecEnd::InputHeldOver(bound) => tracing::warn!(
-                            %channel_id, ?bound,
-                            "exec: the command's unread input crossed a bound; ending the exec",
-                        ),
-                        ExecEnd::InputHeldUnstarted(bound) => tracing::warn!(
-                            %channel_id, ?bound,
-                            "exec: the command started after its wait at an input bound ran out; ending the exec",
-                        ),
-                    }
+                    log_exec_end(&channel_id, end);
                     ssh_write_failed = true;
                 }
             }
@@ -1520,14 +1577,17 @@ where
         None => {
             tokio::select! {
                 status = process.wait() => status,
-                // Reduced to a bool in the branch: the `watch::Ref` it
-                // yields is not `Send` and must not live across the wait.
-                lost = async { client_lost.wait_for(|end| end.is_some()).await.is_ok() } => {
-                    if lost {
-                        tracing::warn!(
-                            %channel_id,
-                            "exec: ssh client disconnected; killing child",
-                        );
+                // Copied out of the `watch::Ref` in the branch: the `Ref`
+                // is not `Send` and must not live across the wait.
+                end = async {
+                    client_lost
+                        .wait_for(|end| end.is_some())
+                        .await
+                        .ok()
+                        .and_then(|end| *end)
+                } => {
+                    if let Some(end) = end {
+                        log_exec_end(&channel_id, end);
                         // A `--detach` exec, if one is ever added, must not reach this
                         // client-loss kill.
                         let _ = process.start_kill();

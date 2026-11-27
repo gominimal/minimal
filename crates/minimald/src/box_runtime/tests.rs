@@ -1184,20 +1184,134 @@ async fn an_unrequested_kill_still_warns_abnormal() {
     );
 }
 
+/// On Linux a read on the pty master fails with `EIO` once the last slave fd
+/// closes: the ordinary end of a session, logged at debug. A write, a
+/// readiness error or another errno stays a warning.
+#[test]
+fn eio_on_a_master_read_is_not_a_warning() {
+    let eio = std::io::Error::from_raw_os_error(EIO_ON_EXIT);
+    assert_eq!(pty_err_log_level(PtyOp::Read, &eio), tracing::Level::DEBUG);
+    for op in [PtyOp::Readable, PtyOp::Writable, PtyOp::Write] {
+        assert_eq!(
+            pty_err_log_level(op, &eio),
+            tracing::Level::WARN,
+            "{}",
+            op.as_str()
+        );
+    }
+    let eintr = std::io::Error::from_raw_os_error(libc::EINTR);
+    assert_eq!(pty_err_log_level(PtyOp::Read, &eintr), tracing::Level::WARN);
+}
+
+/// The reap after a pty error nobody asked for is info only for the
+/// ordinary end: a master read's `EIO` and an exit the process made itself,
+/// zero or not. A signal, another errno, the same `EIO` from a write or a
+/// readiness wait, or a failed reap stays a warning.
+#[test]
+fn the_reap_after_eio_and_an_own_exit_is_info() {
+    let eio = std::io::Error::from_raw_os_error(EIO_ON_EXIT);
+    let eintr = std::io::Error::from_raw_os_error(libc::EINTR);
+    let sigkill = signalled("container received signal SIGKILL");
+    assert_eq!(
+        pty_reap_log_level(Some((PtyOp::Read, &eio)), Some(&exited(0))),
+        tracing::Level::INFO
+    );
+    assert_eq!(
+        pty_reap_log_level(Some((PtyOp::Read, &eio)), Some(&exited(1))),
+        tracing::Level::INFO
+    );
+    assert_eq!(
+        pty_reap_log_level(Some((PtyOp::Read, &eio)), Some(&sigkill)),
+        tracing::Level::WARN
+    );
+    assert_eq!(
+        pty_reap_log_level(Some((PtyOp::Read, &eio)), None),
+        tracing::Level::WARN
+    );
+    assert_eq!(
+        pty_reap_log_level(Some((PtyOp::Read, &eintr)), Some(&exited(0))),
+        tracing::Level::WARN
+    );
+    // A write into the pty can fail with `EIO` when the process exits with
+    // input still buffered. That error is a warning on its own line, so the
+    // reap after it is one too, even after an exit the process made itself.
+    for op in [PtyOp::Readable, PtyOp::Writable, PtyOp::Write] {
+        assert_eq!(
+            pty_reap_log_level(Some((op, &eio)), Some(&exited(0))),
+            tracing::Level::WARN,
+            "{}",
+            op.as_str()
+        );
+    }
+    assert_eq!(
+        pty_reap_log_level(None, Some(&exited(0))),
+        tracing::Level::WARN
+    );
+}
+
+/// A shell that exits on its own ends its session with no warning: neither
+/// the master's `EIO` nor the reap after it is a WARN line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shell_that_exits_on_its_own_logs_no_warning() {
+    let capture = captured_log();
+    let (mut host, _handle) = reap_log_host("reap-own-exit").await;
+    let _rx = watch_binding(&mut host);
+    let stdin = host.remote_tx.clone();
+    let task = crate::traced::spawn(host.mainloop());
+
+    stdin
+        .send(stdin_bytes(format!("{MOCK_EXIT_LINE}\n").into_bytes()))
+        .await
+        .expect("failed to send the exit line");
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("host mainloop should terminate after the shell exits")
+        .expect("host task should not panic during teardown")
+        .expect("mainloop should return the reaped exit status");
+
+    let warned: Vec<String> = capture
+        .contents()
+        .lines()
+        .filter(|l| l.contains("session=reap-own-exit ") && l.contains(" WARN "))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        warned.is_empty(),
+        "a session that ended the ordinary way logs no warning: {warned:?}"
+    );
+}
+
 /// The level a box's exit is logged at. A box the daemon killed reaps with
 /// the same SIGKILL account an out-of-memory kill gives, so only the kill
 /// the daemon sent turns it into a debug line; the same account with no kill
-/// sent stays a warning, and so does a non-zero exit the command made itself.
+/// sent stays a warning.
 #[test]
 fn a_box_the_daemon_killed_logs_its_exit_at_debug() {
     let sigkill = signalled("container received signal SIGKILL");
     assert_eq!(exit_log_level(&sigkill, true), tracing::Level::DEBUG);
     assert_eq!(exit_log_level(&sigkill, false), tracing::Level::WARN);
-    assert_eq!(exit_log_level(&exited(1), false), tracing::Level::WARN);
-    // The command exited before the kill reached it: its own failure.
-    assert_eq!(exit_log_level(&exited(1), true), tracing::Level::WARN);
     assert_eq!(exit_log_level(&exited(0), false), tracing::Level::INFO);
     assert_eq!(exit_log_level(&exited(0), true), tracing::Level::INFO);
+}
+
+/// A command or task that exits with a code of its own, zero or not, has
+/// given the user its result: the exit is info, not a warning, whether or
+/// not a kill was sent after it ended.
+#[test]
+fn a_non_zero_exit_the_command_made_itself_logs_at_info() {
+    for code in [1, 2, 127, 130] {
+        assert_eq!(
+            exit_log_level(&exited(code), false),
+            tracing::Level::INFO,
+            "exit {code}"
+        );
+        // The command exited before the kill reached it: its own result.
+        assert_eq!(
+            exit_log_level(&exited(code), true),
+            tracing::Level::INFO,
+            "exit {code} after a kill was sent"
+        );
+    }
 }
 
 /// The kill flag the level rests on is set by the process handle's own
