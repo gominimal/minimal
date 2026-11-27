@@ -27,7 +27,7 @@ pub mod handle;
 pub mod http;
 pub mod inject;
 pub mod keys;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "secret-service"))]
 pub mod linux_store;
 pub mod listener;
 pub mod module;
@@ -37,7 +37,9 @@ pub mod redeem;
 pub mod redeemer;
 pub mod revoke;
 pub mod seal;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "secret-service"))]
+pub mod secret_items;
+#[cfg(all(target_os = "linux", feature = "secret-service"))]
 pub mod secret_service;
 pub mod signin;
 pub mod store;

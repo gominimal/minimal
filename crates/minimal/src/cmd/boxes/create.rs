@@ -7649,7 +7649,7 @@ mod tests {
         }
         fn check_available(&self) -> Result<(), bep::store::StoreError> {
             Err(bep::store::StoreError::NoSecretService {
-                detail: "secret-tool: Cannot autolaunch D-Bus without X11 $DISPLAY".into(),
+                detail: "no session bus answered: failed to connect to `unix:path=/run/user/1000/bus`: No such file or directory (os error 2)".into(),
             })
         }
     }
@@ -7687,10 +7687,11 @@ mod tests {
             "Cannot create the box: the secret OPENAI_KEY in [defaults.session.secrets] in \
              minimal.toml reads the item openai-key from the host's secret store, and this \
              host cannot use that store. `min secret` keeps secrets in Secret Service on \
-             Linux, and no Secret Service answered in this login session: secret-tool: \
-             Cannot autolaunch D-Bus without X11 $DISPLAY. Install a Secret Service provider \
-             such as GNOME Keyring (the `gnome-keyring` package), and run the command again \
-             in a login session that starts it."
+             Linux, and no Secret Service answered in this login session: no session bus \
+             answered: failed to connect to `unix:path=/run/user/1000/bus`: No such file or \
+             directory (os error 2). Install a \
+             Secret Service provider such as GNOME Keyring (the `gnome-keyring` package), and \
+             run the command again in a login session that starts it."
         );
 
         // A reference to another store reads nothing from the host store,

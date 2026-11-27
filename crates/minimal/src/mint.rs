@@ -60,7 +60,7 @@ use bep::publish::{Identity, PublishError};
 use bep::seal::{Breadth, Context, Member, MemberKind, MemberList, Mode};
 use bep::signin::{Keychain, SignInError};
 use p256::ecdsa::SigningKey;
-use zeroize::{Zeroize as _, Zeroizing};
+use zeroize::Zeroizing;
 
 /// How long a control socket request waits for the proxy.
 pub(crate) const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -757,22 +757,20 @@ const CLIENT_KEY_ACCOUNT: &str = "minimal";
 const CLIENT_KEY_LABEL: &str = "Minimal client signing key";
 
 /// The host keychain as a [`ClientKeyStore`]: the login keychain through
-/// `/usr/bin/security` on macOS, the Secret Service through `secret-tool`
-/// on Linux. The item holds the key's secret scalar, unpadded base64url.
-/// The secret goes to the tool on its stdin, never on a command line.
+/// `/usr/bin/security` on macOS, and Secret Service on Linux. The item holds
+/// the key's secret scalar, unpadded base64url. On macOS the secret goes to
+/// the tool on its stdin, never on a command line.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct HostClientKeyStore;
 
 impl HostClientKeyStore {
     /// The key from the item's text. An item that holds no valid key is
     /// refused, so [`local_client_key`] replaces it.
-    fn decode(text: &mut Vec<u8>) -> Result<ClientKey, ClientKeyError> {
-        let decoded = std::str::from_utf8(text)
+    fn decode(text: &Zeroizing<Vec<u8>>) -> Result<ClientKey, ClientKeyError> {
+        std::str::from_utf8(text)
             .ok()
             .and_then(|text| URL_SAFE_NO_PAD.decode(text.trim()).ok())
-            .map(Zeroizing::new);
-        text.zeroize();
-        decoded
+            .map(Zeroizing::new)
             .and_then(|bytes| {
                 <[u8; 32]>::try_from(bytes.as_slice())
                     .ok()
@@ -786,7 +784,7 @@ impl HostClientKeyStore {
 impl ClientKeyStore for HostClientKeyStore {
     fn find(&self) -> Result<Option<ClientKey>, ClientKeyError> {
         match host_key::find()? {
-            Some(mut text) => Self::decode(&mut text).map(Some),
+            Some(text) => Self::decode(&text).map(Some),
             None => Ok(None),
         }
     }
@@ -804,11 +802,13 @@ impl ClientKeyStore for HostClientKeyStore {
     }
 }
 
+#[cfg(target_os = "macos")]
 /// How long a keychain tool can run. The tool can wait on an unlock or
 /// access prompt that nobody answers, as in an SSH session, and box
 /// creation must not wait for it forever.
 const KEY_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
 
+#[cfg(target_os = "macos")]
 /// Runs a keychain tool with `stdin` on its standard input, and gives its
 /// output. A tool that runs past `timeout` is killed. The child is reaped
 /// on every path.
@@ -820,6 +820,7 @@ fn run_key_tool(
     run_key_tool_within(tool, cmd, stdin, KEY_TOOL_TIMEOUT)
 }
 
+#[cfg(target_os = "macos")]
 fn run_key_tool_within(
     tool: &str,
     mut cmd: std::process::Command,
@@ -909,6 +910,7 @@ fn run_key_tool_within(
 }
 
 /// The text a keychain tool printed on its standard error.
+#[cfg(target_os = "macos")]
 fn key_tool_error(stderr: &[u8]) -> String {
     String::from_utf8_lossy(stderr).trim().to_owned()
 }
@@ -932,7 +934,7 @@ mod host_key {
     /// `errSecAuthFailed`, `errSecNoAccessForItem` and `userCanceled`.
     const REFUSED: [i32; 3] = [51, 101, 128];
 
-    pub(super) fn find() -> Result<Option<Vec<u8>>, ClientKeyError> {
+    pub(super) fn find() -> Result<Option<Zeroizing<Vec<u8>>>, ClientKeyError> {
         let mut cmd = Command::new(SECURITY);
         cmd.args([
             "find-generic-password",
@@ -944,7 +946,7 @@ mod host_key {
         ]);
         let mut out = run_key_tool(SECURITY, cmd, None)?;
         match out.status.code() {
-            _ if out.status.success() => Ok(Some(out.stdout)),
+            _ if out.status.success() => Ok(Some(Zeroizing::new(out.stdout))),
             Some(NOT_FOUND) => {
                 out.stdout.zeroize();
                 Ok(None)
@@ -1000,80 +1002,64 @@ mod host_key {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 mod host_key {
-    use std::path::{Path, PathBuf};
-    use std::process::Command;
+    use bep::secret_items::{Items, SessionItems};
+    use zeroize::Zeroizing;
 
-    use zeroize::Zeroize as _;
+    use super::{CLIENT_KEY_ACCOUNT, CLIENT_KEY_LABEL, CLIENT_KEY_SERVICE, ClientKeyError};
 
-    use super::{
-        CLIENT_KEY_ACCOUNT, CLIENT_KEY_LABEL, CLIENT_KEY_SERVICE, ClientKeyError, key_tool_error,
-        run_key_tool,
-    };
+    /// The attributes of the item that keeps the client's key.
+    const ATTRIBUTES: [(&str, &str); 2] = [
+        ("service", CLIENT_KEY_SERVICE),
+        ("account", CLIENT_KEY_ACCOUNT),
+    ];
 
-    const SECRET_TOOL: &str = "secret-tool";
-
-    /// The system directories `secret-tool` is taken from. The tool sees
-    /// the client's key, so it is never found through `PATH`, where a
-    /// project directory can put a program of the same name first.
-    const SYSTEM_DIRS: [&str; 3] = ["/usr/bin", "/bin", "/run/current-system/sw/bin"];
-
-    /// The first `secret-tool` in [`SYSTEM_DIRS`].
-    fn secret_tool() -> Result<Command, ClientKeyError> {
-        trusted_tool(&SYSTEM_DIRS).map(Command::new).ok_or_else(|| {
-            ClientKeyError::Store(format!(
-                "`{SECRET_TOOL}` is not installed in {}",
-                SYSTEM_DIRS.join(", ")
-            ))
-        })
-    }
-
-    pub(super) fn trusted_tool(dirs: &[&str]) -> Option<PathBuf> {
-        dirs.iter()
-            .map(|dir| Path::new(dir).join(SECRET_TOOL))
-            .find(|path| path.is_file())
-    }
-
-    pub(super) fn find() -> Result<Option<Vec<u8>>, ClientKeyError> {
-        let mut cmd = secret_tool()?;
-        cmd.args([
-            "lookup",
-            "service",
-            CLIENT_KEY_SERVICE,
-            "account",
-            CLIENT_KEY_ACCOUNT,
-        ]);
-        let mut out = run_key_tool(SECRET_TOOL, cmd, None)?;
-        if out.status.success() && !out.stdout.is_empty() {
-            return Ok(Some(out.stdout));
-        }
-        out.stdout.zeroize();
-        // `secret-tool` exits 1 with nothing on stderr when no item matches.
-        if out.stderr.is_empty() {
-            Ok(None)
-        } else {
-            Err(ClientKeyError::Store(key_tool_error(&out.stderr)))
-        }
+    pub(super) fn find() -> Result<Option<Zeroizing<Vec<u8>>>, ClientKeyError> {
+        find_in(&SessionItems::new())
     }
 
     pub(super) fn store(secret: &str) -> Result<(), ClientKeyError> {
-        // The Secret Service replaces the item whose attributes all match.
-        let mut cmd = secret_tool()?;
-        cmd.args([
-            "store",
-            &format!("--label={CLIENT_KEY_LABEL}"),
-            "service",
-            CLIENT_KEY_SERVICE,
-            "account",
-            CLIENT_KEY_ACCOUNT,
-        ]);
-        let out = run_key_tool(SECRET_TOOL, cmd, Some(secret))?;
-        if out.status.success() {
-            Ok(())
-        } else {
-            Err(ClientKeyError::Store(key_tool_error(&out.stderr)))
-        }
+        store_in(&SessionItems::new(), secret)
+    }
+
+    /// The kept item's text. Every failure is [`ClientKeyError::Store`]: a
+    /// locked keyring keeps the key, so nothing replaces it.
+    pub(super) fn find_in(
+        items: &impl Items,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>, ClientKeyError> {
+        items
+            .lookup(&ATTRIBUTES)
+            .map(|held| held.filter(|text| !text.is_empty()))
+            .map_err(|cause| ClientKeyError::Store(cause.to_string()))
+    }
+
+    pub(super) fn store_in(items: &impl Items, secret: &str) -> Result<(), ClientKeyError> {
+        // Secret Service replaces the item whose attributes all match.
+        items
+            .store(CLIENT_KEY_LABEL, &ATTRIBUTES, secret.as_bytes())
+            .map_err(|cause| ClientKeyError::Store(cause.to_string()))
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+mod host_key {
+    use zeroize::Zeroizing;
+
+    use super::ClientKeyError;
+
+    fn none<T>() -> Result<T, ClientKeyError> {
+        Err(ClientKeyError::Store(
+            "min keeps its signing key in the macOS Keychain or in Secret Service on Linux, and this host has neither".into(),
+        ))
+    }
+
+    pub(super) fn find() -> Result<Option<Zeroizing<Vec<u8>>>, ClientKeyError> {
+        none()
+    }
+
+    pub(super) fn store(_: &str) -> Result<(), ClientKeyError> {
+        none()
     }
 }
 
@@ -2493,6 +2479,7 @@ pub(crate) mod tests {
 
     // A keychain tool that waits on a prompt nobody answers is killed at
     // the deadline, and creation gets an error, not a hang.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_key_tool_past_its_deadline_is_killed() {
         let mut cmd = std::process::Command::new("sleep");
@@ -2506,6 +2493,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_key_tool_gives_its_output_and_takes_its_input() {
         let cmd = std::process::Command::new("cat");
@@ -2514,19 +2502,54 @@ pub(crate) mod tests {
         assert_eq!(out.stdout, b"secret");
     }
 
-    // The tool that sees the client's key is taken from a system directory,
-    // never from a `PATH` entry.
-    #[cfg(not(target_os = "macos"))]
+    // On Linux the client's key is one Secret Service item under `service`
+    // and `account`, as text. A locked keyring keeps the key, so its error
+    // never reads as a refused key that the client replaces.
+    #[cfg(target_os = "linux")]
     #[test]
-    fn secret_tool_is_taken_from_the_listed_directories_only() {
-        let listed = tempfile::tempdir().unwrap();
-        let empty = tempfile::tempdir().unwrap();
-        let tool = listed.path().join("secret-tool");
-        std::fs::write(&tool, b"").unwrap();
-        let listed_dir = listed.path().to_str().unwrap();
-        let empty_dir = empty.path().to_str().unwrap();
-        assert_eq!(host_key::trusted_tool(&[empty_dir]), None);
-        assert_eq!(host_key::trusted_tool(&[empty_dir, listed_dir]), Some(tool));
+    fn the_linux_client_key_is_one_secret_service_item() {
+        use bep::secret_items::{Cause, Items as _, MemoryItems};
+
+        let items = MemoryItems::default();
+        assert_eq!(host_key::find_in(&items).unwrap(), None);
+        let key = ClientKey::generate().unwrap();
+        let secret = URL_SAFE_NO_PAD.encode(key.secret().as_slice());
+        host_key::store_in(&items, "replaced").unwrap();
+        host_key::store_in(&items, &secret).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items
+                .attribute_values(&[("service", "dev.minimal.client-key")], "account")
+                .unwrap(),
+            vec!["minimal"]
+        );
+        let held = host_key::find_in(&items).unwrap().unwrap();
+        assert_eq!(HostClientKeyStore::decode(&held).unwrap().kid(), key.kid());
+        // An item written with a line end holds the same key.
+        let line = Zeroizing::new(format!("{secret}\n").into_bytes());
+        assert_eq!(HostClientKeyStore::decode(&line).unwrap().kid(), key.kid());
+
+        items.set_locked(true);
+        assert_eq!(
+            host_key::find_in(&items),
+            Err(ClientKeyError::Store(
+                "Secret Service lists the item, and it is locked".into()
+            ))
+        );
+        assert_eq!(
+            host_key::store_in(&items, &secret),
+            Err(ClientKeyError::Store(
+                "the default collection is locked".into()
+            ))
+        );
+        items.set_locked(false);
+        items.set_failure(Some(Cause::NoAnswer(Duration::from_secs(60))));
+        assert_eq!(
+            host_key::find_in(&items),
+            Err(ClientKeyError::Store(
+                "Secret Service did not answer in 60 s".into()
+            ))
+        );
     }
 
     // BEP-063: a key the keychain refuses this program is replaced, kept for

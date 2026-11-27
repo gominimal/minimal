@@ -225,6 +225,33 @@ minimal-cli:
 minimald-build:
     cargo build -p minimald --locked
 
+# `bep` links a D-Bus client for Secret Service behind its `secret-service`
+# feature. `min` and the `bep` binary need it. A daemon that depends on `bep`
+# with the feature on carries the client into the guest. Cargo resolves the
+# Linux graph on any host, so this runs on macOS too.
+# CI: none. Run it after a change to bep's features or to a `bep` dependency.
+#
+# Prove that `min` and `bep` link the Secret Service client and the daemons do not.
+secret-service-links:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    links() {
+        cargo tree --locked --target {{musl-target}} -e normal -p "$1" -i secret-service >/dev/null 2>&1
+    }
+    for package in minimald minvmd; do
+        if links "$package"; then
+            echo "$package links secret-service: set default-features = false on its bep dependency"
+            exit 1
+        fi
+    done
+    for package in minimal bep; do
+        if ! links "$package"; then
+            echo "$package does not link secret-service, and it reads Secret Service on Linux"
+            exit 1
+        fi
+    done
+    echo "secret-service: linked by minimal and bep, not by minimald or minvmd"
+
 # THE single build entrypoint for a shippable build: the four release binaries
 # for a target triple, built exactly the way release.yml's build jobs build
 # them (they call this same script), plus completions from the built `min`.

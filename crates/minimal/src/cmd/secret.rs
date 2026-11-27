@@ -732,11 +732,6 @@ pub(crate) fn run_set_with_rule(
             "min secret set stored nothing: the value is empty. Run the command again and give a value."
         );
     }
-    // Before the rule is written, so a value the store cannot keep whole
-    // changes nothing.
-    store
-        .check_value(&value)
-        .context("min secret set stored nothing")?;
     let snapshot = match &mut write {
         None => None,
         Some((path, rule, line, notice)) => {
@@ -1387,9 +1382,6 @@ mod tests {
         fn place(&self) -> String {
             "Secret Service".to_owned()
         }
-        fn check_value(&self, value: &[u8]) -> Result<(), StoreError> {
-            bep::store::check_secret_tool_value(value)
-        }
         fn binds_program(&self) -> bool {
             false
         }
@@ -1454,54 +1446,6 @@ mod tests {
         let mut out = Vec::new();
         run_list(&store, &StoreRules::new(), Err(&missing), &mut out).unwrap();
         assert_eq!(out, b"No secrets in Secret Service.\n");
-    }
-
-    // On Linux, `set` refuses a value that Secret Service would refuse or
-    // keep cut short through `secret-tool`, after the read and before the
-    // rule or the item is written, so nothing changes.
-    #[test]
-    fn secret_set_refuses_a_value_secret_tool_cannot_keep() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, EXISTING).unwrap();
-        let store = UserWideStore::default();
-        let cases: [(Vec<u8>, &str); 2] = [
-            (
-                vec![b'a'; bep::store::SECRET_TOOL_MAX_VALUE + 1],
-                "min secret set stored nothing: On Linux, `min secret` stores a value in \
-                 Secret Service through `secret-tool`, which keeps at most 8192 bytes, and \
-                 this value is 8193 bytes. Give a value of 8192 bytes or fewer.",
-            ),
-            (
-                b"\xff\x00\xfe".to_vec(),
-                "min secret set stored nothing: On Linux, `min secret` stores a value in \
-                 Secret Service through `secret-tool`, which keeps only UTF-8 text, and this \
-                 value is not valid UTF-8. Give the value as UTF-8 text.",
-            ),
-        ];
-        for (value, want) in cases {
-            let mut out = Vec::new();
-            let err = run_set_with_rule(
-                &store,
-                &set_args(&["linear", "--preset", "linear", "--yes"]),
-                Path::new(""),
-                ValueSource::Stdin,
-                &mut no_terminal,
-                &mut &value[..],
-                &mut out,
-                Some(RuleTarget {
-                    path: &path,
-                    confirm: &mut no_confirm,
-                    notice: &mut std::io::sink(),
-                    control: None,
-                }),
-            )
-            .expect_err("refused");
-            assert_eq!(format!("{err:#}"), want);
-            assert!(out.is_empty());
-            assert!(store.0.value("linear").is_none());
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), EXISTING);
-        }
     }
 
     #[test]

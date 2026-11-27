@@ -7,6 +7,28 @@ edition.workspace = true
 publish.workspace = true
 license.workspace = true
 
+[features]
+default = ["secret-service"]
+# The Secret Service client on Linux (`secret_items`), with the proxy's key
+# store and the native secret store over it. `min` and the `bep` binary use
+# it. A crate that takes only the modules and the forwarding types, as the
+# guest's `minimald` does, turns it off and links no D-Bus client.
+secret-service = ["dep:secret-service", "dep:zbus", "dep:zruntime"]
+
+[[bin]]
+name = "bep"
+path = "src/main.rs"
+required-features = ["secret-service"]
+
+# These two start the `bep` binary.
+[[test]]
+name = "linux_custody"
+required-features = ["secret-service"]
+
+[[test]]
+name = "linux_custody_tpm_integration"
+required-features = ["secret-service"]
+
 [dependencies]
 aes-gcm.workspace = true
 base64.workspace = true
@@ -37,6 +59,16 @@ tokio-util = { workspace = true, features = ["io-util"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+# Secret Service over D-Bus (`secret_items`).
+# rt-default: zbus runs on its own executor, which the crate's blocking
+# interface drives, so no tokio runtime is involved.
+# crypto-rust: the encrypted session that Secret Service providers offer
+# (dh-ietf1024-sha256-aes128-cbc-pkcs7), with no OpenSSL.
+[target.'cfg(target_os = "linux")'.dependencies]
+secret-service = { version = "6.0.0", optional = true, default-features = false, features = ["rt-default", "crypto-rust"] }
+zbus = { version = "6", optional = true, default-features = false, features = ["default-rt"] }
+zruntime = { version = "0.2", optional = true, default-features = false, features = ["helper"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"

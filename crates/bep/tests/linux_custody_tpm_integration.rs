@@ -52,7 +52,7 @@ const NO_TPM: &str = "device:/nonexistent/tpmrm0";
 const NO_STORE: &str = "The proxy did not start: this host has no usable TPM and no unlocked Secret Service keyring, so the proxy has nowhere to keep its keys.";
 
 /// One host for `bep`: a home directory, and a `PATH` that holds the TPM
-/// wrappers and a `secret-tool` with no session bus.
+/// wrappers, and a session bus address that nothing listens on.
 struct Host {
     dir: TempDir,
 }
@@ -67,11 +67,6 @@ impl Host {
             fs::create_dir_all(dir).expect("mkdir");
         }
         host.set_tcti(tcti);
-        // The words GDBus prints when a session has no bus.
-        script(
-            &host.bin().join("secret-tool"),
-            "printf '%s\\n' 'Cannot autolaunch D-Bus without X11 $DISPLAY' >&2\nexit 1\n",
-        );
         let state = host.tcti_file();
         for entry in fs::read_dir(tools).expect("read the tpm2-tools directory") {
             let name = entry.expect("entry").file_name();
@@ -139,6 +134,8 @@ impl Host {
             .env("HOME", self.home())
             .env("XDG_CONFIG_HOME", self.config())
             .env("PATH", self.bin())
+            // No Secret Service answers, as on a headless host.
+            .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent/bus")
             .env("RUST_LOG", "info");
         if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
             cmd.env("XDG_RUNTIME_DIR", runtime);

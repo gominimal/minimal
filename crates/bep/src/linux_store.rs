@@ -17,7 +17,7 @@ use zeroize::Zeroizing;
 use crate::ca::CaKey;
 use crate::keys::{HeldKey, KeyError, KeyStore, Role, Slot, StoreReach, UnreadStore, missing_in};
 use crate::seal::ProxyPublicKey;
-use crate::secret_service::{SECRET_TOOL, SecretService, SecretServiceKey};
+use crate::secret_service::{SecretService, SecretServiceKey};
 use crate::tpm::{TpmKey, TpmStore};
 
 /// The log name of the TPM store.
@@ -135,8 +135,9 @@ impl<T: KeyStore, S: KeyStore> LinuxStore<T, S> {
     /// The answer of a Secret Service lookup, or `None` when Secret
     /// Service did not answer. That store is then marked unread. A locked
     /// keyring and a Secret Service that this session cannot reach did
-    /// not answer. Any other error means a keyring answered and can hold
-    /// the key, so it is returned and the start stops.
+    /// not answer. Any other error means a keyring is there and can hold
+    /// the key, so it is returned and the start stops. A Secret Service
+    /// that did not answer in time is one of these.
     fn secret_service_answer<V>(
         &self,
         role: Role,
@@ -145,7 +146,7 @@ impl<T: KeyStore, S: KeyStore> LinuxStore<T, S> {
         let unread = match &answer {
             Ok(_) => return answer.map(Some),
             Err(KeyError::Locked { .. }) => UnreadStore::SecretServiceLocked,
-            Err(err) if secret_service_is_absent(err) => UnreadStore::SecretServiceUnreachable,
+            Err(KeyError::Unreachable { .. }) => UnreadStore::SecretServiceUnreachable,
             Err(err) => {
                 tracing::warn!(role = %role, store = SECRET_SERVICE, error = %err, "Secret Service failed a proxy key lookup");
                 return answer.map(Some);
@@ -183,19 +184,6 @@ impl<T: KeyStore, S: KeyStore> LinuxStore<T, S> {
             }
             answer => Ok(self.secret_service_answer(role, answer)?.unwrap_or(false)),
         }
-    }
-}
-
-/// Whether `err` says that this session has no Secret Service: it cannot
-/// reach one, or `secret-tool` is not installed. Such a host is the
-/// headless host that BEP-088 starts on its TPM.
-fn secret_service_is_absent(err: &KeyError) -> bool {
-    match err {
-        KeyError::Unreachable { .. } => true,
-        KeyError::Store { detail, .. } => {
-            detail.starts_with(&format!("`{SECRET_TOOL}` is not installed"))
-        }
-        _ => false,
     }
 }
 
@@ -329,7 +317,6 @@ mod tests {
     const LOCKED: u8 = 1;
     const UNREACHABLE: u8 = 2;
     const FAILED: u8 = 3;
-    const NOT_INSTALLED: u8 = 4;
 
     /// A memory store that can stop answering, as a locked or unreachable
     /// Secret Service does.
@@ -350,10 +337,6 @@ mod tests {
                 LOCKED => Err(KeyError::Locked { role, detail }),
                 UNREACHABLE => Err(KeyError::Unreachable { role, detail }),
                 FAILED => Err(KeyError::Store { role, detail }),
-                NOT_INSTALLED => Err(KeyError::Store {
-                    role,
-                    detail: format!("`{SECRET_TOOL}` is not installed. Install it"),
-                }),
                 _ => Ok(()),
             }
         }
@@ -441,12 +424,10 @@ mod tests {
 
         // A host with no Secret Service in this session still starts on
         // its TPM.
-        for state in [UNREACHABLE, NOT_INSTALLED] {
-            let headless = store();
-            headless.secret_service.set(state);
-            let keys = load(&headless, &[]).expect("a first start");
-            assert_eq!(stores(&keys), [TPM; 3]);
-        }
+        let headless = store();
+        headless.secret_service.set(UNREACHABLE);
+        let keys = load(&headless, &[]).expect("a first start");
+        assert_eq!(stores(&keys), [TPM; 3]);
     }
 
     // BEP-090: the trait names the store each key is in, so the published
