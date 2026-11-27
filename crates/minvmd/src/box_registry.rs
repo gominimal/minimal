@@ -9892,6 +9892,22 @@ impl BoxTable {
             .shrink_reply_cap(addr, cap);
     }
 
+    /// Shrinks the kernel's refusal-note table of the row at `addr` to `cap`
+    /// notes, `per_client` from one client
+    /// ([`KernelConfig::shrink_notes_cap`]).
+    #[cfg(test)]
+    pub(crate) fn kernel_shrink_notes_cap_for_tests(
+        &self,
+        addr: [u8; 4],
+        cap: usize,
+        per_client: usize,
+    ) {
+        self.kernel
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .shrink_notes_cap(addr, cap, per_client);
+    }
+
     /// Shrinks the kernel's DNS flow table of the row at `addr` to `cap`
     /// flows ([`KernelConfig::shrink_dns_flow_cap`]).
     #[cfg(test)]
@@ -9915,7 +9931,7 @@ impl BoxTable {
     }
 
     /// Records a frame toward a guest in the kernel's tables of the box it
-    /// is for, beside the daemon's own record, under the configuration's
+    /// is for, under the configuration's
     /// read lock with that box's tables locked inside it. Decides nothing,
     /// and records nothing past a poisoned lock ([`recordable`]).
     #[cfg(test)]
@@ -9951,8 +9967,8 @@ impl BoxTable {
     }
 
     /// Records a DNS question a guest sent in the kernel's DNS table its
-    /// source is routed to, beside the daemon's own, when that table is the
-    /// one of the registry records the frame was decided for (`asked`,
+    /// source is routed to, when that table is the one of the registry
+    /// records the frame was decided for (`asked`,
     /// [`KernelConfig::asks_for`]), under the same read lock: a question is
     /// never recorded in the table of another row at the address, and that
     /// refusal is [`NotRecorded::NotDecidedFor`]. Decides nothing.
@@ -9999,8 +10015,8 @@ impl BoxTable {
     }
 
     /// Offers a DNS answer delivered toward `dst` to the kernel's DNS
-    /// tables, beside the daemon's own. Decides nothing, and records nothing
-    /// past a poisoned lock ([`recordable`]).
+    /// tables. Decides nothing, and records nothing past a poisoned lock
+    /// ([`recordable`]).
     #[cfg(test)]
     pub(crate) fn kernel_answer(
         &self,

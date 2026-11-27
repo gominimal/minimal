@@ -372,8 +372,17 @@ impl NodePlaneBaseline {
         &self.entries
     }
 
-    /// The compiled rules the host-side gate decides node-plane frames by.
+    /// The set's entries compiled into frame rules, keyed to the resolver and
+    /// the node's address.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no product code reads the compiled set: the network kernel's adoption of \
+                      the baseline takes its names and blocks itself"
+        )
+    )]
     pub(crate) fn rules(&self) -> &EgressRules {
         &self.rules
     }

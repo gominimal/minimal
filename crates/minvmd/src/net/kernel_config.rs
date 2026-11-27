@@ -1667,7 +1667,7 @@ impl KernelConfig {
     }
 
     /// Records a frame toward a guest in the kernel's tables of the box it is
-    /// for, as `finish_ingress` does, beside the daemon's own record: the
+    /// for, as `finish_ingress` does: the
     /// tables chosen by the kernel's own reading (`ingress_first`). `None`
     /// when no box's tables take it, or their lock was poisoned. Decides
     /// nothing.
@@ -1919,7 +1919,7 @@ impl KernelConfig {
     }
 
     /// Offers a DNS answer delivered toward `dst` at `port` to the kernel's
-    /// DNS tables, as `answer::answer` takes it, beside the daemon's own: a
+    /// DNS tables, as `answer::answer` takes it: a
     /// row's table for a row's address; at the node's address while its
     /// baseline is in force, the node's table first and then the cohort's.
     /// Each table is offered the asked name under its position in its own
