@@ -241,6 +241,7 @@ impl Items for SessionItems {
 
     fn clear(&self, attributes: &[(&str, &str)]) -> Result<usize, Cause> {
         let attributes = owned(attributes);
+        let timeout = self.timeout;
         self.run(async |ss| {
             let found = ss.search_items(borrowed(&attributes)).await.map_err(sort)?;
             // A delete of a locked item answers with a prompt to unlock it.
@@ -250,7 +251,11 @@ impl Items for SessionItems {
             let matching = found.unlocked.len();
             for (removed, item) in found.unlocked.iter().enumerate() {
                 if let Err(err) = item.delete().await {
-                    let cause = sort_sent(err);
+                    let cause = match sort_sent(err) {
+                        // The time that the method had, for the text below.
+                        Cause::NoAnswer(_) => Cause::NoAnswer(timeout),
+                        cause => cause,
+                    };
                     // A refusal of the first delete removed nothing.
                     return Err(if removed == 0 {
                         cause
