@@ -15,8 +15,9 @@ is not available inside a sandbox. The helper comes in these forms:
   [`mip run`](./cli-mip.md#run) runs, on Linux only. It has fewer commands.
 
 In a box, run `min --help` to print the helper's commands, and add `--help`
-to a command to print its usage. The `mip run` helper has no top-level `--help`. Run
-`min` there with no arguments: it prints its commands on stderr and exits 1.
+to a command to print its usage. The `mip run` helper has no top-level
+`--help`. Run `min` there with no arguments: it prints its commands on
+stderr and exits 1.
 
 | Command | Box helper | `mip run` helper |
 |---------|------------|------------------|
