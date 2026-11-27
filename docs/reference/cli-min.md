@@ -1012,8 +1012,15 @@ both with the bundle.
 
 After an upgrade, the box-name service on this host can be the one that an
 earlier release installed. When it speaks an older protocol than this
-release's daemon, it refuses the daemon. The hostname proxy then serves box
-names, and the host line ends with `; finish setup: min finalize-install`.
+release's daemon, it refuses the daemon. A box that already exists stays
+reachable through the hostname proxy, and its host line ends with
+`; finish setup: min finalize-install`. A new box in a VM does not start,
+because the service gives it no address. The start fails with this reason:
+
+```text
+Minimal's DNS service on this machine is from an older release and does not work with this version of Minimal, so this box cannot be given an address; run `min finalize-install` to replace the service, then start the box again
+```
+
 `min finalize-install --show` lists the names item as missing and gives the
 reason, `the installed DNS service speaks protocol <installed>, not this daemon's <daemon>`.
 The next `min finalize-install` replaces the service with this release's

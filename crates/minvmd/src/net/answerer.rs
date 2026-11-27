@@ -2107,10 +2107,9 @@ fn serve_registration(
     let node = match parse_hello(&hello) {
         Ok(hello) if hello.version == CHANNEL_PROTOCOL_VERSION => hello.node,
         Ok(hello) => {
-            let reply = RegistrationReply::refused(format!(
-                "this answerer speaks channel protocol {CHANNEL_PROTOCOL_VERSION}; the \
-                 node said {}",
-                hello.version
+            let reply = RegistrationReply::refused(protocol_refusal(
+                CHANNEL_PROTOCOL_VERSION,
+                hello.version,
             ));
             if let Err(error) = write_reply(&mut stream, &reply) {
                 tracing::debug!(component = COMPONENT, %error, "channel hello reply failed");
@@ -2973,6 +2972,49 @@ const NO_ANSWERER: &str = "the running VM cannot reach Minimal's DNS service for
                            to check the service's setup, or see minvmd.log for the cause (`min \
                            dirs` shows where logs are kept)";
 
+/// Why a box cannot be handed an address while the installed DNS service
+/// speaks an older channel protocol than this daemon and refuses its hello.
+/// `min finalize-install` replaces that service with this release's copy.
+const OLDER_ANSWERER: &str = "Minimal's DNS service on this machine is from an older release \
+                              and does not work with this version of Minimal, so this box cannot \
+                              be given an address; run `min finalize-install` to replace the \
+                              service, then start the box again";
+
+/// The start of the reason an answerer gives when it refuses a hello for
+/// its protocol version. Answerers from earlier releases send this text, so
+/// it must not change.
+const PROTOCOL_REFUSAL_PREFIX: &str = "this answerer speaks channel protocol ";
+
+/// The reason an answerer that speaks protocol `speaks` gives a node whose
+/// hello said `said`.
+fn protocol_refusal(speaks: u32, said: u32) -> String {
+    format!("{PROTOCOL_REFUSAL_PREFIX}{speaks}; the node said {said}")
+}
+
+/// The protocol version the answerer speaks, when `error` is its refusal
+/// of this daemon's hello for the version the hello said.
+fn refusing_answerer_protocol(error: &io::Error) -> Option<u32> {
+    if error.kind() != io::ErrorKind::PermissionDenied {
+        return None;
+    }
+    let reason = error.to_string();
+    let (speaks, _) = reason
+        .strip_prefix(PROTOCOL_REFUSAL_PREFIX)?
+        .split_once(';')?;
+    speaks.parse().ok()
+}
+
+/// Why a box cannot be handed an address after the installed service's
+/// channel answered a connect with `error`: [`OLDER_ANSWERER`] when the
+/// service refused the hello and speaks an older protocol, and
+/// [`NO_ANSWERER`] for every other cause.
+fn no_installed_answerer(error: &io::Error) -> &'static str {
+    match refusing_answerer_protocol(error) {
+        Some(speaks) if speaks < CHANNEL_PROTOCOL_VERSION => OLDER_ANSWERER,
+        _ => NO_ANSWERER,
+    }
+}
+
 /// The answer to a release or a cancel: whether it changed anything, and
 /// a sentence saying what the daemon did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3680,7 +3722,7 @@ fn acquire(
                         paths.global.display()
                     ),
                 );
-                wait_refusing(&pings, &commands, retry, NO_ANSWERER);
+                wait_refusing(&pings, &commands, retry, no_installed_answerer(&error));
                 retry = (retry * 2).min(PORT_RECHECK);
                 continue;
             }
@@ -6070,10 +6112,11 @@ mod tests {
                      said {previous}"
                 )
                 .as_str()
-            )
+            ),
+            "answerers from earlier releases send this text, and a node reads it"
         );
         assert_eq!(
-            read_reply_line(&mut stream).ok().flatten(),
+            read_reply_line(&mut stream).expect("the read ends before its bound"),
             None,
             "the answerer closes the connection after the refusal"
         );
@@ -6086,6 +6129,97 @@ mod tests {
         handle
             .join()
             .expect("the channel's thread ends when its stop is set");
+    }
+
+    /// The installed service is from an older release: it refuses this
+    /// daemon's hello for its protocol version. A box that asks for an
+    /// address is then told to run `min finalize-install`, and every other
+    /// refusal keeps the general reason.
+    #[test]
+    fn an_older_installed_service_names_finalize_install_in_the_address_refusal() {
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
+        let channel = dir.path().join(CHANNEL_SOCK_FILE);
+        private_test_dir(&channel);
+        let marker = dir.path().join("install-marker");
+        std::fs::write(&marker, b"").expect("the install marker writes");
+        let listener = UnixListener::bind(&channel).expect("the service's channel binds");
+        // The reply a 0.7 service gives, as that release wrote it.
+        let previous = CHANNEL_PROTOCOL_VERSION - 1;
+        let refusal = format!(
+            "{{\"ok\":false,\"error\":\"this answerer speaks channel protocol {previous}; the \
+             node said {CHANNEL_PROTOCOL_VERSION}\"}}\n"
+        );
+        std::thread::Builder::new()
+            .name("test-zone-older-service".to_string())
+            .spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    let mut partial = Vec::new();
+                    if read_line_resumable(&mut stream, &mut partial).is_ok() {
+                        let _sent = stream.write_all(refusal.as_bytes());
+                    }
+                }
+            })
+            .expect("the older service's thread spawns");
+
+        let probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("the probe binds loopback");
+        let port = probe.local_addr().expect("the probe names its port").port();
+        drop(probe);
+        let (registry, _) = web_registry();
+        let status = AnswererStatus::starting();
+        let daemon_status = status.clone();
+        let paths = ChannelPaths {
+            global: channel,
+            interim: dir.path().join("no-interim-channel.sock"),
+            marker,
+            release_window: RELEASE_WINDOW,
+        };
+        std::thread::Builder::new()
+            .name("test-zone-newer-daemon".to_string())
+            .spawn(move || acquire(registry, port, &paths, "vm-new", &daemon_status))
+            .expect("the daemon's thread spawns");
+
+        assert_eq!(
+            await_status(
+                || status.get(),
+                "the daemon never said the service refused it"
+            ),
+            ZoneAnswererStatus::PortHeldNoChannel { port },
+        );
+        let refused = status
+            .allocate("web")
+            .expect_err("no address without an answerer");
+        assert_eq!(refused, OLDER_ANSWERER);
+        assert!(
+            refused.contains("run `min finalize-install` to replace the service"),
+            "{refused}"
+        );
+
+        // A service that speaks a newer protocol, a refusal for another
+        // cause, and a channel that never answered keep the general reason.
+        let denied = |reason: String| io::Error::new(io::ErrorKind::PermissionDenied, reason);
+        assert_eq!(
+            no_installed_answerer(&denied(protocol_refusal(
+                previous,
+                CHANNEL_PROTOCOL_VERSION
+            ))),
+            OLDER_ANSWERER
+        );
+        assert_eq!(
+            no_installed_answerer(&denied(protocol_refusal(
+                CHANNEL_PROTOCOL_VERSION + 1,
+                CHANNEL_PROTOCOL_VERSION
+            ))),
+            NO_ANSWERER
+        );
+        assert_eq!(
+            no_installed_answerer(&denied("this channel refuses every hello".to_string())),
+            NO_ANSWERER
+        );
+        assert_eq!(
+            no_installed_answerer(&io::Error::from(io::ErrorKind::TimedOut)),
+            NO_ANSWERER
+        );
     }
 
     #[test]
