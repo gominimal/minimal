@@ -66,6 +66,11 @@ const BOOT_NARRATION: &str = "Starting the Minimal VM (first run only, ~1 min)â€
 /// refusal.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn boot_failure_error(stderr: &str) -> io::Error {
+    // A newer build wrote the box state: the refusal is the whole error.
+    // A retry meets the same refusal, so no retry advice follows it.
+    if let Some(refusal) = state_refusal(stderr) {
+        return io::Error::other(refusal);
+    }
     if stderr.contains(bep::UNREADABLE_AUDIT_LOG_REFUSAL) {
         return io::Error::other(format!(
             "the Minimal VM (minvmd) failed to start: {}\n\
@@ -79,6 +84,15 @@ fn boot_failure_error(stderr: &str) -> io::Error {
          if it keeps failing, run `min bug` to collect a diagnostic bundle.",
         stderr.trim()
     ))
+}
+
+/// The refusal of a newer box state in a daemon's `stderr`, from its first
+/// word to the end of its line. minvmd and the native minimald both print it.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn state_refusal(stderr: &str) -> Option<String> {
+    let at = stderr.rfind(boxes::store::NEWER_STATE_FORMAT_LEAD)?;
+    let line = stderr[at..].lines().next()?;
+    Some(line.trim_end().to_owned())
 }
 
 /// What a failed VM start adds when the VM provider is the default only
@@ -519,6 +533,9 @@ fn ensure_minimald_running(socket_path: &Path, minimal_dir: Option<&Path>) -> io
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        if let Some(refusal) = state_refusal(&stderr) {
+            return Err(boot_failure_error(&refusal));
+        }
         return Err(io::Error::other(format!(
             "minimald run --detach failed: {stderr}"
         )));
@@ -595,6 +612,29 @@ mod tests {
             msg.ends_with(&format!("\n{VM_CHOSEN_BY_KVM_NOTE}")),
             "the note is its own last line: {msg}"
         );
+    }
+
+    /// A daemon that refuses a newer box state: min prints the refusal as
+    /// the error, from the VM and from the native minimald alike, with no
+    /// retry advice.
+    #[test]
+    fn boot_failure_error_for_a_state_refusal() {
+        let refusal = format!(
+            "{}/home/u/.local/state/minimal. That state has format version 2. This min reads \
+             format version 1 or older, and it changed nothing. Install the newer min, then \
+             run your command again.",
+            boxes::store::NEWER_STATE_FORMAT_LEAD
+        );
+        let vm = format!("{refusal} That state is on the data volume /h/data.ext4.");
+        for (stderr, want) in [
+            (format!("Error: {vm}\n"), vm.as_str()),
+            (format!("{refusal}\n"), refusal.as_str()),
+        ] {
+            let msg = boot_failure_error(&stderr).to_string();
+            assert_eq!(msg, want);
+            assert!(!msg.contains("Re-run"), "{msg}");
+            assert!(!msg.contains("min bug"), "{msg}");
+        }
     }
 
     #[test]

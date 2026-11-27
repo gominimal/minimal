@@ -943,7 +943,10 @@ mod beacon_tests {
 
         let mut reader = Cursor::new(b"STATE_REFUSED\n".as_ref());
         let beacon = read_ready_beacon(&mut reader, &tmp.path().join("known_hosts")).unwrap();
-        assert!(matches!(beacon, BootBeacon::StateRefused { .. }), "{beacon:?}");
+        assert!(
+            matches!(beacon, BootBeacon::StateRefused { .. }),
+            "{beacon:?}"
+        );
     }
 
     #[test]
