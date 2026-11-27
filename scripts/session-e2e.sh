@@ -732,6 +732,49 @@ export XDG_RUNTIME_DIR="$WORK/runtime"
 mkdir -p "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME"
 chmod 700 "$XDG_RUNTIME_DIR"
 
+# On Linux `min secret` and `bep serve` keep secrets in Secret Service. A
+# headless lane has none in its session, so where none answers and the
+# tools are installed, the run starts a session bus and an unlocked
+# gnome-keyring of its own, before any daemon starts, so the daemons it
+# spawns inherit DBUS_SESSION_BUS_ADDRESS. The keyring's files live in
+# E2E_SS_KEYRING_DIR, apart from the user's own keyrings. They outlive the
+# run because the proxy's keys do: `bep serve` publishes them under
+# ~/.minimal/bep, and refuses to start when the key store no longer holds
+# them. Where a tool is missing, E2E_SS_MISSING names it: installing one
+# needs a workflow change, so the store cases are NOT RUN there
+# (bep_linux_secret_service).
+E2E_SS_BUS_PID="" E2E_SS_MISSING=""
+E2E_SS_KEYRING_DIR="${E2E_SS_KEYRING_DIR:-$HOME/.local/share/minimal-e2e-keyring}"
+e2e_ss_probe() {
+  local rc=0 err
+  err="$(timeout 10 secret-tool lookup dev.minimal.e2e-probe absent </dev/null 2>&1 >/dev/null)" || rc=$?
+  [ -z "$err" ] && { [ "$rc" = 0 ] || [ "$rc" = 1 ]; }
+}
+e2e_provide_secret_service() {
+  local tool out
+  [ "$(uname -s)" = Linux ] || return 0
+  for tool in secret-tool gnome-keyring-daemon dbus-daemon; do
+    command -v "$tool" >/dev/null 2>&1 || E2E_SS_MISSING="$E2E_SS_MISSING $tool"
+  done
+  E2E_SS_MISSING="${E2E_SS_MISSING# }"
+  if command -v secret-tool >/dev/null 2>&1 && e2e_ss_probe; then
+    E2E_SS_MISSING=""
+    return 0
+  fi
+  [ -z "$E2E_SS_MISSING" ] || return 0
+  out="$(dbus-daemon --session --fork --print-address=1 --print-pid=1)" || {
+    echo "session-e2e: dbus-daemon did not start a session bus for Secret Service"
+    return 0
+  }
+  export DBUS_SESSION_BUS_ADDRESS="${out%%$'\n'*}"
+  E2E_SS_BUS_PID="${out##*$'\n'}"
+  mkdir -p "$E2E_SS_KEYRING_DIR"
+  printf 'e2e\n' | XDG_DATA_HOME="$E2E_SS_KEYRING_DIR" \
+    gnome-keyring-daemon --unlock --components=secrets >/dev/null 2>&1 || true
+  echo "session-e2e: started a session bus and an unlocked gnome-keyring for Secret Service (bus pid $E2E_SS_BUS_PID)"
+}
+e2e_provide_secret_service
+
 # The native Linux lane drives the daemon directly (minimald), whose own-IP
 # boxes need the gvproxy switch it spawns for their taps. A bare checkout
 # ships none, and the native lane's CI invocation (ci-linux-native.yml)
@@ -1199,6 +1242,11 @@ teardown() {
   fi
   if [ -n "$NRV_CONN_PID" ]; then
     kill "$NRV_CONN_PID" 2>/dev/null || true
+  fi
+  # The session bus this run started for Secret Service. Its keyring
+  # daemon exits when the bus goes.
+  if [ -n "$E2E_SS_BUS_PID" ]; then
+    kill "$E2E_SS_BUS_PID" 2>/dev/null || true
   fi
   [ -n "$NRV_SEED_A_DIR" ] && rm -rf "$NRV_SEED_A_DIR"
   [ -n "$NRV_SEED_B_DIR" ] && rm -rf "$NRV_SEED_B_DIR"
@@ -14379,42 +14427,53 @@ bep_linux_key_store() {
   fi
 }
 # Returns 0 when Secret Service answers secret-tool in this session. Else
-# prints why not and returns 1. The probe looks up an attribute no item
-# carries: exit 1 with no error output is a keyring that answered with no
-# match.
+# prints why not, and returns 1 when a tool it needs is not installed
+# (E2E_SS_MISSING), or 2 when the tools are installed and Secret Service
+# does not answer, with the one e2e_provide_secret_service started or the
+# one that answered when the run began: a failure, not a lane gap. The probe looks up an attribute no item carries:
+# exit 1 with no error output is a keyring that answered with no match.
 bep_linux_secret_service() {
   local ss_err ss_rc=0
-  if ! command -v secret-tool >/dev/null 2>&1; then
-    echo "no secret-tool for Secret Service"
+  if [ -n "$E2E_SS_MISSING" ]; then
+    echo "no Secret Service: $E2E_SS_MISSING not installed on this host, and installing it on a CI lane needs a workflow change"
     return 1
   fi
   ss_err="$(timeout 10 secret-tool lookup dev.minimal.e2e-probe absent </dev/null 2>&1 >/dev/null)" || ss_rc=$?
   if [ -z "$ss_err" ] && { [ "$ss_rc" = 0 ] || [ "$ss_rc" = 1 ]; }; then
     return 0
   fi
-  echo "Secret Service did not answer secret-tool (exit $ss_rc${ss_err:+: ${ss_err%%$'\n'*}})"
-  return 1
+  echo "Secret Service did not answer secret-tool (exit $ss_rc${ss_err:+: ${ss_err%%$'\n'*}})${E2E_SS_BUS_PID:+, though this run started a session bus (pid $E2E_SS_BUS_PID) and an unlocked gnome-keyring for it}"
+  return 2
 }
 # `min secret` stores values in the macOS Keychain on macOS and in Secret
 # Service on Linux. Returns 0 where that store answers. Else prints why not
-# and returns 1: on a Linux host where Secret Service does not answer, and on
-# any other host.
+# and returns 1 where the lane cannot provide it (a tool not installed, or a
+# host that is neither), or 2 where Secret Service is installed and still
+# does not answer.
 bep_native_store() {
-  local ns_why
+  local ns_why ns_rc=0
   case "$(uname -s)" in
     Darwin) return 0 ;;
     Linux)
-      ns_why="$(bep_linux_secret_service)" && return 0
+      ns_why="$(bep_linux_secret_service)" || ns_rc=$?
+      [ "$ns_rc" = 0 ] && return 0
       echo "'min secret' stores secrets in Secret Service on Linux, and $ns_why"
+      return "$ns_rc"
       ;;
     *) echo "'min secret' has no secret store on $(uname -s)" ;;
   esac
   return 1
 }
-# Records case $1 as NOT RUN and returns 1 where bep_native_store fails.
+# Returns 0 where bep_native_store answers. Records case $1 as NOT RUN and
+# returns 1 where the lane cannot provide the store, and fails the run where
+# the store is installed and still does not answer.
 bep_native_store_gate() {
-  local ng_why
-  ng_why="$(bep_native_store)" && return 0
+  local ng_why ng_rc=0
+  ng_why="$(bep_native_store)" || ng_rc=$?
+  case "$ng_rc" in
+    0) return 0 ;;
+    2) echo "::error::$1: $ng_why"; fail ;;
+  esac
   not_run "$1" "$ng_why"
   return 1
 }
@@ -16509,7 +16568,7 @@ proof_bep_dns_steering_through_the_box_zone_resolver() {
   # shellcheck disable=SC2031
   local bz_control="$HOME/.minimal/bep/control.sock"
   local bz_header=X-Minimal-E2E-Probe bz_header_lc=x-minimal-e2e-probe
-  local bz_host bz_id bz_value bz_out bz_got bz_want bz_ans bz_try bz_status bz_store_why
+  local bz_host bz_id bz_value bz_out bz_got bz_want bz_ans bz_try bz_status bz_store_why bz_store_rc
   local bz_summary=""
   bz_host="${bz_url#https://}"
   bz_host="${bz_host%%/*}"
@@ -16651,7 +16710,12 @@ print(rcode, an, addr)' "$dq_b64"
   # request carries the stored value.
   # Where `min secret` has no store that answers (bep_native_store), the leg
   # is NOT RUN and the fail_closed leg checks the git box alone.
-  if ! bz_store_why="$(bep_native_store)"; then
+  bz_store_rc=0
+  bz_store_why="$(bep_native_store)" || bz_store_rc=$?
+  if [ "$bz_store_rc" = 2 ]; then
+    echo "::error::$bz_case/store: $bz_store_why"
+    bz_fail
+  elif [ "$bz_store_rc" != 0 ]; then
     bz_not_run store "$bz_store_why"
   else
     bz_id="e2e-dns-store-$(date +%s)-$$"
