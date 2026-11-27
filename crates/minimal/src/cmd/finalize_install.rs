@@ -679,7 +679,8 @@ const NAMES_LABEL: &str =
 
 /// The names item from its verdict: done, missing with the facts the
 /// advisory names and the step that installs them, or blocked by the
-/// note's cause.
+/// note's cause. `port` is the answerer port the daemons report; a step
+/// that installs the DNS service uses the service's port instead.
 pub(crate) fn names_item(verdict: crate::resolver::NamesVerdict, port: u16) -> Item {
     use crate::resolver::NamesVerdict;
     match verdict {
@@ -693,6 +694,15 @@ pub(crate) fn names_item(verdict: crate::resolver::NamesVerdict, port: u16) -> I
         ),
         NamesVerdict::Missing { facts, install } => {
             let zone = crate::resolver::ZONE;
+            // A script that installs the DNS service points the resolver at
+            // the port the service's units bind, whatever port a daemon
+            // reported: a daemon pinned to another port hands its names to
+            // the service once it runs.
+            let port = if install.is_some() {
+                minvmd::net::answerer::DEFAULT_ANSWERER_PORT
+            } else {
+                port
+            };
             // The range clause closes the macOS list, so the service
             // clause joins with a comma there and with "and" on Linux,
             // where it is the last one.
@@ -3152,7 +3162,10 @@ mod tests {
 
     /// The names item's facts are a list in the summary and one line in
     /// the JSON, which carries no layout; a carried service step joins the
-    /// step text as this platform's list reads.
+    /// step text as this platform's list reads. A step that installs the
+    /// DNS service names the service's port, 7656, and its script points
+    /// the resolver there, whatever port the daemon reported (a pinned
+    /// answerer's, here 15353).
     #[test]
     fn names_item_lists_its_facts_in_the_summary_only() {
         use crate::resolver::{AnswererInstall, NamesVerdict};
@@ -3179,17 +3192,20 @@ mod tests {
         let step = item.step.as_deref().unwrap();
         if cfg!(target_os = "macos") {
             assert!(
-                step.contains(
-                    "on 127.0.0.1:15353, installs that service, and reserves the box IPs"
-                ),
+                step.contains("on 127.0.0.1:7656, installs that service, and reserves the box IPs"),
                 "{step}"
             );
         } else {
             assert!(
-                step.ends_with("on 127.0.0.1:15353 at every boot and installs that service"),
+                step.ends_with("on 127.0.0.1:7656 at every boot and installs that service"),
                 "{step}"
             );
         }
+        let script = item.script.as_deref().unwrap();
+        assert!(
+            script.contains("127.0.0.1:7656") && !script.contains("15353"),
+            "{script}"
+        );
         let plan = Plan { items: vec![item] };
         let summary = plan.summary();
         assert!(

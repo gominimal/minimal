@@ -7164,8 +7164,9 @@ impl BoxRegistry {
         // The node's own listeners now include its hostname proxy port, so
         // the mirror leaves it out, a port it held before included
         // (NET-138: a node listener is never mirrored).
-        self.node_mirror
-            .set_node_own(&crate::control::guest_infrastructure_ports(self));
+        let own =
+            crate::control::guest_infrastructure_ports(self, crate::net::answerer::hook_port());
+        self.node_mirror.set_node_own(&own);
         Ok(node)
     }
 
@@ -8012,7 +8013,8 @@ impl BoxRegistry {
     /// no caller can reach a bind without that check.
     pub fn mirror_notice(&self, notice: minimald_rpc::ListenNotice) -> MirrorOutcome {
         // NET-138: the node's own listeners are never mirrored.
-        let infrastructure = crate::control::guest_infrastructure_ports(self);
+        let infrastructure =
+            crate::control::guest_infrastructure_ports(self, crate::net::answerer::hook_port());
         self.node_mirror
             .notice(notice, &infrastructure, Instant::now())
     }
@@ -15268,7 +15270,7 @@ mod tests {
 
         // A notice for the node's own listeners binds nothing: the hostname
         // proxy and the in-VM daemon's own sockets.
-        for port in [proxy, crate::net::answerer::DEFAULT_ANSWERER_PORT] {
+        for port in [proxy, crate::net::answerer::hook_port()] {
             assert_eq!(
                 registry.mirror_notice(listening(port)),
                 MirrorOutcome::RefusedInfrastructure,
@@ -15294,8 +15296,9 @@ mod tests {
             binder.calls()
         );
         assert!(
-            !binder.calls().iter().any(|(call, _, port)| *call == "bind"
-                && *port == crate::net::answerer::DEFAULT_ANSWERER_PORT),
+            !binder.calls().iter().any(
+                |(call, _, port)| *call == "bind" && *port == crate::net::answerer::hook_port()
+            ),
             "the in-VM daemon's socket is never bound"
         );
     }

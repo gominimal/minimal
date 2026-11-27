@@ -130,13 +130,17 @@ pub(crate) const BASELINE_ENDPOINT: &str = "a node-plane baseline endpoint at ho
 ///
 /// - the hostname proxy at each port in `hostname_proxy`: the node row's
 ///   assigned port, an operator's pin or a drawn fallback;
-/// - the box-name answerer at the port each VM-backed node reserves for it;
+/// - the box-name answerer at each port an answerer of this node's box
+///   names may be bound at, given the hook port `answerer`
+///   ([`crate::net::answerer::answerer_host_ports`]: the pin and the
+///   default);
 /// - the node-local Box Egress Proxy at its listener's port;
 /// - the node-plane baseline endpoints at `baseline_alias_ports`, over the
 ///   protocol the baseline fetches with.
 #[must_use]
 pub(crate) fn minimal_listeners(
     hostname_proxy: &[u16],
+    answerer: u16,
     baseline_alias_ports: &[PortRange],
     baseline_protocol: u8,
 ) -> Vec<Holder> {
@@ -148,12 +152,13 @@ pub(crate) fn minimal_listeners(
             name: HOSTNAME_PROXY,
         })
         .collect();
-    let answerer = crate::net::answerer::DEFAULT_ANSWERER_PORT;
-    held.push(Holder {
-        ports: (answerer, answerer),
-        protocol: None,
-        name: ANSWERER,
-    });
+    for port in crate::net::answerer::answerer_host_ports(answerer) {
+        held.push(Holder {
+            ports: (port, port),
+            protocol: None,
+            name: ANSWERER,
+        });
+    }
     let proxy = switch::bep_host::PROXY_PORT;
     held.push(Holder {
         ports: (proxy, proxy),
@@ -471,6 +476,28 @@ mod tests {
 
     fn exposures_of(entries: &[super::Entry]) -> Vec<HostExposure> {
         entries.iter().map(|entry| entry.exposure).collect()
+    }
+
+    /// NET-162: the box-name answerer holds its pinned hook port at the
+    /// alias, and the default beside it, which the DNS service binds
+    /// whatever the pin is. With the hook port at the default it holds the
+    /// default alone, so a host exposure on a port no pin names is not
+    /// refused as the answerer's.
+    #[test]
+    fn answerer_listeners_follow_the_hook_port() {
+        let answerer_ports = |hook: u16| -> Vec<u16> {
+            super::minimal_listeners(&[], hook, &[], 6)
+                .into_iter()
+                .filter(|holder| holder.name == super::ANSWERER)
+                .map(|holder| {
+                    assert_eq!(holder.ports.0, holder.ports.1, "one port per holder");
+                    holder.ports.0
+                })
+                .collect()
+        };
+        let default = crate::net::answerer::DEFAULT_ANSWERER_PORT;
+        assert_eq!(answerer_ports(17_656), vec![default, 17_656]);
+        assert_eq!(answerer_ports(default), vec![default]);
     }
 
     /// NET-159: the host exposures come from the `[host-exposures]` table of

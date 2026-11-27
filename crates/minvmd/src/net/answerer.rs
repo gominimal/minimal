@@ -101,6 +101,7 @@ use boxes::core::zone_answer::{self, ZoneRow, ZoneView};
 use switch::loopback::RangeProbe;
 
 use crate::box_registry::{BoxRegistry, canonical_box_name, is_host_answerable};
+use crate::cmd::PortPinRefusal;
 
 /// The `component` field every answerer log line carries — the same one the
 /// native daemon's answerer logs under, because it is the same zone service
@@ -119,6 +120,117 @@ const COMPONENT: &str = "zone-answerer";
 /// OS-assigned port no resolver would be told about (the guest's handed
 /// answerer port — which the guest now binds nothing on — still is).
 pub const DEFAULT_ANSWERER_PORT: u16 = 7656;
+
+/// The environment variable the operator pins this daemon's answerer hook
+/// port with, read by `minvmd run` when it starts: the VM-backed
+/// counterpart of `minimald run --zone-answerer-port`. It is an env var
+/// beside `MINVMD_NODE_PROXY_PORT` because the supervisor's ports are set
+/// that way, not by `minvmd config set` (which holds the VM's sizing).
+/// Unset is [`DEFAULT_ANSWERER_PORT`]. As on the native daemon there is no
+/// select-when-busy and no off, so `0` is refused rather than read as "any
+/// port". A pin moves only the bind this daemon makes when it answers box
+/// names itself, and adds the pin to the ports Minimal's own listener sets
+/// hold ([`answerer_host_ports`]). An installed DNS service keeps its own
+/// port, and a daemon that finds a channel publishes there whatever its
+/// pin.
+pub const ANSWERER_PORT_ENV: &str = "MINVMD_ZONE_ANSWERER_PORT";
+
+/// The hook port this process resolved at start ([`configure_hook_port`]).
+static HOOK_PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+
+/// The message a value of [`ANSWERER_PORT_ENV`] that is not a port fails
+/// the start with: the value as the environment holds it, what is wrong
+/// with it, and the next step.
+fn hook_port_refusal(shown: impl std::fmt::Debug, refusal: PortPinRefusal) -> String {
+    let what = match refusal {
+        PortPinRefusal::NotAPort => "a port",
+        PortPinRefusal::Zero => "a port minvmd can answer box names on",
+    };
+    format!(
+        "{ANSWERER_PORT_ENV} is set to {shown:?}, which is not {what}. Set it to a port from 1 \
+         to 65535, or unset it to use {DEFAULT_ANSWERER_PORT}."
+    )
+}
+
+/// Decodes the answerer's hook port from the raw value of
+/// [`ANSWERER_PORT_ENV`], with the decode `MINVMD_NODE_PROXY_PORT` shares
+/// (`crate::cmd::port_pin_from_raw`): absent is [`DEFAULT_ANSWERER_PORT`],
+/// and a value that is not a port from 1 to 65535 is an error naming the
+/// variable and the value.
+///
+/// # Errors
+///
+/// Returns the message to fail the start with when `raw` is not a port.
+pub fn hook_port_from_raw(raw: Option<&str>) -> Result<u16, String> {
+    match crate::cmd::port_pin_from_raw(raw) {
+        Ok(port) => Ok(port.unwrap_or(DEFAULT_ANSWERER_PORT)),
+        Err(refusal) => Err(hook_port_refusal(raw.unwrap_or_default(), refusal)),
+    }
+}
+
+/// [`hook_port_from_raw`] for the variable as the environment holds it. A
+/// value that is not Unicode is an error like any other value that is not a
+/// port: only an absent variable selects [`DEFAULT_ANSWERER_PORT`].
+///
+/// # Errors
+///
+/// Returns the message to fail the start with when `raw` is not a port.
+pub fn hook_port_from_os(raw: Option<&std::ffi::OsStr>) -> Result<u16, String> {
+    match raw {
+        None => hook_port_from_raw(None),
+        Some(raw) => match raw.to_str() {
+            Some(text) => hook_port_from_raw(Some(text)),
+            None => Err(hook_port_refusal(raw, PortPinRefusal::NotAPort)),
+        },
+    }
+}
+
+/// Resolves the answerer's hook port from this process's environment and
+/// records it as the one every reader in this process uses
+/// ([`hook_port`]). The supervisor calls it once, before anything reads
+/// the port: the proxy draw that skips it, the answerer's bind, and the
+/// listener sets that refuse it. A second call keeps the port the first
+/// one recorded.
+///
+/// # Errors
+///
+/// Returns the message to fail the start with when the variable is set to
+/// something that is not a port.
+pub fn configure_hook_port() -> Result<u16, String> {
+    let resolved = hook_port_from_os(std::env::var_os(ANSWERER_PORT_ENV).as_deref())?;
+    let port = *HOOK_PORT.get_or_init(|| resolved);
+    if port != DEFAULT_ANSWERER_PORT {
+        tracing::info!(
+            component = COMPONENT,
+            port,
+            env = ANSWERER_PORT_ENV,
+            "the zone answerer's hook port is pinned by the environment"
+        );
+    }
+    Ok(port)
+}
+
+/// The answerer's hook port in this process: the port
+/// [`configure_hook_port`] resolved, or [`DEFAULT_ANSWERER_PORT`] in a
+/// process that never resolved one (the unit tests, and the CLI that links
+/// this crate).
+#[must_use]
+pub fn hook_port() -> u16 {
+    HOOK_PORT.get().copied().unwrap_or(DEFAULT_ANSWERER_PORT)
+}
+
+/// The host ports an answerer of this node's box names may be bound at,
+/// given this daemon's hook port `hook`: `hook`, which this daemon binds
+/// when it answers box names itself, and [`DEFAULT_ANSWERER_PORT`], which
+/// the installed DNS service binds whatever `hook` is (its socket unit
+/// names the port) and a native `minimald` binds unless told otherwise.
+/// Minimal's own listener sets (the proxy draw's reserved ports, the
+/// guest-infrastructure ports and the listeners a host exposure may not
+/// open) hold every one of them, so a pin adds a port to those sets and
+/// takes none out. One port when `hook` is the default.
+pub fn answerer_host_ports(hook: u16) -> impl Iterator<Item = u16> {
+    std::iter::once(DEFAULT_ANSWERER_PORT).chain((hook != DEFAULT_ANSWERER_PORT).then_some(hook))
+}
 
 /// The interim answerer channel socket's file name inside a state dir's
 /// host dir. Deliberately beside [`crate::control`]'s
@@ -2938,9 +3050,21 @@ fn hook_port_holder(port: u16) -> Option<(u32, String)> {
     }
 }
 
+/// The command that stops the VM named `vm`: `minvmd stop` for the
+/// default VM, `minvmd --vm <vm> stop` for a named one.
+fn stop_command(vm: &str) -> String {
+    if vm == paths::DEFAULT_VM_NAME {
+        "minvmd stop".to_string()
+    } else {
+        format!("minvmd --vm {vm} stop")
+    }
+}
+
 /// The error a node with no answerer channel and the hook port held
 /// surfaces, and every box registration fails with: the port, the holder
-/// when known, and the remedy for its kind.
+/// when known, and the remedy for its kind. A native `minimald` holder has
+/// two: the DNS service (`min finalize-install`), or a restart with
+/// [`ANSWERER_PORT_ENV`] set to another port.
 fn channelless_holder_error(port: u16, holder: Option<(u32, String)>) -> String {
     let native = holder.as_ref().is_some_and(|(_, exe)| {
         Path::new(exe)
@@ -2952,11 +3076,13 @@ fn channelless_holder_error(port: u16, holder: Option<(u32, String)>) -> String 
         |(pid, exe)| format!("pid {pid} ({exe})"),
     );
     if native {
+        let stop = stop_command(crate::state::vm_name());
         format!(
             "port 127.0.0.1:{port}, which box names are answered on, is in use by a Minimal \
-             daemon running directly on this machine ({who}), so no box in the VM can be given \
-             an address; run `min finalize-install` to install Minimal's DNS service on that \
-             port instead"
+             daemon running directly on this machine ({who}). No box in the VM can be given an \
+             address while that daemon holds the port. Run `min finalize-install` to install \
+             Minimal's DNS service, or stop this VM with `{stop}` and start it again with \
+             {ANSWERER_PORT_ENV} set to a free port."
         )
     } else {
         format!(
@@ -3332,13 +3458,16 @@ fn acquire_loop(registry: BoxRegistry, port: u16, status: AnswererStatus) {
         marker: resolve_install_marker(),
         release_window: RELEASE_WINDOW,
     };
-    acquire(registry, port, &paths, &node_id(), &status);
+    acquire(
+        registry,
+        port,
+        DEFAULT_ANSWERER_PORT,
+        &paths,
+        &node_id(),
+        &status,
+    );
 }
 
-/// The acquisition over one channel, for the tests that drive it on a
-/// temporary channel: `channel` is the interim's, and no service is
-/// installed (the marker and the global channel are paths nothing holds),
-/// so the decision is the interim's publish-or-host alone.
 /// Makes the dir a test's interim channel sits in mode 0700, the per-user
 /// run dir's mode [`prepare_interim_dir`] requires.
 #[cfg(test)]
@@ -3349,6 +3478,12 @@ fn private_test_dir(sock: &Path) {
     }
 }
 
+/// The acquisition over one channel, for the tests that drive it on a
+/// temporary channel: `channel` is the interim's, and no service is
+/// installed (the marker and the global channel are paths nothing holds),
+/// so the decision is the interim's publish-or-host alone. A service the
+/// test runs behind `channel` binds `port` itself, so `port` is also the
+/// service's port.
 #[cfg(test)]
 fn acquire_loop_at(registry: BoxRegistry, port: u16, channel: PathBuf, status: AnswererStatus) {
     // The interim's dir must be the operator's alone; a test's temp dir is
@@ -3361,7 +3496,14 @@ fn acquire_loop_at(registry: BoxRegistry, port: u16, channel: PathBuf, status: A
         interim: channel,
         release_window: RELEASE_WINDOW,
     };
-    acquire(registry, port, &paths, crate::state::vm_name(), &status);
+    acquire(
+        registry,
+        port,
+        port,
+        &paths,
+        crate::state::vm_name(),
+        &status,
+    );
 }
 
 /// [`acquire_loop_at`] as the node `node`, for the tests that run two
@@ -3381,7 +3523,7 @@ fn acquire_loop_as(
         interim: channel,
         release_window: RELEASE_WINDOW,
     };
-    acquire(registry, port, &paths, node, &status);
+    acquire(registry, port, port, &paths, node, &status);
 }
 
 /// What woke the acquisition's wait ([`wait_for_wake`]): a table change (a
@@ -3566,9 +3708,16 @@ fn warn_refused(node: &str, refused: Vec<RefusedRow>) {
 /// moment the answerer's end of the connection closes it reconnects with
 /// backoff and re-publishes, so a service restart is a short absence
 /// window and never a session restart.
+///
+/// `port` is this daemon's hook port, the one it binds when it hosts the
+/// answerer; `service_port` is the one the installed service binds
+/// ([`DEFAULT_ANSWERER_PORT`] in production, whatever `port` is). The
+/// status names the port of the answerer that holds this table's rows:
+/// `service_port` once the service took them, `port` otherwise.
 fn acquire(
     registry: BoxRegistry,
     port: u16,
+    service_port: u16,
     paths: &ChannelPaths,
     node: &str,
     status: &AnswererStatus,
@@ -3593,8 +3742,9 @@ fn acquire(
     // answering, doubling to the re-check cadence.
     let mut retry = CHANNEL_RETRY;
     // The status a held connection reports: which answerer took the rows,
-    // as the last publish's hello ack named it.
+    // as the last publish's hello ack named it, and the port it answers on.
     let mut held_status = ZoneAnswererStatus::Registered { port };
+    let mut held_port = port;
     loop {
         // ── the publish arm, a held connection: re-publish the whole
         // table, idempotent. A send that fails is the connection's end —
@@ -3611,14 +3761,14 @@ fn acquire(
                         &commands,
                         registration,
                         status,
-                        port,
+                        held_port,
                         &mut erroring,
                     );
                 }
                 Err(error) => {
                     surface_error(
                         status,
-                        port,
+                        held_port,
                         &mut erroring,
                         &format!("the answerer channel connection failed: {error}"),
                     );
@@ -3649,29 +3799,31 @@ fn acquire(
             Ok(published) => {
                 retry = CHANNEL_RETRY;
                 erroring = false;
-                held_status = registered_status(&published.holder, port);
+                held_port = holder_port(&published.holder, port, service_port);
+                held_status = registered_status(&published.holder, held_port);
                 status.set(held_status.clone());
                 warn_refused(node, published.refused);
                 if !published_once {
                     published_once = true;
-                    announce_publish(&published.holder, port, channel, node);
+                    announce_publish(&published.holder, held_port, channel, node);
                 }
                 held = wait_out_wake(
                     &mut pings,
                     &commands,
                     published.registration,
                     status,
-                    port,
+                    held_port,
                     &mut erroring,
                 );
                 continue;
             }
             // The service is installed and its channel did not answer: an
-            // error, never a reason to host.
+            // error, never a reason to host. The port held with nothing
+            // answering is the service's, not this daemon's pin.
             Err(error) if installed => {
                 surface_error(
                     status,
-                    port,
+                    service_port,
                     &mut erroring,
                     &format!(
                         "the answerer service is installed ({}) but its channel {} did not \
@@ -3731,7 +3883,8 @@ fn acquire(
                     while pings.try_recv().is_ok() {}
                     erroring = false;
                     retry = CHANNEL_RETRY;
-                    held_status = registered_status(&published.holder, port);
+                    held_port = holder_port(&published.holder, port, service_port);
+                    held_status = registered_status(&published.holder, held_port);
                     status.set(held_status.clone());
                     warn_refused(node, published.refused);
                     held = wait_out_wake(
@@ -3739,7 +3892,7 @@ fn acquire(
                         &commands,
                         published.registration,
                         status,
-                        port,
+                        held_port,
                         &mut erroring,
                     );
                 }
@@ -3767,12 +3920,13 @@ fn acquire(
                     Ok((published, queued)) => {
                         retry = CHANNEL_RETRY;
                         erroring = false;
-                        held_status = registered_status(&published.holder, port);
+                        held_port = holder_port(&published.holder, port, service_port);
+                        held_status = registered_status(&published.holder, held_port);
                         status.set(held_status.clone());
                         warn_refused(node, published.refused);
                         if !published_once {
                             published_once = true;
-                            announce_publish(&published.holder, port, &paths.interim, node);
+                            announce_publish(&published.holder, held_port, &paths.interim, node);
                         }
                         let mut registration = published.registration;
                         let mut alive = true;
@@ -3786,7 +3940,7 @@ fn acquire(
                         if !alive {
                             surface_error(
                                 status,
-                                port,
+                                held_port,
                                 &mut erroring,
                                 "the answerer channel failed while serving a box address \
                                  request",
@@ -3798,7 +3952,7 @@ fn acquire(
                             &commands,
                             registration,
                             status,
-                            port,
+                            held_port,
                             &mut erroring,
                         );
                     }
@@ -3890,9 +4044,24 @@ fn await_holder_channel(
     }
 }
 
+/// The port the answerer a publish reached answers on, by the holder its
+/// hello ack named: the installed service's `service_port`, which its
+/// socket unit names whatever this daemon's pin is, or, for another VM
+/// host daemon hosting the interim, this daemon's own `port`. The ack
+/// carries no port, so an interim holder pinned to another port is
+/// reported at this daemon's.
+fn holder_port(holder: &str, port: u16, service_port: u16) -> u16 {
+    if holder == SERVICE_HOLDER {
+        service_port
+    } else {
+        port
+    }
+}
+
 /// The status a node that published its rows reports, by the holder its
 /// hello ack named: the manager-held service, or another VM host daemon
-/// hosting the single-operator interim.
+/// hosting the single-operator interim. `port` is the holder's
+/// ([`holder_port`]).
 fn registered_status(holder: &str, port: u16) -> ZoneAnswererStatus {
     if holder == SERVICE_HOLDER {
         ZoneAnswererStatus::ManagerHeld { port }
@@ -6635,6 +6804,268 @@ mod tests {
         }
     }
 
+    /// With `MINVMD_ZONE_ANSWERER_PORT` unset the hook port is the
+    /// documented default, and a process that never resolved one (this
+    /// test binary) reads the default too.
+    #[test]
+    fn hook_port_is_the_default_when_unpinned() {
+        assert_eq!(hook_port_from_raw(None), Ok(DEFAULT_ANSWERER_PORT));
+        assert_eq!(DEFAULT_ANSWERER_PORT, 7656, "the documented default");
+        assert_eq!(
+            hook_port(),
+            DEFAULT_ANSWERER_PORT,
+            "a process that resolved no pin reads the default"
+        );
+    }
+
+    /// A pin is the port the answerer binds, read as written (surrounding
+    /// whitespace aside), at either end of the port range.
+    #[test]
+    fn hook_port_takes_the_operators_pin() {
+        assert_eq!(hook_port_from_raw(Some("17656")), Ok(17656));
+        assert_eq!(hook_port_from_raw(Some(" 17656\n")), Ok(17656));
+        assert_eq!(hook_port_from_raw(Some("1")), Ok(1));
+        assert_eq!(hook_port_from_raw(Some("65535")), Ok(65535));
+        assert_eq!(
+            hook_port_from_raw(Some("7656")),
+            Ok(DEFAULT_ANSWERER_PORT),
+            "pinning the default is the default"
+        );
+    }
+
+    /// A value that is not a port fails the start with a message naming the
+    /// variable and the value, `0` included: there is no "off" and no
+    /// OS-picked answerer port. Each message is short sentences, and ends
+    /// with the next step.
+    #[test]
+    fn hook_port_refuses_a_value_that_is_not_a_port() {
+        for raw in ["no-port-here", "", "65536", "-1", "7656x", "0"] {
+            let err =
+                hook_port_from_raw(Some(raw)).expect_err("a value that is not a port is refused");
+            assert!(
+                err.contains(ANSWERER_PORT_ENV) && err.contains(&format!("{raw:?}")),
+                "the refusal names the variable and the value {raw:?}, got: {err}"
+            );
+            assert!(
+                err.ends_with(". Set it to a port from 1 to 65535, or unset it to use 7656."),
+                "the refusal ends with the next step, got: {err}"
+            );
+        }
+        assert_eq!(
+            hook_port_from_raw(Some("abc")).expect_err("a word is refused"),
+            "MINVMD_ZONE_ANSWERER_PORT is set to \"abc\", which is not a port. Set it to a port \
+             from 1 to 65535, or unset it to use 7656."
+        );
+        assert_eq!(
+            hook_port_from_raw(Some("0")).expect_err("0 is refused"),
+            "MINVMD_ZONE_ANSWERER_PORT is set to \"0\", which is not a port minvmd can answer \
+             box names on. Set it to a port from 1 to 65535, or unset it to use 7656."
+        );
+    }
+
+    /// A value that is not Unicode is refused like any other value that is
+    /// not a port, in the same words, with the variable named. It never
+    /// falls back to the default: only an absent variable does.
+    #[cfg(unix)]
+    #[test]
+    fn hook_port_refuses_a_value_that_is_not_unicode() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let raw = OsStr::from_bytes(b"76\xff56");
+        let err = hook_port_from_os(Some(raw)).expect_err("a value that is not Unicode is refused");
+        assert!(
+            err.starts_with("MINVMD_ZONE_ANSWERER_PORT is set to \"76")
+                && err.ends_with(
+                    "56\", which is not a port. Set it to a port from 1 to 65535, or unset it \
+                     to use 7656."
+                ),
+            "the refusal names the variable and ends with the next step, got: {err}"
+        );
+        assert_eq!(hook_port_from_os(None), Ok(DEFAULT_ANSWERER_PORT));
+        assert_eq!(hook_port_from_os(Some(OsStr::new("17656"))), Ok(17656));
+    }
+
+    /// The ports an answerer of this node's names may be bound at are the
+    /// pin and the default beside it, which the DNS service binds whatever
+    /// the pin is; with no pin, the default alone.
+    #[test]
+    fn answerer_host_ports_are_the_pin_and_the_default() {
+        assert_eq!(
+            answerer_host_ports(17_656).collect::<Vec<_>>(),
+            vec![DEFAULT_ANSWERER_PORT, 17_656]
+        );
+        assert_eq!(
+            answerer_host_ports(DEFAULT_ANSWERER_PORT).collect::<Vec<_>>(),
+            vec![DEFAULT_ANSWERER_PORT]
+        );
+    }
+
+    /// A daemon pinned off the service's port that publishes to the
+    /// installed service reports the service's port, not its pin: the
+    /// service binds the port its socket unit names whatever the pin is, so
+    /// `min ls` names, and the names check asks, the port that answers. The
+    /// acquisition runs as `run` starts it with the service installed: the
+    /// marker present, the publish over the machine-global channel.
+    #[test]
+    fn a_pinned_daemon_reports_the_services_port() {
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
+        let (service_port, channel, listener, channel_listener) = service_sockets(&dir);
+        let (stop, _handle) = start_service(listener, channel_listener);
+        // The service's listener holds its port while the pin is drawn, so
+        // the two differ.
+        let pin = free_port();
+        assert_ne!(pin, service_port, "the pin differs from the service's port");
+        private_test_dir(&channel);
+        let marker = dir.path().join("installed.marker");
+        std::fs::write(&marker, b"").expect("the marker is written");
+        let paths = ChannelPaths {
+            global: channel,
+            interim: dir.path().join("no-interim.sock"),
+            marker,
+            release_window: RELEASE_WINDOW,
+        };
+        let (registry, web) = web_registry();
+        let status = AnswererStatus::starting();
+        let probe = status.clone();
+        std::thread::Builder::new()
+            .name("test-zone-pinned-client".to_string())
+            .spawn(move || acquire(registry, pin, service_port, &paths, "node-pinned", &status))
+            .expect("the daemon's thread spawns");
+
+        assert_eq!(
+            await_status(
+                || probe.get(),
+                "the pinned daemon never said what the machine's answerer is"
+            ),
+            ZoneAnswererStatus::ManagerHeld { port: service_port },
+            "a pinned daemon that publishes to the service reports the service's port"
+        );
+        let reply = await_answer(
+            || query(service_port, "web.min.internal.", RecordType::A),
+            "the pinned daemon's name never answered through the service",
+        );
+        assert_eq!(
+            a_answer(&reply),
+            web,
+            "the name answers at the service's port"
+        );
+        stop.store(true, Ordering::SeqCst);
+    }
+
+    /// A pinned daemon whose installed service's channel does not answer
+    /// names the service's port as held with nothing answering, not its
+    /// pin: the CLI reads that state at the service's port as the service
+    /// failing, and offers its reinstall.
+    #[test]
+    fn a_pinned_daemon_names_the_services_port_when_its_channel_fails() {
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channels");
+        let paths = test_paths(&dir, RELEASE_WINDOW);
+        drop(UnixListener::bind(&paths.global).expect("the refusing socket binds"));
+        std::fs::write(&paths.marker, b"").expect("the marker is written");
+        let pin = free_port();
+        assert_ne!(pin, DEFAULT_ANSWERER_PORT, "the pin is off the default");
+        let (registry, _) = web_registry();
+        let status = AnswererStatus::starting();
+        let probe = status.clone();
+        std::thread::Builder::new()
+            .name("test-zone-pinned-refused".to_string())
+            .spawn(move || {
+                acquire(
+                    registry,
+                    pin,
+                    DEFAULT_ANSWERER_PORT,
+                    &paths,
+                    "node-pinned",
+                    &status,
+                );
+            })
+            .expect("the daemon's thread spawns");
+        await_status_is(
+            &probe,
+            ZoneAnswererStatus::PortHeldNoChannel {
+                port: DEFAULT_ANSWERER_PORT,
+            },
+            "a pinned daemon named its pin for the installed service's failure",
+        );
+    }
+
+    /// Two answerers on different pinned hook ports both bind and both
+    /// answer — the shape of a VM host daemon pinned off the default beside
+    /// another answerer that holds its own port with its own channel (a
+    /// native daemon's, say). Each acquisition runs exactly as `run` starts
+    /// it, over its own interim channel, and each reports holding its own
+    /// port and answers its own box's name there.
+    #[test]
+    fn two_answerers_on_different_pinned_ports_both_hold() {
+        // Both probes are held until both ports are read, so the OS cannot
+        // hand the same port twice.
+        let a_probe_sock =
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("the first probe binds loopback");
+        let b_probe_sock =
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("the second probe binds loopback");
+        let a_port = a_probe_sock
+            .local_addr()
+            .expect("the probe names its port")
+            .port();
+        let b_port = b_probe_sock
+            .local_addr()
+            .expect("the probe names its port")
+            .port();
+        drop((a_probe_sock, b_probe_sock));
+        assert_ne!(a_port, b_port, "the two pins differ");
+
+        let a_dir = tempfile::TempDir::new().expect("a temp dir for the first channel");
+        let b_dir = tempfile::TempDir::new().expect("a temp dir for the second channel");
+        let (a_registry, a_web) = named_box_registry("web-a", 9);
+        let (b_registry, b_web) = named_box_registry("web-b", 10);
+        let a_status = AnswererStatus::starting();
+        let a_probe = a_status.clone();
+        let a_channel = a_dir.path().join(CHANNEL_SOCK_FILE);
+        std::thread::Builder::new()
+            .name("test-zone-pinned-a".to_string())
+            .spawn(move || acquire_loop_at(a_registry, a_port, a_channel, a_status))
+            .expect("the first daemon's thread spawns");
+        let b_status = AnswererStatus::starting();
+        let b_probe = b_status.clone();
+        let b_channel = b_dir.path().join(CHANNEL_SOCK_FILE);
+        std::thread::Builder::new()
+            .name("test-zone-pinned-b".to_string())
+            .spawn(move || acquire_loop_at(b_registry, b_port, b_channel, b_status))
+            .expect("the second daemon's thread spawns");
+
+        assert_eq!(
+            await_status(
+                || a_probe.get(),
+                "the first daemon never said what the machine's answerer is"
+            ),
+            ZoneAnswererStatus::Holder { port: a_port },
+            "the first daemon holds its own pinned port"
+        );
+        assert_eq!(
+            await_status(
+                || b_probe.get(),
+                "the second daemon never said what the machine's answerer is"
+            ),
+            ZoneAnswererStatus::Holder { port: b_port },
+            "the second daemon holds its own pinned port"
+        );
+        let reply = await_answer(
+            || query(a_port, "web-a.min.internal.", RecordType::A),
+            "the first daemon's pinned port never answered",
+        );
+        assert_eq!(a_answer(&reply), a_web, "the first pin answers its own box");
+        let reply = await_answer(
+            || query(b_port, "web-b.min.internal.", RecordType::A),
+            "the second daemon's pinned port never answered",
+        );
+        assert_eq!(
+            a_answer(&reply),
+            b_web,
+            "the second pin answers its own box"
+        );
+    }
+
     /// The channel paths a test acquisition decides over, all in `dir`: the
     /// service's global channel, the interim's, and the install marker —
     /// none of them created here.
@@ -6666,7 +7097,7 @@ mod tests {
         let node = node.to_string();
         std::thread::Builder::new()
             .name("test-zone-daemon".to_string())
-            .spawn(move || acquire(registry, port, &paths, &node, &status))
+            .spawn(move || acquire(registry, port, port, &paths, &node, &status))
             .expect("the daemon's thread spawns");
         probe
     }
@@ -7546,13 +7977,22 @@ mod tests {
             refused.contains("free the port, then try again"),
             "the error gives the remedy: {refused}"
         );
-        // The native remedy, for a minimald holder.
+        // The native remedies, for a minimald holder: the DNS service, or a
+        // pin. The text names no port for the service, which binds its own.
         let native = channelless_holder_error(port, Some((42, "/usr/bin/minimald".to_string())));
-        assert!(
-            native.contains("run `min finalize-install` to install Minimal's DNS service")
-                && native.contains("pid 42"),
-            "{native}"
+        assert_eq!(
+            native,
+            format!(
+                "port 127.0.0.1:{port}, which box names are answered on, is in use by a Minimal \
+                 daemon running directly on this machine (pid 42 (/usr/bin/minimald)). No box in \
+                 the VM can be given an address while that daemon holds the port. Run `min \
+                 finalize-install` to install Minimal's DNS service, or stop this VM with \
+                 `minvmd stop` and start it again with MINVMD_ZONE_ANSWERER_PORT set to a free \
+                 port."
+            )
         );
+        assert_eq!(stop_command("default"), "minvmd stop");
+        assert_eq!(stop_command("work"), "minvmd --vm work stop");
         drop(squatter);
     }
 
@@ -7666,7 +8106,7 @@ mod tests {
             .name("test-zone-daemon".to_string())
             .spawn(move || {
                 tracing::dispatcher::with_default(&dispatch, || {
-                    acquire(registry, port, &daemon_paths, "node-a", &status);
+                    acquire(registry, port, port, &daemon_paths, "node-a", &status);
                 });
             })
             .expect("the daemon's thread spawns");

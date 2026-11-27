@@ -157,6 +157,32 @@ where
         .filter(|value| *value > T::default())
 }
 
+/// Why an operator's port pin is refused ([`port_pin_from_raw`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PortPinRefusal {
+    /// The value is not a number from 0 to 65535.
+    NotAPort,
+    /// The value is 0, which names no port.
+    Zero,
+}
+
+/// Decodes the raw value of an environment variable an operator pins a
+/// port with: `None` (the variable is absent) is `Ok(None)`, a port from 1
+/// to 65535 is read with surrounding whitespace trimmed, and anything else
+/// is refused with the reason. The one decode `MINVMD_NODE_PROXY_PORT` and
+/// `MINVMD_ZONE_ANSWERER_PORT` share; each caller words its own refusal,
+/// because what an operator does instead differs between the two.
+pub(crate) fn port_pin_from_raw(raw: Option<&str>) -> Result<Option<u16>, PortPinRefusal> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match raw.trim().parse::<u16>() {
+        Ok(0) => Err(PortPinRefusal::Zero),
+        Ok(port) => Ok(Some(port)),
+        Err(_) => Err(PortPinRefusal::NotAPort),
+    }
+}
+
 /// The `MINVMD_VM_RAM_MIB` override as a positive value, if set and valid.
 pub(crate) fn env_ram_mib() -> Option<u32> {
     positive_env(VM_RAM_MIB_ENV)
