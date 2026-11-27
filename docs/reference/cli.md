@@ -1,77 +1,79 @@
 ---
 title: CLI Reference
-description: Overview of the Minimal command-line binaries (min, mip, minimald, and minvmd) and where each is documented.
+description: Overview of the Minimal command-line binaries (min, mip, minimald, and minvmd), with the page that documents each one.
 ---
 
 # CLI Reference
 
-Minimal's primary command-line tool is **`min`**, the session CLI: it creates,
-attaches to, and manages sandboxed development sessions. `min` talks to the
-`minimald` host daemon, which creates and supervises sessions. On macOS (and
-optionally on Linux), `minimald` runs inside a Linux microVM managed by the
-`minvmd` daemon.
+Minimal's main command-line tool is **`min`**, the session CLI. You use it to
+create sandboxed development boxes, attach to them and manage them. `min`
+talks to the `minimald` host daemon, which creates and supervises the boxes.
+On macOS, `minimald` always runs inside a Linux microVM that the `minvmd`
+daemon boots. On Linux, the provider decides whether it runs on the host or
+in that microVM, as [Platform availability](#platform-availability) says.
 
-Underneath, Minimal has a declarative package/build engine that evaluates
-`minimal.toml` plus Nickel files, builds packages in clean rooms, runs tasks in
-sandboxes, and manages a content-addressed artifact cache. Most users interact
-with it only through `min` and their `minimal.toml`. Advanced users on Linux can
-drive it directly with the **`mip`** CLI.
+Under `min` is a declarative package and build engine. It evaluates
+`minimal.toml` and the project's Nickel files, and it builds packages in
+clean rooms. It also runs tasks in sandboxes and keeps a content-addressed
+artifact cache. Most users reach the engine only through `min` and their
+`minimal.toml`. On Linux, you can also drive it directly with the **`mip`**
+CLI.
 
 ## Binaries
 
 | Binary | Role | Reference |
 |--------|------|-----------|
-| `min` | Session CLI: create, attach to, and manage sandboxed dev sessions | [min](./cli-min.md) |
-| `mip` | Package/build CLI (advanced, Linux-only): build packages, run tasks, manage the cache directly | [mip](./cli-mip.md) |
-| `minimald` | Host daemon: serves sessions to `min` over SSH-on-UDS | [minimald](./cli-minimald.md) |
+| `min` | Session CLI: create and attach to sandboxed dev boxes, and manage them | [min](./cli-min.md) |
+| `mip` | Package and build CLI (advanced, Linux only): build packages and run tasks directly, without the daemon | [mip](./cli-mip.md) |
+| `minimald` | Host daemon: serves boxes to `min` over SSH on a Unix domain socket | [minimald](./cli-minimald.md) |
 | `minvmd` | VM daemon: boots the Linux microVM that hosts `minimald` | [minvmd](./cli-minvmd.md) |
 
 ## Command naming convention {#command-naming-convention}
 
-Commands are spelled **`<noun> <verb>`**: `min box start`,
+A command has the form **`<noun> <verb>`**: `min box start`,
 `min session start`, `min loadout list`, `mip package build`. The noun names
-the thing being acted on; the verb names the action.
+the thing that the command acts on. The verb names the action.
 
-Three rules follow from that:
+The convention has these rules:
 
-1. **Every noun accepts its singular and plural form.** `box`/`boxes`, `session`/`sessions`,
-   `loadout`/`loadouts`, `package`/`packages` (which also keeps `pkg`). Both
-   spellings are visible in `--help`, so neither is a hidden alias you have to
-   know about.
-2. **Verbs are shared across nouns, not owned by one.** `list`, `stop`,
-   `build`, and friends mean the same thing wherever they appear, so
-   `<noun> list` is guessable for any noun that has a list.
-3. **New surface gets a noun.** Reach for an existing noun before inventing
-   one; a genuinely new kind of thing gets a new noun rather than a new bare
-   verb at the top level.
+1. **A noun for a kind of thing accepts the singular and the plural.** In
+   `min`, `box`/`boxes`, `session`/`sessions`, `task`/`tasks`,
+   `loadout`/`loadouts` and `secret`/`secrets` all work, and `--help` shows
+   both forms. In `mip`, `package` also accepts `packages` and `pkg`, which
+   `--help` does not show.
+2. **A verb means the same thing under every noun.** `list` lists and
+   `stop` stops, so you can guess `<noun> list` for any noun that lists.
+3. **New surface gets a noun.** Use an existing noun when one fits. A new
+   kind of thing gets a new noun. Do not add a bare verb at the top level
+   for it.
 
 ### Documented exceptions
 
-`min` with no arguments prints the top-level help.
+These top-level forms are intentional exceptions to the convention.
 
-A few high-traffic forms stay bare at the top level. These are deliberate
-ergonomic choices, not leftovers — do not "fix" them:
-
-| Form | Why it stays |
+| Form | What it does, and why it stays |
 |------|--------------|
-| `min ls` | The highest-traffic command keeps its bare form, with the `--raw` and `--json` flags that scripts read. It is not an alias of `min session list`, which is `min box list` limited to session boxes. |
-| `min init`, `min add`, `min update` | Passthroughs to the `mip` commands of the same name; keeping the spelling identical across the two CLIs beats the hierarchy. |
+| `min` | In a terminal, attaches to a session box of the project, or starts one from the current directory and attaches. Without a terminal, prints a read-only state report on stderr. [`min`](./cli-min.md) describes how it picks the box. `min --help` prints the help. |
+| `min ls` | The most-used command keeps its bare form, with the `--raw` and `--json` flags that scripts read. It is not an alias of `min session list`, which is `min box list` limited to session boxes. |
+| `min init`, `min add`, `min update` | Pass through to the `mip` commands of the same name. The same spelling in the two CLIs is more useful than the noun form. |
+| `min login` | The same as `min auth login`. |
+| `min bug` | The same as `min diag collect`. It keeps its name because bug reports ask for it. |
 
 ## Platform availability
 
-- **Linux**: installs ship `min`, `mip`, and `minimald`. `minimald` runs
-  natively by default; `min --provider local-minvmd` routes sessions through the `minvmd`
-  microVM instead, which needs a separately obtained `minvmd` binary (a
-  prebuilt Linux amd64 `minvmd` is attached to each GitHub Release; arm64
-  must build from source).
-- **macOS**: installs ship `min` and `minvmd` only. `minimald` always runs
-  inside the microVM, and the package/build plane runs there with it;
-  there is no native macOS `mip`.
-- `mip run` executes tasks in Linux sandboxes and is available on Linux
-  only.
+- **Linux**: the installer puts `min`, `mip`, `minimald` and `minvmd` on the
+  host, on amd64 and arm64. `min` runs `minimald` in the `minvmd` microVM when
+  `/dev/kvm` opens for you, and on the host when it does not. To choose,
+  use `--provider local` or `--provider local-minvmd`, the `MIN_PROVIDER`
+  variable, or the `provider` key in `config.toml`. [Choosing the provider on
+  Linux](./cli-min.md#choosing-the-provider-on-linux) gives the order.
+- **macOS**: the installer puts `min` and `minvmd` on the host, without `mip`
+  or a native `minimald`. `minimald` always runs inside the microVM, and the
+  package and build engine runs there with it.
+- `mip run` runs tasks in Linux sandboxes, so it is on Linux only.
 
 ## In-sandbox helper commands
 
-Task sandboxes expose a small set of helper commands (`add`, `search`,
-`check`, `run`) for use from inside a running sandbox. Those are
-documented separately in [sandbox operations](./sandbox-operations.md).
+Inside a box, `/usr/bin/min` is a helper with its own small set of commands,
+not the session CLI. Run `min` with no arguments inside the box to list
+them. [Sandbox operations](./sandbox-operations.md) describes each one.
