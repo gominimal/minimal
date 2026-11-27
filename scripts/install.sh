@@ -16,6 +16,7 @@
 #   curl … | sh -s -- unstable          # pick a non-default target
 #   curl … | sh -s -- --version 0.6.0   # install a staged version, no pointer
 #   curl … | sh -s -- --force-stop      # stop live sessions without asking
+#   curl … | sh -s -- --skip-state-archive  # upgrade from 0.7 without the state copy
 #   curl … | sh -s -- --uninstall       # remove what a prior run installed
 #
 # An upgrade must stop the running daemon before it swaps its binaries.
@@ -246,6 +247,13 @@ version_set=0
 if [ -n "${MINIMAL_INSTALL_FORCE_STOP:-}" ]; then
     force_stop=1
 fi
+# An upgrade from 0.7 copies the box state aside before it swaps the
+# binaries (see archive_box_state). --skip-state-archive, or a non-empty
+# MINIMAL_INSTALL_SKIP_STATE_ARCHIVE, upgrades without the copy.
+skip_state_archive=0
+if [ -n "${MINIMAL_INSTALL_SKIP_STATE_ARCHIVE:-}" ]; then
+    skip_state_archive=1
+fi
 if [ "${1-}" = "--uninstall" ]; then
     MODE=uninstall
     shift
@@ -268,6 +276,7 @@ else
     while [ "$argn" -gt 0 ]; do
         case "$1" in
             --force-stop) force_stop=1 ;;
+            --skip-state-archive) skip_state_archive=1 ;;
             --version)
                 case "${2-}" in
                     ''|-*) die "--version needs a value (e.g. --version 0.6.0)" ;;
@@ -1201,6 +1210,148 @@ else
 fi
 say ""
 
+# --- Box state across the 0.8 line ------------------------------------------
+
+# Minimal 0.8 writes a box state that 0.7 cannot read: the box index
+# (`sessions/index.json` under the state directory) carries a
+# `format_version`, and a 0.7 daemon refuses or misreads the store. Two
+# guards follow from it. A 0.7 install over 0.8 state is refused before
+# anything is downloaded. An upgrade from 0.7 to 0.8 or later copies the
+# state directory aside (archive_box_state, after the pre-swap daemon stop),
+# so that a later return to 0.7 has a state that 0.7 wrote.
+box_state="$(runtime_dir state)"
+
+# ver_mm <version> — "<major> <minor>" for a version that starts X.Y (a
+# leading `v` allowed, anything after the minor ignored); fails otherwise.
+ver_mm() {
+    _vm="${1#v}"
+    _vm_maj="${_vm%%.*}"
+    [ "$_vm_maj" != "$_vm" ] || return 1
+    _vm_min="${_vm#*.}"
+    _vm_min="${_vm_min%%[!0-9]*}"
+    case "$_vm_maj" in ''|*[!0-9]*) return 1 ;; esac
+    [ -n "$_vm_min" ] || return 1
+    printf '%s %s\n' "$_vm_maj" "$_vm_min"
+}
+# ver_before_0_8 / ver_from_0_8 <version> — which side of the 0.8 line a
+# version is on. A version neither can place is on neither side.
+ver_before_0_8() {
+    _vb="$(ver_mm "$1")" || return 1
+    [ "${_vb% *}" -eq 0 ] && [ "${_vb#* }" -lt 8 ]
+}
+ver_from_0_8() {
+    _vf="$(ver_mm "$1")" || return 1
+    [ "${_vf% *}" -gt 0 ] || [ "${_vf#* }" -ge 8 ]
+}
+
+# The `key` the installer wrote into install.toml: the version it installed.
+installed_key() {
+    [ -f "$state_dir/install.toml" ] || return 0
+    sed -n 's/^key = "\(.*\)"$/\1/p' "$state_dir/install.toml" | head -n 1
+}
+
+# Whether the state on disk is 0.8 state: install.toml names a version from
+# 0.8 on, or the box index carries a format_version above 0.
+state_from_0_8() {
+    _sk="$(installed_key)"
+    if [ -n "$_sk" ] && ver_from_0_8 "$_sk"; then
+        return 0
+    fi
+    [ -f "$box_state/sessions/index.json" ] \
+        && grep -q '"format_version"[[:space:]]*:[[:space:]]*[1-9]' "$box_state/sessions/index.json"
+}
+
+if ver_before_0_8 "$VERSION" && state_from_0_8; then
+    say "install: refused to install Minimal $VERSION over the box state in $(tilde "$box_state")."
+    say "Minimal 0.8 or later wrote that state, and $VERSION cannot read it."
+    say "Move the state aside, then run this installer again:"
+    say "      mv $(shq "$box_state") $(shq "$box_state.0.8")"
+    for _ba in "$box_state".0.7.*; do
+        [ -d "$_ba" ] || continue
+        say "An upgrade to 0.8 saved the earlier state in $(tilde "$_ba")."
+        say "To use it again, run this before the installer:"
+        say "      mv $(shq "$box_state") $(shq "$box_state.0.8") && mv $(shq "$_ba") $(shq "$box_state")"
+        break
+    done
+    exit 1
+fi
+
+# The 0.7 release this run upgrades from, or empty. Set only when this run
+# installs 0.8 or later and the `min` on disk reports a 0.7 version. That
+# `min` is the build that wrote the state, so it is the one to ask. An
+# install.toml that already names 0.8 or later skips the question. The copy
+# (archive_from) also needs a state directory and no --skip-state-archive.
+upgrade_from_0_7=
+_ik="$(installed_key)"
+if [ -x "$bindir/min" ] && ver_from_0_8 "$VERSION" \
+    && { [ -z "$_ik" ] || ! ver_from_0_8 "$_ik"; }; then
+    _af="$("$bindir/min" version </dev/null 2>/dev/null \
+        | sed -n 's/^Client: minimal v\{0,1\}\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' \
+        | head -n 1)" || _af=
+    if [ -n "$_af" ] && [ "$(ver_mm "$_af")" = "0 7" ]; then
+        upgrade_from_0_7="$_af"
+    fi
+fi
+archive_from=
+if [ -n "$upgrade_from_0_7" ] && [ "$skip_state_archive" -eq 0 ] && [ -d "$box_state" ]; then
+    archive_from="$upgrade_from_0_7"
+fi
+archive_tried=0
+archive_dest=
+
+# archive_box_state — copy $box_state to $box_state.<0.7 version>, once,
+# after the pre-swap daemon stop and before the first executable swap. A
+# copy-on-write clone comes first (GNU `cp --reflink=always`, macOS
+# `cp -c`): it takes no space up front. Without one, the copy needs the
+# state's allocated size free on the file system beside it. When that space
+# is short the function refuses and returns 1, and the caller aborts before
+# any executable is replaced. The plain copy keeps sparse files sparse
+# (GNU `cp --sparse=always`), so a VM disk image costs only its used blocks.
+archive_box_state() {
+    [ -n "$archive_from" ] || return 0
+    [ "$archive_tried" -eq 0 ] || return 0
+    archive_tried=1
+    [ -d "$box_state" ] || return 0
+    archive_dest="$box_state.$archive_from"
+    [ ! -e "$archive_dest" ] || archive_dest="$box_state.$archive_from.$t0"
+    [ ! -e "$archive_dest" ] || archive_dest="$box_state.$archive_from.$t0.$$"
+    case "$os" in
+        linux)  cp -a --reflink=always "$box_state" "$archive_dest" >/dev/null 2>&1 && _ab_cow=1 || _ab_cow=0 ;;
+        darwin) cp -c -Rp "$box_state" "$archive_dest" >/dev/null 2>&1 && _ab_cow=1 || _ab_cow=0 ;;
+        *)      _ab_cow=0 ;;
+    esac
+    if [ "$_ab_cow" -eq 0 ]; then
+        rm -rf "$archive_dest"
+        _ab_need="$(du -sk "$box_state" 2>/dev/null | awk 'NR==1 {print $1}')" || _ab_need=
+        _ab_free="$(df -Pk "${box_state%/*}" 2>/dev/null | awk 'NR==2 {print $4}')" || _ab_free=
+        case "$_ab_need" in ''|*[!0-9]*) _ab_need= ;; esac
+        case "$_ab_free" in ''|*[!0-9]*) _ab_free= ;; esac
+        # A size or a free count that did not read proves nothing: the copy
+        # is tried, and a failed copy refuses below.
+        if [ -n "$_ab_need" ] && [ -n "$_ab_free" ] && [ "$_ab_need" -ge "$_ab_free" ]; then
+            say "install: not enough free space to save a copy of the box state before the upgrade."
+            say "$(tilde "$box_state") uses $(human_size $((_ab_need * 1024))), and $(human_size $((_ab_free * 1024))) is free beside it."
+            say "No executables were replaced. Free some space, then run this installer again."
+            say "To upgrade without the copy, run this installer with --skip-state-archive."
+            return 1
+        fi
+        if [ "$os" = linux ] && cp -a --sparse=always "$box_state" "$archive_dest" >/dev/null 2>&1; then
+            :
+        else
+            rm -rf "$archive_dest"
+            if ! cp -Rp "$box_state" "$archive_dest" >/dev/null 2>&1; then
+                rm -rf "$archive_dest"
+                say "install: could not save a copy of $(tilde "$box_state") before the upgrade."
+                say "No executables were replaced."
+                say "To upgrade without the copy, run this installer with --skip-state-archive."
+                return 1
+            fi
+        fi
+    fi
+    row "box state" saved "$(tilde "$archive_dest")"
+    return 0
+}
+
 # Fetch that version's immutable components manifest.
 manifest="$tmpdir/components"
 fetch "$BUCKET/versions/$VERSION/components" "$manifest" \
@@ -1452,6 +1603,7 @@ while read -r comp _ _ _ want kind dest src; do
                 rm -f "$tmp"
                 die "aborted: no executables were replaced, the daemon is still running"
             }
+            archive_box_state || { rm -f "$tmp"; exit 1; }
             daemon_stop_ran=1
             ;;
     esac
@@ -1971,6 +2123,17 @@ case ":${PATH:-}:" in
 esac
 say "  $mark ${b}min init$rst                          ${dim}declare this project's environment$rst"
 say "  $mark ${b}min$rst                               ${dim}build the sandbox and step inside$rst"
+# After an upgrade from 0.7, the commands that work on the boxes the
+# earlier release left, and where the copy of its state is.
+if [ -n "$upgrade_from_0_7" ]; then
+    say "  $mark ${b}min box list$rst                      ${dim}list your boxes$rst"
+    say "  $mark ${b}min box attach <box>$rst              ${dim}open a shell in a running box$rst"
+    say "  $mark ${b}min box rm <box>$rst                  ${dim}remove a box$rst"
+    if [ -n "$archive_dest" ]; then
+        say ""
+        say "  ${dim}A copy of the box state from Minimal $upgrade_from_0_7 is in $(tilde "$archive_dest").$rst"
+    fi
+fi
 say ""
 say "  ${dim}docs.minimal.dev   $sep   discord.com/invite/qgX8sm6X7G$rst"
 # The update check's disclosure (inbox#589), for every install: this card is
