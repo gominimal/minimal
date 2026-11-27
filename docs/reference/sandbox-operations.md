@@ -34,13 +34,14 @@ In a box, add `--help` to a command to print its usage.
 
 ### `add [FLAG] <PACKAGES...>` {#add}
 
-Installs packages into the running sandbox. With a flag, `min add` also
-records the packages in `minimal.toml`. `min package add` is the same
+Installs packages into the running sandbox. Whether `min add` also records
+them in `minimal.toml` depends on the flag and on the helper, as the table
+and the list below say. `min package add` is the same
 command.
 
 | Flag | Description |
 |------|-------------|
-| `--session` | Also add the packages to the `[session]` `packages` list |
+| `--session` | In a box, also add the packages to the `packages` list of `[defaults.session]`. In a `mip run` sandbox, install them without a record |
 | `--runtime` | Also add the packages to `stack.runtime_packages` |
 | `--build` | Also add the packages to `stack.build_packages` |
 | `--task` | `mip run` helper only. Also add the packages to the packages of the task that is running |
@@ -48,11 +49,12 @@ command.
 With no flag, the two helpers do different things:
 
 - In a box, `min add <pkg>` is `min add --session <pkg>`. It installs the
-  package and records it in the `[session]` `packages` list of the box's
-  `minimal.toml`.
+  package and records it in the `packages` list of `[defaults.session]` in
+  the box's `minimal.toml`. A top-level `[session]` table from an older
+  `minimal.toml` moves under `[defaults]` when `min add` writes the file.
 - In a `mip run` sandbox, `min add <pkg>` installs the package for this
   sandbox only and leaves `minimal.toml` unchanged. It prints a line that
-  says so. There, `--session` also installs without a record.
+  says so.
 
 A package that sets environment variables prints an `export` line. Run it
 to apply the variables in your current shell.
