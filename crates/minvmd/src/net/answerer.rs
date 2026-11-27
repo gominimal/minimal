@@ -3125,7 +3125,10 @@ fn holder_error(port: u16, holder: Option<(u32, String)>, stop: Option<&str>) ->
         ),
         (true, None) => format!(
             "{in_use} a Minimal daemon running directly on this machine ({who}), so no box in \
-             the VM can be given an address"
+             the VM can be given an address; if `min host list` lists that daemon's host, run \
+             `min host stop <host>` to stop that daemon and the boxes running on it, then try \
+             again. A daemon that another user or another Minimal directory runs is not listed: \
+             stop it from there"
         ),
         (false, _) => format!(
             "{in_use} {who}, so no box in the VM can be given an address; free the port, then \
@@ -7736,15 +7739,18 @@ mod tests {
                  daemon and the boxes running on it, then try again"
             )
         );
-        // Unknown, the situation alone: no command that could stop another
-        // daemon.
+        // Unknown: how to find the host to stop, and which daemons that
+        // misses, never a host name that could stop another daemon.
         let unknown = channelless_holder_error(port, Some((0, "/usr/bin/minimald".to_string())));
         assert_eq!(
             unknown,
             format!(
                 "port 127.0.0.1:{port}, which box names are answered on, is in use by a Minimal \
                  daemon running directly on this machine (pid 0 (/usr/bin/minimald)), so no box \
-                 in the VM can be given an address"
+                 in the VM can be given an address; if `min host list` lists that daemon's host, \
+                 run `min host stop <host>` to stop that daemon and the boxes running on it, then \
+                 try again. A daemon that another user or another Minimal directory runs is not \
+                 listed: stop it from there"
             )
         );
         drop(squatter);
