@@ -96,6 +96,12 @@ What changes in 0.8:
 
 #### Copy your box state before you upgrade
 
+When the installer upgrades a 0.7 install, it makes this copy itself, next to
+the state directory, and names the copy when it finishes. Make the copy by hand,
+as below, only when you want it somewhere else, or when the installer stops
+because there is not enough free space. Then run the installer with
+`--skip-state-archive`.
+
 Minimal keeps its box state in `${XDG_STATE_HOME:-$HOME/.local/state}/minimal`.
 On macOS, that directory holds the virtual machine's data volume, a large
 sparse file. The copy commands below keep it sparse.
@@ -137,11 +143,12 @@ you made on 0.8 are lost.
    min host stop local-minvmd0
    ```
 
-2. Move the 0.8 state aside, and put the copy back:
+2. Move the 0.8 state aside, and put the copy back. Replace `<copy>` with the
+   copy's path: the one the installer named, or the one you made by hand:
 
    ```shell
    mv "${XDG_STATE_HOME:-$HOME/.local/state}/minimal" "$HOME/minimal-state-0.8"
-   mv "$HOME/minimal-state-0.7" "${XDG_STATE_HOME:-$HOME/.local/state}/minimal"
+   mv "<copy>" "${XDG_STATE_HOME:-$HOME/.local/state}/minimal"
    ```
 
 3. Install the 0.7 release that you had, for example 0.7.3:
