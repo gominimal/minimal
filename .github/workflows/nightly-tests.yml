@@ -38,7 +38,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+      - uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2
         with:
           command: check advisories
 
@@ -58,7 +58,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - name: Free Disk Space
-        uses: endersonmenezes/free-disk-space@8b8cd4e2277836962939a8f3b4ea0ee4bc006156 # v4.0.1
+        uses: endersonmenezes/free-disk-space@8ffcdf1b35c974f0b10496711e9a22bcb0ff3790 # v4.0.2
         with:
           remove_android: true
           remove_dotnet: true
@@ -80,7 +80,7 @@ jobs:
         # build-initramfs.sh cross-compiles the guest minimald to static musl;
         # install the prebuilt cross like the KVM lane so it never falls back
         # to `cargo install cross` from source inside this blocking job.
-        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2
         with:
           tool: cross
       - name: Enable /dev/kvm access
@@ -291,7 +291,7 @@ jobs:
         # from zizmorcore/zizmor). actionlint is NOT — it runs from its
         # pinned official image below. zizmor is version-pinned so new audits
         # arrive through a deliberate bump, not an overnight hygiene failure.
-        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2
         with:
           tool: cargo-machete,zizmor@1.30.1
       - name: actionlint (workflow lint)
@@ -339,7 +339,7 @@ jobs:
         with:
           shared-key: msrv
       - name: Install cargo-hack
-        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2
         with:
           tool: cargo-hack
       - name: cargo hack check --rust-version

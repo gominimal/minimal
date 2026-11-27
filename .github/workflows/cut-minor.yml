@@ -117,7 +117,7 @@ jobs:
             - name: Mint line token (minimal-release-ops)
               id: line-token
               if: ${{ !inputs.dry_run && !steps.plan.outputs.exists }}
-              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+              uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3
               with:
                   app-id: ${{ vars.MINIMAL_RELEASE_OPS_APP_ID }}
                   private-key: ${{ secrets.MINIMAL_RELEASE_OPS_PRIVATE_KEY }}
@@ -136,7 +136,7 @@ jobs:
             - name: Mint PR token (minimal-backporter)
               id: token
               if: ${{ !inputs.dry_run }}
-              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+              uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3
               with:
                   app-id: ${{ vars.MINIMAL_BACKPORTER_APP_ID }}
                   private-key: ${{ secrets.MINIMAL_BACKPORTER_PRIVATE_KEY }}
