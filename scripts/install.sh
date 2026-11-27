@@ -1265,46 +1265,72 @@ state_from_0_8() {
         && grep -q '"format_version"[[:space:]]*:[[:space:]]*[1-9]' "$box_state/sessions/index.json"
 }
 
-if ver_before_0_8 "$VERSION" && state_from_0_8; then
+# refuse_over_0_8_state — print the R2.6 refusal and exit 1. The 0.8 hosts
+# are stopped first: their sockets and locks live under the state directory,
+# and a live daemon writes the box index by absolute path into whatever is
+# there after the move. Then the move aside, and the newest saved 0.7 copy.
+refuse_over_0_8_state() {
     say "install: refused to install Minimal $VERSION over the box state in $(tilde "$box_state")."
     say "Minimal 0.8 or later wrote that state, and $VERSION cannot read it."
+    if [ -x "$bindir/min" ]; then
+        case ":${PATH:-}:" in
+            *":$bindir:"*) _rf_min=min ;;
+            *)             _rf_min="$(shq "$bindir/min")" ;;
+        esac
+        say "Stop every Minimal host first, so that no daemon writes to the state while it moves."
+        if min_has_host_stop; then
+            say "List the hosts, then stop each one that is not stopped:"
+            say "      $_rf_min host list"
+            say "      $_rf_min host stop <host>"
+        else
+            say "      $_rf_min stop"
+        fi
+        say "Then move the state aside, and run this installer again:"
+    else
+        say "Move the state aside, then run this installer again:"
+    fi
     # The move target must not exist: `mv` into an existing directory nests
     # the state inside it. A target an earlier refusal left gets a suffix.
     _b08="$box_state.0.8"
     [ ! -e "$_b08" ] || _b08="$box_state.0.8.$t0"
     [ ! -e "$_b08" ] || _b08="$box_state.0.8.$t0.$$"
-    say "Move the state aside, then run this installer again:"
     say "      mv $(shq "$box_state") $(shq "$_b08")"
+    # The newest saved copy by modification time, and how many others.
+    _rf_new=
+    _rf_other=0
     for _ba in "$box_state".0.7.*; do
         [ -d "$_ba" ] || continue
-        say "An upgrade to 0.8 saved the earlier state in $(tilde "$_ba")."
-        say "To use it again, run this before the installer:"
-        say "      mv $(shq "$box_state") $(shq "$_b08") && mv $(shq "$_ba") $(shq "$box_state")"
-        break
+        if [ -z "$_rf_new" ]; then
+            _rf_new="$_ba"
+        else
+            _rf_other=$((_rf_other + 1))
+            [ ! "$_ba" -nt "$_rf_new" ] || _rf_new="$_ba"
+        fi
     done
+    if [ -n "$_rf_new" ]; then
+        say "An upgrade to 0.8 saved the earlier state in $(tilde "$_rf_new")."
+        if [ "$_rf_other" -eq 1 ]; then
+            say "1 older copy is beside it, in $(tilde "$box_state").0.7.*."
+        elif [ "$_rf_other" -gt 1 ]; then
+            say "$_rf_other older copies are beside it, in $(tilde "$box_state").0.7.*."
+        fi
+        say "To use it again, run this before the installer:"
+        say "      mv $(shq "$box_state") $(shq "$_b08") && mv $(shq "$_rf_new") $(shq "$box_state")"
+    fi
     exit 1
+}
+
+# A version that is not X.Y (a nightly is named by its commit hash) is placed
+# after the manifest fetch, from the downloaded `min version`. Until then it
+# is refused on nothing.
+if ver_before_0_8 "$VERSION" && state_from_0_8; then
+    refuse_over_0_8_state
 fi
 
-# The 0.7 release this run upgrades from, or empty. Set only when this run
-# installs 0.8 or later and the `min` on disk reports a 0.7 version. That
-# `min` is the build that wrote the state, so it is the one to ask. An
-# install.toml that already names 0.8 or later skips the question. The copy
-# (archive_from) also needs a state directory and no --skip-state-archive.
+# upgrade_from_0_7 and archive_from are set after the manifest fetch
+# (place_version), before the component loop.
 upgrade_from_0_7=
-_ik="$(installed_key "$state_dir")"
-if [ -x "$bindir/min" ] && ver_from_0_8 "$VERSION" \
-    && { [ -z "$_ik" ] || ! ver_from_0_8 "$_ik"; }; then
-    _af="$("$bindir/min" version </dev/null 2>/dev/null \
-        | sed -n 's/^Client: minimal v\{0,1\}\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' \
-        | head -n 1)" || _af=
-    if [ -n "$_af" ] && [ "$(ver_mm "$_af")" = "0 7" ]; then
-        upgrade_from_0_7="$_af"
-    fi
-fi
 archive_from=
-if [ -n "$upgrade_from_0_7" ] && [ "$skip_state_archive" -eq 0 ] && [ -d "$box_state" ]; then
-    archive_from="$upgrade_from_0_7"
-fi
 archive_tried=0
 archive_dest=
 
@@ -1324,14 +1350,29 @@ archive_box_state() {
     archive_dest="$box_state.$archive_from"
     [ ! -e "$archive_dest" ] || archive_dest="$box_state.$archive_from.$t0"
     [ ! -e "$archive_dest" ] || archive_dest="$box_state.$archive_from.$t0.$$"
+    # A symlinked state directory is resolved, and its contents are copied
+    # into a new directory: a copy of the link would be another link to the
+    # data 0.8 is about to migrate. `du` measures the resolved directory too.
+    _ab_src="$(cd -P "$box_state" 2>/dev/null && pwd -P)" || _ab_src=
+    [ -n "$_ab_src" ] || _ab_src="$box_state"
+    _ab_err="$tmpdir/archive.cp.err"
+    : >"$_ab_err"
+    _ab_cow=0
     case "$os" in
-        linux)  cp -a --reflink=always "$box_state" "$archive_dest" >/dev/null 2>&1 && _ab_cow=1 || _ab_cow=0 ;;
-        darwin) cp -c -Rp "$box_state" "$archive_dest" >/dev/null 2>&1 && _ab_cow=1 || _ab_cow=0 ;;
-        *)      _ab_cow=0 ;;
+        linux)
+            mkdir "$archive_dest" 2>"$_ab_err" \
+                && cp -a --reflink=always "$_ab_src/." "$archive_dest" >/dev/null 2>"$_ab_err" \
+                && _ab_cow=1
+            ;;
+        darwin)
+            mkdir "$archive_dest" 2>"$_ab_err" \
+                && cp -c -Rp "$_ab_src/." "$archive_dest" >/dev/null 2>"$_ab_err" \
+                && _ab_cow=1
+            ;;
     esac
     if [ "$_ab_cow" -eq 0 ]; then
         rm -rf "$archive_dest"
-        _ab_need="$(du -sk "$box_state" 2>/dev/null | awk 'NR==1 {print $1}')" || _ab_need=
+        _ab_need="$(du -sk "$_ab_src" 2>/dev/null | awk 'NR==1 {print $1}')" || _ab_need=
         _ab_free="$(df -Pk "${box_state%/*}" 2>/dev/null | awk 'NR==2 {print $4}')" || _ab_free=
         case "$_ab_need" in ''|*[!0-9]*) _ab_need= ;; esac
         case "$_ab_free" in ''|*[!0-9]*) _ab_free= ;; esac
@@ -1344,13 +1385,17 @@ archive_box_state() {
             say "To upgrade without the copy, run this installer with --skip-state-archive."
             return 1
         fi
-        if [ "$os" = linux ] && cp -a --sparse=always "$box_state" "$archive_dest" >/dev/null 2>&1; then
+        if [ "$os" = linux ] && mkdir "$archive_dest" 2>"$_ab_err" \
+            && cp -a --sparse=always "$_ab_src/." "$archive_dest" >/dev/null 2>"$_ab_err"; then
             :
         else
             rm -rf "$archive_dest"
-            if ! cp -Rp "$box_state" "$archive_dest" >/dev/null 2>&1; then
+            if ! { mkdir "$archive_dest" 2>"$_ab_err" \
+                && cp -Rp "$_ab_src/." "$archive_dest" >/dev/null 2>"$_ab_err"; }; then
                 rm -rf "$archive_dest"
                 say "install: could not save a copy of $(tilde "$box_state") before the upgrade."
+                _ab_why="$(tail -n 1 "$_ab_err" 2>/dev/null)" || _ab_why=
+                [ -z "$_ab_why" ] || say "cp said: $_ab_why"
                 say "No executables were replaced."
                 say "To upgrade without the copy, run this installer with --skip-state-archive."
                 return 1
@@ -1382,6 +1427,78 @@ applicable="$tmpdir/applicable"
 awk -v o="$os" -v a="$arch" \
     '!/^#/ && NF && $2==o && $3==a {print}' "$manifest" >"$applicable"
 [ -s "$applicable" ] || die "manifest lists no components for $os/$arch at version $VERSION"
+
+# --- Place the version on the 0.8 line ---------------------------------------
+
+# client_version — the X.Y.Z that a `min version` on stdin reports, or empty.
+client_version() {
+    sed -n 's/^Client: minimal v\{0,1\}\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' \
+        | head -n 1
+}
+
+# The 0.7 release the `min` on disk reports, or empty. That `min` is the
+# build that wrote the state, so it is the one to ask. An install.toml that
+# already names 0.8 or later skips the question.
+from_0_7=
+_ik="$(installed_key "$state_dir")"
+if [ -x "$bindir/min" ] && { [ -z "$_ik" ] || ! ver_from_0_8 "$_ik"; }; then
+    _af="$("$bindir/min" version </dev/null 2>/dev/null | client_version)" || _af=
+    if [ -n "$_af" ] && [ "$(ver_mm "$_af")" = "0 7" ]; then
+        from_0_7="$_af"
+    fi
+fi
+
+# The version this run installs, as X.Y.Z, or empty when it cannot be placed.
+# A version that is not X.Y (a nightly named by its commit hash) is read from
+# the `min` this manifest ships, and only when the answer matters: the state
+# is from 0.8 or later, or the `min` on disk is from 0.7. A `min` on disk with
+# the manifest hash is asked directly. Otherwise it is downloaded to the temp
+# dir, checked against the manifest hash, and asked. Nothing is replaced.
+placed_version=
+if ver_mm "$VERSION" >/dev/null; then
+    placed_version="$VERSION"
+elif [ -n "$from_0_7" ] || state_from_0_8; then
+    _pv_row="$(awk '$6 == "file" && $7 == "bin/min" {print; exit}' "$applicable")"
+    if [ -n "$_pv_row" ]; then
+        read -r _ _ _ _ _pv_want _ _ _pv_src <<PVEOF
+$_pv_row
+PVEOF
+        if [ -x "$bindir/min" ] && [ "$(sha256 "$bindir/min")" = "$_pv_want" ]; then
+            placed_version="$("$bindir/min" version </dev/null 2>/dev/null | client_version)" \
+                || placed_version=
+        else
+            _pv_bin="$tmpdir/min.version-probe"
+            if fetch "$BUCKET/$_pv_src" "$_pv_bin" 2>/dev/null \
+                && [ "$(sha256 "$_pv_bin")" = "$_pv_want" ]; then
+                chmod +x "$_pv_bin"
+                if [ "$os" = darwin ]; then
+                    xattr -d com.apple.quarantine "$_pv_bin" 2>/dev/null || true
+                fi
+                placed_version="$("$_pv_bin" version </dev/null 2>/dev/null | client_version)" \
+                    || placed_version=
+            fi
+            rm -f "$_pv_bin"
+        fi
+    fi
+fi
+# A version placed only now gets the R2.6 refusal here, still before any
+# component is downloaded or replaced.
+if [ "$placed_version" != "$VERSION" ] && ver_before_0_8 "$placed_version" \
+    && state_from_0_8; then
+    refuse_over_0_8_state
+fi
+
+# The 0.7 release this run upgrades from, or empty: set when this run
+# installs 0.8 or later over a `min` from 0.7. A version that could not be
+# placed counts as 0.8 or later here, because an extra copy is safe. The copy
+# (archive_from) also needs a state directory and no --skip-state-archive.
+if [ -n "$from_0_7" ] \
+    && { [ -z "$placed_version" ] || ver_from_0_8 "$placed_version"; }; then
+    upgrade_from_0_7="$from_0_7"
+fi
+if [ -n "$upgrade_from_0_7" ] && [ "$skip_state_archive" -eq 0 ] && [ -d "$box_state" ]; then
+    archive_from="$upgrade_from_0_7"
+fi
 
 records="$tmpdir/installed"
 : >"$records"
