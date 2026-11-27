@@ -3,8 +3,10 @@
 //!
 //! `set` reads the value from the terminal or from standard input, never
 //! from an argument or an environment variable, and prints only the
-//! identifier. The item's access control lets the proxy binary read it
-//! without a prompt (BEP-051, `bep::store`). `list` prints metadata and no
+//! identifier. On macOS the item's access control lets the proxy binary read
+//! it without a prompt (BEP-051, `bep::store`). On Linux the store is Secret
+//! Service, where every program of the user reads the item, so no proxy path
+//! is checked or shown. `list` prints metadata and no
 //! value. Each `set` and `rm` logs one info line with the store and the
 //! identifier, never the value.
 
@@ -160,6 +162,9 @@ fn set_proxy(
     store
         .check_available()
         .context("min secret set did not read the value")?;
+    if !store.binds_program() {
+        return Ok(PathBuf::new());
+    }
     resolve().context("min secret set did not read the value")
 }
 
@@ -678,18 +683,22 @@ pub(crate) fn run_set_with_rule(
     store
         .check_available()
         .context("min secret set did not read the value")?;
-    if !proxy.is_absolute() || !proxy.is_file() {
-        bail!(
-            "min secret set did not read the value: the Box Egress Proxy program is not at {}. \
-             Only that program can read the stored secret without a prompt. \
-             Set {} to the path of the `bep` program, and run the command again.",
-            proxy.display(),
-            bep::store::PROXY_BIN_ENV
-        );
+    // A store whose items name no program has no access control to point
+    // at the proxy, so the proxy path decides nothing there.
+    if store.binds_program() {
+        if !proxy.is_absolute() || !proxy.is_file() {
+            bail!(
+                "min secret set did not read the value: the Box Egress Proxy program is not at {}. \
+                 Only that program can read the stored secret without a prompt. \
+                 Set {} to the path of the `bep` program, and run the command again.",
+                proxy.display(),
+                bep::store::PROXY_BIN_ENV
+            );
+        }
+        // Review finding 4369438785: the access control trusts this program,
+        // so nobody but the current user or root can change it.
+        bep::store::check_proxy_binary(proxy).context("min secret set did not read the value")?;
     }
-    // Review finding 4369438785: the access control trusts this program, so
-    // nobody but the current user or root can change it.
-    bep::store::check_proxy_binary(proxy).context("min secret set did not read the value")?;
     let control = target.as_ref().and_then(|target| target.control);
     // BEP-079: the rule is checked, and any change confirmed, before the
     // value is read.
@@ -723,6 +732,11 @@ pub(crate) fn run_set_with_rule(
             "min secret set stored nothing: the value is empty. Run the command again and give a value."
         );
     }
+    // Before the rule is written, so a value the store cannot keep whole
+    // changes nothing.
+    store
+        .check_value(&value)
+        .context("min secret set stored nothing")?;
     let snapshot = match &mut write {
         None => None,
         Some((path, rule, line, notice)) => {
@@ -864,7 +878,7 @@ pub(crate) fn run_list(
         .list(proxy.unwrap_or(Path::new("")))
         .context("min secret list did not read the store")?;
     if items.is_empty() {
-        writeln!(out, "No secrets in the {} store.", store.name())?;
+        writeln!(out, "No secrets in {}.", store.place())?;
         return Ok(());
     }
     for (n, item) in items.iter().enumerate() {
@@ -886,6 +900,7 @@ pub(crate) fn run_list(
             Some(StoreAction::Deny) => "deny",
         };
         let access = match proxy {
+            _ if !store.binds_program() => PROXY_READS_AS_USER.to_owned(),
             Err(_) => "unknown".to_owned(),
             Ok(proxy) if item.proxy_access => format!("yes, {}", proxy.display()),
             Ok(_) => "no".to_owned(),
@@ -897,12 +912,16 @@ pub(crate) fn run_list(
         writeln!(out, "  consent:               {consent}")?;
         writeln!(out, "  proxy reads it freely: {access}")?;
     }
-    if let Err(e) = proxy {
+    if let (true, Err(e)) = (store.binds_program(), proxy) {
         writeln!(out)?;
         writeln!(out, "min secret list shows proxy access as unknown: {e:#}")?;
     }
     Ok(())
 }
+
+/// The access column of `list` for a store where every program of the user
+/// reads every item, as in Secret Service.
+pub(crate) const PROXY_READS_AS_USER: &str = "yes, as every program you run can";
 
 /// The injection form of `rule`, as the list shows it.
 fn injection(rule: &StoreRuleConfig) -> String {
@@ -934,13 +953,13 @@ pub(crate) fn run_rm(
         .with_context(|| format!("min secret rm did not remove {}", args.id))?;
     if !removed {
         bail!(
-            "There is no secret named {} in the {} store. Run `min secret list` to see the stored names.",
+            "There is no secret named {} in {}. Run `min secret list` to see the stored names.",
             args.id,
-            store.name()
+            store.place()
         );
     }
     tracing::info!(store = store.name(), id = %args.id, "secret removed");
-    writeln!(out, "Removed {} from the {} store.", args.id, store.name())?;
+    writeln!(out, "Removed {} from {}.", args.id, store.place())?;
     Ok(())
 }
 
@@ -1282,7 +1301,8 @@ mod tests {
         assert!(store.value("claude").is_none());
     }
 
-    /// A store that this host cannot use, as [`HostStore`] is off macOS.
+    /// A store that this host cannot use, as [`HostStore`] is on a host
+    /// that is neither macOS nor Linux.
     struct NoStore;
     impl SecretStore for NoStore {
         fn name(&self) -> &'static str {
@@ -1345,6 +1365,143 @@ mod tests {
             set_proxy(&store, || resolve_proxy(None, None)).expect_err("refused")
         );
         assert!(text.contains("no `minvmd` program is on PATH"), "{text}");
+    }
+
+    /// A store where every program of the user reads every item, as
+    /// [`HostStore`] is on Linux.
+    #[derive(Default)]
+    struct UserWideStore(MemorySecretStore);
+    impl SecretStore for UserWideStore {
+        fn name(&self) -> &'static str {
+            NATIVE_STORE
+        }
+        fn set(&self, id: &str, value: &[u8], proxy: &Path) -> Result<(), StoreError> {
+            self.0.set(id, value, proxy)
+        }
+        fn list(&self, proxy: &Path) -> Result<Vec<bep::store::ItemInfo>, StoreError> {
+            self.0.list(proxy)
+        }
+        fn remove(&self, id: &str) -> Result<bool, StoreError> {
+            self.0.remove(id)
+        }
+        fn place(&self) -> String {
+            "Secret Service".to_owned()
+        }
+        fn check_value(&self, value: &[u8]) -> Result<(), StoreError> {
+            bep::store::check_secret_tool_value(value)
+        }
+        fn binds_program(&self) -> bool {
+            false
+        }
+    }
+
+    // On Linux the store names no program, so `set` needs no proxy path,
+    // and `list` shows that every program of the user reads each item.
+    #[test]
+    fn secret_commands_on_a_store_that_names_no_program() {
+        let store = UserWideStore::default();
+        let proxy = set_proxy(&store, || panic!("the proxy path was resolved")).unwrap();
+        let mut out = Vec::new();
+        run_set(
+            &store,
+            &set_args(&["claude"]),
+            &proxy,
+            ValueSource::Stdin,
+            &mut no_terminal,
+            &mut &b"sk-ant-secret"[..],
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out, b"claude\n");
+        assert_eq!(
+            store.0.value("claude").as_deref(),
+            Some(&b"sk-ant-secret"[..])
+        );
+
+        let none = tempfile::tempdir().unwrap();
+        let empty = std::env::join_paths([none.path()]).unwrap();
+        let missing = resolve_proxy(None, Some(&empty)).expect_err("no minvmd");
+        for proxy in [Ok(Path::new("/opt/minimal/bep")), Err(&missing)] {
+            let mut out = Vec::new();
+            run_list(&store, &StoreRules::new(), proxy, &mut out).unwrap();
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                "claude
+  store:                 keychain
+  upstream:              none (no [secret-store-rules] rule)
+  injection:             none
+  consent:               none
+  proxy reads it freely: yes, as every program you run can
+"
+            );
+        }
+
+        // `rm` and an empty listing name Secret Service, where the item
+        // lives on Linux, not the store name a reference uses.
+        let args = SecretRmArgs {
+            id: "claude".into(),
+            store: None,
+        };
+        let mut out = Vec::new();
+        run_rm(&store, &args, &mut out).unwrap();
+        assert_eq!(out, b"Removed claude from Secret Service.\n");
+        let err = run_rm(&store, &args, &mut Vec::new()).expect_err("absent");
+        assert_eq!(
+            err.to_string(),
+            "There is no secret named claude in Secret Service. \
+             Run `min secret list` to see the stored names."
+        );
+        let mut out = Vec::new();
+        run_list(&store, &StoreRules::new(), Err(&missing), &mut out).unwrap();
+        assert_eq!(out, b"No secrets in Secret Service.\n");
+    }
+
+    // On Linux, `set` refuses a value that Secret Service would refuse or
+    // keep cut short through `secret-tool`, after the read and before the
+    // rule or the item is written, so nothing changes.
+    #[test]
+    fn secret_set_refuses_a_value_secret_tool_cannot_keep() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, EXISTING).unwrap();
+        let store = UserWideStore::default();
+        let cases: [(Vec<u8>, &str); 2] = [
+            (
+                vec![b'a'; bep::store::SECRET_TOOL_MAX_VALUE + 1],
+                "min secret set stored nothing: On Linux, `min secret` stores a value in \
+                 Secret Service through `secret-tool`, which keeps at most 8192 bytes, and \
+                 this value is 8193 bytes. Give a value of 8192 bytes or fewer.",
+            ),
+            (
+                b"\xff\x00\xfe".to_vec(),
+                "min secret set stored nothing: On Linux, `min secret` stores a value in \
+                 Secret Service through `secret-tool`, which keeps only UTF-8 text, and this \
+                 value is not valid UTF-8. Give the value as UTF-8 text.",
+            ),
+        ];
+        for (value, want) in cases {
+            let mut out = Vec::new();
+            let err = run_set_with_rule(
+                &store,
+                &set_args(&["linear", "--preset", "linear", "--yes"]),
+                Path::new(""),
+                ValueSource::Stdin,
+                &mut no_terminal,
+                &mut &value[..],
+                &mut out,
+                Some(RuleTarget {
+                    path: &path,
+                    confirm: &mut no_confirm,
+                    notice: &mut std::io::sink(),
+                    control: None,
+                }),
+            )
+            .expect_err("refused");
+            assert_eq!(format!("{err:#}"), want);
+            assert!(out.is_empty());
+            assert!(store.0.value("linear").is_none());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), EXISTING);
+        }
     }
 
     #[test]
@@ -1492,7 +1649,11 @@ sentry
         assert!(store.list(&proxy).unwrap().is_empty());
         // A second remove finds nothing, and says so.
         let err = run_rm(&store, &args, &mut Vec::new()).expect_err("absent");
-        assert!(err.to_string().contains("no secret named claude"), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "There is no secret named claude in the keychain store. \
+             Run `min secret list` to see the stored names."
+        );
     }
 
     #[test]
