@@ -958,6 +958,9 @@ pub(crate) mod testing {
         notify: Notify,
         kill_requested: AtomicBool,
         exit_on_kill: Mutex<Option<i32>>,
+        /// Set, and `waited_notify` woken, when a `wait` returns.
+        waited: AtomicBool,
+        waited_notify: Notify,
     }
 
     /// Test-side handle for driving and observing a [`MockProcess`].
@@ -987,6 +990,15 @@ pub(crate) mod testing {
         /// Whether the bridge has called `start_kill` on the process.
         pub fn was_killed(&self) -> bool {
             self.inner.kill_requested.load(Ordering::SeqCst)
+        }
+
+        /// Resolves once a `wait` of the bridge's has returned the
+        /// process's exit. One waiter at a time: `notify_one` keeps a
+        /// permit for a waiter that is not parked yet.
+        pub async fn wait_returned(&self) {
+            while !self.inner.waited.load(Ordering::SeqCst) {
+                self.inner.waited_notify.notified().await;
+            }
         }
     }
 
@@ -1064,18 +1076,23 @@ pub(crate) mod testing {
         }
 
         async fn wait(&mut self) -> std::io::Result<Option<i32>> {
-            loop {
+            let status = loop {
                 if let Some(code) = *self.ctrl.inner.exit.lock().await {
-                    return Ok(Some(code));
+                    break Some(code);
                 }
                 // A killed process winds down with no numeric code (the
                 // shell would report it as signal termination). Model
                 // that as `Ok(None)` so the bridge maps it to exit 1.
                 if self.ctrl.inner.kill_requested.load(Ordering::SeqCst) {
-                    return Ok(*self.ctrl.inner.exit_on_kill.lock().await);
+                    break *self.ctrl.inner.exit_on_kill.lock().await;
                 }
                 self.ctrl.inner.notify.notified().await;
-            }
+            };
+            // No await between here and the return, so a `wait` dropped
+            // before it returns never sets this.
+            self.ctrl.inner.waited.store(true, Ordering::SeqCst);
+            self.ctrl.inner.waited_notify.notify_one();
+            Ok(status)
         }
 
         fn start_kill(&mut self) -> std::io::Result<()> {

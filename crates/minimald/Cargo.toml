@@ -95,6 +95,8 @@ stdlib.workspace = true
 version.workspace = true
 
 [dev-dependencies]
+# The transport probe the read-ahead wiring test puts under each session loop.
+common = { workspace = true, features = ["test-util"] }
 # The two-namespace UC7 mesh integration test (`tests/mesh_uc7.rs`) drives a
 # tokio runtime and `setns(2)` directly.
 libc.workspace = true

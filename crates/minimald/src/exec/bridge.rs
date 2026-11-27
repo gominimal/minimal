@@ -29,8 +29,10 @@ impl<S: Exec> ExecTask<S> {
         let (rs, ws) = channel.split();
         // SSH_EXTENDED_DATA_STDERR (RFC 4254 §5.2) — selects the stderr
         // stream on the same channel as a separate extended-data type.
-        let mut w = ws.make_writer();
-        let mut e = ws.make_writer_ext(Some(1));
+        // Every write to either goes through `ChannelOut`, which writes
+        // nothing more to a writer whose write was given up part way.
+        let mut w = ChannelOut::new(ws.make_writer());
+        let mut e = ChannelOut::new(ws.make_writer_ext(Some(1)));
 
         // Drive `rs.wait()` directly rather than `rs.make_reader()` so we
         // see `ChannelMsg::Close` and `None` (sender dropped) — the signals
@@ -83,10 +85,8 @@ impl<S: Exec> ExecTask<S> {
             Some(ExecEnd::InputHeldUnstarted(bound)) => Some(unstarted_input_notice(bound)),
             Some(ExecEnd::ClientLost) | None => None,
         };
-        if let Some(notice) = notice
-            && e.write_all(notice.as_bytes()).await.is_err()
-        {
-            tracing::debug!("exec: the held-input notice was not written; the client is gone");
+        if let Some(notice) = notice {
+            write_end_notice(&mut e, &notice).await;
         }
         let _ = w.flush().await;
         let _ = e.flush().await;
@@ -244,8 +244,8 @@ pub(super) async fn bridge_noting_reason<C, S, P, R, W, E, F>(
     channel_id: C,
     stream: S,
     r: &mut R,
-    w: &mut W,
-    e: &mut E,
+    w: &mut ChannelOut<W>,
+    e: &mut ChannelOut<E>,
     client_lost: watch::Receiver<Option<ExecEnd>>,
     unread: UnreadStdin,
     destroyed: Option<CancellationToken>,
@@ -276,6 +276,9 @@ where
             })
         })
     };
+    // Kept for the notice below: a client lost while the notice waits on it
+    // ends the wait, as it ends the bridge's other channel writes.
+    let end = client_lost.clone();
     let (exit_status, late_start) =
         bridge_until_end(channel_id, stream, r, w, e, client_lost, unread).await;
     // A shutdown stops a command only by tearing down what runs it: a
@@ -290,7 +293,7 @@ where
     // maps to 1 — and it is the one kind the shutdown never stops.)
     let shutting_down = exit_status >= KILLED_STATUS_MIN && shutting_down();
     if let Some(notice) = exit_notice(shutting_down, exit_status, stopped.load(Ordering::SeqCst)) {
-        let _ = e.write_all(notice).await;
+        let _ = write_unless_lost(e, notice, &end).await;
     }
     (exit_status, late_start)
 }
@@ -758,7 +761,13 @@ impl Drop for HeldInputReader {
 /// queued, bounded per exec and for the daemon as a whole
 /// ([`HeldInputLimits`]): past either, the queue is cleared (its bytes
 /// released at once), the command sees EOF, and `end` carries the bound so
-/// the bridge ends the exec under that reason.
+/// the bridge ends the exec under that reason. The pump then goes on reading
+/// the channel, dropping its data, so a client lost after the bound is still
+/// seen: the bound does not give up a write of output under way, and the
+/// loss is what does ([`until_client_lost`]). A loss replaces the bound.
+/// A command that never started when its wait at a bound ran out
+/// ([`ExecEnd::InputHeldUnstarted`]) has no write under way, and there the
+/// pump returns, letting go of the channel.
 ///
 /// `Eof` closes the held input (the command sees EOF once it has read what
 /// is queued) but keeps watching the channel: `min task run` from a
@@ -898,9 +907,7 @@ pub(super) async fn pump_channel_input<M>(
                             "exec: the daemon's input budget is held by an exec that read none of it for the whole window; ending that exec, not this one",
                         );
                         victim.held.clear();
-                        victim
-                            .end
-                            .send_replace(Some(ExecEnd::InputHeldOver(HeldBound::Daemon)));
+                        end_at_the_daemon_bound(&victim.end);
                         *w = BoundWait::begin(&held);
                         continue;
                     }
@@ -914,7 +921,12 @@ pub(super) async fn pump_channel_input<M>(
                     );
                     held.clear();
                     end.send_replace(Some(ExecEnd::InputHeldOver(bound)));
-                    return;
+                    // The channel is still watched, as after `Eof`: a write
+                    // of output under way when the bound came finishes for a
+                    // live client, and only a loss seen here gives it up if
+                    // the client goes instead. What arrives is dropped.
+                    open = false;
+                    break;
                 }
             }
             Some(russh::ChannelMsg::Eof) => {
@@ -932,6 +944,26 @@ pub(super) async fn pump_channel_input<M>(
             Some(_) => {}
         }
     }
+}
+
+/// Ends another exec at the daemon bound ([`ExecEnd::InputHeldOver`] with
+/// [`HeldBound::Daemon`]), unless its end is already set. Returns whether
+/// this set it.
+///
+/// The victim's own pump may have sent [`ExecEnd::ClientLost`] since the
+/// starved wait chose it. A watch keeps only its latest value, so replacing
+/// that loss would hide it from the victim's parked output write
+/// ([`until_client_lost`]), which would then wait on a client that is gone.
+/// The check and the set are one step under the watch's lock, so a loss
+/// sent at the same time is either kept or sent after, never overwritten.
+pub(super) fn end_at_the_daemon_bound(end: &watch::Sender<Option<ExecEnd>>) -> bool {
+    end.send_if_modified(|value| {
+        if value.is_some() {
+            return false;
+        }
+        *value = Some(ExecEnd::InputHeldOver(HeldBound::Daemon));
+        true
+    })
 }
 
 /// Where an exec's drain stood when its stall window began, and what it
@@ -1101,7 +1133,9 @@ where
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
-    bridge_until_end(channel_id, stream, r, w, e, client_lost, unread)
+    let mut w = ChannelOut::new(w);
+    let mut e = ChannelOut::new(e);
+    bridge_until_end(channel_id, stream, r, &mut w, &mut e, client_lost, unread)
         .await
         .0
 }
@@ -1134,8 +1168,8 @@ pub(super) async fn bridge_until_end<S, P, R, W, E>(
     channel_id: impl Display + Clone,
     mut stream: S,
     r: &mut R,
-    w: &mut W,
-    e: &mut E,
+    w: &mut ChannelOut<W>,
+    e: &mut ChannelOut<E>,
     mut client_lost: watch::Receiver<Option<ExecEnd>>,
     unread: UnreadStdin,
 ) -> (u32, Option<S>)
@@ -1171,7 +1205,8 @@ where
                     %channel_id, error = %err,
                     "exec: failed to spawn next process in sequence; reporting exit 1",
                 );
-                let _ = e.write_all(spawn_failed_notice(&err).as_bytes()).await;
+                let notice = spawn_failed_notice(&err);
+                let _ = write_unless_lost(e, notice.as_bytes(), &client_lost).await;
                 last_exit = 1;
                 break;
             }
@@ -1244,6 +1279,16 @@ where
 /// `write` are cancel-safe, and the SSH-channel writes live in branch
 /// *handlers*, which run after the `select!` has already resolved.
 ///
+/// A handler's channel write waits for as long as the client takes to read,
+/// and while it waits the `select!` polls nothing. So the write itself
+/// watches two things the loop would ([`relay_output`]): the client's loss,
+/// which gives the write up and ends the command as a loss seen between
+/// writes does, and the process, whose exit is recorded and ends the loop
+/// once the write is done. A client that has gone without a word (a russh
+/// writer at zero window waits on a window grant that a dead session never
+/// sends) can no longer keep its command running. An input bound is not
+/// raced: it ends the exec once the write is done, as before.
+///
 /// On an SSH-channel write failure or client disconnect we stop and
 /// `start_kill` the child: with no one reading its output the pipe
 /// buffer would fill, the child would block on write, and `wait` would
@@ -1260,8 +1305,8 @@ pub(super) async fn bridge_one<P, R, W, E>(
     channel_id: impl Display,
     mut process: P,
     r: &mut R,
-    w: &mut W,
-    e: &mut E,
+    w: &mut ChannelOut<W>,
+    e: &mut ChannelOut<E>,
     stdin_open: &mut bool,
     client_lost: &mut watch::Receiver<Option<ExecEnd>>,
     unread: UnreadStdin,
@@ -1394,12 +1439,27 @@ where
                         stdout_open = false;
                     }
                     Ok(n) => {
-                        if let Err(err) = w.write_all(&stdout_buf[..n]).await {
-                            tracing::warn!(
-                                %channel_id, error = %err,
-                                "exec: failed to forward child stdout to ssh channel; killing child",
-                            );
-                            ssh_write_failed = true;
+                        let chunk = stdout_buf.get(..n).unwrap_or_default();
+                        let relayed =
+                            relay_output(w, chunk, client_lost, &mut process, &mut child_exit)
+                                .await;
+                        match relayed {
+                            Relayed::Written => {}
+                            Relayed::Failed(err) => {
+                                tracing::warn!(
+                                    %channel_id, error = %err,
+                                    "exec: failed to forward child stdout to ssh channel; killing child",
+                                );
+                                ssh_write_failed = true;
+                            }
+                            // Cut: an earlier write was given up, so the exec
+                            // is already ending, and this ends it the same way.
+                            Relayed::Lost | Relayed::Cut => {
+                                if let Some(end) = *client_lost.borrow() {
+                                    log_end(&channel_id, end);
+                                }
+                                ssh_write_failed = true;
+                            }
                         }
                     }
                 }
@@ -1415,12 +1475,27 @@ where
                         stderr_open = false;
                     }
                     Ok(n) => {
-                        if let Err(err) = e.write_all(&stderr_buf[..n]).await {
-                            tracing::warn!(
-                                %channel_id, error = %err,
-                                "exec: failed to forward child stderr to ssh channel; killing child",
-                            );
-                            ssh_write_failed = true;
+                        let chunk = stderr_buf.get(..n).unwrap_or_default();
+                        let relayed =
+                            relay_output(e, chunk, client_lost, &mut process, &mut child_exit)
+                                .await;
+                        match relayed {
+                            Relayed::Written => {}
+                            Relayed::Failed(err) => {
+                                tracing::warn!(
+                                    %channel_id, error = %err,
+                                    "exec: failed to forward child stderr to ssh channel; killing child",
+                                );
+                                ssh_write_failed = true;
+                            }
+                            // Cut: an earlier write was given up, so the exec
+                            // is already ending, and this ends it the same way.
+                            Relayed::Lost | Relayed::Cut => {
+                                if let Some(end) = *client_lost.borrow() {
+                                    log_end(&channel_id, end);
+                                }
+                                ssh_write_failed = true;
+                            }
                         }
                     }
                 }
@@ -1428,8 +1503,10 @@ where
             // Lowest-value branch but deliberately unbiased: `select!`
             // picks at random among ready branches, so this can win a
             // race with pending output. That is what the post-loop
-            // `drain_ready` covers. Nothing here touches `process`, so
-            // the `&mut process` this future holds is uncontended.
+            // `drain_ready` covers. No other branch future touches
+            // `process`, so the `&mut process` this future holds is
+            // uncontended; the output handlers that wait on it
+            // ([`relay_output`]) run once this future is dropped.
             status = process.wait() => child_exit = Some(status),
 
             // The SSH client disconnected (channel close or sender
@@ -1439,20 +1516,7 @@ where
                 if res.is_err() {
                     client_watch_open = false;
                 } else if let Some(end) = *client_lost.borrow() {
-                    match end {
-                        ExecEnd::ClientLost => tracing::warn!(
-                            %channel_id,
-                            "exec: ssh client disconnected; killing child",
-                        ),
-                        ExecEnd::InputHeldOver(bound) => tracing::warn!(
-                            %channel_id, ?bound,
-                            "exec: the command's unread input crossed a bound; ending the exec",
-                        ),
-                        ExecEnd::InputHeldUnstarted(bound) => tracing::warn!(
-                            %channel_id, ?bound,
-                            "exec: the command started after its wait at an input bound ran out; ending the exec",
-                        ),
-                    }
+                    log_end(&channel_id, end);
                     ssh_write_failed = true;
                 }
             }
@@ -1463,21 +1527,26 @@ where
 
     // Nobody is reading the child's output any more, so it would wedge
     // on a full pipe and never be reapable. Kill, then fall through to
-    // the `wait` below.
-    if ssh_write_failed {
+    // the `wait` below. A child whose exit a parked channel write already
+    // recorded ([`relay_output`]) is not signalled: it is gone, and its
+    // status is the one it exited with.
+    if ssh_write_failed && child_exit.is_none() {
         // A `--detach` exec, if one is ever added, must not reach this client-loss kill.
         let _ = process.start_kill();
     }
 
     // The child is gone but a grandchild may still hold the write ends.
     // Everything the child itself wrote is already in the pipe buffer
-    // and still belongs to the caller — take it before returning.
-    if child_exit.is_some() {
+    // and still belongs to the caller — take it before returning, unless
+    // the channel failed or the client was lost while a write waited, in
+    // which case there is no one left to take it.
+    if child_exit.is_some() && !ssh_write_failed {
         let relayed = drain_ready(
             &channel_id,
             &mut child_stdout,
             &mut stdout_open,
             w,
+            client_lost,
             &mut stdout_buf,
             "stdout",
         )
@@ -1492,6 +1561,7 @@ where
                 &mut child_stderr,
                 &mut stderr_open,
                 e,
+                client_lost,
                 &mut stderr_buf,
                 "stderr",
             )
@@ -1539,13 +1609,25 @@ where
     };
     // A task whose sandbox failed may have written nothing, so the reason
     // goes on stderr ahead of the status. A client that stops reading holds
-    // the write, so the wait for it is bounded and the status still returns.
+    // the write, so the wait for it is bounded and the status still returns;
+    // a client lost during that wait ends it at once. A notice given up
+    // either way leaves `e` cut ([`ChannelOut`]): nothing more goes to it.
     if let Some(notice) = process.exit_notice() {
-        match tokio::time::timeout(EXIT_NOTICE_BOUND, e.write_all(notice.as_bytes())).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => {
+        let write = write_unless_lost(e, notice.as_bytes(), client_lost);
+        let written = tokio::time::timeout(EXIT_NOTICE_BOUND, write).await;
+        match written {
+            Ok(Relayed::Written) => {}
+            Ok(Relayed::Failed(_)) => {
                 tracing::debug!(%channel_id, "exec: the exit notice was not written; the client is gone");
             }
+            Ok(Relayed::Lost) => tracing::debug!(
+                %channel_id,
+                "exec: the exit notice was not written; the client was lost while it waited",
+            ),
+            Ok(Relayed::Cut) => tracing::debug!(
+                %channel_id,
+                "exec: the exit notice was not written; an earlier write was given up",
+            ),
             Err(_) => tracing::debug!(
                 %channel_id,
                 bound = ?EXIT_NOTICE_BOUND,
@@ -1565,9 +1647,39 @@ where
     }
 }
 
-/// How long [`bridge_one`] waits to write a process's exit notice to a
-/// client that is not reading, before it returns the status without it.
+/// How long a notice waits to be written to a client that is not reading,
+/// before the exec goes on without it: a process's exit notice
+/// ([`bridge_one`]), and the notice that names an input bound
+/// ([`write_end_notice`]).
 pub(super) const EXIT_NOTICE_BOUND: Duration = Duration::from_secs(5);
+
+/// Writes the notice that names the input bound an exec ended at, to the
+/// client's stderr, waiting no longer than [`EXIT_NOTICE_BOUND`].
+///
+/// The input pump is stopped by the time this runs, so nothing signals a
+/// lost client here, and a russh writer at zero window waits for a window
+/// grant that a dead session never sends. The bound is what ends that wait:
+/// the exit status, the channel's close and the end of a command still
+/// starting all follow this write. A notice given up leaves `e` cut
+/// ([`ChannelOut`]).
+pub(super) async fn write_end_notice<W>(e: &mut ChannelOut<W>, notice: &str)
+where
+    W: AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(EXIT_NOTICE_BOUND, e.write(notice.as_bytes())).await {
+        Ok(Relayed::Written) => {}
+        Ok(Relayed::Cut) => tracing::debug!(
+            "exec: the held-input notice was not written; an earlier write was given up",
+        ),
+        Ok(Relayed::Failed(_) | Relayed::Lost) => {
+            tracing::debug!("exec: the held-input notice was not written; the client is gone",)
+        }
+        Err(_) => tracing::debug!(
+            bound = ?EXIT_NOTICE_BOUND,
+            "exec: the held-input notice was not written; the client did not take it in time",
+        ),
+    }
+}
 
 /// How long [`drain_ready`] waits for a pipe to produce something after
 /// the child has been reaped, before concluding that whatever still
@@ -1596,13 +1708,24 @@ pub(super) const DRAIN_GRACE: Duration = Duration::from_millis(100);
 /// (the overwhelmingly common shape) and at most one [`DRAIN_GRACE`]
 /// when a grandchild really is holding the write end open.
 ///
+/// Each write to `sink` is raced against the client's loss
+/// ([`write_unless_lost`]): the process is gone, so a write is all that
+/// holds the drain, and a client lost while it waits ends the drain rather
+/// than holding the bridge. An input bound set by then does not stop the
+/// drain: a bound ends a command that is still running, and this one has
+/// exited, so what it wrote is still the caller's. A live client gets it as
+/// a slow client gets any output, and a client lost after the bound is still
+/// seen ([`pump_channel_input`] keeps reading the channel past a bound).
+///
 /// Sets `*open = false` on EOF or a read error. Returns `false` if a
-/// write to the SSH channel failed, so the caller can stop relaying.
+/// write to the SSH channel failed, or the client was lost while one
+/// waited, so the caller can stop relaying.
 pub(super) async fn drain_ready<S, W>(
     channel_id: &impl Display,
     src: &mut S,
     open: &mut bool,
-    sink: &mut W,
+    sink: &mut ChannelOut<W>,
+    end: &watch::Receiver<Option<ExecEnd>>,
     buf: &mut [u8],
     stream_name: &'static str,
 ) -> bool
@@ -1638,17 +1761,218 @@ where
                 *open = false;
             }
             Ok(n) => {
-                if let Err(err) = sink.write_all(&buf[..n]).await {
-                    tracing::warn!(
-                        %channel_id, error = %err, stream = stream_name,
-                        "exec: failed to forward drained child output to ssh channel",
-                    );
-                    return false;
+                let chunk = buf.get(..n).unwrap_or_default();
+                let relayed = write_unless_lost(sink, chunk, end).await;
+                match relayed {
+                    Relayed::Written => {}
+                    Relayed::Failed(err) => {
+                        tracing::warn!(
+                            %channel_id, error = %err, stream = stream_name,
+                            "exec: failed to forward drained child output to ssh channel",
+                        );
+                        return false;
+                    }
+                    Relayed::Lost | Relayed::Cut => {
+                        tracing::warn!(
+                            %channel_id, stream = stream_name,
+                            "exec: the client was lost while drained child output waited on it",
+                        );
+                        return false;
+                    }
                 }
             }
         }
     }
     true
+}
+
+/// How a write of the bridge's to the client's channel came out.
+#[derive(Debug)]
+pub(super) enum Relayed {
+    /// The channel took every byte.
+    Written,
+    /// The channel refused the write: it is closed.
+    Failed(io::Error),
+    /// The client was lost ([`ExecEnd::ClientLost`]) while the write waited
+    /// on it, and the write was given up, part written or none.
+    Lost,
+    /// Not written: an earlier write to this channel was given up part way,
+    /// and nothing is written to it after that ([`ChannelOut`]).
+    Cut,
+}
+
+/// A writer of the client's channel that is not written to again once a
+/// write to it has been given up part way.
+///
+/// A russh channel writer cannot be left in the middle of a write. When a
+/// write finds room in the window but the session's queue full, the writer
+/// takes a chunk of the bytes off the window and keeps it, with the send
+/// that waits for the queue. The next write to that writer finishes the
+/// kept send, whatever bytes it was given, and reports the kept chunk's
+/// length as written (russh `ChannelTx::poll_write`). Its own bytes are
+/// lost, old ones go out in their place, and a length longer than its
+/// bytes makes `write_all` panic.
+///
+/// So every write the bridge makes to the client goes through here. A write
+/// counts as given up from its first poll until it returns. One the
+/// client's loss gave up, or one dropped part way (by the bound on the exit
+/// notice), leaves the writer cut: every later write returns
+/// [`Relayed::Cut`] and does not touch the writer.
+pub(super) struct ChannelOut<W> {
+    sink: W,
+    cut: bool,
+}
+
+impl<W> ChannelOut<W>
+where
+    W: AsyncWrite + Unpin,
+{
+    pub(super) fn new(sink: W) -> Self {
+        Self { sink, cut: false }
+    }
+
+    /// Whether a write to this channel was given up part way.
+    #[cfg(test)]
+    pub(super) fn is_cut(&self) -> bool {
+        self.cut
+    }
+
+    /// Writes all of `bytes`, for as long as the client takes.
+    pub(super) async fn write(&mut self, bytes: &[u8]) -> Relayed {
+        self.write_until(bytes, std::future::pending::<()>()).await
+    }
+
+    /// Flushes the writer, unless the channel is cut.
+    pub(super) async fn flush(&mut self) -> io::Result<()> {
+        if self.cut {
+            return Ok(());
+        }
+        self.sink.flush().await
+    }
+
+    /// Writes all of `bytes` unless `give_up` resolves while the write
+    /// waits. The write is polled first, so bytes the channel can take at
+    /// once still go out after `give_up` has resolved; only a write that
+    /// would wait is given up, and that cuts the channel.
+    async fn write_until(&mut self, bytes: &[u8], give_up: impl Future<Output = ()>) -> Relayed {
+        if self.cut {
+            return Relayed::Cut;
+        }
+        // Left set if this write is dropped before it returns.
+        self.cut = true;
+        let relayed = tokio::select! {
+            biased;
+            res = self.sink.write_all(bytes) => match res {
+                Ok(()) => Relayed::Written,
+                Err(err) => Relayed::Failed(err),
+            },
+            () = give_up => Relayed::Lost,
+        };
+        self.cut = matches!(relayed, Relayed::Lost);
+        relayed
+    }
+}
+
+/// Writes all of `bytes` to the client's channel unless the client is lost
+/// first ([`until_client_lost`]).
+///
+/// A russh channel writer at zero window waits for a window grant, and a
+/// session that has died sends none and wakes nothing, so the write alone
+/// would wait forever on a client that is gone. Racing it against the loss,
+/// which the input pump signals in `end`, bounds every such wait by it. A
+/// client that is only slow is never cut off: until it is lost the write
+/// waits for as long as it takes. The write is polled first, so bytes the
+/// channel can take now still go out after the loss; only a write that
+/// would wait is given up.
+pub(super) async fn write_unless_lost<W>(
+    out: &mut ChannelOut<W>,
+    bytes: &[u8],
+    end: &watch::Receiver<Option<ExecEnd>>,
+) -> Relayed
+where
+    W: AsyncWrite + Unpin,
+{
+    out.write_until(bytes, until_client_lost(end)).await
+}
+
+/// [`write_unless_lost`] for the output of a process still being waited
+/// on: while the write waits on the client, the process is waited on too.
+///
+/// Everything [`bridge_one`] does on the process's behalf happens inside
+/// `wait`: an exit is seen there, and a destroy, an exec timeout or a stop
+/// ends the process from there. A write parked behind a client that does
+/// not read would otherwise hold all of that up. An exit seen here is put
+/// in `child_exit` and does not stop the write: the output still belongs to
+/// the client, and a live client gets every byte before the status. Once
+/// `child_exit` is set the process is not waited on again.
+///
+/// What this does not do: a command that a destroy, timeout or stop ended
+/// here has its status recorded, but the status, and the notice that names
+/// the destroy, reach the client only once this write is done. A client
+/// that is alive and not reading holds them until it reads or is lost.
+pub(super) async fn relay_output<W, P>(
+    out: &mut ChannelOut<W>,
+    bytes: &[u8],
+    end: &watch::Receiver<Option<ExecEnd>>,
+    process: &mut P,
+    child_exit: &mut Option<io::Result<Option<i32>>>,
+) -> Relayed
+where
+    W: AsyncWrite + Unpin,
+    P: Process,
+{
+    // Polled after the write (`write_until`); in it the process comes
+    // before the loss, so an exit that comes with the loss is kept as the
+    // status rather than lost to a kill of a process already gone.
+    let lost = async {
+        if child_exit.is_none() {
+            tokio::select! {
+                biased;
+                status = process.wait() => *child_exit = Some(status),
+                () = until_client_lost(end) => return,
+            }
+        }
+        until_client_lost(end).await;
+    };
+    out.write_until(bytes, lost).await
+}
+
+/// Resolves once the client is lost ([`ExecEnd::ClientLost`]); never, if
+/// the end's sender is gone without that.
+///
+/// The one end a channel write is given up for. An input bound
+/// ([`ExecEnd::InputHeldOver`], [`ExecEnd::InputHeldUnstarted`]) ends the
+/// exec between writes, as it did before writes were raced: the client is
+/// still there, so a write under way finishes and the client then gets the
+/// notice that names the bound. Waits on a clone of `end`, so an end it
+/// passes over is still unseen for the `changed()` in [`bridge_one`]'s loop.
+pub(super) async fn until_client_lost(end: &watch::Receiver<Option<ExecEnd>>) {
+    let mut end = end.clone();
+    let lost = end
+        .wait_for(|value| matches!(value, Some(ExecEnd::ClientLost)))
+        .await
+        .is_ok();
+    if !lost {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Logs the end the bridge is about to end an exec for.
+pub(super) fn log_end(channel_id: &impl Display, end: ExecEnd) {
+    match end {
+        ExecEnd::ClientLost => tracing::warn!(
+            %channel_id,
+            "exec: ssh client disconnected; killing child",
+        ),
+        ExecEnd::InputHeldOver(bound) => tracing::warn!(
+            %channel_id, ?bound,
+            "exec: the command's unread input crossed a bound; ending the exec",
+        ),
+        ExecEnd::InputHeldUnstarted(bound) => tracing::warn!(
+            %channel_id, ?bound,
+            "exec: the command started after its wait at an input bound ran out; ending the exec",
+        ),
+    }
 }
 
 /// Reads and discards a grandchild's inherited stdio for as long as it

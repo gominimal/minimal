@@ -390,18 +390,27 @@ impl Client {
 
     /// The SSH handshake over an already-connected stream: version exchange
     /// and `none` auth as `username`, bounded by [`HANDSHAKE_TIMEOUT`] — a
-    /// connect is not proof anyone is home (#730).
-    async fn handshake(
-        stream: tokio::net::UnixStream,
+    /// connect is not proof anyone is home (#730). The stream is the
+    /// daemon's Unix socket in the product; tests pass an in-memory pipe.
+    async fn handshake<S>(
+        stream: S,
         username: &str,
         sock_path: &Path,
-    ) -> Result<russh::client::Handle<MinimalClientHandler>, anyhow::Error> {
+    ) -> Result<russh::client::Handle<MinimalClientHandler>, anyhow::Error>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         // The client deliberately runs without keepalives: a laptop closed
         // for an hour should reconnect transparently on wake rather than have
         // the link torn down mid-sleep. The server's long-interval keepalive
         // is the only liveness mechanism, and it no longer reaps
         // idle-but-alive sessions.
         let config = Arc::new(russh::client::Config::default());
+        // The library's session loop writes its whole send buffer before it
+        // reads again, and so may the daemon's, including a VM guest that
+        // predates this. Reading ahead while a write is blocked keeps the two
+        // from waiting on each other.
+        let stream = common::read_while_writing::ReadWhileWriting::new(stream);
         let handshake = async {
             let mut handle = russh::client::connect_stream(config, stream, MinimalClientHandler)
                 .await
@@ -3240,5 +3249,361 @@ mod rpc_status_tests {
         );
         drop(client);
         server.abort();
+    }
+}
+
+/// The stall the transport wrapper ends. The library's session loop, on the client and on the
+/// daemon alike, writes its whole send buffer before it reads again. Over a pipe far smaller
+/// than a channel window, an exec that relays stdin and stdout at once puts both loops in that
+/// write, each waiting for the other to read. The probe tests make that state certain: the
+/// daemon stops reading, the client's write blocks, and then the daemon sends. The echo tests
+/// run a stand-in daemon that echoes 4 MiB, with the wrapper on one end only.
+#[cfg(test)]
+mod duplex_transport_tests {
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use common::read_while_writing::test_util::Probe;
+    use russh::ChannelMsg;
+
+    /// The in-memory pipe's buffer each way: the size of a macOS Unix socket's, where the stall
+    /// was seen, and far below one channel window (2 MiB).
+    const PIPE_BYTES: usize = 8 * 1024;
+
+    /// What the client sends and the stand-in daemon echoes: more than a channel window plus the
+    /// pipe in each direction, so the echo needs the wrapper.
+    const PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+
+    /// What the client sends to a daemon that has stopped reading: far more than the pipe holds,
+    /// and within the daemon's window, so the client's write blocks.
+    const SENT_BYTES: usize = 1024 * 1024;
+
+    /// What the stand-in daemon sends while the client's write is blocked: far more than the
+    /// pipe holds, and within the client's window and read-ahead cap.
+    const SPOKEN_BYTES: usize = 256 * 1024;
+
+    /// The bound on one echo, and on each wait the probe tests expect to end. Real time: the
+    /// library's own timers run here.
+    const BOUND: Duration = Duration::from_secs(60);
+
+    /// How long the probe control watches for bytes that by construction cannot move.
+    const CONTROL_WAIT: Duration = Duration::from_secs(2);
+
+    const STALLED: &str =
+        "the echo stalled for 60 s: both session loops are waiting for the other to read";
+
+    /// Set to `1` to run [`bare_ends_can_wait_on_each_other`], whose outcome depends on
+    /// scheduling, by hand; unset, it returns at once.
+    const BARE_ECHO_BY_HAND: &str = "MINIMAL_BARE_ECHO_STALL";
+
+    /// `len` bytes with a period of 251 (a prime), so a dropped, repeated or swapped chunk does
+    /// not compare equal.
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// A stand-in daemon whose session channels echo like `cat`: every byte that arrives goes
+    /// back, then exit status 0, EOF and close once the client's EOF has arrived. Its read side
+    /// never waits on its write side (an unbounded queue joins them, as the daemon's input pump
+    /// holds stdin), so a stall can only come from the transport.
+    struct Echo;
+
+    impl russh::server::Handler for Echo {
+        type Error = russh::Error;
+
+        async fn auth_none(&mut self, _: &str) -> Result<russh::server::Auth, Self::Error> {
+            Ok(russh::server::Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            channel: russh::Channel<russh::server::Msg>,
+            reply: russh::server::ChannelOpenHandle,
+            _: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            let (mut rd, wr) = channel.split();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+            tokio::spawn(async move {
+                // Read until the channel ends; the client's EOF ends the echo queue.
+                let mut tx = Some(tx);
+                while let Some(msg) = rd.wait().await {
+                    match msg {
+                        ChannelMsg::Data { data } => {
+                            if let Some(tx) = &tx {
+                                drop(tx.send(data.to_vec()));
+                            }
+                        }
+                        ChannelMsg::Eof => tx = None,
+                        _ => {}
+                    }
+                }
+            });
+            tokio::spawn(async move {
+                while let Some(data) = rx.recv().await {
+                    if wr.data(data.as_slice()).await.is_err() {
+                        return;
+                    }
+                }
+                drop(wr.exit_status(0).await);
+                drop(wr.eof().await);
+                drop(wr.close().await);
+            });
+            Ok(())
+        }
+    }
+
+    /// A stand-in daemon whose one session channel sends [`SPOKEN_BYTES`] once `go` fires, and
+    /// does nothing else.
+    struct Speaker {
+        go: Option<tokio::sync::oneshot::Receiver<()>>,
+    }
+
+    impl russh::server::Handler for Speaker {
+        type Error = russh::Error;
+
+        async fn auth_none(&mut self, _: &str) -> Result<russh::server::Auth, Self::Error> {
+            Ok(russh::server::Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            channel: russh::Channel<russh::server::Msg>,
+            reply: russh::server::ChannelOpenHandle,
+            _: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            let go = self.go.take();
+            tokio::spawn(async move {
+                // The read half lives as long as the task, so the channel stays whole.
+                let (_rd, wr) = channel.split();
+                let Some(go) = go else {
+                    return;
+                };
+                if go.await.is_err() {
+                    return;
+                }
+                drop(wr.data(pattern(SPOKEN_BYTES).as_slice()).await);
+            });
+            Ok(())
+        }
+    }
+
+    /// The stand-in daemon's configuration: a fresh host key, `none` auth answered at once.
+    fn stand_in_config() -> Arc<russh::server::Config> {
+        let key = russh::keys::PrivateKey::random(
+            &mut russh::keys::key::safe_rng(),
+            russh::keys::Algorithm::Ed25519,
+        )
+        .unwrap();
+        Arc::new(russh::server::Config {
+            keys: vec![key],
+            auth_rejection_time_initial: Some(Duration::ZERO),
+            ..Default::default()
+        })
+    }
+
+    /// Runs the echoing stand-in daemon's side of a connection over `stream`, through the
+    /// wrapper when `wrap` is set.
+    fn serve(stream: tokio::io::DuplexStream, wrap: bool) {
+        let config = stand_in_config();
+        tokio::spawn(async move {
+            let session = if wrap {
+                let stream = common::read_while_writing::ReadWhileWriting::new(stream);
+                russh::server::run_stream(config, stream, Echo).await
+            } else {
+                russh::server::run_stream(config, stream, Echo).await
+            };
+            if let Ok(session) = session {
+                drop(session.await);
+            }
+        });
+    }
+
+    /// Runs the speaking stand-in daemon's side of a connection over `stream`, bare, as a VM
+    /// guest built before the wrapper.
+    fn serve_speaker(
+        stream: Probe<tokio::io::DuplexStream>,
+        go: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let config = stand_in_config();
+        tokio::spawn(async move {
+            let speaker = Speaker { go: Some(go) };
+            if let Ok(session) = russh::server::run_stream(config, stream, speaker).await {
+                drop(session.await);
+            }
+        });
+    }
+
+    /// A client without the wrapper, as a CLI built before it was.
+    async fn bare_client<S>(stream: S) -> russh::client::Handle<crate::MinimalClientHandler>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let config = Arc::new(russh::client::Config::default());
+        let mut handle = russh::client::connect_stream(config, stream, crate::MinimalClientHandler)
+            .await
+            .unwrap();
+        let auth = handle.authenticate_none("minimal-cli").await.unwrap();
+        assert!(auth.success(), "the stand-in daemon accepts `none`");
+        handle
+    }
+
+    /// The daemon stops reading and the client sends [`SENT_BYTES`], so the client's session
+    /// loop is blocked in its write. Then the daemon sends [`SPOKEN_BYTES`]. Returns how many
+    /// bytes the daemon's transport accepted after that, waiting up to `wait` for all of them.
+    ///
+    /// With `wrapped_client`, the client goes through [`crate::Client::handshake`], which wraps
+    /// its transport; without, it is bare. A bare client blocked in a write never reads again,
+    /// so at most the pipe's [`PIPE_BYTES`] can be accepted. That holds by construction, not by
+    /// timing: nothing reads the client's end while its write is blocked.
+    async fn daemon_progress_while_the_client_is_blocked(
+        wrapped_client: bool,
+        wait: Duration,
+    ) -> usize {
+        let (client_end, daemon_end) = tokio::io::duplex(PIPE_BYTES);
+        let (client_end, mut client_probe) = Probe::new(client_end);
+        let (daemon_end, mut daemon_probe) = Probe::new(daemon_end);
+        let (go, speak) = tokio::sync::oneshot::channel();
+        serve_speaker(daemon_end, speak);
+        let handle = if wrapped_client {
+            crate::Client::handshake(client_end, "minimal-cli", Path::new("duplex"))
+                .await
+                .unwrap()
+        } else {
+            bare_client(client_end).await
+        };
+        let (_rd, wr) = handle.channel_open_session().await.unwrap().split();
+
+        daemon_probe.pause_reads();
+        let sent = pattern(SENT_BYTES);
+        let _sender = tokio::spawn(async move { wr.data(sent.as_slice()).await });
+        let blocked =
+            tokio::time::timeout(BOUND, client_probe.wait_for_writes(|w| w.blocked)).await;
+        assert!(
+            matches!(blocked, Ok(true)),
+            "the client's write must block on a daemon that does not read"
+        );
+
+        let before = daemon_probe.writes().accepted;
+        go.send(()).expect("the stand-in daemon waits for the word");
+        let _reached = tokio::time::timeout(
+            wait,
+            daemon_probe.wait_for_writes(|w| w.accepted >= before + SPOKEN_BYTES),
+        )
+        .await;
+        daemon_probe.writes().accepted - before
+    }
+
+    /// The client wrapped, through the real wiring in [`crate::Client::handshake`], and the
+    /// daemon bare: while the client's write is blocked, it still takes in what the daemon
+    /// sends, so the daemon's write goes through.
+    #[tokio::test]
+    async fn the_client_reads_while_its_write_is_blocked() {
+        let accepted = daemon_progress_while_the_client_is_blocked(true, BOUND).await;
+        assert!(
+            accepted >= SPOKEN_BYTES,
+            "the daemon got {accepted} of {SPOKEN_BYTES} bytes out to a wrapped client"
+        );
+    }
+
+    /// The control for the test above: a bare client blocked in its write takes in no more than
+    /// the pipe holds. This is what shows that test needs the wrapper.
+    #[tokio::test]
+    async fn a_bare_client_blocked_in_a_write_reads_nothing() {
+        let accepted = daemon_progress_while_the_client_is_blocked(false, CONTROL_WAIT).await;
+        assert!(
+            accepted <= PIPE_BYTES,
+            "a bare client blocked in a write read {accepted} bytes, more than the pipe holds"
+        );
+    }
+
+    /// Sends `payload` on a fresh session channel while reading the echo, as `min box exec`
+    /// relays stdin and stdout at once. Returns what came back and the exit status.
+    async fn round_trip(
+        handle: &russh::client::Handle<crate::MinimalClientHandler>,
+        payload: Arc<Vec<u8>>,
+    ) -> (Vec<u8>, Option<u32>) {
+        let (mut rd, wr) = handle.channel_open_session().await.unwrap().split();
+        let writer = tokio::spawn(async move {
+            wr.data(payload.as_slice()).await.unwrap();
+            wr.eof().await.unwrap();
+        });
+        let mut echoed = Vec::with_capacity(PAYLOAD_BYTES);
+        let mut exit_status = None;
+        while let Some(msg) = rd.wait().await {
+            match msg {
+                ChannelMsg::Data { data } => echoed.extend_from_slice(&data),
+                ChannelMsg::ExitStatus { exit_status: code } => exit_status = Some(code),
+                ChannelMsg::Eof => break,
+                _ => {}
+            }
+        }
+        writer.await.unwrap();
+        (echoed, exit_status)
+    }
+
+    fn check(payload: &[u8], echoed: &[u8], exit_status: Option<u32>) {
+        assert_eq!(echoed.len(), payload.len(), "every byte came back");
+        assert!(echoed == payload, "the bytes came back in order");
+        assert_eq!(exit_status, Some(0), "and then the exit status");
+    }
+
+    /// The client wrapped, the daemon bare (as a VM guest built before the wrapper): the echo
+    /// completes, through the real wiring in [`crate::Client::handshake`].
+    #[tokio::test]
+    async fn the_client_alone_breaks_the_wait() {
+        let (client_end, daemon_end) = tokio::io::duplex(PIPE_BYTES);
+        serve(daemon_end, false);
+        let payload = Arc::new(pattern(PAYLOAD_BYTES));
+        let echo = async {
+            let handle = crate::Client::handshake(client_end, "minimal-cli", Path::new("duplex"))
+                .await
+                .unwrap();
+            round_trip(&handle, payload.clone()).await
+        };
+        let (echoed, exit_status) = tokio::time::timeout(BOUND, echo).await.expect(STALLED);
+        check(&payload, &echoed, exit_status);
+    }
+
+    /// The daemon wrapped, the client bare (as a CLI built before the wrapper): the echo
+    /// completes. The daemon's own wiring, in minimald's `Connection::from_stream`, has its own
+    /// probe test there; this stand-in wraps its end the same way.
+    #[tokio::test]
+    async fn the_daemon_alone_breaks_the_wait() {
+        let (client_end, daemon_end) = tokio::io::duplex(PIPE_BYTES);
+        serve(daemon_end, true);
+        let payload = Arc::new(pattern(PAYLOAD_BYTES));
+        let echo = async {
+            let handle = bare_client(client_end).await;
+            round_trip(&handle, payload.clone()).await
+        };
+        let (echoed, exit_status) = tokio::time::timeout(BOUND, echo).await.expect(STALLED);
+        check(&payload, &echoed, exit_status);
+    }
+
+    /// Neither end wrapped. Whether a free-running echo stalls depends on when each session loop
+    /// runs, so no gate may depend on it: `just ci` runs the ignored tests on Linux, and there
+    /// this one returns at once unless [`BARE_ECHO_BY_HAND`] is set to `1`. The probe control
+    /// above is the one that always runs. Run it by hand, with that set, to see the stall in a
+    /// whole echo.
+    #[tokio::test]
+    #[ignore = "the stall depends on scheduling; run by hand with MINIMAL_BARE_ECHO_STALL=1"]
+    async fn bare_ends_can_wait_on_each_other() {
+        if std::env::var(BARE_ECHO_BY_HAND).as_deref() != Ok("1") {
+            eprintln!("skipping: set {BARE_ECHO_BY_HAND}=1 to run the whole bare echo by hand");
+            return;
+        }
+        let (client_end, daemon_end) = tokio::io::duplex(PIPE_BYTES);
+        serve(daemon_end, false);
+        let payload = Arc::new(pattern(PAYLOAD_BYTES));
+        let echo = async {
+            let handle = bare_client(client_end).await;
+            round_trip(&handle, payload.clone()).await
+        };
+        if tokio::time::timeout(BOUND, echo).await.is_ok() {
+            panic!("two bare ends finished the echo: this pipe did not reproduce the stall");
+        }
     }
 }

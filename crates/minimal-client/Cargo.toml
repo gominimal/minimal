@@ -11,6 +11,9 @@ license.workspace = true
 anyhow.workspace = true
 async-compression.workspace = true
 async-tar.workspace = true
+# The transport wrapper that keeps the SSH session loop reading while it
+# writes. Already in the build through boxes.
+common.workspace = true
 constcat.workspace = true
 indicatif.workspace = true
 # `libc` is only for the winsize ioctls (TIOCGWINSZ/TIOCSWINSZ) in
@@ -36,6 +39,8 @@ tracing.workspace = true
 version.workspace = true
 
 [dev-dependencies]
+# The transport probe the read-ahead wiring tests put under each session loop.
+common = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 # A layer that reads the `client.rpc` span's status in the RPC tests.
 tracing-subscriber.workspace = true
