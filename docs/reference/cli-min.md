@@ -399,9 +399,9 @@ When the box takes a number, the command prints one line on stderr, also with
 `--detach`. The line names the name that the box took and the name that it did
 not get. When you can read the box that has that name, the line names that box
 and its state. It also names `min box attach`, `min box restart` or
-`min box logs` for that box. When the name is reserved, or has the form of a
-box id, the line says so. The line always names `min box prune`, which removes
-stopped boxes.
+`min box logs` for that box. When the host reserves the name, or the name has
+the form of a box id, the line says so. The line always names `min box prune`,
+which removes stopped boxes.
 
 | Flag | Description |
 |------|-------------|
@@ -498,9 +498,9 @@ When the box takes a number, the command prints one line on stderr, also with
 `--detach`. The line names the name that the box took and the name that it did
 not get. When you can read the box that has that name, the line names that box
 and its state. It also names `min box attach`, `min box restart` or
-`min box logs` for that box. When the name is reserved, or has the form of a
-box id, the line says so. The line always names `min box prune`, which removes
-stopped boxes.
+`min box logs` for that box. When the host reserves the name, or the name has
+the form of a box id, the line says so. The line always names `min box prune`,
+which removes stopped boxes.
 
 | Flag | Description |
 |------|-------------|
