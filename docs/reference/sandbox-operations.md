@@ -66,8 +66,8 @@ The flags differ: `mip add` requires one of `--runtime`, `--build`, or
 
 ### `package search <TERM>` {#search}
 
-Lists the packages whose names match the search term. `min search` is the
-same command.
+Lists up to eight packages whose names are closest to the search term.
+`min search` is the same command.
 
 ### `check [<OPTIONS>] [FILTER_NAMES...]` {#check}
 
@@ -96,12 +96,21 @@ You cannot run an interactive task from inside a sandbox. The helper refuses
 it with `cannot run interactive tasks from within an environment`. Run it
 from the host instead.
 
-In a box, the task also gets the current directory and the exported
-environment variables of the shell that runs `min task run`. When the
-helper's stdin is a pipe or a file, the task reads that stdin. The helper
-exits with the task's exit code. When the connection closes before the task
-reports its exit code, the helper prints an error and exits 125. Ctrl-C ends
-the helper with 130, and the helper does not print an error.
+In a box, a task that sets [`inherit_cwd = true`](./tasks.md) starts in the
+current directory when that directory is under `/workbench`. When the
+directory is outside `/workbench`, the helper prints a line that says so,
+and the task starts in `/workbench`. Any other task starts in `/workbench`.
+
+From the shell that runs `min task run`, the task gets only the variables
+that it declares with [`{ inherit = true }`](./tasks.md#env_vars). The
+shell's other variables do not reach the task, and a declared variable that
+the shell does not set makes Minimal refuse the run.
+
+When the helper's stdin is a pipe or a file, the task reads that stdin.
+The helper exits with the task's exit code. When the connection closes
+before the task reports its exit code, the helper prints an error and exits
+125. Ctrl-C ends the helper with 130, and the helper does not print an
+error.
 
 `min task run` is the in-sandbox equivalent of [`mip run`](./cli-mip.md#run).
 
@@ -118,7 +127,8 @@ refuses a project package that needs the network. See
 ### `package patched-build <PACKAGE>` {#package-patched-build}
 
 Builds the package in a clean room against the cached builds of its
-dependencies. It does not rebuild those dependencies first. Use it to iterate quickly on the build of one package.
+dependencies. It does not rebuild those dependencies first. Use it to
+iterate quickly on the build of one package.
 
 It writes the result to the local cache, apart from the builds that a
 normal build or install uses. A later patched build of a package that
