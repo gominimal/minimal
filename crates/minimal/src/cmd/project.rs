@@ -561,8 +561,9 @@ impl InitOutcome {
 /// missing-mfile prompt.
 ///
 /// The file is always written in the entry shape (BCLI-017):
-/// [`to_entry_shape`] adds the `[boxes.dev]` session entry to the
-/// initializer's `[defaults.task]` and `[defaults.session]`.
+/// [`to_entry_shape`] moves the initializer's session packages into the
+/// `[sessions.default]` session entry, and writes no `[defaults.<type>]`
+/// table.
 pub(crate) fn run_init_flow(
     config: mctx::Config,
     skip_confirm: bool,
@@ -766,44 +767,50 @@ fn check_entry_name(entry: &str) -> Result<(), InitRefusal> {
 
 /// Rewrite the scaffold that the project initializer generates into the
 /// entry shape (BCLI-017): the file declares one session entry,
-/// `[boxes.dev]`. The initializer writes `[defaults.task]` and
-/// `[defaults.session]`, and those are kept as they are. A legacy
-/// `[session]` table still becomes `[defaults.session]`, and a legacy
-/// `[defaults] state_key` becomes `[defaults.task] state_key` (BOX-050,
-/// BOX-051).
+/// `[sessions.default]`, so the first `min session start` names its box
+/// after the project. The scaffold writes no `[defaults.<type>]` table.
+/// The keys of the generated `[defaults.session]`, and of a legacy
+/// `[session]`, move into `[sessions.default]` with their values and
+/// order. `[defaults.task]` and a legacy `[defaults] state_key` are
+/// removed. `[defaults]` is removed when nothing is left in it, and any
+/// other key in it is kept.
 pub(crate) fn to_entry_shape(legacy: &str) -> Result<String, anyhow::Error> {
-    use toml_edit::{DocumentMut, Item, Table, value};
+    use toml_edit::{DocumentMut, Item, Table};
     let mut doc: DocumentMut = legacy
         .parse()
         .context("reading the generated minimal.toml")?;
-    let state_key = doc
-        .get_mut("defaults")
-        .and_then(Item::as_table_mut)
-        .and_then(|defaults| defaults.remove("state_key"));
-    let session = doc.remove("session");
-
-    let defaults = doc
-        .entry("defaults")
-        .or_insert(toml_edit::table())
-        .as_table_mut()
-        .context("the generated [defaults] is not a table")?;
-    defaults.set_implicit(true);
-    if let Some(Item::Table(mut session)) = session {
-        session.decor_mut().clear();
-        defaults.insert("session", Item::Table(session));
-    }
-    if let Some(state_key) = state_key {
-        let mut task = Table::new();
-        task.insert("state_key", state_key);
-        defaults.insert("task", Item::Table(task));
-    }
 
     let mut entry = Table::new();
-    entry.insert("type", value("session"));
-    let mut boxes = Table::new();
-    boxes.set_implicit(true);
-    boxes.insert("dev", Item::Table(entry));
-    doc.insert("boxes", Item::Table(boxes));
+    let mut take = |item: Option<Item>| -> Result<(), anyhow::Error> {
+        match item {
+            None => Ok(()),
+            Some(Item::Table(table)) => {
+                for (key, value) in table {
+                    entry.insert(&key, value);
+                }
+                Ok(())
+            }
+            Some(_) => bail!("the generated session table is not a table"),
+        }
+    };
+    take(doc.remove("session"))?;
+    if let Some(defaults) = doc.get_mut("defaults") {
+        let defaults = defaults
+            .as_table_mut()
+            .context("the generated [defaults] is not a table")?;
+        defaults.remove("state_key");
+        defaults.remove("task");
+        take(defaults.remove("session"))?;
+        if defaults.is_empty() {
+            doc.remove("defaults");
+        }
+    }
+
+    // `[sessions.*]` sets the type `session`, so the entry has no `type` key.
+    let mut sessions = Table::new();
+    sessions.set_implicit(true);
+    sessions.insert(mfile::entry::DEFAULT_ENTRY_NAME, Item::Table(entry));
+    doc.insert("sessions", Item::Table(sessions));
     Ok(doc.to_string())
 }
 
@@ -1080,7 +1087,7 @@ pub async fn cmd_init(global: &GlobalArgs, args: InitArgs) -> Result<(), mctx::E
             tracing::info!(
                 verb = "init",
                 shape = "entry",
-                entry = "dev",
+                entry = mfile::entry::DEFAULT_ENTRY_NAME,
                 outcome = if outcome.result_line().is_some() {
                     "written"
                 } else {
@@ -1405,24 +1412,35 @@ mod init_tests {
             doc.get("session").is_none(),
             "no legacy [session]:\n{shaped}"
         );
-        assert!(
-            doc["defaults"].get("state_key").is_none(),
-            "no legacy state_key:\n{shaped}"
-        );
+        assert!(doc.get("defaults").is_none(), "no [defaults]:\n{shaped}");
+        let entry = doc["sessions"]["default"]
+            .as_table()
+            .unwrap_or_else(|| panic!("[sessions.default] is a table:\n{shaped}"));
+        assert!(entry.get("type").is_none(), "no type key:\n{shaped}");
+        assert!(doc.get("boxes").is_none(), "no [boxes]:\n{shaped}");
         assert_eq!(
-            doc["boxes"]["dev"]["type"].as_str(),
-            Some("session"),
-            "{shaped}"
-        );
-        assert_eq!(
-            doc["defaults"]["task"]["state_key"].as_str(),
-            Some("dev"),
-            "{shaped}"
-        );
-        assert_eq!(
-            doc["defaults"]["session"]["packages"],
+            doc["sessions"]["default"]["packages"],
             toml::Value::Array(vec!["base".into(), "vim".into(), "git".into()]),
             "{shaped}"
+        );
+        assert!(!shaped.contains("# min session attach"), "{shaped}");
+
+        // A legacy [session] moves into the entry too, a legacy
+        // state_key is removed, and any other [defaults] key is kept.
+        let legacy = "[defaults]\nstate_key = \"dev\"\n\n[defaults.build]\nx = 1\n\n\
+                      [session]\npackages = [\"base\"]\n";
+        let shaped_legacy = to_entry_shape(legacy).expect("the legacy scaffold converts");
+        let legacy_doc: toml::Table = shaped_legacy.parse().expect("it parses");
+        assert!(legacy_doc.get("session").is_none(), "{shaped_legacy}");
+        assert!(
+            legacy_doc["defaults"].get("state_key").is_none(),
+            "{shaped_legacy}"
+        );
+        assert_eq!(legacy_doc["defaults"]["build"]["x"].as_integer(), Some(1));
+        assert_eq!(
+            legacy_doc["sessions"]["default"]["packages"],
+            toml::Value::Array(vec!["base".into()]),
+            "{shaped_legacy}"
         );
         assert_eq!(doc["upstream"]["locked_commit"].as_str(), Some("abc123"));
         assert!(shaped.starts_with("# Generated by `min init`"), "{shaped}");
@@ -1440,9 +1458,9 @@ mod init_tests {
         let after_text = read(&dir);
         let after: toml::Table = after_text.parse().unwrap();
         let boxes = after["boxes"].as_table().unwrap();
-        assert_eq!(boxes.len(), 2, "{after_text}");
+        assert_eq!(boxes.len(), 1, "{after_text}");
         assert_eq!(boxes["build"]["type"].as_str(), Some("task"));
-        assert_eq!(boxes["dev"], before["boxes"]["dev"]);
+        assert_eq!(after["sessions"]["default"], before["sessions"]["default"]);
         assert_eq!(
             after["upstream"], before["upstream"],
             "the rest of the file is kept"
@@ -1466,7 +1484,7 @@ mod init_tests {
     // BCLI-018: a [box_types] entry with no extends is invalid minimal.toml.
     #[test]
     fn init_box_type_without_extends_exit3_appends_nothing() {
-        let original = "[box_types.web]\nimage = \"x\"\n\n[boxes.dev]\ntype = \"session\"\n";
+        let original = "[box_types.web]\nimage = \"x\"\n\n[sessions.default]\n";
         let dir = project(original);
         let refusal = run(&dir, &["init", "x", "--type", "web"]).unwrap_err();
         assert_eq!(refusal.code, 3, "{}", refusal.message);
@@ -1494,8 +1512,7 @@ mod init_tests {
     // BCLI-018, BOX-063
     #[test]
     fn init_refused_type_exit3_appends_nothing() {
-        let original =
-            "[box_types.reviewer]\nextends = \"agent\"\n\n[boxes.dev]\ntype = \"session\"\n";
+        let original = "[box_types.reviewer]\nextends = \"agent\"\n\n[sessions.default]\n";
         let dir = project(original);
         for ty in ["agent", "service", "build", "container-build", "reviewer"] {
             let refusal = run(&dir, &["init", "bot", "--type", ty]).unwrap_err();
@@ -1647,7 +1664,7 @@ mod init_tests {
     // exit 3, and the refusal names the file.
     #[test]
     fn init_invalid_mfile_exit3_appends_nothing() {
-        const BROKEN: &str = "[boxes.dev\ntype = \"session\"\n";
+        const BROKEN: &str = "[sessions.default\npackages = [\"base\"]\n";
         let root = project(BROKEN);
         let sub = root.path().join("src");
         std::fs::create_dir(&sub).expect("create the subdirectory");

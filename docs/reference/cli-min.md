@@ -385,6 +385,24 @@ host names the box `<project>-<TASK>`, and adds `-<n>` when a box already holds
 that name. The box stays when the task ends: `min box show <NAME>` shows it
 and `min box rm <NAME>` removes it.
 
+A name from `--name` or the task's `[box] name` is a written name. When a box
+on the host has the written name, in any state, the command refuses with exit
+code 2 and creates nothing. The refusal says that another box has the name.
+When you can read the box that has the name, the refusal names that box and
+its state. Where one fits, it names the command that goes back into that box,
+as on [`box start`](#box-start). It also names `min box rm <name>`, or
+`min box rm --force <name>` for a running box, which removes that box and
+frees the name. Every refusal names `min task run <TASK> --name <name>`, which
+starts a box from the task under another name.
+
+When the box takes a number, the command prints one line on stderr, also with
+`--detach`. The line names the name that the box took and the name that it did
+not get. When you can read the box that has that name, the line names that box
+and its state. It also names `min box attach`, `min box restart` or
+`min box logs` for that box. When the host reserves the name, or the name has
+the form of a box id, the line says so. The line always names `min box prune`,
+which removes stopped boxes.
+
 | Flag | Description |
 |------|-------------|
 | `--name <NAME>` | Name the box. This replaces the `[box] name` in minimal.toml |
@@ -435,6 +453,25 @@ The command takes every override flag of [`session start`](#session-start),
 with the same meaning. A task entry refuses `--ingress` and `--loadout` with
 exit code 2.
 
+When the name comes from `--name` or the entry's `[box] name`, and a box on
+the host has that name in any state, the command refuses with exit code 2 and
+creates nothing. The refusal says that the name is taken. When you can read
+the box that has the name, the refusal also names that box and its state. It
+names `min box attach <name>` for a box with a terminal, or
+`min box restart <name>` for a box that runs until stopped. It also names
+`min box rm <name>`, or `min box rm --force <name>` for a running box, which
+removes that box and frees the name. Every refusal names `--name <name>`,
+which starts a box from the entry under another name.
+
+When the name is derived and taken, the box takes the name with `-<n>` added.
+When the command does not attach this terminal, it prints one line on stderr.
+The line names the name that the box took and the name that it did not get.
+When you can read the box that has that name, the line names that box, its
+state, and `min box attach`, `min box restart` or `min box logs` for it. A
+reserved name, or a name in the form of a box id, is named as such. The line
+always names `min box prune`, which removes stopped boxes. A start that
+attaches this terminal prints no such line.
+
 ### `box run`
 
 ```
@@ -446,6 +483,24 @@ exits with its exit code. The command's stdin, stdout and stderr are the
 box's. The box takes the name given with `--name`, else the entry's
 `[box] name`. Without either, the host names the box `<project>-<ENTRY>`,
 and adds `-<n>` when a box already holds that name.
+
+A name from `--name` or the entry's `[box] name` is a written name. When a box
+on the host has the written name, in any state, the command refuses with exit
+code 2 and creates nothing. The refusal says that another box has the name.
+When you can read the box that has the name, the refusal names that box and
+its state. Where one fits, it names the command that goes back into that box,
+as on [`box start`](#box-start). It also names `min box rm <name>`, or
+`min box rm --force <name>` for a running box, which removes that box and
+frees the name. Every refusal names `min box run <ENTRY> --name <name>`, which
+starts a box from the entry under another name.
+
+When the box takes a number, the command prints one line on stderr, also with
+`--detach`. The line names the name that the box took and the name that it did
+not get. When you can read the box that has that name, the line names that box
+and its state. It also names `min box attach`, `min box restart` or
+`min box logs` for that box. When the host reserves the name, or the name has
+the form of a box id, the line says so. The line always names `min box prune`,
+which removes stopped boxes.
 
 | Flag | Description |
 |------|-------------|
@@ -738,14 +793,30 @@ use another project, give `--repo-dir <DIR>` (short `-C`).
 `min box spec <ENTRY>` shows the spec that `min box start <ENTRY>` sends to
 the host, before any box exists. A comment or a `sources` field names the
 layer that set each value. A secret shows only as its reference, never as its
-value. The output also names the loadouts that `min box start` applies. When
-the entry declares a broker secret, the Box Egress Proxy rows follow.
+value. When the entry declares a broker secret, the Box Egress Proxy rows
+follow.
+
+The output names the loadouts that `min box start` applies, and the spec
+includes their values, as the spec of a started box does. A package, a
+variable or a lifecycle hook from a loadout names that loadout as its layer,
+for example `loadout dev`. Each variable of `env_vars` shows once, with the
+value that the box gets, and names the layer that set that value. With no
+`--loadout` and no `default_loadouts`, the `default` loadout applies: your
+`default` loadout file, or the built-in `default` loadout when there is no
+such file. An entry with `loadout_mode = "sealed"` applies no loadout.
+
+A variable whose name looks like a secret's, such as `GITHUB_TOKEN`, gets a
+warning on stderr. The warning names the layer that set the variable, and
+the loadout file for a variable from a loadout. Put a secret value in a
+`[secrets]` entry to keep it out of the spec.
 
 | Flag | Short | Description |
 |------|-------|-------------|
 | `--output <toml\|json\|yaml>` | `-o` | The format of the spec. The default is `toml` |
 | `--network`, `--ingress`, `--allow-subnets`, `--allow-dns-hosts`, `--allow-protocols`, `--deny-subnets`, `--deny-all-egress` | | Overrides of the entry's `[network]` keys, as on [`session start`](#session-start) |
 | `--loadout <NAME>` | | Apply the named loadout, as on [`session start`](#session-start). Repeatable |
+| `--no-loadouts` | | Apply no loadouts, and not the config file's `default_loadouts` either. Cannot be combined with `--loadout` |
+| `--no-hooks` | | Show the spec with no lifecycle hook, from the loadouts or from `minimal.toml`, as a box started with `--no-hooks` stores it |
 
 A task entry refuses `--ingress` and `--loadout` with exit code 2, as
 `min box start` does.

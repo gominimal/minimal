@@ -782,19 +782,114 @@ impl std::fmt::Display for StartNeedsTerminal {
 
 impl std::error::Error for StartNeedsTerminal {}
 
-/// The refusal of a start whose box name a running box on the host holds
-/// (BCLI-069, BOX-163). It names the holder and `--name`, which starts a box
-/// under another name. `main.rs` ends the command with [`Self::EXIT_CODE`].
+/// The verb that goes back into a box that has a name, as its stored spec
+/// gives it (BCLI-069, BCLI-081).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HolderVerb {
+    /// The spec sets `pty_enabled`: `min box attach <name>`.
+    Attach,
+    /// The spec sets `lifetime = "until_stopped"`: `min box restart <name>`.
+    Restart,
+}
+
+impl HolderVerb {
+    /// The sentence that names the verb for the box `name`.
+    fn sentence(self, name: &str) -> String {
+        match self {
+            Self::Attach => format!("Run min box attach {name} to go back into it."),
+            Self::Restart => format!("Run min box restart {name} to restart it."),
+        }
+    }
+}
+
+/// The verb that goes back into a box, read from the box's stored `spec`
+/// (BCLI-069, BCLI-081): `attach` for a spec that sets `io.pty_enabled`,
+/// else `restart` for one that sets `box.lifetime = "until_stopped"`, else
+/// none. A box with no stored spec has none.
+#[must_use]
+pub(crate) fn holder_verb(spec: Option<&serde_json_lenient::Value>) -> Option<HolderVerb> {
+    let spec = spec?;
+    let pty = spec
+        .get("io")
+        .and_then(|io| io.get("pty_enabled"))
+        .and_then(serde_json_lenient::Value::as_bool)
+        .unwrap_or(false);
+    if pty {
+        return Some(HolderVerb::Attach);
+    }
+    let until_stopped = spec
+        .get("box")
+        .and_then(|section| section.get("lifetime"))
+        .and_then(serde_json_lenient::Value::as_str)
+        == Some("until_stopped");
+    until_stopped.then_some(HolderVerb::Restart)
+}
+
+/// The [`holder_verb`] of the box `id`, from the spec the host stores for
+/// it. `None` when the host cannot give the spec. The failure goes to the
+/// log, and the message names no verb.
+pub(crate) async fn stored_holder_verb(
+    client: &mut client::Client,
+    id: boxes::SessionId,
+) -> Option<HolderVerb> {
+    use minimald_rpc::{Errorable, GetBoxSpec, GetBoxSpecRequest};
+    match client
+        .oneshot_rpc::<GetBoxSpec>(GetBoxSpecRequest { id })
+        .await
+    {
+        Ok(Errorable::Ok(reply)) => holder_verb(reply.spec.as_ref()),
+        Ok(Errorable::Err { error }) => {
+            tracing::debug!(box_id = %id, "the spec of the box that has the name is not readable: {error}");
+            None
+        }
+        Err(error) => {
+            tracing::debug!(box_id = %id, "could not read the spec of the box that has the name: {error:#}");
+            None
+        }
+    }
+}
+
+/// The refusal of a create whose written name a box on the host has, in
+/// any state (BCLI-069, BOX-163). It says that the name is taken. To a
+/// caller who may read the box that has it, it names that box, its state,
+/// the verb that goes back into it, and `min box rm`. It always names
+/// `--name`, which starts a box under another name. `main.rs` ends the
+/// command with [`Self::EXIT_CODE`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartNameHeld {
-    pub verb: StartVerb,
+    /// The command the person typed, such as `min box start`.
+    pub command: &'static str,
     pub entry: String,
     pub refusal: minimald_rpc::HeldNameRefusal,
+    /// The verb that goes back into the box that has the name, from its
+    /// stored spec.
+    pub verb: Option<HolderVerb>,
 }
 
 impl StartNameHeld {
     /// The exit code of the held-name refusal.
     pub const EXIT_CODE: u8 = minimald_rpc::HeldNameRefusal::EXIT_CODE;
+
+    /// The refusal of `command` for `entry`, with the verb that the stored
+    /// spec of the box that has the name gives, when the caller may read
+    /// that box.
+    pub(crate) async fn read(
+        client: &mut client::Client,
+        command: &'static str,
+        entry: &str,
+        refusal: minimald_rpc::HeldNameRefusal,
+    ) -> Self {
+        let verb = match (&refusal.holder_name, refusal.holder) {
+            (Some(_), Some(id)) => stored_holder_verb(client, id).await,
+            _ => None,
+        };
+        Self {
+            command,
+            entry: entry.to_string(),
+            refusal,
+            verb,
+        }
+    }
 }
 
 impl std::fmt::Display for StartNameHeld {
@@ -807,36 +902,122 @@ impl std::fmt::Display for StartNameHeld {
         } = &self.refusal;
         let entry = printable(&self.entry);
         let name = printable(name);
-        // The daemon names the holder and its state only to the person
-        // who may read that box. Otherwise the name is only taken.
-        let state = state
-            .as_deref()
-            .map(|state| format!("{} ", printable(state)))
-            .unwrap_or_default();
-        match (holder_name, holder) {
-            (Some(holder_name), Some(holder)) => write!(
+        write!(f, "Cannot start {entry}. The name {name} is taken.")?;
+        // The daemon names the box that has the name and its state only to
+        // the person who may read that box. Otherwise the name is only taken.
+        if let Some(holder_name) = holder_name {
+            let holder_name = printable(holder_name);
+            let state_word = state.as_deref().map(printable);
+            let state = state_word
+                .as_deref()
+                .map(|state| format!("{state} "))
+                .unwrap_or_default();
+            match holder {
+                Some(holder) => write!(f, " The {state}box {holder_name} ({holder}) has it.")?,
+                None => write!(f, " The {state}box {holder_name} has it.")?,
+            }
+            if let Some(verb) = self.verb {
+                write!(f, " {}", verb.sentence(&holder_name))?;
+            }
+            let force = if state_word.as_deref() == Some("running") {
+                "--force "
+            } else {
+                ""
+            };
+            write!(
                 f,
-                "Cannot start {entry}. The {state}box {holder_name} ({holder}) holds the \
-                 name {name}.",
-                holder_name = printable(holder_name),
-            )?,
-            (Some(holder_name), None) => write!(
-                f,
-                "Cannot start {entry}. The {state}box {holder_name} holds the name {name}.",
-                holder_name = printable(holder_name),
-            )?,
-            (None, _) => write!(f, "Cannot start {entry}. The name {name} is taken.")?,
+                " Run min box rm {force}{holder_name} to remove it and free the name."
+            )?;
         }
         write!(
             f,
             " Run {command} {entry} --name <name> to start a box from the entry under \
              another name.",
-            command = self.verb.command(),
+            command = self.command,
         )
     }
 }
 
 impl std::error::Error for StartNameHeld {}
+
+/// The one stderr line of a create whose box took a number (BCLI-081):
+/// the name the box took, the name it did not get and why. To a caller who
+/// may read the box that has that name, it names that box, its state and
+/// the verb that fits it. It always names `min box prune`.
+#[must_use]
+pub(crate) fn numbered_name_line(
+    took: &str,
+    not_taken: &minimald_rpc::NameNotTaken,
+    verb: Option<HolderVerb>,
+) -> String {
+    use minimald_rpc::NameTakenReason;
+    let took = printable(took);
+    let wanted = printable(&not_taken.name);
+    let mut line = format!("The box is named {took}, because ");
+    match &not_taken.reason {
+        NameTakenReason::Held { holder } => {
+            line.push_str(&format!("the name {wanted} is taken."));
+            if let Some(holder) = holder {
+                let holder_name = printable(&holder.name);
+                line.push_str(&format!(
+                    " The {state} box {holder_name} ({id}) has it.",
+                    state = printable(&holder.state),
+                    id = holder.id,
+                ));
+                line.push(' ');
+                line.push_str(&match verb {
+                    Some(verb) => verb.sentence(&holder_name),
+                    None => format!("Run min box logs {holder_name} for its output."),
+                });
+            }
+        }
+        NameTakenReason::Reserved => {
+            line.push_str(&format!("the name {wanted} is reserved."));
+        }
+        NameTakenReason::BoxIdForm => {
+            line.push_str(&format!("the name {wanted} has the form of a box id."));
+        }
+    }
+    line.push_str(" Run min box prune to remove stopped boxes.");
+    line
+}
+
+/// The numbered line of a create, or `None` (BCLI-081, BCLI-082). `None`
+/// when the box did not take a number, and when the command attaches this
+/// terminal to the box, because the shell's first paint replaces any line
+/// printed before it.
+#[must_use]
+pub(crate) fn numbered_line_for_start(
+    attach: bool,
+    created: &minimald_rpc::CreateSessionResponse,
+    verb: Option<HolderVerb>,
+) -> Option<String> {
+    if attach {
+        return None;
+    }
+    let not_taken = created.name_not_taken.as_ref()?;
+    let took = created.name.as_deref()?;
+    Some(numbered_name_line(took, not_taken, verb))
+}
+
+/// The holder verb of a numbered create's line: read from the stored spec
+/// of the box that has the name, when the reply names that box. No RPC
+/// when the command attaches, because it prints no line.
+pub(crate) async fn numbered_holder_verb(
+    client: &mut client::Client,
+    attach: bool,
+    created: &minimald_rpc::CreateSessionResponse,
+) -> Option<HolderVerb> {
+    if attach {
+        return None;
+    }
+    match &created.name_not_taken.as_ref()?.reason {
+        minimald_rpc::NameTakenReason::Held {
+            holder: Some(holder),
+        } => stored_holder_verb(client, holder.id).await,
+        _ => None,
+    }
+}
 
 /// The one stderr hint of a start that returns without attaching to a box
 /// that has no terminal (BCLI-029). The box's stdin is already closed.
@@ -1228,11 +1409,21 @@ pub async fn start_entry(global: &GlobalArgs, start: StartEntry) -> Result<(), a
             entry,
             args,
             options,
-        } => activate_box(global, args, options)
-            .await
-            .map_err(|error| start_refusal(error, start.verb, &entry)),
+        } => match activate_box(global, args, options).await {
+            Ok(()) => Ok(()),
+            Err(error) => Err(start_error(global, error, start.verb, &entry).await),
+        },
         StartPlan::Detached { entry, run } => {
-            let id = crate::task::run_entry(global, run).await?;
+            // The run names its own command in a held-name refusal. The
+            // person typed this start's command (BCLI-069).
+            let id = crate::task::run_entry(global, run)
+                .await
+                .map_err(|mut error| {
+                    if let Some(held) = error.downcast_mut::<StartNameHeld>() {
+                        held.command = start.verb.command();
+                    }
+                    error
+                })?;
             crate::output::record_box_id(&id.to_string());
             eprintln!("{}", unattached_start_hint(&entry, id));
             Ok(())
@@ -1247,12 +1438,36 @@ pub async fn start_entry(global: &GlobalArgs, start: StartEntry) -> Result<(), a
 pub(crate) fn start_refusal(error: anyhow::Error, verb: StartVerb, entry: &str) -> anyhow::Error {
     match error.downcast::<minimald_rpc::HeldNameRefusal>() {
         Ok(refusal) => anyhow::Error::new(StartNameHeld {
-            verb,
+            command: verb.command(),
             entry: entry.to_string(),
             refusal,
+            verb: None,
         }),
         Err(error) => crate::cmd::session::activate_refusal(error),
     }
+}
+
+/// [`start_refusal`], with the verb that goes back into the box that has
+/// a held name, read from that box's stored spec (BCLI-069). The verb is
+/// left out when the host cannot give the spec.
+async fn start_error(
+    global: &GlobalArgs,
+    error: anyhow::Error,
+    verb: StartVerb,
+    entry: &str,
+) -> anyhow::Error {
+    let mut error = start_refusal(error, verb, entry);
+    if let Some(held) = error.downcast_mut::<StartNameHeld>()
+        && let (Some(_), Some(id)) = (&held.refusal.holder_name, held.refusal.holder)
+    {
+        match crate::connect_daemon_unchecked(global).await {
+            Ok(mut client) => held.verb = stored_holder_verb(&mut client, id).await,
+            Err(e) => {
+                tracing::debug!(box_id = %id, "could not read the spec of the box that has the name: {e:#}")
+            }
+        }
+    }
+    error
 }
 
 /// Settings of an activation that no `min session activate` flag carries.
@@ -2198,7 +2413,7 @@ impl SelectedLoadouts {
     /// The layer of each loadout, with its name and file: the keys that
     /// BOX-167 applies, without the vars that the policy ignores, and the
     /// retired variable keys, which the expansion refuses (BOX-206).
-    fn layers(&self) -> anyhow::Result<Vec<mfile::expand::LoadoutLayer>> {
+    pub(crate) fn layers(&self) -> anyhow::Result<Vec<mfile::expand::LoadoutLayer>> {
         self.loadouts
             .iter()
             .map(|loadout| loadout_layer(loadout, self.ignore.as_ref()))
@@ -2599,13 +2814,14 @@ pub(crate) fn box_entry(
 }
 
 /// A table for each type of a chain, with the type's name.
-type TypeTables = Vec<(String, toml::Table)>;
+pub(crate) type TypeTables = Vec<(String, toml::Table)>;
 
 /// The defaults and the constraints of each type in the chain of `entry`,
 /// as the start's loadout gate reads them: the resolved chain, or the
 /// built-in layers of a built-in type name that does not resolve. Empty
-/// for any other name, which the gate already refused.
-fn entry_type_layers(
+/// for any other name, which the gate already refused. `min box spec
+/// <entry>` reads the same layers, so its loadouts fold as the start's do.
+pub(crate) fn entry_type_layers(
     doc: &toml::Table,
     entry: &mfile::entry::BoxEntry,
 ) -> (TypeTables, TypeTables) {
@@ -4803,8 +5019,8 @@ pub(crate) fn network_override_policy(
 
 /// The loadouts an activation resolves (BCLI-073): each `--loadout` in
 /// place of the client config's `default_loadouts`, or none under
-/// `--no-loadouts`. The stored spec does not record the selected loadouts
-/// yet: <https://github.com/gominimal/minimal/issues/3236>.
+/// `--no-loadouts`. `min box spec <entry>` takes the same selection and
+/// folds each selected loadout into the spec it renders (BCLI-075).
 pub(crate) fn start_loadout_selection(args: &ActivateArgs) -> loadouts::LoadoutSelection {
     loadouts::LoadoutSelection::from_flags(&args.loadout, args.no_loadouts)
 }
@@ -5505,6 +5721,10 @@ pub(crate) async fn activate_box(
         );
         box_name = Some(name);
     }
+    // BCLI-081, BCLI-082: a box that took a number gets one stderr line,
+    // printed below with the id, and only when the start does not attach.
+    let holder_verb = numbered_holder_verb(&mut client, args.attach, &created).await;
+    let numbered_line = numbered_line_for_start(args.attach, &created, holder_verb);
     // A `host_ip` box's egress, admitted on the VM host daemon before the
     // box runs anything (NET-085): the host gate decides every frame the box
     // sends from the node's own address by the admitted policies, and drops
@@ -6294,6 +6514,9 @@ pub(crate) async fn activate_box(
 
     println!("{id}");
     crate::output::record_box_id(&id.to_string());
+    if let Some(line) = &numbered_line {
+        eprintln!("{line}");
+    }
 
     // T126 (NET-138): a `host_ip` box on a VM host names each of its
     // mirrored ports that another program on the host holds. Printed only
@@ -6376,7 +6599,8 @@ mod tests {
         ] {
             texts.push(
                 StartNameHeld {
-                    verb: StartVerb::Box,
+                    command: StartVerb::Box.command(),
+                    verb: Some(HolderVerb::Attach),
                     entry: bad.clone(),
                     refusal: minimald_rpc::HeldNameRefusal {
                         name: bad.clone(),

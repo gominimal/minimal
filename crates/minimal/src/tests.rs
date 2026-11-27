@@ -3403,10 +3403,22 @@ async fn start_with_a_box_for_the_path_prints_no_warning() {
         let (stdout, stderr) = (read(out), read(err));
         result
             .unwrap_or_else(|e| panic!("{verb:?} round {round}: the start fails: {e:#}\n{stderr}"));
-        assert_eq!(
-            stderr, "",
-            "{verb:?} round {round}: the start prints nothing on stderr"
-        );
+        // The first start takes the derived name. The later two take a
+        // number, and an unattached start says so in one line (BCLI-081).
+        // Nothing else reaches stderr.
+        if round == 0 {
+            assert_eq!(
+                stderr, "",
+                "{verb:?} round {round}: the start prints nothing on stderr"
+            );
+        } else {
+            assert!(
+                stderr.starts_with("The box is named ")
+                    && stderr.ends_with(" Run min box prune to remove stopped boxes.\n")
+                    && stderr.matches('\n').count() == 1,
+                "{verb:?} round {round}: the start prints only the numbered line: {stderr:?}"
+            );
+        }
         let id = stdout
             .strip_suffix('\n')
             .unwrap_or_else(|| panic!("{verb:?} round {round}: stdout is one line: {stdout:?}"));
@@ -3484,7 +3496,7 @@ async fn unattached_start_closes_stdin_and_hints_run_logs_wait() {
     let text = std::fs::read_to_string(manifest.join("src/cmd/boxes/create.rs")).unwrap();
     let body = function_body(&text, "start_entry").expect("create.rs defines start_entry");
     for step in [
-        "let id = crate::task::run_entry(global, run).await?;",
+        "let id = crate::task::run_entry(global, run)",
         "crate::output::record_box_id(&id.to_string());",
         "unattached_start_hint(&entry, id)",
     ] {
@@ -4051,10 +4063,10 @@ fn create_name_held_exit2_names_holder_hints_name_flag() {
     assert_eq!(held.refusal.holder, Some(holder));
     assert_eq!(
         format!("{error:#}"),
-        "Cannot start default. The running box default \
-         (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) holds the name default. Run \
-         min box start default --name <name> to start a box from the entry under \
-         another name."
+        "Cannot start default. The name default is taken. The running box default \
+         (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) has it. Run min box rm --force default \
+         to remove it and free the name. Run min box start default --name <name> to \
+         start a box from the entry under another name."
     );
 
     let unread = start_refusal(
@@ -4065,9 +4077,9 @@ fn create_name_held_exit2_names_holder_hints_name_flag() {
     assert!(unread.downcast_ref::<StartNameHeld>().is_some());
     assert_eq!(
         format!("{unread:#}"),
-        "Cannot start dev. The box dev holds the name dev. Run \
-         min session start dev --name <name> to start a box from the entry under \
-         another name."
+        "Cannot start dev. The name dev is taken. The box dev has it. Run min box rm \
+         dev to remove it and free the name. Run min session start dev --name <name> \
+         to start a box from the entry under another name."
     );
 
     let other = start_refusal(anyhow::anyhow!("boom"), StartVerb::Box, "dev");
@@ -4087,6 +4099,335 @@ fn create_name_held_exit2_names_holder_hints_name_flag() {
         let printed = format!("{:#}", start_refusal(from_daemon, verb, "dev"));
         assert_eq!(printed, port.to_string(), "{verb:?}");
     }
+}
+
+/// The id of the box that has a name, in the held-name tests.
+fn held_name_holder() -> boxes::SessionId {
+    boxes::SessionId::parse_str("0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b").unwrap()
+}
+
+/// A create reply for a box that took `took`, because it did not get
+/// `not_taken`.
+fn numbered_reply(
+    took: &str,
+    not_taken: minimald_rpc::NameNotTaken,
+) -> minimald_rpc::CreateSessionResponse {
+    let mut reply: minimald_rpc::CreateSessionResponse =
+        serde_json_lenient::from_str(r#"{"id":"0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7c"}"#)
+            .expect("a create reply needs only its id");
+    reply.name = Some(took.to_string());
+    reply.name_not_taken = Some(not_taken);
+    reply
+}
+
+/// The reason a derived name was taken by the box `holder`, in `state`.
+fn held_by(name: &str, state: &str) -> minimald_rpc::NameTakenReason {
+    minimald_rpc::NameTakenReason::Held {
+        holder: Some(minimald_rpc::NameHolder {
+            id: held_name_holder(),
+            name: name.to_string(),
+            state: state.to_string(),
+        }),
+    }
+}
+
+// BCLI-069: a written name that a box has refuses the create with exit
+// 2. To a caller who may read that box, the refusal names it, its state,
+// the verb that goes back into it, `min box rm` and `--name`.
+#[test]
+fn create_written_name_held_exit2_names_holder_and_next_steps() {
+    let refusal = |state: &str| minimald_rpc::HeldNameRefusal {
+        name: "api".to_string(),
+        holder: Some(held_name_holder()),
+        holder_name: Some("api".to_string()),
+        state: Some(state.to_string()),
+    };
+    let error = start_refusal(
+        create_refusal(refusal("stopped").to_string(), None, None, None),
+        StartVerb::Box,
+        "web",
+    );
+    let held = error
+        .downcast_ref::<StartNameHeld>()
+        .expect("main.rs maps this error to exit 2");
+    assert_eq!(StartNameHeld::EXIT_CODE, 2);
+    assert_eq!(held.refusal.holder, Some(held_name_holder()));
+
+    let cases = [
+        (
+            "stopped",
+            Some(HolderVerb::Attach),
+            "min box start",
+            "Cannot start web. The name api is taken. The stopped box api \
+             (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) has it. Run min box attach api to \
+             go back into it. Run min box rm api to remove it and free the name. Run \
+             min box start web --name <name> to start a box from the entry under \
+             another name.",
+        ),
+        (
+            "running",
+            Some(HolderVerb::Restart),
+            "min task run",
+            "Cannot start web. The name api is taken. The running box api \
+             (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) has it. Run min box restart api to \
+             restart it. Run min box rm --force api to remove it and free the \
+             name. Run min task run web --name <name> to start a box from the entry \
+             under another name.",
+        ),
+        (
+            "stopped",
+            Some(HolderVerb::Restart),
+            "min box start",
+            "Cannot start web. The name api is taken. The stopped box api \
+             (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) has it. Run min box restart api to \
+             restart it. Run min box rm api to remove it and free the name. Run \
+             min box start web --name <name> to start a box from the entry under \
+             another name.",
+        ),
+        (
+            "exited",
+            None,
+            "min box run",
+            "Cannot start web. The name api is taken. The exited box api \
+             (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) has it. Run min box rm api to \
+             remove it and free the name. Run min box run web --name <name> to start \
+             a box from the entry under another name.",
+        ),
+    ];
+    for (state, verb, command, text) in cases {
+        let held = StartNameHeld {
+            command,
+            entry: "web".to_string(),
+            refusal: refusal(state),
+            verb,
+        };
+        assert_eq!(held.to_string(), text, "{state}");
+        assert!(!held.to_string().contains('\n'), "{state}");
+    }
+}
+
+// BCLI-069: a caller who may not read the box that has the name learns
+// only that the name is taken, and `--name`.
+#[test]
+fn create_written_name_held_without_box_read_names_no_box() {
+    let hidden = minimald_rpc::HeldNameRefusal {
+        name: "api".to_string(),
+        holder: None,
+        holder_name: None,
+        state: None,
+    };
+    let error = start_refusal(
+        create_refusal(hidden.to_string(), None, None, None),
+        StartVerb::Session,
+        "web",
+    );
+    let held = error
+        .downcast_ref::<StartNameHeld>()
+        .expect("main.rs maps this error to exit 2");
+    // Even a verb read by mistake does not print without the box.
+    let held = StartNameHeld {
+        verb: Some(HolderVerb::Attach),
+        ..held.clone()
+    };
+    let text = held.to_string();
+    assert_eq!(
+        text,
+        "Cannot start web. The name api is taken. Run min session start web \
+         --name <name> to start a box from the entry under another name."
+    );
+    for word in ["box api", "attach", "restart", "min box rm", "0192f3c4"] {
+        assert!(!text.contains(word), "{word}: {text}");
+    }
+}
+
+// BCLI-081: an unattached create whose box took a number prints one
+// stderr line. It names the name the box took, the name it did not get,
+// the box that has that name, its state, the verb that fits, and
+// `min box prune`.
+#[test]
+fn unattached_create_numbered_prints_one_stderr_line() {
+    let cases = [
+        (
+            Some(HolderVerb::Attach),
+            "The box is named dev-1, because the name dev is taken. The stopped box \
+             dev (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) has it. Run min box attach dev \
+             to go back into it. Run min box prune to remove stopped boxes.",
+        ),
+        (
+            Some(HolderVerb::Restart),
+            "The box is named dev-1, because the name dev is taken. The stopped box \
+             dev (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) has it. Run min box restart dev \
+             to restart it. Run min box prune to remove stopped boxes.",
+        ),
+        (
+            None,
+            "The box is named dev-1, because the name dev is taken. The stopped box \
+             dev (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) has it. Run min box logs dev \
+             for its output. Run min box prune to remove stopped boxes.",
+        ),
+    ];
+    let reply = numbered_reply(
+        "dev-1",
+        minimald_rpc::NameNotTaken {
+            name: "dev".to_string(),
+            reason: held_by("dev", "stopped"),
+        },
+    );
+    for (verb, text) in cases {
+        let line = numbered_line_for_start(false, &reply, verb).expect("the box took a number");
+        assert_eq!(line, text, "{verb:?}");
+        assert!(!line.contains('\n'), "one line: {line}");
+    }
+
+    // A running box that runs until stopped still gets the restart
+    // sentence: the verb follows the stored spec, not the state.
+    let running = numbered_reply(
+        "dev-1",
+        minimald_rpc::NameNotTaken {
+            name: "dev".to_string(),
+            reason: held_by("dev", "running"),
+        },
+    );
+    assert_eq!(
+        numbered_line_for_start(false, &running, Some(HolderVerb::Restart)).as_deref(),
+        Some(
+            "The box is named dev-1, because the name dev is taken. The running box \
+             dev (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) has it. Run min box restart \
+             dev to restart it. Run min box prune to remove stopped boxes."
+        )
+    );
+
+    // A box that took the name it derived prints nothing.
+    let mut first = reply.clone();
+    first.name_not_taken = None;
+    assert_eq!(numbered_line_for_start(false, &first, None), None);
+}
+
+// BCLI-081: a derived name that the form rule excludes is named as such,
+// the line names no box, and it names `min box prune`.
+#[test]
+fn unattached_create_numbered_excluded_name_names_no_box() {
+    use minimald_rpc::NameTakenReason;
+    let cases = [
+        (
+            "self",
+            NameTakenReason::Reserved,
+            "The box is named self-1, because the name self is reserved. Run min box \
+             prune to remove stopped boxes.",
+        ),
+        (
+            "0192f3c4",
+            NameTakenReason::BoxIdForm,
+            "The box is named 0192f3c4-1, because the name 0192f3c4 has the form of a \
+             box id. Run min box prune to remove stopped boxes.",
+        ),
+    ];
+    for (name, reason, text) in cases {
+        let reply = numbered_reply(
+            &format!("{name}-1"),
+            minimald_rpc::NameNotTaken {
+                name: name.to_string(),
+                reason,
+            },
+        );
+        let line = numbered_line_for_start(false, &reply, Some(HolderVerb::Attach))
+            .expect("the box took a number");
+        assert_eq!(line, text, "{name}");
+        for word in ["has it", "attach", "logs", "restart"] {
+            assert!(!line.contains(word), "{word}: {line}");
+        }
+    }
+}
+
+// BCLI-081: a caller who may not read the box that has the derived name
+// learns that the name is taken, the name the box took, and
+// `min box prune`, and nothing about the other box.
+#[test]
+fn unattached_create_numbered_without_box_read_names_no_box() {
+    let reply = numbered_reply(
+        "dev-2",
+        minimald_rpc::NameNotTaken {
+            name: "dev".to_string(),
+            reason: minimald_rpc::NameTakenReason::Held { holder: None },
+        },
+    );
+    let line = numbered_line_for_start(false, &reply, Some(HolderVerb::Attach))
+        .expect("the box took a number");
+    assert_eq!(
+        line,
+        "The box is named dev-2, because the name dev is taken. Run min box prune to \
+         remove stopped boxes."
+    );
+    for word in [
+        "has it",
+        "attach",
+        "logs",
+        "restart",
+        "The stopped",
+        "0192f3c4",
+    ] {
+        assert!(!line.contains(word), "{word}: {line}");
+    }
+}
+
+// BCLI-082: a start that attaches this terminal prints nothing about the
+// box's name before the shell, whatever the reason the box took a number.
+#[test]
+fn attached_start_numbered_prints_nothing_before_shell() {
+    use minimald_rpc::NameTakenReason;
+    for reason in [
+        held_by("dev", "running"),
+        NameTakenReason::Held { holder: None },
+        NameTakenReason::Reserved,
+        NameTakenReason::BoxIdForm,
+    ] {
+        let reply = numbered_reply(
+            "dev-1",
+            minimald_rpc::NameNotTaken {
+                name: "dev".to_string(),
+                reason: reason.clone(),
+            },
+        );
+        assert_eq!(
+            numbered_line_for_start(true, &reply, Some(HolderVerb::Attach)),
+            None,
+            "{reason:?}"
+        );
+        assert!(
+            numbered_line_for_start(false, &reply, None).is_some(),
+            "{reason:?}"
+        );
+    }
+}
+
+// BCLI-069, BCLI-081: the verb that goes back into a box comes from its
+// stored spec: `attach` for `pty_enabled`, `restart` for
+// `lifetime = "until_stopped"`, else none.
+#[test]
+fn holder_verb_reads_the_stored_spec() {
+    let spec =
+        |text: &str| serde_json_lenient::from_str::<serde_json_lenient::Value>(text).unwrap();
+    let cases = [
+        (
+            r#"{"io":{"pty_enabled":true},"box":{"lifetime":"until_stopped"}}"#,
+            Some(HolderVerb::Attach),
+        ),
+        (r#"{"io":{"pty_enabled":true}}"#, Some(HolderVerb::Attach)),
+        (
+            r#"{"io":{"pty_enabled":false},"box":{"lifetime":"until_stopped"}}"#,
+            Some(HolderVerb::Restart),
+        ),
+        (
+            r#"{"io":{"pty_enabled":false},"box":{"lifetime":"until_entrypoint_exits"}}"#,
+            None,
+        ),
+        (r#"{}"#, None),
+    ];
+    for (text, verb) in cases {
+        assert_eq!(holder_verb(Some(&spec(text))), verb, "{text}");
+    }
+    // A box with no stored spec has no verb.
+    assert_eq!(holder_verb(None), None);
 }
 
 // BCLI-071: a bare `min session start` starts the `default` session entry,
@@ -15467,8 +15808,8 @@ fn show_and_prune_dry_run_report_disk_unit_boundaries() {
 /// `write_init_plan`, the write half of `run_init_flow`, with the plan the
 /// project initializer returns, and reads the file it writes. That file
 /// loads through mfile with no legacy-table hint and no unknown-field
-/// warning, and a session start on it sends the `[defaults.session]`
-/// packages (D3112).
+/// warning, it has no `[defaults]`, and a session start on it sends the
+/// packages that `[sessions.default]` holds (D3112).
 #[test]
 fn init_scaffolds_entry_shape_loads_and_starts_with_its_packages() {
     // The initializer's own output (`op::project::init::generate_mfile`,
@@ -15494,14 +15835,10 @@ fn init_scaffolds_entry_shape_loads_and_starts_with_its_packages() {
     let written = std::fs::read_to_string(&toml_path).unwrap();
     let doc: toml::Table = written.parse().expect("the scaffold parses");
     assert!(doc.get("session").is_none(), "{written}");
+    assert!(doc.get("defaults").is_none(), "no [defaults]:\n{written}");
     assert_eq!(
-        doc["boxes"]["dev"]["type"].as_str(),
-        Some("session"),
-        "{written}"
-    );
-    assert_eq!(
-        doc["defaults"]["task"]["state_key"].as_str(),
-        Some("dev"),
+        doc["sessions"]["default"]["packages"],
+        toml::Value::Array(vec!["base".into(), "vim".into(), "git".into()]),
         "{written}"
     );
     // The legacy tables are what make a load print a hint. The written
@@ -15535,6 +15872,49 @@ fn init_scaffolds_entry_shape_loads_and_starts_with_its_packages() {
         wire["install"]["packages"],
         serde_json_lenient::json!(["base", "vim", "git"])
     );
+}
+
+/// BCLI-017: the scaffold's session entry is `default`, so the first
+/// `min session start` on a fresh scaffold picks it with no entry typed,
+/// and the box takes the project name with no entry suffix.
+#[test]
+fn init_scaffold_first_session_start_takes_project_name() {
+    const GENERATED: &str = "# Generated by `min init`\n\n\
+        [upstream] # Source of software & tooling\n\
+        repo = \"https://github.com/gominimal/pkgs\"\n\
+        locked_commit = \"abc123\"\n\n\
+        [defaults.task]\n\
+        state_key = \"dev\"\n\n\
+        [defaults.session] # min session attach\n\
+        packages = [\"base\", \"vim\", \"git\"]\n";
+    let parent = tempfile::tempdir().unwrap();
+    let root = camino::Utf8Path::from_path(parent.path())
+        .expect("temp path is UTF-8")
+        .join("my-app");
+    std::fs::create_dir(&root).unwrap();
+    let toml_path = root.join(mfile::MFILE_NAME).into_std_path_buf();
+    let plan = op::InitPlan {
+        toml_path: toml_path.clone(),
+        content: GENERATED.to_string(),
+        matched: false,
+    };
+    cmd::write_init_plan(plan, true, false).expect("the scaffold is written");
+
+    let entries = mfile::entry::read_entries(std::fs::read(&toml_path).unwrap().as_slice())
+        .expect("the entries read");
+    let start = parsed_start(&["min", "session", "start", "--network", "own_ip"]);
+    let StartPlan::Session { args, options, .. } =
+        plan_start(&start, &entries, true).expect("the scaffold starts a session")
+    else {
+        panic!("the scaffold's entry is a session box");
+    };
+    assert_eq!(options.entry.as_deref(), Some("default"));
+    let request = planned_session_request(&args, &options, &root);
+    assert_eq!(request.config.project_name.as_deref(), Some("my-app"));
+    // No name is written, so the daemon derives it from the project name
+    // and the entry. The `default` entry adds no suffix.
+    assert_eq!(request.config.name, None);
+    assert_eq!(created_box_name(&request).as_deref(), Some("my-app"));
 }
 
 /// A listed box for the `min box wait` tests: `web` in `state`, with the
@@ -20053,10 +20433,10 @@ async fn box_spec_renders_formats_secrets_as_refs() {
         yaml.starts_with("entry: default\nloadouts:\n  - default\nschema: min/v1/spec\nsources:\n"),
         "{yaml}"
     );
-    assert!(
-        yaml.contains("\nspec:\n  network:\n    mode: host_ip\n"),
-        "{yaml}"
-    );
+    // The built-in `default` loadout folds its `env_vars` into the spec
+    // before `network` (BCLI-021).
+    assert!(yaml.contains("\nspec:\n  env_vars:\n"), "{yaml}");
+    assert!(yaml.contains("\n  network:\n    mode: host_ip\n"), "{yaml}");
     assert!(yaml.ends_with("\ntype: session\n"), "{yaml}");
     assert!(
         yaml.contains("  packages:\n    - curl\n    - git\n"),
@@ -20759,6 +21139,12 @@ async fn box_spec_entry_loadouts_resolve_as_start() {
     .expect("the entry renders");
     let doc: serde_json_lenient::Value = serde_json_lenient::from_str(&json).expect("JSON");
     assert_eq!(doc["loadouts"], serde_json_lenient::json!(["dev"]));
+    // BCLI-021: the loadout's packages are in the spec, after the entry's.
+    assert_eq!(
+        doc["spec"]["packages"],
+        serde_json_lenient::json!(["git", "helix"]),
+        "{json}"
+    );
     let yaml = box_spec_text(
         &global,
         &[
@@ -20808,6 +21194,222 @@ async fn box_spec_entry_loadouts_resolve_as_start() {
     .await
     .expect_err("the spec fails");
     assert_eq!(format!("{error:#}"), format!("{expected:#}"));
+}
+
+// BCLI-021, BCLI-077: `min box spec <entry>` folds each selected loadout
+// into the spec it renders, as `min box start` folds it into the spec it
+// stores. Each package and variable a loadout adds names that loadout.
+#[tokio::test]
+async fn box_spec_entry_folds_selected_loadouts_as_start() {
+    let (project, global) = spec_project(
+        "[sessions.default]\npackages = [\"git\"]\n\
+         env_vars = { EDITOR = \"vi\" }\n\
+         lifecycle_hooks = [{ on_activate = { type = \"inline\", value = \"echo project\" } }]\n",
+    );
+    let loadouts = global.config_dir.clone().unwrap().join("minimal/loadouts");
+    std::fs::create_dir_all(&loadouts).unwrap();
+    std::fs::write(
+        loadouts.join("dev.toml"),
+        "packages = [\"helix\"]\n\
+         [env_vars]\nPAGER = \"less\"\n\
+         [[lifecycle_hooks]]\non_activate = { type = \"inline\", value = \"echo dev\" }\n",
+    )
+    .unwrap();
+
+    let json = box_spec_text(
+        &global,
+        &[
+            "min",
+            "box",
+            "spec",
+            "default",
+            "--loadout",
+            "dev",
+            "-o",
+            "json",
+        ],
+    )
+    .await
+    .expect("the entry renders");
+    let doc: serde_json_lenient::Value = serde_json_lenient::from_str(&json).expect("JSON");
+    let spec = &doc["spec"];
+    assert_eq!(
+        spec["packages"],
+        serde_json_lenient::json!(["git", "helix"])
+    );
+    assert_eq!(spec["env_vars"]["EDITOR"], "vi", "{json}");
+    assert_eq!(spec["env_vars"]["PAGER"], "less", "{json}");
+    assert_eq!(
+        doc["sources"]["env_vars.PAGER"],
+        serde_json_lenient::json!(["loadout dev"]),
+        "{json}"
+    );
+    assert_eq!(
+        doc["sources"]["env_vars.EDITOR"],
+        serde_json_lenient::json!(["[sessions.default]"]),
+        "{json}"
+    );
+
+    // The same keys as the spec a start with the same loadout stores.
+    let root = camino::Utf8Path::from_path(project.path()).expect("a UTF-8 project path");
+    let cfg = crate::config::read_client_config(&global).unwrap();
+    let selected = crate::SelectedLoadouts {
+        loadouts: crate::loadouts::resolve_active_loadouts(
+            crate::loadouts::LoadoutSelection::from_flags(&["dev".to_owned()], false),
+            &cfg,
+            &global,
+        )
+        .expect("the loadout resolves")
+        .loadouts,
+        ignore: None,
+    };
+    let start = crate::session_box_expansion(root, Some("default"), true, &selected)
+        .expect("the entry expands")
+        .expect("the project declares the entry");
+    for key in ["packages", "env_vars", "lifecycle_hooks"] {
+        let started = serde_json_lenient::to_value(&start.spec[key]).unwrap();
+        assert_eq!(spec[key], started, "{key}: {json}");
+    }
+
+    let toml = box_spec_text(
+        &global,
+        &["min", "box", "spec", "default", "--loadout", "dev"],
+    )
+    .await
+    .expect("the entry renders");
+    assert!(
+        toml.contains("\n# env_vars.PAGER: from loadout dev\n"),
+        "{toml}"
+    );
+
+    // BCLI-075: `--no-loadouts` selects none, so nothing of `dev` folds in.
+    let json = box_spec_text(
+        &global,
+        &[
+            "min",
+            "box",
+            "spec",
+            "default",
+            "--no-loadouts",
+            "-o",
+            "json",
+        ],
+    )
+    .await
+    .expect("the entry renders");
+    let doc: serde_json_lenient::Value = serde_json_lenient::from_str(&json).expect("JSON");
+    assert_eq!(doc["loadouts"], serde_json_lenient::json!([]), "{json}");
+    assert_eq!(doc["spec"]["packages"], serde_json_lenient::json!(["git"]));
+    assert!(doc["spec"]["env_vars"].get("PAGER").is_none(), "{json}");
+}
+
+// BCLI-021, BCLI-075: with no loadout on disk and no `default_loadouts`,
+// `min box spec <entry>` folds in the built-in `default` loadout, as the
+// start does, and names it. `--no-loadouts` leaves it out.
+#[tokio::test]
+async fn box_spec_entry_shows_builtin_default_loadout() {
+    let (_project, global) = spec_project("[sessions.default]\npackages = [\"git\"]\n");
+
+    let json = box_spec_text(&global, &["min", "box", "spec", "default", "-o", "json"])
+        .await
+        .expect("the entry renders");
+    let doc: serde_json_lenient::Value = serde_json_lenient::from_str(&json).expect("JSON");
+    assert_eq!(doc["loadouts"], serde_json_lenient::json!(["default"]));
+    assert_eq!(doc["spec"]["env_vars"]["PS1"], "minimal:\\w\\$ ", "{json}");
+    assert_eq!(
+        doc["sources"]["env_vars.PS1"],
+        serde_json_lenient::json!(["loadout default"]),
+        "{json}"
+    );
+
+    let json = box_spec_text(
+        &global,
+        &[
+            "min",
+            "box",
+            "spec",
+            "default",
+            "--no-loadouts",
+            "-o",
+            "json",
+        ],
+    )
+    .await
+    .expect("the entry renders");
+    let doc: serde_json_lenient::Value = serde_json_lenient::from_str(&json).expect("JSON");
+    assert_eq!(doc["loadouts"], serde_json_lenient::json!([]));
+    assert!(doc["spec"].get("env_vars").is_none(), "{json}");
+    let toml = box_spec_text(&global, &["min", "box", "spec", "default", "--no-loadouts"])
+        .await
+        .expect("the entry renders");
+    assert!(toml.contains("\n# Loadouts: none.\n"), "{toml}");
+}
+
+// BCLI-076: with `--no-hooks`, `min box spec <entry>` renders no lifecycle
+// hook, from the project or from a loadout. Without it, both render.
+#[tokio::test]
+async fn box_spec_entry_no_hooks_renders_no_hook() {
+    let (_project, global) = spec_project(
+        "[sessions.default]\n\
+         lifecycle_hooks = [{ on_activate = { type = \"inline\", value = \"echo project\" } }]\n",
+    );
+    let loadouts = global.config_dir.clone().unwrap().join("minimal/loadouts");
+    std::fs::create_dir_all(&loadouts).unwrap();
+    std::fs::write(
+        loadouts.join("dev.toml"),
+        "[[lifecycle_hooks]]\non_activate = { type = \"inline\", value = \"echo dev\" }\n",
+    )
+    .unwrap();
+
+    let json = box_spec_text(
+        &global,
+        &[
+            "min",
+            "box",
+            "spec",
+            "default",
+            "--loadout",
+            "dev",
+            "-o",
+            "json",
+        ],
+    )
+    .await
+    .expect("the entry renders");
+    let doc: serde_json_lenient::Value = serde_json_lenient::from_str(&json).expect("JSON");
+    let hooks = doc["spec"]["lifecycle_hooks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("hooks render: {json}"));
+    assert_eq!(hooks.len(), 2, "{json}");
+
+    for argv in [
+        &[
+            "min",
+            "box",
+            "spec",
+            "default",
+            "--loadout",
+            "dev",
+            "--no-hooks",
+            "-o",
+            "json",
+        ][..],
+        &[
+            "min",
+            "box",
+            "spec",
+            "default",
+            "--loadout",
+            "dev",
+            "--no-hooks",
+        ][..],
+    ] {
+        let text = box_spec_text(&global, argv)
+            .await
+            .expect("the entry renders");
+        assert!(!text.contains("lifecycle_hooks"), "{argv:?}: {text}");
+        assert!(!text.contains("echo"), "{argv:?}: {text}");
+    }
 }
 
 /// The project file error that a start ends with. It keeps the start text.
@@ -23088,11 +23690,7 @@ async fn spec_type_init_end_to_end() {
     std::fs::write(&toml_path, &text).unwrap();
 
     // `min init <entry> --type <type>` appends one entry each time.
-    for (entry, box_type) in [
-        ("default", "session"),
-        ("build", "task"),
-        ("web", "rust-dev"),
-    ] {
+    for (entry, box_type) in [("dev", "session"), ("build", "task"), ("web", "rust-dev")] {
         let argv = ["min", "init", entry, "--type", box_type];
         let request = cmd::init_request(&parsed_init(&argv));
         let Ok(cmd::InitRequest::Append {
@@ -23120,12 +23718,14 @@ async fn spec_type_init_end_to_end() {
         .unwrap()
         .parse()
         .expect("the file parses");
-    for (entry, box_type) in [
-        ("dev", "session"),
-        ("default", "session"),
-        ("build", "task"),
-        ("web", "rust-dev"),
-    ] {
+    // The scaffold's entry is `[sessions.default]`, and `[sessions.*]` sets
+    // the type, so it has no `type` key. `min init <entry> --type <type>`
+    // appends under `[boxes]`.
+    let scaffolded = doc["sessions"]["default"]
+        .as_table()
+        .unwrap_or_else(|| panic!("[sessions.default] is a table\n{doc}\n{ran}"));
+    assert!(scaffolded.get("type").is_none(), "{doc}\n{ran}");
+    for (entry, box_type) in [("dev", "session"), ("build", "task"), ("web", "rust-dev")] {
         assert_eq!(
             doc["boxes"][entry]["type"].as_str(),
             Some(box_type),
@@ -23215,11 +23815,11 @@ async fn spec_type_init_end_to_end() {
     // "# timeout: from type rust-dev defaults\ntimeout = \"30m\"\n".
     for (entry, needles) in [
         (
-            "dev",
+            "default",
             &[
-                "# The spec of entry dev (type session).",
-                "# type: from [boxes.dev]\ntype = \"session\"\n",
-                "# packages: from [defaults.session]\npackages = [\"base\", \"git\"]\n",
+                "# The spec of entry default (type session).",
+                "# type: from [sessions.default]\ntype = \"session\"\n",
+                "# packages: from [sessions.default]\npackages = [\"base\", \"git\"]\n",
                 "# network.mode: from the default\n",
             ][..],
         ),
@@ -23255,8 +23855,8 @@ async fn spec_type_init_end_to_end() {
 
     // A box created from an entry on the test daemon renders the spec
     // stored with its record.
-    // The box comes from the session entry `default`. An entry of a project
-    // type is refused (#3140).
+    // The box comes from the session entry `default`, the one the scaffold
+    // writes. An entry of a project type is refused (#3140).
     let start = parsed_start(&["min", "session", "start", "default", "--network", "own_ip"]);
     let entries = mfile::entry::read_entries(std::fs::read(&toml_path).unwrap().as_slice())
         .expect("the entries read");
@@ -23303,7 +23903,7 @@ async fn spec_type_init_end_to_end() {
     // entry form, and the box for the box form.
     let log = log.contents();
     for (field, value) in [
-        ("entry", "dev".to_owned()),
+        ("entry", "default".to_owned()),
         ("entry", "web".to_owned()),
         ("box_id", id_text.clone()),
     ] {

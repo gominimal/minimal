@@ -1761,7 +1761,23 @@ pub(crate) async fn run_entry(
             code,
             exit_code,
             hint,
-        } => return Err(crate::create_refusal(error, code, exit_code, hint)),
+        } => {
+            // BCLI-069: a written name that a box has refuses the run with
+            // exit 2, and names that box to a caller who may read it.
+            let error = crate::create_refusal(error, code, exit_code, hint);
+            return Err(match error.downcast::<minimald_rpc::HeldNameRefusal>() {
+                Ok(refusal) => anyhow::Error::new(
+                    crate::StartNameHeld::read(
+                        &mut client,
+                        args.verb.command(),
+                        &args.entry,
+                        refusal,
+                    )
+                    .await,
+                ),
+                Err(error) => error,
+            });
+        }
     };
     // A daemon too old to know the field ignored it and echoes no version;
     // that silence is the skew. Caught here, before the upload and the
@@ -1780,6 +1796,12 @@ pub(crate) async fn run_entry(
         box_network.mode_layer.as_deref(),
     ) {
         tracing::debug!(%error, "the run's network notices did not print");
+    }
+    // BCLI-081: a task box never has a terminal, so a run never attaches
+    // one, and a box that took a number gets its one stderr line.
+    let holder_verb = crate::numbered_holder_verb(&mut client, false, &created).await;
+    if let Some(line) = crate::numbered_line_for_start(false, &created, holder_verb) {
+        eprintln!("{line}");
     }
     // A `host_ip` task box has its egress admitted on the VM host daemon
     // before it runs anything (NET-085), or the host gate drops

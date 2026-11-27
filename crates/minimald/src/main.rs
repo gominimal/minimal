@@ -308,6 +308,17 @@ fn egress_deny_all_opt_out(flag: bool, env: Option<&str>) -> bool {
 pub enum MainError {
     IO(std::io::Error, &'static str),
     Other(String),
+    /// The box state under the state dir is from a newer build. `main`
+    /// prints the text as it is and exits non-zero.
+    StateRefused(String),
+}
+
+/// The refusal text when a newer build wrote the box state under
+/// `state_dir`. Reads only: any other error of the check is left to the
+/// store's own open.
+fn state_refusal(state_dir: &DaemonAbsPath) -> Option<String> {
+    let err = boxes::store::check_state_format(state_dir.as_utf8_path()).err()?;
+    boxes::store::NewerStateFormat::from_io(&err).map(ToString::to_string)
 }
 
 impl From<russh::keys::ssh_key::Error> for MainError {
@@ -474,6 +485,10 @@ fn main() -> Result<(), MainError> {
         }
     }
 
+    if let Err(MainError::StateRefused(text)) = &result {
+        eprintln!("{text}");
+        std::process::exit(1);
+    }
     result
 }
 
@@ -489,6 +504,11 @@ fn spawn_detached(cli: &Cli) -> Result<(), MainError> {
     // (`SHUTDOWN_DEPARTURE_WAIT`) before its own startup.
     const DETACH_TIMEOUT_SECS: u64 = 8 + minimald_rpc::SHUTDOWN_DEPARTURE_WAIT.as_secs();
 
+    // The detached child's stderr is null'd, so refuse a newer state here,
+    // where the caller reads the text.
+    if let Some(text) = state_refusal(&cli.minimal_state_dir()) {
+        return Err(MainError::StateRefused(text));
+    }
     let exe = std::env::current_exe().map_err(|e| MainError::IO(e, "resolving current exe"))?;
     let args: Vec<String> = std::env::args()
         .skip(1)
@@ -1072,6 +1092,23 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
                 return Err(MainError::IO(e, "mounting the state volume"));
             }
         }
+    }
+
+    // A newer build's box state is refused before this daemon writes
+    // anything under the state dir. In the microVM the refusal goes to the
+    // host as STATE_REFUSED in place of READY, and pid-1 parks as on a
+    // mount failure. A native daemon exits non-zero with the text.
+    if let Some(text) = state_refusal(&cli.minimal_state_dir()) {
+        tracing::error!(state_dir = %cli.minimal_state_dir(), "box state is from a newer build; refusing READY");
+        if cli.listen_args().unwrap().vsock {
+            if let Err(emit) = guest::emit_state_refused_marker(&text).await {
+                tracing::error!(error = %emit, "emitting STATE_REFUSED marker failed; host will see a READY timeout");
+            }
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        }
+        return Err(MainError::StateRefused(text));
     }
 
     if let Err(e) = std::fs::create_dir_all(cli.minimal_state_dir())

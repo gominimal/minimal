@@ -120,9 +120,14 @@ choose, the start gives the session a name. If a session already has that name,
 the new session takes it with a number at the end. You choose the name with
 `--name <NAME>` or with the entry's `[box] name` in `minimal.toml`. If a box on
 the host already has that name, in any state, `min session start` refuses and
-creates nothing. Attach
+creates nothing. When you can read the box that has the name, the refusal names
+it, its state, and the command that goes back into it. It also names
+`min box rm`, which removes that box and frees the name. Attach
 to the existing session when you mean to rejoin it, or pass another
-`--name <NAME>` for a second session from the same entry. Once two sessions share a
+`--name <NAME>` for a second session from the same entry. A `--detach` start of
+a session that takes a number prints one line on stderr. The line names the
+name that the session took. The line always names `min box prune`, which
+removes stopped boxes. Once two sessions share a
 project directory, a bare `min session attach` there cannot choose between
 them. When more than one session can match, the command lists them and exits
 with code 2.
