@@ -1182,6 +1182,7 @@ impl std::error::Error for NewerStateFormat {}
 
 impl NewerStateFormat {
     /// The refusal inside `err`, when `err` is one.
+    #[must_use]
     pub fn from_io(err: &std::io::Error) -> Option<&Self> {
         err.get_ref()?.downcast_ref::<Self>()
     }

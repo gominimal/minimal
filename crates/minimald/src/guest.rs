@@ -268,6 +268,25 @@ const MOUNT_FAILED_REASON_MAX_BYTES: usize = 512;
 /// The reason is flattened to a single line and capped at
 /// [`MOUNT_FAILED_REASON_MAX_BYTES`] (on a char boundary).
 pub(crate) fn mount_failed_beacon(reason: &str) -> Vec<u8> {
+    format!("MOUNT_FAILED\n{}\n", one_line_reason(reason)).into_bytes()
+}
+
+/// Emits the state-refusal marker instead of READY: the data volume mounted,
+/// but a newer build wrote the box state on it, so this daemon must not
+/// serve it. The host fails the boot with the reason and keeps the volume.
+pub async fn emit_state_refused_marker(reason: &str) -> std::io::Result<()> {
+    emit_marker(&state_refused_beacon(reason), "STATE_REFUSED").await
+}
+
+/// Builds the two-line `STATE_REFUSED\n<one-line reason>\n` beacon payload,
+/// with the same flattening and cap as [`mount_failed_beacon`].
+pub(crate) fn state_refused_beacon(reason: &str) -> Vec<u8> {
+    format!("STATE_REFUSED\n{}\n", one_line_reason(reason)).into_bytes()
+}
+
+/// `reason` flattened to one line and capped at
+/// [`MOUNT_FAILED_REASON_MAX_BYTES`] (on a char boundary).
+fn one_line_reason(reason: &str) -> String {
     let mut reason: String = reason
         .chars()
         .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
@@ -277,7 +296,7 @@ pub(crate) fn mount_failed_beacon(reason: &str) -> Vec<u8> {
         cut -= 1;
     }
     reason.truncate(cut);
-    format!("MOUNT_FAILED\n{reason}\n").into_bytes()
+    reason
 }
 
 async fn emit_marker(payload: &[u8], label: &str) -> std::io::Result<()> {
@@ -2062,6 +2081,25 @@ mod tests {
         let payload = String::from_utf8(mount_failed_beacon(&long)).unwrap();
         let reason = payload
             .strip_prefix("MOUNT_FAILED\n")
+            .unwrap()
+            .strip_suffix('\n')
+            .unwrap();
+        assert!(reason.len() <= MOUNT_FAILED_REASON_MAX_BYTES);
+        assert!(reason.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn state_refused_beacon_is_two_lines_flattened_and_capped() {
+        let payload = state_refused_beacon("A newer min wrote\r\nthe box state");
+        assert_eq!(
+            String::from_utf8(payload).unwrap(),
+            "STATE_REFUSED\nA newer min wrote  the box state\n"
+        );
+
+        let long = "é".repeat(MOUNT_FAILED_REASON_MAX_BYTES);
+        let payload = String::from_utf8(state_refused_beacon(&long)).unwrap();
+        let reason = payload
+            .strip_prefix("STATE_REFUSED\n")
             .unwrap()
             .strip_suffix('\n')
             .unwrap();
