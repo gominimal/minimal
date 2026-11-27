@@ -442,7 +442,8 @@ pub(crate) fn default_vm_known_hosts_path() -> std::path::PathBuf {
 
 /// Outcome of the guest boot beacon (R2.4/R2.5): the guest either reached
 /// READY, or refused with `MOUNT_FAILED\n<reason>\n` because the data volume
-/// could not be mounted.
+/// could not be mounted, or refused with `STATE_REFUSED\n<reason>\n` because
+/// a newer build wrote the box state on the volume.
 #[cfg(any(minvmd_libkrun, test))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum BootBeacon {
@@ -451,6 +452,12 @@ pub(crate) enum BootBeacon {
     /// The guest refused READY: the data volume mount failed (R2.5).
     MountFailed {
         /// One-line failure cause relayed from the guest (capped there).
+        reason: String,
+    },
+    /// The guest refused READY: the data volume mounted, but a newer build
+    /// wrote the box state on it. The guest changed nothing on it.
+    StateRefused {
+        /// The guest's one-line refusal text (capped there).
         reason: String,
     },
 }
@@ -476,6 +483,20 @@ pub(crate) fn read_ready_beacon<R: std::io::BufRead>(
         .read_line(&mut line)
         .map_err(|e| format!("reading READY marker: {e}"))?;
     let trimmed = line.trim();
+    if trimmed == "STATE_REFUSED" {
+        let mut reason = String::new();
+        if let Err(e) = std::io::Read::take(reader.by_ref(), 1024).read_line(&mut reason) {
+            tracing::debug!(error = %e, "failed to read STATE_REFUSED reason line");
+        }
+        let reason = reason.trim();
+        return Ok(BootBeacon::StateRefused {
+            reason: if reason.is_empty() {
+                "A newer min wrote the box state on the data volume.".to_string()
+            } else {
+                reason.to_string()
+            },
+        });
+    }
     if trimmed == "MOUNT_FAILED" {
         // Optional second line: the failure reason (guest caps it at 512 B;
         // 1024 here leaves margin without unbounding the read).
@@ -614,6 +635,34 @@ pub(crate) fn mount_failed_error(
         )
     }
 }
+
+/// Build the error for a guest `STATE_REFUSED` boot: the guest's refusal
+/// text, then the host path of the data volume that holds the state. The
+/// guest names its own mount point, which a person on the host cannot open.
+/// The volume is never touched: it holds the newer build's state.
+#[cfg(any(minvmd_libkrun, test))]
+pub(crate) fn state_refused_error(reason: &str, volume_path: &std::path::Path) -> anyhow::Error {
+    anyhow::Error::new(StateRefusedError(format!(
+        "{reason} That state is on the data volume {}.",
+        volume_path.display()
+    )))
+}
+
+/// The error [`state_refused_error`] builds. A caller tells it from other
+/// boot failures by its type, and keeps the volume for it.
+#[cfg(any(minvmd_libkrun, test))]
+#[derive(Debug)]
+pub(crate) struct StateRefusedError(String);
+
+#[cfg(any(minvmd_libkrun, test))]
+impl std::fmt::Display for StateRefusedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[cfg(any(minvmd_libkrun, test))]
+impl std::error::Error for StateRefusedError {}
 
 /// Whether the data-volume image already exists before this boot provisions
 /// it — the input to the R2.5 fatality decision. A stat error counts as
@@ -869,6 +918,32 @@ mod beacon_tests {
                 reason: "mkfs.ext4 failed: exit 1".to_string()
             }
         );
+    }
+
+    #[test]
+    fn read_ready_beacon_parses_state_refused() {
+        let text = "A newer min wrote the box state in /var/lib/minimal. That state has \
+                    format version 2.";
+        let payload = format!("STATE_REFUSED\n{text}\n");
+        let mut reader = Cursor::new(payload.as_bytes());
+        let tmp = tempfile::tempdir().unwrap();
+        let beacon = read_ready_beacon(&mut reader, &tmp.path().join("known_hosts")).unwrap();
+        assert_eq!(
+            beacon,
+            BootBeacon::StateRefused {
+                reason: text.to_string()
+            }
+        );
+        let err = state_refused_error(text, std::path::Path::new("/h/minimal/data.ext4"));
+        assert_eq!(
+            err.to_string(),
+            format!("{text} That state is on the data volume /h/minimal/data.ext4.")
+        );
+        assert!(err.is::<StateRefusedError>());
+
+        let mut reader = Cursor::new(b"STATE_REFUSED\n".as_ref());
+        let beacon = read_ready_beacon(&mut reader, &tmp.path().join("known_hosts")).unwrap();
+        assert!(matches!(beacon, BootBeacon::StateRefused { .. }), "{beacon:?}");
     }
 
     #[test]
