@@ -4418,6 +4418,15 @@ seed_0_8_versions() {
     done
 }
 
+# tilde_of <home> <path> — <path> as the installer prints it for a run with
+# HOME=<home>: a ~ in place of <home>, when <path> is under it.
+tilde_of() {
+    case "$2" in
+        "$1"/*) printf '~%s\n' "${2#"$1"}" ;;
+        *)      printf '%s\n' "$2" ;;
+    esac
+}
+
 # stage_0_7_upgrade <home> <label> — a completed install whose on-disk `min`
 # reports 0.7.3, one stale executable so the next run swaps, and box state
 # in the state directory: an index without format_version and a record.
@@ -4555,19 +4564,25 @@ case_state_archive_on_upgrade_from_0_7() {
     want_ok "a version that cannot be placed gets the state copy (R5.7)" \
         diff -r "$root/sa6.before" "$HSF/xdg-state/minimal.0.7.3"
 
-    # A symlinked state directory: the copy is a real directory that holds
-    # the data, not another link to it.
+    # A symlinked state directory: the copy is a real directory beside the
+    # link's target, it holds the data, and the link is left as it was.
     HSG="$root/sa7"; mkdir -p "$HSG"
     stage_0_7_upgrade "$HSG" sa7
     mv "$HSG/xdg-state/minimal" "$HSG/real-state"
     ln -s ../real-state "$HSG/xdg-state/minimal"
+    _sa7_real="$(cd -P "$HSG/real-state" && pwd -P)"
     cp -Rp "$HSG/real-state" "$root/sa7.before"
     run sa7 "$HSG" --version 0.8.0
     check 0 "$rc" "an upgrade with a symlinked state directory exits 0 (R5.7)"
-    want_err "the copy of a symlinked state is not a link (R5.7)" test -L "$HSG/xdg-state/minimal.0.7.3"
-    want_ok "the copy of a symlinked state is a directory (R5.7)" test -d "$HSG/xdg-state/minimal.0.7.3"
+    want_ok "the copy of a symlinked state is beside the target (R5.7)" test -d "$HSG/real-state.0.7.3"
+    want_err "the copy of a symlinked state is not a link (R5.7)" test -L "$HSG/real-state.0.7.3"
+    want_err "no copy is made beside the link (R5.7)" test -e "$HSG/xdg-state/minimal.0.7.3"
     want_ok "the copy of a symlinked state holds the target's files (R5.7)" \
-        diff -r "$root/sa7.before" "$HSG/xdg-state/minimal.0.7.3"
+        diff -r "$root/sa7.before" "$HSG/real-state.0.7.3"
+    check "../real-state" "$(readlink "$HSG/xdg-state/minimal")" \
+        "the link to the state is unchanged (R5.7)"
+    want_ok "the card says the copy is beside the target (R10.5)" \
+        grep -qF "is in $(tilde_of "$HSG" "$_sa7_real.0.7.3")." "$OUT"
 
     # A copy from an earlier run is left alone: the new copy gets a suffix.
     HSH="$root/sa8"; mkdir -p "$HSH"
@@ -4780,6 +4795,72 @@ case_refuses_0_7_over_0_8_state() {
         grep -qxF "1 older copy is beside it, in ~/xdg-state/minimal.0.7.*." "$OUT"
     want_ok "rd7: the restore puts back the newest copy (R2.6)" \
         grep -qF "mv '$HRG/xdg-state/minimal.0.7.3' '$HRG/xdg-state/minimal'" "$OUT"
+
+    # A symlinked state: 0.7.3 -> 0.8.0 saves the copy beside the target.
+    # Back to 0.7.3 is refused. The printed steps move the target, the
+    # restore runs, and the link points at the restored 0.7 state.
+    HRJ="$root/rd10"; mkdir -p "$HRJ"
+    stage_0_7_upgrade "$HRJ" rd10
+    mkdir -p "$HRJ/other"
+    mv "$HRJ/xdg-state/minimal" "$HRJ/other/minimal"
+    ln -s ../other/minimal "$HRJ/xdg-state/minimal"
+    _rd10_real="$(cd -P "$HRJ/other/minimal" && pwd -P)"
+    run rd10_up "$HRJ" --version 0.8.0
+    check 0 "$rc" "rd10: the upgrade over a symlinked state exits 0"
+    want_ok "rd10: the copy is beside the target (R5.7)" test -d "$HRJ/other/minimal.0.7.3"
+    reset_dl
+    run rd10 "$HRJ" --version 0.7.3
+    check 1 "$rc" "rd10: 0.7.3 over a symlinked 0.8 state is refused (R2.6)"
+    check 0 "$(downloads)" "rd10: the refusal downloads nothing (R2.6)"
+    check "install: refused to install Minimal 0.7.3 over the box state in ~/xdg-state/minimal." \
+        "$(grep '^install: refused' "$OUT")" "rd10: the refusal names the state the user knows (R2.6)"
+    want_ok "rd10: the refusal says the state is a link (R2.6)" \
+        grep -qxF "$(tilde_of "$HRJ" "$HRJ/xdg-state/minimal") is a link to $(tilde_of "$HRJ" "$_rd10_real"). The steps below move $(tilde_of "$HRJ" "$_rd10_real") and keep the link." "$OUT"
+    want_ok "rd10: the refusal prints the move of the target (R2.6)" \
+        grep -qxF "      mv '$_rd10_real' '$_rd10_real.0.8'" "$OUT"
+    want_ok "rd10: the refusal names the copy beside the target (R2.6)" \
+        grep -qxF "An upgrade to 0.8 saved the earlier state in $(tilde_of "$HRJ" "$_rd10_real.0.7.3")." "$OUT"
+    _rd_restore="$(awk '/^      mv .*&&/ {sub(/^      /, ""); l=$0} END {print l}' "$OUT")"
+    check "mv '$_rd10_real' '$_rd10_real.0.8' && mv '$_rd10_real.0.7.3' '$_rd10_real'" "$_rd_restore" \
+        "rd10: the restore moves the target and the copy beside it (R2.6)"
+    want_ok "rd10: the printed restore runs (R2.6)" sh -c "$_rd_restore"
+    check "../other/minimal" "$(readlink "$HRJ/xdg-state/minimal")" \
+        "rd10: the restore keeps the link (R2.6)"
+    want_ok "rd10: the link points at the restored 0.7 state (R2.6)" \
+        test -f "$HRJ/xdg-state/minimal/sessions/abc/record.json"
+    want_ok "rd10: the 0.8 state is moved aside beside the target (R2.6)" \
+        test -d "$HRJ/other/minimal.0.8"
+    run rd10_restored "$HRJ" --version 0.7.3
+    check 0 "$rc" "rd10: 0.7.3 over the restored 0.7 state installs (R2.6)"
+
+    # A copy that an earlier installer saved beside the link, not beside the
+    # target. The restore copies it back to the target, and keeps the link.
+    HRK="$root/rd11"; mkdir -p "$HRK"
+    run rd11_seed "$HRK" --version 0.8.0
+    check 0 "$rc" "rd11: a 0.8.0 install exits 0"
+    mkdir -p "$HRK/other"
+    mv "$HRK/xdg-state/minimal" "$HRK/other/minimal"
+    ln -s ../other/minimal "$HRK/xdg-state/minimal"
+    _rd11_real="$(cd -P "$HRK/other/minimal" && pwd -P)"
+    mkdir -p "$HRK/xdg-state/minimal.0.7.3/sessions/abc"
+    printf '{"short_to_id":{},"name_to_id":{}}\n' >"$HRK/xdg-state/minimal.0.7.3/sessions/index.json"
+    printf '{"id":"abc"}\n' >"$HRK/xdg-state/minimal.0.7.3/sessions/abc/record.json"
+    run rd11 "$HRK" --version 0.7.3
+    check 1 "$rc" "rd11: 0.7.3 over a symlinked 0.8 state is refused (R2.6)"
+    want_ok "rd11: the refusal names the copy beside the link (R2.6)" \
+        grep -qxF "An upgrade to 0.8 saved the earlier state in ~/xdg-state/minimal.0.7.3." "$OUT"
+    _rd_restore="$(awk '/^      mv .*&&/ {sub(/^      /, ""); l=$0} END {print l}' "$OUT")"
+    check "mv '$_rd11_real' '$_rd11_real.0.8' && cp -Rp '$HRK/xdg-state/minimal.0.7.3' '$_rd11_real'" \
+        "$_rd_restore" "rd11: the restore copies the copy beside the link to the target (R2.6)"
+    want_ok "rd11: the printed restore runs (R2.6)" sh -c "$_rd_restore"
+    check "../other/minimal" "$(readlink "$HRK/xdg-state/minimal")" \
+        "rd11: the restore keeps the link (R2.6)"
+    want_ok "rd11: the link points at the restored 0.7 state (R2.6)" \
+        test -f "$HRK/xdg-state/minimal/sessions/abc/record.json"
+    want_ok "rd11: the copy beside the link stays (R2.6)" \
+        test -f "$HRK/xdg-state/minimal.0.7.3/sessions/abc/record.json"
+    run rd11_restored "$HRK" --version 0.7.3
+    check 0 "$rc" "rd11: 0.7.3 over the restored 0.7 state installs (R2.6)"
 
     # A version named by a commit hash is placed from the downloaded `min`.
     # One that reports 0.7.3 is refused before any component is replaced.
