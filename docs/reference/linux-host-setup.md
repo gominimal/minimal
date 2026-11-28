@@ -77,8 +77,9 @@ $ sudo scripts/install-apparmor-profile.sh --path "$PWD/target/debug/minimald"
 For `mip`, which builds every task in the same kind of sandbox, attach
 the profile to the `mip` binary with `--path`. `min finalize-install`
 covers the daemon alone. The installer puts the loader in the Minimal data
-directory, `${XDG_DATA_HOME:-~/.local/share}/minimal`, and the refusal that
-`mip` prints names the loader's path:
+directory. That is `$XDG_DATA_HOME/minimal` when `XDG_DATA_HOME` is an
+absolute path, and `~/.local/share/minimal` when it is not set. The warning
+that `mip` logs at the start of a task run names the loader's path:
 
 ```console
 $ sudo bash "${XDG_DATA_HOME:-$HOME/.local/share}/minimal/apparmor/install-apparmor-profile.sh" --path "$(command -v mip)"
