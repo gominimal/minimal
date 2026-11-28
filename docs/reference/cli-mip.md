@@ -45,6 +45,9 @@ mip run [OPTIONS] --upstream <upstream> --task-spec <task_spec> [task_args]...
 | `--upstream <JSON>` | The upstream link, as JSON. Use it with `--task-spec`, in place of `<task_name>`. It needs no `minimal.toml` |
 | `--task-spec <JSON>` | A task, as JSON. Use it with `--upstream` |
 
+`mip run --upstream ... --task-spec ...` refuses to run unless
+`MINIMAL_SCIENCE_MODE=yeppers` is in the environment.
+
 A task that `mip run <task_name>` runs has its `[patches]` checked against
 your [`user_policy.toml`](./user-policy.md) first.
 
@@ -228,6 +231,6 @@ Prints a shell tab-completion script for `mip`. The shells are `bash`,
 ## Hidden commands
 
 With `MINIMAL_SCIENCE_MODE` in the environment, `mip --help` shows more
-commands. They
-are experimental and unsupported, and this page does not document them.
-They refuse to run unless `MINIMAL_SCIENCE_MODE=yeppers`.
+commands. They are experimental and unsupported, and this page does not
+document them. `mip package patched-build` refuses to run unless
+`MINIMAL_SCIENCE_MODE=yeppers`.
