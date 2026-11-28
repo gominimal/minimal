@@ -158,7 +158,13 @@ prints the `mv` command that moves the state directory aside, to a path that
 does not exist yet. When an R5.7 copy of 0.7 state is beside the state
 directory, the refusal also names the newest copy by modification time and
 prints the command that puts it back in place. When there are more copies,
-one line says how many and where. The installer installs a version before
+one line says how many and where. When the state directory is a symlink, the
+refusal says that it is a link and names its target. The printed `mv` moves
+the target, not the link, and the restore line puts the copy back at the
+target, so the link stays and points at the restored 0.7 state. The refusal
+looks for a copy beside the target first. When none is there, it looks beside
+the link, where an installer before this rule saved it, and the restore line
+copies that copy to the target with `cp -Rp`. The installer installs a version before
 0.8 over 0.7 state, and over a state that the user put back. A version that
 is not `X.Y` (a nightly named by its commit hash) is placed from the
 `min version` output of the `min` its manifest ships, after the manifest
@@ -188,6 +194,11 @@ is not refused.
   copies, the refusal names the newest one and says where the other is. A
   hash-named version whose `min` reports 0.7.3 is refused before any
   component is replaced. A hash-named version that cannot be placed installs.
+  With a symlinked state directory, the refusal names the link and its
+  target, and the printed `mv` moves the target. After an upgrade from 0.7.3
+  to 0.8.0, the printed restore moves the copy beside the target back, and the
+  link points at the restored state. A copy beside the link is copied back to
+  the target with `cp -Rp`, and the link stays.
 
 ### Unit 3 - Manifest format and field extraction
 
@@ -433,8 +444,10 @@ both hash columns in place of digests.
 to `<state directory>.<0.7 version>` beside it. A version that R2.6 cannot
 place counts as 0.8 or later here. When that path exists, the copy gets a
 `.<time>` suffix and the existing one is left alone. A symlinked state
-directory is resolved first: the copy is a real directory that holds the
-contents, and `du` measures the resolved directory. An `install.toml` whose `key`
+directory is resolved once, to its target: the copy is a real directory
+beside the target, at `<target>.<0.7 version>`, and holds the contents. The
+link is left as it is. `du` measures the target, and `df -Pk` reads the
+free space beside the target. An `install.toml` whose `key`
 names 0.8 or later skips the question to `min`. The copy happens once, after
 the R5.5 pre-swap stop and before the first executable swap, so the daemon
 writes nothing during the copy. The installer first tries a copy-on-write
@@ -531,7 +544,8 @@ what R2.6 puts back for a return to 0.7.
   `--skip-state-archive` and `MINIMAL_INSTALL_SKIP_STATE_ARCHIVE` upgrade
   without the copy. A hash-named version whose `min` reports 0.8.0, and one
   that cannot be placed, get the copy. A symlinked state directory gets a
-  real directory with the target's files. An earlier copy at the same path
+  real directory with the target's files, beside the target, and the link
+  is unchanged. An earlier copy at the same path
   is left untouched, and the new copy gets a suffix.
 - **Test** (R5.7, `case_state_archive_refuses_short_space`): with a `cp` that
   refuses a clone and a `df` that reports 1 KB free, the upgrade exits
