@@ -236,7 +236,13 @@ secret-service-links:
     #!/usr/bin/env bash
     set -euo pipefail
     links() {
-        cargo tree --locked --target {{musl-target}} -e normal -p "$1" -i secret-service >/dev/null 2>&1
+        local tree
+        # A `cargo tree` that fails says nothing about what the package links.
+        tree="$(cargo tree --locked --target {{musl-target}} -e normal --prefix none -p "$1")" || {
+            echo "cargo tree failed for $1, so its dependencies are not known"
+            exit 2
+        }
+        grep -q '^secret-service v' <<<"$tree"
     }
     for package in minimald minvmd; do
         if links "$package"; then

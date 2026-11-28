@@ -315,22 +315,35 @@ async fn open_bus(timeout: Duration, address: Option<&str>) -> Result<zbus::Conn
         Some(address) => Some(address.to_owned()),
         None => std::env::var("DBUS_SESSION_BUS_ADDRESS").ok(),
     };
-    let mut first_failure = None;
+    let mut failure = None;
     for one in listed.iter().flat_map(|listed| listed.split(';')) {
         if one.is_empty() {
             continue;
         }
         match open(zbus::connection::Builder::address(one), timeout).await {
             Ok(bus) => return Ok(bus),
-            Err(cause) => {
-                first_failure.get_or_insert(cause);
-            }
+            Err(cause) => keep_failure(&mut failure, cause),
         }
     }
-    match first_failure {
+    match failure {
         Some(cause) => Err(cause),
         // No address is named, so the client works out the session's own.
         None => open(zbus::connection::Builder::session(), timeout).await,
+    }
+}
+
+/// Keeps in `kept` the failure that tells the most about a list of
+/// addresses: the first bus that was there and did not take the connection,
+/// or else the first address with no bus. An address with no bus never
+/// hides a bus that refused.
+fn keep_failure(kept: &mut Option<Cause>, cause: Cause) {
+    let replace = match kept {
+        None => true,
+        Some(Cause::Unreachable(_)) => !matches!(cause, Cause::Unreachable(_)),
+        Some(_) => false,
+    };
+    if replace {
+        *kept = Some(cause);
     }
 }
 
@@ -673,6 +686,25 @@ mod tests {
         let none = format!("unix:path={};unix:path={}", gone.display(), gone.display());
         let answer = SessionItems::within(timeout).at(&none).lookup(ONE);
         assert!(matches!(answer, Err(Cause::Unreachable(_))), "{answer:?}");
+    }
+
+    // Of the failures of a list of addresses, a bus that refused is kept
+    // ahead of an address with no bus, whichever came first.
+    #[test]
+    fn a_refusal_is_kept_ahead_of_an_address_with_no_bus() {
+        let gone = |n: u8| Cause::Unreachable(format!("gone {n}"));
+        let refused = |n: u8| Cause::Other(format!("refused {n}"));
+        for (failures, expected) in [
+            (vec![gone(1), gone(2)], gone(1)),
+            (vec![gone(1), refused(2), gone(3)], refused(2)),
+            (vec![refused(1), gone(2), refused(3)], refused(1)),
+        ] {
+            let mut kept = None;
+            for cause in failures {
+                keep_failure(&mut kept, cause);
+            }
+            assert_eq!(kept, Some(expected));
+        }
     }
 
     // A bus that accepts the connection and says nothing ends the call at
