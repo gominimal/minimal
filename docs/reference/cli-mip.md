@@ -1,39 +1,37 @@
 ---
 title: mip CLI
-description: "Reference for the mip package/build CLI: build packages, run tasks, materialize outputs, and manage the local cache."
+description: "Reference for mip, the package and build CLI that runs without the daemon on Linux, with its flags and commands."
 ---
 
 # `mip` - package/build CLI
 
-`mip` (short for "Minimal in-process") is the Minimal package/build CLI. It
-reads a project's [`minimal.toml`](./minimal-dot-toml.md), builds packages in
-clean rooms, runs [tasks](./tasks.md) in sandboxes, and manages the
-content-addressed local cache.
+`mip` (short for "Minimal in-process") is the Minimal package and build
+CLI. It reads a project's [`minimal.toml`](./minimal-dot-toml.md) and builds
+packages in clean rooms. It also runs [tasks](./tasks.md) in sandboxes and
+keeps the content-addressed local cache. It works without the daemon.
 
-> **Advanced tool.** `mip` is Linux-only and aimed at advanced users driving
-> the package/build plane directly. Most workflows are better served by the
+> **Advanced tool.** `mip` is for Linux only, and for advanced users who
+> drive the package and build engine directly. For most work, use the
 > [`min` session CLI](./cli-min.md).
-
-Generated from `--help` at `43183a44`.
 
 ## Global flags
 
-These apply to every subcommand.
+These flags apply to every subcommand.
 
 | Flag | Short | Description |
 |------|-------|-------------|
-| `--repo-dir <PATH>` | `-C` | Use the given directory as the repository root instead of searching from the current working directory |
-| `--minimal-dir <PATH>` | | Override the base directory used for operations (default: `~/.cache/minimal`) |
-| `--no-cache` | | Ignore locally-available binary artifacts (results in rebuilds unless present in a remote cache) |
+| `--repo-dir <PATH>` | `-C` | Use this directory as the repository root. Without it, `mip` searches up from the current directory |
+| `--minimal-dir <PATH>` | | The state directory. The default is `$XDG_STATE_HOME/minimal` when `XDG_STATE_HOME` is an absolute path, else `minimal` in the platform state directory, else `~/.local/state/minimal` |
+| `--no-cache` | | Do not use the binary artifacts in the local cache. `mip` builds again each package that no remote cache has |
 | `--no-fetch` | | Do not fetch binary artifacts from the internet |
-| `--offline` | | Use only what's already in the local cache for sources, VCS checkouts, and the remote artifact cache; fail with a clear error on cache miss instead of attempting any network call. Implies the remote-artifact-cache half of `--no-fetch`; orthogonal to `--no-cache`/`--rebuild` |
-| `--num-parallel-builds <N>` | `-n` | Configure the number of parallel builds |
+| `--offline` | | Use only what is in the local cache for sources, VCS checkouts and artifacts. On a cache miss, `mip` exits with an error and does not use the network. `--offline` includes the remote-cache part of `--no-fetch`. It does not change `--no-cache` or `--rebuild` |
+| `--num-parallel-builds <N>` | `-n` | The number of builds that run in parallel |
 
 ## Commands
 
 ### `run` {#run}
 
-Runs a task, such as one specified in `minimal.toml`. *(Linux only)*
+Runs a task. *(Linux only)*
 
 ```
 mip run [OPTIONS] <task_name> [task_args]...
@@ -42,10 +40,13 @@ mip run [OPTIONS] --upstream <upstream> --task-spec <task_spec> [task_args]...
 
 | Argument / flag | Description |
 |-----------------|-------------|
-| `<task_name>` | Name of the task to run (from `minimal.toml`) |
-| `[task_args]...` | Additional arguments to pass to the task |
-| `--upstream <JSON>` | JSON stanza specifying the software supply chain; must be used with `--task-spec` |
-| `--task-spec <JSON>` | JSON stanza specifying a task inline; must be used with `--upstream` |
+| `<task_name>` | The name of a task in `minimal.toml` |
+| `[task_args]...` | More arguments for the task, parsed by the task's `args` schema |
+| `--upstream <JSON>` | The upstream link, as JSON. Use it with `--task-spec`, in place of `<task_name>`. It needs no `minimal.toml` |
+| `--task-spec <JSON>` | A task, as JSON. Use it with `--upstream` |
+
+A task that `mip run <task_name>` runs has its `[patches]` checked against
+your [`user_policy.toml`](./user-policy.md) first.
 
 ### `update`
 
@@ -53,7 +54,14 @@ mip run [OPTIONS] --upstream <upstream> --task-spec <task_spec> [task_args]...
 mip update
 ```
 
-Refreshes local checkouts of upstream packages and the standard library.
+Updates the project's `[upstream]` link and each sideload to the head of
+its tracking branch, and writes the new `locked_commit` values to
+`minimal.toml`. The command prints each change. It then downloads the
+packages that the project can reach and that are in a remote cache but
+not in the local cache.
+
+The command changes `minimal.toml` in your working tree. Do not run it
+only to fetch artifacts.
 
 ### `add` {#add}
 
@@ -61,13 +69,13 @@ Refreshes local checkouts of upstream packages and the standard library.
 mip add <--runtime|--build|--task <TASK>> <PACKAGES>...
 ```
 
-Add a new tool or dependency. Exactly one placement flag is required:
+Adds packages to `minimal.toml`. Give exactly one of these flags:
 
 | Flag | Description |
 |------|-------------|
-| `--runtime` | Add as a runtime dependency: your program needs this package anywhere it runs |
-| `--build` | Add as a build dependency: your program needs this package to build |
-| `--task <TASK>` | Add to a task's package list |
+| `--runtime` | Add the packages as runtime dependencies, which your program needs wherever it runs |
+| `--build` | Add the packages as build dependencies, which your program needs to build |
+| `--task <TASK>` | Add the packages to the package list of the task `<TASK>` |
 
 ### `init`
 
@@ -75,9 +83,8 @@ Add a new tool or dependency. Exactly one placement flag is required:
 mip init [-y|--yes]
 ```
 
-Automatically initialize minimal configuration based on your source tree.
-`--yes` skips confirmation and writes configuration based on
-auto-detection.
+Writes a Minimal configuration for your source tree, from what it detects
+there. With `--yes`, it writes the configuration and does not ask you first.
 
 ### `status`
 
@@ -93,23 +100,23 @@ Shows the status of Minimal in this codebase.
 mip materialize --output <OUTPUT> [--arch <ARCH>] <OUTPUT_NAME>
 ```
 
-Materializes an output specified in an
+Writes an output that an
 [`[outputs.<name>]`](./minimal-dot-toml.md#outputs) section of
-`minimal.toml`.
+`minimal.toml` declares.
 
 | Flag | Short | Description |
 |------|-------|-------------|
 | `--output <PATH>` | `-o` | **(required)** The output file to write |
-| `--arch <ARCH>` | | Override the architecture used when building the output (e.g. `amd64`, `arm64`); takes precedence over the `arch` field in `minimal.toml` and the host default |
+| `--arch <ARCH>` | | The architecture to build the output for, such as `amd64` or `arm64`. It takes precedence over the `arch` field in `minimal.toml` and the host default |
 
-Supported output types include `oci-image`, a Linux OCI image archive
-containing the configured packages, suitable for `docker load` or pushing
-to a registry.
+The output type `oci-image` writes a Linux OCI image archive of the
+configured packages. You can load it with `docker load` or push it to a
+registry.
 
 ### `package` (aliases: `pkg`, `packages`)
 
-Package-level operations. Takes a subcommand; see `package build` and
-`package dep` below.
+Package operations. It takes the subcommand `package build` or
+`package dep`.
 
 #### `package build`
 
@@ -117,13 +124,12 @@ Package-level operations. Takes a subcommand; see `package build` and
 mip package build [OPTIONS] [PACKAGES]...
 ```
 
-Builds the specified package(s) in a clean room, making them available in
-the local cache.
+Builds the packages in a clean room. The builds go into the local cache.
 
 | Flag | Short | Description |
 |------|-------|-------------|
-| `--verbose` | `-v` | Log stdout/stderr during the build |
-| `--rebuild` | | Always build the specified packages, even if they are already available |
+| `--verbose` | `-v` | Print the build's stdout and stderr |
+| `--rebuild` | | Build the packages again, even when the cache already has them |
 
 #### `package dep`
 
@@ -131,12 +137,15 @@ the local cache.
 mip package dep [OPTIONS] [PACKAGES]...
 ```
 
-Generates Graphviz source code of the dependency graph, e.g.
+Prints the dependency graph as Graphviz source, or as Mermaid with
+`--output-format mermaid`. To draw it, run
 `mip package dep --input-deps-depth=0 | dot -Tpng > deps.png`.
+
+A `<BOOL>` flag with no value means `true`: `--needs` is `--needs=true`.
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
-| `--excludes <PKGS>` | `-e` | | Packages left out of the graph and not traversed |
+| `--excludes <PKGS>` | `-e` | | Packages to leave out of the graph and not follow, comma-separated. `--exclude` is the same flag |
 | `--build-spec-deps <BOOL>` | | `true` | Include build spec `build_deps` (does not affect runtime deps) |
 | `--source-deps <BOOL>` | | `false` | Include source code `build_deps` |
 | `--local-deps <BOOL>` | | `false` | Include local (`build.sh`) input deps |
@@ -144,8 +153,8 @@ Generates Graphviz source code of the dependency graph, e.g.
 | `--provides <BOOL>` | | `false` | Include "Provides" edges and "Needs" nodes |
 | `--bootstrap <BOOL>` | | `false` | Include replace-on-cycle/prebuilts/bootstrap |
 | `--subtrees-only <BOOL>` | | `false` | Require non-zero subtree deps for runtime/input deps |
-| `--input-deps-depth <N>` | | `-1` | How deeply input dependencies are followed (`-1` = all) |
-| `--runtime-deps-depth <N>` | | `-1` | How deeply runtime dependencies are followed (`-1` = all) |
+| `--input-deps-depth <N>` | | `-1` | How many levels of input dependencies the graph follows (`-1` = all) |
+| `--runtime-deps-depth <N>` | | `-1` | How many levels of runtime dependencies the graph follows (`-1` = all) |
 | `--prune-edgeless <BOOL>` | | `false` | Discard graph nodes with no edges |
 | `--output-format <FMT>` | | `dot` | Output format: `dot` or `mermaid` |
 
@@ -155,14 +164,15 @@ Generates Graphviz source code of the dependency graph, e.g.
 mip cache clean [--older-than <DURATION>]
 ```
 
-Removes stale entries from the local cache: cached build artifacts whose
-last recorded use and last write are both older than the cutoff. An
-artifact with neither time recorded is deleted too. Packages needed by the current project's tasks
-and stack are always kept. Also removes sandbox, task, and temporary build
-directories whose owning process is no longer running.
+Removes old entries from the local cache. It deletes a cached build
+artifact when its last recorded use and last write are both older than
+the cutoff. It also deletes each artifact with neither time recorded. It
+always keeps the packages that the current project's tasks and stack need.
+It also removes the sandbox, task and temporary build directories whose
+process is no longer running.
 
-`--older-than` takes a whole number of days, hours, or minutes (e.g.
-`30d`, `12h`, `45m`); the default is `14d`.
+`--older-than` takes a whole number of days, hours or minutes, such as
+`30d`, `12h` or `45m`. The default is `14d`.
 
 ### `cache notices`
 
@@ -170,16 +180,16 @@ directories whose owning process is no longer running.
 mip cache notices <source_sha256>
 ```
 
-Prints the upstream attribution files (`NOTICE` / `COPYRIGHT` / `COPYING`)
-recorded when the source archive with the given sha256 was last extracted,
-as pretty JSON. The sha256 is the one declared in the build spec.
+Prints, as JSON, the upstream attribution files (`NOTICE`, `COPYRIGHT`,
+`COPYING`) that `mip` recorded the last time it extracted the source archive
+with this sha256. Use the sha256 that the build spec declares.
 
 | Argument | Description |
 |----------|-------------|
 | `<source_sha256>` | The archive's sha256, as declared in the build spec |
 
-Errors if no notices are recorded for the given sha256 — extract the source
-first.
+With no notices recorded for the sha256, the command fails with
+`no notices recorded for <sha256>; extract the source first`.
 
 ### `check` {#check}
 
@@ -187,17 +197,17 @@ first.
 mip check [OPTIONS] [FILTER_NAMES]...
 ```
 
-Validates minimal configuration including packages & stacks.
+Checks the Minimal configuration: packages and stacks.
 
 | Flag | Short | Description |
 |------|-------|-------------|
-| `--fix` | `-f` | Attempt to fix any issues |
+| `--fix` | `-f` | Try to fix each issue that it finds |
 | `--packages` | | Check packages defined in the codebase |
 | `--stacks` | | Check stacks defined in the codebase |
-| `--skip-checkers <NAMES>` | `-s` | Checker names to skip, comma-separated |
+| `--skip-checkers <NAMES>` | `-s` | The checkers to skip, by name, comma-separated. `--skip` is the same flag |
 
-If no type flags are specified, all types are checked. If filter names
-are given, any package or stack matching a name is checked.
+With no type flag, `mip check` checks packages and stacks. With filter
+names, it checks each package or stack whose name matches one of them.
 
 ### `completions`
 
@@ -205,17 +215,19 @@ are given, any package or stack matching a name is checked.
 mip completions <SHELL>
 ```
 
-Generates a shell tab-completion script for `mip`. Supported shells:
-`bash`, `zsh`, `elvish`, `fish`, `powershell`. Usage: `source <(mip completions bash)`.
+Prints a shell tab-completion script for `mip`. The shells are `bash`,
+`zsh`, `elvish`, `fish` and `powershell`. To load it in bash, run
+`source <(mip completions bash)`.
 
 ## Environment variables
 
 | Variable | Description |
 |----------|-------------|
-| `RUST_LOG` | Controls logging level (default: `info`) |
+| `RUST_LOG` | The log filter. The default is `info` |
 
 ## Hidden commands
 
-Additional unsupported/internal commands are hidden behind the
-`MINIMAL_SCIENCE_MODE` environment variable. They are experimental, carry
-no stability or consistency guarantees, and are not documented here.
+With `MINIMAL_SCIENCE_MODE` in the environment, `mip --help` shows more
+commands. They
+are experimental and unsupported, and this page does not document them.
+They refuse to run unless `MINIMAL_SCIENCE_MODE=yeppers`.
