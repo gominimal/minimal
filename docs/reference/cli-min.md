@@ -270,7 +270,7 @@ The command refuses these starts before it creates a box:
 | No terminal, and no `--detach` | 2 |
 | `--no-loadouts` and `--loadout` together | 2 |
 | A box on the host already has the name from `--name` or `[box] name`, in any state. Pass another `--name` to create the box | 2 |
-| The name from `--name` or `[box] name` is not one DNS label, is reserved, or has the form of a box id | 3 |
+| The name from `--name` or `[box] name` breaks a box-name rule. A box name is one DNS label. It must not be a reserved name (`host`, `local`, `localhost`, `minimald` or `self`, in any case), and it must not have the form of a box id | 3 |
 
 An invalid `minimal.toml` ends the command with exit code 3.
 
@@ -702,8 +702,10 @@ min box rename <BOX> <NEW_NAME>
 
 Gives a box a new name. The box keeps its id, its state and its files. The
 command refuses a name that another box on the host has, in any state, with
-exit code 2. It refuses a name that is not one DNS label, is reserved, or has
-the form of a box id, with exit code 3.
+exit code 2. It refuses a name that breaks a box-name rule with exit code 3.
+A box name is one DNS label. It must not be a reserved name (`host`, `local`,
+`localhost`, `minimald` or `self`, in any case), and it must not have the form
+of a box id.
 
 ### `box show`
 
@@ -797,13 +799,13 @@ value. When the entry declares a broker secret, the Box Egress Proxy rows
 follow.
 
 The output names the loadouts that `min box start` applies, and the spec
-includes their values, as the spec of a started box does. A package, a
-variable or a lifecycle hook from a loadout names that loadout as its layer,
-for example `loadout dev`. Each variable of `env_vars` shows once, with the
-value that the box gets, and names the layer that set that value. With no
-`--loadout` and no `default_loadouts`, the `default` loadout applies: your
-`default` loadout file, or the built-in `default` loadout when there is no
-such file. An entry with `loadout_mode = "sealed"` applies no loadout.
+includes their values. A package, a variable or a lifecycle hook from a
+loadout names that loadout as its layer, such as `loadout dev`. Each
+variable of `env_vars` shows once, with the value that the box gets, and
+names the layer that set that value. With no `--loadout` and no
+`default_loadouts`, the `default` loadout applies: your `default` loadout
+file, or the built-in `default` loadout when there is no such file. An entry
+with `loadout_mode = "sealed"` applies no loadout.
 
 A variable whose name looks like a secret's, such as `GITHUB_TOKEN`, gets a
 warning on stderr. The warning names the layer that set the variable, and
@@ -824,6 +826,13 @@ A task entry refuses `--ingress` and `--loadout` with exit code 2, as
 `min box spec <BOX>` shows the spec that the box was created with, as its
 host stores it. It takes `-o` and no override flag. An override flag with a
 box gives exit code 2.
+
+The host does not yet store the packages that loadouts add, or any
+`env_vars`, in the spec of a box. The box still gets those packages and
+variables. `min box spec <ENTRY>` shows them when you pass it the same
+`--loadout` or `--no-loadouts` flags that you gave `min box start`.
+[#3257](https://github.com/gominimal/minimal/issues/3257) tracks storing them
+in the spec.
 
 The TOML form starts with the box's name and its origin, as the box's record
 holds them. The origin says whether a person wrote the name or the host
