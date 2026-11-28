@@ -170,7 +170,7 @@ A 0.7 daemon that meets 0.8 state can fail to start, or start without the boxes
 that 0.8 changed. In the other direction, a 0.8 release that meets box state
 from a newer release stops and changes nothing, and its message says so. To go
 back, put your copy back in place first. The boxes that you made on 0.8 are
-lost.
+lost. No step below deletes the 0.8 state or the copy.
 
 1. Stop the 0.8 hosts. Run `min host list` to see their names, then stop each
    one. This command stops the VM host on macOS:
@@ -180,31 +180,41 @@ lost.
    ```
 
 2. Set `state` as in the copy steps above. Set `copy` to the copy's path: the
-   one the closing card named, or the one you made by hand. Set `aside` to a
-   path that does not exist yet. Then move the 0.8 state aside, and put the
-   copy back. The second `mv` runs only when the first one works:
+   one the closing card named, or the one you made by hand. Then rename the
+   0.8 state in its own directory:
 
    ```shell
    copy="<copy>"
-   aside="$HOME/minimal-state-0.8"
-   test ! -e "$aside" && mv "$state" "$aside" && mv "$copy" "$state" && echo restored
+   test -d "$copy" && test ! -e "$state.0.8" && mv "$state" "$state.0.8" && echo "moved aside"
    ```
 
-   When `aside` exists already, the command moves nothing. Choose another
-   `aside`, and run it again.
+   Go on only when the command prints `moved aside`. When it prints nothing,
+   it moved nothing: `copy` is not a directory, or `$state.0.8` exists
+   already. Correct `copy`, or rename the old `$state.0.8`, and run it again.
 
-   When the command does not print `restored`, do not go on to step 3. If the
-   first move worked and the second did not, the 0.8 state is at `aside`, and
-   the copy is still at `copy`. A second move that failed partway can leave
-   part of the copy at `state`. Remove that part, put the 0.8 state back,
-   correct `copy`, and run step 2 again:
+3. Copy the 0.7 state into a new directory beside `state`, then rename that
+   directory to `state`. A copy that fails partway leaves only
+   `$state.restore`, never a partial `state`.
+
+   On macOS:
 
    ```shell
-   test -d "$aside" && test -d "$copy" && rm -rf "$state" && mv "$aside" "$state"
+   mkdir "$state.restore" && cp -Rc "$copy/." "$state.restore/" && mv "$state.restore" "$state" && echo restored
    ```
 
-3. When step 2 printed `restored`, install the 0.7 release that you had. Replace `<0.7.x>` with the version
-   that `min --version` printed before the upgrade:
+   On Linux:
+
+   ```shell
+   mkdir "$state.restore" && cp -a --sparse=always "$copy/." "$state.restore/" && mv "$state.restore" "$state" && echo restored
+   ```
+
+   Go on only when the command prints `restored`. When it does not, remove
+   `$state.restore`, which holds only part of the copy, and run step 3 again.
+   To stay on 0.8 instead, rename `$state.0.8` back to `state`.
+
+4. When step 3 printed `restored`, install the 0.7 release that you had.
+   Replace `<0.7.x>` with the version that `min --version` printed before the
+   upgrade:
 
    ```shell
    curl --proto "=https" --tlsv1.2 -fsSL https://go.minimal.dev/stable | sh -s -- --version <0.7.x>
