@@ -132,25 +132,27 @@ file. The copy commands below keep it sparse.
        /*) state="$XDG_STATE_HOME/minimal" ;;
        *)  state="$HOME/.local/state/minimal" ;;
    esac
+   source="$(cd -P "$state" && pwd -P)"
    copy="$HOME/minimal-state-0.7"
-   test ! -e "$copy" && echo "ready to copy to $copy"
+   test ! -e "$copy" && echo "ready to copy $source to $copy"
    ```
 
-   When the command prints nothing, choose another `copy`. For another disk,
-   set `copy` to a path on that disk.
+   `source` is the real directory, also when `state` is a symbolic link to
+   another disk. When the command prints nothing, choose another `copy`. For
+   another disk, set `copy` to a path on that disk.
 
-3. Copy the state directory.
+3. Copy what the state directory holds.
 
    On macOS:
 
    ```shell
-   cp -Rc "$state" "$copy"
+   mkdir "$copy" && cp -Rc "$source/." "$copy/"
    ```
 
    On Linux:
 
    ```shell
-   cp -a --sparse=always "$state" "$copy"
+   mkdir "$copy" && cp -a --sparse=always "$source/." "$copy/"
    ```
 
    Run the install command only when the copy command exits with no error.
@@ -184,13 +186,21 @@ lost.
    ```shell
    copy="<copy>"
    aside="$HOME/minimal-state-0.8"
-   test ! -e "$aside" && mv "$state" "$aside" && mv "$copy" "$state"
+   test ! -e "$aside" && mv "$state" "$aside" && mv "$copy" "$state" && echo restored
    ```
 
    When `aside` exists already, the command moves nothing. Choose another
    `aside`, and run it again.
 
-3. Install the 0.7 release that you had. Replace `<0.7.x>` with the version
+   When the command does not print `restored`, do not go on to step 3. If the
+   first move worked and the second did not, put the 0.8 state back, correct
+   `copy`, and run step 2 again:
+
+   ```shell
+   test ! -e "$state" && mv "$aside" "$state"
+   ```
+
+3. When step 2 printed `restored`, install the 0.7 release that you had. Replace `<0.7.x>` with the version
    that `min --version` printed before the upgrade:
 
    ```shell
