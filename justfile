@@ -229,7 +229,7 @@ minimald-build:
 # feature. `min` and the `bep` binary need it. A daemon that depends on `bep`
 # with the feature on carries the client into the guest. Cargo resolves the
 # Linux graph on any host, so this runs on macOS too.
-# CI: none. Run it after a change to bep's features or to a `bep` dependency.
+# CI: none. `just ci` runs it.
 #
 # Prove that `min` and `bep` link the Secret Service client and the daemons do not.
 secret-service-links:
@@ -611,12 +611,12 @@ hooks:
 #
 # The local PR gate set, cheapest first.
 [linux]
-ci: fmt-check check-version clippy clippy-strict deny metrics-layers test doctest test-ignored zoned-link-check
+ci: fmt-check check-version clippy clippy-strict deny metrics-layers test doctest test-ignored zoned-link-check secret-service-links
     @echo "ci: local PR gates green"
 
 # The local PR gate set, cheapest first (`just test-cross` covers the Linux-only crates).
 [macos]
-ci: fmt-check check-version clippy clippy-strict deny metrics-layers test doctest zoned-link-check
+ci: fmt-check check-version clippy clippy-strict deny metrics-layers test doctest zoned-link-check secret-service-links
     @echo "ci: local PR gates green"
 
 # Run the curl|sh installer's tests under every POSIX sh. CI: ci-shell-installer.yml.

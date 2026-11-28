@@ -291,30 +291,68 @@ impl Items for SessionItems {
 
 /// A connection to Secret Service. Each method call on it gives up after
 /// `timeout`.
+///
+/// The session encrypts each secret on the bus (`EncryptionType::Dh`), and
+/// a Secret Service that refuses that is refused here. No call falls back
+/// to a session that carries secrets in the clear.
 async fn connect(
     timeout: Duration,
     address: Option<&str>,
 ) -> Result<SecretService<'static>, Cause> {
-    let builder = match address {
-        Some(address) => zbus::connection::Builder::address(address),
-        None => zbus::connection::Builder::session(),
-    };
-    let bus = builder
-        .method_timeout(timeout)
-        .build()
-        .await
-        .map_err(|err| match sort_bus(&err) {
-            Some(Cause::Unreachable(_)) => {
-                Cause::Unreachable(format!("no session bus answered: {err}"))
-            }
-            Some(cause) => cause,
-            // A bus that is there and refuses the connection is not a
-            // session with no bus.
-            None => Cause::Other(format!("the session bus refused the connection: {err}")),
-        })?;
+    let bus = open_bus(timeout, address).await?;
     SecretService::connect_with_existing(EncryptionType::Dh, bus)
         .await
         .map_err(sort)
+}
+
+/// Opens the session bus at `address`, or at the session's own address.
+///
+/// An address can list several, with `;` between them, and the bus is the
+/// first one that connects. The D-Bus client reads a value as one address,
+/// so the list is split here.
+async fn open_bus(timeout: Duration, address: Option<&str>) -> Result<zbus::Connection, Cause> {
+    let listed = match address {
+        Some(address) => Some(address.to_owned()),
+        None => std::env::var("DBUS_SESSION_BUS_ADDRESS").ok(),
+    };
+    let mut first_failure = None;
+    for one in listed.iter().flat_map(|listed| listed.split(';')) {
+        if one.is_empty() {
+            continue;
+        }
+        match open(zbus::connection::Builder::address(one), timeout).await {
+            Ok(bus) => return Ok(bus),
+            Err(cause) => {
+                first_failure.get_or_insert(cause);
+            }
+        }
+    }
+    match first_failure {
+        Some(cause) => Err(cause),
+        // No address is named, so the client works out the session's own.
+        None => open(zbus::connection::Builder::session(), timeout).await,
+    }
+}
+
+/// Builds one connection to a bus.
+async fn open(
+    builder: zbus::connection::Builder<'_>,
+    timeout: Duration,
+) -> Result<zbus::Connection, Cause> {
+    let sorted = |err: zbus::Error| match sort_bus(&err) {
+        Some(Cause::Unreachable(_)) => {
+            Cause::Unreachable(format!("no session bus answered: {err}"))
+        }
+        Some(cause) => cause,
+        // A bus that is there and refuses the connection is not a
+        // session with no bus.
+        None => Cause::Other(format!("the session bus refused the connection: {err}")),
+    };
+    builder
+        .method_timeout(timeout)
+        .build()
+        .await
+        .map_err(sorted)
 }
 
 /// Sorts an error of the client by cause, from its variant and the D-Bus
@@ -592,6 +630,51 @@ mod tests {
         }
     }
 
+    /// The next connection to `listener`. Panics when none arrives within
+    /// `limit`, so a call that never connected fails the test.
+    fn accept_within(
+        listener: &std::os::unix::net::UnixListener,
+        limit: Duration,
+    ) -> std::os::unix::net::UnixStream {
+        listener.set_nonblocking(true).unwrap();
+        let started = Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((peer, _)) => {
+                    peer.set_nonblocking(false).unwrap();
+                    return peer;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(started.elapsed() < limit, "the call made no connection");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!("accept failed: {err}"),
+            }
+        }
+    }
+
+    // An address can list several buses. The first one that connects is the
+    // bus, so an address that is gone ahead of it changes nothing.
+    #[test]
+    fn a_listed_address_that_is_gone_gives_way_to_the_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone");
+        let live = dir.path().join("live");
+        let listener = std::os::unix::net::UnixListener::bind(&live).unwrap();
+        let timeout = Duration::from_millis(300);
+        let listed = format!("unix:path={};unix:path={}", gone.display(), live.display());
+        // The live bus says nothing, so the call that reached it gets no
+        // answer. A call that stopped at the first address says no bus.
+        assert_eq!(
+            SessionItems::within(timeout).at(&listed).lookup(ONE),
+            Err(Cause::NoAnswer(timeout))
+        );
+        drop(accept_within(&listener, Duration::from_secs(10)));
+        let none = format!("unix:path={};unix:path={}", gone.display(), gone.display());
+        let answer = SessionItems::within(timeout).at(&none).lookup(ONE);
+        assert!(matches!(answer, Err(Cause::Unreachable(_))), "{answer:?}");
+    }
+
     // A bus that accepts the connection and says nothing ends the call at
     // the timeout, as a stuck Secret Service does.
     #[test]
@@ -607,7 +690,7 @@ mod tests {
         assert_eq!(err, Cause::NoAnswer(timeout));
         // Nothing of the call outlives it: its end of the connection is
         // closed, so the bus reads to the end.
-        let (mut peer, _) = listener.accept().unwrap();
+        let mut peer = accept_within(&listener, Duration::from_secs(10));
         peer.set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         std::io::Read::read_to_end(&mut peer, &mut Vec::new())
