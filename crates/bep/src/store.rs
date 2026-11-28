@@ -14,8 +14,16 @@
 //! `apple-tool:` partition, so the proxy gets `errSecAuthFailed` although the
 //! list names it.
 //!
-//! Other hosts have no native store yet: the Linux default waits on the store
-//! roster. [`HostStore`] there refuses every operation, and says so.
+//! On Linux the native store is Secret Service, through `secret-tool`, the
+//! store that already holds the GitHub sign-in there. Each secret is one item
+//! with two attributes: `service`, which is [`SERVICE`], and `id`, which is
+//! the identifier. Secret Service has no access control per program, so every
+//! program of the user reads an unlocked item, the proxy included. A store
+//! reference still names the store [`NATIVE_STORE`], so one project file names
+//! the same store on both hosts.
+//!
+//! Other hosts have no native store. [`HostStore`] there refuses every
+//! operation, and says so.
 //!
 //! The proxy reads a value through [`ValueReader`], once for each request
 //! that injects it, and keeps no copy (BEP-033). So a replaced value goes in
@@ -270,6 +278,30 @@ pub fn check_proxy_binary(_path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// The longest value that `secret-tool store` keeps whole. It reads at most
+/// this many bytes of its input, and stores a longer value cut short while it
+/// exits 0.
+pub const SECRET_TOOL_MAX_VALUE: usize = 8192;
+
+/// Whether Secret Service can keep `value` through `secret-tool`: UTF-8 text
+/// of at most [`SECRET_TOOL_MAX_VALUE`] bytes. `secret-tool store` refuses a
+/// value that is not UTF-8 and cuts a longer one short, so the Linux store
+/// refuses both before it runs. The limit holds until the store stops using
+/// `secret-tool`.
+///
+/// # Errors
+///
+/// [`StoreError::ValueTooLong`] or [`StoreError::ValueNotText`].
+pub fn check_secret_tool_value(value: &[u8]) -> Result<(), StoreError> {
+    if value.len() > SECRET_TOOL_MAX_VALUE {
+        return Err(StoreError::ValueTooLong { len: value.len() });
+    }
+    if std::str::from_utf8(value).is_err() {
+        return Err(StoreError::ValueNotText);
+    }
+    Ok(())
+}
+
 /// Whether `id` is an identifier a secret can have: 1 to [`MAX_ID_LEN`]
 /// ASCII letters, digits, `.`, `_` and `-`, not starting with `-`.
 #[must_use]
@@ -307,9 +339,30 @@ pub enum StoreError {
     },
     /// This host has no native store.
     #[error(
-        "This host has no secret store that `min secret` can use. `min secret` stores secrets only in the macOS Keychain."
+        "This host has no secret store that `min secret` can use. `min secret` stores secrets in the macOS Keychain on macOS and in Secret Service on Linux."
     )]
     Unsupported,
+    /// `secret-tool`, which the Linux store runs, is not installed.
+    #[error(
+        "`min secret` keeps secrets in Secret Service on Linux, through `secret-tool`, and `secret-tool` is not installed. Install it (the `libsecret-tools` package on Debian and Ubuntu, `libsecret` on Fedora and Arch), and a Secret Service provider such as GNOME Keyring (the `gnome-keyring` package) if none runs, then run the command again."
+    )]
+    NoSecretTool,
+    /// No Secret Service answered in this login session.
+    #[error(
+        "`min secret` keeps secrets in Secret Service on Linux, and no Secret Service answered in this login session: {detail}. Install a Secret Service provider such as GNOME Keyring (the `gnome-keyring` package), and run the command again in a login session that starts it."
+    )]
+    NoSecretService {
+        /// What `secret-tool` said.
+        detail: String,
+    },
+    /// The Secret Service keyring is locked.
+    #[error(
+        "`min secret` keeps secrets in Secret Service on Linux, and its keyring is locked: {detail}."
+    )]
+    KeyringLocked {
+        /// What `secret-tool` said.
+        detail: String,
+    },
     /// A user other than the current one or root can change the proxy
     /// program, so the item's access control cannot trust it.
     #[error(
@@ -321,6 +374,19 @@ pub enum StoreError {
         /// The check that failed.
         reason: String,
     },
+    /// The value is longer than Secret Service keeps through `secret-tool`.
+    #[error(
+        "On Linux, `min secret` stores a value in Secret Service through `secret-tool`, which keeps at most {SECRET_TOOL_MAX_VALUE} bytes, and this value is {len} bytes. Give a value of {SECRET_TOOL_MAX_VALUE} bytes or fewer."
+    )]
+    ValueTooLong {
+        /// The value's length in bytes.
+        len: usize,
+    },
+    /// The value is not UTF-8, which `secret-tool` refuses.
+    #[error(
+        "On Linux, `min secret` stores a value in Secret Service through `secret-tool`, which keeps only UTF-8 text, and this value is not valid UTF-8. Give the value as UTF-8 text."
+    )]
+    ValueNotText,
     /// The identifier is not one that [`valid_id`] admits.
     #[error(
         "`{0}` is not a name a secret can have. Use 1 to {MAX_ID_LEN} letters, digits, `.`, `_` and `-`, not starting with `-`."
@@ -376,6 +442,40 @@ pub trait SecretStore {
     /// When the host has no such store.
     fn check_available(&self) -> Result<(), StoreError> {
         Ok(())
+    }
+
+    /// Whether an item is stored under `id`. Reads no value and shows no
+    /// prompt, so a creation can ask it before the proxy reads the value.
+    ///
+    /// # Errors
+    ///
+    /// When the store cannot tell without a prompt, or refuses the lookup.
+    fn holds(&self, id: &str) -> Result<bool, StoreError> {
+        Ok(self.list(Path::new(""))?.iter().any(|item| item.id == id))
+    }
+
+    /// Whether the store can keep `value` whole. `set` asks before it writes
+    /// anything, so a value the store would refuse or cut short changes
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// When the store cannot keep the value as given.
+    fn check_value(&self, _value: &[u8]) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// The store as a message names it, such as "the keychain store".
+    fn place(&self) -> String {
+        format!("the {} store", self.name())
+    }
+
+    /// Whether an item's access control names one program, the proxy, as
+    /// a Keychain item's does. `false` for a store where every program of
+    /// the user reads every item, as in Secret Service. Then no proxy path
+    /// decides who reads an item.
+    fn binds_program(&self) -> bool {
+        true
     }
 }
 
@@ -905,7 +1005,8 @@ fn add_checked(
 }
 
 /// The native store of this host: the macOS Keychain through
-/// `/usr/bin/security`. Other hosts refuse every operation.
+/// `/usr/bin/security` on macOS, and Secret Service through `secret-tool`
+/// on Linux. Other hosts refuse every operation.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct HostStore;
 
@@ -928,6 +1029,35 @@ impl SecretStore for HostStore {
 
     fn check_available(&self) -> Result<(), StoreError> {
         host::check_available()
+    }
+
+    fn holds(&self, id: &str) -> Result<bool, StoreError> {
+        if !valid_id(id) {
+            return Err(StoreError::InvalidId(id.to_owned()));
+        }
+        host::holds(id)
+    }
+
+    fn check_value(&self, value: &[u8]) -> Result<(), StoreError> {
+        if cfg!(target_os = "linux") {
+            check_secret_tool_value(value)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Secret Service on Linux, where a store reference still names the
+    /// store `keychain`. The keychain store elsewhere.
+    fn place(&self) -> String {
+        if cfg!(target_os = "linux") {
+            "Secret Service".to_owned()
+        } else {
+            format!("the {NATIVE_STORE} store")
+        }
+    }
+
+    fn binds_program(&self) -> bool {
+        cfg!(target_os = "macos")
     }
 }
 
@@ -1269,6 +1399,35 @@ mod host {
         delete(SERVICE, id)
     }
 
+    /// Whether an item is stored under `id`. The search asks for a
+    /// reference, not the value, and runs with prompts off, so a locked
+    /// keychain answers `errSecInteractionNotAllowed` and shows no dialog.
+    pub(super) fn holds(id: &str) -> Result<bool, StoreError> {
+        let refused = |detail: String| StoreError::Refused {
+            store: NATIVE_STORE,
+            action: "find the secret",
+            detail,
+        };
+        let _serial = NO_PROMPT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _no_prompt =
+            security_framework::os::macos::keychain::SecKeychain::disable_user_interaction()
+                .map_err(|e| refused(e.to_string()))?;
+        let mut search = ItemSearchOptions::new();
+        search
+            .class(ItemClass::generic_password())
+            .service(SERVICE)
+            .account(id)
+            .load_refs(true)
+            .limit(Limit::Max(1));
+        match search.search() {
+            Ok(found) => Ok(!found.is_empty()),
+            Err(e) if e.code() == ITEM_NOT_FOUND => Ok(false),
+            Err(e) => Err(refused(e.to_string())),
+        }
+    }
+
     /// The codes that mean the item does not let this program read it:
     /// `errSecAuthFailed`, `errSecNoAccessForItem` and `errSecUserCanceled`.
     const DENIED: [i32; 3] = [-25293, -25243, -128];
@@ -1341,7 +1500,407 @@ mod host {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+mod host {
+    use super::{ItemInfo, ReadError, SERVICE, StoreError, valid_id};
+    use crate::secret_service::{self as ss, SECRET_TOOL};
+    use std::collections::BTreeSet;
+    use std::ffi::OsString;
+    use std::io::Write as _;
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, ExitStatus, Output, Stdio};
+    use std::time::{Duration, Instant};
+    use zeroize::Zeroizing;
+
+    /// The store's name in a refusal.
+    const STORE: &str = "Secret Service";
+
+    /// The attribute that holds the identifier. The `service` attribute
+    /// holds [`SERVICE`].
+    const ID: &str = "id";
+
+    /// An attribute that no item carries. A lookup of it is answered with
+    /// no match by a Secret Service that runs.
+    const PROBE: &str = "dev.minimal.secret.probe";
+
+    /// The longest that the proxy's read of a value waits for `secret-tool`.
+    /// A lookup on a locked keyring can show an unlock prompt, and the
+    /// request waits on it no longer than this.
+    pub(super) const READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// The line that `secret-tool search` prints on standard error for an
+    /// item's identifier.
+    const ID_LINE: &str = "attribute.id = ";
+
+    /// The items `min secret` keeps in Secret Service, through `secret-tool`.
+    ///
+    /// Only `lookup` reads standard output, which holds the value. Every
+    /// other call sends standard output to `/dev/null`: `secret-tool search`
+    /// prints each value there, and its attributes on standard error, so a
+    /// listing never receives a value.
+    #[derive(Debug, Clone)]
+    pub(super) struct SecretItems {
+        program: PathBuf,
+        leading: Vec<OsString>,
+        timeout: Duration,
+        /// The longest that the proxy's read of a value waits, over every
+        /// `secret-tool` call it makes. [`READ_TIMEOUT`] outside tests.
+        read_timeout: Duration,
+    }
+
+    impl SecretItems {
+        /// The items, through `secret-tool` from `PATH`.
+        pub(super) fn new() -> Self {
+            Self::with_program(SECRET_TOOL, Vec::<OsString>::new())
+        }
+
+        /// The items, through `program` with `leading` before each
+        /// `secret-tool` argument list. A test gives it a fake `secret-tool`.
+        pub(super) fn with_program(
+            program: impl Into<PathBuf>,
+            leading: impl IntoIterator<Item = impl Into<OsString>>,
+        ) -> Self {
+            Self {
+                program: program.into(),
+                leading: leading.into_iter().map(Into::into).collect(),
+                timeout: ss::TIMEOUT,
+                read_timeout: READ_TIMEOUT,
+            }
+        }
+
+        /// The same items, with `timeout` as the cap of the proxy's read.
+        #[cfg(test)]
+        pub(super) fn with_read_timeout(mut self, timeout: Duration) -> Self {
+            self.read_timeout = timeout;
+            self
+        }
+
+        /// The same items, with `timeout` for each `secret-tool` call.
+        #[cfg(test)]
+        pub(super) fn with_timeout(mut self, timeout: Duration) -> Self {
+            self.timeout = timeout;
+            self
+        }
+
+        /// Whether a Secret Service answers in this session.
+        pub(super) fn check_available(&self) -> Result<(), StoreError> {
+            let action = "answer a lookup";
+            let out = self.run(
+                action,
+                &["lookup", "service", SERVICE, PROBE, "absent"],
+                None,
+                false,
+            )?;
+            if out.status.success() || no_match(&out) {
+                return Ok(());
+            }
+            Err(failure(action, &out))
+        }
+
+        /// Store `value` under `service` and `id`. Secret Service replaces
+        /// the item whose attributes all match, so a held item is replaced
+        /// in place, and a failed store leaves it as it was.
+        pub(super) fn set(&self, service: &str, id: &str, value: &[u8]) -> Result<(), StoreError> {
+            check_id(id)?;
+            super::check_secret_tool_value(value)?;
+            let action = "store the secret";
+            let label = format!("--label=Minimal secret {id}");
+            let out = self.run(
+                action,
+                &["store", &label, "service", service, ID, id],
+                Some(value),
+                false,
+            )?;
+            if !out.status.success() {
+                return Err(failure(action, &out));
+            }
+            Ok(())
+        }
+
+        /// Every stored identifier. Every program of the user reads an
+        /// unlocked item, so each one admits the proxy.
+        pub(super) fn list(&self) -> Result<Vec<ItemInfo>, StoreError> {
+            Ok(self
+                .ids("list the secrets", &["search", "--all", "service", SERVICE])?
+                .into_iter()
+                .map(|id| ItemInfo {
+                    id,
+                    proxy_access: true,
+                })
+                .collect())
+        }
+
+        /// Remove the item under `id`. `false` when none was held.
+        pub(super) fn remove(&self, id: &str) -> Result<bool, StoreError> {
+            check_id(id)?;
+            let action = "remove the secret";
+            let out = self.run(action, &["clear", "service", SERVICE, ID, id], None, false)?;
+            if out.status.success() {
+                return Ok(true);
+            }
+            if no_match(&out) {
+                return Ok(false);
+            }
+            Err(failure(action, &out))
+        }
+
+        /// Whether an item is stored under `id`. `search` without
+        /// `--unlock` lists a locked item too and shows no unlock prompt.
+        /// Its standard output, which holds the values, goes to
+        /// `/dev/null`.
+        pub(super) fn holds(&self, id: &str) -> Result<bool, StoreError> {
+            check_id(id)?;
+            Ok(self
+                .ids(
+                    "find the secret",
+                    &["search", "--all", "service", SERVICE, ID, id],
+                )?
+                .contains(id))
+        }
+
+        /// The value under `id`, read now. The `lookup` and the `search`
+        /// that may follow it share one deadline, [`READ_TIMEOUT`] from the
+        /// start, so a locked keyring's unlock prompt or a stalled Secret
+        /// Service holds a request only that long, and each call's output
+        /// for at most its drain grace after it.
+        pub(super) fn read(&self, id: &str) -> Result<Zeroizing<Vec<u8>>, ReadError> {
+            check_id(id).map_err(ReadError::Store)?;
+            let action = "read the secret";
+            let started = Instant::now();
+            let cap = self.timeout.min(self.read_timeout);
+            let reader = Self {
+                timeout: cap,
+                ..self.clone()
+            };
+            let mut out = reader
+                .run(action, &["lookup", "service", SERVICE, ID, id], None, true)
+                .map_err(ReadError::Store)?;
+            let value = Zeroizing::new(std::mem::take(&mut out.stdout));
+            if out.status.success() {
+                if value.is_empty() {
+                    return Err(ReadError::Store(refused(
+                        action,
+                        format!("Secret Service returned no value for {id}"),
+                    )));
+                }
+                return Ok(value);
+            }
+            if !no_match(&out) {
+                return Err(ReadError::Store(failure(action, &out)));
+            }
+            // `lookup` exits 1 with no message when no item matches. A
+            // dismissed unlock prompt gives the same result, so ask whether
+            // the item is listed: `search` lists a locked item too.
+            let searcher = Self {
+                timeout: cap.saturating_sub(started.elapsed()),
+                ..self.clone()
+            };
+            let listed = searcher
+                .ids(action, &["search", "--all", "service", SERVICE, ID, id])
+                .map_err(ReadError::Store)?;
+            if listed.contains(id) {
+                return Err(ReadError::Store(StoreError::KeyringLocked {
+                    detail: format!("Secret Service lists {id} but did not return its value"),
+                }));
+            }
+            Err(ReadError::Deleted(id.to_owned()))
+        }
+
+        /// The identifiers that a `secret-tool search` with `args` lists.
+        fn ids(&self, action: &'static str, args: &[&str]) -> Result<BTreeSet<String>, StoreError> {
+            let out = self.run(action, args, None, false)?;
+            if !out.status.success() && !no_match(&out) {
+                return Err(failure(action, &out));
+            }
+            Ok(String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .filter_map(|line| line.trim_end().strip_prefix(ID_LINE))
+                .filter(|id| valid_id(id))
+                .map(str::to_owned)
+                .collect())
+        }
+
+        /// Run `secret-tool` with `args`, with `stdin` on its standard input.
+        /// Its standard output is read only when `capture` is set.
+        fn run(
+            &self,
+            action: &'static str,
+            args: &[&str],
+            stdin: Option<&[u8]>,
+            capture: bool,
+        ) -> Result<Output, StoreError> {
+            let piped_if = |yes: bool| if yes { Stdio::piped() } else { Stdio::null() };
+            let mut cmd = Command::new(&self.program);
+            // libsecret and GDBus translate their messages. The causes are
+            // sorted by their English text.
+            cmd.env("LC_ALL", "C")
+                .args(&self.leading)
+                .args(args)
+                .stdin(piped_if(stdin.is_some()))
+                .stdout(piped_if(capture))
+                .stderr(Stdio::piped());
+            let mut child = cmd.spawn().map_err(|err| {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    StoreError::NoSecretTool
+                } else {
+                    refused(action, format!("`{SECRET_TOOL}` did not run: {err}"))
+                }
+            })?;
+            let stdout = ss::drain(child.stdout.take());
+            let stderr = ss::drain(child.stderr.take());
+            let written = match (stdin, child.stdin.take()) {
+                // Dropping the pipe at the end of the arm closes it, so the
+                // child sees the end of its input.
+                (Some(input), Some(mut pipe)) => pipe.write_all(input),
+                _ => Ok(()),
+            };
+            let status = self.wait(action, &mut child)?;
+            let deadline = Instant::now() + ss::DRAIN_GRACE;
+            let (stdout, stdout_ended) = stdout.collect(deadline);
+            let (stderr, stderr_ended) = stderr.collect(deadline);
+            let mut out = Output {
+                status,
+                stdout,
+                stderr,
+            };
+            if !(stdout_ended && stderr_ended) {
+                // A pipe that is still open can still carry the value, so the
+                // output read so far is never taken as the whole answer.
+                zeroize::Zeroize::zeroize(&mut out.stdout);
+                if !ss::blank(&out.stderr) {
+                    return Err(failure(action, &out));
+                }
+                return Err(refused(
+                    action,
+                    format!(
+                        "an output pipe of `{SECRET_TOOL}` stayed open after it exited ({})",
+                        out.status
+                    ),
+                ));
+            }
+            match written {
+                // A `secret-tool` that fails before it reads its input closes
+                // the pipe. Its exit status and error output say why.
+                Err(_) if !out.status.success() => Ok(out),
+                Err(err) => {
+                    zeroize::Zeroize::zeroize(&mut out.stdout);
+                    Err(refused(
+                        action,
+                        format!("`{SECRET_TOOL}` did not read the value: {err}"),
+                    ))
+                }
+                Ok(()) => Ok(out),
+            }
+        }
+
+        /// Waits for `child` until the timeout. A call that outlives it is
+        /// killed and reads as a locked keyring: an unlock prompt that
+        /// nobody answered.
+        fn wait(&self, action: &'static str, child: &mut Child) -> Result<ExitStatus, StoreError> {
+            let deadline = Instant::now() + self.timeout;
+            loop {
+                let finished = child.try_wait().map_err(|err| {
+                    refused(action, format!("`{SECRET_TOOL}` did not finish: {err}"))
+                })?;
+                if let Some(status) = finished {
+                    return Ok(status);
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    tracing::warn!(
+                        action,
+                        timeout_secs = self.timeout.as_secs_f64(),
+                        "secret-tool did not finish in time"
+                    );
+                    return Err(refused(
+                        action,
+                        format!(
+                            "`{SECRET_TOOL}` did not answer in {} s. A keyring unlock prompt can be waiting, or Secret Service can be stuck",
+                            self.timeout.as_secs()
+                        ),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    fn check_id(id: &str) -> Result<(), StoreError> {
+        // An identifier never starts with `-`, so `secret-tool` never reads
+        // it as an option.
+        if valid_id(id) {
+            Ok(())
+        } else {
+            Err(StoreError::InvalidId(id.to_owned()))
+        }
+    }
+
+    /// Whether `out` is `secret-tool`'s answer that no item matched.
+    fn no_match(out: &Output) -> bool {
+        out.status.code() == Some(ss::NO_MATCH) && ss::blank(&out.stderr)
+    }
+
+    fn refused(action: &'static str, detail: String) -> StoreError {
+        StoreError::Refused {
+            store: STORE,
+            action,
+            detail,
+        }
+    }
+
+    /// The error for a `secret-tool` run that failed with `out`, sorted by
+    /// cause.
+    fn failure(action: &'static str, out: &Output) -> StoreError {
+        let detail = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+        if detail.is_empty() {
+            return refused(
+                action,
+                format!("`{SECRET_TOOL}` failed with no message ({})", out.status),
+            );
+        }
+        let lower = detail.to_ascii_lowercase();
+        if ss::LOCKED.iter().any(|part| lower.contains(part)) {
+            StoreError::KeyringLocked { detail }
+        } else if ss::UNREACHABLE.iter().any(|part| lower.contains(part)) {
+            StoreError::NoSecretService { detail }
+        } else {
+            refused(action, detail)
+        }
+    }
+
+    pub(super) fn read(id: &str) -> Result<Zeroizing<Vec<u8>>, ReadError> {
+        SecretItems::new().read(id)
+    }
+
+    pub(super) fn set(id: &str, value: &[u8], _proxy: &Path) -> Result<(), StoreError> {
+        SecretItems::new().set(SERVICE, id, value)
+    }
+
+    pub(super) fn add_as_this_program(service: &str, id: &str, value: &[u8]) -> Result<(), String> {
+        SecretItems::new()
+            .set(service, id, value)
+            .map_err(|e| e.to_string())
+    }
+
+    pub(super) fn list(_proxy: &Path) -> Result<Vec<ItemInfo>, StoreError> {
+        SecretItems::new().list()
+    }
+
+    pub(super) fn remove(id: &str) -> Result<bool, StoreError> {
+        SecretItems::new().remove(id)
+    }
+
+    pub(super) fn check_available() -> Result<(), StoreError> {
+        SecretItems::new().check_available()
+    }
+
+    pub(super) fn holds(id: &str) -> Result<bool, StoreError> {
+        SecretItems::new().holds(id)
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod host {
     use super::{ItemInfo, ReadError, StoreError};
     use std::path::Path;
@@ -1368,6 +1927,10 @@ mod host {
     }
 
     pub(super) fn check_available() -> Result<(), StoreError> {
+        Err(StoreError::Unsupported)
+    }
+
+    pub(super) fn holds(_: &str) -> Result<bool, StoreError> {
         Err(StoreError::Unsupported)
     }
 }
@@ -2195,9 +2758,260 @@ access: 1 entries
     fn host_store_reads_an_item_this_program_added() {
         let store = HostStore;
         let id = format!("minimal-own-item-{}", std::process::id());
+        assert!(!store.holds(&id).expect("lookup"), "no item before the add");
         add_as_this_program(SERVICE, &id, b"value").expect("add");
+        let held = store.holds(&id);
         let read = store.read(&id);
         assert!(store.remove(&id).expect("remove"), "the item was held");
+        assert!(held.expect("lookup"), "the lookup finds the added item");
         assert_eq!(read.expect("read").as_slice(), b"value");
+        assert!(!store.holds(&id).expect("lookup"), "no item after remove");
+    }
+
+    // Secret Service through `secret-tool` keeps UTF-8 text of at most 8192
+    // bytes. Each refusal says why and gives the limit.
+    #[test]
+    fn secret_tool_value_limits_refuse_with_the_limit() {
+        assert_eq!(SECRET_TOOL_MAX_VALUE, 8192);
+        check_secret_tool_value(&vec![b'a'; 8192]).expect("the longest value");
+        check_secret_tool_value("sk-ant-\u{e9}".as_bytes()).expect("UTF-8 text");
+        let err = check_secret_tool_value(&vec![b'a'; 8193]).expect_err("too long");
+        assert_eq!(
+            err.to_string(),
+            "On Linux, `min secret` stores a value in Secret Service through `secret-tool`, which keeps at most 8192 bytes, and this value is 8193 bytes. Give a value of 8192 bytes or fewer."
+        );
+        let err = check_secret_tool_value(b"\xff\x00\xfe").expect_err("not text");
+        assert_eq!(
+            err.to_string(),
+            "On Linux, `min secret` stores a value in Secret Service through `secret-tool`, which keeps only UTF-8 text, and this value is not valid UTF-8. Give the value as UTF-8 text."
+        );
+        let host = HostStore.check_value(b"\xff");
+        assert_eq!(host.is_err(), cfg!(target_os = "linux"), "{host:?}");
+    }
+
+    // A creation asks whether an item is stored, by identifier, and a
+    // message names the store where it lives: Secret Service on Linux, and
+    // the keychain store on macOS and in a store held in memory.
+    #[test]
+    fn store_holds_by_identifier_and_names_its_place() {
+        let store = MemorySecretStore::default();
+        assert!(!store.holds("claude").unwrap());
+        store.set("claude", b"v", Path::new("/bep")).unwrap();
+        assert!(store.holds("claude").unwrap());
+        assert!(!store.holds("linear").unwrap());
+        assert_eq!(store.place(), "the keychain store");
+        assert!(matches!(
+            HostStore.holds("-x"),
+            Err(StoreError::InvalidId(_))
+        ));
+        let host = if cfg!(target_os = "linux") {
+            "Secret Service"
+        } else {
+            "the keychain store"
+        };
+        assert_eq!(HostStore.place(), host);
+    }
+
+    /// A fake `secret-tool` that keeps each item in a file under `dir`, and
+    /// prints as the real one does: `search` prints each value on standard
+    /// output and each attribute on standard error. An `unreachable` or a
+    /// `locked` file in `dir` makes every call fail as the real tool does in
+    /// that state. A `silent-locked` file makes `lookup` exit 1 with no
+    /// message, as after a dismissed unlock prompt.
+    #[cfg(target_os = "linux")]
+    fn fake_secret_tool(dir: &Path) -> host::SecretItems {
+        let script = dir.join("secret-tool");
+        let body = format!(
+            r#"dir='{dir}'
+if [ -e "$dir/unreachable" ]; then
+  echo "secret-tool: Cannot autolaunch D-Bus without X11 \$DISPLAY" >&2; exit 1
+fi
+if [ -e "$dir/locked" ]; then
+  echo "secret-tool: Cannot get secret of a locked object" >&2; exit 1
+fi
+cmd=$1; shift
+[ "$cmd" = store ] && shift
+[ "$cmd" = search ] && shift
+service=$2 id=$4
+case "$cmd" in
+  store) cat > "$dir/item.$id" ;;
+  lookup)
+    [ -e "$dir/silent-locked" ] && exit 1
+    [ "$service" = {SERVICE} ] && [ "$3" = id ] && [ -f "$dir/item.$id" ] || exit 1
+    cat "$dir/item.$id" ;;
+  search)
+    for f in "$dir"/item.*; do
+      [ -f "$f" ] || continue
+      i=${{f##*/item.}}
+      [ -z "$id" ] || [ "$id" = "$i" ] || continue
+      printf '[/1]\nsecret = '; cat "$f"; printf '\n'
+      printf 'attribute.service = %s\nattribute.id = %s\n' "$service" "$i" >&2
+    done ;;
+  clear) [ -f "$dir/item.$id" ] || exit 1; rm "$dir/item.$id" ;;
+  *) echo "unknown command $cmd" >&2; exit 2 ;;
+esac
+"#,
+            dir = dir.display()
+        );
+        std::fs::write(&script, body).unwrap();
+        // Run the script through `sh`, so no test executes a file another
+        // thread can still hold open for writing.
+        host::SecretItems::with_program("/bin/sh", [script])
+    }
+
+    // On Linux, `min secret` and the proxy's read use Secret Service: set,
+    // list, read, replace and remove, by identifier, with no value in a
+    // listing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_native_store_is_secret_service() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fake_secret_tool(dir.path());
+        store.check_available().expect("Secret Service answers");
+        assert!(store.list().unwrap().is_empty());
+        assert!(matches!(store.read("claude"), Err(ReadError::Deleted(id)) if id == "claude"));
+
+        store.set(SERVICE, "claude", b"sk-ant-one\n").unwrap();
+        store.set(SERVICE, "linear", b"lin-two").unwrap();
+        assert_eq!(
+            store.list().unwrap(),
+            vec![
+                ItemInfo {
+                    id: "claude".into(),
+                    proxy_access: true
+                },
+                ItemInfo {
+                    id: "linear".into(),
+                    proxy_access: true
+                },
+            ]
+        );
+        assert_eq!(store.read("claude").unwrap().as_slice(), b"sk-ant-one\n");
+        assert!(store.holds("claude").unwrap());
+        assert!(!store.holds("absent").unwrap());
+
+        // A replaced value is the one the next read returns (BEP-054).
+        store.set(SERVICE, "claude", b"sk-ant-new").unwrap();
+        assert_eq!(store.read("claude").unwrap().as_slice(), b"sk-ant-new");
+
+        assert!(store.remove("claude").unwrap());
+        assert!(!store.remove("claude").unwrap(), "no item the second time");
+        assert!(matches!(store.read("claude"), Err(ReadError::Deleted(_))));
+        assert!(!store.holds("claude").unwrap(), "no item after remove");
+        assert_eq!(store.list().unwrap().len(), 1);
+
+        // A value that `secret-tool` would refuse or cut short is refused
+        // before it runs, and the held value stays.
+        let long = vec![b'a'; SECRET_TOOL_MAX_VALUE + 1];
+        assert!(matches!(
+            store.set(SERVICE, "linear", &long),
+            Err(StoreError::ValueTooLong { len }) if len == SECRET_TOOL_MAX_VALUE + 1
+        ));
+        assert!(matches!(
+            store.set(SERVICE, "linear", b"\xff\x00\xfe"),
+            Err(StoreError::ValueNotText)
+        ));
+        assert_eq!(store.read("linear").unwrap().as_slice(), b"lin-two");
+        let longest = vec![b'a'; SECRET_TOOL_MAX_VALUE];
+        store.set(SERVICE, "linear", &longest).unwrap();
+        assert_eq!(store.read("linear").unwrap().as_slice(), &longest[..]);
+
+        // An identifier that `secret-tool` could read as an option is
+        // refused before it runs.
+        assert!(matches!(
+            store.set(SERVICE, "--label=x", b"v"),
+            Err(StoreError::InvalidId(_))
+        ));
+        assert!(matches!(store.remove("-x"), Err(StoreError::InvalidId(_))));
+    }
+
+    // A Linux host without a usable Secret Service gets a refusal that
+    // names what to install or set up.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_native_store_refusals_name_what_to_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = host::SecretItems::with_program(
+            dir.path().join("no-such-secret-tool"),
+            Vec::<std::ffi::OsString>::new(),
+        );
+        let err = missing.check_available().expect_err("not installed");
+        assert!(matches!(err, StoreError::NoSecretTool), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "`min secret` keeps secrets in Secret Service on Linux, through `secret-tool`, and `secret-tool` is not installed. Install it (the `libsecret-tools` package on Debian and Ubuntu, `libsecret` on Fedora and Arch), and a Secret Service provider such as GNOME Keyring (the `gnome-keyring` package) if none runs, then run the command again."
+        );
+
+        let store = fake_secret_tool(dir.path());
+        std::fs::write(dir.path().join("unreachable"), "").unwrap();
+        let err = store.check_available().expect_err("unreachable");
+        assert_eq!(
+            err.to_string(),
+            "`min secret` keeps secrets in Secret Service on Linux, and no Secret Service answered in this login session: secret-tool: Cannot autolaunch D-Bus without X11 $DISPLAY. Install a Secret Service provider such as GNOME Keyring (the `gnome-keyring` package), and run the command again in a login session that starts it."
+        );
+        assert!(matches!(
+            store.list(),
+            Err(StoreError::NoSecretService { .. })
+        ));
+        assert!(matches!(
+            store.read("claude"),
+            Err(ReadError::Store(StoreError::NoSecretService { .. }))
+        ));
+        std::fs::remove_file(dir.path().join("unreachable")).unwrap();
+
+        std::fs::write(dir.path().join("locked"), "").unwrap();
+        let err = store.set(SERVICE, "claude", b"v").expect_err("locked");
+        assert_eq!(
+            err.to_string(),
+            "`min secret` keeps secrets in Secret Service on Linux, and its keyring is locked: secret-tool: Cannot get secret of a locked object."
+        );
+        std::fs::remove_file(dir.path().join("locked")).unwrap();
+
+        // A lookup that returns nothing for a listed item is a locked
+        // keyring, never a deleted item.
+        store.set(SERVICE, "claude", b"v").unwrap();
+        std::fs::write(dir.path().join("silent-locked"), "").unwrap();
+        assert!(matches!(
+            store.read("claude"),
+            Err(ReadError::Store(StoreError::KeyringLocked { .. }))
+        ));
+        std::fs::remove_file(dir.path().join("silent-locked")).unwrap();
+
+        // A call that waits on an unlock prompt nobody answers ends at the
+        // timeout, and says what can be waiting.
+        let script = dir.path().join("slow");
+        std::fs::write(&script, "exec sleep 5\n").unwrap();
+        let slow = host::SecretItems::with_program("/bin/sh", [script])
+            .with_timeout(std::time::Duration::from_millis(200));
+        let err = slow.check_available().expect_err("timed out");
+        assert_eq!(
+            err.to_string(),
+            "the Secret Service store refused to answer a lookup: `secret-tool` did not answer in 0 s. A keyring unlock prompt can be waiting, or Secret Service can be stuck"
+        );
+        // The proxy's read refuses its request on the timeout, and never
+        // waits longer than READ_TIMEOUT, whatever the store's own timeout.
+        assert!(matches!(
+            slow.read("claude"),
+            Err(ReadError::Store(StoreError::Refused { .. }))
+        ));
+        assert_eq!(host::READ_TIMEOUT, std::time::Duration::from_secs(10));
+
+        // The `search` after a silent `lookup` keeps the read's deadline,
+        // not the store's longer timeout, so a stalled search ends the
+        // request at the deadline.
+        let script = dir.path().join("stalled-search");
+        std::fs::write(&script, "[ \"$1\" = lookup ] && exit 1\nexec sleep 30\n").unwrap();
+        let stalled = host::SecretItems::with_program("/bin/sh", [script])
+            .with_read_timeout(std::time::Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            stalled.read("claude"),
+            Err(ReadError::Store(StoreError::Refused { .. }))
+        ));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the read waited {:?}",
+            started.elapsed()
+        );
     }
 }

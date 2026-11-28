@@ -355,6 +355,14 @@ fn unreadable_audit_refusal(text: &str) -> Option<String> {
     Some(refusal.join("\n").trim_end().to_owned())
 }
 
+/// The guest's refusal of a newer box state, from the line of `text` that
+/// carries it, starting at the refusal's own first word.
+fn state_refusal(text: &str) -> Option<String> {
+    let at = text.rfind(boxes::store::NEWER_STATE_FORMAT_LEAD)?;
+    let line = text[at..].lines().next()?;
+    Some(line.trim_end().to_owned())
+}
+
 /// The error of a detached start whose supervisor exited before the VM was
 /// ready. When this start's proxy log or `run.log` holds the proxy's refusal
 /// over an unreadable audit log, the error repeats that refusal, which names
@@ -367,6 +375,11 @@ fn detach_failure_message(
     bep_log_path: Option<&std::path::Path>,
     bep_log: &str,
 ) -> String {
+    // The guest refused the box state on the data volume: that refusal is
+    // the whole error, in place of the generic supervisor text.
+    if let Some(refusal) = state_refusal(run_log) {
+        return refusal;
+    }
     let head = format!(
         "the detached supervisor exited during startup ({status}). \
          Its error output is in {}.",
@@ -1588,7 +1601,10 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
             Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                crate::cmd::discard_fresh_volume_image(&volume_path, volume_preexisted);
+                // A state refusal keeps the volume: a newer build's state is on it.
+                if !e.is::<crate::cmd::StateRefusedError>() {
+                    crate::cmd::discard_fresh_volume_image(&volume_path, volume_preexisted);
+                }
                 return Err(e);
                 // guard drops here → StartingGuard resets state to Stopped (R4.6)
             }
@@ -3677,6 +3693,9 @@ fn wait_boot_beacon(
             volume_path,
             volume_preexisted,
         )),
+        Ok(crate::cmd::BootBeacon::StateRefused { reason }) => {
+            Err(crate::cmd::state_refused_error(&reason, volume_path))
+        }
         Err(e) => Err(anyhow::anyhow!("boot failed: {e}")),
     }
 }
@@ -4224,6 +4243,21 @@ mod tests {
         // The refusal found in run.log is named there too.
         let from_run = super::detach_failure_message(exited(1), &run_log, &refusal, None, "");
         assert!(from_run.contains("--quarantine-unreadable"), "{from_run}");
+
+        // A state refusal in run.log is the whole message.
+        let state = format!(
+            "{}/var/lib/minimal. That state has format version 2. Install the newer min, \
+             then run your command again. That state is on the data volume /h/data.ext4.",
+            boxes::store::NEWER_STATE_FORMAT_LEAD
+        );
+        let from_state = super::detach_failure_message(
+            exited(1),
+            &run_log,
+            &format!("Error: {state}\n"),
+            None,
+            "",
+        );
+        assert_eq!(from_state, state);
 
         // A failure with no refusal in either log says nothing of the proxy.
         let plain = super::detach_failure_message(exited(1), &run_log, "boom", Some(&bep_log), "");

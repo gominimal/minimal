@@ -751,7 +751,7 @@ fn origin_label(origin: &mfile::expand::Origin, entry: &mfile::entry::BoxEntry) 
 /// names the entry's own table, or `[defaults.<type>]` for the implicit
 /// default entry: a value from the upstream or the type's defaults sits
 /// below the entry, so an edit there replaces it.
-fn setting_table(
+pub(crate) fn setting_table(
     report: &mfile::expand::ExpansionReport,
     entry: &mfile::entry::BoxEntry,
     key: &str,

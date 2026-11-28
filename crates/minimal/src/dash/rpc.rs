@@ -999,6 +999,23 @@ fn put_picked_entry(
     upload_root: &camino::Utf8Path,
     picked: &PickedEntry,
 ) -> Result<BoxGrants, anyhow::Error> {
+    put_picked_entry_with(
+        request,
+        contribution,
+        upload_root,
+        picked,
+        &bep::store::HostStore,
+    )
+}
+
+/// [`put_picked_entry`] with `store` as the host's native store.
+fn put_picked_entry_with(
+    request: &mut CreateSessionRequest,
+    contribution: &mut boxes::wire::request::WireContribution,
+    upload_root: &camino::Utf8Path,
+    picked: &PickedEntry,
+    store: &dyn bep::store::SecretStore,
+) -> Result<BoxGrants, anyhow::Error> {
     let dir = request.config.project_path.as_utf8_path().to_path_buf();
     let box_name = request.config.name.clone();
     // The pick `min session start` makes: a typed entry the project does
@@ -1048,6 +1065,7 @@ fn put_picked_entry(
         None,
         (Vec::new(), None),
         crate::ProjectPrompts::Dashboard,
+        store,
     )?;
     request.config.network = args.network_mode().into();
     request.config.policy = checks.policy;
@@ -2126,6 +2144,7 @@ mod tests {
             options.quic443,
             flags,
             crate::ProjectPrompts::Terminal,
+            &crate::EveryItemStore,
         )
         .expect("min box start dev passes its project checks");
         let mut started = fresh(args.network_mode().into(), checks.policy);
@@ -2147,7 +2166,7 @@ mod tests {
         // The dashboard's create, with `dev` and `own_ip` picked in the form.
         let mut created = fresh(NetworkMode::OwnIp, BoxPolicy::default());
         let mut created_contribution = boxes::wire::request::WireContribution::default();
-        let grants = put_picked_entry(
+        let grants = put_picked_entry_with(
             &mut created,
             &mut created_contribution,
             &root,
@@ -2156,6 +2175,7 @@ mod tests {
                 global: Some(global.clone()),
                 ..PickedEntry::default()
             },
+            &crate::EveryItemStore,
         )
         .expect("the dashboard creates a box from an entry with network and secret settings");
 
@@ -2237,7 +2257,13 @@ mod tests {
             }),
             ..PickedEntry::default()
         };
-        let result = put_picked_entry(&mut request, &mut contribution, &root, &picked);
+        let result = put_picked_entry_with(
+            &mut request,
+            &mut contribution,
+            &root,
+            &picked,
+            &crate::EveryItemStore,
+        );
         (result, request, contribution)
     }
 

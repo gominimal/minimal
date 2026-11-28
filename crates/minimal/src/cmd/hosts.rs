@@ -64,8 +64,12 @@ pub(crate) fn open_kvm_device() -> std::io::Result<()> {
 #[cfg(target_os = "linux")]
 const KVM_API_VERSION: i32 = 12;
 
+// `KVM_GET_API_VERSION` takes no argument, and the kernel refuses the call
+// with `EINVAL` unless the argument register holds 0. `ioctl_none!` passes
+// no third argument, which leaves whatever the register held (arm64 shows
+// it), so the call goes out with an explicit 0.
 #[cfg(target_os = "linux")]
-nix::ioctl_none!(kvm_get_api_version, 0xAE, 0x00);
+nix::ioctl_write_int_bad!(kvm_get_api_version, nix::request_code_none!(0xAE, 0x00));
 
 /// Whether the KVM device at `path` runs VMs for this user: it opens for
 /// reading and writing, and answers `KVM_GET_API_VERSION` with
@@ -78,9 +82,10 @@ pub(crate) fn kvm_usable_at(path: &Path) -> std::io::Result<()> {
         .read(true)
         .write(true)
         .open(path)?;
-    // SAFETY: KVM_GET_API_VERSION takes no argument and writes no memory of
-    // ours, and `device` keeps the descriptor open for the whole call.
-    let version = unsafe { kvm_get_api_version(device.as_raw_fd()) }?;
+    // SAFETY: the argument of KVM_GET_API_VERSION is the integer 0, not a
+    // pointer, so the call reads and writes no memory of ours, and `device`
+    // keeps the descriptor open for the whole call.
+    let version = unsafe { kvm_get_api_version(device.as_raw_fd(), 0) }?;
     if version == KVM_API_VERSION {
         Ok(())
     } else {
@@ -1115,5 +1120,22 @@ mod default_provider_tests {
         assert_eq!(error.raw_os_error(), Some(nix::libc::ENOTTY), "{error}");
         let absent = kvm_usable_at(Path::new("/nonexistent/kvm")).unwrap_err();
         assert_eq!(absent.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// Where `/dev/kvm` opens, the probe's `KVM_GET_API_VERSION` is never
+    /// refused with `EINVAL`, which the kernel answers only when the
+    /// argument is not 0. A call that left the argument unset was refused
+    /// whenever the register it reads held a stale value, so this catches
+    /// that only on a host where the register held one. A host whose
+    /// `/dev/kvm` does not open has nothing to check.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_kvm_probe_is_not_refused_for_its_argument() {
+        if open_kvm_device().is_err() {
+            return;
+        }
+        if let Err(error) = kvm_usable_at(Path::new(KVM_DEVICE)) {
+            assert_ne!(error.raw_os_error(), Some(nix::libc::EINVAL), "{error}");
+        }
     }
 }
