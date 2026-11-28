@@ -5,12 +5,11 @@ description: "Preparing a Linux host to run minimald: the unprivileged user name
 
 # Linux host setup
 
-`minimald` and `mip` run every session and task inside their own
-sandbox composed of an unprivileged user namespace and other Linux
-namespaces, similar to how containers are sandboxed on
-Kubernetes. Root/sudo access is not needed to create these sandboxes;
-however, some Linux distributions require enabling unprivileged user
-namespace creation.
+`minimald` and `mip` run each box and task in a sandbox of its own. The
+sandbox is an unprivileged user namespace with other Linux namespaces,
+much like a container on Kubernetes. You do not need root or sudo to
+create these sandboxes. On some Linux distributions, you must first let
+unprivileged programs create user namespaces.
 
 Most distributions allow this by default. **Ubuntu 24.04
 and later require the small configuration change described
@@ -18,7 +17,7 @@ below.**
 
 ## The symptom
 
-Ubuntu 24.04 ships `kernel.apparmor_restrict_unprivileged_userns=1`, which stops
+Ubuntu 24.04 sets `kernel.apparmor_restrict_unprivileged_userns=1`, which stops
 an unconfined program from creating a user namespace. The sandbox child dies
 writing its uid map before it runs anything, so *no* session can start:
 
@@ -60,8 +59,9 @@ $ min finalize-install --show
 $ min finalize-install
 ```
 
-The profile takes effect when the daemon next starts. Run `min host stop <host>`,
-then your command again. `min host list` prints the host names. To remove the profile run:
+The profile takes effect when the daemon next starts. Run
+`min host stop <host>`, then your command again. `min host list` prints the
+host names. To remove the profile, run:
 
 ```console
 $ min finalize-install --undo
@@ -76,11 +76,12 @@ $ sudo scripts/install-apparmor-profile.sh --path "$PWD/target/debug/minimald"
 
 For `mip`, which builds every task in the same kind of sandbox, attach
 the profile to the `mip` binary with `--path`. `min finalize-install`
-covers the daemon alone. The installer places the loader under the
-Minimal data directory:
+covers the daemon alone. The installer puts the loader in the Minimal data
+directory, `${XDG_DATA_HOME:-~/.local/share}/minimal`, and the refusal that
+`mip` prints names the loader's path:
 
 ```console
-$ sudo bash ~/.local/share/minimal/apparmor/install-apparmor-profile.sh --path "$(command -v mip)"
+$ sudo bash "${XDG_DATA_HOME:-$HOME/.local/share}/minimal/apparmor/install-apparmor-profile.sh" --path "$(command -v mip)"
 ```
 
 From a checkout, the same loader is `scripts/install-apparmor-profile.sh`,
