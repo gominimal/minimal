@@ -88,11 +88,11 @@ the task's value.
 
 ### `build_cmd` or `build_cmds_cmd`
 
-_String or array of strings, optional_
+_String or array of strings, required: exactly one of the two_
 
 `build_cmd` and `build_cmds_cmd` each give the command that builds software
-with this stack. A stack can set one of them, not both. A stack that sets
-both fails to load.
+with this stack. Set exactly one of them. A stack that sets both, or
+neither, fails to load.
 
 `build_cmd` is the command that [`mip run build`](./cli-mip.md#run) runs.
 It can be a shell-style string, or an array of the executable and its
@@ -157,8 +157,9 @@ rules.
 
 ### `matches_project_priority`
 
-_Number, optional_
+_Whole number, optional_
 
-The order in which `mip init` tries the stacks. It tries the stack with the
+A signed 32-bit integer that sets the order in which `mip init` tries the
+stacks. It tries the stack with the
 highest priority first, and it uses the first stack that matches. The
 default is `0`.
