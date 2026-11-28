@@ -7849,8 +7849,8 @@ mod tests {
 
     /// A native store that this host cannot use, as on a Linux host where
     /// no Secret Service answers.
-    struct NoAnswerStore;
-    impl bep::store::SecretStore for NoAnswerStore {
+    struct NoBusStore;
+    impl bep::store::SecretStore for NoBusStore {
         fn name(&self) -> &'static str {
             bep::store::NATIVE_STORE
         }
@@ -7872,8 +7872,8 @@ mod tests {
             panic!("remove was called")
         }
         fn check_available(&self) -> Result<(), bep::store::StoreError> {
-            Err(bep::store::StoreError::NoSecretService {
-                detail: "secret-tool: Cannot autolaunch D-Bus without X11 $DISPLAY".into(),
+            Err(bep::store::StoreError::NoSessionBus {
+                detail: "no session bus answered: failed to connect to `unix:path=/run/user/1000/bus`: No such file or directory (os error 2)".into(),
             })
         }
     }
@@ -7883,13 +7883,13 @@ mod tests {
     // rule names the item. No rule is asked for, since a rule would not let
     // the proxy read the item, and nothing is minted.
     #[test]
-    fn store_reference_refused_when_the_host_store_does_not_answer() {
+    fn store_reference_refused_when_the_host_has_no_session_bus() {
         use bep::store::SecretStore as _;
         let egress = egress_of(&["api.openai.com"]);
         let expected = GrantNotDelivered::StoreUnavailable {
             grant: "OPENAI_KEY".into(),
             item: "openai-key".into(),
-            reason: NoAnswerStore.check_available().unwrap_err().to_string(),
+            reason: NoBusStore.check_available().unwrap_err().to_string(),
             table: boxes::core::bep::SESSION_SECRETS_TABLE.into(),
         };
         for rules in [boxes::core::bep::StoreRules::new(), store_rule(None)] {
@@ -7900,7 +7900,7 @@ mod tests {
                 &rules,
                 true,
                 &mut never_ask,
-                &NoAnswerStore,
+                &NoBusStore,
                 boxes::core::bep::SESSION_SECRETS_TABLE,
             )
             .expect_err("the host store cannot be used");
@@ -7911,10 +7911,10 @@ mod tests {
             "Cannot create the box: the secret OPENAI_KEY in [defaults.session.secrets] in \
              minimal.toml reads the item openai-key from the host's secret store, and this \
              host cannot use that store. `min secret` keeps secrets in Secret Service on \
-             Linux, and no Secret Service answered in this login session: secret-tool: \
-             Cannot autolaunch D-Bus without X11 $DISPLAY. Install a Secret Service provider \
-             such as GNOME Keyring (the `gnome-keyring` package), and run the command again \
-             in a login session that starts it."
+             Linux, and this process reached no D-Bus session bus: no session bus \
+             answered: failed to connect to `unix:path=/run/user/1000/bus`: No such file or \
+             directory (os error 2). Run the command again in a login session where \
+             DBUS_SESSION_BUS_ADDRESS names a running session bus."
         );
 
         // A reference to another store reads nothing from the host store,
@@ -7932,7 +7932,7 @@ mod tests {
             &boxes::core::bep::StoreRules::new(),
             true,
             &mut never_ask,
-            &NoAnswerStore,
+            &NoBusStore,
             boxes::core::bep::SESSION_SECRETS_TABLE,
         )
         .expect_err("no rule");
@@ -8154,7 +8154,7 @@ mod tests {
             &boxes::core::bep::StoreRules::new(),
             true,
             &mut never_ask,
-            &NoAnswerStore,
+            &NoBusStore,
             LEGACY_SESSION_SECRETS_TABLE,
         )
         .expect_err("the host store cannot be used");

@@ -1383,7 +1383,11 @@ enum Interrupted {
 
 /// The error for a move out of an empty slot. Only the move of the old key
 /// aside finds an empty slot and succeeds: a role can have no key yet.
-#[cfg(any(test, target_os = "macos", target_os = "linux"))]
+#[cfg(any(
+    test,
+    target_os = "macos",
+    all(target_os = "linux", feature = "secret-service")
+))]
 pub(crate) fn missing_in(role: Role, slot: Slot) -> KeyError {
     let detail = match slot {
         Slot::New => "the store holds no new key to move in",

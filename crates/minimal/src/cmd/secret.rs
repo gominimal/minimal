@@ -732,11 +732,6 @@ pub(crate) fn run_set_with_rule(
             "min secret set stored nothing: the value is empty. Run the command again and give a value."
         );
     }
-    // Before the rule is written, so a value the store cannot keep whole
-    // changes nothing.
-    store
-        .check_value(&value)
-        .context("min secret set stored nothing")?;
     let snapshot = match &mut write {
         None => None,
         Some((path, rule, line, notice)) => {
@@ -766,7 +761,13 @@ pub(crate) fn run_set_with_rule(
         if matches!(e, StoreError::StagingLeft { .. }) {
             return Err(anyhow::Error::new(e));
         }
-        let mut message = format!("min secret set did not store {}", args.id);
+        // With no answer to the request, the store can still make the
+        // change, so "did not store" is not known.
+        let mut message = if matches!(e, StoreError::ChangeUnsettled { .. }) {
+            format!("min secret set cannot tell whether it stored {}", args.id)
+        } else {
+            format!("min secret set did not store {}", args.id)
+        };
         if let Some((path, snapshot)) = &snapshot {
             match crate::config::restore_config(snapshot) {
                 Ok(()) => {
@@ -948,9 +949,14 @@ pub(crate) fn run_rm(
 ) -> anyhow::Result<()> {
     check_id(RM, &args.id)?;
     check_store(RM, args.store.as_deref())?;
-    let removed = store
-        .remove(&args.id)
-        .with_context(|| format!("min secret rm did not remove {}", args.id))?;
+    let removed = store.remove(&args.id).map_err(|e| {
+        let message = if matches!(e, StoreError::ChangeUnsettled { .. }) {
+            format!("min secret rm cannot tell whether it removed {}", args.id)
+        } else {
+            format!("min secret rm did not remove {}", args.id)
+        };
+        anyhow::Error::new(e).context(message)
+    })?;
     if !removed {
         bail!(
             "There is no secret named {} in {}. Run `min secret list` to see the stored names.",
@@ -1387,9 +1393,6 @@ mod tests {
         fn place(&self) -> String {
             "Secret Service".to_owned()
         }
-        fn check_value(&self, value: &[u8]) -> Result<(), StoreError> {
-            bep::store::check_secret_tool_value(value)
-        }
         fn binds_program(&self) -> bool {
             false
         }
@@ -1454,54 +1457,6 @@ mod tests {
         let mut out = Vec::new();
         run_list(&store, &StoreRules::new(), Err(&missing), &mut out).unwrap();
         assert_eq!(out, b"No secrets in Secret Service.\n");
-    }
-
-    // On Linux, `set` refuses a value that Secret Service would refuse or
-    // keep cut short through `secret-tool`, after the read and before the
-    // rule or the item is written, so nothing changes.
-    #[test]
-    fn secret_set_refuses_a_value_secret_tool_cannot_keep() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, EXISTING).unwrap();
-        let store = UserWideStore::default();
-        let cases: [(Vec<u8>, &str); 2] = [
-            (
-                vec![b'a'; bep::store::SECRET_TOOL_MAX_VALUE + 1],
-                "min secret set stored nothing: On Linux, `min secret` stores a value in \
-                 Secret Service through `secret-tool`, which keeps at most 8192 bytes, and \
-                 this value is 8193 bytes. Give a value of 8192 bytes or fewer.",
-            ),
-            (
-                b"\xff\x00\xfe".to_vec(),
-                "min secret set stored nothing: On Linux, `min secret` stores a value in \
-                 Secret Service through `secret-tool`, which keeps only UTF-8 text, and this \
-                 value is not valid UTF-8. Give the value as UTF-8 text.",
-            ),
-        ];
-        for (value, want) in cases {
-            let mut out = Vec::new();
-            let err = run_set_with_rule(
-                &store,
-                &set_args(&["linear", "--preset", "linear", "--yes"]),
-                Path::new(""),
-                ValueSource::Stdin,
-                &mut no_terminal,
-                &mut &value[..],
-                &mut out,
-                Some(RuleTarget {
-                    path: &path,
-                    confirm: &mut no_confirm,
-                    notice: &mut std::io::sink(),
-                    control: None,
-                }),
-            )
-            .expect_err("refused");
-            assert_eq!(format!("{err:#}"), want);
-            assert!(out.is_empty());
-            assert!(store.0.value("linear").is_none());
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), EXISTING);
-        }
     }
 
     #[test]
@@ -2543,6 +2498,73 @@ attributes:
         fn remove(&self, _: &str) -> Result<bool, StoreError> {
             Ok(false)
         }
+    }
+
+    /// A store that gets no answer to a change.
+    struct UnansweredStore;
+    impl SecretStore for UnansweredStore {
+        fn name(&self) -> &'static str {
+            NATIVE_STORE
+        }
+        fn set(&self, _: &str, _: &[u8], _: &Path) -> Result<(), StoreError> {
+            Err(Self::unsettled())
+        }
+        fn list(&self, _: &Path) -> Result<Vec<bep::store::ItemInfo>, StoreError> {
+            Ok(Vec::new())
+        }
+        fn remove(&self, _: &str) -> Result<bool, StoreError> {
+            Err(Self::unsettled())
+        }
+    }
+    impl UnansweredStore {
+        fn unsettled() -> StoreError {
+            StoreError::ChangeUnsettled {
+                detail: "Secret Service did not answer in 60 s".into(),
+            }
+        }
+    }
+
+    // A change that got no answer can still be made, so neither command
+    // says that it changed nothing.
+    #[test]
+    fn secret_change_with_no_answer_says_the_outcome_is_unknown() {
+        let (_dir, proxy) = proxy();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, EXISTING).unwrap();
+        let (result, out) = set_with_rule(
+            &UnansweredStore,
+            &["claude", "--preset", "anthropic", "--yes"],
+            &proxy,
+            ValueSource::Stdin,
+            &path,
+            &mut no_confirm,
+        );
+        assert_eq!(
+            format!("{:#}", result.expect_err("no answer")),
+            format!(
+                "min secret set cannot tell whether it stored claude. The rule for claude in {} \
+                 is back as it was: Secret Service did not answer in 60 s. Secret Service can \
+                 still make the change, or it made a part of it. Run the command again.",
+                path.display()
+            )
+        );
+        assert!(out.is_empty());
+
+        let args = SecretRmArgs {
+            id: "claude".into(),
+            store: None,
+        };
+        let mut out = Vec::new();
+        assert_eq!(
+            format!(
+                "{:#}",
+                run_rm(&UnansweredStore, &args, &mut out).unwrap_err()
+            ),
+            "min secret rm cannot tell whether it removed claude: Secret Service did not answer \
+             in 60 s. Secret Service can still make the change, or it made a part of it. Run \
+             the command again."
+        );
     }
 
     #[test]

@@ -14410,7 +14410,7 @@ s.settimeout(2)
 s.connect(sys.argv[1])' "$1" 2>/dev/null
 }
 # On Linux `bep serve` keeps its keys in the TPM (through tpm2-tools on
-# /dev/tpmrm0) or in Secret Service (through secret-tool), BEP-088 and
+# /dev/tpmrm0) or in Secret Service, BEP-088 and
 # BEP-089. Returns 0 when one of them answers, or when the lane sets
 # E2E_BEP_KEY_STORE=1 to say that it provides one: then a proxy that does
 # not come up is a failure. Else prints why neither answers and returns 1.

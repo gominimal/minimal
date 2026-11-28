@@ -4043,29 +4043,6 @@ mod tests {
         assert!(!path.exists());
     }
 
-    /// A fake `secret-tool` that keeps each item in a file under `dir`.
-    #[cfg(target_os = "linux")]
-    fn fake_secret_tool(dir: &Path) -> bep::secret_service::SecretService {
-        let script = dir.join("secret-tool");
-        let body = format!(
-            r#"dir='{dir}'
-cmd=$1; shift
-[ "$cmd" = store ] && shift
-name=$2
-case "$cmd" in
-  store) cat > "$dir/item.$name" ;;
-  lookup) [ -f "$dir/item.$name" ] || exit 1; cat "$dir/item.$name" ;;
-  search) [ -f "$dir/item.$name" ] && printf '[/org/freedesktop/secrets/collection/login/1]\nlabel = %s\n' "$name"; exit 0 ;;
-  clear) rm -f "$dir/item.$name" ;;
-  *) echo "unknown command $cmd" >&2; exit 2 ;;
-esac
-"#,
-            dir = dir.display()
-        );
-        std::fs::write(&script, body).unwrap();
-        bep::secret_service::SecretService::with_program("/bin/sh", [script])
-    }
-
     // BEP-088, BEP-089: on Linux, `bep` and `bep --replace-key` run on the
     // Linux key store. With no TPM, the keys go to Secret Service.
     #[cfg(target_os = "linux")]
@@ -4075,29 +4052,16 @@ esac
         use bep::tpm::TpmStore;
 
         let tmp = tempfile::tempdir().unwrap();
-        let items = tmp.path().join("secret-service");
-        std::fs::create_dir(&items).unwrap();
+        let items = bep::secret_items::MemoryItems::default();
         let path = tmp.path().join("identity.json");
         let store = || {
             LinuxStore::new(
                 TpmStore::new(tmp.path().join("tpm"), "device:/nonexistent/tpm"),
-                fake_secret_tool(&items),
+                bep::secret_service::SecretService::with_items(items.clone()),
             )
         };
         let identity = path.to_str().unwrap();
-        let count_items = || {
-            std::fs::read_dir(&items)
-                .unwrap()
-                .filter(|entry| {
-                    entry
-                        .as_ref()
-                        .unwrap()
-                        .file_name()
-                        .to_string_lossy()
-                        .starts_with("item.")
-                })
-                .count()
-        };
+        let count_items = || items.len();
 
         let args = Args::try_parse_from(["bep", "--identity", identity]).unwrap();
         assert_eq!(run(&store(), &args), ExitCode::SUCCESS);

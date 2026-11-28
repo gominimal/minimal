@@ -2163,9 +2163,9 @@ mod tests {
         assert!(upstream.is_empty());
     }
 
-    // The store `bep serve` opens off macOS reads nothing, so an admitted
-    // store member is refused `store_item_unreadable`, never forwarded
-    // without the key.
+    // Where the host's native store cannot be reached, an admitted store
+    // member is refused `store_item_unreadable`, never forwarded without
+    // the key.
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn serve_refuses_an_unreadable_store_member() {
@@ -2179,7 +2179,7 @@ mod tests {
         let (upstream, end, records) = send_to_store(
             &world,
             "b1",
-            Arc::new(crate::store::HostStore),
+            Arc::new(crate::store::UnreachableHostStore),
             &format!("Authorization: Bearer {sealed}"),
         );
         assert_eq!(refused(&end), Some(crate::forward::STORE_ITEM_UNREADABLE));
@@ -2189,5 +2189,28 @@ mod tests {
             records[0].marker.as_deref(),
             Some(crate::forward::STORE_ITEM_UNREADABLE)
         );
+    }
+
+    // A Secret Service that does not answer the read in its time refuses
+    // the request the same way, and nothing goes upstream.
+    #[cfg(all(target_os = "linux", feature = "secret-service"))]
+    #[test]
+    fn serve_refuses_a_store_member_that_secret_service_does_not_answer() {
+        let keychain = MemoryKeychain::default();
+        let key = MemoryStore::default().generate(Role::Sealing).unwrap();
+        let world = world_over(key, keychain, |redeemer| {
+            redeemer.with_rules(Arc::new(vec![openai_rule()]))
+        });
+        world.boxes.register("b1", vec![openai()], Stance::OwnIp);
+        let sealed = store_sealed_for(&world, "b1");
+        let (upstream, end, records) = send_to_store(
+            &world,
+            "b1",
+            Arc::new(crate::store::UnansweredHostStore),
+            &format!("Authorization: Bearer {sealed}"),
+        );
+        assert_eq!(refused(&end), Some(crate::forward::STORE_ITEM_UNREADABLE));
+        assert!(upstream.is_empty());
+        assert_eq!(records[0].outcome, Outcome::Refuse);
     }
 }

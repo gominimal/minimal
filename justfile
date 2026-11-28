@@ -225,6 +225,46 @@ minimal-cli:
 minimald-build:
     cargo build -p minimald --locked
 
+# `bep` links a D-Bus client for Secret Service behind its `secret-service`
+# feature. `min` and the `bep` binary need it. A daemon that depends on `bep`
+# with the feature on carries the client into the guest. Cargo resolves the
+# Linux graph on any host, so this runs on macOS too.
+#
+# This reads each package's own dependency tree (`cargo tree -p <package>`).
+# That is the graph of a build of that one package, which is how the shipped
+# daemons are built: `scripts/dist-build.sh` and the initramfs build run one
+# `cargo build -p` for each package. It proves nothing about a build of
+# several packages in one cargo call. Cargo unifies features there, so a
+# `minimald` from `just min` or from a workspace build links the client.
+# CI: no workflow runs it. `just ci` runs it, on Linux and on macOS.
+#
+# Prove that `min` and `bep` link the Secret Service client and a daemon built on its own does not.
+secret-service-links:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    links() {
+        local tree
+        # A `cargo tree` that fails says nothing about what the package links.
+        tree="$(cargo tree --locked --target {{musl-target}} -e normal --prefix none -p "$1")" || {
+            echo "cargo tree failed for $1, so its dependencies are not known"
+            exit 2
+        }
+        grep -q '^secret-service v' <<<"$tree"
+    }
+    for package in minimald minvmd; do
+        if links "$package"; then
+            echo "$package links secret-service: set default-features = false on its bep dependency"
+            exit 1
+        fi
+    done
+    for package in minimal bep; do
+        if ! links "$package"; then
+            echo "$package does not link secret-service, and it reads Secret Service on Linux"
+            exit 1
+        fi
+    done
+    echo "secret-service: linked by minimal and bep, not by minimald or minvmd"
+
 # THE single build entrypoint for a shippable build: the four release binaries
 # for a target triple, built exactly the way release.yml's build jobs build
 # them (they call this same script), plus completions from the built `min`.
@@ -584,12 +624,12 @@ hooks:
 #
 # The local PR gate set, cheapest first.
 [linux]
-ci: fmt-check check-version clippy clippy-strict deny metrics-layers test doctest test-ignored zoned-link-check
+ci: fmt-check check-version clippy clippy-strict deny metrics-layers test doctest test-ignored zoned-link-check secret-service-links
     @echo "ci: local PR gates green"
 
 # The local PR gate set, cheapest first (`just test-cross` covers the Linux-only crates).
 [macos]
-ci: fmt-check check-version clippy clippy-strict deny metrics-layers test doctest zoned-link-check
+ci: fmt-check check-version clippy clippy-strict deny metrics-layers test doctest zoned-link-check secret-service-links
     @echo "ci: local PR gates green"
 
 # Run the curl|sh installer's tests under every POSIX sh. CI: ci-shell-installer.yml.

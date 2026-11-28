@@ -20,11 +20,10 @@
 //! - macOS: the login keychain item under [`SERVICE`] holds the secret as
 //!   its password and the metadata as its comment. `security
 //!   find-generic-password` without `-w` prints the comment and no password.
-//! - Linux and other hosts: the Secret Service holds two items. The item
-//!   under [`SERVICE`] holds the secret, with the instance identifier. A
-//!   second item under [`META_SERVICE`] holds the encoded metadata as its
-//!   secret and no token.
-//!   `secret-tool lookup` on [`META_SERVICE`] reads the metadata only.
+//! - Linux: Secret Service holds two items. The item under [`SERVICE`]
+//!   holds the secret, with the instance identifier. A second item under
+//!   [`META_SERVICE`] holds the encoded metadata as its secret and no
+//!   token. A lookup of [`META_SERVICE`] reads the metadata only.
 //!
 //! The instance identifier names one sign-in. A sign-in while no item is
 //! held, or a sign-in to a different account, gets a new identifier. A
@@ -33,7 +32,9 @@
 //! sign-in.
 
 use std::fmt;
+#[cfg(target_os = "macos")]
 use std::io::Write as _;
+#[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
@@ -775,6 +776,10 @@ fn decode_secret(secret: &str) -> Result<Material, SignInError> {
 /// Decode the secret a keychain tool printed, then zeroize the captured
 /// output. The returned [`Material`] is the one copy that remains, and it
 /// zeroizes itself on drop.
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", feature = "secret-service")
+))]
 fn decode_captured(stdout: &mut Vec<u8>) -> Result<Material, SignInError> {
     // `from_utf8` borrows the buffer, so the decode makes no copy of it.
     let decoded = std::str::from_utf8(stdout)
@@ -785,8 +790,8 @@ fn decode_captured(stdout: &mut Vec<u8>) -> Result<Material, SignInError> {
 }
 
 /// The host keychain of this machine: the login keychain through
-/// `/usr/bin/security` on macOS, the Secret Service through `secret-tool`
-/// elsewhere. Both keep the material out of every file this program writes.
+/// `/usr/bin/security` on macOS, and Secret Service on Linux. Both keep the
+/// material out of every file this program writes.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct HostKeychain;
 
@@ -885,6 +890,7 @@ pub fn lock_item_at(path: &std::path::Path) -> Result<ItemLock, SignInError> {
     Ok(ItemLock { _file: file })
 }
 
+#[cfg(target_os = "macos")]
 fn run(
     action: &'static str,
     mut cmd: Command,
@@ -1004,80 +1010,111 @@ mod host {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(target_os = "linux", feature = "secret-service"))]
 mod host {
-    use super::{LABEL, META_SERVICE, Material, SERVICE, SignInError, decode_captured, run};
-    use std::process::Command;
-    use zeroize::Zeroize as _;
-
-    const SECRET_TOOL: &str = "secret-tool";
-    pub(super) const TOOL: &str = SECRET_TOOL;
-    pub(super) const INSTALL: &str = "Install it (the `libsecret-tools` package on Debian and Ubuntu, `libsecret` on Fedora and Arch), then run `min auth login` again.";
+    use super::{LABEL, META_SERVICE, Material, SERVICE, SignInError, decode_captured};
+    use crate::secret_items::{Cause, Items, SessionItems};
 
     /// The label of the item under [`META_SERVICE`].
     const META_LABEL: &str = "Minimal GitHub sign-in details";
 
-    /// Read the metadata from the item under [`META_SERVICE`]. That item's
-    /// secret is the encoded metadata, so the lookup returns no token.
+    /// How long a read of the sign-in waits for Secret Service. The proxy
+    /// reads it for a request of a box, so the read has the time that a
+    /// read of a stored secret has. A write waits for
+    /// [`TIMEOUT`](crate::secret_items::TIMEOUT).
+    const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
     pub(super) fn metadata() -> Result<Option<String>, SignInError> {
-        let mut cmd = Command::new(SECRET_TOOL);
-        cmd.args(["lookup", "service", META_SERVICE]);
-        let out = run("read the sign-in", cmd, None)?;
-        if !out.status.success() {
-            if out.stderr.is_empty() {
-                return Ok(None);
-            }
-            return Err(refused("read the sign-in", &out.stderr));
-        }
-        let text = String::from_utf8_lossy(&out.stdout);
-        let text = text.trim();
-        Ok((!text.is_empty()).then(|| text.to_owned()))
+        metadata_in(&SessionItems::within(READ_TIMEOUT))
     }
 
     pub(super) fn material() -> Result<Option<Material>, SignInError> {
-        let mut cmd = Command::new(SECRET_TOOL);
-        cmd.args(["lookup", "service", SERVICE]);
-        let mut out = run("read the sign-in", cmd, None)?;
-        if !out.status.success() {
-            out.stdout.zeroize();
-            if out.stderr.is_empty() {
-                return Ok(None);
-            }
-            return Err(refused("read the sign-in", &out.stderr));
-        }
-        decode_captured(&mut out.stdout).map(Some)
+        material_in(&SessionItems::within(READ_TIMEOUT))
+    }
+
+    pub(super) fn write(metadata: &str, secret: &str) -> Result<(), SignInError> {
+        write_in(&SessionItems::new(), metadata, secret)
+    }
+
+    /// Read the metadata from the item under [`META_SERVICE`]. That item's
+    /// secret is the encoded metadata, so the lookup returns no token.
+    pub(super) fn metadata_in(items: &impl Items) -> Result<Option<String>, SignInError> {
+        let held = items
+            .lookup(&[("service", META_SERVICE)])
+            .map_err(|cause| refused("read the sign-in", &cause))?;
+        Ok(held
+            .map(|held| String::from_utf8_lossy(&held).trim().to_owned())
+            .filter(|text| !text.is_empty()))
+    }
+
+    pub(super) fn material_in(items: &impl Items) -> Result<Option<Material>, SignInError> {
+        items
+            .lookup(&[("service", SERVICE)])
+            .map_err(|cause| refused("read the sign-in", &cause))?
+            .map(|mut held| decode_captured(&mut held))
+            .transpose()
     }
 
     /// Write the secret to the item under [`SERVICE`], then the metadata to
     /// the item under [`META_SERVICE`].
-    pub(super) fn write(metadata: &str, secret: &str) -> Result<(), SignInError> {
+    pub(super) fn write_in(
+        items: &impl Items,
+        metadata: &str,
+        secret: &str,
+    ) -> Result<(), SignInError> {
         // A failed secret store leaves both held items as they were. A
         // failed metadata store after it leaves the old metadata, and the
         // read-back in `HostKeychain::write` reports the failed write. The
         // stored secret names its own new instance, so no reference bound
         // to the old instance resolves the new token.
+        //
+        // Secret Service replaces the item whose attributes all match.
+        // Each item's one attribute is `service`, so the store replaces the
+        // held item in place, and a failed store leaves it as it was.
+        let store = |label, service, secret: &str| {
+            items
+                .store(label, &[("service", service)], secret.as_bytes())
+                .map_err(|cause| SignInError::Keychain {
+                    action: "write the sign-in",
+                    detail: cause.with_next_step(),
+                })
+        };
         store(LABEL, SERVICE, secret)?;
         store(META_LABEL, META_SERVICE, metadata)
     }
 
-    fn store(label: &str, service: &str, secret: &str) -> Result<(), SignInError> {
-        // The Secret Service replaces the item whose attributes all match.
-        // Each item's one attribute is `service`, so the store replaces the
-        // held item in place, and a failed store leaves it as it was.
-        let mut cmd = Command::new(SECRET_TOOL);
-        cmd.args(["store", &format!("--label={label}"), "service", service]);
-        let out = run("write the sign-in", cmd, Some(secret))?;
-        if !out.status.success() {
-            return Err(refused("write the sign-in", &out.stderr));
-        }
-        Ok(())
-    }
-
-    fn refused(action: &'static str, stderr: &[u8]) -> SignInError {
+    fn refused(action: &'static str, cause: &Cause) -> SignInError {
         SignInError::Keychain {
             action,
-            detail: String::from_utf8_lossy(stderr).trim().to_owned(),
+            detail: cause.to_string(),
         }
+    }
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    all(target_os = "linux", feature = "secret-service")
+)))]
+mod host {
+    use super::{Material, SignInError};
+
+    fn none<T>(action: &'static str) -> Result<T, SignInError> {
+        Err(SignInError::Keychain {
+            action,
+            detail: "this program has no host keychain on this host".into(),
+        })
+    }
+
+    pub(super) fn metadata() -> Result<Option<String>, SignInError> {
+        none("read the sign-in")
+    }
+
+    pub(super) fn material() -> Result<Option<Material>, SignInError> {
+        none("read the sign-in")
+    }
+
+    pub(super) fn write(_: &str, _: &str) -> Result<(), SignInError> {
+        none("write the sign-in")
     }
 }
 
@@ -1099,5 +1136,56 @@ mod tests {
         );
         drop(held);
         other.try_lock().expect("the lock is free once dropped");
+    }
+
+    // The sign-in is two Secret Service items, each under the one attribute
+    // `service`. A write replaces both in place, and a line end after the
+    // held text reads the same.
+    #[cfg(all(target_os = "linux", feature = "secret-service"))]
+    #[test]
+    fn the_linux_sign_in_is_two_secret_service_items() {
+        use crate::secret_items::{Cause, Items as _, MemoryItems};
+
+        let items = MemoryItems::default();
+        assert_eq!(host::metadata_in(&items).unwrap(), None);
+        assert!(host::material_in(&items).unwrap().is_none());
+
+        let instance = "0123456789abcdef0123456789abcdef";
+        host::write_in(&items, "old", &format!("v1 {instance} old-token refresh")).unwrap();
+        host::write_in(&items, "meta", &format!("v1 {instance} token refresh")).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(host::metadata_in(&items).unwrap().as_deref(), Some("meta"));
+        let material = host::material_in(&items).unwrap().unwrap();
+        assert_eq!(material.instance, instance);
+        assert_eq!(material.access_token, "token");
+        assert_eq!(
+            items.attribute_values(&[], "service").unwrap(),
+            vec![SERVICE, META_SERVICE]
+        );
+        items
+            .store("x", &[("service", META_SERVICE)], b"meta\n")
+            .unwrap();
+        assert_eq!(host::metadata_in(&items).unwrap().as_deref(), Some("meta"));
+
+        // A locked keyring is an error that says so, never "not signed in".
+        items.set_locked(true);
+        let err = host::metadata_in(&items).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "the host keychain refused to read the sign-in: Secret Service lists the item, and it is locked"
+        );
+        assert!(host::material_in(&items).is_err());
+        let err = host::write_in(&items, "meta", "secret").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "the host keychain refused to write the sign-in: the default collection is locked. Unlock the login keyring, then run the command again"
+        );
+        items.set_locked(false);
+
+        items.set_failure(Some(Cause::NoAnswer(std::time::Duration::from_secs(60))));
+        assert_eq!(
+            host::metadata_in(&items).unwrap_err().to_string(),
+            "the host keychain refused to read the sign-in: Secret Service did not answer in 60 s"
+        );
     }
 }
