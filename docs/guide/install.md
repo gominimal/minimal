@@ -134,11 +134,12 @@ file. The copy commands below keep it sparse.
    esac
    source="$(cd -P "$state" && pwd -P)"
    copy="$HOME/minimal-state-0.7"
-   test ! -e "$copy" && echo "ready to copy $source to $copy"
+   test -n "$source" && test ! -e "$copy" && echo "ready to copy $source to $copy"
    ```
 
    `source` is the real directory, also when `state` is a symbolic link to
-   another disk. When the command prints nothing, choose another `copy`. For
+   another disk. When the command prints nothing, `state` does not exist or
+   `copy` exists already. Correct the one that is wrong before you go on. For
    another disk, set `copy` to a path on that disk.
 
 3. Copy what the state directory holds.
@@ -193,11 +194,13 @@ lost.
    `aside`, and run it again.
 
    When the command does not print `restored`, do not go on to step 3. If the
-   first move worked and the second did not, put the 0.8 state back, correct
-   `copy`, and run step 2 again:
+   first move worked and the second did not, the 0.8 state is at `aside`, and
+   the copy is still at `copy`. A second move that failed partway can leave
+   part of the copy at `state`. Remove that part, put the 0.8 state back,
+   correct `copy`, and run step 2 again:
 
    ```shell
-   test ! -e "$state" && mv "$aside" "$state"
+   test -d "$aside" && test -d "$copy" && rm -rf "$state" && mv "$aside" "$state"
    ```
 
 3. When step 2 printed `restored`, install the 0.7 release that you had. Replace `<0.7.x>` with the version
