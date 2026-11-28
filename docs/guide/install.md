@@ -73,6 +73,8 @@ curl --proto "=https" --tlsv1.2 -fsSL https://go.minimal.dev/stable | sh -s -- -
 0.8 writes. To go back to 0.7 with your boxes after the upgrade, you need a
 copy of the state from before it. The installer makes that copy for you when
 it upgrades a 0.7 install. The next section says when to make it by hand.
+Before you upgrade, run `min --version` and note the 0.7 version. The way back
+installs that version again.
 
 What changes in 0.8:
 
@@ -91,9 +93,9 @@ What changes in 0.8:
   loadout files. A session, task or defaults table, or a loadout file, that
   still sets `vars` or `vars_lenient` fails with exit code 3. The message
   names the file and the key. Rename `vars` to `env_vars`. Move each
-  `vars_lenient` entry into `env_vars` as `NAME = "value"`. A name in
-  `env_vars` holds only letters, digits and `_`, and does not start with a
-  digit. Minimal refuses any other name.
+  `vars_lenient` entry into `env_vars` as `NAME = "value"`. Minimal refuses a
+  name in `env_vars` that starts with a digit, or that holds a character
+  other than a letter, a digit or `_`.
 - `min init` writes the session entry as `[sessions.default]`, which holds the
   session's packages, and writes no `[boxes]` or `[defaults]` table.
 
@@ -196,7 +198,9 @@ boxes that you made on 0.8 are lost when you go back.
    0.8 instead, stop here.
 
 2. Run the install command for the 0.7 release that you had. Replace
-   `<0.7.x>` with the version that `min --version` printed before the upgrade:
+   `<0.7.x>` with the version that you noted before the upgrade. The name of
+   a copy that the installer made ends with that version, such as
+   `minimal.0.7.3`:
 
    ```shell
    curl --proto "=https" --tlsv1.2 -fsSL https://go.minimal.dev/stable | sh -s -- --version <0.7.x>
@@ -208,10 +212,13 @@ boxes that you made on 0.8 are lost when you go back.
    copy beside it into its place. When more than one copy is there, the
    installer says how many others there are.
 
-3. Run the stop commands that the installer printed. Then run its last line,
-   the one that renames the 0.8 state aside and renames the copy into its
-   place. Do not run the shorter `mv` line before it, because that line only
-   moves the 0.8 state aside. Then run the install command from step 2 again.
+3. Run the stop commands that the installer printed. Then check which copy
+   its last line names. That line renames the 0.8 state aside, and renames the
+   newest copy into its place. It can name another copy than the one you
+   mean, such as an installer copy in place of `$state.0.7.hand`. Then put
+   your copy's path in its place. Then run the line. Do not run the shorter `mv`
+   line before it. That line only moves the 0.8 state aside. Then run the
+   install command from step 2 again.
 
 ## Uninstall
 
