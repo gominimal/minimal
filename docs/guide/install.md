@@ -188,9 +188,12 @@ boxes that you made on 0.8 are lost when you go back.
    mkdir "$state.0.7.hand" && cp -a --sparse=always "$copy/." "$state.0.7.hand/" && echo ready
    ```
 
-   When the command does not print `ready`, `$state.0.7.hand` exists already
-   or holds only part of the copy. Choose another name that starts with
-   `$state.0.7.`, and run it again.
+   When the command does not print `ready`, `$state.0.7.hand` exists already,
+   or the copy stopped partway. For a name that exists, choose another name
+   that starts with `$state.0.7.`, and run it again. When the disk is short
+   of space, move other files that you do not need off that disk, and run it
+   again. Do not delete the 0.8 state or the copy to make space. To stay on
+   0.8 instead, stop here.
 
 2. Run the install command for the 0.7 release that you had. Replace
    `<0.7.x>` with the version that `min --version` printed before the upgrade:
@@ -205,8 +208,10 @@ boxes that you made on 0.8 are lost when you go back.
    copy beside it into its place. When more than one copy is there, the
    installer says how many others there are.
 
-3. Run the commands that the installer printed, then run the install command
-   from step 2 again.
+3. Run the stop commands that the installer printed. Then run its last line,
+   the one that renames the 0.8 state aside and renames the copy into its
+   place. Do not run the shorter `mv` line before it, because that line only
+   moves the 0.8 state aside. Then run the install command from step 2 again.
 
 ## Uninstall
 
