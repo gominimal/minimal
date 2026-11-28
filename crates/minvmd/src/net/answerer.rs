@@ -2845,7 +2845,7 @@ fn refuse_command(command: HandoverCommand, why: &str) {
 /// than at its own timeout.
 fn wait_refusing(
     pings: &std::sync::mpsc::Receiver<()>,
-    commands: &std::sync::mpsc::Receiver<HandoverCommand>,
+    commands: &Commands,
     bound: Duration,
     why: &str,
 ) {
@@ -2853,6 +2853,97 @@ fn wait_refusing(
     loop {
         while let Ok(command) = commands.try_recv() {
             refuse_command(command, why);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        match pings.recv_timeout(remaining.min(CONNECTION_POLL)) {
+            Ok(()) => return,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                std::thread::sleep(remaining.min(CONNECTION_POLL));
+            }
+        }
+    }
+}
+
+/// The acquisition's end of the command door: the channel, behind the
+/// commands a pass took and put back for the next pass to serve. A command
+/// put back is read again before any command still in the channel, so no
+/// later request for the same box overtakes it.
+struct Commands {
+    channel: std::sync::mpsc::Receiver<HandoverCommand>,
+    put_back: std::cell::RefCell<std::collections::VecDeque<HandoverCommand>>,
+}
+
+impl Commands {
+    fn new(channel: std::sync::mpsc::Receiver<HandoverCommand>) -> Self {
+        Self {
+            channel,
+            put_back: std::cell::RefCell::default(),
+        }
+    }
+
+    /// Puts `taken`, in the order it was read, in front of every command
+    /// not yet read.
+    fn put_back(&self, taken: impl IntoIterator<Item = HandoverCommand>) {
+        let mut put_back = self.put_back.borrow_mut();
+        let taken: Vec<HandoverCommand> = taken.into_iter().collect();
+        for command in taken.into_iter().rev() {
+            put_back.push_front(command);
+        }
+    }
+
+    fn take_put_back(&self) -> Option<HandoverCommand> {
+        self.put_back.borrow_mut().pop_front()
+    }
+
+    fn try_recv(&self) -> Result<HandoverCommand, std::sync::mpsc::TryRecvError> {
+        self.take_put_back()
+            .map_or_else(|| self.channel.try_recv(), Ok)
+    }
+
+    fn recv(&self) -> Result<HandoverCommand, std::sync::mpsc::RecvError> {
+        self.take_put_back().map_or_else(|| self.channel.recv(), Ok)
+    }
+
+    fn recv_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<HandoverCommand, std::sync::mpsc::RecvTimeoutError> {
+        self.take_put_back()
+            .map_or_else(|| self.channel.recv_timeout(timeout), Ok)
+    }
+}
+
+/// [`wait_refusing`] for a hook port held by a process with no answerer
+/// channel, where every box address request checks the port again. Still
+/// held, the request is refused naming the holder that holds it now. Free,
+/// the request is put back and the wait ends, so the next pass takes the
+/// port and answers it before any later request.
+fn wait_refusing_held_port(
+    pings: &std::sync::mpsc::Receiver<()>,
+    commands: &Commands,
+    port: u16,
+    bound: Duration,
+) {
+    let deadline = Instant::now() + bound;
+    loop {
+        while let Ok(command) = commands.try_recv() {
+            if !matches!(command, HandoverCommand::Allocate { .. }) {
+                refuse_command(command, NO_ANSWERER);
+                continue;
+            }
+            if UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).is_err() {
+                let holder = hook_port_holder(port);
+                refuse_command(command, &channelless_holder_error(port, holder));
+                continue;
+            }
+            // The probe's socket is dropped here, so the next pass binds the
+            // port and serves the command first.
+            commands.put_back([command]);
+            return;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -2938,10 +3029,84 @@ fn hook_port_holder(port: u16) -> Option<(u32, String)> {
     }
 }
 
+/// The host directory of the native daemon `pid`: the
+/// `providers/local-minimald<N>` directory whose `minimald.lock` it holds
+/// open for its whole life. Read from its open files on Linux; `None` where
+/// they cannot be read or none is such a lock.
+fn native_host_dir(pid: u32) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .ok()?
+            .flatten()
+            .filter_map(|fd| std::fs::read_link(fd.path()).ok())
+            .find_map(|file| {
+                let dir = file.parent()?;
+                (file.file_name()? == paths::MINIMALD_LOCK_FILE
+                    && native_instance_of(dir).is_some())
+                .then(|| dir.to_path_buf())
+            })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// The instance of the native host directory `dir`,
+/// `<state>/providers/local-minimald<N>`, or `None` for any other path.
+fn native_instance_of(dir: &Path) -> Option<u32> {
+    if dir.parent()?.file_name()? != "providers" {
+        return None;
+    }
+    let digits = dir.file_name()?.to_str()?.strip_prefix("local-minimald")?;
+    let instance: u32 = digits.parse().ok()?;
+    // `local-minimald01` and `+1` are no instance `min` lists.
+    (instance.to_string() == digits).then_some(instance)
+}
+
+/// The `min` command that stops the native daemon whose host directory is
+/// `dir`, when `dir` names one: `min host stop local<N>`, with
+/// `--minimal-dir <state>` unless `<state>` is `default_state`, the state
+/// directory `min` resolves without the flag. `None` when `dir` is no host
+/// directory, or its state directory does not print as one shell word.
+fn native_stop_command(dir: &Path, default_state: Option<&Path>) -> Option<String> {
+    let instance = native_instance_of(dir)?;
+    let state = dir.parent()?.parent()?;
+    let same = |default: &Path| {
+        default == state || std::fs::canonicalize(default).is_ok_and(|default| default == state)
+    };
+    if default_state.is_some_and(same) {
+        return Some(format!("min host stop local{instance}"));
+    }
+    let state = state.to_str()?;
+    let plain = |byte: u8| byte.is_ascii_alphanumeric() || b"/._-+,:@%".contains(&byte);
+    state
+        .bytes()
+        .all(plain)
+        .then(|| format!("min --minimal-dir {state} host stop local{instance}"))
+}
+
 /// The error a node with no answerer channel and the hook port held
 /// surfaces, and every box registration fails with: the port, the holder
 /// when known, and the remedy for its kind.
 fn channelless_holder_error(port: u16, holder: Option<(u32, String)>) -> String {
+    let stop = holder.as_ref().and_then(|(pid, _)| {
+        let default_state = paths::try_minimal_state_dir();
+        native_stop_command(
+            &native_host_dir(*pid)?,
+            default_state
+                .as_ref()
+                .map(|dir| dir.as_utf8_path().as_std_path()),
+        )
+    });
+    holder_error(port, holder, stop.as_deref())
+}
+
+/// [`channelless_holder_error`] with the command that stops a native
+/// holder, `stop`, when it is known.
+fn holder_error(port: u16, holder: Option<(u32, String)>, stop: Option<&str>) -> String {
     let native = holder.as_ref().is_some_and(|(_, exe)| {
         Path::new(exe)
             .file_name()
@@ -2951,18 +3116,24 @@ fn channelless_holder_error(port: u16, holder: Option<(u32, String)>) -> String 
         || "a process this daemon cannot identify".to_string(),
         |(pid, exe)| format!("pid {pid} ({exe})"),
     );
-    if native {
-        format!(
-            "port 127.0.0.1:{port}, which box names are answered on, is in use by a Minimal \
-             daemon running directly on this machine ({who}), so no box in the VM can be given \
-             an address; run `min finalize-install` to install Minimal's DNS service on that \
-             port instead"
-        )
-    } else {
-        format!(
-            "port 127.0.0.1:{port}, which box names are answered on, is in use by {who}, so no \
-             box in the VM can be given an address; free the port, then try again"
-        )
+    let in_use = format!("port 127.0.0.1:{port}, which box names are answered on, is in use by");
+    match (native, stop) {
+        (true, Some(stop)) => format!(
+            "{in_use} a Minimal daemon running directly on this machine ({who}), so no box in \
+             the VM can be given an address; run `{stop}` to stop that daemon and the boxes \
+             running on it, then try again"
+        ),
+        (true, None) => format!(
+            "{in_use} a Minimal daemon running directly on this machine ({who}), so no box in \
+             the VM can be given an address; if `min host list` lists that daemon's host, run \
+             `min host stop <host>` to stop that daemon and the boxes running on it, then try \
+             again. A daemon that another user or another Minimal directory runs is not listed: \
+             stop it from there"
+        ),
+        (false, _) => format!(
+            "{in_use} {who}, so no box in the VM can be given an address; free the port, then \
+             try again"
+        ),
     }
 }
 
@@ -3408,7 +3579,7 @@ enum Wake {
 /// service restart a short absence window.
 fn wait_for_wake(
     pings: &mut std::sync::mpsc::Receiver<()>,
-    commands: &std::sync::mpsc::Receiver<HandoverCommand>,
+    commands: &Commands,
     held: Option<&Registration>,
     bound: Duration,
 ) -> Wake {
@@ -3441,7 +3612,7 @@ fn wait_for_wake(
 /// reconnects — and the caller reconnects next pass.
 fn wait_out_wake(
     pings: &mut std::sync::mpsc::Receiver<()>,
-    commands: &std::sync::mpsc::Receiver<HandoverCommand>,
+    commands: &Commands,
     mut registration: Registration,
     status: &AnswererStatus,
     port: u16,
@@ -3576,7 +3747,7 @@ fn acquire(
     // Subscribed before the first connect, so no change lands unpinged in
     // the window before the answerer is decided.
     let mut pings = registry.subscribe_table_pings();
-    let commands = status.attach_commands();
+    let commands = Commands::new(status.attach_commands());
     status.begin_acquiring();
     let mut held: Option<Registration> = None;
     // The once-only start info line: the first publish that lands says
@@ -3803,6 +3974,12 @@ fn acquire(
                         );
                     }
                     Err((queued, last)) => {
+                        // The holder can leave inside the wait: then the
+                        // next pass takes the port and serves the requests.
+                        if UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
+                            commands.put_back(queued);
+                            continue;
+                        }
                         let why = channelless_holder_error(port, hook_port_holder(port));
                         for command in queued {
                             refuse_command(command, &why);
@@ -3822,7 +3999,7 @@ fn acquire(
                                 paths.interim.display()
                             ),
                         );
-                        wait_refusing(&pings, &commands, PORT_RECHECK, &why);
+                        wait_refusing_held_port(&pings, &commands, port, PORT_RECHECK);
                     }
                 }
             }
@@ -3855,7 +4032,7 @@ fn await_holder_channel(
     channel: &Path,
     node: &str,
     pings: &mut std::sync::mpsc::Receiver<()>,
-    commands: &std::sync::mpsc::Receiver<HandoverCommand>,
+    commands: &Commands,
     bound: Duration,
 ) -> Result<(Published, Vec<HandoverCommand>), (Vec<HandoverCommand>, io::Error)> {
     let deadline = Instant::now() + bound;
@@ -3949,7 +4126,7 @@ fn host_interim(
     paths: &ChannelPaths,
     node: &str,
     status: &AnswererStatus,
-    commands: &std::sync::mpsc::Receiver<HandoverCommand>,
+    commands: &Commands,
     socket: UdpSocket,
 ) -> Option<Published> {
     let mut socket = socket;
@@ -7546,14 +7723,153 @@ mod tests {
             refused.contains("free the port, then try again"),
             "the error gives the remedy: {refused}"
         );
-        // The native remedy, for a minimald holder.
-        let native = channelless_holder_error(port, Some((42, "/usr/bin/minimald".to_string())));
-        assert!(
-            native.contains("run `min finalize-install` to install Minimal's DNS service")
-                && native.contains("pid 42"),
-            "{native}"
+        // A minimald holder whose host directory is known: the command
+        // that stops it.
+        let native = holder_error(
+            port,
+            Some((42, "/usr/bin/minimald".to_string())),
+            Some("min host stop local3"),
+        );
+        assert_eq!(
+            native,
+            format!(
+                "port 127.0.0.1:{port}, which box names are answered on, is in use by a Minimal \
+                 daemon running directly on this machine (pid 42 (/usr/bin/minimald)), so no box \
+                 in the VM can be given an address; run `min host stop local3` to stop that \
+                 daemon and the boxes running on it, then try again"
+            )
+        );
+        // Unknown: how to find the host to stop, and which daemons that
+        // misses, never a host name that could stop another daemon.
+        let unknown = channelless_holder_error(port, Some((0, "/usr/bin/minimald".to_string())));
+        assert_eq!(
+            unknown,
+            format!(
+                "port 127.0.0.1:{port}, which box names are answered on, is in use by a Minimal \
+                 daemon running directly on this machine (pid 0 (/usr/bin/minimald)), so no box \
+                 in the VM can be given an address; if `min host list` lists that daemon's host, \
+                 run `min host stop <host>` to stop that daemon and the boxes running on it, then \
+                 try again. A daemon that another user or another Minimal directory runs is not \
+                 listed: stop it from there"
+            )
         );
         drop(squatter);
+    }
+
+    /// A box registration checks the held port again: once the holder lets
+    /// it go, the next registration is answered at once, not after the
+    /// re-check cadence, and no refusal names the holder that left.
+    #[test]
+    fn registration_after_the_holder_leaves_is_answered() {
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channels");
+        let squatter =
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("a foreign holder binds a port");
+        let port = squatter.local_addr().expect("the holder's port").port();
+        let status = start_daemon(
+            web_registry().0,
+            port,
+            test_paths(&dir, RELEASE_WINDOW),
+            "node-a",
+        );
+        await_status_is(
+            &status,
+            ZoneAnswererStatus::PortHeldNoChannel { port },
+            "the daemon never surfaced the held port",
+        );
+        status
+            .allocate("box")
+            .expect_err("no box is handed an address while the port is held");
+        drop(squatter);
+        let asked = Instant::now();
+        status
+            .allocate("box")
+            .expect("the freed port is taken and the box handed an address");
+        assert!(
+            asked.elapsed() < PORT_RECHECK,
+            "answered on the registration, not the re-check cadence: {:?}",
+            asked.elapsed()
+        );
+    }
+
+    /// Commands put back are read again in the order they were taken, and
+    /// before every command still in the channel: a release taken before
+    /// a later allocation for the same box still runs first.
+    #[test]
+    fn put_back_commands_are_read_before_later_ones() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let commands = Commands::new(receiver);
+        let release = |name: &str| HandoverCommand::ReleaseAddress {
+            name: name.to_string(),
+        };
+        for name in ["first", "second", "later"] {
+            sender.send(release(name)).expect("the channel is open");
+        }
+        let taken = vec![
+            commands.try_recv().expect("first"),
+            commands.try_recv().expect("second"),
+        ];
+        commands.put_back(taken);
+        sender
+            .send(release("sent after"))
+            .expect("the channel is open");
+        let names: Vec<String> = std::iter::from_fn(|| commands.try_recv().ok())
+            .map(|command| match command {
+                HandoverCommand::ReleaseAddress { name } => name,
+                _ => unreachable!("only releases were sent"),
+            })
+            .collect();
+        assert_eq!(names, ["first", "second", "later", "sent after"]);
+    }
+
+    /// The stop command names the instance of the holder's host directory,
+    /// and its state directory unless it is the one `min` resolves on its
+    /// own; any other directory names no command.
+    #[test]
+    fn native_stop_command_names_the_holders_host() {
+        let default = Path::new("/home/u/.local/state/minimal");
+        let stop = |dir: &str| native_stop_command(Path::new(dir), Some(default));
+        assert_eq!(
+            stop("/home/u/.local/state/minimal/providers/local-minimald0").as_deref(),
+            Some("min host stop local0")
+        );
+        assert_eq!(
+            stop("/srv/minimal-ci/providers/local-minimald2").as_deref(),
+            Some("min --minimal-dir /srv/minimal-ci host stop local2")
+        );
+        assert_eq!(
+            native_stop_command(Path::new("/srv/m/providers/local-minimald1"), None).as_deref(),
+            Some("min --minimal-dir /srv/m host stop local1")
+        );
+        assert_eq!(stop("/srv/my state/providers/local-minimald0"), None);
+        assert_eq!(stop("/srv/m/providers/local-minimald01"), None);
+        assert_eq!(stop("/srv/m/providers/local-minvmd0"), None);
+        assert_eq!(stop("/srv/m/other/local-minimald0"), None);
+    }
+
+    /// A native daemon's host directory is the one whose lock it holds
+    /// open: here this test process, holding a lock in a temp state
+    /// directory, so the refusal names that directory's host.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_refusal_names_the_host_whose_lock_the_holder_holds() {
+        let state = tempfile::TempDir::new().expect("a temp state directory");
+        let host = state.path().join("providers").join("local-minimald4");
+        std::fs::create_dir_all(&host).expect("the host directory");
+        let _lock =
+            std::fs::File::create(host.join(paths::MINIMALD_LOCK_FILE)).expect("the daemon's lock");
+        let state = std::fs::canonicalize(state.path()).expect("the state directory's path");
+        let refused = channelless_holder_error(
+            53,
+            Some((std::process::id(), "/usr/bin/minimald".to_string())),
+        );
+        assert!(
+            refused.ends_with(&format!(
+                "run `min --minimal-dir {} host stop local4` to stop that daemon and the boxes \
+                 running on it, then try again",
+                state.display()
+            )),
+            "{refused}"
+        );
     }
 
     /// A release whose service never comes re-binds the interim on its own
