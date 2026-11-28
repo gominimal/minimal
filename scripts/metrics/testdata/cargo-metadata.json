@@ -1242,6 +1242,13 @@
   },
   {
    "dependencies": [],
+   "description": "The pure decision kernel of the host-side network gate. No I/O, no clock, no dependencies.",
+   "id": "path+file:///workbench/minimal/crates/netcore#0.0.1",
+   "manifest_path": "<root>/crates/netcore/Cargo.toml",
+   "name": "netcore"
+  },
+  {
+   "dependencies": [],
    "description": "Shared build-time version identity for min, mip, minimald, and minvmd.",
    "id": "path+file:///workbench/minimal/crates/version#0.8.0",
    "manifest_path": "<root>/crates/version/Cargo.toml",
@@ -2680,6 +2687,12 @@
     },
     {
      "kind": null,
+     "name": "netcore",
+     "path": "<root>/crates/netcore",
+     "source": null
+    },
+    {
+     "kind": null,
      "name": "paths",
      "path": "<root>/crates/paths",
      "source": null
@@ -3318,6 +3331,7 @@
   "path+file:///workbench/minimal/crates/rcache#0.0.1",
   "path+file:///workbench/minimal/crates/check#0.0.1",
   "path+file:///workbench/minimal/crates/mlog#0.0.1",
+  "path+file:///workbench/minimal/crates/netcore#0.0.1",
   "path+file:///workbench/minimal/crates/version#0.8.0",
   "path+file:///workbench/minimal/crates/op#0.0.1",
   "path+file:///workbench/minimal/crates/sandbox#0.0.1",

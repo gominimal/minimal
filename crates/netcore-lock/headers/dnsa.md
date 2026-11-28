@@ -1,0 +1,1 @@
+`dnsa`: which addresses a DNS answer gives for the name that was asked, read from bytes the network chose. Each control below breaks one thing in a copy of the crate; the verifier must reject the copy in the functions named, and the last run's places are shown beside them.

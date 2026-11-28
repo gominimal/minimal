@@ -4371,6 +4371,7 @@ dependencies = [
  "libc",
  "minimald-rpc",
  "mlog",
+ "netcore",
  "opentelemetry",
  "opentelemetry_sdk",
  "paths",
@@ -4583,6 +4584,10 @@ dependencies = [
  "widestring",
  "windows 0.61.3",
 ]
+
+[[package]]
+name = "netcore"
+version = "0.0.1"
 
 [[package]]
 name = "netlink-packet-core"

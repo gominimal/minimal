@@ -90,6 +90,9 @@ pub(crate) mod egress_gate;
 pub use egress_gate::EgressGate;
 pub mod answerer;
 mod forward_revoke;
+pub(crate) mod kernel_config;
+mod kernel_facts;
+mod kernel_names;
 pub(crate) mod proxy_reclaim;
 mod shuttle;
 mod stale_gvproxy;
@@ -798,18 +801,6 @@ impl HostGvproxy {
             .with_subnet(registry.subnet());
         let subnet = registry.subnet();
         let table = registry.table();
-        // The host-side DNS admission table (NET-081 deciding NET-066/067):
-        // one entry per registered box that declared `allow_dns_hosts`,
-        // filled from the DNS replies the gate's ingress leg observes toward
-        // a box and read by the verdict's pin arm for the one drop class a
-        // DNS-declaring row's address rules cannot carry. Built empty here —
-        // pins exist only from replies a box received — for the same plan the
-        // rows were compiled against, and handed to the gate, which keeps it
-        // for the switch runtime's lifetime: the table's entries are keyed by
-        // the rows' switch addresses and retired beside the withdrawal report
-        // that ends each row (NET-133), so the table itself needs no lifetime
-        // of its own beyond the gate's.
-        let pins = dns_pins::DnsPins::new(subnet);
         // The node-plane baseline set: the helper's built-in enumeration of
         // the categories the in-VM daemon's own traffic may reach (NET-130),
         // built from the same address plan the rows were compiled against.
@@ -861,7 +852,7 @@ impl HostGvproxy {
                     // baseline set (in force; announced, the interim node row
                     // still decides it), everything else against the boxes'
                     // rows, and a DNS-declaring row's undeclared destinations
-                    // against `pins`.
+                    // against the kernel's DNS tables the registry holds.
                     // Underscore-bound and never read: it is held for
                     // its lifetime — to the end of this block — so it lives and
                     // dies with the switch runtime, and dropping it stops the
@@ -871,7 +862,6 @@ impl HostGvproxy {
                         shuttle::gate_sock_beside(&sock),
                         sock.clone(),
                         table,
-                        pins,
                         baseline,
                     ) {
                         Ok(gate) => gate,

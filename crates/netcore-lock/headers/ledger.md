@@ -1,0 +1,1 @@
+`ledger`: the record of published forwards: which loopback listener is bound for which box and port. Each control below breaks one thing in a copy of the crate; the verifier must reject the copy in the functions named, and the last run's places are shown beside them.

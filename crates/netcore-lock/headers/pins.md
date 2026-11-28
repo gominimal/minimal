@@ -1,0 +1,1 @@
+`pins`: one box's DNS tables: the questions it asked, the addresses its answers admitted, and the flows opened to them. Each control below breaks one thing in a copy of the crate; the verifier must reject the copy in the functions named, and the last run's places are shown beside them.

@@ -23,6 +23,7 @@ leaf = [
     "async-dialog",
     "client-config",
     "diagnostics",
+    "netcore",
     "ot",
     "paths",
     "remote-proto",

@@ -1,0 +1,1 @@
+`gate`: the per-frame decision in both directions over one state, composed from the modules below it. Each control below breaks one thing in a copy of the crate; the verifier must reject the copy in the functions named, and the last run's places are shown beside them.

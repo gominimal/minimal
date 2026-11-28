@@ -1,0 +1,1 @@
+`flow`: one box's table of inbound conversations, how a record opens, closes and expires, and the replies it admits. Each control below breaks one thing in a copy of the crate; the verifier must reject the copy in the functions named, and the last run's places are shown beside them.

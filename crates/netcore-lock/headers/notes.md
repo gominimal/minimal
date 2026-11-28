@@ -1,0 +1,1 @@
+`notes`: one box's refusal notes, the connects it may answer with a reset. Each control below breaks one thing in a copy of the crate; the verifier must reject the copy in the functions named, and the last run's places are shown beside them.

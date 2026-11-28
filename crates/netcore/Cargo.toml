@@ -1,0 +1,19 @@
+[package]
+name = "netcore"
+description = "The pure decision kernel of the host-side network gate. No I/O, no clock, no dependencies."
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# No dependencies, by rule: a verifier ingests everything the kernel's types touch.
+[dependencies]
+
+[features]
+# The Kani harnesses that take minutes each. Off, the Kani lane runs the
+# quick ones; the lab runs all of them with this on.
+kani-full = []
+
+[lints]
+workspace = true
