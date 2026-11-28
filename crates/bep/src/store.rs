@@ -337,10 +337,17 @@ pub enum StoreError {
     },
     /// The Secret Service keyring is locked.
     #[error(
-        "`min secret` keeps secrets in Secret Service on Linux, and its keyring is locked: {detail}."
+        "`min secret` keeps secrets in Secret Service on Linux, and its keyring is locked: {detail}. Unlock the login keyring, then run the command again."
     )]
     KeyringLocked {
         /// What is locked.
+        detail: String,
+    },
+    /// Secret Service gave no answer to a call that changes nothing. It
+    /// refused nothing, and nothing says what it holds.
+    #[error("`min secret` keeps secrets in Secret Service on Linux. {detail}.")]
+    Unanswered {
+        /// How long the call waited.
         detail: String,
     },
     /// A request to change an item did not end with an answer that settles
@@ -1631,6 +1638,10 @@ mod host {
             Cause::Locked(detail) => StoreError::KeyringLocked { detail },
             Cause::Unreachable(detail) => StoreError::NoSessionBus { detail },
             Cause::NoProvider(detail) => StoreError::NoSecretService { detail },
+            // No answer is not a refusal.
+            Cause::NoAnswer(_) => StoreError::Unanswered {
+                detail: cause.to_string(),
+            },
             cause => refused(action, cause.to_string()),
         }
     }
@@ -2721,7 +2732,7 @@ access: 1 entries
         let err = store.set(SERVICE, "claude", b"new").expect_err("locked");
         assert_eq!(
             err.to_string(),
-            "`min secret` keeps secrets in Secret Service on Linux, and its keyring is locked: the default collection is locked."
+            "`min secret` keeps secrets in Secret Service on Linux, and its keyring is locked: the default collection is locked. Unlock the login keyring, then run the command again."
         );
         assert!(matches!(
             store.read("claude"),
@@ -2742,11 +2753,11 @@ access: 1 entries
         let err = store.check_available().expect_err("timed out");
         assert_eq!(
             err.to_string(),
-            "the Secret Service store refused to answer a lookup: Secret Service did not answer in 10 s"
+            "`min secret` keeps secrets in Secret Service on Linux. Secret Service did not answer in 10 s."
         );
         assert!(matches!(
             store.read("claude"),
-            Err(ReadError::Store(StoreError::Refused { .. }))
+            Err(ReadError::Store(StoreError::Unanswered { .. }))
         ));
 
         // A change with no answer may still be made, and the error says so.

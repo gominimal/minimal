@@ -934,7 +934,7 @@ Setting secrets
 
 - **BEP-092** IF a box spec declares a store reference to the host's native store and this host cannot use that store THEN THE SYSTEM SHALL refuse the creation with exit 3 before it seals a value, and report the store's reason and next step.
   tier:     T0
-  verify:   cargo nextest run -p minimal store_reference_refused_when_the_host_store_does_not_answer
+  verify:   cargo nextest run -p minimal store_reference_refused_when_the_host_has_no_session_bus
   <!-- unwanted; without it the box starts and every credentialed request fails; the check runs after the deny-set and egress checks (BEP-034, BEP-036) and before the rule check (BEP-035), because a rule cannot make an unusable store readable -->
   - IF a box spec declares a store reference to an item that the host's native store does not hold THEN THE SYSTEM SHALL refuse the creation with exit 3 before it seals a value, and name the `min secret set` command that stores the item.
     tier:   T0

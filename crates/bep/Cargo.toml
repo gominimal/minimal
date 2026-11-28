@@ -12,7 +12,14 @@ default = ["secret-service"]
 # The Secret Service client on Linux (`secret_items`), with the proxy's key
 # store and the native secret store over it. `min` and the `bep` binary use
 # it. A crate that takes only the modules and the forwarding types, as the
-# guest's `minimald` does, turns it off and links no D-Bus client.
+# guest's `minimald` does, turns it off.
+#
+# That keeps the D-Bus client out of a daemon that is built on its own, as
+# `scripts/dist-build.sh` and the initramfs build do it, one package for
+# each cargo call. Cargo unifies features across the packages of one build,
+# so a `minimald` built in the same call as `min` or `bep` (`just min`, a
+# workspace build or test) links the client. `just secret-service-links`
+# checks the single-package case.
 secret-service = ["dep:secret-service", "dep:zbus", "dep:zruntime"]
 
 [[bin]]

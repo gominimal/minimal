@@ -229,9 +229,16 @@ minimald-build:
 # feature. `min` and the `bep` binary need it. A daemon that depends on `bep`
 # with the feature on carries the client into the guest. Cargo resolves the
 # Linux graph on any host, so this runs on macOS too.
-# CI: none. `just ci` runs it.
 #
-# Prove that `min` and `bep` link the Secret Service client and the daemons do not.
+# This reads each package's own dependency tree (`cargo tree -p <package>`).
+# That is the graph of a build of that one package, which is how the shipped
+# daemons are built: `scripts/dist-build.sh` and the initramfs build run one
+# `cargo build -p` for each package. It proves nothing about a build of
+# several packages in one cargo call. Cargo unifies features there, so a
+# `minimald` from `just min` or from a workspace build links the client.
+# CI: no workflow runs it. `just ci` runs it, on Linux and on macOS.
+#
+# Prove that `min` and `bep` link the Secret Service client and a daemon built on its own does not.
 secret-service-links:
     #!/usr/bin/env bash
     set -euo pipefail

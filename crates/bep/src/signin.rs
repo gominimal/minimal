@@ -776,6 +776,10 @@ fn decode_secret(secret: &str) -> Result<Material, SignInError> {
 /// Decode the secret a keychain tool printed, then zeroize the captured
 /// output. The returned [`Material`] is the one copy that remains, and it
 /// zeroizes itself on drop.
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", feature = "secret-service")
+))]
 fn decode_captured(stdout: &mut Vec<u8>) -> Result<Material, SignInError> {
     // `from_utf8` borrows the buffer, so the decode makes no copy of it.
     let decoded = std::str::from_utf8(stdout)
@@ -1014,12 +1018,18 @@ mod host {
     /// The label of the item under [`META_SERVICE`].
     const META_LABEL: &str = "Minimal GitHub sign-in details";
 
+    /// How long a read of the sign-in waits for Secret Service. The proxy
+    /// reads it for a request of a box, so the read has the time that a
+    /// read of a stored secret has. A write waits for
+    /// [`TIMEOUT`](crate::secret_items::TIMEOUT).
+    const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
     pub(super) fn metadata() -> Result<Option<String>, SignInError> {
-        metadata_in(&SessionItems::new())
+        metadata_in(&SessionItems::within(READ_TIMEOUT))
     }
 
     pub(super) fn material() -> Result<Option<Material>, SignInError> {
-        material_in(&SessionItems::new())
+        material_in(&SessionItems::within(READ_TIMEOUT))
     }
 
     pub(super) fn write(metadata: &str, secret: &str) -> Result<(), SignInError> {
@@ -1064,7 +1074,10 @@ mod host {
         let store = |label, service, secret: &str| {
             items
                 .store(label, &[("service", service)], secret.as_bytes())
-                .map_err(|cause| refused("write the sign-in", &cause))
+                .map_err(|cause| SignInError::Keychain {
+                    action: "write the sign-in",
+                    detail: cause.with_next_step(),
+                })
         };
         store(LABEL, SERVICE, secret)?;
         store(META_LABEL, META_SERVICE, metadata)
@@ -1165,7 +1178,7 @@ mod tests {
         let err = host::write_in(&items, "meta", "secret").unwrap_err();
         assert_eq!(
             err.to_string(),
-            "the host keychain refused to write the sign-in: the default collection is locked"
+            "the host keychain refused to write the sign-in: the default collection is locked. Unlock the login keyring, then run the command again"
         );
         items.set_locked(false);
 

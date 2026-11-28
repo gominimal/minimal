@@ -249,9 +249,18 @@ fn host_delete() -> anyhow::Result<()> {
 
 #[cfg(target_os = "linux")]
 fn host_delete_in(items: &impl bep::secret_items::Items) -> anyhow::Result<()> {
+    use bep::secret_items::Cause;
     for service in [signin::META_SERVICE, signin::SERVICE] {
-        if let Err(cause) = items.clear(&[("service", service)]) {
-            bail!("the host keychain refused to delete the GitHub sign-in: {cause}");
+        match items.clear(&[("service", service)]) {
+            Ok(_) => {}
+            // The delete was sent, and nothing says whether it was made.
+            Err(cause @ (Cause::NoAnswer(_) | Cause::Unsettled(_))) => bail!(
+                "min auth logout cannot tell whether the host keychain deleted the GitHub sign-in: {cause}. Run `min auth logout` again."
+            ),
+            Err(cause) => bail!(
+                "the host keychain refused to delete the GitHub sign-in: {}",
+                cause.with_next_step()
+            ),
         }
     }
     Ok(())
@@ -1656,7 +1665,16 @@ mod tests {
         items.set_locked(true);
         assert_eq!(
             host_delete_in(&items).unwrap_err().to_string(),
-            "the host keychain refused to delete the GitHub sign-in: a matching item is locked"
+            "the host keychain refused to delete the GitHub sign-in: a matching item is locked. Unlock the login keyring, then run the command again"
+        );
+        // A delete with no answer can still be made, and the error says so.
+        items.set_locked(false);
+        items.set_failure(Some(bep::secret_items::Cause::NoAnswer(
+            std::time::Duration::from_secs(60),
+        )));
+        assert_eq!(
+            host_delete_in(&items).unwrap_err().to_string(),
+            "min auth logout cannot tell whether the host keychain deleted the GitHub sign-in: Secret Service did not answer in 60 s. Run `min auth logout` again."
         );
     }
 

@@ -1024,21 +1024,22 @@ mod host_key {
     }
 
     /// The kept item's text. Every failure is [`ClientKeyError::Store`]: a
-    /// locked keyring keeps the key, so nothing replaces it.
+    /// locked keyring keeps the key, so nothing replaces it, and the error
+    /// says to unlock it.
     pub(super) fn find_in(
         items: &impl Items,
     ) -> Result<Option<Zeroizing<Vec<u8>>>, ClientKeyError> {
         items
             .lookup(&ATTRIBUTES)
             .map(|held| held.filter(|text| !text.is_empty()))
-            .map_err(|cause| ClientKeyError::Store(cause.to_string()))
+            .map_err(|cause| ClientKeyError::Store(cause.with_next_step()))
     }
 
     pub(super) fn store_in(items: &impl Items, secret: &str) -> Result<(), ClientKeyError> {
         // Secret Service replaces the item whose attributes all match.
         items
             .store(CLIENT_KEY_LABEL, &ATTRIBUTES, secret.as_bytes())
-            .map_err(|cause| ClientKeyError::Store(cause.to_string()))
+            .map_err(|cause| ClientKeyError::Store(cause.with_next_step()))
     }
 }
 
@@ -2529,17 +2530,24 @@ pub(crate) mod tests {
         let line = Zeroizing::new(format!("{secret}\n").into_bytes());
         assert_eq!(HostClientKeyStore::decode(&line).unwrap().kid(), key.kid());
 
+        // A locked keyring refuses with the step that ends it, in the
+        // message that box creation prints.
         items.set_locked(true);
+        let Err(ClientKeyError::Store(detail)) = host_key::find_in(&items) else {
+            panic!("a locked keyring gave the key")
+        };
         assert_eq!(
-            host_key::find_in(&items),
-            Err(ClientKeyError::Store(
-                "Secret Service lists the item, and it is locked".into()
-            ))
+            MintError::KeyStore(detail).to_string(),
+            "Cannot start the box: the host keychain did not give this client's signing key: \
+             Secret Service lists the item, and it is locked. Unlock the login keyring, then \
+             run the command again."
         );
         assert_eq!(
             host_key::store_in(&items, &secret),
             Err(ClientKeyError::Store(
-                "the default collection is locked".into()
+                "the default collection is locked. Unlock the login keyring, then run the \
+                 command again"
+                    .into()
             ))
         );
         items.set_locked(false);

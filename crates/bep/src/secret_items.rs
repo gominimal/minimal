@@ -54,6 +54,21 @@ pub enum Cause {
     Other(String),
 }
 
+/// What a person does about a locked keyring. No call unlocks one.
+pub const UNLOCK_STEP: &str = "Unlock the login keyring, then run the command again";
+
+impl Cause {
+    /// The cause in words, and for a locked keyring the step that ends it.
+    /// The text has no full stop at its end.
+    #[must_use]
+    pub fn with_next_step(&self) -> String {
+        match self {
+            Self::Locked(detail) => format!("{detail}. {UNLOCK_STEP}"),
+            cause => cause.to_string(),
+        }
+    }
+}
+
 impl std::fmt::Display for Cause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -85,8 +100,9 @@ pub trait Items {
     /// [`Cause::Locked`] when every matching item is locked.
     fn lookup(&self, attributes: &[(&str, &str)]) -> Result<Option<Zeroizing<Vec<u8>>>, Cause>;
 
-    /// Stores `secret` under `attributes` in the default collection, in
-    /// place of the item that carries exactly these attributes.
+    /// Stores `secret` under `attributes` in the default collection. An
+    /// item there that carries every one of these attributes is replaced,
+    /// whatever others it carries, and the new item carries these alone.
     ///
     /// # Errors
     ///
@@ -352,24 +368,53 @@ async fn open(
     builder: zbus::connection::Builder<'_>,
     timeout: Duration,
 ) -> Result<zbus::Connection, Cause> {
-    let sorted = |err: zbus::Error| match sort_bus(&err) {
-        Some(Cause::Unreachable(_)) => {
-            Cause::Unreachable(format!("no session bus answered: {err}"))
-        }
-        Some(cause) => cause,
-        // A bus that is there and refuses the connection is not a
-        // session with no bus.
-        None => Cause::Other(format!("the session bus refused the connection: {err}")),
-    };
     builder
         .method_timeout(timeout)
         .build()
         .await
-        .map_err(sorted)
+        .map_err(|err| sort_connect(&err))
+}
+
+/// Sorts the error of a connection that was not made. Only here is a
+/// failure [`Cause::Unreachable`]: a socket that is not there, or that
+/// nothing listens on, is a session with no bus.
+fn sort_connect(err: &zbus::Error) -> Cause {
+    use std::io::ErrorKind;
+    match err {
+        zbus::Error::InputOutput(io) | zbus::Error::Connection(io, _)
+            if matches!(
+                io.kind(),
+                ErrorKind::NotFound | ErrorKind::ConnectionRefused | ErrorKind::PermissionDenied
+            ) =>
+        {
+            Cause::Unreachable(format!("no session bus answered: {err}"))
+        }
+        zbus::Error::FDO(fdo) if matches!(**fdo, zbus::fdo::Error::NoServer(_)) => {
+            Cause::Unreachable(format!("no session bus answered: {err}"))
+        }
+        zbus::Error::MethodError(name, _, _) if name.as_str() == NO_SERVER => {
+            Cause::Unreachable(format!("no session bus answered: {err}"))
+        }
+        // An address that does not parse names no bus to look for, so it
+        // does not say that the session has none.
+        zbus::Error::Address(_) => {
+            Cause::Other(format!("the session bus address is not usable: {err}"))
+        }
+        // A bus that is there and refuses the connection is not a
+        // session with no bus.
+        err => match sort_bus(err) {
+            Some(cause) => cause,
+            None => Cause::Other(format!("the session bus refused the connection: {err}")),
+        },
+    }
 }
 
 /// Sorts an error of the client by cause, from its variant and the D-Bus
 /// error name. No message text is read, so the locale changes nothing.
+///
+/// Every call that this sorts ran on a connection that was made, so no
+/// error here says that the session has no bus. A bus that dropped the
+/// call, or that says it is disconnected, is a failing store.
 fn sort(err: Error) -> Cause {
     let sorted = match &err {
         Error::Locked => Some(Cause::Locked("Secret Service says it is locked".into())),
@@ -445,17 +490,12 @@ fn answer_lost(err: &Error) -> bool {
     }
 }
 
-/// The D-Bus error names that say the bus has no Secret Service.
-const NO_PROVIDER: [&str; 2] = [
-    "org.freedesktop.DBus.Error.ServiceUnknown",
-    "org.freedesktop.DBus.Error.NameHasNoOwner",
-];
+/// The D-Bus error name that says the bus has no Secret Service and can
+/// start none.
+const NO_PROVIDER: &str = "org.freedesktop.DBus.Error.ServiceUnknown";
 
-/// The D-Bus error names that say no bus answers.
-const UNREACHABLE: [&str; 2] = [
-    "org.freedesktop.DBus.Error.NoServer",
-    "org.freedesktop.DBus.Error.Disconnected",
-];
+/// The D-Bus error name that says no bus answers at the address.
+const NO_SERVER: &str = "org.freedesktop.DBus.Error.NoServer";
 
 /// The D-Bus error name that says the object is locked.
 const IS_LOCKED: &str = "org.freedesktop.Secret.Error.IsLocked";
@@ -463,28 +503,20 @@ const IS_LOCKED: &str = "org.freedesktop.Secret.Error.IsLocked";
 fn sort_bus(err: &zbus::Error) -> Option<Cause> {
     use std::io::ErrorKind;
     match err {
-        zbus::Error::MethodError(name, _, _) if NO_PROVIDER.contains(&name.as_str()) => {
+        zbus::Error::MethodError(name, _, _) if name.as_str() == NO_PROVIDER => {
             Some(Cause::NoProvider(err.to_string()))
-        }
-        zbus::Error::MethodError(name, _, _) if UNREACHABLE.contains(&name.as_str()) => {
-            Some(Cause::Unreachable(err.to_string()))
         }
         zbus::Error::MethodError(name, _, _) if name.as_str() == IS_LOCKED => {
             Some(Cause::Locked(err.to_string()))
         }
         zbus::Error::FDO(fdo) => sort_fdo(fdo),
-        zbus::Error::Address(_) => Some(Cause::Unreachable(err.to_string())),
-        // `Connection` is a socket that did not connect, as in a session
-        // with no bus.
-        zbus::Error::InputOutput(io) | zbus::Error::Connection(io, _) => match io.kind() {
-            ErrorKind::NotFound | ErrorKind::ConnectionRefused | ErrorKind::PermissionDenied => {
-                Some(Cause::Unreachable(err.to_string()))
-            }
-            // The time of one method ran out. `SessionItems::run` gives
-            // the time that the call had.
-            ErrorKind::TimedOut => Some(Cause::NoAnswer(Duration::ZERO)),
-            _ => None,
-        },
+        // The time of one method ran out. `SessionItems::run` gives the
+        // time that the call had.
+        zbus::Error::InputOutput(io) | zbus::Error::Connection(io, _)
+            if io.kind() == ErrorKind::TimedOut =>
+        {
+            Some(Cause::NoAnswer(Duration::ZERO))
+        }
         _ => None,
     }
 }
@@ -492,18 +524,25 @@ fn sort_bus(err: &zbus::Error) -> Option<Cause> {
 fn sort_fdo(err: &zbus::fdo::Error) -> Option<Cause> {
     use zbus::fdo::Error as Fdo;
     match err {
-        Fdo::ServiceUnknown(_) | Fdo::NameHasNoOwner(_) => Some(Cause::NoProvider(err.to_string())),
-        Fdo::NoServer(_) | Fdo::Disconnected(_) => Some(Cause::Unreachable(err.to_string())),
+        Fdo::ServiceUnknown(_) => Some(Cause::NoProvider(err.to_string())),
         Fdo::ZBus(bus) => sort_bus(bus),
         _ => None,
     }
 }
 
 /// One item of [`MemoryItems`].
-#[derive(Debug)]
 struct MemoryItem {
     attributes: BTreeMap<String, String>,
     secret: Zeroizing<Vec<u8>>,
+}
+
+// Prints the attributes and never the secret.
+impl std::fmt::Debug for MemoryItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryItem")
+            .field("attributes", &self.attributes)
+            .finish_non_exhaustive()
+    }
 }
 
 impl MemoryItem {
@@ -523,7 +562,8 @@ struct Memory {
 
 /// Items held in memory, for tests. A clone shares the items. It answers
 /// as Secret Service does: a locked keyring still lists its items and
-/// their attributes, and gives no secret and takes no change.
+/// their attributes, and gives no secret and takes no change. A store
+/// replaces the first item that carries every given attribute.
 #[derive(Debug, Clone, Default)]
 pub struct MemoryItems {
     memory: Arc<Mutex<Memory>>,
@@ -586,11 +626,19 @@ impl Items for MemoryItems {
             return Err(Cause::Locked("the default collection is locked".into()));
         }
         let attributes: BTreeMap<String, String> = owned(attributes).into_iter().collect();
-        memory.items.retain(|item| item.attributes != attributes);
-        memory.items.push(MemoryItem {
+        let held = memory.items.iter().position(|item| {
+            attributes
+                .iter()
+                .all(|(key, value)| item.attributes.get(key) == Some(value))
+        });
+        let item = MemoryItem {
             attributes,
             secret: Zeroizing::new(secret.to_vec()),
-        });
+        };
+        match held {
+            Some(at) => memory.items[at] = item,
+            None => memory.items.push(item),
+        }
         Ok(())
     }
 
@@ -688,6 +736,41 @@ mod tests {
         assert!(matches!(answer, Err(Cause::Unreachable(_))), "{answer:?}");
     }
 
+    // An address that does not parse is a failing store, not a session
+    // with no bus, so a first start stops on it.
+    #[test]
+    fn a_bus_address_that_does_not_parse_is_not_a_session_with_no_bus() {
+        let answer = SessionItems::within(Duration::from_secs(5))
+            .at("not an address")
+            .lookup(ONE);
+        assert!(matches!(answer, Err(Cause::Other(_))), "{answer:?}");
+    }
+
+    // A store replaces an item that carries more attributes than it gives,
+    // as Secret Service does. An item that `secret-tool` wrote carries a
+    // schema attribute, and a write over it leaves one item.
+    #[test]
+    fn a_store_replaces_an_item_that_carries_more_attributes() {
+        let items = MemoryItems::default();
+        let written = [
+            ("service", "dev.minimal.test"),
+            ("id", "one"),
+            ("xdg:schema", "org.freedesktop.Secret.Generic"),
+        ];
+        let two = [("service", "dev.minimal.test"), ("id", "two")];
+        items.store("old", &written, b"old").unwrap();
+        items.store("other", &two, b"other").unwrap();
+        items.store("new", ONE, b"new").unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items.lookup(ONE).unwrap().unwrap().as_slice(), b"new");
+        assert_eq!(items.lookup(&written).unwrap(), None);
+        assert_eq!(items.lookup(&two).unwrap().unwrap().as_slice(), b"other");
+        // The secret is in no debug text.
+        let text = format!("{items:?}");
+        assert!(text.contains("service"), "{text}");
+        assert!(!text.contains("[110, 101, 119]"), "{text}");
+    }
+
     // Of the failures of a list of addresses, a bus that refused is kept
     // ahead of an address with no bus, whichever came first.
     #[test]
@@ -755,19 +838,11 @@ mod tests {
         assert!(matches!(sort(Error::Locked), Cause::Locked(_)));
         // A bus with no Secret Service is not a session with no bus.
         assert!(matches!(sort(Error::Unavailable), Cause::NoProvider(_)));
-        for name in NO_PROVIDER {
-            assert!(matches!(sort(method(name)), Cause::NoProvider(_)), "{name}");
-        }
+        assert!(matches!(sort(method(NO_PROVIDER)), Cause::NoProvider(_)));
         assert!(matches!(
             sort(method("org.freedesktop.Secret.Error.IsLocked")),
             Cause::Locked(_)
         ));
-        for name in UNREACHABLE {
-            assert!(
-                matches!(sort(method(name)), Cause::Unreachable(_)),
-                "{name}"
-            );
-        }
         assert!(matches!(
             sort(Error::ZbusFdo(zbus::fdo::Error::ServiceUnknown("x".into()))),
             Cause::NoProvider(_)
@@ -777,21 +852,50 @@ mod tests {
                 kind,
             ))))
         };
+        // A call ran on a connection that was made, so none of its errors
+        // says that the session has no bus or no Secret Service: a bus that
+        // dropped the call (`BrokenPipe` is what the client gives for it),
+        // that says it is disconnected, or that names no owner is a store
+        // that failed, and a first start stops on it.
+        for other in [
+            method("org.freedesktop.DBus.Error.Failed"),
+            method("org.freedesktop.Secret.Error.NoSuchObject"),
+            method("org.freedesktop.DBus.Error.Disconnected"),
+            method("org.freedesktop.DBus.Error.NameHasNoOwner"),
+            method(NO_SERVER),
+            Error::ZbusFdo(zbus::fdo::Error::Disconnected("x".into())),
+            Error::ZbusFdo(zbus::fdo::Error::NameHasNoOwner("x".into())),
+            Error::Zbus(zbus::Error::Address("x".into())),
+            io(std::io::ErrorKind::BrokenPipe),
+            io(std::io::ErrorKind::NotFound),
+            io(std::io::ErrorKind::ConnectionRefused),
+            io(std::io::ErrorKind::PermissionDenied),
+            Error::NoResult,
+            Error::Prompt,
+        ] {
+            let cause = sort(other);
+            assert!(matches!(cause, Cause::Other(_)), "{cause:?}");
+        }
+
+        // A connection that was not made is a session with no bus when the
+        // socket is not there or takes no connection. An address that does
+        // not parse, and a bus that ended the connection, are not.
+        let bus = |kind| zbus::Error::InputOutput(Arc::new(std::io::Error::from(kind)));
         for kind in [
             std::io::ErrorKind::NotFound,
             std::io::ErrorKind::ConnectionRefused,
             std::io::ErrorKind::PermissionDenied,
         ] {
-            assert!(matches!(sort(io(kind)), Cause::Unreachable(_)), "{kind:?}");
+            let cause = sort_connect(&bus(kind));
+            assert!(matches!(cause, Cause::Unreachable(_)), "{kind:?} {cause:?}");
         }
         for other in [
-            method("org.freedesktop.DBus.Error.Failed"),
-            method("org.freedesktop.Secret.Error.NoSuchObject"),
-            io(std::io::ErrorKind::BrokenPipe),
-            Error::NoResult,
-            Error::Prompt,
+            zbus::Error::Address("x".into()),
+            bus(std::io::ErrorKind::BrokenPipe),
+            bus(std::io::ErrorKind::UnexpectedEof),
         ] {
-            assert!(matches!(sort(other), Cause::Other(_)));
+            let cause = sort_connect(&other);
+            assert!(matches!(cause, Cause::Other(_)), "{cause:?}");
         }
         assert!(matches!(
             sort(io(std::io::ErrorKind::TimedOut)),
