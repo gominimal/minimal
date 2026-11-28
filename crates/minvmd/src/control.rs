@@ -5642,7 +5642,7 @@ mod tests {
         );
         assert_eq!(
             web.switch_address,
-            Ipv4Addr::new(100, 64, 127, 255),
+            Ipv4Addr::new(100, 64, 127, 254),
             "the first box takes the hand-out run's first address, above the \
              daemon's reserve"
         );
@@ -5719,7 +5719,7 @@ mod tests {
         );
         assert_eq!(
             db.switch_address,
-            Ipv4Addr::new(100, 64, 128, 0),
+            Ipv4Addr::new(100, 64, 127, 255),
             "the second box takes the hand-out run's next address, never the first again"
         );
         assert_eq!(

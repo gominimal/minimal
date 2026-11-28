@@ -1000,10 +1000,12 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
     // boot whose load failed reports the guest as unable to decide per box
     // exactly as a native host without the step does.
     if guest::is_microvm_daemon() {
-        // NET-078's two source identities are the guest's own address on a
-        // guest — the cohort and the node plane share it — but the render is
-        // told them as the two inputs they are, never left to assume.
-        let identity = std::net::IpAddr::V4(minimald::net::DEFAULT_SUBNET.daemon_ip());
+        // NET-078's two source identities, distinct on a guest: the boxes
+        // cohort leaves as its own reserved address and the node plane as
+        // the daemon's, so the VM host's gate picks the cohort's rules or
+        // the node's by source address.
+        let cohort = std::net::IpAddr::V4(minimald::net::DEFAULT_SUBNET.host_ip_cohort_address());
+        let node_plane = std::net::IpAddr::V4(minimald::net::DEFAULT_SUBNET.daemon_ip());
         let render = minimald::net::classifier::GuestRender {
             tree_root,
             // The listener the deny subtree's DNS-port lookups are dstnat'd
@@ -1012,8 +1014,8 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
             // questions to the switch gateway alone.
             answerer_address: minimald::net::guest_dns::LISTENER_ADDRESS,
             answerer_port: minimald::net::guest_dns::LISTENER_PORT,
-            cohort_address: identity,
-            node_plane_address: identity,
+            cohort_address: cohort,
+            node_plane_address: node_plane,
             ct_mark_mask: minimald::net::classifier::GUEST_CT_MARK_MASK,
             // BEP-083: the proxy's listener, whose address the table refuses
             // to every box whose own leaf is not in the lane set.

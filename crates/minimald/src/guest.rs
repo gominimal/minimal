@@ -1419,6 +1419,23 @@ pub async fn bring_up_root_egress() -> std::io::Result<crate::net::switch::Switc
     // Configure the interface directly via ioctls — the generic guest rootfs
     // ships no `ip`/iproute2 binary, so shelling out is not an option.
     configure_interface_v4(TAP, ip, DEFAULT_SUBNET.prefix(), Some(gateway))?;
+    // NET-078: the `host_ip` cohort's address, beside the daemon's own. The
+    // guest's classifier SNATs a host-address box's connections to it, so
+    // the VM host's gate tells them from the daemon's by source address.
+    // The SNAT replies come back to this address, so eth0 must carry it.
+    // Without it the daemon's own egress still works, and host-address
+    // boxes get no replies.
+    let cohort = DEFAULT_SUBNET.host_ip_cohort_address();
+    if let Err(error) =
+        configure_interface_v4(&format!("{TAP}:1"), cohort, DEFAULT_SUBNET.prefix(), None)
+    {
+        tracing::error!(
+            %error,
+            %cohort,
+            "the guest's eth0 does not carry the host_ip cohort address; \
+             host-address boxes get no replies to their connections"
+        );
+    }
     // Bring loopback up too (no address/route needed).
     bring_up_loopback()?;
 
@@ -1433,7 +1450,8 @@ pub async fn bring_up_root_egress() -> std::io::Result<crate::net::switch::Switc
     // Relay the tap to the host gvproxy over the vsock shuttle (CID 2). The
     // daemon relay carries no gate, so it emits no deprecation notice; its
     // lease is the daemon's own address (NET-084: a frame out of this tap
-    // whose source is anything else is rejected at the relay), and the
+    // whose source is anything else, other than the host_ip cohort's
+    // address, is rejected at the relay), and the
     // subnet passed is the one the guest is configured on above. It carries
     // the node's DNS layer: every host-address box shares this namespace, so
     // its lookups to the gateway leave through here and reach upstream only

@@ -6560,19 +6560,27 @@ fn gate_verdict(
     // The arm sits after the reply record, so the answers to connections the
     // node's published ports received still pass, and after the
     // control-surface check, so the switch's own ports stay refused.
-    // The node address is not the node plane's alone: a host-address box,
-    // the default network mode, leaves from it too. What tells them apart
-    // is the sender's cgroup, which the guest's classifier writes into the
-    // frame as `BOX_COHORT_DSCP` for a connection a box opened and clears
-    // on every other packet. An unmarked frame is the daemon's own, and the
-    // baseline set decides it, so a guest whose classifier never loaded
-    // fails closed to the baseline.
+    // A host-address box leaves as the cohort address (decided above), so
+    // a frame at the node address is the daemon's own. The guest's
+    // classifier still writes `BOX_COHORT_DSCP` on a box's connection. A
+    // marked frame at the node address is decided by the cohort's rules,
+    // which hold the cohort address, so it drops. An unmarked frame is the
+    // daemon's own, and the baseline set decides it, so a guest whose
+    // classifier never loaded fails closed to the baseline.
     // The mark is no proof of a box: root in the guest can write it on any
     // frame (NET-085). So a marked frame is decided by the union of the
     // resident `host_ip` boxes' rules, which the host-side client
     // registered, and dropped when no `host_ip` box is resident (design
     // §4.3 rule 2). The node row never decides it. A process that writes
     // the mark reaches only what a resident box's own rules admit.
+    // NET-078, NET-138: the guest's classifier SNATs a host-address box's
+    // connections to the subnet's cohort address, and the daemon's own to
+    // the node address. A frame from the cohort address is decided by the
+    // cohort's rules, in every phase, and never by the node row or the
+    // baseline set. Only the guest's root namespace can send from it.
+    if src == table.subnet().host_ip_cohort_address().octets() {
+        return host_ip_verdict(summary, l4, table, baseline, pins, src);
+    }
     if baseline.phase() == NodeBaselinePhase::InForce && src == baseline.node_addr() {
         if summary.box_cohort_marked() {
             return host_ip_verdict(summary, l4, table, baseline, pins, src);
@@ -6612,7 +6620,9 @@ fn log_marked_decision(
     let src = summary.source();
     let phase = baseline.phase();
     let node = baseline.node_addr();
-    let arm = if phase != NodeBaselinePhase::InForce {
+    let arm = if src == Some(table.subnet().host_ip_cohort_address().octets()) {
+        "host-ip-boxes: the source is the host_ip cohort address"
+    } else if phase != NodeBaselinePhase::InForce {
         "source-row: the node baseline is not in force"
     } else if src != Some(node) {
         "source-row: the source is not the node address"
@@ -7158,13 +7168,18 @@ impl<'a> Who<'a> {
     }
 
     /// The row `addr` holds now, or none: for a frame with no address, for
-    /// an address no row holds, and for the node address, which the
-    /// `host_ip` cohort shares with the VM's own namespace, so no one box
-    /// is the frame's and the node row's name would be the wrong one.
+    /// an address no row holds, and for the node address, which an older
+    /// guest's `host_ip` cohort shares with the VM's own namespace, so no
+    /// one box is the frame's and the node row's name would be the wrong
+    /// one. The cohort's own address names the cohort's record, while one
+    /// resident `host_ip` box declares a name.
     fn resolve(self) -> Named {
         let Some(addr) = self.addr else {
             return Named(None);
         };
+        if addr == self.table.subnet().host_ip_cohort_address().octets() {
+            return Named(self.table.host_ip_cohort());
+        }
         if addr == self.table.subnet().daemon_ip().octets() {
             return Named(None);
         }
@@ -16781,8 +16796,19 @@ mod tests {
         ));
         assert_eq!(
             marked(host_ip_reach, 443),
+            Err(unbounded(host_ip_reach, 1)),
+            "a marked node-address frame stays refused: the box's rules hold \
+             the cohort address (NET-078)"
+        );
+        let from_cohort = |dst: [u8; 4]| {
+            let cohort = SUBNET.host_ip_cohort_address().octets();
+            let frame = boxes::core::egress::summarize(&ipv4_frame(cohort, 6, dst, 443));
+            gate_verdict(&frame, None, &table, &baseline, &pins, &ReplyTables::new())
+        };
+        assert_eq!(
+            from_cohort(host_ip_reach),
             Ok(GateAdmit::HostIpBox),
-            "a marked frame a resident host_ip box admits passes"
+            "a cohort-address frame a resident host_ip box admits passes"
         );
         for dst in [outside, baseline_endpoint] {
             assert_eq!(
@@ -16798,6 +16824,10 @@ mod tests {
             marked(host_ip_reach, 443),
             Err(unbounded(host_ip_reach, 0)),
             "a retired host_ip box's rules admit nothing"
+        );
+        assert!(
+            from_cohort(host_ip_reach).is_err(),
+            "a retired host_ip box's rules admit nothing at the cohort address"
         );
 
         // The universal the table makes cheap, beside the membership loop
@@ -17328,13 +17358,26 @@ mod tests {
         assert!(registry.admit_host_ip_box(session, None));
         assert_eq!(
             decide(&summary),
+            Err(GateDrop::HostIpUnbounded {
+                src: node,
+                dst: outside,
+                dst_port: 443,
+                resident: 1,
+            }),
+            "a marked frame at the node address stays refused: the box's \
+             rules hold the cohort address (NET-078)"
+        );
+        let cohort = SUBNET.host_ip_cohort_address().octets();
+        let from_cohort = box_cohort_frame(ipv4_frame(cohort, 6, outside, 443));
+        assert_eq!(
+            decide(&boxes::core::egress::summarize(&from_cohort)),
             Ok(GateAdmit::HostIpBox),
-            "a marked frame at the node address is the resident host_ip boxes' to decide"
+            "a frame at the cohort address is the resident host_ip boxes' to decide"
         );
         // The box's verdict still keeps the floors every row keeps: the
         // link-local metadata service and the switch's own ports stay
         // refused.
-        let metadata = box_cohort_frame(ipv4_frame(node, 6, [169, 254, 169, 254], 80));
+        let metadata = box_cohort_frame(ipv4_frame(cohort, 6, [169, 254, 169, 254], 80));
         assert!(matches!(
             gate_verdict(
                 &boxes::core::egress::summarize(&metadata),
@@ -17346,7 +17389,7 @@ mod tests {
             ),
             Err(GateDrop::Infrastructure { .. })
         ));
-        let control = box_cohort_frame(ipv4_frame(node, 6, SUBNET.dns_server().octets(), 80));
+        let control = box_cohort_frame(ipv4_frame(cohort, 6, SUBNET.dns_server().octets(), 80));
         assert!(matches!(
             gate_verdict(
                 &boxes::core::egress::summarize(&control),
@@ -17395,6 +17438,79 @@ mod tests {
                 "the daemon's own frame is the baseline's to decide"
             );
         }
+    }
+
+    /// NET-078, NET-138: on a microVM guest the `host_ip` cohort leaves as
+    /// `100.64.255.251` and the daemon as `100.64.255.253`. The gate picks
+    /// the rules by the source address alone: a cohort-address frame is the
+    /// resident `host_ip` boxes' to decide, with or without the box mark,
+    /// and never the node baseline's. A node-address frame is the baseline's.
+    /// A drop line names the cohort's record for the cohort address, and no
+    /// box for the node address.
+    #[test]
+    fn gate_decides_cohort_and_node_rows_by_source_address() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        assert_eq!(baseline.phase(), NodeBaselinePhase::InForce);
+        let pins = dns_pins::DnsPins::new(SUBNET);
+        let cohort = SUBNET.host_ip_cohort_address().octets();
+        let node = SUBNET.daemon_ip().octets();
+        assert_eq!(cohort, [100, 64, 255, 251]);
+        assert_eq!(node, [100, 64, 255, 253]);
+        let outside = [8, 8, 8, 8];
+        let decide = |frame: &[u8]| {
+            gate_verdict(
+                &boxes::core::egress::summarize(frame),
+                None,
+                &table,
+                &baseline,
+                &pins,
+                &ReplyTables::new(),
+            )
+        };
+        let from_cohort = ipv4_frame(cohort, 6, outside, 443);
+        let from_node = ipv4_frame(node, 6, outside, 443);
+
+        // No host_ip box resident: the cohort's frame drops under the
+        // cohort's rule, never as an unregistered source or a node frame.
+        let cohort_drop = Err(GateDrop::HostIpUnbounded {
+            src: cohort,
+            dst: outside,
+            dst_port: 443,
+            resident: 0,
+        });
+        assert_eq!(decide(&from_cohort), cohort_drop);
+        assert_eq!(decide(&box_cohort_frame(from_cohort.clone())), cohort_drop);
+        let node_drop = Err(GateDrop::NodePlaneUnpinned {
+            src: node,
+            dst: outside,
+            dst_port: 443,
+        });
+        assert_eq!(decide(&from_node), node_drop);
+
+        // A resident host_ip box opens the cohort's frame. The node's own
+        // frame to the same place stays the baseline's to refuse.
+        assert!(registry.admit_host_ip_box(
+            boxes::SessionId::mint(),
+            Some(&EgressPolicy {
+                allow_protocols: None,
+                allow_subnets: Some(vec!["8.8.8.0/24".to_string()]),
+                allow_dns_hosts: Some(vec!["example.com".to_string()]),
+                deny_subnets: None,
+            }),
+        ));
+        assert_eq!(decide(&from_cohort), Ok(GateAdmit::HostIpBox));
+        assert_eq!(decide(&from_node), node_drop);
+
+        // The cohort's record is keyed to the cohort address, and a drop
+        // line names it there. The node address names no box.
+        let record = table.host_ip_cohort().expect("the box declares a name");
+        assert_eq!(record.switch_addr().octets(), cohort);
+        let named = Who::of(&table, Some(cohort)).resolve();
+        assert_eq!(named.name().as_deref(), Some("host_ip boxes"));
+        assert!(Who::of(&table, Some(node)).resolve().name().is_none());
     }
 
     /// The gate's verdict for one frame `src` sends to the host alias, with
@@ -17568,7 +17684,7 @@ mod tests {
 
     /// The node-plane identity alone reaches the host alias at the ports
     /// the baseline set's own endpoints open there (NET-156). A box row and
-    /// the host-address cohort, marked frames at the node address, never
+    /// the host-address cohort, frames at the cohort address, never
     /// get that set, and each drop names its row. With no endpoint at the
     /// alias the node is closed there too.
     #[test]
@@ -17582,6 +17698,7 @@ mod tests {
         assert!(registry.admit_host_ip_box(boxes::SessionId::mint(), None));
         let table = registry.table();
         let node = SUBNET.daemon_ip().octets();
+        let cohort = SUBNET.host_ip_cohort_address().octets();
         let alias = Ipv4Addr::from(SUBNET.host_alias().octets());
         let built_in = NodePlaneBaseline::built_in(SUBNET);
         assert_eq!(built_in.phase(), NodeBaselinePhase::InForce);
@@ -17614,9 +17731,9 @@ mod tests {
             );
         }
         assert_eq!(
-            alias_verdict(&table, &at_alias, node, true, 6, 443),
+            alias_verdict(&table, &at_alias, cohort, true, 6, 443),
             Err(GateDrop::HostAlias {
-                src: node,
+                src: cohort,
                 dst_port: 443,
                 row: AliasRow::Cohort,
             }),
@@ -17635,9 +17752,9 @@ mod tests {
             crate::net::host_exposures::HostExposure::tcp(8080),
             crate::net::host_exposures::HostExposure::tcp(443),
         ]);
-        for marked in [false, true] {
+        for (src, marked) in [(node, false), (cohort, true)] {
             assert!(
-                alias_verdict(&table, &exposed, node, marked, 6, 8080).is_ok(),
+                alias_verdict(&table, &exposed, src, marked, 6, 8080).is_ok(),
                 "a host exposure is open to the node and to the cohort"
             );
         }
@@ -17647,7 +17764,7 @@ mod tests {
             "the node keeps its baseline port"
         );
         for (src, marked, row) in [
-            (node, true, AliasRow::Cohort),
+            (cohort, true, AliasRow::Cohort),
             (LEASE, false, AliasRow::Box),
         ] {
             assert_eq!(
@@ -17664,9 +17781,9 @@ mod tests {
         // so the table decides it like any other port.
         let udp_exposed =
             exposed.with_host_exposure(vec![crate::net::host_exposures::HostExposure::udp(443)]);
-        for marked in [false, true] {
+        for (src, marked) in [(node, false), (cohort, true)] {
             assert!(
-                alias_verdict(&table, &udp_exposed, node, marked, 17, 443).is_ok(),
+                alias_verdict(&table, &udp_exposed, src, marked, 17, 443).is_ok(),
                 "a UDP exposure at a baseline TCP port is open to the node and the cohort"
             );
         }
