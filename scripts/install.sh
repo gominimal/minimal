@@ -1220,6 +1220,15 @@ say ""
 # state directory aside (archive_box_state, after the pre-swap daemon stop),
 # so that a later return to 0.7 has a state that 0.7 wrote.
 box_state="$(runtime_dir state)"
+# box_state_dir — the directory that holds the state. When $box_state is a
+# symlink, it is the link's target, resolved once here: the copy goes beside
+# the target, and the refusal moves the target, so the link stays and points
+# at whatever state is restored there. Otherwise it is $box_state itself.
+box_state_dir="$box_state"
+if [ -L "$box_state" ]; then
+    _bsd="$(cd -P "$box_state" 2>/dev/null && pwd -P)" || _bsd=
+    [ -z "$_bsd" ] || box_state_dir="$_bsd"
+fi
 
 # ver_mm <version> — "<major> <minor>" for a version that starts X.Y (a
 # leading `v` allowed, anything after the minor ignored); fails otherwise.
@@ -1272,6 +1281,11 @@ state_from_0_8() {
 refuse_over_0_8_state() {
     say "install: refused to install Minimal $VERSION over the box state in $(tilde "$box_state")."
     say "Minimal 0.8 or later wrote that state, and $VERSION cannot read it."
+    # A symlinked state is moved at its target: the link stays, and points
+    # at the state that is restored there.
+    if [ "$box_state_dir" != "$box_state" ]; then
+        say "$(tilde "$box_state") is a link to $(tilde "$box_state_dir"). The steps below move $(tilde "$box_state_dir") and keep the link."
+    fi
     if [ -x "$bindir/min" ]; then
         case ":${PATH:-}:" in
             *":$bindir:"*) _rf_min=min ;;
@@ -1291,31 +1305,46 @@ refuse_over_0_8_state() {
     fi
     # The move target must not exist: `mv` into an existing directory nests
     # the state inside it. A target an earlier refusal left gets a suffix.
-    _b08="$box_state.0.8"
-    [ ! -e "$_b08" ] || _b08="$box_state.0.8.$t0"
-    [ ! -e "$_b08" ] || _b08="$box_state.0.8.$t0.$$"
-    say "      mv $(shq "$box_state") $(shq "$_b08")"
-    # The newest saved copy by modification time, and how many others.
+    _b08="$box_state_dir.0.8"
+    [ ! -e "$_b08" ] || _b08="$box_state_dir.0.8.$t0"
+    [ ! -e "$_b08" ] || _b08="$box_state_dir.0.8.$t0.$$"
+    say "      mv $(shq "$box_state_dir") $(shq "$_b08")"
+    # The newest saved copy by modification time, and how many others. The
+    # copies are beside the target. A copy from an installer before the
+    # target rule is beside the link: it is copied back, not moved, because
+    # the link's directory can be on another file system.
     _rf_new=
     _rf_other=0
-    for _ba in "$box_state".0.7.*; do
-        [ -d "$_ba" ] || continue
-        if [ -z "$_rf_new" ]; then
-            _rf_new="$_ba"
-        else
-            _rf_other=$((_rf_other + 1))
-            [ ! "$_ba" -nt "$_rf_new" ] || _rf_new="$_ba"
+    _rf_at=
+    for _rf_base in "$box_state_dir" "$box_state"; do
+        for _ba in "$_rf_base".0.7.*; do
+            [ -d "$_ba" ] || continue
+            if [ -z "$_rf_new" ]; then
+                _rf_new="$_ba"
+            else
+                _rf_other=$((_rf_other + 1))
+                [ ! "$_ba" -nt "$_rf_new" ] || _rf_new="$_ba"
+            fi
+        done
+        if [ -n "$_rf_new" ]; then
+            _rf_at="$_rf_base"
+            break
         fi
+        [ "$box_state_dir" != "$box_state" ] || break
     done
     if [ -n "$_rf_new" ]; then
         say "An upgrade to 0.8 saved the earlier state in $(tilde "$_rf_new")."
         if [ "$_rf_other" -eq 1 ]; then
-            say "1 older copy is beside it, in $(tilde "$box_state").0.7.*."
+            say "1 older copy is beside it, in $(tilde "$_rf_at").0.7.*."
         elif [ "$_rf_other" -gt 1 ]; then
-            say "$_rf_other older copies are beside it, in $(tilde "$box_state").0.7.*."
+            say "$_rf_other older copies are beside it, in $(tilde "$_rf_at").0.7.*."
         fi
         say "To use it again, run this before the installer:"
-        say "      mv $(shq "$box_state") $(shq "$_b08") && mv $(shq "$_rf_new") $(shq "$box_state")"
+        if [ "$_rf_at" = "$box_state_dir" ]; then
+            say "      mv $(shq "$box_state_dir") $(shq "$_b08") && mv $(shq "$_rf_new") $(shq "$box_state_dir")"
+        else
+            say "      mv $(shq "$box_state_dir") $(shq "$_b08") && cp -Rp $(shq "$_rf_new") $(shq "$box_state_dir")"
+        fi
     fi
     exit 1
 }
@@ -1334,7 +1363,8 @@ archive_from=
 archive_tried=0
 archive_dest=
 
-# archive_box_state — copy $box_state to $box_state.<0.7 version>, once,
+# archive_box_state — copy $box_state_dir to $box_state_dir.<0.7 version>
+# (beside the link's target when the state is a symlink), once,
 # after the pre-swap daemon stop and before the first executable swap. A
 # copy-on-write clone comes first (GNU `cp --reflink=always`, macOS
 # `cp -c`): it takes no space up front. Without one, the copy needs the
@@ -1347,14 +1377,14 @@ archive_box_state() {
     [ "$archive_tried" -eq 0 ] || return 0
     archive_tried=1
     [ -d "$box_state" ] || return 0
-    archive_dest="$box_state.$archive_from"
-    [ ! -e "$archive_dest" ] || archive_dest="$box_state.$archive_from.$t0"
-    [ ! -e "$archive_dest" ] || archive_dest="$box_state.$archive_from.$t0.$$"
-    # A symlinked state directory is resolved, and its contents are copied
+    # The copy goes beside the directory that holds the state: for a
+    # symlinked state, beside the link's target. Its contents are copied
     # into a new directory: a copy of the link would be another link to the
     # data 0.8 is about to migrate. `du` measures the resolved directory too.
-    _ab_src="$(cd -P "$box_state" 2>/dev/null && pwd -P)" || _ab_src=
-    [ -n "$_ab_src" ] || _ab_src="$box_state"
+    _ab_src="$box_state_dir"
+    archive_dest="$_ab_src.$archive_from"
+    [ ! -e "$archive_dest" ] || archive_dest="$_ab_src.$archive_from.$t0"
+    [ ! -e "$archive_dest" ] || archive_dest="$_ab_src.$archive_from.$t0.$$"
     _ab_err="$tmpdir/archive.cp.err"
     : >"$_ab_err"
     _ab_cow=0
@@ -1373,7 +1403,7 @@ archive_box_state() {
     if [ "$_ab_cow" -eq 0 ]; then
         rm -rf "$archive_dest"
         _ab_need="$(du -sk "$_ab_src" 2>/dev/null | awk 'NR==1 {print $1}')" || _ab_need=
-        _ab_free="$(df -Pk "${box_state%/*}" 2>/dev/null | awk 'NR==2 {print $4}')" || _ab_free=
+        _ab_free="$(df -Pk "${box_state_dir%/*}" 2>/dev/null | awk 'NR==2 {print $4}')" || _ab_free=
         case "$_ab_need" in ''|*[!0-9]*) _ab_need= ;; esac
         case "$_ab_free" in ''|*[!0-9]*) _ab_free= ;; esac
         # A size or a free count that did not read proves nothing: the copy
