@@ -168,57 +168,45 @@ file. The copy commands below keep it sparse.
 
 A 0.7 daemon that meets 0.8 state can fail to start, or start without the boxes
 that 0.8 changed. In the other direction, a 0.8 release that meets box state
-from a newer release stops and changes nothing, and its message says so. To go
-back, put your copy back in place first. The boxes that you made on 0.8 are
-lost. No step below deletes the 0.8 state or the copy.
+from a newer release stops and changes nothing, and its message says so. The
+boxes that you made on 0.8 are lost when you go back.
 
-1. Stop the 0.8 hosts. Run `min host list` to see their names, then stop each
-   one. This command stops the VM host on macOS:
-
-   ```shell
-   min host stop local-minvmd0
-   ```
-
-2. Set `state` as in the copy steps above. Set `copy` to the copy's path: the
-   one the closing card named, or the one you made by hand. Then rename the
-   0.8 state in its own directory:
-
-   ```shell
-   copy="<copy>"
-   test -d "$copy" && test ! -e "$state.0.8" && mv "$state" "$state.0.8" && echo "moved aside"
-   ```
-
-   Go on only when the command prints `moved aside`. When it prints nothing,
-   it moved nothing: `copy` is not a directory, or `$state.0.8` exists
-   already. Correct `copy`, or rename the old `$state.0.8`, and run it again.
-
-3. Copy the 0.7 state into a new directory beside `state`, then rename that
-   directory to `state`. A copy that fails partway leaves only
-   `$state.restore`, never a partial `state`.
+1. Skip this step when the installer made the copy. That copy is beside the
+   state directory already. For a copy that you made by hand, copy it into a
+   new directory beside the state directory. Set `state` and `copy` as in the
+   copy steps above, then:
 
    On macOS:
 
    ```shell
-   mkdir "$state.restore" && cp -Rc "$copy/." "$state.restore/" && mv "$state.restore" "$state" && echo restored
+   mkdir "$state.0.7.hand" && cp -Rc "$copy/." "$state.0.7.hand/" && echo ready
    ```
 
    On Linux:
 
    ```shell
-   mkdir "$state.restore" && cp -a --sparse=always "$copy/." "$state.restore/" && mv "$state.restore" "$state" && echo restored
+   mkdir "$state.0.7.hand" && cp -a --sparse=always "$copy/." "$state.0.7.hand/" && echo ready
    ```
 
-   Go on only when the command prints `restored`. When it does not, remove
-   `$state.restore`, which holds only part of the copy, and run step 3 again.
-   To stay on 0.8 instead, rename `$state.0.8` back to `state`.
+   When the command does not print `ready`, `$state.0.7.hand` exists already
+   or holds only part of the copy. Choose another name that starts with
+   `$state.0.7.`, and run it again.
 
-4. When step 3 printed `restored`, install the 0.7 release that you had.
-   Replace `<0.7.x>` with the version that `min --version` printed before the
-   upgrade:
+2. Run the install command for the 0.7 release that you had. Replace
+   `<0.7.x>` with the version that `min --version` printed before the upgrade:
 
    ```shell
    curl --proto "=https" --tlsv1.2 -fsSL https://go.minimal.dev/stable | sh -s -- --version <0.7.x>
    ```
+
+   Over 0.8 state, the installer stops before it downloads or changes
+   anything. It prints the commands for this machine. They stop the 0.8
+   hosts. Then one line renames the 0.8 state aside, and renames the newest
+   copy beside it into its place. When more than one copy is there, the
+   installer says how many others there are.
+
+3. Run the commands that the installer printed, then run the install command
+   from step 2 again.
 
 ## Uninstall
 
